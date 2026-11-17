@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3b22f915.js";
+            window.path_to_searchindex_js = "searchindex-0994f316.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -502,9 +502,14 @@ or in the same keymanager API request that imports the key. See
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>
 <tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
-<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
+<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay</td></tr>
+<tr><td><code>--gas-limit</code></td><td><code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. <strong>Sepolia and Platåberget schedule <code>200000000</code></strong> (their <code>config.yaml</code>’s <code>GAS_LIMIT_SCHEDULE</code>, which this client does not read yet, <a href="https://github.com/lambdaclass/ethlambda/issues/795">#795</a>), so on either pass <code>--gas-limit 200000000</code>. Must be positive</td></tr>
 <tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
+<tr><td><code>--builder-proposals</code></td><td>off</td><td>Propose builder blocks: register each validator with the beacon node’s builder (an ethlambda node: <code>--builder</code>) and accept a blinded block when the builder’s bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in <code>produceBlockV4</code>. Without it that factor is <code>0</code>, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do</td></tr>
+<tr><td><code>--builder-boost-factor</code></td><td><code>100</code></td><td>How a builder’s bid is weighed against the local payload: the local payload wins iff <code>local &gt;= factor * bid / 100</code>. <code>0</code> prefers the local payload unless it cannot be built. From gloas it is also sent in <code>produceBlockV4</code>’s body, so a pooled p2p bid can win on value; without <code>--builder-proposals</code> the body carries <code>0</code>, which still lets a node whose local build fails build on such a bid. Requires <code>--builder-proposals</code>; conflicts with <code>--prefer-builder-proposals</code></td></tr>
+<tr><td><code>--prefer-builder-proposals</code></td><td>off</td><td>Take the builder’s block whenever there is a valid bid: this client sends <code>builder_boost_factor = u64::MAX</code>. The beacon node still keeps its local payload when its execution client sets <code>shouldOverrideBuilder</code>. Requires <code>--builder-proposals</code>; conflicts with <code>--builder-boost-factor</code></td></tr>
+<tr><td><code>--builder-min-bid</code></td><td><code>0</code></td><td>The smallest builder bid, in gwei, a gloas block may be built on: sent as <code>produceBlockV4</code>’s <code>min_bid</code>, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with <code>--prefer-builder-proposals</code>, which otherwise takes a 1-gwei bid over the local payload. <code>0</code> sets no floor. Taken with or without <code>--builder-proposals</code>: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot</td></tr>
 <tr><td><code>--init-slashing-protection</code></td><td>off</td><td>Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing</td></tr>
 </tbody>
 </table>
@@ -518,6 +523,44 @@ to the committee subnets the attester duties need, and registers each
 validator’s fee recipient with the beacon node. The subscription also tells the
 node which committees this client will aggregate for, which it has to know in
 advance so it can collect the votes.</p>
+<p>With <code>--builder-proposals</code>, before gloas, it also signs a builder registration
+(fee recipient and gas limit) for each validator the node resolved and sends
+them to every node: the full set after each epoch’s refresh, in batches, and
+every slot only the registrations whose fee recipient or gas limit changed
+through the keymanager API. A block request then carries a
+<code>builder_boost_factor</code>, and when the node answers with a blinded block it is
+signed like a full one and published to <code>blinded_blocks</code> on the node that
+produced it, with no failover. A publish that node does not confirm is logged
+at error and counted as unconfirmed, not as a missed proposal, since the relay
+may still publish the block.</p>
+<p>From the epoch before gloas on, it also signs a proposer preferences message
+(fee recipient and target gas limit) for each of its proposal slots in the
+current and next gloas epoch, and sends them to every node. This happens every
+slot, whether or not <code>--builder-proposals</code> is set: from gloas the preferences
+are what carry a proposal’s fee recipient, and a node ignores builders’ bids
+for a slot with none. It reads those duties from the v2 proposer duties
+endpoint, whose dependent root the preferences must carry, and publishes each
+<code>(slot, dependent root)</code> until every node has accepted it, sending the message
+as first signed to all of them again each slot until then, and again after a
+reorg changes the root. After that it sends each one, as first signed, once
+more every epoch while its slot is ahead, at the epoch’s second-to-last slot
+(or the next poll after it, if a slow node made the client skip that one),
+since a node that restarts loses what it accepted. A node restarted mid-epoch
+thus lacks the preferences of the slots before that re-send and holds the
+later ones; one restarted after it lacks the next epoch’s too, all but its
+last slot’s, which the next epoch’s re-send covers. A re-send covers only the
+slots that have not started when its duties fetch returns, so slow nodes
+ahead of the one that answers can leave the next epoch’s first slots out.
+Each preference is its own request, and a poll sends all of them, for both
+epochs, to every node at once, so a node that does not answer delays the end
+of the poll by one request timeout, not the other nodes’ delivery. The duties
+are fetched from one node at a time, so each node that does not answer,
+listed ahead of the one that does, delays every send by a request timeout.
+Duties outside their epoch, and all but the first for a slot, are dropped
+before anything is signed. A validator with no fee recipient is skipped, with
+one warning per epoch naming the count. A preference cannot be replaced for the same slot and root, so a
+fee recipient changed through the keymanager API applies from the next
+dependent root.</p>
 <p>Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
@@ -540,7 +583,12 @@ slot. The specification defines no block-production deadline; the nearest thing
 it defines is the point attesters stop waiting for a block, which is the same
 instant. A proposal still running then has already lost most of the block’s
 value, and every second past it comes out of this client’s own attestations, so
-it is abandoned and the slot’s attesters still vote.</p>
+it is abandoned and the slot’s attesters still vote. A blinded block that was
+already signed is the exception: its publish runs on its own task, since the
+beacon node may wait several seconds on the relay, so an overrun after signing
+is logged at info and not counted as a failed proposal, and the task counts the
+real outcome (a refusal as a failed proposal, success with its publication
+delay).</p>
 <p>Electra is the earliest fork it will propose under. A deneb block body has one
 field fewer than an electra one, so it would need a container pair of its own,
 and it would buy nothing: the attestations this client submits are electra’s
@@ -583,10 +631,9 @@ contribution cannot be fetched is skipped without stopping the others. Duties
 for wall slot <code>S</code> are those of the period containing <code>S + 1</code>, since members
 assigned to slot <code>S</code> sign for <code>S - 1</code>. Both halves are bounded by the end of the
 slot.</p>
-<p>Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), doppelganger protection and remote
-signing. Voluntary exits are signed by the keymanager API’s <code>voluntary_exit</code>
-route and by <a href="#voluntary-exit"><code>ethlambda voluntary-exit</code></a>.</p>
+<p>Not implemented: doppelganger protection and remote signing. Voluntary exits
+are signed by the keymanager API’s <code>voluntary_exit</code> route and by
+<a href="#voluntary-exit"><code>ethlambda voluntary-exit</code></a>.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
 <p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
@@ -631,9 +678,9 @@ give one validator its own value in place of the command line’s default:</p>
 <tr><th>Setting</th><th>Default</th><th>Takes effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch</td></tr>
+<tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With <code>--builder-proposals</code>, the next builder registration carries it too, usually at the next slot (later while the epoch’s full registration send is still running) and again every slot until a node accepts it or the epoch’s full send carries it, and an ethlambda beacon node takes it from there. A <code>DELETE</code> that leaves a validator with no address at all (no <code>--suggested-fee-recipient</code> either) sends no registration, so the builder keeps paying the address it was last given. From gloas, the proposer preferences carry it, from the next dependent root on</td></tr>
 <tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal</td></tr>
-<tr><td><code>gas_limit</code></td><td><code>DEFAULT_GAS_LIMIT</code></td><td>Stored and served only: it matters to builder registrations, and there is no builder flow</td></tr>
+<tr><td><code>gas_limit</code></td><td><code>--gas-limit</code></td><td>Before gloas, the next builder registration with <code>--builder-proposals</code> (usually at the next slot, later while the epoch’s full registration send is still running, and again every slot until a node accepts it or the epoch’s full send carries it), and stored and served only without it. From gloas, the proposer preferences’ target gas limit, from the next dependent root on, flag or not</td></tr>
 </tbody>
 </table>
 </div>
@@ -644,8 +691,8 @@ Deleting a keystore drops its values too.</p>
 has no address and there is no <code>--suggested-fee-recipient</code> default, as
 Lighthouse answers it; <code>POST feerecipient</code> refuses the zero address, as the
 specification requires; <code>POST graffiti</code> refuses text over 32 bytes rather than
-truncating it; and every route answers <code>404</code> for a key this client does not
-hold.</p>
+truncating it; <code>POST gas_limit</code> refuses <code>0</code>, as <code>--gas-limit</code> does; and every
+route answers <code>404</code> for a key this client does not hold.</p>
 <p>The keystore routes carry slashing-protection history. <code>POST</code> refuses every
 key in the request if its <code>slashing_protection</code> does not parse or is for
 another chain, and otherwise writes that history before any key is saved, so a

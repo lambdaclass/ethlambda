@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3b22f915.js";
+            window.path_to_searchindex_js = "searchindex-0994f316.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -470,12 +470,14 @@ cache, so reading it would IGNORE most honest preferences.</li>
 and a bid is compatible with it when it builds on that head and its payload.
 The builder-exit check is skipped for a pre-gloas parent, which carries no
 envelope.</li>
-<li><strong>Preference signatures</strong> are accepted under the lookahead state’s own
-<code>DOMAIN_PROPOSER_PREFERENCES</code> domain (the specification’s), the fork version of
-the epoch before the proposal’s, or the proposal epoch’s. They coincide outside
-the first epoch of a fork. Lighthouse signs with the proposal epoch’s version
-and the specification gives the earlier one, so accepting both avoids
-rejecting an honest client’s messages around the gloas upgrade.</li>
+<li><strong>Preference signatures</strong> are accepted under <code>DOMAIN_PROPOSER_PREFERENCES</code> at
+the proposal epoch’s fork version, which consensus-specs v1.7.0-beta.4 signs
+and verifies with and every client signs with, and also under the two that
+v1.7.0-beta.2’s rule (<code>get_domain</code> on the lookahead state) could give: that
+state’s own fork, and the fork version of the epoch before the proposal’s.
+They coincide outside the first epoch of a fork. The older two are kept for a
+client still signing by beta.2, until the fixtures (pinned to beta.2) move
+past it.</li>
 <li><strong>Consequence:</strong> builders onboarded at the fork are inactive until their
 deposit epoch is finalized, so gossip bids are rejected for the first epochs of
 gloas and <code>produceBlockV4</code> self-builds.</li>
@@ -917,6 +919,75 @@ comes first. The validator client signs once, at the deadline
 (<code>SYNC_MESSAGE_DUE_BPS</code>, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (<code>specs/bellatrix/optimistic-sync.md</code>).</p>
+<h2 id="the-validator-clients-builder-proposals"><a class="header" href="#the-validator-clients-builder-proposals">The validator client’s builder proposals</a></h2>
+<p>With <code>--builder-proposals</code> the validator client registers its validators with
+the beacon node’s builder and may sign a blinded block (builder-specs and
+<code>validator.md</code>’s builder flow), for fulu and earlier slots. A blinded block
+has the root of the full block it stands for, so slashing protection records
+its slot like any other block’s, durably and before it is signed: one slot, one
+signature, whichever way the node answered. Three departures:</p>
+<ul>
+<li><strong>A blinded block is published only on the beacon node that produced it, with
+no failover.</strong> This is this client’s choice, not the specification’s: only
+that node’s builder holds the payload and only that node claimed the slot, so
+offering the signed block to another node would hand it to a builder that
+never saw the bid. If the producing node fails, the publish fails, and
+slashing protection has already recorded the slot, so nothing retries. A 5xx
+other than 503, or no answer once connected, is reported as unconfirmed
+(logged at error, counted on <code>blinded_blocks_unconfirmed_total</code>) and not as a
+missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+a connection never made (refused, or past the client’s 3 s connect timeout)
+is a missed proposal: the node cannot have handed the block on. The block
+carries the node that produced it (<code>Producer</code>, filled in by the fallback),
+and the proposal path sends the signed block back to it; Teku pins a blinded
+block to its producer too, in a cache keyed by slot and root, while
+Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+Two status codes are read the wrong way: some of ethlambda’s own 500s are
+definite (no builder configured, the block failing the node’s checks) and
+count as unconfirmed, and a proxy’s 503 sent after it forwarded the request
+counts as definite. Neither leads to a retry or a second signature.</li>
+<li><strong>A blinded block stays signed but undelivered for longer.</strong> The node waits
+up to 5 s on the relay and the client up to 8 s on the node, against well
+under a second for a full block. The publish runs on its own task so the
+proposal budget cannot cut it off: past the budget the proposal returns
+“still publishing” and the task reports the outcome itself. The process
+handles no signals, though: a SIGINT in that window ends the task with the
+request.</li>
+<li><strong>Registrations stop at gloas.</strong> The client sends no <code>register_validator</code> from
+the gloas fork epoch on: the builder market works through proposer
+preferences there (see the next section), and <code>produceBlockV4</code> sends the
+configured boost factor and <code>--builder-min-bid</code> (default <code>0</code>), and no
+builders.
+Validators with no fee recipient are not registered either (the field is
+required), and only validators the beacon node resolved, pending or active,
+are signed for: the flashbots relay refuses a whole batch over an exited or
+withdrawn key, as Teku’s validator client and Lighthouse’s beacon node
+account for.</li>
+</ul>
+<h2 id="the-validator-clients-proposer-preferences"><a class="header" href="#the-validator-clients-proposer-preferences">The validator client’s proposer preferences</a></h2>
+<ul>
+<li><strong>Signing domain: no departure, but ahead of the fixtures.</strong> The validator
+client signs under <code>DOMAIN_PROPOSER_PREFERENCES</code> at the proposal epoch’s fork
+version (<code>SigningContext::sign_proposer_preferences</code>), as consensus-specs
+v1.7.0-beta.4’s <code>get_signed_proposer_preferences</code> does with
+<code>compute_fork_version(proposal_epoch)</code>, and as Lighthouse, Prysm, Teku,
+Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
+v1.7.0-beta.2, whose gossip rule verified with <code>get_domain</code> on the dependent
+block’s state advanced to the lookahead start, the fork of the epoch before
+the proposal’s. The two differ only for a proposal in the first epoch of a
+fork, where Lighthouse refuses beta.2’s signature as a bad one. This node
+still accepts beta.2’s domain too (see the fulu-to-gloas boundary entry).</li>
+<li><strong>Published unconditionally,</strong> not gated on <code>--builder-proposals</code>, since from
+gloas the preferences carry every proposal’s fee recipient. Validators with no
+fee recipient are skipped (the field is required), and a preference cannot be
+replaced for the same slot and dependent root.</li>
+<li><strong>Re-sent once an epoch,</strong> as signed, to every node, while its slot is ahead.
+The specification says nothing about re-sending; it is here because a beacon
+node holds them in memory only
+and gossip does not replay them, so a node that restarts would otherwise
+self-build without them, and ignore builders’ bids, until the next dependent
+root. Same cadence as <code>prepare_beacon_proposer</code>, which a restart loses too.</li>
+</ul>
 
                     </main>
 

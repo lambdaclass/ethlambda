@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3b22f915.js";
+            window.path_to_searchindex_js = "searchindex-0994f316.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -1010,6 +1010,13 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
+<tr><td><code>ethlambda_validator_builder_registrations_sent_total</code></td><td>Counter</td><td>Builder registrations a beacon node accepted (<code>--builder-proposals</code>)</td></tr>
+<tr><td><code>ethlambda_validator_builder_registration_failures_total</code></td><td>Counter</td><td>Registration batches no beacon node accepted. A missed registration costs at most a builder block, never a duty</td></tr>
+<tr><td><code>ethlambda_validator_proposer_preferences_published_total</code></td><td>Counter</td><td>Signed proposer preferences a beacon node accepted, counted once per preference, when the first node accepts it (re-sends to nodes that missed it do not count). Published for every proposal from the epoch before gloas, whether or not <code>--builder-proposals</code> is set</td></tr>
+<tr><td><code>ethlambda_validator_proposer_preferences_failures_total</code></td><td>Counter</td><td>Proposer preference sends some beacon node refused or did not answer (one count per preference per attempt, re-sends included, so a node that keeps refusing shows up here even while another accepts). After a restart with other settings, a node holding the preference signed before it refuses the new one every slot until the slot starts, so a steady climb then is expected rather than a fault. So is one while the beacon nodes follow different heads: a node whose dependent root differs from the one the duties came from refuses the preference until the root changes or the slot starts. The next slot retries; a node that misses a preference never gossips it, and until some node accepts it, builders’ bids for its slot are ignored. A send whose slot started before the nodes answered is not counted</td></tr>
+<tr><td><code>ethlambda_validator_proposer_preferences_duty_fetch_failures_total</code></td><td>Counter</td><td>v2 proposer-duty fetches no beacon node answered (one count per target epoch per attempt). Without the duties no preference is signed for that epoch; a syncing node, or one without the v2 endpoint, shows up here</td></tr>
+<tr><td><code>ethlambda_validator_blinded_blocks_proposed_total</code></td><td>Counter</td><td>Blinded blocks a beacon node handed to its builder. A subset of <code>blocks_proposed_total</code></td></tr>
+<tr><td><code>ethlambda_validator_blinded_blocks_unconfirmed_total</code></td><td>Counter</td><td>Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation</td></tr>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
 <tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time to sign one slot’s batch, store read lock included</td></tr>
@@ -1027,13 +1034,17 @@ different causes, and the distinction is the reason they are separate series:
 second points at the beacon nodes; a rise in the third points at the clock or
 the duty schedule and is worth investigating even though the attestation was
 correctly suppressed.</p>
-<p>The proposal series split the same way, plus one that is neither a success nor
+<p>The proposal series split the same way, plus two that are neither a success nor
 a failure. <code>blocks_proposed_total</code> counts blocks a node accepted;
 <code>block_proposal_failures_total</code> counts duties that produced none;
 <code>blocks_refused_total</code> counts blocks deliberately not signed. Between them,
 <code>blocks_broadcast_not_imported_total</code> counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
-rather than a validator one and is why it is not folded into either.</p>
+rather than a validator one and is why it is not folded into either.
+<code>blinded_blocks_unconfirmed_total</code> is the other: a blinded block the node did
+not confirm, which the relay may still have published. It is not in
+<code>blocks_proposed_total</code> nor in the publication delay histogram, and it is not a
+failure either.</p>
 <p>Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
 and the envelope’s failure does not fail the proposal: <code>blocks_proposed_total</code>
 counts the block, and <code>envelope_failures_total</code> the reveal that did not follow.

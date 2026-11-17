@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3b22f915.js";
+            window.path_to_searchindex_js = "searchindex-0994f316.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -891,10 +891,14 @@ would not relay. An accepted bid is pooled for block production and gossiped.
 <code>500</code> when the network actor is down.</li>
 <li><strong><code>POST /eth/v1/validator/proposer_preferences</code></strong> takes a list of
 <code>SignedProposerPreferences</code> (at most <code>(MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH</code>, 64 on mainnet), as a JSON array or an SSZ list.
-<code>Eth-Consensus-Version</code> is optional and may be <code>fulu</code> or <code>gloas</code>, since a
-validator client submits during the epoch before the fork. Each entry runs the
-gossip rules in order; an entry already cached, identical, succeeds without a
-republish. Accepted entries are cached (the first per <code>(proposal slot, dependent root)</code> wins) and gossiped. If any entry fails the answer is <code>400</code>
+<code>Eth-Consensus-Version</code> is optional and may be <code>fulu</code> or <code>gloas</code>. Validator
+clients name <code>gloas</code> even during the epoch before the fork (the fork of the
+preference’s slot); <code>fulu</code> is accepted as leniency towards one that names its
+wall clock’s fork. Each entry runs the gossip rules in order; an entry already
+cached, identical, succeeds without a republish, including one gossip cached
+while this copy was being validated. Accepted entries are cached
+(the first per <code>(proposal slot, dependent root)</code> wins) and gossiped. If any
+entry fails the answer is <code>400</code>
 <code>{code, message, failures: [{index, message}]}</code> and the others were still
 published. The endpoint is not gated on the sync status. A node whose
 dependent block is unknown answers <code>ignore: unknown_block</code> for that entry.</li>
