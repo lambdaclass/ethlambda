@@ -937,13 +937,13 @@ fn warn_no_blob_pipeline(block: &SignedBeaconBlock) {
 }
 
 impl BlockChainServer {
-    /// One tick, with the sync gate judged by its end whatever path it took.
+    /// One tick, then the sync gate judged if the tick did not judge it.
     ///
-    /// Lean judges in the tick itself, and beacon in the head recompute its
-    /// tick ends in (off the head that recompute reads: on beacon a read is a
-    /// whole-block decode). This catches a tick that returned before either,
-    /// so a return added to the tick later cannot leave the gate unjudged,
-    /// and costs nothing when the tick judged it.
+    /// A lean tick judges the gate itself, and a beacon tick judges it in the
+    /// head recompute at its end. Judging again every time would decode the
+    /// beacon head block a second time, so this judges only when the tick
+    /// returned before doing so. That keeps a return added to the tick later
+    /// from leaving the gate unjudged.
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         self.run_tick(timestamp_ms, ctx).await;
         let time_config = self.store.config().time_grid();
@@ -3651,6 +3651,8 @@ impl BlockChainServer {
     /// the network is treated as being at the clock, since no peer on that
     /// fork can tell it so.
     fn judge_sync_status(&mut self, current_slot: u64, head_slot: u64) {
+        // P2P reads the head slot from here rather than decoding the head.
+        self.store.set_head_slot_hint(head_slot);
         let past_followed_forks = self.store.chain() == Chain::Beacon
             && Self::clock_is_past_followed_forks(&self.store.config(), current_slot, head_slot);
         let status = if past_followed_forks {

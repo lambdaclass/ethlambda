@@ -1209,6 +1209,10 @@ pub struct Store {
     /// while no connected peer reports one. Written by P2P, read by the chain
     /// actor's sync tracker; see [`Store::network_head`].
     network_head: Arc<AtomicU64>,
+    /// The head slot as the chain actor last judged the sync gate at, or
+    /// [`NO_NETWORK_HEAD`] before its first judgment. Written by the chain
+    /// actor, read by P2P; see [`Store::head_slot_hint`].
+    head_slot_hint: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
     /// and anything else holding a `Store` clone. See
@@ -1860,6 +1864,7 @@ impl Store {
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             network_head: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
+            head_slot_hint: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -3329,6 +3334,24 @@ impl Store {
         // A slot at the sentinel would read back as no report: clamp it.
         let slot = slot.map_or(NO_NETWORK_HEAD, |slot| slot.min(NO_NETWORK_HEAD - 1));
         self.network_head.store(slot, Ordering::Relaxed);
+    }
+
+    /// The head slot the chain actor last judged the sync gate at, which P2P
+    /// reads instead of the head itself: on beacon, reading the head decodes
+    /// the whole head block, and the chain actor has just read it anyway.
+    /// `None` before the actor's first judgment. Never older than the latest
+    /// judgment, which follows every head change. Runtime-only and shared by
+    /// every clone of this `Store`.
+    pub fn head_slot_hint(&self) -> Option<u64> {
+        let slot = self.head_slot_hint.load(Ordering::Relaxed);
+        (slot != NO_NETWORK_HEAD).then_some(slot)
+    }
+
+    /// Publish the head slot; see [`Self::head_slot_hint`]. The chain actor
+    /// is the only writer.
+    pub fn set_head_slot_hint(&self, slot: u64) {
+        self.head_slot_hint
+            .store(slot.min(NO_NETWORK_HEAD - 1), Ordering::Relaxed);
     }
 
     /// The total-active-balance cache shared by every clone of this store.

@@ -55,11 +55,11 @@ impl Default for SyncStatusController {
 /// | event | effect |
 /// |---|---|
 /// | head advances past `high_water` | progress: window starts over, stall released |
-/// | head climbs past `climbing_back` after a move back | progress, likewise |
-/// | first move back below a high-water mark | window starts over, stall released, climb begins |
-/// | a judgment behind on the peers' word | slots added to `behind_for`: a stretch in full, a slot after a short lapse once |
-/// | a claim after a lapse longer than the window, with something counted | count back to zero, once per mark (`renewed`) |
-/// | `behind_for` past the window | stall: synced until progress |
+/// | head climbs past the highest reached since a move back (`climb`) | progress, likewise |
+/// | first move back below a high-water mark, or a new low below the climb's | window starts over, stall released |
+/// | a judgment behind on the peers' word | slots added to the count (`StallCount`): a stretch in full, a slot after a short lapse once |
+/// | a claim after a lapse longer than the window, with something counted | count back to zero, once per count (`renewed`) |
+/// | the count past the window | stall: synced until progress |
 ///
 /// With the head flat, no schedule of claims and lapses keeps the node
 /// syncing for more than about two windows' worth of slots at one head:
@@ -83,15 +83,34 @@ pub(crate) struct SyncStatusTracker {
     high_water: Option<u64>,
     /// The head at the last judgment, to tell a move back.
     last_head: Option<u64>,
-    /// The highest head reached since the head moved back below
-    /// [`Self::high_water`], while it has not yet climbed past it. An advance
-    /// past it is progress too: a branch being re-imported after an `INVALID`
-    /// cut. Set by the first move back at a high-water mark and not by
-    /// later ones, so a head flipping between two branches restarts the
-    /// window at most twice per mark rather than on every flip.
-    climbing_back: Option<u64>,
-    /// Slots the node has spent behind on its peers' word since its head last
-    /// advanced, measured against [`SyncThresholds::stall_window`].
+    /// After the head moved back below [`Self::high_water`], while it has not
+    /// yet climbed past it: the lowest head reached since, and the highest.
+    /// Climbing past the highest is progress (a branch being re-imported
+    /// after an `INVALID` cut), and so is a new low (a deeper cut). A head
+    /// flipping between two branches does neither after its first two flips,
+    /// so it restarts the window at most twice per mark rather than on every
+    /// flip.
+    climb: Option<(u64, u64)>,
+    /// The stall window's count at the current head position.
+    stall: StallCount,
+    /// Whether a peer-reported lead was given up on for making no progress
+    /// (see [`SyncThresholds::stall_window`]). Holds the node synced until
+    /// the head makes progress: the peers that claimed the lead repeat it on
+    /// every refresh, so a fresh report is no reason to believe them again.
+    stalled: bool,
+}
+
+/// How long the node has been behind on its peers' word with its head making
+/// no progress, measured against [`SyncThresholds::stall_window`]. Starts
+/// over (`Default`) whenever the head makes progress.
+///
+/// Invariants: `counted_at` is `None` only while nothing was judged behind
+/// since the count started, and `behind_for` is then zero; `lapsed_at` is
+/// `Some` only while the latest judgment was not behind on the peers' word
+/// (it may have been on the clock's), and the next judgment that is takes it.
+#[derive(Debug, Default)]
+struct StallCount {
+    /// Slots counted so far.
     ///
     /// Added up rather than measured from when the node last fell behind: a
     /// claim that lapses for a moment (a peer reporting a block this node
@@ -101,30 +120,57 @@ pub(crate) struct SyncStatusTracker {
     /// once, so a lapse at every slot boundary pauses nothing.
     behind_for: u64,
     /// The wall-clock slot of the last judgment that found the node behind on
-    /// its peers' word, already counted into [`Self::behind_for`].
-    ///
-    /// Invariants, with [`Self::lapsed_at`]: `counted_at` is `None` only
-    /// while nothing was judged behind since the window last started over,
-    /// and `behind_for` is then zero; `lapsed_at` is `Some` only while the
-    /// latest judgment was not behind on the peers' word (it may have been on
-    /// the clock's), and the next judgment that is takes it.
+    /// its peers' word, already counted into `behind_for`.
     counted_at: Option<u64>,
     /// The wall-clock slot from which no judgment has found the node behind
-    /// on its peers' word, while that lasts. A lapse longer than the stall
-    /// window (an outage, peers that stopped claiming) ends the count: the
-    /// next claim gets a window of its own, once per head position.
+    /// on its peers' word, while that lasts. A lapse longer than the window
+    /// (an outage, peers that stopped claiming) ends the count: the next
+    /// claim gets a window of its own, once per count.
     lapsed_at: Option<u64>,
-    /// Whether a claim after a long lapse has already had a fresh window at
-    /// the current head. Once per head position, so that claiming for most
-    /// of a window, lapsing for a whole one and claiming again cannot keep
-    /// a node idle for half of all slots indefinitely.
+    /// Whether a claim after a long lapse has already had a fresh window in
+    /// this count. Once per count, so that claiming for most of a window,
+    /// lapsing for a whole one and claiming again cannot keep a node idle for
+    /// half of all slots indefinitely.
     renewed: bool,
-    /// The head slot at which a peer-reported lead was given up on for making
-    /// no progress (see [`SyncThresholds::stall_window`]). Holds the node
-    /// synced until the head makes progress (past [`Self::high_water`]): the
-    /// peers that claimed the lead repeat it on every refresh, so a fresh
-    /// report is no reason to believe them again.
-    stalled_at_head: Option<u64>,
+}
+
+impl StallCount {
+    /// Note a judgment at `current_slot`, behind on the peers' word or not,
+    /// and return the slots counted so far.
+    fn count(&mut self, current_slot: u64, on_peers_word: bool, stall_window: u64) -> u64 {
+        if !on_peers_word {
+            self.lapsed_at.get_or_insert(current_slot);
+            return self.behind_for;
+        }
+        self.behind_for = match (self.counted_at, self.lapsed_at.take()) {
+            // Behind since the last judgment: the whole stretch counts.
+            (Some(counted), None) => self
+                .behind_for
+                .saturating_add(current_slot.saturating_sub(counted)),
+            // Back after a lapse longer than the window: a new claim, with a
+            // window of its own, once per count. Only once something was
+            // counted: the first claim after a quiet stretch starts from zero
+            // anyway, and must not use up the renewal an outage later would
+            // need.
+            (Some(_), Some(lapsed))
+                if !self.renewed
+                    && self.behind_for > 0
+                    && current_slot.saturating_sub(lapsed) > stall_window =>
+            {
+                self.renewed = true;
+                0
+            }
+            // Back after a shorter lapse: this slot counts once, however many
+            // judgments it has.
+            (Some(counted), Some(_)) => self
+                .behind_for
+                .saturating_add(u64::from(current_slot != counted)),
+            // Behind for the first time in this count.
+            (None, _) => self.behind_for,
+        };
+        self.counted_at = Some(current_slot);
+        self.behind_for
+    }
 }
 
 impl SyncStatusTracker {
@@ -137,12 +183,9 @@ impl SyncStatusTracker {
             last_slot: 0,
             high_water: None,
             last_head: None,
-            climbing_back: None,
-            behind_for: 0,
-            counted_at: None,
-            lapsed_at: None,
-            renewed: false,
-            stalled_at_head: None,
+            climb: None,
+            stall: StallCount::default(),
+            stalled: false,
         }
     }
 
@@ -202,23 +245,27 @@ impl SyncStatusTracker {
             // over. The window starts over, and a lead given up on is believed
             // again.
             self.high_water = Some(head_slot);
-            self.climbing_back = None;
+            self.climb = None;
             self.start_window_over();
-        } else if let Some(climbed) = self.climbing_back {
-            // Climbing back after a move back: each block past the highest
-            // reached since is progress, so a re-import after an `INVALID`
-            // cut stays syncing while it lasts.
+        } else if let Some((low, climbed)) = self.climb {
             if head_slot > climbed {
-                self.climbing_back = Some(head_slot);
+                // Climbing back after a move back: each block past the
+                // highest reached since is progress, so a re-import after an
+                // `INVALID` cut stays syncing while it lasts.
+                self.climb = Some((low, head_slot));
+                self.start_window_over();
+            } else if head_slot < low {
+                // A deeper cut than any since the mark: the peers may be
+                // right again.
+                self.climb = Some((head_slot, head_slot));
                 self.start_window_over();
             }
         } else if head_slot < last_head {
             // The head moved back (an `INVALID` execution verdict cutting a
             // branch out, a reorg onto a shorter branch). The peers may have
             // been right about the chain all along, so the window starts over
-            // and a lead given up on is believed again. Once per high-water
-            // mark: a later move back below it starts nothing.
-            self.climbing_back = Some(head_slot);
+            // and a lead given up on is believed again.
+            self.climb = Some((head_slot, head_slot));
             self.start_window_over();
         }
 
@@ -243,43 +290,12 @@ impl SyncStatusTracker {
         // word (past a fork the node does not follow) is no claim that a peer
         // can fail to deliver.
         let on_peers_word = behind && !network_at_clock;
-        if on_peers_word {
-            self.behind_for = match (self.counted_at, self.lapsed_at.take()) {
-                // Behind since the last judgment: the whole stretch counts.
-                (Some(counted), None) => self
-                    .behind_for
-                    .saturating_add(current_slot.saturating_sub(counted)),
-                // Back after a lapse longer than the window: a new claim,
-                // with a window of its own, once per head position. Only
-                // once something was counted at this head: the first claim
-                // after a quiet stretch starts from zero anyway, and must not
-                // use up the renewal an outage later would need.
-                (Some(_), Some(lapsed))
-                    if !self.renewed
-                        && self.behind_for > 0
-                        && current_slot.saturating_sub(lapsed) > stall_window =>
-                {
-                    self.renewed = true;
-                    0
-                }
-                // Back after a shorter lapse: this slot counts once, however
-                // many judgments it has.
-                (Some(counted), Some(_)) => self
-                    .behind_for
-                    .saturating_add(u64::from(current_slot != counted)),
-                // Behind for the first time since the head advanced.
-                (None, _) => self.behind_for,
-            };
-            self.counted_at = Some(current_slot);
-        } else {
-            self.lapsed_at.get_or_insert(current_slot);
-        }
+        let behind_for = self.stall.count(current_slot, on_peers_word, stall_window);
 
         // The backstop: behind on the peers' word for a whole window, all of
         // it with the head flat. Whoever claims the lead is not delivering it,
         // which is what a stalled network looks like too.
-        let behind_for = self.behind_for;
-        if on_peers_word && self.stalled_at_head.is_none() && behind_for > stall_window {
+        if on_peers_word && !self.stalled && behind_for > stall_window {
             warn!(
                 current_slot,
                 head_slot,
@@ -287,11 +303,11 @@ impl SyncStatusTracker {
                 behind_for,
                 "Peers report a head this node is not reaching; treating the network as stalled"
             );
-            self.stalled_at_head = Some(head_slot);
+            self.stalled = true;
         }
 
         let was_syncing = self.syncing;
-        self.syncing = behind && (network_at_clock || self.stalled_at_head.is_none());
+        self.syncing = behind && (network_at_clock || !self.stalled);
 
         if self.syncing != was_syncing {
             info!(
@@ -300,7 +316,7 @@ impl SyncStatusTracker {
                 network_head,
                 clock_lag,
                 peer_lead,
-                stalled = self.stalled_at_head.is_some(),
+                stalled = self.stalled,
                 syncing = self.syncing,
                 "Sync status changed"
             );
@@ -315,11 +331,8 @@ impl SyncStatusTracker {
 
     /// Start the stall window over, and believe a lead given up on again.
     fn start_window_over(&mut self) {
-        self.behind_for = 0;
-        self.counted_at = None;
-        self.lapsed_at = None;
-        self.renewed = false;
-        self.stalled_at_head = None;
+        self.stall = StallCount::default();
+        self.stalled = false;
     }
 
     /// The latest wall-clock slot judged at.
@@ -548,6 +561,31 @@ mod tests {
         assert_eq!(
             tracker.update(end + 1, 60, Some(end + 1)),
             SyncStatus::Synced
+        );
+    }
+
+    #[test]
+    fn a_deeper_cut_during_a_re_climb_is_judged_afresh() {
+        // Finding: once a re-climb had begun, a second `INVALID` cut moving
+        // the head lower still kept a stall given up on in the meantime.
+        let mut tracker = steady_lean();
+        assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
+        assert_eq!(tracker.update(101, 50, Some(101)), SyncStatus::Syncing);
+        assert_eq!(tracker.update(102, 55, Some(102)), SyncStatus::Syncing);
+        let tripped = 103 + LEAN.stall_window;
+        assert_eq!(
+            tracker.update(tripped, 55, Some(tripped)),
+            SyncStatus::Synced
+        );
+        // Back to 52: above the climb's low, so not on its own a new cut.
+        assert_eq!(
+            tracker.update(tripped + 1, 52, Some(tripped + 1)),
+            SyncStatus::Synced
+        );
+        // Below it: a deeper cut, and the peers are believed again.
+        assert_eq!(
+            tracker.update(tripped + 2, 45, Some(tripped + 2)),
+            SyncStatus::Syncing
         );
     }
 
