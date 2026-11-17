@@ -937,7 +937,24 @@ fn warn_no_blob_pipeline(block: &SignedBeaconBlock) {
 }
 
 impl BlockChainServer {
+    /// One tick, with the sync gate judged by its end whatever path it took.
+    ///
+    /// Lean judges in the tick itself, and beacon in the head recompute its
+    /// tick ends in (off the head that recompute reads: on beacon a read is a
+    /// whole-block decode). This catches a tick that returned before either,
+    /// so a return added to the tick later cannot leave the gate unjudged,
+    /// and costs nothing when the tick judged it.
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
+        self.run_tick(timestamp_ms, ctx).await;
+        let time_config = self.store.config().time_grid();
+        let since_genesis_ms = timestamp_ms.saturating_sub(time_config.genesis_time_ms());
+        let slot = since_genesis_ms / time_config.milliseconds_per_slot.max(1);
+        if self.sync_status.judged_through() < slot {
+            self.update_sync_status(slot);
+        }
+    }
+
+    async fn run_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let time_config = self.store.config().time_grid();
 
         // Calculate current slot and interval from milliseconds
@@ -998,10 +1015,8 @@ impl BlockChainServer {
         metrics::update_current_slot(slot);
         // Beacon judges the gate in the head recompute this tick ends in (see
         // `update_head_from_fork_choice`), off the head it has just read;
-        // judging here too would only be overwritten moments later. Every
-        // beacon tick that gets this far reaches that recompute: the only
-        // returns above are the duplicate-tick guard and a lean-only check,
-        // and nothing below returns before it.
+        // judging here too would only be overwritten moments later. `on_tick`
+        // judges after this if nothing did.
         if self.store.chain() == Chain::Lean {
             self.update_sync_status(slot);
         }
@@ -4508,6 +4523,15 @@ mod tests {
     // with `beacon::gossip::column`.
     // -----------------------------------------------------------------
 
+    /// [`beacon_server`] for a lean store, with lean's sync thresholds. The
+    /// chain duties stay the beacon arm's: nothing these tests drive reaches
+    /// a lean duty.
+    pub(crate) fn lean_server(store: Store) -> BlockChainServer {
+        let mut server = beacon_server(store);
+        server.sync_status = SyncStatusTracker::new(false, SyncThresholds::LEAN);
+        server
+    }
+
     pub(crate) fn beacon_server(store: Store) -> BlockChainServer {
         BlockChainServer {
             events: ChainEvents::new(EventBus::default(), &store),
@@ -5474,8 +5498,7 @@ mod tests {
             State::from_genesis(0, Vec::new()),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
-        let mut server = beacon_server(store);
-        server.sync_status = SyncStatusTracker::new(false, SyncThresholds::LEAN);
+        let mut server = lean_server(store);
         let orphan = || {
             SignedBeaconBlock::Lean(ethlambda_types::block::SignedBlock {
                 message: ethlambda_types::block::Block {

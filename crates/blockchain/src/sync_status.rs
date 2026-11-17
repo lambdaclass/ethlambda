@@ -102,6 +102,11 @@ pub(crate) struct SyncStatusTracker {
     behind_for: u64,
     /// The wall-clock slot of the last judgment that found the node behind on
     /// its peers' word, already counted into [`Self::behind_for`].
+    ///
+    /// Invariants, with [`Self::lapsed_at`]: `counted_at` is `None` only
+    /// while nothing was judged behind since the window last started over,
+    /// and `behind_for` is then zero; `lapsed_at` is `Some` only while the
+    /// latest judgment was not behind, and the next behind judgment takes it.
     counted_at: Option<u64>,
     /// The wall-clock slot from which no judgment has found the node behind
     /// on its peers' word, while that lasts. A lapse longer than the stall
@@ -314,6 +319,11 @@ impl SyncStatusTracker {
         self.lapsed_at = None;
         self.renewed = false;
         self.stalled_at_head = None;
+    }
+
+    /// The latest wall-clock slot judged at.
+    pub(crate) fn judged_through(&self) -> u64 {
+        self.last_slot
     }
 
     /// Whether the tracker currently considers the node to be syncing,
