@@ -3747,6 +3747,32 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_count_waits_for_blocks_above_the_head() {
+        // Finding: a session that delivered nothing, or the watermark seeded
+        // at the anchor on startup, started the count, so the first real
+        // batch, a window later, was dropped at the next tick and its honest
+        // sender made a suspect.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        let honest = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, honest, 2000));
+        for wall in 100..=100 + 2 * window {
+            server.expire_range_watermark(wall);
+        }
+        // The first batch lands: it gets a whole window from here.
+        server.range_fetched_through = 64;
+        server.head_watch.note_delivery(honest, 64);
+        let delivered = 101 + 2 * window;
+        server.expire_range_watermark(delivered);
+        server.expire_range_watermark(delivered + window);
+        assert_eq!(server.range_fetched_through, 64);
+        assert!(!server.peer_heads.is_suspect(&honest));
+        server.expire_range_watermark(delivered + window + 1);
+        assert_eq!(server.range_fetched_through, head);
+    }
+
+    #[tokio::test]
     async fn a_peer_whose_blocks_never_import_is_cut_off_after_a_window() {
         // Finding: a peer answering every batch with in-range blocks that
         // never import kept the watermark rising and its count restarting,

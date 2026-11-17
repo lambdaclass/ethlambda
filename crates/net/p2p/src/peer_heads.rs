@@ -375,7 +375,9 @@ impl PeerHeads {
 }
 
 /// Whether this node has already imported `root`: its own head, or any block
-/// it holds a post-state for. A pending or held block has no post-state, so it
+/// it holds a post-state for. On either chain: `Store::head` is the head key
+/// both share (`Store::beacon_head` reads it too), and `has_state` covers
+/// beacon states. A pending or held block has no post-state, so it
 /// does not count, the same as a block the node has never seen.
 fn holds_block(store: &Store, root: &H256) -> bool {
     store.head().is_ok_and(|head| head == *root) || store.has_state(root).unwrap_or(false)

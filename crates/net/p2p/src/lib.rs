@@ -525,6 +525,11 @@ impl HeadWatch {
         wall_slot.saturating_sub(since)
     }
 
+    /// Forget when deliveries started, nothing being above the head.
+    pub(crate) fn clear_delivery(&mut self) {
+        self.delivering_since = None;
+    }
+
     /// Note that `peer` handed blocks over, through slot `through`.
     pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
         let highest = self.deliverers.entry(peer).or_insert(through);
@@ -2137,9 +2142,16 @@ impl P2PServer {
         };
         // Blocks being handed over: a session running, or the watermark moved
         // since the last tick (a short session can start and end between
-        // two).
+        // two), and only with blocks above the head to show for it. A session
+        // that has delivered nothing yet, or the watermark seeded at the
+        // anchor on startup, must not start the count the first real batch
+        // would then be measured from.
         let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
-        let delivering = self.range_sync_state.is_some() || watermark_moved;
+        let above_head = self.range_fetched_through > head_slot;
+        let delivering = above_head && (self.range_sync_state.is_some() || watermark_moved);
+        if !above_head {
+            self.head_watch.clear_delivery();
+        }
         // Suspects the head has passed, or that have served their time.
         peer_heads::clear_suspects(self, head_slot, wall_slot);
         let flat_for = self.head_watch.flat_for(head_slot, wall_slot, delivering);
