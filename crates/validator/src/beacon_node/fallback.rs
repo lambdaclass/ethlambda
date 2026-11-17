@@ -393,6 +393,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// node fails, the publish fails, and the answer is returned unchanged so
     /// the caller can tell a refusal from an unconfirmed send. Slashing
     /// protection has already recorded the slot, so nothing retries it.
+    ///
+    /// The node is handed `Producer::default()`, since a single node has no
+    /// one to choose. So a fallback of fallbacks would send every blinded
+    /// block to its inner list's first node: one level only, which is all the
+    /// client builds.
     async fn publish_blinded_block(
         &self,
         producer: Producer,
