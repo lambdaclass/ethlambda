@@ -1,23 +1,27 @@
 //! Producing the signatures a validator owes: attestations, the RANDAO reveal
-//! a block carries, the block itself, and the two an aggregator needs.
+//! a block carries, the block itself, the two an aggregator needs, and the one
+//! an operator asks for when a validator leaves: the voluntary exit.
 //!
 //! The signing root always comes from the SSZ container, never from the JSON a
 //! beacon node sent: the wire representation is a transport detail, and the
 //! chain only ever agrees about the merkle root.
 
+use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, VoluntaryExit};
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
     Root, Slot,
@@ -25,7 +29,7 @@ use ethlambda_types::beacon::primitives::{
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
 use ethlambda_types::beacon::signing::{
-    compute_domain, compute_epoch_at_slot, compute_signing_root,
+    compute_builder_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
 use crate::error::{Error, Result};
@@ -192,6 +196,46 @@ impl SigningContext {
         compute_signing_root(message.hash_tree_root(), domain)
     }
 
+    /// The root a voluntary exit's signature is computed over.
+    ///
+    /// Every other signature here follows the fork at its message's own epoch.
+    /// An exit follows the fork of the state that *processes* it, because that
+    /// is the state a node verifies it against, and the two part ways as soon
+    /// as an exit names an epoch from an earlier fork:
+    ///
+    /// - A deneb-or-later state verifies under `CAPELLA_FORK_VERSION` whatever
+    ///   epoch the exit names (EIP-7044), so an exit signed now stays valid
+    ///   across every fork to come. The point was pre-signed exits, which a
+    ///   staking service hands its customer so they can leave without the
+    ///   service's cooperation; a domain that moved with the schedule made
+    ///   those expire at each fork.
+    /// - An earlier state verifies under `get_domain(state,
+    ///   DOMAIN_VOLUNTARY_EXIT, exit.epoch)`: its previous fork version for an
+    ///   exit naming an epoch before its own fork, its current one otherwise.
+    ///
+    /// No state can process the exit before `max(current_epoch, exit.epoch)`:
+    /// the chain is already at the one, and an exit is refused before the
+    /// other. So the fork at that epoch is the one to sign for. Keying on
+    /// `exit.epoch` alone, as Lighthouse does, signs an exit naming a
+    /// pre-deneb epoch under that epoch's version, which no node on a chain
+    /// past deneb accepts.
+    pub fn voluntary_exit_signing_root(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> Root {
+        let fork = self.config.fork_at_epoch(current_epoch.max(exit.epoch));
+        let fork_version = if fork >= ForkName::Deneb {
+            self.config.capella_fork_version
+        } else if exit.epoch < self.config.fork_epoch(fork) {
+            self.config.fork_version(fork.previous().unwrap_or(fork))
+        } else {
+            self.config.fork_version(fork)
+        };
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            fork_version,
+            self.genesis_validators_root,
+        );
+        compute_signing_root(exit.hash_tree_root(), domain)
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
@@ -297,6 +341,53 @@ impl SigningContext {
         self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
     }
 
+    /// A builder registration's signature.
+    ///
+    /// Signed under `compute_builder_domain(genesis_fork_version)`: the genesis
+    /// fork version and a zero validators root, per builder-specs, so a
+    /// registration verifies whatever fork the chain is in. Not
+    /// `DOMAIN_BEACON_BUILDER`, which is gloas's envelope domain. Not
+    /// slashable: a registration commits to nothing about the chain, and a
+    /// builder keeps only the newest one per validator.
+    pub fn sign_validator_registration(
+        &self,
+        store: &ValidatorStore,
+        registration: &ValidatorRegistrationV1,
+    ) -> Result<BlsSignature> {
+        let domain = compute_builder_domain(self.config.genesis_fork_version);
+        let root = compute_signing_root(registration.hash_tree_root(), domain);
+        self.sign_root(store, &registration.pubkey, root)
+    }
+
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the proposal
+    /// epoch itself.
+    ///
+    /// That is `get_signed_proposer_preferences` as of consensus-specs
+    /// v1.7.0-beta.4, `compute_fork_version(proposal_epoch)` read off the
+    /// schedule, and the `proposer_preferences` gossip rule verifies under the
+    /// same domain. Every other client signs and verifies this way
+    /// (Lighthouse, Prysm, Teku, Lodestar and Nimbus all take the fork of the
+    /// proposal's epoch).
+    ///
+    /// The rule before it, beta.2's, verified with `get_domain` on the
+    /// dependent block's state advanced to the lookahead start, which gives
+    /// the fork of the epoch before the proposal's. That differs only for a
+    /// proposal in the first epoch of a fork, and there Lighthouse refuses it
+    /// as a bad signature: it did so for every first-gloas-epoch preference
+    /// this client signed that way on a devnet. Not slashable.
+    pub fn sign_proposer_preferences(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign_root(store, pubkey, root)
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -359,6 +450,28 @@ impl SigningContext {
             pubkey,
             self.contribution_and_proof_signing_root(message),
         )
+    }
+
+    /// Sign a voluntary exit on behalf of `pubkey`.
+    ///
+    /// Not slashable, and not guarded, but the one signature here that is
+    /// **irreversible**: once the chain processes it the validator is on its
+    /// way out, and nothing it signs afterwards brings it back. The guard is
+    /// the caller's: the command line asks for a confirmation phrase, and the
+    /// keymanager route is bearer-authenticated and only ever returns the
+    /// signed message to its caller, which is what then decides to publish.
+    ///
+    /// `current_epoch` is the chain's, by the caller's clock; see
+    /// [`Self::voluntary_exit_signing_root`] for why the domain needs it.
+    pub fn sign_voluntary_exit(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        exit: &VoluntaryExit,
+        current_epoch: Epoch,
+    ) -> Result<BlsSignature> {
+        let root = self.voluntary_exit_signing_root(exit, current_epoch);
+        self.sign_root(store, pubkey, root)
     }
 
     /// Sign the block whose root is `block_root`, proposed for `slot`, on
@@ -505,6 +618,153 @@ mod tests {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         (store, pubkey)
+    }
+
+    fn registration(pubkey: BlsPubkey) -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            gas_limit: 36_000_000,
+            timestamp: 1_700_000_000,
+            pubkey,
+        }
+    }
+
+    /// A context whose genesis validators root is not zero, so the builder
+    /// domain (which zeroes it) and a context-derived one cannot coincide.
+    fn context_with_validators_root() -> SigningContext {
+        SigningContext {
+            config: Config::mainnet(),
+            genesis_validators_root: Root::repeat_byte(0x42),
+        }
+    }
+
+    #[test]
+    fn a_registration_is_signed_under_the_builder_domain() {
+        use ethlambda_types::beacon::constants::DOMAIN_APPLICATION_BUILDER;
+
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .expect("signs");
+
+        let root = compute_signing_root(
+            registration.hash_tree_root(),
+            compute_builder_domain(Config::mainnet().genesis_fork_version),
+        );
+        assert!(verify(&pubkey, &signature, root));
+
+        // The same domain type under this chain's validators root is a
+        // different domain: a context-derived one would not verify.
+        let with_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_APPLICATION_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, with_root));
+    }
+
+    /// The registration domain is not gloas's envelope domain, whose type
+    /// constant is similar in name only: a signature under one must not verify
+    /// under the other.
+    #[test]
+    fn a_registration_does_not_verify_under_the_envelope_domain() {
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .expect("signs");
+
+        let envelope_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_BEACON_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext {
+                config,
+                genesis_validators_root: Root::repeat_byte(0x42),
+            },
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Whether a preference for `slot`, signed by the client, verifies under
+    /// fulu's and under gloas's version of `DOMAIN_PROPOSER_PREFERENCES`, in
+    /// that order. The domains are spelled out rather than asked of
+    /// [`SigningContext::domain`], so the test does not share the signer's
+    /// choice of epoch.
+    fn preference_verifies_under_fulu_and_gloas(slot: Slot) -> (bool, bool) {
+        let (store, pubkey) = store_with_key();
+        let (context, _) = gloas_scheduled_context();
+        let preferences = preferences_for(slot);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .expect("signs");
+
+        let verifies_under = |version| {
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), domain);
+            verify(&pubkey, &signature, root)
+        };
+        (
+            verifies_under(context.config.fulu_fork_version),
+            verifies_under(context.config.gloas_fork_version),
+        )
+    }
+
+    /// The first gloas epoch's preference is signed at gloas's version, the
+    /// proposal epoch's own, which is what beta.4's gossip rule and every
+    /// other client verify. Fulu's, the version beta.2's rule gave (the epoch
+    /// before the proposal's), is what Lighthouse refused as a bad signature.
+    #[test]
+    fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas, "the proposal epoch's version");
+        assert!(!under_fulu, "not the version of the epoch before it");
+    }
+
+    /// One epoch later beta.2's rule gives gloas's version too, so the two
+    /// rules agree from here on.
+    #[test]
+    fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot);
+
+        assert!(under_gloas);
+        assert!(!under_fulu);
     }
 
     #[test]
@@ -758,6 +1018,146 @@ mod tests {
             &signature,
             context.contribution_and_proof_signing_root(&message)
         ));
+    }
+
+    /// The root an exit signs to under `version`, for the tests below.
+    fn exit_root_under(context: &SigningContext, exit: &VoluntaryExit, version: [u8; 4]) -> Root {
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            version,
+            context.genesis_validators_root,
+        );
+        compute_signing_root(exit.hash_tree_root(), domain)
+    }
+
+    #[test]
+    fn a_voluntary_exit_verifies_under_its_own_root() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        let exit = VoluntaryExit {
+            epoch: context.config.deneb_fork_epoch + 10,
+            validator_index: 42,
+        };
+
+        let signature = context
+            .sign_voluntary_exit(&store, &pubkey, &exit, exit.epoch)
+            .expect("signs");
+        assert!(verify(
+            &pubkey,
+            &signature,
+            context.voluntary_exit_signing_root(&exit, exit.epoch)
+        ));
+    }
+
+    /// EIP-7044: from deneb on, an exit signs under the capella fork version
+    /// and not the version of the fork its epoch is in. A client that used
+    /// the schedule's version here would produce exits every deneb-or-later
+    /// node rejects, and the operator would learn that from the node's 400.
+    #[test]
+    fn an_exit_at_or_after_deneb_signs_under_the_capella_fork_version() {
+        let context = context();
+        let far_beyond_deneb = context.config.electra_fork_epoch + 1_000;
+        for epoch in [context.config.deneb_fork_epoch, far_beyond_deneb] {
+            let exit = VoluntaryExit {
+                epoch,
+                validator_index: 1,
+            };
+            let expected = exit_root_under(&context, &exit, context.config.capella_fork_version);
+            assert_eq!(context.voluntary_exit_signing_root(&exit, epoch), expected);
+            assert_ne!(
+                expected,
+                compute_signing_root(
+                    exit.hash_tree_root(),
+                    context.domain(DOMAIN_VOLUNTARY_EXIT, epoch)
+                ),
+                "the fixture must cross a fork the schedule's version differs at"
+            );
+        }
+    }
+
+    /// The rule is the processing state's, not the exit's epoch's: a chain
+    /// past deneb verifies every exit under the capella version, one naming
+    /// epoch 0 included. Signing that one under the genesis version, which is
+    /// what keying on `exit.epoch` did, produced an exit no node accepts.
+    #[test]
+    fn an_exit_naming_a_pre_deneb_epoch_signs_under_capella_on_a_chain_past_deneb() {
+        let context = context();
+        let config = &context.config;
+        let now = config.electra_fork_epoch + 1_000;
+        for epoch in [
+            0,
+            config.altair_fork_epoch,
+            config.capella_fork_epoch + 1,
+            config.deneb_fork_epoch - 1,
+        ] {
+            let exit = VoluntaryExit {
+                epoch,
+                validator_index: 1,
+            };
+            assert_eq!(
+                context.voluntary_exit_signing_root(&exit, now),
+                exit_root_under(&context, &exit, config.capella_fork_version),
+                "exit epoch {epoch}"
+            );
+        }
+        // A pre-signed exit for a deneb epoch, signed while the chain is still
+        // before deneb, is processed by a deneb state too.
+        let exit = VoluntaryExit {
+            epoch: config.deneb_fork_epoch,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&exit, config.altair_fork_epoch),
+            exit_root_under(&context, &exit, config.capella_fork_version)
+        );
+    }
+
+    /// Before deneb the ordinary rule held: the version of the fork at the
+    /// exit's epoch, for an exit processed in that fork.
+    #[test]
+    fn an_exit_before_deneb_signs_under_its_epochs_fork_version() {
+        let context = context();
+        let exit = VoluntaryExit {
+            epoch: context.config.altair_fork_epoch + 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&exit, exit.epoch),
+            compute_signing_root(
+                exit.hash_tree_root(),
+                context.domain(DOMAIN_VOLUNTARY_EXIT, exit.epoch)
+            )
+        );
+    }
+
+    /// A pre-deneb state verifies through `get_domain`, which knows two
+    /// versions: its own, and its previous one for any epoch before its fork.
+    /// One fork back that is the exit's own version; two forks back it is not,
+    /// and the chain's answer is the one to sign under.
+    #[test]
+    fn an_exit_before_deneb_signs_under_what_the_processing_state_verifies() {
+        let context = context();
+        let config = &context.config;
+        let in_bellatrix = config.bellatrix_fork_epoch + 5;
+
+        let one_fork_back = VoluntaryExit {
+            epoch: config.altair_fork_epoch + 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&one_fork_back, in_bellatrix),
+            exit_root_under(&context, &one_fork_back, config.altair_fork_version)
+        );
+
+        let two_forks_back = VoluntaryExit {
+            epoch: config.altair_fork_epoch - 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&two_forks_back, in_bellatrix),
+            exit_root_under(&context, &two_forks_back, config.altair_fork_version),
+            "a bellatrix state's previous version is altair's, not genesis's"
+        );
     }
 
     #[test]

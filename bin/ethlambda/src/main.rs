@@ -11,6 +11,7 @@ mod network;
 mod slashing_protection;
 mod validator;
 mod version;
+mod voluntary_exit;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
 // See https://github.com/shadow/shadow/issues/3763. Build the Shadow binary
@@ -109,6 +110,12 @@ fn main() -> eyre::Result<()> {
         Command::Validator(options) => {
             init_node_logging()?;
             validator::run(options)
+        }
+        // A one-shot command whose stdout may carry a pre-signed exit, so its
+        // logs go to stderr like keygen's.
+        Command::VoluntaryExit(options) => {
+            init_info_stderr_logging()?;
+            voluntary_exit::run(options)
         }
         // Offline file work: no runtime, and stdout left alone.
         Command::SlashingProtection(options) => {
@@ -453,6 +460,46 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(lean) => lean.is_aggregator,
         Network::Mainnet { .. } => false,
     });
+
+    // A malformed URL fails here, at startup, rather than at the first
+    // proposal; an unreachable builder only warns, since it may come up
+    // after this node does.
+    let builder = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet
+            .builder
+            .as_deref()
+            .map(|url| {
+                ethlambda_rpc::BuilderClient::with_redirects(
+                    url,
+                    std::time::Duration::from_millis(mainnet.builder_header_timeout),
+                    version::client_version(),
+                    mainnet.builder_follow_redirects,
+                )
+            })
+            .transpose()?,
+    };
+    let builder_fallback = match &network {
+        Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
+        Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
+            skips: mainnet.builder_fallback_skips,
+            skips_per_epoch: mainnet.builder_fallback_skips_per_epoch,
+            epochs_since_finalization: mainnet.builder_fallback_epochs_since_finalization,
+        },
+    };
+    // A one-off probe, for the log only: nothing waits on it or reads its
+    // answer, and every later call to the builder is tried on its own.
+    if let Some(builder) = builder.clone() {
+        tokio::spawn(async move {
+            let _ = builder
+                .status()
+                .await
+                .inspect(|()| info!("Builder is up"))
+                .inspect_err(|err| {
+                    warn!(%err, "Builder did not answer the startup status check; each call to it is still tried")
+                });
+        });
+    }
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
@@ -848,6 +895,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     events: rpc_events,
                     client_version: version::engine_client_version(),
                     identity: rpc_identity,
+                    builder,
+                    builder_fallback,
                 },
                 local_peer_id,
                 rpc_shutdown,

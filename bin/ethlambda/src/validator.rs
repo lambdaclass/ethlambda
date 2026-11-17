@@ -6,8 +6,10 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
-use ethlambda_validator::ValidatorConfig;
-use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
+use ethlambda_validator::proposer_settings::{
+    DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
+};
+use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -70,6 +72,24 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) suggested_fee_recipient: Option<String>,
 
+    /// The gas limit every validator targets, unless the keymanager API gives
+    /// it its own.
+    ///
+    /// Before gloas it goes into builder registrations (with
+    /// `--builder-proposals`). From gloas it goes into the proposer
+    /// preferences, published for every proposal, and the beacon node builds
+    /// this client's own payloads toward it too, so on a network whose gas
+    /// limit is not the default, set it or every proposal pulls the limit
+    /// toward 60M. Sepolia and Platåberget schedule 200000000: pass
+    /// `--gas-limit 200000000` there. The network config's
+    /// `GAS_LIMIT_SCHEDULE` is not read yet (#795).
+    #[arg(
+        long,
+        default_value_t = DEFAULT_GAS_LIMIT,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) gas_limit: u64,
+
     /// Serve the keymanager API: keystores, plus each validator's own fee
     /// recipient, graffiti and gas limit, which are held in memory only.
     ///
@@ -78,6 +98,51 @@ pub(crate) struct ValidatorOptions {
     /// beyond localhost must front it with TLS.
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
+
+    /// Propose builder blocks: register each validator with the beacon node's
+    /// builder and accept a blinded block when the builder's bid wins. Requires
+    /// a beacon node started with a builder (ethlambda: `--builder`). The
+    /// registrations and blinded blocks are fulu and earlier only. From gloas
+    /// the builder market works through proposer preferences, which are
+    /// published with or without this flag; there it only sets the boost
+    /// factor that weighs p2p bids in `produceBlockV4`. Without it the factor
+    /// is 0, the local payload unless it cannot be built: a node whose
+    /// execution client fails at the slot may still build on a p2p bid, and
+    /// that block is signed.
+    #[arg(long, default_value = "false")]
+    pub(crate) builder_proposals: bool,
+
+    /// How a builder's bid is weighed against the local payload: the local
+    /// payload wins iff `local >= factor * bid / 100`. 100 compares them as
+    /// they are; 0 prefers the local payload unless it cannot be built.
+    #[arg(
+        long,
+        default_value = "100",
+        requires = "builder_proposals",
+        conflicts_with = "prefer_builder_proposals"
+    )]
+    pub(crate) builder_boost_factor: u64,
+
+    /// Take the builder's block whenever there is a valid bid: this client
+    /// sends `builder_boost_factor = u64::MAX`. The beacon node still keeps
+    /// its local payload when its execution client sets
+    /// `shouldOverrideBuilder`.
+    #[arg(long, default_value = "false", requires = "builder_proposals")]
+    pub(crate) prefer_builder_proposals: bool,
+
+    /// The smallest builder bid, in gwei, a gloas block may be built on: the
+    /// beacon node takes no p2p bid whose value plus execution payment is
+    /// below it, however the boost factor weighs it.
+    ///
+    /// Sent as `produceBlockV4`'s `min_bid`, so gloas only. A bid floor
+    /// matters most with `--prefer-builder-proposals`, which otherwise takes
+    /// a 1-gwei bid over the local payload. `0` sets no floor.
+    ///
+    /// Taken with or without `--builder-proposals`: without it, a node whose
+    /// execution client fails at the slot may still build on a pooled bid,
+    /// and this is the floor that bid must clear.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) builder_min_bid: u64,
 
     /// Register every loaded key that has no slashing-protection record,
     /// instead of refusing to start.
@@ -134,6 +199,21 @@ impl ValidatorOptions {
         Ok(Some(H160(bytes)))
     }
 
+    /// The builder configuration these flags describe, or `None` when builder
+    /// proposals are off.
+    ///
+    /// `--prefer-builder-proposals` wins over the factor by construction:
+    /// clap refuses the two together, so at most one is ever set.
+    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
+        self.builder_proposals.then_some(BuilderProposals {
+            boost_factor: if self.prefer_builder_proposals {
+                u64::MAX
+            } else {
+                self.builder_boost_factor
+            },
+        })
+    }
+
     /// Reject a port clash before anything binds, the way the node's own
     /// options do.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
@@ -157,6 +237,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
+    let builder = options.builder();
     ethlambda_validator::run(ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
@@ -167,6 +248,9 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        gas_limit: options.gas_limit,
+        builder,
+        builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
     })
     .await
@@ -187,9 +271,137 @@ mod tests {
             metrics_port: 5064,
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
+            gas_limit: DEFAULT_GAS_LIMIT,
             enable_keymanager: false,
+            builder_proposals: false,
+            builder_boost_factor: 100,
+            prefer_builder_proposals: false,
+            builder_min_bid: 0,
             init_slashing_protection: false,
         }
+    }
+
+    /// Parse a command line the way the binary does, so `requires` and
+    /// `conflicts_with` are exercised rather than assumed.
+    fn parse(extra: &[&str]) -> Result<ValidatorOptions, clap::Error> {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            options: ValidatorOptions,
+        }
+        let base = [
+            "ethlambda",
+            "--beacon-nodes",
+            "http://localhost:5052",
+            "--validators-dir",
+            "/tmp/v",
+            "--secrets-dir",
+            "/tmp/s",
+        ];
+        Cli::try_parse_from(base.iter().chain(extra)).map(|cli| cli.options)
+    }
+
+    #[test]
+    fn the_gas_limit_defaults_to_60m_and_takes_any_positive_value() {
+        assert_eq!(parse(&[]).expect("parses").gas_limit, DEFAULT_GAS_LIMIT);
+        let options = parse(&["--gas-limit", "200000000"]).expect("parses");
+        assert_eq!(options.gas_limit, 200_000_000);
+        parse(&["--gas-limit", "0"]).expect_err("a zero gas limit is a mistake");
+    }
+
+    /// From gloas the gas limit is published whether or not builder proposals
+    /// are on, so it does not require them.
+    #[test]
+    fn the_gas_limit_does_not_need_builder_proposals() {
+        parse(&["--gas-limit", "30000000"]).expect("parses alone");
+    }
+
+    #[test]
+    fn builder_proposals_are_off_by_default() {
+        assert_eq!(parse(&[]).expect("parses").builder(), None);
+    }
+
+    #[test]
+    fn builder_proposals_default_to_a_factor_of_100() {
+        let options = parse(&["--builder-proposals"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals { boost_factor: 100 })
+        );
+    }
+
+    #[test]
+    fn an_explicit_factor_is_used() {
+        let options =
+            parse(&["--builder-proposals", "--builder-boost-factor", "250"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals { boost_factor: 250 })
+        );
+    }
+
+    #[test]
+    fn preferring_the_builder_sends_the_maximum_factor() {
+        let options =
+            parse(&["--builder-proposals", "--prefer-builder-proposals"]).expect("parses");
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals {
+                boost_factor: u64::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn the_factor_and_the_preference_need_builder_proposals() {
+        parse(&["--builder-boost-factor", "250"])
+            .expect_err("a factor with builder proposals off is a mistake");
+        parse(&["--prefer-builder-proposals"])
+            .expect_err("a preference with builder proposals off is a mistake");
+    }
+
+    /// The floor travels with either way of weighing bids, in gwei as given,
+    /// and without builder proposals too: a node whose local build fails may
+    /// still build on a pooled bid, which the floor then applies to.
+    #[test]
+    fn a_min_bid_is_taken_with_or_without_builder_proposals() {
+        let options =
+            parse(&["--builder-proposals", "--builder-min-bid", "1000000"]).expect("parses");
+        assert_eq!(options.builder_min_bid, 1_000_000);
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals { boost_factor: 100 })
+        );
+        let options = parse(&[
+            "--builder-proposals",
+            "--prefer-builder-proposals",
+            "--builder-min-bid",
+            "5",
+        ])
+        .expect("parses");
+        assert_eq!(options.builder_min_bid, 5);
+        assert_eq!(
+            options.builder(),
+            Some(BuilderProposals {
+                boost_factor: u64::MAX
+            })
+        );
+        let options = parse(&["--builder-min-bid", "1000000"]).expect("parses");
+        assert_eq!(options.builder_min_bid, 1_000_000);
+        assert_eq!(options.builder(), None);
+    }
+
+    #[test]
+    fn the_factor_and_the_preference_conflict() {
+        parse(&[
+            "--builder-proposals",
+            "--builder-boost-factor",
+            "250",
+            "--prefer-builder-proposals",
+        ])
+        .expect_err("the two say different things");
     }
 
     #[test]
