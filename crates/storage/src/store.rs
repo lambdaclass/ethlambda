@@ -254,12 +254,14 @@ impl Chain {
 /// snapshot read or a diff-chain reconstruction.
 const STATE_CACHE_CAPACITY: usize = 32;
 
-/// [`Store::network_head`]'s "no peer has reported" marker. No slot reaches it.
+/// The marker for an unset slot: [`Store::network_head`] with no peer
+/// reporting, and [`Store::head_slot_hint`] before the chain actor's first
+/// judgment. No slot reaches it.
 ///
 /// No report can be this slot: P2P drops a head more than a slot past the
 /// wall clock. `Relaxed` is enough on both sides, since the value is the
 /// whole message: nothing else is published with it.
-const NO_NETWORK_HEAD: u64 = u64::MAX;
+const UNSET_SLOT: u64 = u64::MAX;
 
 /// Keep block proofs for at least this many slots below the tip, even once
 /// finalized. Proofs older than this window are pruned only when the window
@@ -1205,12 +1207,12 @@ pub struct Store {
     /// See [`ObservedLiveness`]. Always empty on lean.
     observed_liveness: Arc<ObservedLiveness>,
     /// The highest head slot this node's peers report in `Status` that it has
-    /// not already imported, as P2P last published it, or [`NO_NETWORK_HEAD`]
+    /// not already imported, as P2P last published it, or [`UNSET_SLOT`]
     /// while no connected peer reports one. Written by P2P, read by the chain
     /// actor's sync tracker; see [`Store::network_head`].
     network_head: Arc<AtomicU64>,
     /// The head slot as the chain actor last judged the sync gate at, or
-    /// [`NO_NETWORK_HEAD`] before its first judgment. Written by the chain
+    /// [`UNSET_SLOT`] before its first judgment. Written by the chain
     /// actor, read by P2P; see [`Store::head_slot_hint`].
     head_slot_hint: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
@@ -1863,8 +1865,8 @@ impl Store {
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
-            network_head: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
-            head_slot_hint: Arc::new(AtomicU64::new(NO_NETWORK_HEAD)),
+            network_head: Arc::new(AtomicU64::new(UNSET_SLOT)),
+            head_slot_hint: Arc::new(AtomicU64::new(UNSET_SLOT)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -3325,14 +3327,14 @@ impl Store {
     /// Runtime-only and shared by every clone of this `Store`.
     pub fn network_head(&self) -> Option<u64> {
         let slot = self.network_head.load(Ordering::Relaxed);
-        (slot != NO_NETWORK_HEAD).then_some(slot)
+        (slot != UNSET_SLOT).then_some(slot)
     }
 
     /// Publish the peers' head; see [`Self::network_head`]. P2P is the only
     /// writer.
     pub fn set_network_head(&self, slot: Option<u64>) {
         // A slot at the sentinel would read back as no report: clamp it.
-        let slot = slot.map_or(NO_NETWORK_HEAD, |slot| slot.min(NO_NETWORK_HEAD - 1));
+        let slot = slot.map_or(UNSET_SLOT, |slot| slot.min(UNSET_SLOT - 1));
         self.network_head.store(slot, Ordering::Relaxed);
     }
 
@@ -3345,14 +3347,14 @@ impl Store {
     /// interval. Runtime-only and shared by every clone of this `Store`.
     pub fn head_slot_hint(&self) -> Option<u64> {
         let slot = self.head_slot_hint.load(Ordering::Relaxed);
-        (slot != NO_NETWORK_HEAD).then_some(slot)
+        (slot != UNSET_SLOT).then_some(slot)
     }
 
     /// Publish the head slot; see [`Self::head_slot_hint`]. The chain actor
     /// is the only writer.
     pub fn set_head_slot_hint(&self, slot: u64) {
         self.head_slot_hint
-            .store(slot.min(NO_NETWORK_HEAD - 1), Ordering::Relaxed);
+            .store(slot.min(UNSET_SLOT - 1), Ordering::Relaxed);
     }
 
     /// The total-active-balance cache shared by every clone of this store.

@@ -27,7 +27,7 @@ pub mod muxers {
 }
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     fmt, io,
     net::{IpAddr, SocketAddr},
     num::{NonZeroU8, NonZeroUsize},
@@ -495,7 +495,7 @@ pub(crate) struct HeadWatch {
     /// The peers that handed blocks over, each with the last slot of every
     /// batch the head has not reached yet (the most recent
     /// [`Self::MAX_TRACKED_BATCHES`]).
-    deliverers: HashMap<PeerId, Vec<u64>>,
+    deliverers: HashMap<PeerId, VecDeque<u64>>,
     /// Watermark drops at the current head, each of which doubles the wait
     /// before the next one.
     drops: u32,
@@ -569,9 +569,9 @@ impl HeadWatch {
     /// Note that `peer` handed over a batch ending at slot `through`.
     pub(crate) fn note_delivery(&mut self, peer: PeerId, through: u64) {
         let ends = self.deliverers.entry(peer).or_default();
-        ends.push(through);
+        ends.push_back(through);
         if ends.len() > Self::MAX_TRACKED_BATCHES {
-            ends.remove(0);
+            ends.pop_front();
         }
     }
 
@@ -1529,9 +1529,9 @@ pub struct P2PServer {
     /// `range_sync_target`. Dropped back to the head when the blocks above
     /// the head never import; see [`Self::expire_range_watermark`].
     pub(crate) range_fetched_through: u64,
-    /// This node's beacon `Status` (v2) and the wall-clock slot it was built
-    /// at; see [`Self::beacon_status_v2`].
-    pub(crate) beacon_status: Option<(u64, beacon::messages::StatusV2)>,
+    /// This node's beacon `Status` (v2), with the wall-clock slot and the head
+    /// slot hint it was built at; see [`Self::beacon_status_v2`].
+    pub(crate) beacon_status: Option<(u64, Option<u64>, beacon::messages::StatusV2)>,
     /// How long the store's head has stayed put, for
     /// [`Self::expire_range_watermark`].
     pub(crate) head_watch: HeadWatch,
@@ -2169,24 +2169,26 @@ impl P2PServer {
             })
     }
 
-    /// This node's beacon `Status` in v2, built at most once a wall-clock
-    /// slot and shared by every inbound request and the refresh: building one
-    /// decodes the head block, and requests are not rate limited on the wire.
-    /// A head imported within the slot shows from the next one. `None` on a
-    /// lean node.
+    /// This node's beacon `Status` in v2, shared by every inbound request and
+    /// the refresh: building one decodes the head block, and requests are not
+    /// rate limited on the wire. Rebuilt on a new slot, a new head (as the
+    /// chain actor publishes it, so at most one judgment stale) or a new fork
+    /// digest. `None` on a lean node.
     pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
         let wire = self.wire.beacon()?;
         let slot = wall_clock_slot(&self.store);
-        // Rebuilt on a new slot, and on a fork-digest switch within one: a
-        // peer that switched would take the old digest for another network.
-        if let Some((built_at, status)) = &self.beacon_status
+        let head = self.store.head_slot_hint();
+        // A fork-digest switch within the slot counts too: a peer that
+        // switched would take the old digest for another network.
+        if let Some((built_at, built_on, status)) = &self.beacon_status
             && *built_at == slot
+            && *built_on == head
             && status.fork_digest == wire.fork_digest
         {
             return Some(status.clone());
         }
         let status = beacon::handler::build_status_v2(&self.store, wire);
-        self.beacon_status = Some((slot, status.clone()));
+        self.beacon_status = Some((slot, head, status.clone()));
         Some(status)
     }
 
@@ -2235,7 +2237,8 @@ impl P2PServer {
         }
         // Peers whose blocks the head has reached served what they handed
         // over: that, not an answer merely reaching the chain actor, ends
-        // their run of range failures.
+        // their run of range failures. Before `flat_for`, whose own clean-up
+        // on a head move would drop those batches without the credit.
         for peer in self.head_watch.reached(head_slot) {
             self.peer_heads.note_range_success(&peer);
         }

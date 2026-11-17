@@ -31,13 +31,13 @@ use std::collections::{HashMap, HashSet};
 
 use ethlambda_network_api::sync::SyncThresholds;
 use ethlambda_storage::{Chain, Store};
+use ethlambda_types::beacon::primitives::ForkDigest;
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::P2PServer;
 use crate::beacon::handler::StatusVersion;
-use ethlambda_types::beacon::primitives::ForkDigest;
 
 /// Slots a `Status` head may sit past the wall clock and still count: Lighthouse's
 /// `FUTURE_SLOT_TOLERANCE` and Prysm's `maxFutureStatusHeadSlot`.
@@ -320,14 +320,16 @@ impl PeerHeads {
         interval: u64,
     ) -> Vec<PeerId> {
         let interval = interval.max(1);
+        // The share is of the peers that can be asked: counting muted ones
+        // (or ones awaiting an answer) would inflate it for the rest.
         let mut connected_count = 0usize;
         let mut due = Vec::new();
         for peer in connected {
-            connected_count += 1;
             let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
             if self.awaiting_answer.contains(&peer) || self.muted.contains(&peer) {
                 continue;
             }
+            connected_count += 1;
             if last.saturating_add(interval) <= wall_slot {
                 due.push((last, peer));
             }
@@ -410,6 +412,12 @@ impl PeerHeads {
         self.awaiting_answer.insert(peer);
     }
 
+    /// Whether a `Status` request to `peer` is outstanding.
+    #[cfg(test)]
+    pub(crate) fn is_awaiting_answer(&self, peer: &PeerId) -> bool {
+        self.awaiting_answer.contains(peer)
+    }
+
     /// Note that `peer`'s outstanding `Status` request is over, answered or
     /// failed, so it may be refreshed again.
     pub(crate) fn end_status_request(&mut self, peer: &PeerId) {
@@ -460,7 +468,13 @@ impl PeerHeads {
 /// held, which is harmless: a head that old leads this node by nothing. A pending or held block has no post-state, so it
 /// does not count, the same as a block the node has never seen.
 fn holds_block(store: &Store, root: &H256) -> bool {
-    store.head().is_ok_and(|head| head == *root) || store.has_state(root).unwrap_or(false)
+    store.head().is_ok_and(|head| head == *root)
+        || store
+            .has_state(root)
+            .inspect_err(
+                |err| warn!(%err, "State lookup failed; counting the peer's head as a lead"),
+            )
+            .unwrap_or(false)
 }
 
 /// Record the head `peer` reported in a `Status` (request or answer) and
@@ -790,6 +804,20 @@ mod tests {
         heads.forget(&peer);
         heads.due_for_refresh([peer], 30, 4);
         assert_eq!(heads.due_for_refresh([peer], 40, 4), vec![peer]);
+    }
+
+    #[test]
+    fn the_share_counts_only_peers_that_can_be_asked() {
+        // Finding: muted peers and peers awaiting an answer counted towards
+        // the share, inflating it for the rest.
+        let mut heads = PeerHeads::default();
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        heads.due_for_refresh(peers.iter().copied(), 10, 2);
+        heads.mute(peers[0]);
+        heads.mute(peers[1]);
+        // Two can be asked, so one a slot over an interval of two.
+        let asked = heads.due_for_refresh(peers.iter().copied(), 20, 2);
+        assert_eq!(asked.len(), 1);
     }
 
     #[test]

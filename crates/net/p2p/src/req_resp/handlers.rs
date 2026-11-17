@@ -1880,7 +1880,9 @@ async fn handle_status_request(
     // Answered first, so recording the peer's head (store lookups, possibly a
     // range batch) never holds up the answer. Built once a slot (see
     // `P2PServer::beacon_status_v2`), however many requests arrive in it.
-    let our_status_v2 = server.beacon_status_v2().expect("checked above");
+    let Some(our_status_v2) = server.beacon_status_v2() else {
+        return;
+    };
     let our_status =
         beacon_handler::status_in_version(&our_status_v2, StatusVersion::of(&peer_status));
     respond(server, channel, ResponsePayload::Status(our_status));
@@ -3680,7 +3682,7 @@ pub(crate) mod tests {
         let interval = SyncThresholds::LEAN.status_refresh_slots;
         let wall = crate::wall_clock_slot(&server.store);
         // Five, so that asking nobody (five still due, three returned) and
-        // asking the share (two still due) cannot look alike.
+        // asking the share (three awaiting an answer) cannot look alike.
         let peers: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
         for &peer in &peers {
             server
@@ -3694,13 +3696,13 @@ pub(crate) mod tests {
 
         server.refresh_due_peer_statuses_at(wall).await;
 
-        // This slot's share was asked and counts as just exchanged; the rest
-        // are still due.
+        // This slot's share was asked, and awaits its answers.
         let share = peers.len().div_ceil(interval as usize);
-        let still_due = server
-            .peer_heads
-            .due_for_refresh(peers.iter().copied(), wall, interval);
-        assert_eq!(still_due.len(), peers.len() - share);
+        let asked = peers
+            .iter()
+            .filter(|peer| server.peer_heads.is_awaiting_answer(peer))
+            .count();
+        assert_eq!(asked, share);
     }
 
     #[test]
