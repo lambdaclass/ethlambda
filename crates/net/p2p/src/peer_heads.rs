@@ -97,11 +97,14 @@ pub(crate) struct PeerHeads {
     heads: HashMap<PeerId, Claim>,
     /// Peers that have answered a `Status` of ours on this connection. The
     /// first answer is the handshake's, and every later one is a refresh's,
-    /// which needs a larger lead to start a range sync. Counted by answer
-    /// rather than marked per request, since a slow handshake answer can
-    /// arrive after the first refresh has gone out, and a mark per peer would
-    /// then swap the two.
+    /// which needs a larger lead to start a range sync. No refresh goes out
+    /// while the handshake is (see [`Self::awaiting_handshake`]), so the
+    /// answers cannot arrive out of order.
     answered: HashSet<PeerId>,
+    /// Peers whose handshake `Status` is still out: neither answered nor
+    /// failed. They are not refreshed meanwhile, or a refresh answered before
+    /// a slow handshake answer would be taken for the handshake's.
+    awaiting_handshake: HashSet<PeerId>,
     /// Each peer's failed range requests (an empty or refused answer, a
     /// timeout) since its last successful one. A peer that has just failed is
     /// cooling down (see [`Self::range_cooling_down`]): it is not synced
@@ -171,6 +174,7 @@ impl PeerHeads {
     pub(crate) fn forget(&mut self, peer: &PeerId) {
         self.heads.remove(peer);
         self.answered.remove(peer);
+        self.awaiting_handshake.remove(peer);
         self.range_failures.remove(peer);
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
@@ -215,6 +219,9 @@ impl PeerHeads {
         for peer in connected {
             connected_count += 1;
             let last = *self.last_exchange.entry(peer).or_insert(wall_slot);
+            if self.awaiting_handshake.contains(&peer) {
+                continue;
+            }
             if last.saturating_add(interval) <= wall_slot {
                 due.push((last, peer));
             }
@@ -258,6 +265,17 @@ impl PeerHeads {
             let cooldown = interval.saturating_mul(1 << doublings);
             failures.last.saturating_add(cooldown) > wall_slot
         })
+    }
+
+    /// Note that the handshake `Status` to `peer` has gone out.
+    pub(crate) fn begin_handshake(&mut self, peer: PeerId) {
+        self.awaiting_handshake.insert(peer);
+    }
+
+    /// Note that `peer`'s handshake is over, answered or failed, so it may be
+    /// refreshed again.
+    pub(crate) fn end_handshake(&mut self, peer: &PeerId) {
+        self.awaiting_handshake.remove(peer);
     }
 
     /// Note an answer from `peer` to a `Status` of ours, returning whether it
@@ -538,6 +556,19 @@ mod tests {
             asked.extend(batch);
         }
         assert_eq!(asked.len(), peers.len());
+    }
+
+    #[test]
+    fn a_peer_is_not_refreshed_while_its_handshake_is_out() {
+        // Finding: a refresh answered before a slow handshake answer was
+        // taken for the handshake's, and could start a one-block range sync.
+        let mut heads = PeerHeads::default();
+        let peer = PeerId::random();
+        heads.begin_handshake(peer);
+        heads.due_for_refresh([peer], 10, 4);
+        assert!(heads.due_for_refresh([peer], 20, 4).is_empty());
+        heads.end_handshake(&peer);
+        assert_eq!(heads.due_for_refresh([peer], 20, 4), vec![peer]);
     }
 
     #[test]

@@ -528,7 +528,17 @@ pub async fn handle_req_resp_message(
                             request_response::OutboundFailure::UnsupportedProtocols
                         )
                     {
+                        // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
+                    } else if matches!(
+                        request_id.protocol,
+                        ReqRespProtocol::LeanStatus
+                            | ReqRespProtocol::BeaconStatusV1
+                            | ReqRespProtocol::BeaconStatusV2
+                    ) {
+                        // A handshake that failed is over: the refresh takes
+                        // its place. A failed refresh changes nothing here.
+                        server.peer_heads.end_handshake(&peer);
                     }
                 }
             }
@@ -707,8 +717,11 @@ async fn handle_lean_status_response(server: &mut P2PServer, status: Status, pee
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
     // Checked first, so an answer delivered after the disconnect does not
     // count against the next connection's handshake.
-    let refresh =
-        server.connected_peers.contains_key(&peer) && server.peer_heads.answer_is_refresh(peer);
+    let connected = server.connected_peers.contains_key(&peer);
+    if connected {
+        server.peer_heads.end_handshake(&peer);
+    }
+    let refresh = connected && server.peer_heads.answer_is_refresh(peer);
     let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
     on_lean_status(server, peer, &status, refresh_lead).await;
 }
@@ -2004,6 +2017,9 @@ async fn handle_status_response(
     if !server.connected_peers.contains_key(&peer) {
         return;
     }
+    // Any answer ends the handshake, from whatever digest: the peer may be
+    // refreshed from now on.
+    server.peer_heads.end_handshake(&peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };

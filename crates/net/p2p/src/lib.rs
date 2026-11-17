@@ -2206,6 +2206,9 @@ async fn handle_swarm_event(
             metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id, direction);
+                // Both chains send the handshake below; no refresh until it
+                // is answered or fails.
+                server.peer_heads.begin_handshake(peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
