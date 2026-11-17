@@ -1,5 +1,6 @@
 //! Producing the signatures a validator owes: attestations, the RANDAO reveal
-//! a block carries, the block itself, and the two an aggregator needs.
+//! a block carries, the block itself, the two an aggregator needs, and the one
+//! an operator asks for when a validator leaves: the voluntary exit.
 //!
 //! The signing root always comes from the SSZ container, never from the JSON a
 //! beacon node sent: the wire representation is a transport detail, and the
@@ -10,6 +11,7 @@ use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
     DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
@@ -17,7 +19,8 @@ use ethlambda_types::beacon::containers::altair::{
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, VoluntaryExit};
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
     Root, Slot,
@@ -192,6 +195,46 @@ impl SigningContext {
         compute_signing_root(message.hash_tree_root(), domain)
     }
 
+    /// The root a voluntary exit's signature is computed over.
+    ///
+    /// Every other signature here follows the fork at its message's own epoch.
+    /// An exit follows the fork of the state that *processes* it, because that
+    /// is the state a node verifies it against, and the two part ways as soon
+    /// as an exit names an epoch from an earlier fork:
+    ///
+    /// - A deneb-or-later state verifies under `CAPELLA_FORK_VERSION` whatever
+    ///   epoch the exit names (EIP-7044), so an exit signed now stays valid
+    ///   across every fork to come. The point was pre-signed exits, which a
+    ///   staking service hands its customer so they can leave without the
+    ///   service's cooperation; a domain that moved with the schedule made
+    ///   those expire at each fork.
+    /// - An earlier state verifies under `get_domain(state,
+    ///   DOMAIN_VOLUNTARY_EXIT, exit.epoch)`: its previous fork version for an
+    ///   exit naming an epoch before its own fork, its current one otherwise.
+    ///
+    /// No state can process the exit before `max(current_epoch, exit.epoch)`:
+    /// the chain is already at the one, and an exit is refused before the
+    /// other. So the fork at that epoch is the one to sign for. Keying on
+    /// `exit.epoch` alone, as Lighthouse does, signs an exit naming a
+    /// pre-deneb epoch under that epoch's version, which no node on a chain
+    /// past deneb accepts.
+    pub fn voluntary_exit_signing_root(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> Root {
+        let fork = self.config.fork_at_epoch(current_epoch.max(exit.epoch));
+        let fork_version = if fork >= ForkName::Deneb {
+            self.config.capella_fork_version
+        } else if exit.epoch < self.config.fork_epoch(fork) {
+            self.config.fork_version(fork.previous().unwrap_or(fork))
+        } else {
+            self.config.fork_version(fork)
+        };
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            fork_version,
+            self.genesis_validators_root,
+        );
+        compute_signing_root(exit.hash_tree_root(), domain)
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
@@ -359,6 +402,28 @@ impl SigningContext {
             pubkey,
             self.contribution_and_proof_signing_root(message),
         )
+    }
+
+    /// Sign a voluntary exit on behalf of `pubkey`.
+    ///
+    /// Not slashable, and not guarded, but the one signature here that is
+    /// **irreversible**: once the chain processes it the validator is on its
+    /// way out, and nothing it signs afterwards brings it back. The guard is
+    /// the caller's: the command line asks for a confirmation phrase, and the
+    /// keymanager route is bearer-authenticated and only ever returns the
+    /// signed message to its caller, which is what then decides to publish.
+    ///
+    /// `current_epoch` is the chain's, by the caller's clock; see
+    /// [`Self::voluntary_exit_signing_root`] for why the domain needs it.
+    pub fn sign_voluntary_exit(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        exit: &VoluntaryExit,
+        current_epoch: Epoch,
+    ) -> Result<BlsSignature> {
+        let root = self.voluntary_exit_signing_root(exit, current_epoch);
+        self.sign_root(store, pubkey, root)
     }
 
     /// Sign the block whose root is `block_root`, proposed for `slot`, on
@@ -758,6 +823,146 @@ mod tests {
             &signature,
             context.contribution_and_proof_signing_root(&message)
         ));
+    }
+
+    /// The root an exit signs to under `version`, for the tests below.
+    fn exit_root_under(context: &SigningContext, exit: &VoluntaryExit, version: [u8; 4]) -> Root {
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            version,
+            context.genesis_validators_root,
+        );
+        compute_signing_root(exit.hash_tree_root(), domain)
+    }
+
+    #[test]
+    fn a_voluntary_exit_verifies_under_its_own_root() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        let exit = VoluntaryExit {
+            epoch: context.config.deneb_fork_epoch + 10,
+            validator_index: 42,
+        };
+
+        let signature = context
+            .sign_voluntary_exit(&store, &pubkey, &exit, exit.epoch)
+            .expect("signs");
+        assert!(verify(
+            &pubkey,
+            &signature,
+            context.voluntary_exit_signing_root(&exit, exit.epoch)
+        ));
+    }
+
+    /// EIP-7044: from deneb on, an exit signs under the capella fork version
+    /// and not the version of the fork its epoch is in. A client that used
+    /// the schedule's version here would produce exits every deneb-or-later
+    /// node rejects, and the operator would learn that from the node's 400.
+    #[test]
+    fn an_exit_at_or_after_deneb_signs_under_the_capella_fork_version() {
+        let context = context();
+        let far_beyond_deneb = context.config.electra_fork_epoch + 1_000;
+        for epoch in [context.config.deneb_fork_epoch, far_beyond_deneb] {
+            let exit = VoluntaryExit {
+                epoch,
+                validator_index: 1,
+            };
+            let expected = exit_root_under(&context, &exit, context.config.capella_fork_version);
+            assert_eq!(context.voluntary_exit_signing_root(&exit, epoch), expected);
+            assert_ne!(
+                expected,
+                compute_signing_root(
+                    exit.hash_tree_root(),
+                    context.domain(DOMAIN_VOLUNTARY_EXIT, epoch)
+                ),
+                "the fixture must cross a fork the schedule's version differs at"
+            );
+        }
+    }
+
+    /// The rule is the processing state's, not the exit's epoch's: a chain
+    /// past deneb verifies every exit under the capella version, one naming
+    /// epoch 0 included. Signing that one under the genesis version, which is
+    /// what keying on `exit.epoch` did, produced an exit no node accepts.
+    #[test]
+    fn an_exit_naming_a_pre_deneb_epoch_signs_under_capella_on_a_chain_past_deneb() {
+        let context = context();
+        let config = &context.config;
+        let now = config.electra_fork_epoch + 1_000;
+        for epoch in [
+            0,
+            config.altair_fork_epoch,
+            config.capella_fork_epoch + 1,
+            config.deneb_fork_epoch - 1,
+        ] {
+            let exit = VoluntaryExit {
+                epoch,
+                validator_index: 1,
+            };
+            assert_eq!(
+                context.voluntary_exit_signing_root(&exit, now),
+                exit_root_under(&context, &exit, config.capella_fork_version),
+                "exit epoch {epoch}"
+            );
+        }
+        // A pre-signed exit for a deneb epoch, signed while the chain is still
+        // before deneb, is processed by a deneb state too.
+        let exit = VoluntaryExit {
+            epoch: config.deneb_fork_epoch,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&exit, config.altair_fork_epoch),
+            exit_root_under(&context, &exit, config.capella_fork_version)
+        );
+    }
+
+    /// Before deneb the ordinary rule held: the version of the fork at the
+    /// exit's epoch, for an exit processed in that fork.
+    #[test]
+    fn an_exit_before_deneb_signs_under_its_epochs_fork_version() {
+        let context = context();
+        let exit = VoluntaryExit {
+            epoch: context.config.altair_fork_epoch + 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&exit, exit.epoch),
+            compute_signing_root(
+                exit.hash_tree_root(),
+                context.domain(DOMAIN_VOLUNTARY_EXIT, exit.epoch)
+            )
+        );
+    }
+
+    /// A pre-deneb state verifies through `get_domain`, which knows two
+    /// versions: its own, and its previous one for any epoch before its fork.
+    /// One fork back that is the exit's own version; two forks back it is not,
+    /// and the chain's answer is the one to sign under.
+    #[test]
+    fn an_exit_before_deneb_signs_under_what_the_processing_state_verifies() {
+        let context = context();
+        let config = &context.config;
+        let in_bellatrix = config.bellatrix_fork_epoch + 5;
+
+        let one_fork_back = VoluntaryExit {
+            epoch: config.altair_fork_epoch + 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&one_fork_back, in_bellatrix),
+            exit_root_under(&context, &one_fork_back, config.altair_fork_version)
+        );
+
+        let two_forks_back = VoluntaryExit {
+            epoch: config.altair_fork_epoch - 1,
+            validator_index: 1,
+        };
+        assert_eq!(
+            context.voluntary_exit_signing_root(&two_forks_back, in_bellatrix),
+            exit_root_under(&context, &two_forks_back, config.altair_fork_version),
+            "a bellatrix state's previous version is altair's, not genesis's"
+        );
     }
 
     #[test]
