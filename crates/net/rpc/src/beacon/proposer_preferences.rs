@@ -65,8 +65,10 @@ async fn post_proposer_preferences(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // A validator client submits during the epoch before gloas, when the
-    // consensus version it names is still fulu.
+    // Every validator client names gloas, even during the epoch before it:
+    // Prysm hardcodes it, the others (this one's too) take the fork of the
+    // preference's slot. Fulu is still accepted, as leniency towards a client
+    // that names the fork of its wall clock instead.
     if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas]) {
         return err.into_response();
     }
@@ -97,6 +99,14 @@ async fn post_proposer_preferences(
     response
 }
 
+/// Whether `market` holds `signed` itself for its slot and dependent root,
+/// rather than another message: an identical entry is a success.
+fn holds(market: &SharedBuilderMarket, signed: &SignedProposerPreferences) -> bool {
+    let message = &signed.message;
+    let held = market.preferences(message.proposal_slot, message.dependent_root);
+    held.as_ref() == Some(signed)
+}
+
 /// Validate, record and publish each entry, in order.
 fn submit(
     store: &Store,
@@ -110,13 +120,24 @@ fn submit(
     for (index, signed) in preferences.into_iter().enumerate() {
         let slot = signed.message.proposal_slot;
         let validator = signed.message.validator_index;
-        let held = market.preferences(slot, signed.message.dependent_root);
-        if held.as_ref() == Some(&signed) {
+        // An entry identical to the one held is a success, checked before
+        // `validate` so no rule of it (a started slot, say) can refuse a
+        // resubmission, and at no signature check's cost. Asked again after a
+        // refusal and after `record_preferences` too: gossip can record the
+        // same message (relayed by another node this client posted it to)
+        // while this copy is being validated.
+        if holds(market, &signed) {
             debug!(%slot, validator, "Proposer preferences already cached; not republishing");
             continue;
         }
         let verdict = validate(market, store, &signed, now_ms);
         if verdict != Outcome::Accept {
+            // Gossip may have recorded this very message since the check
+            // above, and `validate` then calls it already seen.
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             let (outcome, reason) = verdict.labels();
             warn!(%slot, validator, outcome, reason, "Refused submitted proposer preferences");
             failures.push(Failure {
@@ -126,6 +147,10 @@ fn submit(
             continue;
         }
         if !market.record_preferences(signed.clone(), wall_slot) {
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             failures.push(Failure {
                 index,
                 message: describe(&Outcome::Ignore(IgnoreReason::AlreadySeen)),
