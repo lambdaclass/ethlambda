@@ -567,10 +567,13 @@ naming both keystore paths and a `url` is refused at startup rather than read
 as either. So is a `web3signer` entry carrying a field this client does not
 implement, such as Lighthouse's `root_certificate_path`: skipping it would sign
 through a connection the operator did not describe. `description` is the one
-exception, since Lighthouse writes it on every entry. A local entry is read
-past such fields, so a file Lighthouse wrote for local keystores loads as it
-is; the fields are not kept when the file is next rewritten. The `url` must not
-carry credentials, a query string or a fragment.
+exception, since Lighthouse writes it on every entry, and
+`suggested_fee_recipient`, `graffiti` and `gas_limit` are not such fields: they
+are read on either kind of entry (see the proposer settings below). A local
+entry is read past the fields this client does not have, so a file Lighthouse
+wrote for local keystores loads as it is; those fields are not kept when the
+file is next rewritten. The `url` must not carry credentials, a query string
+or a fragment.
 
 The signer is reached over HTTP or HTTPS. HTTPS is verified against the Mozilla
 root store bundled into the binary (`webpki-roots`), **not** the operating
@@ -633,9 +636,32 @@ give one validator its own value in place of the command line's default:
 | `graffiti` | `--graffiti` | The next proposal |
 | `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
-**These are held in memory only.** A restart puts every validator back on the
-defaults, so an operator driving these endpoints must set them again after one.
-Deleting a keystore drops its values too.
+**These persist.** Each is written onto the validator's entry in
+`validator_definitions.yml` (`suggested_fee_recipient`, `graffiti`, `gas_limit`,
+Lighthouse's layout, so a file Lighthouse wrote loads here with the three in
+effect) before the request is answered, and loaded again at startup, so a
+restart runs with what the operator set. They are the validator's settings
+whichever way its key signs, so a key in a remote signer takes them too, on its
+`web3signer` entry. The file does not go back to Lighthouse unchanged: a save
+here keeps only the fields this client reads, so an entry's `description` and
+`builder_*` settings are dropped the first time this client rewrites the file,
+which every one of these requests does.
+
+A write that fails is a `500` that changes nothing. One `500` is different and
+says so: the file was replaced but its directory could not be flushed, so the
+change is in effect, here and at the next start, and only its survival of a
+power loss is in doubt; repeating the request flushes it. A request made while
+a keystore import is running is answered once the import is done, since both
+write the same file. Where the file names one key twice, the change goes to
+the enabled entry, the one a restart reads.
+
+The fields may also be put in the file by hand before the client starts; a
+malformed one refuses startup, before any keystore is decrypted. Deleting a
+keystore drops its entry and its
+values with it. Importing a key whose entry is already in the file, a
+re-import or one that enables a disabled entry, keeps the entry's values and
+runs with them at once; if one of them is malformed the import is refused and
+nothing is written.
 
 A few answers worth knowing: `GET feerecipient` is a `500` when the validator
 has no address and there is no `--suggested-fee-recipient` default, as
