@@ -30,6 +30,8 @@ const EXPLICIT: &[&str] = &[
     BENCHMARK,
     REPLAY_ERA,
     VALIDATOR,
+    VOLUNTARY_EXIT,
+    SLASHING_PROTECTION,
     KEYGEN,
     "help",
     "-h",
@@ -43,6 +45,8 @@ const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
 const REPLAY_ERA: &str = "replay-era";
 const VALIDATOR: &str = "validator";
+const VOLUNTARY_EXIT: &str = "voluntary-exit";
+const SLASHING_PROTECTION: &str = "slashing-protection";
 const KEYGEN: &str = "keygen";
 
 #[derive(Debug, clap::Parser)]
@@ -84,6 +88,14 @@ pub(crate) enum Command {
     ReplayEra(ReplayEraOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
     Validator(crate::validator::ValidatorOptions),
+    /// Sign a voluntary exit for one validator and publish it to a beacon node.
+    ///
+    /// Irreversible once the chain processes it. Asks for a confirmation phrase
+    /// before publishing unless --no-confirmation is given.
+    VoluntaryExit(crate::voluntary_exit::VoluntaryExitOptions),
+    /// Import or export the validator client's EIP-3076 slashing-protection
+    /// history, offline.
+    SlashingProtection(crate::slashing_protection::SlashingProtectionOptions),
     /// Generate validator XMSS keys for a genesis.
     Keygen(KeygenOptions),
 }
@@ -200,6 +212,36 @@ mod tests {
         };
         assert_eq!(options.beacon_nodes, vec!["http://localhost:5052"]);
         assert_eq!(options.validators_dir, PathBuf::from("/tmp/validators"));
+    }
+
+    /// `voluntary-exit` is a command of its own, so it takes only its own
+    /// flags and the validator client's required ones are not asked of it.
+    #[test]
+    fn voluntary_exit_parses_as_its_own_sub_command() {
+        let args = [
+            "ethlambda",
+            VOLUNTARY_EXIT,
+            "--keystore",
+            "/tmp/keystore.json",
+            "--password-file",
+            "/tmp/password",
+            "--beacon-node",
+            "http://localhost:5052",
+            "--presign",
+            "--epoch",
+            "123",
+        ];
+        let command = try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        let Command::VoluntaryExit(exit) = command else {
+            panic!("expected a voluntary-exit invocation, got {command:?}");
+        };
+        assert_eq!(exit.keystore, PathBuf::from("/tmp/keystore.json"));
+        assert_eq!(exit.password_file, PathBuf::from("/tmp/password"));
+        assert_eq!(exit.beacon_node, "http://localhost:5052");
+        assert_eq!(exit.epoch, Some(123));
+        assert!(exit.presign);
+        assert!(!exit.no_confirmation);
+        assert!(!exit.no_wait);
     }
 
     /// The historical flat form must keep working, unchanged.
@@ -415,13 +457,45 @@ mod tests {
     /// `ethlambda node keygen ...`, which fails on a stray positional.
     #[test]
     fn sub_command_tokens_do_not_get_the_default_inserted() {
-        for token in [NODE, BEACON, BENCHMARK, VALIDATOR, KEYGEN] {
+        for token in [
+            NODE,
+            BEACON,
+            BENCHMARK,
+            VALIDATOR,
+            VOLUNTARY_EXIT,
+            SLASHING_PROTECTION,
+            KEYGEN,
+        ] {
             let args = [OsString::from("ethlambda"), OsString::from(token)];
             assert_eq!(
                 default_subcommand(&args),
                 None,
                 "`{token}` must be recognised as a sub-command"
             );
+        }
+    }
+
+    #[test]
+    fn slashing_protection_parses_as_its_own_sub_command() {
+        let args = [
+            "ethlambda",
+            SLASHING_PROTECTION,
+            "export",
+            "--validators-dir",
+            "/tmp/validators",
+            "--pubkeys",
+            "0xaa,0xbb",
+            "out.json",
+        ];
+        match try_parse_from(args.iter().map(OsString::from)).expect("parses") {
+            Command::SlashingProtection(options) => match options.action {
+                crate::slashing_protection::Action::Export { pubkeys, file, .. } => {
+                    assert_eq!(pubkeys, vec!["0xaa", "0xbb"]);
+                    assert_eq!(file, PathBuf::from("out.json"));
+                }
+                other => panic!("expected an export, got {other:?}"),
+            },
+            other => panic!("expected a slashing-protection invocation, got {other:?}"),
         }
     }
 

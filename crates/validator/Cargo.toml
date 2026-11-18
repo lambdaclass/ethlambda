@@ -26,10 +26,15 @@ serde_yaml_ng.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# `time` for the duty loop's sleep between slots. Declared here rather than
-# relied on through workspace feature unification, so this crate still builds
-# if it is ever compiled on its own.
-tokio = { workspace = true, features = ["time", "macros"] }
+# `time` for the duty loop's sleep between slots, `rt` for `spawn_blocking`,
+# which keeps the slashing-protection record's disk flush off the executor.
+# Declared here rather than relied on through workspace feature unification,
+# so this crate still builds if it is ever compiled on its own.
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# `CancellationToken`: the signal that stops the client when the
+# slashing-protection record becomes unusable, and the one that tells the
+# keymanager server to finish its requests in flight.
+tokio-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a
@@ -41,6 +46,8 @@ blst = "0.3.16"
 # the `impl Future + Send` bounds at every method is noise this trait does not
 # need.
 async-trait = "0.1"
+# `join_all`, so the calls every beacon node must hear reach them all at once.
+futures-util = "0.3"
 
 # EIP-2335 keystore decryption.
 scrypt = { version = "0.11", default-features = false }
@@ -72,3 +79,15 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+[features]
+# Exposes `SlashingProtection::in_memory` to other crates' tests.
+test-utils = []
+
+# Skipped by a plain `cargo test`: it reads the EIP-3076 interchange vectors,
+# which `make slashing-protection-interchange-tests` downloads, and fails
+# without them. `make test-node` runs it by name.
+[[test]]
+name = "interchange_vectors"
+path = "tests/interchange_vectors.rs"
+test = false

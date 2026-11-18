@@ -63,7 +63,7 @@ jobs:
       # lag leanVM, and `--all-targets` leaves such targets out. Name them so
       # they keep compiling until they run again.
       - name: Clippy (skipped spectests)
-        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
 
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.

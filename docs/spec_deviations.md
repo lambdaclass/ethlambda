@@ -40,58 +40,91 @@ target-slot order as they are scanned.
 - **Equivalence:** both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the *newest* target where leanSpec takes the *oldest*; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.
 - **Upstream status:** the tiered strategy is proposed upstream as leanSpec [PR #1149](https://github.com/leanEthereum/leanSpec/pull/1149) (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.
 
-## The validator client keeps no slashing-protection record
+## The validator client keeps EIP-3076's minimal watermarks, not full history
 
-`ethlambda validator` signs attestations and blocks without recording what it
-has signed. It cannot detect that a previous run, or another client holding the
-same keys, already signed.
+`ethlambda validator` records, per validator, only the highest block slot and
+the highest attestation source and target epochs it has signed, and refuses
+anything that does not advance past them.
 
 - **The specification:** [EIP-3076](https://eips.ethereum.org/EIPS/eip-3076)
-  defines an interchange format and the conditions a validator client must never
-  violate. For attestations: signing two *distinct* attestations with the same
-  target epoch (a double vote), and signing one whose source and target surround
-  or are surrounded by another's. For blocks: signing two distinct ones for the
-  same slot. Enforcing any of them requires a durable record, written before the
-  signature leaves the process.
-- **ethlambda:** there is no such record and no store to hold one. This is a
-  deliberate scope decision for the client's first phase, not an oversight.
-- **What partially covers it:** two in-memory guards, one per message kind.
-  `crate::attestation_guard::AttestationGuard` refuses to sign a second
-  conflicting attestation for a validator *within one run*, using EIP-3076's
-  minimal rule (the target must advance, the source must not regress).
-  `crate::proposal_guard::ProposalGuard` does the same for blocks, with the
-  minimal rule for those (the slot must strictly advance). Between them they
-  close the shapes reachable through ordinary operation: a backward wall-clock
-  step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
-  a restart empties them and neither knows anything about any other process.
-- **Gloas messages:** a gloas proposer also signs an execution payload
-  envelope, and a payload timeliness committee member signs a payload
-  attestation. Neither is slashable, so neither has a guard. An envelope is
+  forbids signing two *distinct* attestations with the same target epoch (a
+  double vote), one whose source and target surround or are surrounded by
+  another's, and two distinct blocks for one slot. It allows enforcing those
+  either against the full signing history or with the stricter minimal rule
+  over watermarks.
+- **ethlambda:** the minimal rule. An attestation is signed only if its target
+  is above the recorded target and its source is not below the recorded source;
+  a block only if its slot is above the recorded slot. The record is
+  `<validators-dir>/slashing_protection.json`, an EIP-3076 version 5 minimal
+  interchange naming the chain's `genesis_validators_root`. It is written to a
+  temporary file, flushed, renamed into place and the directory flushed, all
+  before the signature exists, and a write that fails leaves the message
+  unsigned. A file that is empty, malformed, of another version or for another
+  chain stops the client at startup rather than being read as "nothing
+  signed". An exclusive `flock` on the validators directory itself, the one
+  inode nothing replaces or deletes, keeps a second process away from it. See
+  `crate::slashing_protection`.
+- **What the strictness costs:** a byte-identical re-sign is refused. A client
+  that recorded an attestation, crashed before publishing it, and restarted
+  into the same slot loses that attestation rather than publishing it; the same
+  holds for a block. An honest validator's messages otherwise advance this way,
+  so nothing else is refused. Lighthouse and Prysm keep signing roots to allow
+  the identical re-sign; Teku keeps the same watermarks as this client.
+- **A wedged record:** the client refuses attestation data whose source is at
+  or past its target, which is never valid outside genesis, so an impossible
+  answer from a beacon node is refused rather than recorded. What it cannot
+  tell is a possible one: a source below the target but ahead of what the
+  chain has justified passes, the record keeps it, and every honest
+  attestation after it is refused as `SourceRegressed` until justification
+  reaches it, which during non-finality may be never. That is trust in the
+  beacon node, the same trust every attestation already places in it; the
+  symptom is the `SourceRegressed` refusal in the log and a non-zero
+  `attestations_refused_total`. There is no tool that lowers a watermark, by
+  design: stop the client, edit `slashing_protection.json` by hand, and start
+  it again. Lowering a watermark is only safe for a key that has not signed
+  past the value written. The same holds for a clock that jumps forward: the
+  target is pinned to the slot the local clock asked for, so a beacon node
+  that answers for a slot far ahead lets the record run ahead of the chain.
+  A bound against the clock would be circular; the guard is the beacon
+  node's own view of the head, which doppelganger protection will bring.
+- **No checksum, and rewritten minimal at every start:** the record is an
+  EIP-3076 minimal interchange and nothing more, by design: readable by other
+  tools and editable by the operator, which the hand edit above relies on. A
+  checksum or a generation counter would make it this client's private format
+  and refuse that edit, to guard against a flipped digit that still parses,
+  which the disk's and the filesystem's own integrity checks are there for.
+  Every start rewrites the file in the minimal shape, so signing roots and
+  extra entries dropped in by hand collapse to their maxima.
+- **Keys with no record:** refused at startup. `--init-slashing-protection`
+  registers them as never having signed, and a key imported through the
+  keymanager API with no history is registered the same way before it is
+  loaded. Nothing here stops such a key from signing again what it signed
+  elsewhere a moment ago, so the flag is only for keys that have signed nothing
+  anywhere for at least two epochs; the migration window is doppelganger
+  protection's to close, which this client does not have yet.
+- **Messages outside the rule:** sync committee messages and contributions
+  are not slashable, and are not recorded. A gloas proposer also signs an
+  execution payload envelope, and a payload timeliness committee member signs
+  a payload attestation; neither is slashable, so neither is recorded. An envelope is
   published once per proposal, right after its block, and a failure to publish it
   is logged at error and counted without failing the proposal. A PTC vote has an
   in-memory dedup of `(validator, slot)` pairs recorded at signing time
   (`PayloadAttestationService`), so a duty abandoned between signing and
-  submission is lost rather than re-signed. It is emptied by a restart and says
-  nothing about another process, so it is not slashing protection either: a
-  second, different vote for one slot is equivocation that peers penalize in
-  gossip, not a slashing.
-- **Why a proposer slashing is the worse of the two:** a double vote needs a
-  second validator's attestation to be caught. Two signed block headers for one
-  slot are the whole of the evidence on their own.
-- **What is therefore not covered:** restarting into a state where the chain has
-  moved, and running these keys in two places at once. Both can produce a
-  slashable double vote or a double proposal, and nothing in this client will
-  stop them.
-- **Keymanager consequences:** `DELETE /eth/v1/keystores` must return an
-  EIP-3076 interchange. This client returns a well-formed but empty one whose
-  `genesis_validators_root` is deliberately all-zero, so a conformant importer
-  rejects it outright rather than trusting an empty history that was never
-  recorded. `POST` accepts the `slashing_protection` field and ignores it, with
-  a server-side warning. A key migrated in or out through this API does not
-  carry its history.
-- **Operationally:** do not run these keys in any other client while this one
-  runs, and treat a restart as an event that needs the same care a manual key
-  move would. The client warns about this at startup on every run.
+  submission is lost rather than re-signed. A second, different vote for one
+  slot is equivocation that peers penalize in gossip, not a slashing.
+- **What is not covered:** the same keys running in another client on another
+  machine. No local record can see that.
+- **Interchange:** an import (`ethlambda slashing-protection import`, or the
+  keymanager API's `POST /eth/v1/keystores`) reduces each validator to its
+  highest slot, source and target and merges them with the record by maximum,
+  so slashable data in the file is absorbed rather than refused, as Lighthouse
+  and Nimbus do. The one exception is an attestation whose source is at or
+  past its target outside genesis, which fails the whole import: it is never
+  valid, and read into the record it would refuse every honest attestation
+  until the chain justified past that source. An export (`ethlambda slashing-protection export`, or `DELETE
+  /eth/v1/keystores`) is the record itself, in the minimal format. Both pass
+  the shared `eth-clients/slashing-protection-interchange-tests` v5.3.0 vectors
+  under their `should_succeed` (minimal) expectations.
 
 ## Builder bids: gossip and API only (no builder API)
 
@@ -125,7 +158,62 @@ from the Beacon API, and no other way.
   the bid's.
 - **Why:** gossip and API bids need only a pool and the gossip rules. A builder
   API client is a separate crate with its own failure modes and timeouts, and
-  is left for a later phase.
+  is left for a later phase for gloas. Fulu's builder API (MEV-Boost) is now
+  served (`produceBlockV3` and `blinded_blocks`); gloas's is not.
+
+## Builder bids: the fee recipient is not checked
+
+- **The specification:** builder-specs' `process_bid` asserts
+  `header.fee_recipient == fee_recipient`.
+- **ethlambda:** a mismatch is logged at `debug` only.
+- **Why:** a builder names its own address as the payload's fee recipient
+  (the coinbase), so priority fees and MEV accrue to it, and pays the proposer
+  with a transaction to the registered fee recipient, worth the bid's `value`,
+  as the payload's last transaction. A mismatch is therefore the normal case,
+  and the assertion would refuse nearly every real bid. Every client reviewed
+  (Lighthouse, Teku, Prysm, Nimbus, Lodestar, Grandine) skips it. A counter of
+  mismatches would rise on nearly every bid and tell an operator nothing.
+- **The payment itself is not checked either, by this node or any client
+  reviewed.** A bid carries only the payload's header: the transactions,
+  payment included, stay with the builder until the proposer has signed. After
+  signing, `submitBlindedBlockV2` returns no payload; the builder publishes
+  the block, which reaches this node over gossip like any other, by which time
+  nothing can be undone.
+- **Who does check it:** the relay. Before serving a builder's bid, a relay
+  validates the submission on an execution node, and that validation requires
+  the proposer payment. Flashbots' block-validation API
+  (`flashbots_validateBuilderSubmission*`) passes the registered fee
+  recipient and the bid's value to `ValidatePayload`, which requires the
+  block's last transaction to pay that address at least that much (or, if the
+  relay configures it, the address's balance to rise by it). The proposer
+  relies on the relay for this, as for the payload's validity. A relay
+  publishes what it delivered on its data API
+  (`/relay/v1/data/bidtraces/proposer_payload_delivered`), which is where an
+  underpayment would surface. An operator who wants more than that trust must
+  choose relays accordingly. A check after the fact, comparing a published
+  block's last transaction with the bid it won, is possible but not
+  implemented.
+
+## `builder_boost_factor` scales the bid before rounding
+
+- **The specification:** beacon-APIs' `produceBlockV3` serves the local payload
+  iff `exec_node_payload_value >= builder_boost_factor *
+  (builder_payload_value // 100)`: the bid is rounded down to a multiple of
+  100 wei, then scaled.
+- **ethlambda:** the local payload wins iff its value is at least
+  `(builder_boost_factor * builder_payload_value) // 100`, scaled first and
+  rounded down once (`builder_flow::choice::boosted`), saturating at
+  `u128::MAX`. A tie still goes local, and the factors 0, 100 and `2^64 - 1`
+  keep the meanings the specification gives them.
+- **Why:** rounding first loses up to 99 wei of the bid before it is weighed,
+  so even at the default factor of 100 a bid slightly better than the local
+  payload lost to it. Scaling first makes 100 an exact comparison. The two
+  differ by less than `factor` wei, only ever in the bid's favour. The gloas
+  `produceBlockV4` comparison (`bid_selection::choose_payload`) already
+  multiplies first. Teku and Lodestar compare `local * 100` against
+  `factor * bid`, and Nimbus computes `(factor * bid) div 100` (giving a tie to
+  the builder). Lighthouse follows the specification's order but skips the
+  arithmetic at factor 100 for the same reason (sigp/lighthouse#5352).
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 
@@ -209,12 +297,14 @@ from the Beacon API, and no other way.
   and a bid is compatible with it when it builds on that head and its payload.
   The builder-exit check is skipped for a pre-gloas parent, which carries no
   envelope.
-- **Preference signatures** are accepted under the lookahead state's own
-  `DOMAIN_PROPOSER_PREFERENCES` domain (the specification's), the fork version of
-  the epoch before the proposal's, or the proposal epoch's. They coincide outside
-  the first epoch of a fork. Lighthouse signs with the proposal epoch's version
-  and the specification gives the earlier one, so accepting both avoids
-  rejecting an honest client's messages around the gloas upgrade.
+- **Preference signatures** are accepted under `DOMAIN_PROPOSER_PREFERENCES` at
+  the proposal epoch's fork version, which consensus-specs v1.7.0-beta.4 signs
+  and verifies with and every client signs with, and also under the two that
+  v1.7.0-beta.2's rule (`get_domain` on the lookahead state) could give: that
+  state's own fork, and the fork version of the epoch before the proposal's.
+  They coincide outside the first epoch of a fork. The older two are kept for a
+  client still signing by beta.2, until the fixtures (pinned to beta.2) move
+  past it.
 - **Consequence:** builders onboarded at the fork are inactive until their
   deposit epoch is finalized, so gossip bids are rejected for the first epochs of
   gloas and `produceBlockV4` self-builds.
@@ -707,3 +797,73 @@ comes first. The validator client signs once, at the deadline
 (`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
+
+## The validator client's builder proposals
+
+With `--builder-proposals` the validator client registers its validators with
+the beacon node's builder and may sign a blinded block (builder-specs and
+`validator.md`'s builder flow), for fulu and earlier slots. A blinded block
+has the root of the full block it stands for, so slashing protection records
+its slot like any other block's, durably and before it is signed: one slot, one
+signature, whichever way the node answered. Three departures:
+
+- **A blinded block is published only on the beacon node that produced it, with
+  no failover.** This is this client's choice, not the specification's: only
+  that node's builder holds the payload and only that node claimed the slot, so
+  offering the signed block to another node would hand it to a builder that
+  never saw the bid. If the producing node fails, the publish fails, and
+  slashing protection has already recorded the slot, so nothing retries. A 5xx
+  other than 503, or no answer once connected, is reported as unconfirmed
+  (logged at error, counted on `blinded_blocks_unconfirmed_total`) and not as a
+  missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+  a connection never made (refused, or past the client's 3 s connect timeout)
+  is a missed proposal: the node cannot have handed the block on. The block
+  carries the node that produced it (`Producer`, filled in by the fallback),
+  and the proposal path sends the signed block back to it; Teku pins a blinded
+  block to its producer too, in a cache keyed by slot and root, while
+  Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+  Two status codes are read the wrong way: some of ethlambda's own 500s are
+  definite (no builder configured, the block failing the node's checks) and
+  count as unconfirmed, and a proxy's 503 sent after it forwarded the request
+  counts as definite. Neither leads to a retry or a second signature.
+- **A blinded block stays signed but undelivered for longer.** The node waits
+  up to 5 s on the relay and the client up to 8 s on the node, against well
+  under a second for a full block. The publish runs on its own task so the
+  proposal budget cannot cut it off: past the budget the proposal returns
+  "still publishing" and the task reports the outcome itself. The process
+  handles no signals, though: a SIGINT in that window ends the task with the
+  request.
+- **Registrations stop at gloas.** The client sends no `register_validator` from
+  the gloas fork epoch on: the builder market works through proposer
+  preferences there (see the next section), and `produceBlockV4` sends the
+  configured boost factor and `--builder-min-bid` (default `0`), and no
+  builders.
+  Validators with no fee recipient are not registered either (the field is
+  required), and only validators the beacon node resolved, pending or active,
+  are signed for: the flashbots relay refuses a whole batch over an exited or
+  withdrawn key, as Teku's validator client and Lighthouse's beacon node
+  account for.
+
+## The validator client's proposer preferences
+
+- **Signing domain: no departure, but ahead of the fixtures.** The validator
+  client signs under `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork
+  version (`SigningContext::sign_proposer_preferences`), as consensus-specs
+  v1.7.0-beta.4's `get_signed_proposer_preferences` does with
+  `compute_fork_version(proposal_epoch)`, and as Lighthouse, Prysm, Teku,
+  Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
+  v1.7.0-beta.2, whose gossip rule verified with `get_domain` on the dependent
+  block's state advanced to the lookahead start, the fork of the epoch before
+  the proposal's. The two differ only for a proposal in the first epoch of a
+  fork, where Lighthouse refuses beta.2's signature as a bad one. This node
+  still accepts beta.2's domain too (see the fulu-to-gloas boundary entry).
+- **Published unconditionally,** not gated on `--builder-proposals`, since from
+  gloas the preferences carry every proposal's fee recipient. Validators with no
+  fee recipient are skipped (the field is required), and a preference cannot be
+  replaced for the same slot and dependent root.
+- **Re-sent once an epoch,** as signed, to every node, while its slot is ahead.
+  The specification says nothing about re-sending; it is here because a beacon
+  node holds them in memory only
+  and gossip does not replay them, so a node that restarts would otherwise
+  self-build without them, and ignore builders' bids, until the next dependent
+  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.

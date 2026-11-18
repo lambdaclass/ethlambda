@@ -74,19 +74,19 @@ static ATTESTATION_DEADLINE_MISSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .unwrap()
 });
 
-/// Attestations this process declined to sign because it had already signed a
-/// conflicting one for that validator in this run.
+/// Attestations this process declined to sign because slashing protection
+/// judged them unsafe, or could not record them.
 ///
 /// Separate from `signing_failures_total`, which counts signatures that were
 /// attempted and failed. This counts signatures deliberately not attempted, and
 /// it should normally read zero: a non-zero value means the duty loop tried to
-/// sign something the guard judged a double vote, which is worth investigating
-/// even though the attestation was correctly suppressed. See
-/// `crate::attestation_guard`.
+/// sign something slashing protection judged a double or surround vote, which
+/// is worth investigating even though the attestation was correctly
+/// suppressed. See `crate::slashing_protection`.
 static ATTESTATIONS_REFUSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_attestations_refused_total",
-        "Attestations refused because this process already signed a conflicting one"
+        "Attestations refused by slashing protection"
     )
     .unwrap()
 });
@@ -113,18 +113,94 @@ static BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL: LazyLock<IntCounter> = LazyLock::new
     .unwrap()
 });
 
-/// Blocks this process declined to sign because it had already proposed that
-/// slot for that validator in this run.
+/// Builder registrations a beacon node accepted, counted per registration so a
+/// full `REGISTRATION_BATCH` reads as that many.
+static BUILDER_REGISTRATIONS_SENT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registrations_sent_total",
+        "Builder registrations a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Registration batches no beacon node accepted. A missed registration costs
+/// at most a builder block, never a duty, so this is a warning sign rather
+/// than a failure.
+static BUILDER_REGISTRATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registration_failures_total",
+        "Registration batches no beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Proposer preferences a beacon node accepted. Counted per preference, so a
+/// full epoch's worth reads as that many, and once, when the first node
+/// accepts it: the re-sends to nodes that missed it do not count again.
+static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_published_total",
+        "Proposer preferences a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Proposer preference sends some beacon node refused or did not answer, one
+/// count per preference per attempt, re-sends included. The next slot retries,
+/// so this is a warning sign: a node that misses one never gossips it, and
+/// until some node accepts it, builders' bids for the slot are ignored. A send
+/// whose slot started before the nodes answered is not counted.
+static PROPOSER_PREFERENCES_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_failures_total",
+        "Proposer preference sends some beacon node refused or did not answer"
+    )
+    .unwrap()
+});
+
+/// v2 proposer-duty fetches no beacon node answered, one count per target epoch
+/// per attempt. Without the duties no preference is signed for that epoch, so a
+/// node that is syncing or lacks the endpoint shows up here and not as refused
+/// preferences.
+static PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_duty_fetch_failures_total",
+        "v2 proposer-duty fetches no beacon node answered"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks a beacon node handed to its builder.
+static BLINDED_BLOCKS_PROPOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_proposed_total",
+        "Blinded blocks a beacon node handed to its builder"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks the beacon node did not confirm. The relay may still have
+/// published them, so this is not a count of missed proposals.
+static BLINDED_BLOCKS_UNCONFIRMED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_unconfirmed_total",
+        "Blinded blocks the beacon node did not confirm, which the relay may still have published"
+    )
+    .unwrap()
+});
+
+/// Blocks this process declined to sign because slashing protection judged
+/// them unsafe, or could not record them.
 ///
 /// The proposal-shaped counterpart to `attestations_refused_total`, and it
 /// should read zero for the same reason: a non-zero value means the duty loop
-/// tried to propose a slot the guard judged already proposed, which is worth
-/// investigating even though the block was correctly suppressed. See
-/// `crate::proposal_guard`.
+/// tried to propose a slot slashing protection judged already proposed, which
+/// is worth investigating even though the block was correctly suppressed. See
+/// `crate::slashing_protection`.
 static BLOCKS_REFUSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_blocks_refused_total",
-        "Blocks refused because this process already proposed that slot"
+        "Blocks refused by slashing protection"
     )
     .unwrap()
 });
@@ -248,6 +324,31 @@ static SIGNING_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Time spent durably writing the slashing-protection record: one write per
+/// slot's attestation batch and one per block, each flushed to disk before
+/// anything is signed. See `crate::slashing_protection`.
+static SLASHING_PROTECTION_WRITE_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "ethlambda_validator_slashing_protection_write_seconds",
+        "Time spent durably writing the slashing-protection record",
+        vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+        ]
+    )
+    .unwrap()
+});
+
+/// Slashing-protection writes that failed, each of which left its messages
+/// unsigned. Should read zero; anything else points at the disk under the
+/// validators directory.
+static SLASHING_PROTECTION_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_slashing_protection_write_failures_total",
+        "Slashing-protection writes that failed, leaving their messages unsigned"
+    )
+    .unwrap()
+});
+
 static PUBLICATION_DELAY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_publication_delay_seconds",
@@ -316,6 +417,13 @@ pub fn init() {
     LazyLock::force(&ATTESTATION_DEADLINE_MISSED_TOTAL);
     LazyLock::force(&BLOCKS_PROPOSED_TOTAL);
     LazyLock::force(&BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATIONS_SENT_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATION_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_PUBLISHED_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_PROPOSED_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_UNCONFIRMED_TOTAL);
     LazyLock::force(&BLOCKS_REFUSED_TOTAL);
     LazyLock::force(&BLOCK_PROPOSAL_FAILURES_TOTAL);
     LazyLock::force(&ENVELOPES_PUBLISHED_TOTAL);
@@ -334,6 +442,8 @@ pub fn init() {
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
+    LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
+    LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -364,6 +474,10 @@ pub fn inc_attestations_refused() {
     ATTESTATIONS_REFUSED_TOTAL.inc();
 }
 
+pub fn inc_attestations_refused_by(count: u64) {
+    ATTESTATIONS_REFUSED_TOTAL.inc_by(count);
+}
+
 pub fn inc_attestation_deadline_missed() {
     ATTESTATION_DEADLINE_MISSED_TOTAL.inc();
 }
@@ -374,6 +488,34 @@ pub fn inc_blocks_proposed() {
 
 pub fn inc_blocks_broadcast_not_imported() {
     BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL.inc();
+}
+
+pub fn inc_builder_registrations_sent(count: usize) {
+    BUILDER_REGISTRATIONS_SENT_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_builder_registration_failures() {
+    BUILDER_REGISTRATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_published(count: usize) {
+    PROPOSER_PREFERENCES_PUBLISHED_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_proposer_preferences_failures() {
+    PROPOSER_PREFERENCES_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_duty_fetch_failures() {
+    PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_proposed() {
+    BLINDED_BLOCKS_PROPOSED_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_unconfirmed() {
+    BLINDED_BLOCKS_UNCONFIRMED_TOTAL.inc();
 }
 
 pub fn inc_blocks_refused() {
@@ -448,6 +590,14 @@ pub fn set_beacon_node_available(available: bool) {
 /// the signing took plus whatever else shared the guard's scope".
 pub fn time_signing() -> TimingGuard {
     TimingGuard::new(&SIGNING_DURATION_SECONDS)
+}
+
+pub fn time_slashing_protection_write() -> TimingGuard {
+    TimingGuard::new(&SLASHING_PROTECTION_WRITE_SECONDS)
+}
+
+pub fn inc_slashing_protection_write_failures() {
+    SLASHING_PROTECTION_WRITE_FAILURES_TOTAL.inc();
 }
 
 /// Record how long after a slot's start its attestations were accepted.

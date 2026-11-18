@@ -6,20 +6,21 @@
 //! (a reorg invalidating duties, a node failing mid-slot) untestable.
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::shared::AttestationData;
+use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Epoch, Root, Slot, ValidatorIndex,
 };
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
-use crate::beacon_node::block_contents::ProducedBlock;
+use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
-use crate::error::Result;
+use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
@@ -32,8 +33,13 @@ pub mod http;
 #[cfg(test)]
 pub mod mock;
 
-/// Check that `data` is an answer about `slot`, as the contract on
-/// [`BeaconNodeApi::attestation_data`] requires.
+/// Builder registrations per request. Lighthouse's batch size: large enough
+/// that a few thousand validators take a handful of requests, small enough
+/// that one request stays well under a node's body limit.
+pub const REGISTRATION_BATCH: usize = 500;
+
+/// Check that `data` is an answer about `slot`, which is in `fork`, as the
+/// contract on [`BeaconNodeApi::attestation_data`] requires.
 ///
 /// One function rather than two copies, because it is enforced in two places
 /// for two different reasons and they must not drift apart. Each
@@ -42,12 +48,28 @@ pub mod mock;
 /// before signing, since the trait is public and nothing stops an
 /// implementation from being wrong.
 ///
-/// Both fields are checked because both are signable. `slot` is the obvious
-/// one. `target.epoch` matters independently: it selects the signing domain
-/// (see `SigningContext::attestation_signing_root`), so a node answering with
-/// the right slot and a wrong target epoch is a second, distinct way to make
-/// this client sign something it should not.
-pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<()> {
+/// `slot` and `target.epoch` are checked because both are signable. `slot` is
+/// the obvious one. `target.epoch` matters independently: it selects the
+/// signing domain (see `SigningContext::attestation_signing_root`), so a node
+/// answering with the right slot and a wrong target epoch is a second,
+/// distinct way to make this client sign something it should not.
+///
+/// `index` is checked for liveness rather than safety. A vote whose index
+/// cannot be valid at `fork` is one every peer rejects (gossip's
+/// `attestation.data.index == 0` from electra, `< 2` from gloas), and by
+/// then slashing protection has recorded its target, so the validator has no
+/// second vote to cast in that epoch. Refused here, nothing is recorded for
+/// it, and the `Err` is one failover moves past to a node that may answer
+/// properly. Lodestar's validator client refuses the same before signing
+/// (`validateAttestationDuty`).
+///
+/// `fork` must be the fork `slot` falls in on the caller's schedule, and is
+/// taken on trust: an implementation is handed it with the request and holds
+/// no schedule to check it against, so the bound on `index` is only as right
+/// as the fork it is given. [`crate::attestation::AttestationService`], the
+/// caller that signs, derives it from its own `Config` for the slot it asks
+/// about, and runs this check again under it.
+pub fn validate_attestation_data(slot: Slot, fork: ForkName, data: &AttestationData) -> Result<()> {
     if data.slot != slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "requested attestation data for slot {slot}, node answered for slot {}",
@@ -62,7 +84,64 @@ pub fn validate_attestation_data(slot: Slot, data: &AttestationData) -> Result<(
             data.target.epoch
         )));
     }
+    // Signing a source at or past its target would record a source the
+    // chain's justified checkpoint cannot have reached, and the record keeps
+    // it: every honest attestation afterwards would be refused as a source
+    // regression until justification caught up, or forever during
+    // non-finality.
+    if crate::slashing_protection::is_impossible_source(data.source.epoch, data.target.epoch) {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "attestation data for slot {slot} carries source epoch {} at or past its target \
+             epoch {}",
+            data.source.epoch, data.target.epoch
+        )));
+    }
+    let highest_index = highest_attestation_index(fork);
+    if data.index > highest_index {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "attestation data for slot {slot} carries index {}, and a {} attestation's is at \
+             most {highest_index}",
+            data.index,
+            fork.as_str()
+        )));
+    }
     Ok(())
+}
+
+/// The highest `AttestationData.index` a vote at `fork` can carry.
+///
+/// Every fork is named rather than compared against, so a fork added after
+/// gloas has to say what its index means instead of inheriting gloas's
+/// answer.
+fn highest_attestation_index(fork: ForkName) -> u64 {
+    match fork {
+        // A committee, and the one the query names: this client only ever
+        // asks about committee 0 (see `BeaconNodeApi::attestation_data`), so
+        // any other index is not an answer to its question.
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => 0,
+        // EIP-7549 moved the committee out of the signed data and left the
+        // field fixed at zero.
+        ForkName::Electra | ForkName::Fulu => 0,
+        // The payload signal: 0 for a same-slot block or an empty one, 1 for
+        // a block whose payload was seen. Which of the two is right depends
+        // on the node's view of the block, which this client does not have,
+        // so only the range is checked.
+        ForkName::Gloas => 1,
+        // Not a Beacon Chain fork: `Config::fork_at_epoch` never names it, so
+        // a caller that does has a bug of its own. A panic rather than an
+        // `Err`, because this runs after the node has answered: an `Err`
+        // here is `InconsistentResponse`, which failover blames on the node
+        // and retries on every other one, so a local bug would read as every
+        // beacon node failing, every slot.
+        ForkName::Lean => unreachable!(
+            "validate_attestation_data: lean is not a Beacon Chain fork and has no attestation \
+             data of this shape"
+        ),
+    }
 }
 
 /// The chain's genesis, as the beacon node reports it.
@@ -130,6 +209,17 @@ pub struct BlockRequest {
     pub randao_reveal: BlsSignature,
     /// Thirty-two bytes consensus never reads.
     pub graffiti: Bytes32,
+    /// The `builder_boost_factor` to send, or `None` when builder proposals are
+    /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
+    /// factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
+    /// win on value; a gloas answer is never blinded.
+    pub builder_boost_factor: Option<u64>,
+    /// The smallest p2p bid, in gwei, the node may take for a gloas block
+    /// (`produceBlockV4`'s `min_bid`): `--builder-min-bid`, with or without
+    /// builder proposals, since a node whose local build fails may still build
+    /// on a pooled bid. Not sent before gloas, where no endpoint takes it.
+    pub builder_min_bid: u64,
 }
 
 /// What became of a published block.
@@ -145,6 +235,25 @@ pub enum Published {
     Imported,
     /// 202: broadcast, but the node could not import it.
     BroadcastNotImported,
+    /// 200 from `blinded_blocks`: the node handed the signed blinded block to
+    /// its builder, which publishes the block and reveals the payload. Nothing
+    /// says the node imported it.
+    HandedToBuilder,
+}
+
+/// How many of the configured nodes took something sent to every node.
+///
+/// The caller needs it when what it sends lives on each node separately and
+/// a node that missed it never hears it any other way. Proposer preferences
+/// are such a send: each node gossips only what it accepted, and the service
+/// sends a preference every node holds only once an epoch more, so "some
+/// node accepted" must not be mistaken for "every node did".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every configured node accepted. The only answer a single node gives.
+    Everywhere,
+    /// At least one node accepted and at least one refused or did not answer.
+    Partly,
 }
 
 /// Check that `block` is the block that was asked for.
@@ -156,11 +265,11 @@ pub enum Published {
 /// stuck on a stale head is never failed over from.
 ///
 /// Both fields are checked because both end up signed. The slot selects the
-/// signing domain and is the whole of what the proposal guard keys on. The
+/// signing domain and is the whole of what slashing protection keys a block on. The
 /// proposer index is not something this client chooses either: a node on a
 /// different fork computes a different proposer, and a block naming someone
 /// else is one this client's key can only sign uselessly, while still burning
-/// the guard's record for that slot.
+/// the slot in slashing protection's record.
 pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) -> Result<()> {
     if block.slot() != request.slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
@@ -241,6 +350,21 @@ pub struct ValidatorEntry {
     pub status: String,
 }
 
+/// One validator's registry entry, as much of it as a voluntary exit needs.
+///
+/// `status` is the Beacon API's own string (`active_ongoing`,
+/// `active_exiting`, `exited_unslashed`, ...). The three epochs are what the
+/// exit command checks eligibility against before signing and reports once the
+/// chain has accepted the exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorDetails {
+    pub index: ValidatorIndex,
+    pub status: String,
+    pub activation_epoch: Epoch,
+    pub exit_epoch: Epoch,
+    pub withdrawable_epoch: Epoch,
+}
+
 #[async_trait]
 pub trait BeaconNodeApi: Send + Sync {
     /// The chain's genesis time and validators root, needed to compute slots
@@ -308,6 +432,18 @@ pub trait BeaconNodeApi: Send + Sync {
     /// treats the two the same way will act on a stale proposer schedule.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
+    /// Every proposer duty in `epoch` with v2's `dependent_root`: the block at
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1`, the shuffling dependent
+    /// root fulu's proposer lookahead fixes the epoch's proposers from. Signed
+    /// proposer preferences must carry exactly this root, which v1's
+    /// definition (one epoch later) is not.
+    ///
+    /// The fallback fails over quietly here: when every node fails it logs
+    /// nothing of its own, since its one caller, the preferences service,
+    /// reports the failure itself, once per epoch. A new caller that needs
+    /// the failure seen must log it.
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
+
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
     /// No committee index is ever a parameter here. Before gloas the query
@@ -322,9 +458,16 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// An implementation must reject data whose `slot` is not the one asked
     /// for, and whose `target.epoch` is not that slot's epoch. Both are
-    /// signable material, and this client keeps no slashing-protection record,
+    /// signable material, and slashing protection records whatever it allows,
     /// so a node answering about the wrong slot must never reach the signing
-    /// path.
+    /// path: a target from the future would raise the validator's watermark
+    /// and cost it every attestation until the chain caught up.
+    ///
+    /// It must also reject an `index` that cannot be valid at `fork`: anything
+    /// but 0 before gloas, anything above 1 from it. Such a vote is rejected
+    /// by every peer, after slashing protection has spent the validator's one
+    /// vote for the epoch on it. [`validate_attestation_data`] is every one of
+    /// these checks.
     ///
     /// It matters that this is the *implementation's* job rather than the
     /// caller's, because of where failover sits.
@@ -351,12 +494,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// returning, so that a node answering about the wrong slot or naming the
     /// wrong proposer is failed over from rather than signed for.
     ///
-    /// # Contract: never a blinded block
+    /// # Contract: a blinded block only when builder proposals are on
     ///
-    /// This client does not implement the builder flow, so it cannot publish a
-    /// blinded block and must not sign one. An implementation must ask for an
-    /// unblinded block and reject a blinded answer rather than returning
-    /// something the caller will sign and then be unable to send.
+    /// A blinded block is returned only when `request.builder_boost_factor` is
+    /// `Some`, since only then does the caller publish one through
+    /// [`Self::publish_blinded_block`]. With `None` an implementation must ask
+    /// for an unblinded block and reject a blinded answer rather than
+    /// returning something the caller will sign and then be unable to send.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock>;
 
     /// Publish an already-signed block, given the SSZ body and the fork it was
@@ -371,6 +515,112 @@ pub trait BeaconNodeApi: Send + Sync {
     /// a `Vec` here would be cloned once per configured node on every
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
+
+    /// Publish a signed blinded block, produced under `fork` by `producer`
+    /// (the [`ProducedBlock::producer`] of the block it was signed from), to
+    /// `POST /eth/v2/beacon/blinded_blocks`. The node hands it to its builder.
+    ///
+    /// # Contract: the node that produced it, and no other
+    ///
+    /// Only the producing node's builder holds the payload, and only that node
+    /// claimed the slot. Failover must not offer it elsewhere: the fallback
+    /// sends it to `producer` alone.
+    ///
+    /// # Contract: which error means what
+    ///
+    /// The line is whether the node can have handed the block to its builder.
+    ///
+    /// - **Definite**, an `Err` other than `Error::BlindedUnconfirmed`: the
+    ///   block was not published. A 4xx; a 503, which a syncing node answers
+    ///   before it hands anything to a builder; and a connection that was never
+    ///   established, refused or timed out, since the request never left.
+    /// - **Unconfirmed**, `Error::BlindedUnconfirmed`: every other 5xx, and any
+    ///   failure once the connection was up (no answer in time, a reset). The
+    ///   relay may still publish the block.
+    ///
+    /// The status cannot always tell, and the HTTP implementation documents the
+    /// edges it knowingly reads the wrong way.
+    async fn publish_blinded_block(
+        &self,
+        producer: Producer,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published>;
+
+    /// Send signed builder registrations to the node in one request, which it
+    /// forwards to its builder. JSON, since a node may forward the body
+    /// unchanged to MEV-Boost. State installed on the node's builder, so
+    /// failover sends it to every node.
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()>;
+
+    /// Send `registrations` in requests of at most [`REGISTRATION_BATCH`], one
+    /// after another, and say what became of each batch: one outcome per
+    /// batch, in order, `Ok` when the node accepted it.
+    ///
+    /// Batched here, below the fallback's fan-out, so that each node works
+    /// through its own sequence of batches beside the others: a hung node
+    /// holds back only its own. Batched above it, every batch would wait for
+    /// every node before the next one started.
+    ///
+    /// Once the node cannot be reached ([`Error::BeaconNode`]) the batches left
+    /// are not sent, and fail with that error: each would cost another
+    /// timeout, and the send waiting on them holds back the next keymanager
+    /// change (see `crate::registration`). A node that answered with an error
+    /// status is up, so it is still given the rest.
+    ///
+    /// [`Error::BeaconNode`]: crate::error::Error::BeaconNode
+    async fn register_validators_in_batches(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Vec<Result<()>> {
+        let mut outcomes = Vec::new();
+        let mut unreachable: Option<(String, BeaconNodeFailure, String)> = None;
+        for batch in registrations.chunks(REGISTRATION_BATCH) {
+            if let Some((url, failure, detail)) = &unreachable {
+                outcomes.push(Err(Error::BeaconNode {
+                    url: url.clone(),
+                    failure: *failure,
+                    detail: format!(
+                        "not sent, an earlier batch could not reach the node: {detail}"
+                    ),
+                }));
+                continue;
+            }
+            let outcome = self.register_validators(batch).await;
+            if let Err(Error::BeaconNode {
+                url,
+                failure,
+                detail,
+            }) = &outcome
+            {
+                unreachable = Some((url.clone(), *failure, detail.clone()));
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// Submit signed proposer preferences, which the node validates with the
+    /// `proposer_preferences` gossip rules and publishes. `fork` is the
+    /// `Eth-Consensus-Version`: the fork the preferences belong to, that of
+    /// their proposal epoch.
+    ///
+    /// A 400 naming per-index failures is an `Err`: the whole call failed for
+    /// the caller's purposes, although the node may have published the entries
+    /// that passed. A node only short-circuits an identical entry, so one it
+    /// holds for the same `(slot, dependent_root)` with other content fails
+    /// every call that carries it. The caller therefore sends one preference
+    /// per call. State on the node's gossip, so failover sends it to every
+    /// node, and answers [`Delivery::Partly`] when only some of them accepted
+    /// it, so the caller knows to send it again.
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery>;
 
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.
@@ -549,6 +799,20 @@ pub trait BeaconNodeApi: Send + Sync {
         &self,
         subscriptions: &[SyncCommitteeSubscriptionDto],
     ) -> Result<()>;
+
+    /// One validator's registry entry at the node's head, or `None` when the
+    /// node knows no validator with that key (404), which is an ordinary
+    /// answer for a key whose deposit has not been processed, not an error.
+    ///
+    /// `GET /eth/v1/beacon/states/head/validators/{pubkey}`. Unlike
+    /// [`Self::validator_indices`] this carries the activation and exit
+    /// epochs, which is what a voluntary exit is checked against.
+    async fn validator(&self, pubkey: &BlsPubkey) -> Result<Option<ValidatorDetails>>;
+
+    /// Hand a signed voluntary exit to the node's pool, which validates it
+    /// against its head state and gossips it. A refusal (400) surfaces as
+    /// [`crate::error::Error::BeaconNodeStatus`] carrying the node's reason.
+    async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()>;
 }
 
 /// Check that `contribution` is the one asked for, as the contract on
@@ -570,4 +834,102 @@ pub fn validate_sync_contribution(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    fn data(slot: Slot, source: Epoch, target: Epoch) -> AttestationData {
+        AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint {
+                epoch: source,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: target,
+                root: Root::ZERO,
+            },
+        }
+    }
+
+    /// Slot 100 is in epoch 3 on the mainnet preset.
+    #[test]
+    fn attestation_data_with_a_source_at_or_past_its_target_is_refused() {
+        let fork = ForkName::Fulu;
+        assert!(validate_attestation_data(100, fork, &data(100, 2, 3)).is_ok());
+        assert!(validate_attestation_data(100, fork, &data(100, 0, 3)).is_ok());
+        let err =
+            validate_attestation_data(100, fork, &data(100, 3, 3)).expect_err("source == target");
+        assert!(err.to_string().contains("source epoch 3"), "{err}");
+        assert!(validate_attestation_data(100, fork, &data(100, 4, 3)).is_err());
+    }
+
+    /// At genesis both checkpoints are epoch 0, and that is the one valid
+    /// shape where the source does not precede the target.
+    #[test]
+    fn genesis_attestation_data_is_accepted() {
+        let fork = ForkName::Phase0;
+        assert!(validate_attestation_data(0, fork, &data(0, 0, 0)).is_ok());
+        assert!(
+            validate_attestation_data(0, fork, &data(0, 1, 0)).is_err(),
+            "a source past a genesis target is not the genesis shape"
+        );
+    }
+
+    fn with_index(index: u64) -> AttestationData {
+        AttestationData {
+            index,
+            ..data(100, 2, 3)
+        }
+    }
+
+    /// Before gloas the index is zero: the committee this client asks about
+    /// up to deneb, and EIP-7549's fixed zero from electra. Anything else is
+    /// a vote no peer accepts.
+    #[test]
+    fn a_nonzero_index_is_refused_before_gloas() {
+        let before_gloas = ForkName::ALL
+            .iter()
+            .copied()
+            .filter(|fork| *fork < ForkName::Gloas);
+        for fork in before_gloas {
+            assert!(
+                validate_attestation_data(100, fork, &with_index(0)).is_ok(),
+                "{fork:?} takes index 0"
+            );
+            let err = validate_attestation_data(100, fork, &with_index(1))
+                .expect_err("an index of 1 before gloas");
+            assert!(
+                matches!(err, crate::error::Error::InconsistentResponse(_)),
+                "{fork:?}: failover must be able to move past it, got {err}"
+            );
+            assert!(err.to_string().contains("carries index 1"), "{err}");
+        }
+    }
+
+    /// From gloas the index is the payload signal, 0 or 1, and passes through
+    /// as the node gave it. Only a value outside that range is refused.
+    #[test]
+    fn a_gloas_index_is_zero_or_one() {
+        let fork = ForkName::Gloas;
+        assert!(validate_attestation_data(100, fork, &with_index(0)).is_ok());
+        assert!(validate_attestation_data(100, fork, &with_index(1)).is_ok());
+        let err = validate_attestation_data(100, fork, &with_index(2)).expect_err("an index of 2");
+        assert!(err.to_string().contains("at most 1"), "{err}");
+        assert!(validate_attestation_data(100, fork, &with_index(u64::MAX)).is_err());
+    }
+
+    /// Lean is not on the Beacon Chain's fork timeline and no schedule names
+    /// it, so a caller that does has a bug, reported as one rather than as a
+    /// node answering badly.
+    #[test]
+    #[should_panic(expected = "lean is not a Beacon Chain fork")]
+    fn the_lean_fork_is_a_bug_in_the_caller() {
+        let _ = validate_attestation_data(100, ForkName::Lean, &with_index(0));
+    }
 }

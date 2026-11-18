@@ -1,0 +1,247 @@
+//! EIP-3076's shared interchange test vectors
+//! (`eth-clients/slashing-protection-interchange-tests`), run against
+//! `SlashingProtection`.
+//!
+//! Each case starts from an empty record, then for every step imports the
+//! step's interchange and attempts its blocks and attestations, each of which
+//! must be allowed or refused as the case says. This client keeps EIP-3076's
+//! minimal watermarks, so the expectation read is `should_succeed`, the
+//! minimal strategy's, rather than `should_succeed_complete`.
+//!
+//! The vectors are a download: `make slashing-protection-interchange-tests`,
+//! which `make test` runs first.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Root};
+use ethlambda_validator::beacon_node::dto::parse_pubkey;
+use ethlambda_validator::slashing_protection::SlashingProtection;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Case {
+    name: String,
+    genesis_validators_root: String,
+    steps: Vec<Step>,
+}
+
+#[derive(Deserialize)]
+struct Step {
+    should_succeed: bool,
+    contains_slashable_data: bool,
+    interchange: serde_json::Value,
+    blocks: Vec<Block>,
+    attestations: Vec<Attestation>,
+}
+
+#[derive(Deserialize)]
+struct Block {
+    pubkey: String,
+    slot: String,
+    should_succeed: bool,
+}
+
+#[derive(Deserialize)]
+struct Attestation {
+    pubkey: String,
+    source_epoch: String,
+    target_epoch: String,
+    should_succeed: bool,
+}
+
+fn vectors_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../slashing-protection-interchange-tests/tests/generated")
+}
+
+#[test]
+fn eip_3076_interchange_vectors() {
+    let dir = vectors_dir();
+    assert!(
+        dir.is_dir(),
+        "{} is missing: run `make slashing-protection-interchange-tests`",
+        dir.display()
+    );
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("reads the vectors directory")
+        .map(|entry| entry.expect("reads an entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no vectors in {}", dir.display());
+
+    let failures: Vec<String> = paths
+        .iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(path).expect("reads a vector");
+            let case: Case = serde_json::from_str(&text).expect("parses a vector");
+            run(&case)
+                .err()
+                .map(|reason| format!("{}: {reason}", case.name))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} vectors failed:\n{}",
+        failures.len(),
+        paths.len(),
+        failures.join("\n")
+    );
+}
+
+fn run(case: &Case) -> Result<(), String> {
+    let root = parse_root(&case.genesis_validators_root)?;
+
+    // The vectors start from an empty database in which any validator may
+    // sign, so every key a case signs for is registered as never having signed:
+    // with no current slot, as before genesis.
+    let mut keys: Vec<BlsPubkey> = Vec::new();
+    let mut seen = HashSet::new();
+    for step in &case.steps {
+        let texts = step.blocks.iter().map(|block| &block.pubkey).chain(
+            step.attestations
+                .iter()
+                .map(|attestation| &attestation.pubkey),
+        );
+        for text in texts {
+            let pubkey = parse_pubkey(text).map_err(|err| err.to_string())?;
+            if seen.insert(pubkey.0) {
+                keys.push(pubkey);
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let mut protection =
+        SlashingProtection::open(dir.path(), root, &keys, true).map_err(|err| err.to_string())?;
+
+    for (index, step) in case.steps.iter().enumerate() {
+        let imported = protection
+            .import(&step.interchange.to_string())
+            .map_err(|err| err.to_string());
+        match (&imported, step.should_succeed) {
+            (Ok(_), true) | (Err(_), false) => {}
+            // The README lets an importer refuse an interchange holding
+            // slashable data, in which case the rest of the case is skipped.
+            // This one absorbs all of it but an attestation whose source is at
+            // or past its target, so a refusal ends the case, as it does in
+            // Lighthouse, only when the step's interchange holds one and that
+            // is what the importer says it refused. Every other refusal is a
+            // failure: skipping on the flag alone, or on the interchange
+            // alone, would pass a suite whose importer had started refusing,
+            // say, a duplicated pubkey or a surround, with that case's blocks
+            // and attestations never attempted.
+            (Err(refusal), true)
+                if step.contains_slashable_data
+                    && holds_impossible_source(&step.interchange)
+                    && refusal.contains(IMPOSSIBLE_SOURCE_REFUSAL) =>
+            {
+                return Ok(());
+            }
+            (Err(refusal), true) => {
+                return Err(format!(
+                    "step {index}: import failed but should succeed (slashable data: {}): \
+                     {refusal}",
+                    step.contains_slashable_data
+                ));
+            }
+            (Ok(_), false) => {
+                return Err(format!("step {index}: import succeeded but should fail"));
+            }
+        }
+
+        for (position, block) in step.blocks.iter().enumerate() {
+            let pubkey = parse_pubkey(&block.pubkey).map_err(|err| err.to_string())?;
+            let slot = parse_u64(&block.slot)?;
+            let allowed = protection
+                .check_and_record_block(&pubkey, slot)
+                .map_err(|err| err.to_string())?
+                .is_ok();
+            if allowed != block.should_succeed {
+                return Err(format!(
+                    "step {index}, block {position} at slot {slot}: allowed {allowed}, \
+                     expected {}",
+                    block.should_succeed
+                ));
+            }
+        }
+
+        for (position, attestation) in step.attestations.iter().enumerate() {
+            let pubkey = parse_pubkey(&attestation.pubkey).map_err(|err| err.to_string())?;
+            let source = parse_u64(&attestation.source_epoch)?;
+            let target = parse_u64(&attestation.target_epoch)?;
+            let verdicts = protection
+                .check_and_record_attestations(&[pubkey], &data(source, target))
+                .map_err(|err| err.to_string())?;
+            let allowed = verdicts.first().is_some_and(|verdict| verdict.is_ok());
+            if allowed != attestation.should_succeed {
+                return Err(format!(
+                    "step {index}, attestation {position} ({source} -> {target}): allowed \
+                     {allowed}, expected {}",
+                    attestation.should_succeed
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the importer says when it refuses an interchange for an attestation
+/// whose source is at or past its target (`slashing_protection::file`).
+const IMPOSSIBLE_SOURCE_REFUSAL: &str = "is at or after its target epoch";
+
+/// Whether `interchange` holds an attestation whose source is at or past its
+/// target outside genesis: the one shape this importer refuses rather than
+/// absorbs. The rule is restated here rather than borrowed from the crate, so
+/// that the importer widening what it refuses cannot widen what this runner
+/// forgives along with it.
+fn holds_impossible_source(interchange: &serde_json::Value) -> bool {
+    // Quoted, as EIP-3076 writes them and the vectors do, or bare, which the
+    // importer reads too.
+    let epoch = |value: &serde_json::Value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    };
+    interchange["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["signed_attestations"].as_array().into_iter().flatten())
+        .any(|attestation| {
+            let source = epoch(&attestation["source_epoch"]);
+            let target = epoch(&attestation["target_epoch"]);
+            matches!((source, target), (Some(source), Some(target)) if source >= target && source != 0)
+        })
+}
+
+/// Only the epochs are judged; the rest of the data is filler.
+fn data(source: u64, target: u64) -> AttestationData {
+    AttestationData {
+        slot: target * 32,
+        index: 0,
+        beacon_block_root: Root::ZERO,
+        source: Checkpoint {
+            epoch: source,
+            root: Root::ZERO,
+        },
+        target: Checkpoint {
+            epoch: target,
+            root: Root::ZERO,
+        },
+    }
+}
+
+fn parse_u64(text: &str) -> Result<u64, String> {
+    text.parse().map_err(|err| format!("{text:?}: {err}"))
+}
+
+fn parse_root(text: &str) -> Result<Root, String> {
+    ethlambda_validator::beacon_node::dto::parse_root(text).map_err(|err| err.to_string())
+}

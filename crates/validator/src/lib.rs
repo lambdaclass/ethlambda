@@ -7,47 +7,47 @@
 //! everything it knows about the chain arrives through the `BeaconNodeApi`
 //! trait, so it runs against any conformant node.
 //!
-//! # Deviations from the specifications
+//! # Slashing protection
 //!
-//! This client implements **no slashing protection**. It keeps no durable
-//! record of what it has signed, so a restart, or a second instance sharing the
-//! same keystores, can double-vote or propose twice for one slot. On a live
-//! network either is a slashable offence. This is a deliberate, recorded scope decision, not an oversight;
-//! see [`docs/spec_deviations.md`] for the full entry, including what is and is
-//! not covered.
-//!
-//! [`crate::attestation_guard`] and [`crate::proposal_guard`] close the part of
-//! this that is reachable within a single run: a backward wall-clock step, or a
-//! duty schedule replaced mid-epoch. Both are in-memory only and neither is a
-//! substitute for the real thing.
+//! Every block and attestation is checked against a durable, per-validator
+//! record before it is signed, and the record is on disk before the signature
+//! exists. The record keeps EIP-3076's minimal watermarks, lives next to the
+//! keys, names the chain it belongs to, and is locked to one process. See
+//! [`crate::slashing_protection`] for the rule and its guarantees, and
+//! [`docs/spec_deviations.md`] for where the minimal rule is stricter than the
+//! specification.
 //!
 //! [`docs/spec_deviations.md`]: https://github.com/lambdaclass/ethlambda/blob/main/docs/spec_deviations.md
 //!
-//! The keymanager API is affected by the same decision. Its specification makes
-//! `slashing_protection` a required field of the `DELETE /eth/v1/keystores`
-//! response, so this implementation returns a well-formed but empty EIP-3076
-//! interchange, and accepts and ignores the optional `slashing_protection`
-//! field on import.
+//! History moves in and out as EIP-3076 interchange files: through the
+//! keymanager API's `POST` and `DELETE /eth/v1/keystores`, and offline through
+//! `ethlambda slashing-protection`. A key imported with no history is
+//! registered as never having signed before it is loaded.
 
 pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
-pub mod attestation_guard;
 pub mod beacon_node;
 pub mod duties;
 pub mod error;
+pub mod exit;
 pub mod http_api;
+pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod preferences;
 pub mod proposal;
-pub mod proposal_guard;
 pub mod proposer_settings;
-pub(crate) mod secure_fs;
+pub mod registration;
+pub mod secure_fs;
 pub mod signing;
+pub mod slashing_protection;
 pub mod slot_clock;
 pub mod subscriptions;
 pub mod sync_committee;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{Error, Result};
 
@@ -57,6 +57,8 @@ use std::time::SystemTime;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, ValidatorIndex};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::aggregation::AggregationService;
@@ -68,8 +70,10 @@ use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
-use crate::proposal::ProposalService;
+use crate::preferences::PreferencesService;
+use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
+use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -95,29 +99,42 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// The gas limit every validator targets unless the keymanager API gives
+    /// it its own: its builder registrations' before gloas, and its proposer
+    /// preferences' from gloas, which is what the node's own payload is built
+    /// toward.
+    pub gas_limit: u64,
+    /// Builder proposals, or `None` when `--builder-proposals` is off.
+    pub builder: Option<BuilderProposals>,
+    /// The smallest p2p bid, in gwei, a gloas block may be built on
+    /// (`produceBlockV4`'s `min_bid`). `0` takes any bid that wins on value.
+    ///
+    /// Not part of [`BuilderProposals`]: without them a node whose local build
+    /// fails may still build on a pooled bid, and this floor applies to that
+    /// bid too.
+    pub builder_min_bid: u64,
+    /// Register keys that have no slashing-protection record as never having
+    /// signed, instead of refusing to start. See
+    /// [`slashing_protection::SlashingProtection::open`].
+    pub init_slashing_protection: bool,
+}
+
+/// Builder proposals: register each validator with the beacon node's builder
+/// and accept a blinded block when the builder's bid wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuilderProposals {
+    /// The `builder_boost_factor` sent with every block request (in the query
+    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
+    /// bid and the local payload as they are; `u64::MAX` takes the builder
+    /// whenever there is a bid.
+    pub boost_factor: u64,
 }
 
 /// Run the validator client until the process is stopped.
 pub async fn run(config: ValidatorConfig) -> Result<()> {
     metrics::init();
 
-    // Said once, at startup, before anything is loaded or signed.
-    //
-    // Until now this client's most consequential property was recorded only in
-    // a rustdoc comment on this module, which nobody running a binary reads.
-    // An operator can build this, point it at mainnet keys, and never meet the
-    // warning. `warn!` rather than `info!` because the consequence is losing
-    // stake, and it is unconditional rather than behind a flag because a
-    // warning an operator can silence is one they will.
-    warn!(
-        "This validator client keeps NO slashing-protection record. It cannot detect that a \
-         previous run, or another client holding these keys, already signed. Running the same \
-         keys here and anywhere else, or restarting into a state where the chain has moved, can \
-         produce a slashable double vote or a double block proposal. Do not use these keys in \
-         any other client while this one runs. See docs/spec_deviations.md."
-    );
-
-    // Said at startup for the same reason the warning above is: an operator
+    // Said at startup, where an operator reads it: an operator
     // who never sets this proposes blocks that pay their execution-layer
     // rewards to whatever address their beacon node was configured with, which
     // on a default configuration is nobody useful. It is silent money, and
@@ -130,10 +147,27 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              keymanager API."
         );
     }
-    let settings = Arc::new(ProposerSettings::new(
-        config.graffiti,
-        config.suggested_fee_recipient,
-    ));
+    // Accepted, as every other client's flag accepts it, but said loudly:
+    // nobody holds the zero address's key, so what it is paid is burned, and
+    // a builder registration or proposer preference signs that into a
+    // commitment the builder honours. Only the default can be zero, since the
+    // keymanager API refuses it for a single validator.
+    if config.suggested_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--suggested-fee-recipient is the zero address. Every validator without its own \
+             address burns its execution-layer rewards, and builder registrations and proposer \
+             preferences sign that address for the builder to pay."
+        );
+    }
+    let settings = Arc::new(
+        ProposerSettings::new(config.graffiti, config.suggested_fee_recipient)
+            .with_default_gas_limit(config.gas_limit),
+    );
+
+    // The directory's lock first, before any key is read: held from here,
+    // nothing another process does to the directory can get between what
+    // this one loads and what it signs with. See `SlashingProtection::lock`.
+    let record_lock = slashing_protection::SlashingProtection::lock(&config.validators_dir)?;
 
     let discovered = keys::definitions::ValidatorDefinitions::discover_if_absent(
         &config.validators_dir,
@@ -188,22 +222,85 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         attestation_due_bps = spec.attestation_due_bps,
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
+        gas_limit = config.gas_limit,
         "Validator client starting"
     );
 
     let clock = SlotClock::from_config(genesis.genesis_time, &spec);
+
+    // After the beacon node names the chain, which the record must belong to,
+    // and before any service that signs exists. Every loaded key must already
+    // have a record, unless the operator said otherwise.
+    let keys = store.read().await.pubkeys();
+    let protection = slashing_protection::SlashingProtection::open_locked(
+        record_lock,
+        &config.validators_dir,
+        genesis.genesis_validators_root,
+        &keys,
+        config.init_slashing_protection,
+    )?;
+    info!(
+        validators = protection.len(),
+        path = %protection.path().map(|path| path.display().to_string()).unwrap_or_default(),
+        "Slashing protection loaded"
+    );
+    let protection = slashing_protection::SharedProtection::new(protection);
+
     let context = Arc::new(SigningContext {
         config: spec,
         genesis_validators_root: genesis.genesis_validators_root,
     });
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
-    let attestation = AttestationService::new(beacon_node.clone(), context.clone());
+    let attestation =
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
-    let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
 
+    // Unconditional, as Lighthouse does: from gloas the preferences carry the
+    // fee recipient of every proposal, builders or not. See the module doc.
+    let preferences = Arc::new(
+        PreferencesService::new(beacon_node.clone(), context.clone(), settings.clone())
+            .with_clock(clock.clone()),
+    );
+
+    let proposal = ProposalService::new(
+        beacon_node.clone(),
+        context.clone(),
+        settings.clone(),
+        protection.clone(),
+        config.builder.map(|builder| builder.boost_factor),
+    )
+    .with_clock(clock.clone())
+    .with_builder_min_bid(config.builder_min_bid)
+    .with_preferences(preferences.clone());
+    let registration = config.builder.map(|builder| {
+        info!(
+            boost_factor = builder.boost_factor,
+            min_bid_gwei = config.builder_min_bid,
+            "Builder proposals on: registering validators and accepting blinded blocks"
+        );
+        Arc::new(RegistrationService::new(
+            beacon_node.clone(),
+            context.clone(),
+            settings.clone(),
+        ))
+    });
+    // Logged above when builder proposals are on.
+    if config.builder.is_none() && config.builder_min_bid > 0 {
+        info!(
+            min_bid_gwei = config.builder_min_bid,
+            "Builder proposals off; --builder-min-bid still applies to a p2p bid taken when the local \
+             payload cannot be built"
+        );
+    }
+
+    // Cancelled when the duty loop below ends, whatever ended it: the
+    // keymanager server then stops accepting requests and finishes the ones
+    // in flight, and `run` waits for it before returning.
+    let shutdown = CancellationToken::new();
+    let mut keymanager = None;
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
         let context = http_api::KeymanagerContext {
@@ -212,6 +309,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            beacon_node: beacon_node.clone(),
+            signing: context.clone(),
+            clock: clock.clone(),
+            definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            protection: protection.clone(),
         };
         let router = http_api::router(context, token);
         let listener = tokio::net::TcpListener::bind(address)
@@ -221,117 +323,221 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 source,
             })?;
         info!(%address, "Keymanager API listening");
-        tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, router).await {
+        let shutdown = shutdown.clone();
+        keymanager = Some(tokio::spawn(async move {
+            if let Err(err) = http_api::serve(listener, router, shutdown).await {
                 error!(%err, "Keymanager API stopped");
             }
-        });
+        }));
     }
 
-    let mut last_epoch: Option<u64> = None;
-    // The slot whose duties were last attempted, so an overrunning slot does
-    // not cost the next one as well. See `SlotClock::next_slot_to_serve`.
-    let mut served: Option<u64> = None;
+    // The duty loop, as a future that ends only with the error that stopped
+    // it. Not awaited here: `run_until_stopped` races it against the
+    // slashing-protection record becoming unusable.
+    let duty_loop = async {
+        let mut last_epoch: Option<u64> = None;
+        // The slot whose duties were last attempted, so an overrunning slot does
+        // not cost the next one as well. See `SlotClock::next_slot_to_serve`.
+        let mut served: Option<u64> = None;
 
-    loop {
-        // One wake per slot, at the slot boundary, rather than one at the
-        // attester offset.
-        //
-        // A slot has more than one thing due in it and they are due at
-        // different points: a proposer publishes at the boundary, every
-        // attester votes one third in. A loop woken only at the attester
-        // offset can never propose, because by the time it runs the slot it
-        // would be proposing for is already a third gone.
-        //
-        // Waking at the boundary and sleeping further in reaches both, and
-        // gives the epoch refresh below a third of a slot of headroom it did
-        // not have when it ran at the attester offset itself, where every
-        // second it took came straight out of the attestation's lateness.
-        let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
-        tokio::time::sleep(delay).await;
-        served = Some(slot);
+        loop {
+            // One wake per slot, at the slot boundary, rather than one at the
+            // attester offset.
+            //
+            // A slot has more than one thing due in it and they are due at
+            // different points: a proposer publishes at the boundary, every
+            // attester votes one third in. A loop woken only at the attester
+            // offset can never propose, because by the time it runs the slot it
+            // would be proposing for is already a third gone.
+            //
+            // Waking at the boundary and sleeping further in reaches both, and
+            // gives the epoch refresh below a third of a slot of headroom it did
+            // not have when it ran at the attester offset itself, where every
+            // second it took came straight out of the attestation's lateness.
+            let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
+            tokio::time::sleep(delay).await;
+            served = Some(slot);
 
-        let epoch = clock.epoch_of(slot);
+            let epoch = clock.epoch_of(slot);
 
-        if last_epoch != Some(epoch) {
-            // Snapshot the pubkeys and let the guard drop right here, before
-            // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
-            // validator lookup, a subscription POST). Passing the guard
-            // itself in used to extend it across that whole call, because
-            // `&*store.read().await` as a match scrutinee has its temporary
-            // lifetime extended to the entire match. Holding a read lock
-            // that long lets the keymanager's write lock
-            // (`http_api::keystores::import`, held across slow EIP-2335
-            // derivation) queue ahead of it, and since `tokio::sync::RwLock`
-            // is write-preferring, every read after that point, including
-            // this one next epoch, would starve until the import finished.
-            let pubkeys = store.read().await.pubkeys();
-            let refreshed = refresh_epoch(
-                &beacon_node,
-                &mut duties,
-                &pubkeys,
-                epoch,
-                &settings,
-                &store,
-                &context,
-            );
-            match refreshed.await {
-                Ok(()) => last_epoch = Some(epoch),
-                // A beacon node that is down, syncing or answering badly will
-                // likely answer next epoch, so keep the schedule already held
-                // and try again. Anything else will not fix itself, and looping
-                // on it would hide the cause behind a warning every slot.
-                Err(err) if err.is_retryable() => {
-                    warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
-                    metrics::set_beacon_node_available(false);
-                }
-                // Unreachable today: every error `refresh_epoch` can produce
-                // comes from a `BeaconNodeApi` call, and every variant those
-                // raise is classified retryable (see `Error::is_retryable`).
-                // Kept rather than deleted, since it is the only thing that
-                // would stop the process if a future non-retryable failure
-                // (a local config or key problem, say) ever reached this
-                // point; do not remove it as unreachable dead code.
-                Err(err) => {
-                    error!(%epoch, %err, "Cannot refresh duties; stopping");
-                    return Err(err);
+            if last_epoch != Some(epoch) {
+                // Snapshot the pubkeys and let the guard drop right here, before
+                // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
+                // validator lookup, a subscription POST). Passing the guard
+                // itself in used to extend it across that whole call, because
+                // `&*store.read().await` as a match scrutinee has its temporary
+                // lifetime extended to the entire match. Holding a read lock
+                // that long lets the keymanager's write lock
+                // (`http_api::keystores::import`, held across slow EIP-2335
+                // derivation) queue ahead of it, and since `tokio::sync::RwLock`
+                // is write-preferring, every read after that point, including
+                // this one next epoch, would starve until the import finished.
+                let pubkeys = store.read().await.pubkeys();
+                let refreshed = refresh_epoch(
+                    &beacon_node,
+                    &mut duties,
+                    &pubkeys,
+                    epoch,
+                    &settings,
+                    &store,
+                    &context,
+                );
+                match refreshed.await {
+                    Ok(resolved) => {
+                        last_epoch = Some(epoch);
+                        // Only after a refresh that got all the way through, so a
+                        // failing one does not respawn a full send every slot, and
+                        // spawned so a slow or hung node never delays this epoch's
+                        // duties: a missed registration costs at most a builder
+                        // block, never a duty.
+                        if let Some(registration) = &registration {
+                            let registration = registration.clone();
+                            let store = store.clone();
+                            tokio::spawn(registration.register_all(epoch, resolved, store));
+                        }
+                    }
+                    // A beacon node that is down, syncing or answering badly will
+                    // likely answer next epoch, so keep the schedule already held
+                    // and try again. Anything else will not fix itself, and looping
+                    // on it would hide the cause behind a warning every slot.
+                    Err(err) if err.is_retryable() => {
+                        warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
+                        metrics::set_beacon_node_available(false);
+                    }
+                    // Unreachable today: every error `refresh_epoch` can produce
+                    // comes from a `BeaconNodeApi` call, and every variant those
+                    // raise is classified retryable (see `Error::is_retryable`).
+                    // Kept rather than deleted, since it is the only thing that
+                    // would stop the process if a future non-retryable failure
+                    // (a local config or key problem, say) ever reached this
+                    // point; do not remove it as unreachable dead code.
+                    Err(err) => {
+                        error!(%epoch, %err, "Cannot refresh duties; stopping");
+                        return err;
+                    }
                 }
             }
+
+            // A block is due now, at the boundary this iteration woke on.
+            //
+            // Cloned out of `duties` so the borrow ends before the await: the duty
+            // is three small fields, and holding a borrow of the schedule across
+            // the proposal would stop the next epoch's refresh from replacing it.
+            if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
+                propose(&proposal, &clock, slot, &duty, &store).await;
+            }
+
+            // Right after the proposal and ahead of the slot's other duties: the
+            // preferences for the slots after this one must be out before those
+            // slots start (gossip IGNOREs a started slot), and the poll's v2 duties
+            // fetch for the next epoch can make the node advance a state, which
+            // should not compete with it producing this slot's block. Off the slot
+            // loop, since it is single-flight and a slow node must not delay this
+            // slot's duties.
+            tokio::spawn(preferences.clone().poll(slot, store.clone()));
+
+            // The rest of the way to the first of the slot's remaining duties:
+            // the attester offset, or the sync committee offset when the network
+            // puts it earlier. Zero if the refresh or the proposal above already
+            // ran past it, in which case the duty is late rather than skipped.
+            // Each branch of `serve_slot_duties` waits for its own offset.
+            tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+
+            let slot_duties = duties.at_slot(slot, epoch);
+            let committee = duties.ptc_at_slot(slot, epoch);
+            let sync_duties = duties.sync_at_slot(slot);
+            serve_slot_duties(
+                &attestation,
+                &aggregation,
+                &payload_attestation,
+                &sync_committee,
+                &clock,
+                slot,
+                &slot_duties,
+                &committee,
+                &sync_duties,
+                &store,
+            )
+            .await;
+
+            // Off the slot loop, like the epoch's full send: a keymanager change
+            // to a fee recipient or gas limit reaches the builder within a slot,
+            // and a slow node cannot delay the next slot's duties.
+            if let Some(registration) = &registration {
+                tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
+            }
         }
+    };
 
-        // A block is due now, at the boundary this iteration woke on.
-        //
-        // Cloned out of `duties` so the borrow ends before the await: the duty
-        // is three small fields, and holding a borrow of the schedule across
-        // the proposal would stop the next epoch's refresh from replacing it.
-        if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
-            propose(&proposal, &clock, slot, &duty, &store).await;
+    Err(run_until_stopped(duty_loop, &protection, shutdown, keymanager).await)
+}
+
+/// How long the keymanager gets to finish its requests in flight once the
+/// client is stopping.
+///
+/// Generous on purpose. An import decrypts every keystore of its batch before
+/// it registers any, tens of seconds for a full one, and cut short between
+/// saving its keys and registering them it leaves keys the next start
+/// refuses. Nothing waits this long unless a request really is in flight, and
+/// one that never ends must not keep a stopped client from being restarted.
+const KEYMANAGER_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `duties` until they stop on their own or the slashing-protection
+/// record becomes unusable, then let the keymanager finish, and say why the
+/// client stopped.
+///
+/// # Stopping on an unusable record
+///
+/// A poisoned record signs no attestation and no block for the rest of the
+/// process (see [`slashing_protection::SharedProtection`]). Carrying on would
+/// leave a client that answers `/health` and does not attest, which nothing
+/// that supervises it has a reason to touch; stopping hands systemd or
+/// Kubernetes the restart. The duties are dropped where they stand, at once,
+/// since the access that poisons the record is the one that raises the
+/// signal. Dropping them is safe for the reason abandoning one at its
+/// deadline is: whatever was signed was recorded first.
+///
+/// # The keymanager goes last
+///
+/// Returning from [`run`] drops the runtime, and a request dropped with it
+/// stops at whichever await it was parked on. For an import that can be
+/// between saving its keys and registering them, the one place it must not
+/// stop (see [`http_api::serve`]). So the server is told to stop and waited
+/// for: on a poisoned record the import's registration fails, and it takes
+/// its keys off disk again before it answers.
+async fn run_until_stopped(
+    duties: impl Future<Output = Error>,
+    protection: &slashing_protection::SharedProtection,
+    shutdown: CancellationToken,
+    keymanager: Option<JoinHandle<()>>,
+) -> Error {
+    let stopped = tokio::select! {
+        err = duties => err,
+        () = protection.unusable() => {
+            let err = Error::SlashingProtectionUnusable {
+                reason: "an access panicked while holding the record, so no attestation or \
+                         block is signed until the validator client is restarted"
+                    .to_string(),
+            };
+            error!(%err, "Stopping so the validator client can be restarted");
+            err
         }
+    };
 
-        // The rest of the way to the first of the slot's remaining duties:
-        // the attester offset, or the sync committee offset when the network
-        // puts it earlier. Zero if the refresh or the proposal above already
-        // ran past it, in which case the duty is late rather than skipped.
-        // Each branch of `serve_slot_duties` waits for its own offset.
-        tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
-
-        let slot_duties = duties.at_slot(slot, epoch);
-        let committee = duties.ptc_at_slot(slot, epoch);
-        let sync_duties = duties.sync_at_slot(slot);
-        serve_slot_duties(
-            &attestation,
-            &aggregation,
-            &payload_attestation,
-            &sync_committee,
-            &clock,
-            slot,
-            &slot_duties,
-            &committee,
-            &sync_duties,
-            &store,
-        )
-        .await;
+    shutdown.cancel();
+    if let Some(keymanager) = keymanager {
+        match tokio::time::timeout(KEYMANAGER_DRAIN, keymanager).await {
+            Ok(joined) => {
+                let _ =
+                    joined.inspect_err(|err| error!(%err, "Keymanager API failed while stopping"));
+            }
+            Err(_) => warn!(
+                waited_s = KEYMANAGER_DRAIN.as_secs(),
+                "Keymanager API still has a request in flight; stopping without it"
+            ),
+        }
     }
+    stopped
 }
 
 /// Everything a slot owes after its proposal: attest and aggregate, then the
@@ -462,7 +668,7 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     // also delays the next slot's is worth less than nothing.
     //
     // Dropping the future mid-flight is safe here specifically because of
-    // `AttestationGuard`: it records at signing time, so a duty abandoned
+    // slashing protection: it records before signing, so a duty abandoned
     // between signing and submission cannot be re-signed next slot under
     // the same target. That is the intended outcome and matches `attest`'s
     // own "do not retry within a slot" rule; the attestation is simply
@@ -620,13 +826,13 @@ async fn aggregate<B: BeaconNodeApi>(
 /// So: a proposal that overruns is abandoned, and the slot's attesters still
 /// vote. Dropping the future mid-flight is safe for the same reason it is on
 /// the attestation path, and only for that reason: `ProposalService` records
-/// the slot in its guard at signing time, so a block abandoned between signing
-/// and publication cannot be signed a second time.
+/// the slot in slashing protection before signing, so a block abandoned between
+/// signing and publication cannot be signed a second time.
 ///
 /// Failures are logged and counted rather than propagated. A proposal is one
 /// slot's work; losing it must not stop the client attesting for the rest of
 /// the epoch.
-async fn propose<B: BeaconNodeApi>(
+async fn propose<B: BeaconNodeApi + 'static>(
     proposal: &ProposalService<B>,
     clock: &SlotClock,
     slot: u64,
@@ -634,19 +840,28 @@ async fn propose<B: BeaconNodeApi>(
     store: &RwLock<ValidatorStore>,
 ) {
     let budget = clock.until_attestation(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, proposal.propose(slot, duty, store));
-    match attempt.await {
-        Ok(Ok(_)) => {
-            let elapsed = SystemTime::now()
-                .duration_since(clock.start_of(slot))
-                .unwrap_or_default();
-            metrics::observe_block_publication_delay(elapsed.as_secs_f64());
+    let deadline = tokio::time::Instant::now() + budget;
+    match proposal.propose_by(slot, duty, store, deadline).await {
+        // The service took the delay when the node accepted the block: a
+        // full one's before a gloas envelope's publish, a blinded one's in
+        // the task that published it.
+        Ok(Proposed::Full(_) | Proposed::Blinded(BlindedOutcome::Published(_))) => {}
+        // Already logged at error and counted on its own series; the block
+        // may well be out, so it is neither a published-in-time delay nor a
+        // failure.
+        Ok(Proposed::Blinded(BlindedOutcome::Unconfirmed)) => {}
+        // The beacon node waits up to 5 s for the relay, which can outlast
+        // this budget. Not a missed proposal: the publish goes on, on its own
+        // task, which reports and counts the real outcome.
+        Ok(Proposed::Blinded(BlindedOutcome::StillPublishing)) => {
+            info!(
+                %slot,
+                validator = duty.validator_index,
+                budget_ms = budget.as_millis() as u64,
+                "Blinded block signed; its publish outlived the proposal budget and continues"
+            );
         }
-        Ok(Err(err)) => {
-            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
-            metrics::inc_block_proposal_failures();
-        }
-        Err(_) => {
+        Err(Error::ProposalDeadline { .. }) => {
             warn!(
                 %slot,
                 validator = duty.validator_index,
@@ -655,11 +870,19 @@ async fn propose<B: BeaconNodeApi>(
             );
             metrics::inc_block_proposal_failures();
         }
+        Err(err) => {
+            error!(%slot, validator = duty.validator_index, %err, "Failed to propose this slot's block");
+            metrics::inc_block_proposal_failures();
+        }
     }
 }
 
 /// Resolve any newly activated validators, refresh the duty schedule, and
 /// re-send subnet subscriptions if it moved.
+///
+/// Returns the pubkeys a builder registration is signed for: those the beacon
+/// node resolved to an index whose validator is pending or active (see
+/// [`is_registrable`]).
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -668,12 +891,12 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     settings: &ProposerSettings,
     store: &RwLock<ValidatorStore>,
     context: &SigningContext,
-) -> Result<()> {
+) -> Result<Vec<BlsPubkey>> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if beacon_node.is_optimistic_or_syncing().await? {
@@ -744,7 +967,22 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
-    Ok(())
+    let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
+    Ok(registrable.map(|entry| entry.pubkey).collect())
+}
+
+/// Whether a validator whose Beacon API `status` is this one is sent a builder
+/// registration: one that is pending or active, not one that exited or was
+/// withdrawn.
+///
+/// The flashbots relay refuses a whole registration request over one key it
+/// does not know, and it knows only pending and active validators, so one
+/// exited key would cost every other in its batch of up to
+/// [`beacon_node::REGISTRATION_BATCH`]. Teku's validator client leaves exited
+/// keys out the same way, and Lighthouse's beacon node drops them before
+/// forwarding; a node that forwards as it gets would otherwise pass them on.
+fn is_registrable(status: &str) -> bool {
+    status.starts_with("pending") || status.starts_with("active")
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -1046,6 +1284,64 @@ mod tests {
         );
     }
 
+    /// Only pending and active validators get a builder registration: the
+    /// flashbots relay refuses a whole batch over one key it does not know, and
+    /// it knows no exited or withdrawn one. Proposer preparations still go to
+    /// every resolved validator.
+    #[tokio::test]
+    async fn only_pending_and_active_validators_are_registered() {
+        let mut node = node();
+        node.validators[1].status = "exited_unslashed".to_string();
+        node.validators.push(ValidatorEntry {
+            index: 33,
+            pubkey: pubkey(3),
+            status: "pending_queued".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 44,
+            pubkey: pubkey(4),
+            status: "withdrawal_done".to_string(),
+        });
+        // Exiting and slashed are still active: the relay loads validators
+        // with `status=active,pending`, which takes in both.
+        node.validators.push(ValidatorEntry {
+            index: 55,
+            pubkey: pubkey(5),
+            status: "active_exiting".to_string(),
+        });
+        node.validators.push(ValidatorEntry {
+            index: 66,
+            pubkey: pubkey(6),
+            status: "active_slashed".to_string(),
+        });
+        let node = Arc::new(node);
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [
+            pubkey(1),
+            pubkey(2),
+            pubkey(3),
+            pubkey(4),
+            pubkey(5),
+            pubkey(6),
+        ];
+        let settings = settings(Some(H160([0xab; 20])));
+
+        let registered = refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings,
+            &empty_store(),
+            &context(),
+        )
+        .await
+        .expect("refreshes");
+
+        assert_eq!(registered, vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]);
+        assert_eq!(node.preparations().len(), 6);
+    }
+
     /// With nothing resolved there is nobody to register, and an empty array
     /// must not be posted: it is a request that can only fail or do nothing.
     #[tokio::test]
@@ -1197,7 +1493,11 @@ mod tests {
         }];
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
@@ -1335,7 +1635,11 @@ mod tests {
         }];
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
@@ -1371,7 +1675,11 @@ mod tests {
         let store = empty_store();
 
         serve_slot_duties(
-            &AttestationService::new(node.clone(), context.clone()),
+            &AttestationService::new(
+                node.clone(),
+                context.clone(),
+                slashing_protection::SlashingProtection::in_memory(),
+            ),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
@@ -1384,5 +1692,115 @@ mod tests {
         )
         .await;
         assert_eq!(node.payload_attestation_data_call_count(), 0);
+    }
+
+    // Stopping.
+
+    /// Stands in for the keymanager server with a request in flight: told to
+    /// stop, it takes `work` to finish, and the flag says when it has.
+    fn keymanager_finishing_in(
+        shutdown: &CancellationToken,
+        work: std::time::Duration,
+    ) -> (JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let finished = finished.clone();
+            async move {
+                shutdown.cancelled().await;
+                tokio::time::sleep(work).await;
+                finished.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        (handle, finished)
+    }
+
+    /// A record poisoned by one of its accesses stops duties that would
+    /// otherwise never end, and the client is not reported stopped until the
+    /// keymanager has finished what it had in flight.
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_record_stops_the_client_once_the_keymanager_has_finished() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let (keymanager, finished) =
+            keymanager_finishing_in(&shutdown, std::time::Duration::from_secs(5));
+
+        slashing_protection::blocking(&protection, |_| -> Result<()> {
+            panic!("a bug in the record")
+        })
+        .await
+        .expect_err("the access panicked");
+
+        let stopped = run_until_stopped(
+            std::future::pending(),
+            &protection,
+            shutdown.clone(),
+            Some(keymanager),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
+            "got {stopped}"
+        );
+        assert!(shutdown.is_cancelled(), "the keymanager was told to stop");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::Acquire),
+            "its request in flight finishes before the client stops"
+        );
+    }
+
+    /// Duties that end on their own leave the same way: with the error that
+    /// ended them, after the keymanager has finished.
+    #[tokio::test(start_paused = true)]
+    async fn duties_that_stop_on_their_own_also_wait_for_the_keymanager() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let (keymanager, finished) =
+            keymanager_finishing_in(&shutdown, std::time::Duration::from_secs(5));
+
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            shutdown,
+            Some(keymanager),
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// A request that never ends does not keep a stopped client from being
+    /// restarted: the wait for the keymanager is bounded.
+    #[tokio::test(start_paused = true)]
+    async fn a_keymanager_that_never_finishes_does_not_hold_the_client_up() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let keymanager = tokio::spawn(std::future::pending::<()>());
+
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            CancellationToken::new(),
+            Some(keymanager),
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert_eq!(before.elapsed(), KEYMANAGER_DRAIN);
+    }
+
+    /// With no keymanager there is nothing to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_without_a_keymanager_waits_for_nothing() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            async { Error::BeaconNodeSyncing },
+            &protection,
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert_eq!(before.elapsed(), std::time::Duration::ZERO);
     }
 }
