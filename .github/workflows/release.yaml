@@ -275,7 +275,7 @@ jobs:
           push-to-registry: true
 
   build-binaries:
-    name: Build binary (${{ matrix.target.name }})
+    name: Build binary (${{ matrix.target.name }}, ${{ matrix.variant.name }})
     needs: meta
     strategy:
       matrix:
@@ -288,7 +288,20 @@ jobs:
             name: linux-aarch64
           - runner: macos-latest
             name: macos-aarch64
+        # Every platform ships twice: ethlambda alone, and ethlambda with ethrex
+        # embedded as the beacon node's execution client (`include-ethrex`, see
+        # docs/ethrex.md). Both asset names start with `ethlambda-`, which is
+        # what github-release downloads, checksums and verifies by.
+        variant:
+          - name: default
+            asset: ethlambda
+            features: ""
+          - name: ethrex
+            asset: ethlambda-ethrex
+            features: ethlambda/include-ethrex
     runs-on: ${{ matrix.target.runner }}
+    env:
+      ASSET: ${{ matrix.variant.asset }}-${{ matrix.target.name }}
 
     steps:
       - name: Checkout repository
@@ -309,19 +322,36 @@ jobs:
         env:
           # A tag checkout is detached, so vergen would report "HEAD".
           VERGEN_GIT_BRANCH: ${{ needs.meta.outputs.channel }}
-        run: cargo build --release --locked --bin ethlambda
+          FEATURES: ${{ matrix.variant.features }}
+        run: cargo build --release --locked --bin ethlambda --features "$FEATURES"
 
       - name: Package binary
+        env:
+          EMBEDS_ETHREX: ${{ matrix.variant.name == 'ethrex' }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp target/release/ethlambda "dist/ethlambda-${{ matrix.target.name }}"
-          "dist/ethlambda-${{ matrix.target.name }}" --version
+          cp target/release/ethlambda "dist/$ASSET"
+          "dist/$ASSET" --version
+
+          # Both builds report the same version, so a feature that did not take
+          # would ship two identical binaries under different names. Only a
+          # build with ethrex embedded takes the `--ethrex.*` flags. The help
+          # text is captured first: `grep -q` stops reading at the first match,
+          # and under pipefail the writer's SIGPIPE would fail the pipe.
+          help=$("dist/$ASSET" beacon --help)
+          embeds=false
+          if grep -q -- '--ethrex\.' <<< "$help"; then embeds=true; fi
+          if [ "$embeds" != "$EMBEDS_ETHREX" ]; then
+            echo "::error::$ASSET: takes --ethrex.* flags: $embeds, expected $EMBEDS_ETHREX"
+            exit 1
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: ethlambda-${{ matrix.target.name }}
-          path: dist/ethlambda-${{ matrix.target.name }}
+          name: ${{ env.ASSET }}
+          path: dist/${{ env.ASSET }}
           if-no-files-found: error
 
   changelog:
@@ -450,7 +480,7 @@ jobs:
 
           **Docker image:** \`$IMAGE\` (amd64 and arm64)
 
-          **Binaries:** attached below, with their \`SHA256SUMS\`. The \`linux-x86_64\` build targets x86-64-v3, so it needs a CPU with AVX2 (Haswell or later).
+          **Binaries:** attached below, with their \`SHA256SUMS\`, in two builds per platform. \`ethlambda-<platform>\` is ethlambda alone. \`ethlambda-ethrex-<platform>\` embeds [ethrex](https://github.com/lambdaclass/ethrex) as the beacon node's execution client, so \`ethlambda beacon\` needs no separate one; see [docs/ethrex.md](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/ethrex.md). The \`linux-x86_64\` builds target x86-64-v3, so they need a CPU with AVX2 (Haswell or later).
 
           **Verifying:** the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
 
