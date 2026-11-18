@@ -44,8 +44,8 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 
 use super::{
-    IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
-    is_gloas_slot, verify_attestation_payload_status,
+    IgnoreReason, Outcome, Prepared, RejectReason, ancestor_at, is_current_or_previous_epoch,
+    is_future_slot, is_gloas_slot, verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::config::Config;
@@ -169,24 +169,45 @@ pub fn cheap_checks(
 /// vote block's own cached post-state rather than the head's, and why the
 /// pubkey-only signature check runs before any committee derivation.
 pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id: u64) -> Outcome {
+    match prepare_stateful_checks(store, attestation, subnet_id).resolve() {
+        Ok(()) => Outcome::Accept,
+        Err(outcome) => outcome,
+    }
+}
+
+/// [`stateful_checks`] without evaluating the attester's signature: a
+/// [`Prepared`] whose steps are the rules in their original order, the
+/// signature among them.
+///
+/// Every other rule runs here, ahead of the pairing, so the committee cache
+/// is consulted even for a message whose signature will turn out forged. That
+/// is the price of letting the pairings of many messages be batched; the
+/// verdict is unchanged, since resolution takes the first failure in the
+/// original order.
+pub fn prepare_stateful_checks(
+    store: &Store,
+    attestation: &SingleAttestation,
+    subnet_id: u64,
+) -> Prepared<()> {
+    let mut prepared = Prepared::default();
     let data = &attestation.data;
     let beacon_block_root = data.beacon_block_root;
 
     // [IGNORE] The block being voted for has been seen.
     if !store.has_block(&beacon_block_root) {
-        return Outcome::Ignore(IgnoreReason::UnknownBlock);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::UnknownBlock));
     }
     let Some(state) = store.cached_state(CacheKey::BlockState(beacon_block_root)) else {
-        return Outcome::Ignore(IgnoreReason::StateUnavailable);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::StateUnavailable));
     };
 
     let target_epoch = data.target.epoch;
     let config = store.config();
 
-    // The pubkey-only signature, before any committee derivation, under the
-    // schedule's domain: the voted block's state may predate the target's fork.
+    // The pubkey-only signature, under the schedule's domain: the voted
+    // block's state may predate the target's fork.
     let Ok(attester) = state.validator(attestation.attester_index) else {
-        return Outcome::Reject(RejectReason::UnknownValidator);
+        return prepared.fail(Outcome::Reject(RejectReason::UnknownValidator));
     };
     let domain = get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
@@ -194,16 +215,17 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
         index: attestation.attester_index,
         pubkey: attester.pubkey,
     };
-    if !bls::verify(&attester, signing_root, &attestation.signature) {
-        return Outcome::Reject(RejectReason::BadSignature);
-    }
+    prepared.signature(
+        bls::SignatureSet::single(&attester, signing_root, &attestation.signature),
+        Outcome::Reject(RejectReason::BadSignature),
+    );
 
     // Committees for the target epoch, through the shared cache.
     let committees = store.committee_cache();
     let epoch_committees = committees.committees(&state, target_epoch);
     // [REJECT] The committee index is within range.
     if attestation.committee_index >= epoch_committees.committees_per_slot() {
-        return Outcome::Reject(RejectReason::CommitteeIndex);
+        return prepared.fail(Outcome::Reject(RejectReason::CommitteeIndex));
     }
     // [New in Electra:EIP7549] [REJECT] The correct subnet.
     let expected_subnet = compute_subnet_for_attestation(
@@ -213,36 +235,36 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
         &config,
     );
     if expected_subnet != subnet_id {
-        return Outcome::Reject(RejectReason::WrongSubnet);
+        return prepared.fail(Outcome::Reject(RejectReason::WrongSubnet));
     }
     let Ok(committee) = epoch_committees.committee(data.slot, attestation.committee_index) else {
         // `committee_index` and `data.slot`'s epoch were both just checked
         // against this same `epoch_committees`, so this cannot fail.
-        return Outcome::Ignore(IgnoreReason::Internal);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::Internal));
     };
     // [New in Electra:EIP7549] [REJECT] The attester is a member of the
     // named committee.
     if !committee.contains(&attestation.attester_index) {
-        return Outcome::Reject(RejectReason::NotInCommittee);
+        return prepared.fail(Outcome::Reject(RejectReason::NotInCommittee));
     }
 
     // Ancestry, via the vote state's own history.
     let target_start_slot = compute_start_slot_at_epoch(target_epoch);
     // [REJECT] The target is the vote block's ancestor at the target epoch.
     let Some(checkpoint_block) = ancestor_at(&state, beacon_block_root, target_start_slot) else {
-        return Outcome::Ignore(IgnoreReason::AncestryUnknown);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::AncestryUnknown));
     };
     if checkpoint_block != data.target.root {
-        return Outcome::Reject(RejectReason::TargetNotAncestor);
+        return prepared.fail(Outcome::Reject(RejectReason::TargetNotAncestor));
     }
     // [IGNORE] The finalized checkpoint is an ancestor of the vote block.
     let finalized = store.beacon_finalized_checkpoint();
     let finalized_start_slot = compute_start_slot_at_epoch(finalized.epoch);
     let Some(finalized_block) = ancestor_at(&state, beacon_block_root, finalized_start_slot) else {
-        return Outcome::Ignore(IgnoreReason::AncestryUnknown);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::AncestryUnknown));
     };
     if finalized_block != finalized.root {
-        return Outcome::Ignore(IgnoreReason::FinalizedNotAncestor);
+        return prepared.fail(Outcome::Ignore(IgnoreReason::FinalizedNotAncestor));
     }
 
     // [New in Gloas:EIP7732] The attested payload status is consistent with the
@@ -250,10 +272,10 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
     if is_gloas_slot(&store.config(), data.slot)
         && let Err(outcome) = verify_attestation_payload_status(store, data)
     {
-        return outcome;
+        return prepared.fail(outcome);
     }
 
-    Outcome::Accept
+    prepared.accept(())
 }
 
 /// `cheap_checks` then `stateful_checks`, for callers with no reason to
@@ -442,8 +464,10 @@ mod tests {
     /// A vote cast in a fork's first slot while that slot has no block: the
     /// voted block, and so the state it is checked against, is still the
     /// previous fork's, but the vote is signed under the new fork's version.
-    #[test]
-    fn a_vote_across_a_fork_boundary_verifies_under_the_new_forks_version() {
+    ///
+    /// Returns the store holding the voted block's state, the correctly signed
+    /// vote, and the subnet it belongs on.
+    fn signed_vote_across_a_fork_boundary() -> (Store, SingleAttestation, u64) {
         use crate::beacon::containers::shared::{AttestationData, Checkpoint, Fork};
         use crate::beacon::containers::{SignedBeaconBlock, electra};
         use crate::beacon::fork::ForkName;
@@ -518,10 +542,107 @@ mod tests {
             .committees(&state, fulu_epoch)
             .committees_per_slot();
         let subnet_id = compute_subnet_for_attestation(committees_per_slot, slot, 0, &config);
+        (store, attestation, subnet_id)
+    }
 
+    #[test]
+    fn a_vote_across_a_fork_boundary_verifies_under_the_new_forks_version() {
+        let (store, attestation, subnet_id) = signed_vote_across_a_fork_boundary();
         assert_eq!(
             stateful_checks(&store, &attestation, subnet_id),
             Outcome::Accept
+        );
+    }
+
+    // -- prepare_stateful_checks ---------------------------------------------
+
+    /// `attestation` with its signature replaced by another validator's over
+    /// the same data: well-formed, so it fails the pairing and not the decode.
+    fn with_a_wrong_signature(mut attestation: SingleAttestation) -> SingleAttestation {
+        use crate::beacon::helpers::test_state::sign_for;
+        let other = attestation.attester_index as usize + 1;
+        attestation.signature = sign_for(other, attestation.data.hash_tree_root());
+        attestation
+    }
+
+    #[test]
+    fn a_valid_vote_prepares_to_one_pairing_and_resolves_to_accept_either_way() {
+        let (store, attestation, subnet_id) = signed_vote_across_a_fork_boundary();
+        let prepared = prepare_stateful_checks(&store, &attestation, subnet_id);
+        let sets = prepared.signature_sets();
+        assert_eq!(sets.len(), 1);
+        assert!(bls::verify_signature_sets(&sets));
+        assert_eq!(prepared.resolve_batch_passed(), Ok(()));
+        assert_eq!(
+            prepare_stateful_checks(&store, &attestation, subnet_id).resolve(),
+            Ok(())
+        );
+    }
+
+    /// The signature rule comes before the committee rules, so a vote that
+    /// breaks both reports the signature, as it did when the signature was
+    /// verified in place, even though preparation has already run the committee
+    /// rules by then.
+    #[test]
+    fn a_bad_signature_still_outranks_a_later_committee_failure() {
+        let (store, attestation, subnet_id) = signed_vote_across_a_fork_boundary();
+        let mut attestation = with_a_wrong_signature(attestation);
+        attestation.committee_index = 99;
+        assert_eq!(
+            stateful_checks(&store, &attestation, subnet_id),
+            Outcome::Reject(RejectReason::BadSignature)
+        );
+        // And on the wrong subnet.
+        let attestation = with_a_wrong_signature(signed_vote_across_a_fork_boundary().1);
+        assert_eq!(
+            stateful_checks(&store, &attestation, subnet_id + 1),
+            Outcome::Reject(RejectReason::BadSignature)
+        );
+    }
+
+    /// A good signature does not hide the committee failure after it.
+    #[test]
+    fn a_good_signature_still_reports_the_later_committee_failure() {
+        let (store, mut attestation, subnet_id) = signed_vote_across_a_fork_boundary();
+        attestation.committee_index = 99;
+        // The signature does not cover `committee_index`, so it still verifies.
+        let prepared = prepare_stateful_checks(&store, &attestation, subnet_id);
+        assert_eq!(prepared.signature_sets().len(), 1);
+        assert_eq!(
+            prepared.resolve_batch_passed(),
+            Err(Outcome::Reject(RejectReason::CommitteeIndex))
+        );
+    }
+
+    /// One batch holding a valid vote and a forged one fails, and resolving
+    /// each on its own then gives the valid one `Accept` and the forged one
+    /// its rejection.
+    #[test]
+    fn a_failed_batch_resolves_each_vote_on_its_own() {
+        let (store, good, subnet_id) = signed_vote_across_a_fork_boundary();
+        let forged = with_a_wrong_signature(good.clone());
+        let good_prepared = prepare_stateful_checks(&store, &good, subnet_id);
+        let forged_prepared = prepare_stateful_checks(&store, &forged, subnet_id);
+        let mut sets = good_prepared.signature_sets();
+        sets.extend(forged_prepared.signature_sets());
+        assert!(!bls::verify_signature_sets(&sets));
+        assert_eq!(good_prepared.resolve(), Ok(()));
+        assert_eq!(
+            forged_prepared.resolve(),
+            Err(Outcome::Reject(RejectReason::BadSignature))
+        );
+    }
+
+    /// A rule that fails before the signature leaves nothing to batch.
+    #[test]
+    fn a_vote_for_an_unseen_block_prepares_no_pairing() {
+        let store = store(0);
+        let attestation = attestation_at(0, 1, 0);
+        let prepared = prepare_stateful_checks(&store, &attestation, 0);
+        assert!(prepared.signature_sets().is_empty());
+        assert_eq!(
+            prepared.resolve_batch_passed(),
+            Err(Outcome::Ignore(IgnoreReason::UnknownBlock))
         );
     }
 }

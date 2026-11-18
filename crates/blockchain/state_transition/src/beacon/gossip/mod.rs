@@ -32,6 +32,7 @@ use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
+use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
 use crate::beacon::containers::{AttestationData, BeaconState, gloas};
@@ -43,6 +44,103 @@ use crate::beacon::lean_boundary::lean_fork_unreachable;
 use crate::beacon::precheck::PrecheckError;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
+
+/// A signature rule whose pairing the caller evaluates, alone or batched with
+/// other messages' (see [`Prepared`]).
+pub struct SignatureStep {
+    /// `None` when the key or the signature failed validation while the set
+    /// was built, which fails exactly where [`bls::verify`] returning false
+    /// does.
+    pub set: Option<bls::SignatureSet>,
+    /// The verdict when the signature does not verify.
+    pub on_failure: Outcome,
+}
+
+/// A stateful rule evaluated up to, but not including, its signature pairings.
+///
+/// The rules run as a sequence of signature checks and non-signature rules,
+/// and preparation stops at the first non-signature rule that fails (later
+/// rules may depend on it). So the original order is always some signature
+/// steps, in order, then one end: the failed rule, or the payload `Accept`
+/// carries. Every signature is a deferred step rather than a verified one, so
+/// a caller can fold the pairings of many messages into one
+/// [`bls::verify_signature_sets`] call. The non-signature rules are pure
+/// reads, so running them before the pairings and then taking the first
+/// failure in the original order gives the verdict the one-by-one order did:
+/// a message with a bad signature and a bad committee index is still a
+/// `BadSignature`, for instance, because the signature step sits before the
+/// end.
+pub struct Prepared<T> {
+    signatures: Vec<SignatureStep>,
+    end: Option<Result<T, Outcome>>,
+}
+
+impl<T> Default for Prepared<T> {
+    fn default() -> Self {
+        Self {
+            signatures: Vec::new(),
+            end: None,
+        }
+    }
+}
+
+impl<T> Prepared<T> {
+    /// Add a signature rule after the steps so far.
+    pub(crate) fn signature(&mut self, set: Option<bls::SignatureSet>, on_failure: Outcome) {
+        self.signatures.push(SignatureStep { set, on_failure });
+    }
+
+    /// End with a failed non-signature rule.
+    pub(crate) fn fail(mut self, outcome: Outcome) -> Self {
+        self.end = Some(Err(outcome));
+        self
+    }
+
+    /// End with every non-signature rule passed, carrying what `Accept` hands
+    /// on.
+    pub(crate) fn accept(mut self, payload: T) -> Self {
+        self.end = Some(Ok(payload));
+        self
+    }
+
+    /// The pairings a batch must verify for this message's verdict to be
+    /// settled: the signature sets up to the first one that could not be built,
+    /// which fails whatever the batch says. Sets after that point are never
+    /// reached, so batching them would only let one bad message sink a batch
+    /// for nothing.
+    pub fn signature_sets(&self) -> Vec<bls::SignatureSet> {
+        self.signatures.iter().map_while(|step| step.set).collect()
+    }
+
+    /// Walk the steps in the original order: the first failure is the verdict,
+    /// else `Ok` with the payload. A set that could not be built fails without
+    /// consulting `verifies`.
+    fn resolve_with(
+        self,
+        mut verifies: impl FnMut(&bls::SignatureSet) -> bool,
+    ) -> Result<T, Outcome> {
+        for SignatureStep { set, on_failure } in self.signatures {
+            if !set.as_ref().is_some_and(&mut verifies) {
+                return Err(on_failure);
+            }
+        }
+        self.end
+            .unwrap_or(Err(Outcome::Ignore(IgnoreReason::Internal)))
+    }
+
+    /// Resolve by evaluating each pairing on its own, only as far as the walk
+    /// reaches. What the one-by-one callers (the Beacon API, the spec vectors)
+    /// and a failed batch's fallback use.
+    pub fn resolve(self) -> Result<T, Outcome> {
+        self.resolve_with(bls::SignatureSet::verify)
+    }
+
+    /// Resolve knowing a [`bls::verify_signature_sets`] call over
+    /// [`Self::signature_sets`] passed: every set that exists verifies.
+    pub fn resolve_batch_passed(self) -> Result<T, Outcome> {
+        self.resolve_with(|_| true)
+    }
+}
 
 /// A gossip message's verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,5 +1197,83 @@ mod tests {
         // state cannot answer, so the ancestor is unknown rather than absent.
         *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot + 10;
         assert_eq!(ancestor_at(&state, at_block_root, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    use crate::beacon::helpers::test_state::{secret_key_for, sign_for};
+    use crate::beacon::primitives::BlsPubkey;
+
+    const FAILED_SIGNATURE: Outcome = Outcome::Reject(RejectReason::BadSignature);
+
+    fn set_for(signer: usize, message: Root) -> Option<bls::SignatureSet> {
+        let pubkey = BlsPubkey(secret_key_for(signer).sk_to_pk().to_bytes());
+        bls::SignatureSet::single(&pubkey, message, &sign_for(signer, message))
+    }
+
+    fn forged_set(message: Root) -> Option<bls::SignatureSet> {
+        let pubkey = BlsPubkey(secret_key_for(1).sk_to_pk().to_bytes());
+        bls::SignatureSet::single(&pubkey, message, &sign_for(2, message))
+    }
+
+    #[test]
+    fn a_prepared_check_with_every_step_passing_accepts_with_its_payload() {
+        let mut prepared = Prepared::default();
+        prepared.signature(set_for(1, Root::repeat_byte(1)), FAILED_SIGNATURE);
+        let prepared = prepared.accept(7u8);
+        assert_eq!(prepared.signature_sets().len(), 1);
+        assert_eq!(prepared.resolve(), Ok(7));
+    }
+
+    #[test]
+    fn the_first_failing_step_in_the_original_order_is_the_verdict() {
+        // Signature, then a failed rule: a good signature lets the rule speak,
+        // a bad one speaks first.
+        let rule = Outcome::Reject(RejectReason::CommitteeIndex);
+        let build = |set| {
+            let mut prepared = Prepared::<()>::default();
+            prepared.signature(set, FAILED_SIGNATURE);
+            prepared.fail(rule)
+        };
+        assert_eq!(
+            build(set_for(1, Root::repeat_byte(1))).resolve_batch_passed(),
+            Err(rule)
+        );
+        assert_eq!(
+            build(forged_set(Root::repeat_byte(1))).resolve(),
+            Err(FAILED_SIGNATURE)
+        );
+    }
+
+    #[test]
+    fn a_set_that_could_not_be_built_fails_like_a_failed_pairing() {
+        let mut prepared = Prepared::<()>::default();
+        prepared.signature(None, FAILED_SIGNATURE);
+        let prepared = prepared.accept(());
+        // Nothing to batch, and the batch passing does not rescue it.
+        assert!(prepared.signature_sets().is_empty());
+        assert_eq!(prepared.resolve_batch_passed(), Err(FAILED_SIGNATURE));
+    }
+
+    #[test]
+    fn only_the_sets_a_verdict_can_depend_on_are_batched() {
+        let mut prepared = Prepared::<()>::default();
+        prepared.signature(set_for(1, Root::repeat_byte(1)), FAILED_SIGNATURE);
+        prepared.signature(None, FAILED_SIGNATURE);
+        prepared.signature(set_for(2, Root::repeat_byte(2)), FAILED_SIGNATURE);
+        // The second step fails whatever the batch says, so the third is never
+        // reached and must not be able to sink a batch.
+        assert_eq!(prepared.signature_sets().len(), 1);
+    }
+
+    #[test]
+    fn a_prepared_check_with_no_verdict_is_internal() {
+        let prepared = Prepared::<()>::default();
+        assert_eq!(
+            prepared.resolve(),
+            Err(Outcome::Ignore(IgnoreReason::Internal))
+        );
     }
 }

@@ -2130,6 +2130,7 @@ dependencies = [
  "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "rand 0.8.6",
+ "rayon",
  "secp256k1 0.30.0",
  "sha2",
  "snap",

@@ -23,7 +23,7 @@ use std::num::NonZeroUsize;
 use ethlambda_storage::CacheKey;
 use lru::LruCache;
 
-use super::{IgnoreReason, Outcome, RejectReason, is_current_slot};
+use super::{IgnoreReason, Outcome, Prepared, RejectReason, is_current_slot};
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT;
@@ -200,8 +200,20 @@ pub fn message_stateful_checks(
     message: &SyncCommitteeMessage,
     subnet_id: u64,
 ) -> Result<Vec<(u64, usize)>, Outcome> {
-    let state = head_state(store)?;
-    check_message(&state, &store.config(), message, Some(subnet_id))
+    prepare_message_stateful_checks(store, message, subnet_id).resolve()
+}
+
+/// [`message_stateful_checks`] without evaluating the signature: see
+/// [`prepare_message`] and [`Prepared`].
+pub fn prepare_message_stateful_checks(
+    store: &Store,
+    message: &SyncCommitteeMessage,
+    subnet_id: u64,
+) -> Prepared<Vec<(u64, usize)>> {
+    match head_state(store) {
+        Ok(state) => prepare_message(&state, &store.config(), message, Some(subnet_id)),
+        Err(outcome) => Prepared::default().fail(outcome),
+    }
 }
 
 /// The state-dependent rules for one message. With `subnet_id`, the seats kept
@@ -213,14 +225,27 @@ pub fn check_message(
     message: &SyncCommitteeMessage,
     subnet_id: Option<u64>,
 ) -> Result<Vec<(u64, usize)>, Outcome> {
+    prepare_message(state, config, message, subnet_id).resolve()
+}
+
+/// [`check_message`] without evaluating the signature. The signature is the
+/// last rule, so the steps are either a seat rule that failed early, or the
+/// one signature step and the seats it covers.
+pub fn prepare_message(
+    state: &BeaconState,
+    config: &Config,
+    message: &SyncCommitteeMessage,
+    subnet_id: Option<u64>,
+) -> Prepared<Vec<(u64, usize)>> {
+    let mut prepared = Prepared::default();
     // [REJECT] The validator index is valid.
     let Ok(validator) = state.validator(message.validator_index) else {
-        return Err(Outcome::Reject(RejectReason::UnknownValidator));
+        return prepared.fail(Outcome::Reject(RejectReason::UnknownValidator));
     };
     // A period the head state's committees cannot answer for is not the
     // sender's fault.
     let Ok(committee) = sync_committee_for_slot(state, message.slot) else {
-        return Err(Outcome::Ignore(IgnoreReason::SyncCommitteeUnavailable));
+        return prepared.fail(Outcome::Ignore(IgnoreReason::SyncCommitteeUnavailable));
     };
     let mut seats = sync_committee_seats(committee, &validator.pubkey);
     match subnet_id {
@@ -228,13 +253,13 @@ pub fn check_message(
             seats.retain(|&(seat_subnet, _)| seat_subnet == subnet);
             // [REJECT] The validator is in the subcommittee of this subnet.
             if seats.is_empty() {
-                return Err(Outcome::Reject(RejectReason::WrongSubnet));
+                return prepared.fail(Outcome::Reject(RejectReason::WrongSubnet));
             }
         }
         None => {
             // [REJECT] The validator is in the sync committee.
             if seats.is_empty() {
-                return Err(Outcome::Reject(RejectReason::NotInCommittee));
+                return prepared.fail(Outcome::Reject(RejectReason::NotInCommittee));
             }
         }
     }
@@ -249,10 +274,11 @@ pub fn check_message(
         index: message.validator_index,
         pubkey: validator.pubkey,
     };
-    if !bls::verify(&validator, signing_root, &message.signature) {
-        return Err(Outcome::Reject(RejectReason::BadSignature));
-    }
-    Ok(seats)
+    prepared.signature(
+        bls::SignatureSet::single(&validator, signing_root, &message.signature),
+        Outcome::Reject(RejectReason::BadSignature),
+    );
+    prepared.accept(seats)
 }
 
 /// The rules for a message submitted through the Beacon API: the clock, then
@@ -570,6 +596,59 @@ mod tests {
         assert_eq!(
             check_message(&state, &store.config(), &message, None),
             Err(Outcome::Ignore(IgnoreReason::SyncCommitteeUnavailable))
+        );
+    }
+
+    // --- prepared messages ------------------------------------------------
+
+    #[test]
+    fn a_valid_message_prepares_one_pairing_and_resolves_to_its_seats_either_way() {
+        let (store, _) = store_with_head();
+        let message = message_from(1, 1);
+        let prepared = prepare_message_stateful_checks(&store, &message, subnet_of(1));
+        let sets = prepared.signature_sets();
+        assert_eq!(sets.len(), 1);
+        assert!(bls::verify_signature_sets(&sets));
+        let seats = vec![(subnet_of(1), 1 % SYNC_SUBCOMMITTEE_SIZE)];
+        assert_eq!(prepared.resolve_batch_passed(), Ok(seats.clone()));
+        assert_eq!(
+            prepare_message_stateful_checks(&store, &message, subnet_of(1)).resolve(),
+            Ok(seats)
+        );
+    }
+
+    /// The seat rules come before the signature, so a message that breaks one
+    /// and carries a bad signature reports the seat rule, and prepares no
+    /// pairing for a batch to verify.
+    #[test]
+    fn a_wrong_subnet_outranks_a_bad_signature() {
+        let (store, _) = store_with_head();
+        let forged = message_from(1, 2);
+        let wrong_subnet = (subnet_of(1) + 1) % 4;
+        let prepared = prepare_message_stateful_checks(&store, &forged, wrong_subnet);
+        assert!(prepared.signature_sets().is_empty());
+        assert_eq!(
+            prepared.resolve(),
+            Err(Outcome::Reject(RejectReason::WrongSubnet))
+        );
+        assert_eq!(
+            message_stateful_checks(&store, &forged, wrong_subnet),
+            Err(Outcome::Reject(RejectReason::WrongSubnet))
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_resolves_each_message_on_its_own() {
+        let (store, _) = store_with_head();
+        let good = prepare_message_stateful_checks(&store, &message_from(1, 1), subnet_of(1));
+        let forged = prepare_message_stateful_checks(&store, &message_from(1, 2), subnet_of(1));
+        let mut sets = good.signature_sets();
+        sets.extend(forged.signature_sets());
+        assert!(!bls::verify_signature_sets(&sets));
+        assert!(good.resolve().is_ok());
+        assert_eq!(
+            forged.resolve(),
+            Err(Outcome::Reject(RejectReason::BadSignature))
         );
     }
 

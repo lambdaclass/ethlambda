@@ -72,3 +72,31 @@ pub(crate) fn inc_pubkey_cache_table_entries() {
 pub(crate) fn inc_pubkey_cache_index_chunks() {
     LEAN_BEACON_PUBKEY_CACHE_INDEX_CHUNKS.inc();
 }
+
+static LEAN_BEACON_HASHED_MESSAGE_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_hashed_message_cache_lookups_total",
+            "Signing roots resolved to a G2 point for a signature check, by whether the \
+             hashed-message cache already held the hash",
+            &["result"]
+        )
+        .unwrap()
+    });
+
+// Resolved once for the same reason as the pubkey cache's: a lookup is counted
+// on every signature check.
+static LEAN_BEACON_HASHED_MESSAGE_CACHE_HITS: LazyLock<IntCounter> =
+    LazyLock::new(|| LEAN_BEACON_HASHED_MESSAGE_CACHE_LOOKUPS_TOTAL.with_label_values(&["hit"]));
+static LEAN_BEACON_HASHED_MESSAGE_CACHE_MISSES: LazyLock<IntCounter> =
+    LazyLock::new(|| LEAN_BEACON_HASHED_MESSAGE_CACHE_LOOKUPS_TOTAL.with_label_values(&["miss"]));
+
+/// Count one signing root looked up in the hashed-message cache: a hit found
+/// it in either generation, a miss hashed it.
+pub(crate) fn inc_hashed_message_lookups(hit: bool) {
+    if hit {
+        LEAN_BEACON_HASHED_MESSAGE_CACHE_HITS.inc();
+    } else {
+        LEAN_BEACON_HASHED_MESSAGE_CACHE_MISSES.inc();
+    }
+}
