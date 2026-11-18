@@ -29,6 +29,7 @@ use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::containers::shared::{SignedVoluntaryExit, VoluntaryExit};
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch};
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::beacon_node::dto::encode_hex;
@@ -95,6 +96,9 @@ pub enum Outcome {
 pub async fn run(config: ExitConfig) -> Result<Outcome> {
     let (store, pubkey) = load_keystore(&config.keystore, &config.password_file)?;
     let node = HttpBeaconNode::new(&config.beacon_node)?;
+    // Behind the lock every signing method takes its store through. Nothing
+    // else holds this one: the command signs once and exits.
+    let store = RwLock::new(store);
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     run_with(&node, &store, pubkey, &config.options, &mut input).await
@@ -116,7 +120,7 @@ pub fn load_keystore(
 /// phrase, which is what the tests drive.
 pub async fn run_with<B: BeaconNodeApi + ?Sized>(
     node: &B,
-    store: &ValidatorStore,
+    store: &RwLock<ValidatorStore>,
     pubkey: BlsPubkey,
     options: &ExitOptions,
     input: &mut dyn BufRead,
@@ -124,10 +128,7 @@ pub async fn run_with<B: BeaconNodeApi + ?Sized>(
     let genesis = node.genesis().await?;
     let spec = node.spec().await?;
     let clock = SlotClock::from_config(genesis.genesis_time, &spec);
-    let signing = SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    };
+    let signing = SigningContext::new(spec, genesis.genesis_validators_root);
 
     // A syncing node's registry is behind the chain's, so its answer about
     // the validator's status and index is not one to sign over.
@@ -152,7 +153,9 @@ pub async fn run_with<B: BeaconNodeApi + ?Sized>(
         epoch,
         validator_index: details.index,
     };
-    let signature = signing.sign_voluntary_exit(store, &pubkey, &exit, current_epoch)?;
+    let signature = signing
+        .sign_voluntary_exit(store, &pubkey, &exit, current_epoch)
+        .await?;
     let signed = SignedVoluntaryExit {
         message: exit,
         signature,
@@ -382,10 +385,10 @@ mod tests {
             .expect("32 bytes")
     }
 
-    fn store_with_key() -> (ValidatorStore, BlsPubkey) {
+    fn store_with_key() -> (RwLock<ValidatorStore>, BlsPubkey) {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
-        (store, pubkey)
+        (RwLock::new(store), pubkey)
     }
 
     /// Genesis far enough back that the current epoch clears mainnet's
@@ -577,10 +580,7 @@ mod tests {
             "presign must not publish"
         );
 
-        let signing = SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: genesis().genesis_validators_root,
-        };
+        let signing = SigningContext::new(Config::mainnet(), genesis().genesis_validators_root);
         let root = signing.voluntary_exit_signing_root(&signed.message, now());
         let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
         let sig = Signature::from_bytes(&signed.signature.0).expect("valid signature");
