@@ -81,6 +81,15 @@ impl ValidatorDefinition {
                 })
             })
             .transpose()?;
+        // Refused as `--gas-limit` and the keymanager's `POST gas_limit`
+        // refuse it: from gloas this value is signed into the proposer
+        // preferences, which cannot be replaced for their dependent root.
+        if self.gas_limit == Some(0) {
+            return Err(reject(
+                "gas_limit",
+                "is zero, which cannot be a gas limit".to_string(),
+            ));
+        }
         Ok(Overrides {
             fee_recipient,
             graffiti,
@@ -711,6 +720,11 @@ mod tests {
         entry.graffiti = Some("a".repeat(GRAFFITI_BYTES + 1));
         let err = entry.overrides().expect_err("33 bytes does not fit");
         assert!(err.to_string().contains("graffiti"), "got {err}");
+
+        let mut entry = definition("0xaa", true);
+        entry.gas_limit = Some(0);
+        let err = entry.overrides().expect_err("a zero gas limit is refused");
+        assert!(err.to_string().contains("gas_limit"), "got {err}");
     }
 
     /// Startup seeding: enabled entries' overrides land in the settings, a
