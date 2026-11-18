@@ -336,7 +336,10 @@ jobs:
           if [ -s "$RUNNER_TEMP/error.txt" ]; then
             echo "error=$(head -c 400 "$RUNNER_TEMP/error.txt" | tr '\r\n' '  ')" >> "$GITHUB_OUTPUT"
           fi
+          # Newest by mtime; the runner names these itself, so `ls` is safe here.
+          # shellcheck disable=SC2012
           run_dir=$(ls -td "$HOME"/.ai-review/runs/*/ 2>/dev/null | head -n1)
+          # shellcheck disable=SC2012
           comment=$(ls -t "$RUNNER_TEMP"/out/*.comment.md 2>/dev/null | head -n1)
           if [ -z "$run_dir" ] || [ -z "$comment" ]; then
             echo "No review report was written"
