@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use ethrex::cli::compute_effective_datadir;
 use ethrex::initializers::{
-    get_local_node_record, get_local_p2p_node, get_signer, init_blockchain, init_metrics,
-    init_network, init_store_skip_validation_with_config, init_store_with_config,
+    get_local_node_record, get_local_p2p_node, get_log_query_limits, get_signer, init_blockchain,
+    init_metrics, init_network, init_store_skip_validation_with_config, init_store_with_config,
     migrate_datadir_if_needed, regenerate_head_state,
 };
 use ethrex::utils::{
@@ -240,9 +240,11 @@ pub async fn start(config: EthrexConfig) -> Result<EmbeddedEthrex, StartError> {
         gas_tip_estimator: Arc::new(tokio::sync::Mutex::new(GasTipEstimator::new())),
         log_filter_handler: None,
         gas_ceil: opts.gas_limit,
+        rpc_gas_cap: opts.rpc_gas_cap,
         block_worker_channel,
         ws: None,
         allowed_namespaces: Arc::new(opts.http_api.iter().copied().collect::<HashSet<_>>()),
+        log_query_limits: get_log_query_limits(&opts),
     };
     spawn_filter_cleanup(active_filters, &tracker, cancel_token.clone());
 

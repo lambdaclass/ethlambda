@@ -32,7 +32,14 @@ ethrex-rpc = { workspace = true, optional = true }
 [features]
 # Adds `EngineClient::in_process`, which drives an ethrex embedded in this
 # process through typed handler calls instead of JSON-RPC over HTTP.
-include-ethrex = ["dep:bytes", "dep:ethrex-common", "dep:ethrex-rlp", "dep:ethrex-rpc"]
+# `serde_json/raw_value`: ethrex's handlers `parse` their params as raw JSON text.
+include-ethrex = [
+    "dep:bytes",
+    "dep:ethrex-common",
+    "dep:ethrex-rlp",
+    "dep:ethrex-rpc",
+    "serde_json/raw_value",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

@@ -224,8 +224,8 @@ impl InProcessEngine {
     ) -> Result<Vec<ClientVersionV1>, EngineError> {
         // The request's only field is private, so it is built by its own
         // `parse`. This runs once at startup and for graffiti, never per block.
-        let ours =
-            serde_json::to_value(ours).map_err(|err| EngineError::Decode(err.to_string()))?;
+        let ours = serde_json::value::to_raw_value(ours)
+            .map_err(|err| EngineError::Decode(err.to_string()))?;
         let request = GetClientVersionV1Request::parse(&Some(vec![ours])).map_err(rpc_error)?;
         self.run(request, ENGINE_TIMEOUT).await
     }
@@ -244,11 +244,17 @@ fn rpc_error(err: RpcErr) -> EngineError {
 }
 
 /// Builds a handler from the positional parameters the HTTP transport sends,
-/// through the handler's own `parse`.
+/// through the handler's own `parse`, which reads each one as the raw JSON
+/// text a request body would carry.
 fn parse_wire<H: RpcHandler>(params: serde_json::Value) -> Result<H, EngineError> {
     let serde_json::Value::Array(params) = params else {
         unreachable!("the engine parameter builders return a JSON array");
     };
+    let params = params
+        .iter()
+        .map(serde_json::value::to_raw_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| EngineError::Decode(err.to_string()))?;
     H::parse(&Some(params)).map_err(rpc_error)
 }
 
