@@ -118,6 +118,9 @@ pub struct BuiltPayload {
     pub blobs_bundle: BlobsBundle,
     /// The EIP-7685 request list, each entry its type byte then its data.
     pub execution_requests: Vec<Vec<u8>>,
+    /// The engine's `shouldOverrideBuilder`: it wants this payload built
+    /// locally whatever a builder bid pays. Absent from an answer means false.
+    pub should_override_builder: bool,
 }
 
 /// `engine_getPayloadV6`'s answer, decoded: [`BuiltPayload`] with Amsterdam's
@@ -150,6 +153,8 @@ pub(crate) struct GetPayloadV5Response {
     execution_payload: ExecutionPayloadJson,
     block_value: String,
     blobs_bundle: BlobsBundleJson,
+    #[serde(default)]
+    should_override_builder: bool,
     #[serde(default)]
     execution_requests: Vec<String>,
 }
@@ -259,6 +264,7 @@ impl TryFrom<GetPayloadV5Response> for BuiltPayload {
             block_value: parse_uint256(&response.block_value)?,
             blobs_bundle,
             execution_requests: decode_requests(&response.execution_requests)?,
+            should_override_builder: response.should_override_builder,
         })
     }
 }
@@ -452,6 +458,29 @@ mod tests {
         assert_eq!(payload.withdrawals[0].validator_index, 2);
         assert_eq!(uint256(&built.block_value), "0x1bc16d674ec80000");
         assert_eq!(built.execution_requests, vec![vec![0x00, 0xaa]]);
+    }
+
+    #[test]
+    fn a_v5_answer_carries_should_override_builder_and_defaults_it_to_false() {
+        let mut json = response_json();
+        json["shouldOverrideBuilder"] = true.into();
+        let response: GetPayloadV5Response = serde_json::from_value(json).unwrap();
+        assert!(
+            BuiltPayload::try_from(response)
+                .unwrap()
+                .should_override_builder
+        );
+
+        let mut json = response_json();
+        json.as_object_mut()
+            .unwrap()
+            .remove("shouldOverrideBuilder");
+        let response: GetPayloadV5Response = serde_json::from_value(json).unwrap();
+        assert!(
+            !BuiltPayload::try_from(response)
+                .unwrap()
+                .should_override_builder
+        );
     }
 
     #[test]
