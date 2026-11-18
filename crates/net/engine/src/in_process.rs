@@ -59,7 +59,8 @@ use serde::de::DeserializeOwned;
 
 use crate::building::{self, PayloadId};
 use crate::client::{
-    ENGINE_NEW_PAYLOAD_V5_TIMEOUT, ENGINE_TIMEOUT, new_payload_v4_params, new_payload_v5_params,
+    ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_V5_TIMEOUT, ENGINE_TIMEOUT,
+    new_payload_v4_params, new_payload_v5_params,
 };
 use crate::error::EngineError;
 use crate::types::{
@@ -189,6 +190,10 @@ impl InProcessEngine {
         self.run(request, ENGINE_TIMEOUT).await
     }
 
+    /// Under [`ENGINE_GET_PAYLOAD_TIMEOUT`], as over HTTP: the payload is due
+    /// at the start of the slot. Abandoning the call loses nothing: ethrex
+    /// finishes the build process and puts the payload back in its table on a
+    /// task of its own, which dropping this future does not cancel.
     pub(crate) async fn get_payload(
         &self,
         payload_id: PayloadId,
@@ -196,9 +201,10 @@ impl InProcessEngine {
         let request = GetPayloadV5Request {
             payload_id: payload_id_u64(payload_id),
         };
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(request, ENGINE_GET_PAYLOAD_TIMEOUT).await
     }
 
+    /// Under [`ENGINE_GET_PAYLOAD_TIMEOUT`], like [`Self::get_payload`].
     pub(crate) async fn get_payload_v6(
         &self,
         payload_id: PayloadId,
@@ -206,7 +212,7 @@ impl InProcessEngine {
         let request = GetPayloadV6Request {
             payload_id: payload_id_u64(payload_id),
         };
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(request, ENGINE_GET_PAYLOAD_TIMEOUT).await
     }
 
     pub(crate) async fn exchange_capabilities(

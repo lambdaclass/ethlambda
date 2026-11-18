@@ -290,8 +290,8 @@ impl EngineClient {
     /// `engine_getPayloadV5`: the payload a build process has assembled so
     /// far, with its blobs bundle and execution requests.
     ///
-    /// Over HTTP, one attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], never retried;
-    /// see there for why.
+    /// One attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], never retried, over either
+    /// transport; see there for why.
     pub async fn get_payload(
         &self,
         payload_id: crate::building::PayloadId,
