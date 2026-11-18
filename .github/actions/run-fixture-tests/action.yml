@@ -109,17 +109,12 @@ runs:
       shell: bash
       run: touch leanSpec/fixtures
 
+    # Keyed by target, so the two halves do not evict each other, and so
+    # `ci.yml` and `daily_ci.yml` running the same half share one entry.
     - name: Setup Rust
-      uses: dtolnay/rust-toolchain@master
+      uses: $/.github/actions/setup-rust
       with:
-        toolchain: "1.97.1"
-
-    # Keyed by target so the two halves do not evict each other: the default
-    # key covers the job id, which is one value for every leg of a matrix.
-    - name: Setup cache
-      uses: Swatinem/rust-cache@v2.9.3
-      with:
-        key: ${{ inputs.make-target }}
+        cache-key: ${{ inputs.make-target }}
 
     - name: Run tests
       shell: bash
