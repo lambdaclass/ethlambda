@@ -15,11 +15,12 @@
 
 use std::time::Duration;
 
+use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
 use ethlambda_types::beacon::containers::shared::{
     AttestationData, BeaconBlockHeader, Fork, VoluntaryExit,
@@ -260,7 +261,12 @@ pub struct ForkInfo {
 pub struct SigningRequest<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
-    pub fork_info: ForkInfo,
+    /// Absent for a builder registration only: its domain is the genesis fork
+    /// version under a zero validators root, which the signer takes from its
+    /// own network configuration, and Web3Signer's schema has no `fork_info`
+    /// for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_info: Option<ForkInfo>,
     #[serde(rename = "signingRoot")]
     pub signing_root: Root,
     #[serde(flatten)]
@@ -268,10 +274,14 @@ pub struct SigningRequest<'a> {
 }
 
 impl<'a> SigningRequest<'a> {
-    pub fn new(fork_info: ForkInfo, signing_root: Root, body: SigningBody<'a>) -> Self {
+    pub fn new(
+        fork_info: impl Into<Option<ForkInfo>>,
+        signing_root: Root,
+        body: SigningBody<'a>,
+    ) -> Self {
         Self {
             kind: body.kind(),
-            fork_info,
+            fork_info: fork_info.into(),
             signing_root,
             body,
         }
@@ -319,6 +329,12 @@ pub enum SigningBody<'a> {
     VoluntaryExit {
         voluntary_exit: &'a VoluntaryExit,
     },
+    ValidatorRegistration {
+        validator_registration: &'a ValidatorRegistrationV1,
+    },
+    ProposerPreferences {
+        proposer_preferences: Versioned<&'a ProposerPreferences>,
+    },
 }
 
 impl SigningBody<'_> {
@@ -338,6 +354,8 @@ impl SigningBody<'_> {
             Self::ExecutionPayloadEnvelope { .. } => "EXECUTION_PAYLOAD_ENVELOPE",
             Self::PayloadAttestationMessage { .. } => "PAYLOAD_ATTESTATION_MESSAGE",
             Self::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
+            Self::ValidatorRegistration { .. } => "VALIDATOR_REGISTRATION",
+            Self::ProposerPreferences { .. } => "PROPOSER_PREFERENCES",
         }
     }
 }
@@ -650,6 +668,77 @@ mod tests {
                     "slot": "3200",
                     "payload_present": true,
                     "blob_data_available": false
+                }
+            })
+        );
+    }
+
+    /// Web3Signer's `ValidatorRegistrationSigning`: the registration under
+    /// `validator_registration`, and no `fork_info`, since the signer takes
+    /// the builder domain's genesis fork version from its own configuration.
+    #[test]
+    fn a_registration_request_has_web3signers_shape_and_no_fork_info() {
+        let registration = ValidatorRegistrationV1 {
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            gas_limit: 36_000_000,
+            timestamp: 1_700_000_000,
+            pubkey: BlsPubkey([0x11; 48]),
+        };
+        let encoded = encode(&SigningRequest::new(
+            None,
+            Root::repeat_byte(0x22),
+            SigningBody::ValidatorRegistration {
+                validator_registration: &registration,
+            },
+        ));
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "VALIDATOR_REGISTRATION",
+                "signingRoot": format!("0x{}", "22".repeat(32)),
+                "validator_registration": {
+                    "fee_recipient": format!("0x{}", "ab".repeat(20)),
+                    "gas_limit": "36000000",
+                    "timestamp": "1700000000",
+                    "pubkey": format!("0x{}", "11".repeat(48))
+                }
+            })
+        );
+    }
+
+    /// Web3Signer's `PROPOSER_PREFERENCES`: a gloas-versioned request, whose
+    /// root the signer derives at the fork it is told.
+    #[test]
+    fn a_proposer_preferences_request_is_versioned_gloas() {
+        let preferences = ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x33),
+            proposal_slot: 3200,
+            validator_index: 7,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 60_000_000,
+        };
+        let encoded = encode(&SigningRequest::new(
+            fork_info(),
+            Root::ZERO,
+            SigningBody::ProposerPreferences {
+                proposer_preferences: Versioned {
+                    version: "GLOAS".to_string(),
+                    data: &preferences,
+                },
+            },
+        ));
+        assert_eq!(encoded["type"], "PROPOSER_PREFERENCES");
+        assert!(encoded.get("fork_info").is_some());
+        assert_eq!(
+            encoded["proposer_preferences"],
+            json!({
+                "version": "GLOAS",
+                "data": {
+                    "dependent_root": format!("0x{}", "33".repeat(32)),
+                    "proposal_slot": "3200",
+                    "validator_index": "7",
+                    "fee_recipient": format!("0x{}", "ab".repeat(20)),
+                    "target_gas_limit": "60000000"
                 }
             })
         );

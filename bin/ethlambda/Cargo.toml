@@ -54,7 +54,8 @@ ethlambda-engine.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
 
-# For `resolve_node_key`'s ephemeral-key generation when `--node-key` is omitted.
+# For `resolve_node_key`: generating the key it stores in `--data-dir` when
+# `--node-key` is omitted, and checking every node key it loads.
 secp256k1.workspace = true
 
 

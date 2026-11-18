@@ -896,7 +896,7 @@ mod tests {
         )
         .expect("opens with no keys");
         let mut context = context_with_dirs(store, dir, None);
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
         (context, protection)
     }

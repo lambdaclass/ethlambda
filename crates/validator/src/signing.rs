@@ -6,18 +6,19 @@
 //! beacon node sent: the wire representation is a transport detail, and the
 //! chain only ever agrees about the merkle root.
 
+use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
 use ethlambda_types::beacon::containers::shared::{
     AttestationData, BeaconBlockHeader, Fork, VoluntaryExit,
@@ -30,7 +31,7 @@ use ethlambda_types::beacon::primitives::{
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
 use ethlambda_types::beacon::signing::{
-    compute_domain, compute_epoch_at_slot, compute_signing_root,
+    compute_builder_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
 use std::collections::HashMap;
@@ -118,7 +119,7 @@ where
     F: Future<Output = Result<T>>,
 {
     let deadline = tokio::time::Instant::now() + SIGNING_BUDGET;
-    futures::future::join_all(requests.into_iter().map(|(pubkey, request)| async move {
+    futures_util::future::join_all(requests.into_iter().map(|(pubkey, request)| async move {
         tokio::time::timeout_at(deadline, request)
             .await
             .unwrap_or_else(|_| {
@@ -431,14 +432,16 @@ impl SigningContext {
         body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
         let fork_info = self.fork_info(epoch);
-        self.sign_under(store, pubkey, root, epoch, fork_info, body)
+        self.sign_under(store, pubkey, root, epoch, Some(fork_info), body)
             .await
     }
 
     /// [`Self::sign`], with the fork a remote signer is told given outright
-    /// rather than read off the schedule at `epoch`. Only a voluntary exit
-    /// needs that: every other message is domained by the fork at its own
-    /// epoch.
+    /// rather than read off the schedule at `epoch`. Only two messages need
+    /// that, every other being domained by the fork at its own epoch: a
+    /// voluntary exit, told the one version it is signed under, and a builder
+    /// registration, told none (`None`), since its domain is the genesis
+    /// version's whatever the schedule says.
     ///
     /// The store's read guard is held for the lookup alone and released before
     /// anything is signed. `tokio::sync::RwLock` is write-preferring, so a
@@ -450,7 +453,7 @@ impl SigningContext {
         pubkey: &BlsPubkey,
         root: Root,
         epoch: Epoch,
-        fork_info: ForkInfo,
+        fork_info: Option<ForkInfo>,
         body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
         let method = store
@@ -671,6 +674,84 @@ impl SigningContext {
         .await
     }
 
+    /// A builder registration's signature.
+    ///
+    /// Signed under `compute_builder_domain(genesis_fork_version)`: the genesis
+    /// fork version and a zero validators root, per builder-specs, so a
+    /// registration verifies whatever fork the chain is in. Not
+    /// `DOMAIN_BEACON_BUILDER`, which is gloas's envelope domain. Not
+    /// slashable: a registration commits to nothing about the chain, and a
+    /// builder keeps only the newest one per validator.
+    ///
+    /// A remote signer is told no fork: Web3Signer builds this domain from the
+    /// genesis version of its own configuration, as this client does from
+    /// its.
+    pub async fn sign_validator_registration(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        registration: &ValidatorRegistrationV1,
+    ) -> Result<BlsSignature> {
+        let domain = compute_builder_domain(self.config.genesis_fork_version);
+        let root = compute_signing_root(registration.hash_tree_root(), domain);
+        // The epoch is only read for a block; a registration has none.
+        self.sign_under(
+            store,
+            &registration.pubkey,
+            root,
+            0,
+            None,
+            SigningBody::ValidatorRegistration {
+                validator_registration: registration,
+            },
+        )
+        .await
+    }
+
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the proposal
+    /// epoch itself.
+    ///
+    /// That is `get_signed_proposer_preferences` as of consensus-specs
+    /// v1.7.0-beta.4, `compute_fork_version(proposal_epoch)` read off the
+    /// schedule, and the `proposer_preferences` gossip rule verifies under the
+    /// same domain. Every other client signs and verifies this way
+    /// (Lighthouse, Prysm, Teku, Lodestar and Nimbus all take the fork of the
+    /// proposal's epoch).
+    ///
+    /// The rule before it, beta.2's, verified with `get_domain` on the
+    /// dependent block's state advanced to the lookahead start, which gives
+    /// the fork of the epoch before the proposal's. That differs only for a
+    /// proposal in the first epoch of a fork, and there Lighthouse refuses it
+    /// as a bad signature: it did so for every first-gloas-epoch preference
+    /// this client signed that way on a devnet. Not slashable.
+    ///
+    /// A remote signer is told the fork at the proposal epoch, from which
+    /// Web3Signer derives the same domain (Teku's
+    /// `signingRootForSignProposerPreferences` takes it at that epoch too).
+    pub async fn sign_proposer_preferences(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign(
+            store,
+            pubkey,
+            root,
+            proposal_epoch,
+            SigningBody::ProposerPreferences {
+                proposer_preferences: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data: preferences,
+                },
+            },
+        )
+        .await
+    }
+
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
     ///
     /// Not slashable by the specification, and deduplicated per validator and
@@ -792,7 +873,7 @@ impl SigningContext {
             pubkey,
             self.voluntary_exit_signing_root(exit, current_epoch),
             exit.epoch,
-            self.voluntary_exit_fork_info(exit, current_epoch),
+            Some(self.voluntary_exit_fork_info(exit, current_epoch)),
             SigningBody::VoluntaryExit {
                 voluntary_exit: exit,
             },
@@ -896,7 +977,7 @@ mod tests {
     /// budget, and nothing else: the others come back as they were.
     #[tokio::test(start_paused = true)]
     async fn a_signature_past_the_budget_does_not_hold_back_the_rest() {
-        use futures::FutureExt as _;
+        use futures_util::FutureExt as _;
 
         let started = tokio::time::Instant::now();
         let answered = BlsPubkey([1; 48]);
@@ -1013,6 +1094,150 @@ mod tests {
             state_root: Root::repeat_byte(2),
             body_root: Root::repeat_byte(3),
         }
+    }
+
+    fn registration(pubkey: BlsPubkey) -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            gas_limit: 36_000_000,
+            timestamp: 1_700_000_000,
+            pubkey,
+        }
+    }
+
+    /// A context whose genesis validators root is not zero, so the builder
+    /// domain (which zeroes it) and a context-derived one cannot coincide.
+    fn context_with_validators_root() -> SigningContext {
+        SigningContext::new(Config::mainnet(), Root::repeat_byte(0x42))
+    }
+
+    #[tokio::test]
+    async fn a_registration_is_signed_under_the_builder_domain() {
+        use ethlambda_types::beacon::constants::DOMAIN_APPLICATION_BUILDER;
+
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .await
+            .expect("signs");
+
+        let root = compute_signing_root(
+            registration.hash_tree_root(),
+            compute_builder_domain(Config::mainnet().genesis_fork_version),
+        );
+        assert!(verify(&pubkey, &signature, root));
+
+        // The same domain type under this chain's validators root is a
+        // different domain: a context-derived one would not verify.
+        let with_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_APPLICATION_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, with_root));
+    }
+
+    /// The registration domain is not gloas's envelope domain, whose type
+    /// constant is similar in name only: a signature under one must not verify
+    /// under the other.
+    #[tokio::test]
+    async fn a_registration_does_not_verify_under_the_envelope_domain() {
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .await
+            .expect("signs");
+
+        let envelope_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_BEACON_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext::new(config, Root::repeat_byte(0x42)),
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Whether a preference for `slot`, signed by the client, verifies under
+    /// fulu's and under gloas's version of `DOMAIN_PROPOSER_PREFERENCES`, in
+    /// that order. The domains are spelled out rather than asked of
+    /// [`SigningContext::domain`], so the test does not share the signer's
+    /// choice of epoch.
+    async fn preference_verifies_under_fulu_and_gloas(slot: Slot) -> (bool, bool) {
+        let (store, pubkey) = store_with_key();
+        let (context, _) = gloas_scheduled_context();
+        let preferences = preferences_for(slot);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .await
+            .expect("signs");
+
+        let verifies_under = |version| {
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), domain);
+            verify(&pubkey, &signature, root)
+        };
+        (
+            verifies_under(context.config.fulu_fork_version),
+            verifies_under(context.config.gloas_fork_version),
+        )
+    }
+
+    /// The first gloas epoch's preference is signed at gloas's version, the
+    /// proposal epoch's own, which is what beta.4's gossip rule and every
+    /// other client verify. Fulu's, the version beta.2's rule gave (the epoch
+    /// before the proposal's), is what Lighthouse refused as a bad signature.
+    #[tokio::test]
+    async fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
+
+        assert!(under_gloas, "the proposal epoch's version");
+        assert!(!under_fulu, "not the version of the epoch before it");
+    }
+
+    /// One epoch later beta.2's rule gives gloas's version too, so the two
+    /// rules agree from here on.
+    #[tokio::test]
+    async fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
+
+        assert!(under_gloas);
+        assert!(!under_fulu);
     }
 
     #[tokio::test]
@@ -1729,6 +1954,128 @@ mod tests {
                 body["signingRoot"],
                 serde_json::to_value(context.block_signing_root(header.hash_tree_root(), slot))
                     .expect("root")
+            );
+        }
+
+        /// A builder registration for a key in a remote signer: the signer
+        /// is told no fork, since it builds the builder domain from its own
+        /// genesis version, and the root sent is that domain's.
+        #[tokio::test]
+        async fn a_registration_is_signed_by_the_remote_signer_and_told_no_fork() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context_with_validators_root();
+            let registration = registration(pubkey);
+
+            let signature = context
+                .sign_validator_registration(&store, &registration)
+                .await
+                .expect("signs");
+            let root = compute_signing_root(
+                registration.hash_tree_root(),
+                compute_builder_domain(context.config.genesis_fork_version),
+            );
+            assert!(verify(&pubkey, &signature, root));
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "VALIDATOR_REGISTRATION");
+            assert!(body.get("fork_info").is_none(), "got {body}");
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(root).expect("root")
+            );
+            assert_eq!(body["validator_registration"]["gas_limit"], "36000000");
+        }
+
+        /// The registration service signs each chunk on the blocking pool, a
+        /// remote key's request included: it goes out and comes back from
+        /// there, beside a local key's signature, on a runtime like the
+        /// client's own. A signer that refuses costs its own key only.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_registration_service_signs_remote_and_local_keys_together() {
+            use crate::beacon_node::mock::MockBeaconNode;
+            use crate::registration::RegistrationService;
+            use ethlambda_types::beacon::primitives::H160;
+
+            for (answer, remote_registered) in
+                [(Answer::Signature, true), (Answer::Status(412), false)]
+            {
+                let (fake, url) = serve(answer).await;
+                let remote = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
+                let mut store = ValidatorStore::new();
+                store.insert_remote(remote, &url).expect("inserts");
+                let local = store
+                    .insert_secret("local", &other_secret())
+                    .expect("inserts");
+                let store = Arc::new(RwLock::new(store));
+
+                let node = Arc::new(MockBeaconNode::new());
+                let context = Arc::new(context_with_validators_root());
+                let settings = crate::test_support::settings(Some(H160([0xab; 20])));
+                let service = Arc::new(RegistrationService::new(
+                    node.clone(),
+                    context.clone(),
+                    settings,
+                ));
+
+                service.register_all(0, vec![remote, local], store).await;
+
+                let sent = node.registrations.lock().expect("lock").clone();
+                let domain = compute_builder_domain(context.config.genesis_fork_version);
+                for registration in &sent {
+                    let root = compute_signing_root(registration.message.hash_tree_root(), domain);
+                    assert!(verify(
+                        &registration.message.pubkey,
+                        &registration.signature,
+                        root
+                    ));
+                }
+                let registered = |pubkey| sent.iter().any(|r| r.message.pubkey == pubkey);
+                assert!(registered(local), "the local key is registered either way");
+                assert_eq!(registered(remote), remote_registered);
+
+                let requests = fake.requests.lock().expect("lock");
+                assert_eq!(requests.len(), 1, "one request, for the remote key");
+                assert_eq!(requests[0].1["type"], "VALIDATOR_REGISTRATION");
+            }
+        }
+
+        /// Proposer preferences for the first gloas epoch: the fork told is
+        /// the proposal epoch's, gloas, from which the signer derives the
+        /// domain this client signs under.
+        #[tokio::test]
+        async fn proposer_preferences_are_signed_remotely_under_the_proposal_epochs_fork() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let (context, gloas_epoch) = gloas_scheduled_context();
+            let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+            let preferences = preferences_for(slot);
+
+            let signature = context
+                .sign_proposer_preferences(&store, &pubkey, &preferences)
+                .await
+                .expect("signs");
+            let gloas_domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                context.config.gloas_fork_version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), gloas_domain);
+            assert!(verify(&pubkey, &signature, root));
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "PROPOSER_PREFERENCES");
+            assert_eq!(body["proposer_preferences"]["version"], "GLOAS");
+            assert_eq!(
+                body["proposer_preferences"]["data"]["proposal_slot"],
+                slot.to_string()
+            );
+            assert_eq!(
+                body["fork_info"],
+                serde_json::to_value(context.fork_info(gloas_epoch)).expect("fork info"),
+                "the fork at the proposal epoch, where the domain came from"
             );
         }
 

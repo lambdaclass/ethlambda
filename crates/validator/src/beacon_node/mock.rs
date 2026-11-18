@@ -2,9 +2,10 @@
 //! service tests. Compiled only under `cfg(test)`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ethlambda_types::beacon::builder::{BlindedBeaconBlock, SignedValidatorRegistrationV1};
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
@@ -14,9 +15,10 @@ use ethlambda_types::beacon::containers::shared::Checkpoint;
 use ethlambda_types::beacon::containers::shared::SignedVoluntaryExit;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
+use tokio::sync::{Notify, Semaphore};
 
 use crate::beacon_node::block_contents::{
-    Contents, GloasPayload, ProducedBlock, empty_block_for, empty_gloas_block_for,
+    Contents, GloasPayload, ProducedBlock, Producer, empty_block_for, empty_gloas_block_for,
     empty_gloas_envelope_for,
 };
 use crate::beacon_node::dto::{
@@ -24,9 +26,9 @@ use crate::beacon_node::dto::{
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
-    validate_sync_contribution,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
+    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    ValidatorEntry, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -64,7 +66,27 @@ pub struct MockBeaconNode {
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
+    /// What `proposer_duties_v2` answers with, by epoch, like `proposers`.
+    pub proposers_v2: Mutex<Vec<(Epoch, ProposerDuties)>>,
+    /// Run inside every `proposer_duties_v2` call that gets past the
+    /// configured failures, before it answers: the point where a caller has
+    /// taken its own snapshot and waits on the node, so a test can change the
+    /// world under it there.
+    pub on_proposer_duties_v2: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Every proposer preferences batch `submit_proposer_preferences`
+    /// received, with the fork it was sent under, in call order.
+    pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
+    /// Proposal slots whose preference the mock refuses, as a node does one it
+    /// holds with other content: a call carrying any of them is an `Err` and
+    /// records nothing, like the node's 400 for the whole call.
+    pub refused_preference_slots: Mutex<Vec<Slot>>,
+    /// How long `submit_proposer_preferences` takes before it answers, as a
+    /// slow node would.
+    pub preference_delay: Option<std::time::Duration>,
     pub attestation_data: Option<AttestationData>,
+    /// Hand `attestation_data` back without checking it, as an implementation
+    /// that failed to honour the trait's contract would.
+    pub attestation_data_unchecked: bool,
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
     pub produces_block: Option<(Slot, ValidatorIndex)>,
@@ -80,6 +102,55 @@ pub struct MockBeaconNode {
     /// What `publish_block` reports. Defaults to `Imported`; a test that cares
     /// about the 202 path sets it.
     pub publish_outcome: Option<Published>,
+    /// When set, `produce_block` answers a pre-gloas request that carries a
+    /// `builder_boost_factor` with a blinded block (for the slot and proposer
+    /// `produces_block` names), as a node whose builder won the slot does. A
+    /// request with no factor still gets a full block, as the contract on
+    /// `BeaconNodeApi::produce_block` requires.
+    pub produces_blinded: bool,
+    /// With [`Self::produces_blinded`], answer with the blinded block even
+    /// when the request carries no factor: a node breaking the contract, so a
+    /// test can see what the caller does with one.
+    pub blinded_regardless: bool,
+    /// Every registration `register_validators` received, in call order.
+    pub registrations: Mutex<Vec<SignedValidatorRegistrationV1>>,
+    /// The size of each `register_validators` call, in call order, so a test
+    /// can see how a send was batched.
+    pub registration_batches: Mutex<Vec<usize>>,
+    /// Every `register_validators` call, refused and still-waiting ones
+    /// included, so a test can tell a call reached the node.
+    pub registration_attempts: std::sync::atomic::AtomicUsize,
+    /// When set, each `register_validators` call takes a permit before it
+    /// records its batch, so a test releases calls one at a time instead of
+    /// guessing how long a delay must be.
+    pub registration_gate: Option<Arc<Semaphore>>,
+    /// Every blinded block published, as (fork, body).
+    pub published_blinded: Mutex<Vec<(ForkName, Vec<u8>)>>,
+    /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
+    /// `Err(detail)` is a `BlindedUnconfirmed` carrying `detail`.
+    pub blinded_publish_outcome: Option<std::result::Result<Published, String>>,
+    /// When set, `publish_blinded_block` answers with this status as a node
+    /// that definitely refused the block (a 4xx) does: `BeaconNodeStatus`.
+    pub blinded_publish_refusal: Option<u16>,
+    /// When set, `publish_blinded_block` takes a permit before it records the
+    /// block and answers, as a node waiting on a slow relay does, for as long
+    /// as the test holds the permit back.
+    pub blinded_publish_gate: Option<Arc<Semaphore>>,
+    /// Notified when `publish_blinded_block` is called, before the gate. A
+    /// test that publishes once can await it whether or not the call came
+    /// first, since `notify_one` keeps the permit for a later waiter.
+    pub blinded_publish_entered: Arc<Notify>,
+    /// When set, `produce_block` takes a permit before it answers, as a node
+    /// slow to build a block does, for as long as the test holds it back.
+    pub produce_gate: Option<Arc<Semaphore>>,
+    /// Notified when `produce_block` is called, before the gate.
+    pub produce_entered: Arc<Notify>,
+    /// When set, `publish_execution_payload_envelope` takes a permit before
+    /// it records the envelope and answers, for as long as the test holds it.
+    pub envelope_publish_gate: Option<Arc<Semaphore>>,
+    /// Notified when `publish_execution_payload_envelope` is called, before
+    /// the gate.
+    pub envelope_publish_entered: Arc<Notify>,
 
     /// What the test asserts against.
     pub submitted: Mutex<Vec<SingleAttestationDto>>,
@@ -114,6 +185,7 @@ pub struct MockBeaconNode {
     pub duties_calls: Mutex<usize>,
     pub validator_indices_calls: Mutex<usize>,
     pub proposer_duties_calls: Mutex<usize>,
+    pub proposer_duties_v2_calls: Mutex<usize>,
     pub attestation_data_calls: Mutex<usize>,
     /// Sync duties by the epoch they are asked at. An epoch never set answers
     /// no duties, so tests that do not care about sync committees are
@@ -241,6 +313,45 @@ impl MockBeaconNode {
         }
     }
 
+    /// Set the v2 proposer duties for `epoch`, replacing any earlier ones: a
+    /// reorg is the same epoch answering with another dependent root.
+    pub fn set_proposers_v2(
+        &self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<ProposerDutyDto>,
+    ) {
+        let mut stored = self.proposers_v2.lock().expect("lock");
+        let entry = ProposerDuties {
+            dependent_root,
+            duties,
+        };
+        match stored
+            .iter_mut()
+            .find(|(stored_epoch, _)| *stored_epoch == epoch)
+        {
+            Some((_, existing)) => *existing = entry,
+            None => stored.push((epoch, entry)),
+        }
+    }
+
+    pub fn with_proposers_v2(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<ProposerDutyDto>,
+    ) -> Self {
+        self.set_proposers_v2(epoch, dependent_root, duties);
+        self
+    }
+
+    /// How many times `proposer_duties_v2` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
+    pub fn proposer_duties_v2_call_count(&self) -> usize {
+        *self.proposer_duties_v2_calls.lock().expect("lock")
+    }
+
     pub fn with_attestation_data(mut self, slot: Slot) -> Self {
         self.attestation_data = Some(AttestationData {
             slot,
@@ -266,6 +377,105 @@ impl MockBeaconNode {
     /// bug pass here and fail in production.
     pub fn with_block(mut self, slot: Slot, proposer_index: ValidatorIndex) -> Self {
         self.produces_block = Some((slot, proposer_index));
+        self
+    }
+
+    /// Answer a `produce_block` that carries a `builder_boost_factor` with a
+    /// blinded block, for the slot and proposer `with_block` names.
+    pub fn with_blinded_block(mut self) -> Self {
+        self.produces_blinded = true;
+        self
+    }
+
+    /// Answer every pre-gloas `produce_block` with a blinded block, factor or
+    /// not, as a node breaking the contract on `BeaconNodeApi::produce_block`.
+    pub fn with_blinded_block_regardless(mut self) -> Self {
+        self.produces_blinded = true;
+        self.blinded_regardless = true;
+        self
+    }
+
+    /// Make `publish_blinded_block` fail as a node that did not confirm the
+    /// block, carrying `detail`.
+    pub fn with_unconfirmed_blinded_publish(mut self, detail: &str) -> Self {
+        self.blinded_publish_outcome = Some(Err(detail.to_string()));
+        self
+    }
+
+    /// Wait, up to five seconds, until `register_validators` has been called
+    /// `calls` times, counting calls still held at the gate.
+    pub async fn wait_for_registration_calls(&self, calls: usize) {
+        let reached = async {
+            while self
+                .registration_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < calls
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .unwrap_or_else(|_| panic!("register_validators was not called {calls} times"));
+    }
+
+    /// Make each `register_validators` call wait for a permit from `gate`
+    /// before it records its batch.
+    pub fn with_registration_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.registration_gate = Some(gate);
+        self
+    }
+
+    /// Make `produce_block` wait for a permit from `gate` before it answers.
+    pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.produce_gate = Some(gate);
+        self
+    }
+
+    /// Make `submit_proposer_preferences` take `delay` before it answers.
+    pub fn with_preference_delay(mut self, delay: std::time::Duration) -> Self {
+        self.preference_delay = Some(delay);
+        self
+    }
+
+    /// The duties `stored` holds for `epoch`, or the error a node without them
+    /// answers, naming `what` was asked for.
+    fn proposers_at(
+        stored: &Mutex<Vec<(Epoch, ProposerDuties)>>,
+        epoch: Epoch,
+        what: &str,
+    ) -> Result<ProposerDuties> {
+        stored
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(held, _)| *held == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no {what} for epoch {epoch}"),
+            })
+    }
+
+    /// Make `publish_execution_payload_envelope` wait for a permit from
+    /// `gate` before it records the envelope and answers.
+    pub fn with_envelope_publish_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.envelope_publish_gate = Some(gate);
+        self
+    }
+
+    /// Make `publish_blinded_block` wait for a permit from `gate` before it
+    /// records the block and answers.
+    pub fn with_blinded_publish_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.blinded_publish_gate = Some(gate);
+        self
+    }
+
+    /// Make `publish_blinded_block` fail as a node that definitely refused the
+    /// block, with `status`.
+    pub fn with_refused_blinded_publish(mut self, status: u16) -> Self {
+        self.blinded_publish_refusal = Some(status);
         self
     }
 
@@ -319,6 +529,15 @@ impl MockBeaconNode {
             .lock()
             .expect("lock")
             .clone()
+    }
+
+    /// Break the contract on `BeaconNodeApi::attestation_data`: answer with
+    /// whatever data is set, unchecked. For tests of the caller's own check,
+    /// which a mock that honours the contract never lets a wrong answer
+    /// reach.
+    pub fn without_attestation_data_check(mut self) -> Self {
+        self.attestation_data_unchecked = true;
+        self
     }
 
     /// Give `attestation_data` answers a nonzero `index`, the way a gloas node
@@ -520,8 +739,9 @@ impl MockBeaconNode {
         *self.validator_indices_calls.lock().expect("lock")
     }
 
-    /// How many times `proposer_duties` has been called, successes and
-    /// failures alike.
+    /// How many times `proposer_duties` has been called and got past the
+    /// configured failures, answers and misses alike. A call `failures` or
+    /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_call_count(&self) -> usize {
         *self.proposer_duties_calls.lock().expect("lock")
     }
@@ -606,17 +826,16 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties> {
         self.guard("proposer_duties")?;
         *self.proposer_duties_calls.lock().expect("lock") += 1;
-        self.proposers
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|(stored, _)| *stored == epoch)
-            .map(|(_, duties)| duties.clone())
-            .ok_or_else(|| Error::BeaconNode {
-                url: "mock".to_string(),
-                failure: BeaconNodeFailure::Request,
-                detail: format!("no proposer duties for epoch {epoch}"),
-            })
+        Self::proposers_at(&self.proposers, epoch, "proposer duties")
+    }
+
+    async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
+        self.guard("proposer_duties_v2")?;
+        *self.proposer_duties_v2_calls.lock().expect("lock") += 1;
+        if let Some(hook) = &self.on_proposer_duties_v2 {
+            hook();
+        }
+        Self::proposers_at(&self.proposers_v2, epoch, "v2 proposer duties")
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
@@ -633,8 +852,11 @@ impl BeaconNodeApi for MockBeaconNode {
         // with data for another slot behaves like a node stuck on a stale
         // head: it errors, and failover moves past it. Without this the mock
         // would be a more permissive node than any real one, and tests built
-        // on it would not reflect what happens in production.
-        crate::beacon_node::validate_attestation_data(slot, &data)?;
+        // on it would not reflect what happens in production. Unless a test
+        // asks for exactly that, to reach the caller's own check.
+        if !self.attestation_data_unchecked {
+            crate::beacon_node::validate_attestation_data(slot, fork, &data)?;
+        }
         Ok(data)
     }
 
@@ -644,6 +866,13 @@ impl BeaconNodeApi for MockBeaconNode {
     /// failover moves past it.
     async fn produce_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         self.guard("produce_block")?;
+        self.produce_entered.notify_one();
+        if let Some(gate) = &self.produce_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
         self.block_requests
             .lock()
             .expect("lock")
@@ -666,6 +895,7 @@ impl BeaconNodeApi for MockBeaconNode {
             let block = ProducedBlock {
                 fork: ForkName::Gloas,
                 contents: Contents::Gloas { block, payload },
+                producer: Default::default(),
             };
             crate::beacon_node::validate_produced_block(request, &block)?;
             return Ok(block);
@@ -675,6 +905,19 @@ impl BeaconNodeApi for MockBeaconNode {
             failure: BeaconNodeFailure::Request,
             detail: "no block set".into(),
         })?;
+        if self.produces_blinded
+            && (request.builder_boost_factor.is_some() || self.blinded_regardless)
+        {
+            let block = ProducedBlock {
+                fork: ForkName::Electra,
+                contents: Contents::Blinded {
+                    block: BlindedBeaconBlock::from(empty_block_for(slot, proposer_index)),
+                },
+                producer: Default::default(),
+            };
+            crate::beacon_node::validate_produced_block(request, &block)?;
+            return Ok(block);
+        }
         // Electra, matching the block shape `empty_block_for` builds. A test
         // that needs a fork mismatch constructs one itself rather than getting
         // it by accident here.
@@ -685,6 +928,7 @@ impl BeaconNodeApi for MockBeaconNode {
                 kzg_proofs: Default::default(),
                 blobs: Default::default(),
             },
+            producer: Default::default(),
         };
         crate::beacon_node::validate_produced_block(request, &block)?;
         Ok(block)
@@ -697,6 +941,98 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .push((fork, body.to_vec()));
         Ok(self.publish_outcome.unwrap_or(Published::Imported))
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _producer: Producer,
+        fork: ForkName,
+        body: &[u8],
+    ) -> Result<Published> {
+        // `failures` and `fail_everything` stand for a node that could not be
+        // reached, which over HTTP is a definite failure: the request never
+        // left. An unconfirmed publish is `with_unconfirmed_blinded_publish`.
+        self.guard("publish_blinded_block")?;
+        if let Some(status) = self.blinded_publish_refusal {
+            return Err(Error::BeaconNodeStatus {
+                status,
+                body: "refused".to_string(),
+            });
+        }
+        self.blinded_publish_entered.notify_one();
+        if let Some(gate) = &self.blinded_publish_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
+        self.published_blinded
+            .lock()
+            .expect("lock")
+            .push((fork, body.to_vec()));
+        match &self.blinded_publish_outcome {
+            None => Ok(Published::HandedToBuilder),
+            Some(Ok(published)) => Ok(*published),
+            Some(Err(detail)) => Err(Error::BlindedUnconfirmed {
+                status: None,
+                detail: detail.clone(),
+            }),
+        }
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistrationV1],
+    ) -> Result<()> {
+        self.registration_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.guard("register_validators")?;
+        if let Some(gate) = &self.registration_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
+        self.registration_batches
+            .lock()
+            .expect("lock")
+            .push(registrations.len());
+        self.registrations
+            .lock()
+            .expect("lock")
+            .extend(registrations.iter().cloned());
+        Ok(())
+    }
+
+    async fn submit_proposer_preferences(
+        &self,
+        fork: ForkName,
+        preferences: &[gloas::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        // Before the guard, so a failing node can be a slow one too: one
+        // whose answer times out.
+        if let Some(delay) = self.preference_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.guard("submit_proposer_preferences")?;
+        let refused = self.refused_preference_slots.lock().expect("lock").clone();
+        if let Some(entry) = preferences
+            .iter()
+            .find(|entry| refused.contains(&entry.message.proposal_slot))
+        {
+            return Err(Error::BeaconNodeStatus {
+                status: 400,
+                body: format!(
+                    "preference for slot {} refused",
+                    entry.message.proposal_slot
+                ),
+            });
+        }
+        self.submitted_preferences
+            .lock()
+            .expect("lock")
+            .push((fork, preferences.to_vec()));
+        Ok(Delivery::Everywhere)
     }
 
     async fn execution_payload_envelope(
@@ -732,6 +1068,13 @@ impl BeaconNodeApi for MockBeaconNode {
         blob_data_included: bool,
     ) -> Result<()> {
         self.guard("publish_execution_payload_envelope")?;
+        self.envelope_publish_entered.notify_one();
+        if let Some(gate) = &self.envelope_publish_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
         self.published_envelopes
             .lock()
             .expect("lock")
