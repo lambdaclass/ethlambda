@@ -23,7 +23,9 @@ lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 # runs this target too.
 #
 # - Every tracked `.rs` file (`git ls-files`), wherever it lives, so a crate
-#   added outside crates/ and bin/ is covered too.
+#   added outside crates/ and bin/ is covered too. If git lists none (not a
+#   checkout, or git refusing the directory) the check fails: `|| true` below
+#   would otherwise read the empty scan as a pass.
 # - Each macro line plus the two after it, which catches the form rustfmt
 #   produces for a long path: `include_str!(` with the path on the next line. A
 #   path assembled further away (`concat!` across many lines) or a file opened
@@ -33,13 +35,16 @@ lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 #   `fixtures/docs/x.ssz`, fails. A false positive fails loudly, while a
 #   narrower pattern can miss the real thing, so widen the list rather than
 #   anchoring it. Keep it in step with the action's `inert` list.
+# - The hits are printed with `printf`, not `echo`: both dash's and macOS's `sh`
+#   expand backslash escapes in `echo`, so a `\c` in a hit cut the list short.
 inert-paths-check: ## 🔎 Fail if a crate compiles in a path the docs-only CI skip treats as unread
 	@pattern='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'; \
+	git ls-files --error-unmatch '*.rs' > /dev/null || { echo "ERROR: git listed no tracked .rs files to scan."; exit 1; }; \
 	hits=$$(git ls-files -z '*.rs' | xargs -0 grep -HnE -A2 'include_(str|bytes)!' | grep -E "$$pattern" || true); \
 	if [ -n "$$hits" ]; then \
 		echo "ERROR: these compile in a path .github/actions/detect-changes treats as docs-only."; \
 		echo "Take the path off that action's inert list, or stop reading it:"; \
-		echo "$$hits"; \
+		printf '%s\n' "$$hits"; \
 		exit 1; \
 	fi
 

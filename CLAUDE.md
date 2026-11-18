@@ -116,7 +116,9 @@ nothing in a build or a test reading those paths. A crate that starts to (a
 take the path off the list, or a change to that file merges untested.
 `make inert-paths-check` (run by `make lint` and CI's Lint job) enforces the
 compile-time half: it fails on an `include_str!`/`include_bytes!` naming one of
-those paths. A path assembled across lines or opened at run time gets past it.
+those paths. It reads the macro line and the two after it, so rustfmt's split
+form is caught; a path assembled further away (a long `concat!`, a
+`macro_rules!` argument) or opened at run time gets past it.
 
 ### Common Operations
 ```bash

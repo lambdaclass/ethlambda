@@ -23,8 +23,8 @@ env:
   # Incremental state is pure cost on a runner: `Swatinem/rust-cache` deletes
   # `target/*/incremental` before saving, so it is never restored, and every job
   # here starts from whatever the cache holds rather than from its own previous
-  # build. Nothing reads it, and it is comparable in size to the build output
-  # itself, on a filesystem that a cold workspace build has already outgrown.
+  # build. Nothing reads it, yet writing it costs about as much disk as the
+  # build output itself.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -121,6 +121,15 @@ jobs:
       # `cargo test -p ethlambda-storage` and nothing else would notice.
       - name: Clippy (storage without RocksDB)
         run: cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
+
+      # The binary alone, with the features it ships with. Every other build of
+      # it in this workflow, `Cargo check` above and `Test (node)` included,
+      # unifies the dev-dependencies' features in (`bin/ethlambda` enables
+      # tokio's `test-util`), so code that compiles only because of one would
+      # pass them all and break `cargo build --release`. The `Benchmark smoke`
+      # job's `cargo run` used to be the build that caught it.
+      - name: Cargo check (binary, shipped features)
+        run: cargo check --locked -p ethlambda
 
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.

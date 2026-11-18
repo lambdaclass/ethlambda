@@ -7,8 +7,8 @@ description: >-
 inputs:
   make-target:
     description: >-
-      Which target to run. CI passes one half of the suite per job, because the
-      two together no longer fit a single runner's root filesystem.
+      Which target to run. CI passes one half of the suite per job, so the two
+      build and run in parallel (the Makefile's `CONSENSUS_CRATES` says more).
     required: false
     default: "test"
 
