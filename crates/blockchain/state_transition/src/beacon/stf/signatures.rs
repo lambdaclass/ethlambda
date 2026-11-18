@@ -47,8 +47,8 @@ use crate::beacon::error::{Result, verify};
 /// callers that apply an operation to a scratch state and must learn at once
 /// whether it was accepted. A deferring batch that could be dropped
 /// unverified would turn every function taking one into "valid except for
-/// its signatures".
-#[derive(Default)]
+/// its signatures", which is also why it does not implement `Default`: a
+/// public `default()` would be exactly such a batch.
 pub struct SignatureBatch {
     sets: Vec<SignatureSet>,
     /// `sets[i]`'s label, apart from the sets so the batch check reads them
@@ -61,7 +61,11 @@ impl SignatureBatch {
     /// An empty batch that defers every set pushed to it. Crate-internal: the
     /// caller must [`Self::verify`] it, which [`Self::deferred`] guarantees.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            sets: Vec::new(),
+            labels: Vec::new(),
+            immediate: false,
+        }
     }
 
     /// Runs `f` with a batch that defers every set pushed to it, then verifies
@@ -86,7 +90,7 @@ impl SignatureBatch {
     pub fn immediate() -> Self {
         Self {
             immediate: true,
-            ..Self::default()
+            ..Self::new()
         }
     }
 
