@@ -96,8 +96,11 @@ Passing therefore covers the registration path, a builder block from ethlambda's
 own beacon node, and ethlambda's validator client proposing blinded blocks
 through lighthouse. The script writes every `lean_beacon_builder_*` and
 `ethlambda_validator_*` blinded or registration series of the three services to
-`<output-dir>/<service>.prom`, pass or fail, and the unmet conditions to
-`failed.txt`.
+`<output-dir>/<service>.prom`, pass or fail, and rewrites `failed.txt` with the
+unmet conditions after every evaluation, so a cancelled run still says what was
+missing. It stops at once, with exit status 2, if a service has no `metrics`
+port: the service names depend on ethereum-package's naming and on the
+participant order, and a mismatch is a setup problem, not a slow builder.
 
 The relay, builder, PBS and spamoor images are pinned by digest in
 `commit_boost_params.yaml` (the package's defaults are floating tags).
