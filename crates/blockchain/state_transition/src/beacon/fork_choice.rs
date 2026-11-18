@@ -1872,9 +1872,10 @@ pub fn get_voting_source(
 /// Walks `block_root`'s subtree, adding every block on a viable branch to
 /// `blocks`, and reporting whether `block_root` itself sits on one.
 ///
-/// *Note*: external callers must pass `store.justified_checkpoint.root` for
-/// `block_root`; only the spec-literal reference in the tests passes anything
-/// else.
+/// *Note*: callers must pass `store.justified_checkpoint.root` for
+/// `block_root`, as [`get_filtered_block_tree`], the only one, does. The
+/// specification passes other roots only from its own recursive calls, which
+/// the walk below replaces.
 ///
 /// The specification recurses once per child. This visits the same blocks in
 /// the same order, failing at the same block, but keeps its own stack of the
@@ -9988,12 +9989,15 @@ mod tests {
         );
     }
 
-    /// The specification's `filter_block_tree` finds a block's children by
-    /// scanning every block in the store. The node's version looks them up in
-    /// a parent-to-children map built once per call, so this keeps the scan
-    /// as the reference and checks the two agree on every random tree, at
-    /// current slots where the filter keeps everything and where it drops a
-    /// branch.
+    /// The specification's `filter_block_tree`, recursing once per child and
+    /// finding a block's children by scanning every block in the store. The
+    /// node's version walks an explicit stack and looks the children up in a
+    /// parent-to-children map built once per call, so this keeps the
+    /// recursive scan as the reference and checks the two agree on every
+    /// random tree, at current slots where the filter keeps everything and
+    /// where it drops a branch. A leaf's viability is the same question
+    /// either way, so the reference asks [`is_viable_leaf`] for it and shares
+    /// nothing else with the walk.
     fn filter_block_tree_by_scan(
         store: &Store,
         index: &HashMap<Root, (Slot, Root)>,
@@ -10001,28 +10005,29 @@ mod tests {
         blocks: &mut HashMap<Root, (Slot, Root)>,
         config: &Config,
     ) -> Result<bool> {
+        let entry = *index
+            .get(&block_root)
+            .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
         let children: Vec<Root> = index
             .iter()
             .filter(|&(_, &(_, parent_root))| parent_root == block_root)
             .map(|(&root, _)| root)
             .collect();
-        if children.is_empty() {
-            // A leaf's viability is the same question either way, so the
-            // reference asks the node's own code for it: an empty child map
-            // makes `filter_block_tree` take its leaf branch.
-            let no_children = HashMap::new();
-            return filter_block_tree(store, index, &no_children, block_root, blocks, config);
-        }
-        let mut any_viable = false;
-        for child in children {
-            if filter_block_tree_by_scan(store, index, child, blocks, config)? {
-                any_viable = true;
+        let viable = if children.is_empty() {
+            is_viable_leaf(store, index, block_root, config)?
+        } else {
+            let mut any_viable = false;
+            for child in children {
+                if filter_block_tree_by_scan(store, index, child, blocks, config)? {
+                    any_viable = true;
+                }
             }
+            any_viable
+        };
+        if viable {
+            blocks.insert(block_root, entry);
         }
-        if any_viable {
-            blocks.insert(block_root, index[&block_root]);
-        }
-        Ok(any_viable)
+        Ok(viable)
     }
 
     #[test]
