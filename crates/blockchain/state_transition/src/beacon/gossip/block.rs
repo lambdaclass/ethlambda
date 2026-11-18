@@ -28,6 +28,11 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
+    // The feature forks after gloas (EIP-8483, PQ) have no gossip rules here:
+    // the node does not follow them.
+    if !block.fork_name().is_followed() {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
     if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
         return cheap_checks_gloas(seen, store, gloas_block, now_ms);
     }
@@ -71,6 +76,10 @@ fn as_gloas<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => None,
+        // No gossip rules for the feature forks after gloas: the node does
+        // not follow them (`ForkName::is_followed`), and `cheap_checks`
+        // ignores their blocks before any rule reads them.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => None,
         SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
     }
 }
@@ -260,7 +269,9 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
 /// which has none: its parent counts as full, so no caller asks.
 fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
     match state {
-        BeaconState::Gloas(state) => Some(state.latest_block_hash),
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
+            state.gloas_family().map(|inner| *inner.latest_block_hash)
+        }
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)

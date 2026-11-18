@@ -151,7 +151,7 @@ async fn post_builders(
         }
         let status = if builder.withdrawable_epoch != FAR_FUTURE_EPOCH {
             BuilderStatus::Exited
-        } else if is_active_builder(inner, index).unwrap_or(false) {
+        } else if is_active_builder(&inner.into(), index).unwrap_or(false) {
             BuilderStatus::Active
         } else {
             BuilderStatus::Pending

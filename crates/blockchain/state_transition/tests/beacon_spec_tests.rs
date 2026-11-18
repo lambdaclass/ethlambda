@@ -33,6 +33,12 @@ fn main() {
     beacon_spec::select_preset();
     let args = libtest_mimic::Arguments::from_args();
 
+    // consensus-specs generates the EIP-8483 and PQ fixtures with XMSS
+    // inactive (its reference key generation takes minutes), so their
+    // signatures are stubs and their proofs empty. Only the PQ fork verifies
+    // XMSS, so no earlier fork's case is affected.
+    ethlambda_state_transition::beacon::helpers::pq::disable_xmss_verification();
+
     let mut trials = Vec::new();
     trials.extend(beacon_spec::harness::trials());
     trials.extend(beacon_spec::fixture_fork_trials());

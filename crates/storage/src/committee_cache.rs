@@ -53,6 +53,12 @@ use ethlambda_types::beacon::primitives::{Epoch, Root};
 /// since. Epoch and decision root together are what makes a cross-state
 /// cache sound where `epoch` or `seed` alone would not be.
 ///
+/// `max_committees_per_slot` is the third input, constant within a fork: the
+/// PQ fork caps a slot's committees at `MAX_COMMITTEES_PER_SLOT_PQ` rather
+/// than `MAX_COMMITTEES_PER_SLOT`, and recomputes even the previous epoch's
+/// committees under its own cap, so a state either side of the fork boundary
+/// names the same epoch and deciding block but a different shuffling.
+///
 /// Opaque to this module: `epoch` and `decision_root` are read only for
 /// equality and (for eviction) ordering by `epoch`. `ethlambda-state-transition`'s
 /// `beacon::helpers::accessors::shuffling_key` is what derives one from a
@@ -62,6 +68,7 @@ use ethlambda_types::beacon::primitives::{Epoch, Root};
 pub struct ShufflingKey {
     pub epoch: Epoch,
     pub decision_root: Root,
+    pub max_committees_per_slot: u64,
 }
 
 /// How many distinct shufflings stay resident in a [`CommitteeCache`].
@@ -375,6 +382,7 @@ mod tests {
         ShufflingKey {
             epoch,
             decision_root: Root::repeat_byte(decision_root),
+            max_committees_per_slot: 64,
         }
     }
 

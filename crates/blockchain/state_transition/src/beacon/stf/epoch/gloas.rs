@@ -123,9 +123,9 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
     let validator_count = state.validator_count();
     let inner = gloas_state(state, "process_participation_flag_updates")?;
 
-    inner.previous_epoch_participation = core::mem::take(&mut inner.current_epoch_participation);
+    *inner.previous_epoch_participation = core::mem::take(inner.current_epoch_participation);
     // `repeat` rather than a zeroed `Vec`, for the reason given in altair's.
-    inner.current_epoch_participation = gloas::EpochParticipation::repeat(0, validator_count);
+    *inner.current_epoch_participation = gloas::EpochParticipation::repeat(0, validator_count);
 
     Ok(())
 }
@@ -229,7 +229,7 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
     let mut window = Vec::with_capacity(preset::ptc_window_length());
     window.extend_from_slice(&inner.ptc_window[slots_per_epoch..]);
     window.extend(new_slice);
-    inner.ptc_window = window.try_into().expect(
+    *inner.ptc_window = window.try_into().expect(
         "dropping SLOTS_PER_EPOCH entries and appending SLOTS_PER_EPOCH more preserves \
          PTC_WINDOW_LENGTH",
     );
@@ -243,7 +243,7 @@ mod tests {
     use crate::beacon::containers::electra;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::accessors::get_total_active_balance;
-    use crate::beacon::helpers::gloas::{get_ptc, gloas_state_ref};
+    use crate::beacon::helpers::gloas::get_ptc;
     use crate::beacon::primitives::ValidatorIndex;
 
     /// A gloas state with `count` fully active, full-balance validators,
@@ -255,11 +255,17 @@ mod tests {
     }
 
     fn gloas_inner(state: &BeaconState) -> &gloas::BeaconState {
-        gloas_state_ref(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     fn gloas_inner_mut(state: &mut BeaconState) -> &mut gloas::BeaconState {
-        gloas_state(state, "test").unwrap()
+        match state {
+            BeaconState::Gloas(inner) => inner,
+            _ => panic!("a gloas test state"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -601,7 +607,7 @@ mod tests {
         // `> 0` regardless of weight.
         let mut settle_state = gloas_state_with_validators(64);
         gloas_inner_mut(&mut settle_state).builder_pending_payments[0] = payment;
-        settle_builder_payment(gloas_inner_mut(&mut settle_state), 0).unwrap();
+        settle_builder_payment(&mut gloas_state(&mut settle_state, "test").unwrap(), 0).unwrap();
         assert!(
             gloas_inner(&settle_state)
                 .builder_pending_withdrawals

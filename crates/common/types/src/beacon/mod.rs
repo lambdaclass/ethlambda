@@ -75,6 +75,23 @@ pub(crate) fn lean_block_unreachable(function: &str) -> ! {
     )
 }
 
+/// Panics, naming the BLS-only accessor a PQ value reached.
+///
+/// The PQ fork signs with leanXMSS, so a block, attestation or key of that
+/// fork has no BLS counterpart to hand back. Every BLS verification path
+/// dispatches on the fork first; reaching this means one did not. Public,
+/// unlike the lean helpers, because the state transition's own PQ arms of BLS
+/// paths panic the same way.
+#[cold]
+#[track_caller]
+pub fn xmss_fork_has_no_bls(function: &str) -> ! {
+    unreachable!(
+        "a PQ value reached a BLS-only function ({function}); \
+         the PQ fork signs with leanXMSS, so the caller must dispatch on the \
+         fork before verifying a BLS signature"
+    )
+}
+
 /// Panics, naming the beacon fork a lean-only caller reached.
 ///
 /// The mirror image of [`lean_state_unreachable`] and [`lean_block_unreachable`]:

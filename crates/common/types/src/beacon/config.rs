@@ -326,6 +326,22 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub gloas_fork_epoch: Epoch,
+    /// The `Fork.current_version` an EIP-8483 block signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub eip8483_fork_version: Version,
+    /// The epoch EIP-8483 activates at, or [`constants::FAR_FUTURE_EPOCH`] if
+    /// it is not scheduled. A consensus-specs feature fork, never scheduled
+    /// on a built-in network.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub eip8483_fork_epoch: Epoch,
+    /// The `Fork.current_version` a PQ block signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub pq_fork_version: Version,
+    /// The epoch PQ activates at, or [`constants::FAR_FUTURE_EPOCH`] if it is
+    /// not scheduled. A consensus-specs feature fork, never scheduled on a
+    /// built-in network.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub pq_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -413,6 +429,11 @@ pub struct Config {
     /// to [`Self::min_validator_withdrawability_delay`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_builder_withdrawability_delay: Epoch,
+    /// PQ: epochs after the fork at which a validator that registered no PQ
+    /// key before it becomes withdrawable (`upgrade_to_pq`'s
+    /// `compute_validators`).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub unregistered_validator_withdrawability_delay: Epoch,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -723,6 +744,10 @@ impl Config {
             fulu_fork_epoch: 411_392,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_version: [0xe8, 0x48, 0x30, 0x00],
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            pq_fork_version: [0xe0, 0x00, 0x00, 0x00],
+            pq_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -742,6 +767,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
+            unregistered_validator_withdrawability_delay: 16_384,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -857,6 +883,10 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_version: [0xe8, 0x48, 0x30, 0x01],
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            pq_fork_version: [0xe0, 0x00, 0x00, 0x01],
+            pq_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -876,6 +906,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
+            unregistered_validator_withdrawability_delay: 16_384,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -979,6 +1010,8 @@ impl Config {
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            eip8483_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            pq_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -1066,6 +1099,8 @@ impl Config {
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
+            ForkName::Eip8483 => self.eip8483_fork_version,
+            ForkName::Pq => self.pq_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -1084,6 +1119,8 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
+            ForkName::Eip8483 => self.eip8483_fork_epoch,
+            ForkName::Pq => self.pq_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1109,6 +1146,8 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
+            ForkName::Eip8483 => self.eip8483_fork_epoch = epoch,
+            ForkName::Pq => self.pq_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1126,6 +1165,8 @@ impl Config {
             ForkName::Electra => self.electra_fork_version = version,
             ForkName::Fulu => self.fulu_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
+            ForkName::Eip8483 => self.eip8483_fork_version = version,
+            ForkName::Pq => self.pq_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),

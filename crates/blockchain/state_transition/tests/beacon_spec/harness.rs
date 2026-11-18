@@ -70,7 +70,14 @@ pub fn trials() -> Vec<Trial> {
         }),
         Trial::test("harness/discovery_covers_every_supported_fork", || {
             let cases = collect(preset(), "ssz_static", "Checkpoint");
-            for fork in ForkName::ALL {
+            // The consensus-specs feature forks no release ships fixtures for:
+            // theirs are generated from the specification's `pq` branch, so
+            // a tree without them is the pinned release, not a broken one.
+            let generated_only = [ForkName::Eip8483, ForkName::Pq];
+            for fork in ForkName::ALL
+                .into_iter()
+                .filter(|fork| !generated_only.contains(fork))
+            {
                 assert!(
                     cases.iter().any(|case| case.fork == fork),
                     "discovery found no {fork} cases; the fixture release is expected to \

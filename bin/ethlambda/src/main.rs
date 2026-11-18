@@ -65,7 +65,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, eip8483, electra, gloas,
+        phase0, pq,
     },
     beacon::fork::ForkName,
     beacon::primitives::Epoch,
@@ -2017,6 +2018,10 @@ fn first_config_difference(
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
+        eip8483_fork_version: _,
+        eip8483_fork_epoch: _,
+        pq_fork_version: _,
+        pq_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -2045,6 +2050,9 @@ fn first_config_difference(
         // Compared below, alongside `min_validator_withdrawability_delay`:
         // the builder-registry counterpart, also a state-transition rule.
         min_builder_withdrawability_delay: _,
+        // Compared below: when an unregistered validator becomes withdrawable
+        // at the PQ fork is a state-transition rule.
+        unregistered_validator_withdrawability_delay: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -2197,6 +2205,7 @@ fn first_config_difference(
         slot_duration_ms,
         min_validator_withdrawability_delay,
         min_builder_withdrawability_delay,
+        unregistered_validator_withdrawability_delay,
         shard_committee_period,
         inactivity_score_bias,
         inactivity_score_recovery_rate,
@@ -2580,6 +2589,26 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
             },
             signature: Default::default(),
         }),
+        ForkName::Eip8483 => SignedBeaconBlock::Eip8483(eip8483::SignedBeaconBlock {
+            message: eip8483::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: eip8483::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Pq => SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+            message: pq::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: pq::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        })),
         // Never reached: this is only called on a network's own genesis
         // state, and every `NetworkSource` decodes a beacon fork there
         // (`NetworkDir::load` resolves the fork from `Config::fork_at_epoch`,
@@ -2848,13 +2877,17 @@ mod tests {
     }
 
     /// Gloas is followed: the envelopes and payload attestations a gloas chain
-    /// needs are delivered, so no fork is refused as an anchor.
+    /// needs are delivered, so no fork through gloas is refused as an anchor.
+    /// The consensus-specs feature forks after it (EIP-8483, PQ) are refused:
+    /// only the state transition and fork choice implement them.
     #[test]
-    fn startup_accepts_an_anchor_at_every_beacon_fork() {
+    fn startup_accepts_an_anchor_at_every_followed_fork() {
         for fork in ForkName::ALL {
-            assert!(
+            let followed = fork <= ForkName::Gloas;
+            assert_eq!(
                 refuse_unfollowable_fork(fork).is_ok(),
-                "{fork} must be followable"
+                followed,
+                "{fork} followed: {followed}"
             );
         }
     }
@@ -3741,6 +3774,8 @@ validators:
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
                 ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Eip8483 => eip8483::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Pq => pq::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;

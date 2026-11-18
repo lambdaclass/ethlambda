@@ -768,6 +768,11 @@ fn gloas_block(store: &Store, root: &Root) -> Result<GloasBlock, Outcome> {
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => Err(Outcome::Reject(RejectReason::BlockNotGloas)),
+        // Not followed (`ForkName::is_followed`): no column of theirs is
+        // judged here.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => {
+            Err(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::gloas_block"),
     };
     Ok(GloasBlock {

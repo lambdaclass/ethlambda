@@ -43,7 +43,12 @@ fn beacon_snapshot_interval() -> u64 {
 /// a target of the beacon STF's `upgrade`-style traversal. See
 /// [`ForkName::ALL`].
 ///
-/// Forks after gloas exist upstream but are out of scope for this crate.
+/// [`ForkName::Eip8483`] and [`ForkName::Pq`] are consensus-specs feature
+/// forks (`specs/_features/{eip8483,pq}` on the `pq` branch, pinned at
+/// `a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`), not mainnet upgrades: the
+/// PQ fork replaces BLS with leanXMSS, and needs the EIP-8483 registrations
+/// made before it, so the two are scheduled in that order after gloas. Other
+/// forks after gloas exist upstream but are out of scope for this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,
@@ -54,6 +59,12 @@ pub enum ForkName {
     Electra,
     Fulu,
     Gloas,
+    /// EIP-8483: validators and builders register post-quantum key material
+    /// through execution-layer requests, which the PQ fork then adopts.
+    Eip8483,
+    /// The post-quantum fork: leanXMSS signatures replace BLS, sync
+    /// committees are removed, and RANDAO reveals become VRF proofs.
+    Pq,
     /// The Lean consensus protocol, which this repository implements alongside
     /// the Beacon Chain. Not a Beacon Chain fork, and not in [`ForkName::ALL`].
     Lean,
@@ -67,7 +78,7 @@ impl ForkName {
     /// array, its absence is what makes `parse("lean")` return `None`, keeps
     /// `Gloas.next()` at `None`, and stops any fixture directory from resolving
     /// to a lean case.
-    pub const ALL: [ForkName; 8] = [
+    pub const ALL: [ForkName; 10] = [
         ForkName::Phase0,
         ForkName::Altair,
         ForkName::Bellatrix,
@@ -76,6 +87,8 @@ impl ForkName {
         ForkName::Electra,
         ForkName::Fulu,
         ForkName::Gloas,
+        ForkName::Eip8483,
+        ForkName::Pq,
     ];
 
     /// The lowercase name the specification and its fixture paths use.
@@ -89,6 +102,8 @@ impl ForkName {
             ForkName::Electra => "electra",
             ForkName::Fulu => "fulu",
             ForkName::Gloas => "gloas",
+            ForkName::Eip8483 => "eip8483",
+            ForkName::Pq => "pq",
             ForkName::Lean => "lean",
         }
     }
@@ -137,6 +152,12 @@ impl ForkName {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas => true,
+            // The state transition and fork choice implement both, but the
+            // live follower does not: nothing gossips, requests or produces
+            // their blocks yet, and the EIP-8483 and PQ execution requests have
+            // no engine API path. A chain reaching either is refused
+            // (`refuse_unfollowable_fork`) rather than followed half way.
+            ForkName::Eip8483 | ForkName::Pq => false,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -150,7 +171,7 @@ impl ForkName {
     /// gloas must be listed here, so the compiler forces the decision.
     pub const fn has_payload_envelopes(self) -> bool {
         match self {
-            ForkName::Gloas => true,
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => true,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -181,6 +202,8 @@ impl ForkName {
             ForkName::Electra => 5,
             ForkName::Fulu => 6,
             ForkName::Gloas => 7,
+            ForkName::Eip8483 => 8,
+            ForkName::Pq => 9,
             ForkName::Lean => 255,
         }
     }
@@ -206,7 +229,9 @@ impl ForkName {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => beacon_snapshot_interval(),
+            | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq => beacon_snapshot_interval(),
         }
     }
 
@@ -224,6 +249,8 @@ impl ForkName {
             5 => Some(ForkName::Electra),
             6 => Some(ForkName::Fulu),
             7 => Some(ForkName::Gloas),
+            8 => Some(ForkName::Eip8483),
+            9 => Some(ForkName::Pq),
             255 => Some(ForkName::Lean),
             _ => None,
         }
@@ -265,18 +292,20 @@ mod tests {
     }
 
     #[test]
-    fn gloas_is_the_last_beacon_fork() {
+    fn pq_is_the_last_beacon_fork() {
         assert_eq!(ForkName::Fulu.next(), Some(ForkName::Gloas));
+        assert_eq!(ForkName::Gloas.next(), Some(ForkName::Eip8483));
+        assert_eq!(ForkName::Eip8483.next(), Some(ForkName::Pq));
         // Also guards the reason Lean is kept out of ALL: adding it there
         // would make this None into Some(Lean) and let `upgrade` walk off
         // the end.
-        assert_eq!(ForkName::Gloas.next(), None);
+        assert_eq!(ForkName::Pq.next(), None);
     }
 
     #[test]
     fn neighbours_terminate_at_the_ends() {
         assert_eq!(ForkName::Phase0.previous(), None);
-        assert_eq!(ForkName::Gloas.next(), None);
+        assert_eq!(ForkName::Pq.next(), None);
         assert_eq!(ForkName::Altair.previous(), Some(ForkName::Phase0));
         assert_eq!(ForkName::Altair.next(), Some(ForkName::Bellatrix));
     }
@@ -336,7 +365,7 @@ mod tests {
     #[test]
     fn every_beacon_fork_through_gloas_is_followed() {
         for fork in ForkName::ALL {
-            assert!(fork.is_followed(), "{fork:?}");
+            assert_eq!(fork.is_followed(), fork <= ForkName::Gloas, "{fork:?}");
         }
     }
 
@@ -354,9 +383,11 @@ mod tests {
         assert_eq!(ForkName::Phase0.selector(), 0);
         assert_eq!(ForkName::Fulu.selector(), 6);
         assert_eq!(ForkName::Gloas.selector(), 7);
+        assert_eq!(ForkName::Eip8483.selector(), 8);
+        assert_eq!(ForkName::Pq.selector(), 9);
         // Lean sits at the top of the byte range so heze can keep taking the
         // next free value after gloas.
         assert_eq!(ForkName::Lean.selector(), 255);
-        assert_eq!(ForkName::from_selector(8), None);
+        assert_eq!(ForkName::from_selector(10), None);
     }
 }

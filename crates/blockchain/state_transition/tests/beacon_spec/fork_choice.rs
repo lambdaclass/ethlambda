@@ -123,8 +123,8 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, Checkpoint, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, fulu,
-    gloas, phase0,
+    BeaconState, Checkpoint, SignedBeaconBlock, altair, bellatrix, capella, deneb, eip8483,
+    electra, fulu, gloas, phase0, pq,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, ForkChoiceNode, ForkRules, PayloadStatus, Store,
@@ -345,6 +345,14 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        ForkName::Eip8483 => Ok(SignedBeaconBlock::Eip8483(eip8483::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        })),
+        ForkName::Pq => Ok(SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        }))),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -372,7 +380,10 @@ fn decode_attestation(case: &Case, name: &str) -> Result<fork_choice::Attestatio
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
-        ForkName::Gloas => Ok(fork_choice::Attestation::Gloas(decode(case, name)?)),
+        ForkName::Gloas | ForkName::Eip8483 => {
+            Ok(fork_choice::Attestation::Gloas(decode(case, name)?))
+        }
+        ForkName::Pq => Ok(fork_choice::Attestation::Pq(decode(case, name)?)),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -392,7 +403,10 @@ fn decode_attester_slashing(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
-        ForkName::Gloas => Ok(fork_choice::AttesterSlashing::Gloas(decode(case, name)?)),
+        ForkName::Gloas | ForkName::Eip8483 => {
+            Ok(fork_choice::AttesterSlashing::Gloas(decode(case, name)?))
+        }
+        ForkName::Pq => Ok(fork_choice::AttesterSlashing::Pq(decode(case, name)?)),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }

@@ -465,8 +465,8 @@ pub fn bid_is_includable(
         && builder.version == constants::PAYLOAD_BUILDER_VERSION
         && bid.blob_kzg_commitments.len() <= preset::MAX_BLOB_COMMITMENTS_PER_BLOCK
         && !exited_by_parent
-        && is_active_builder(inner, bid.builder_index).unwrap_or(false)
-        && can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false)
+        && is_active_builder(&inner.into(), bid.builder_index).unwrap_or(false)
+        && can_builder_cover_bid(&inner.into(), bid.builder_index, bid.value).unwrap_or(false)
 }
 
 /// A produced block and the unsigned envelope that reveals its payload.
@@ -618,7 +618,7 @@ fn check_envelope(
         "payload.slot_number == state.slot",
     )?;
     verify(
-        payload.parent_hash == inner.latest_block_hash,
+        payload.parent_hash == *inner.latest_block_hash,
         "payload.parent_hash == state.latest_block_hash",
     )?;
     verify(

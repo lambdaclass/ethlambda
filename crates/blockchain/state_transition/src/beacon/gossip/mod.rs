@@ -591,7 +591,7 @@ pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms
 /// (A gloas aggregate has its own container, which says so itself.)
 pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas => true,
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

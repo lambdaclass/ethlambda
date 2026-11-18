@@ -1011,3 +1011,83 @@ signature, whichever way the node answered. Three departures:
 - **Until:** Lighthouse's `ValidatorAttestationDataQuery` makes
   `committee_index` optional. The gloas query can then omit it again, as the
   Beacon API asks.
+
+## EIP-8483 and PQ run on a newer gloas than the gloas fork does
+
+consensus-specs' `pq` branch (`a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`) is
+based on a `master` newer than this repository's pin (`v1.7.0-beta.2`). Across
+every fork's `beacon-chain.md`, `fork.md` and `fork-choice.md`, the rules that
+changed in between are the three state-transition rules below, the four
+fork-choice rules in the next section, and two that only touch
+`upgrade_to_gloas` (which deposits `onboard_builders_from_pending_deposits`
+keeps queued, and clearing the fork slot's `execution_payload_availability`
+bit); everything else is renaming and type hints. The two upgrade rules do not
+reach EIP-8483 or PQ, which upgrade from a gloas state.
+
+The EIP-8483 and PQ texts assume the newer state-transition rules, so they
+apply from EIP-8483 on, and gloas keeps the pinned ones until its own fixtures
+move:
+
+- `apply_parent_execution_payload` settles the parent's builder payment
+  *before* processing the parent's execution requests, so a builder exit
+  request is rejected while its payment is pending
+  (`stf::eip8483::apply_parent_execution_payload`,
+  `stf::pq::apply_parent_execution_payload`).
+- The builders sweep pays a builder's balance net of the withdrawals the same
+  sweep already took from it (`get_builder_balance_after_withdrawals`, gated in
+  `stf::gloas::get_builders_sweep_withdrawals`).
+- `slash_validator` clears every pending builder payment whose proposer is the
+  slashed validator, whatever the slashing (`helpers::mutators::slash_validator`).
+  The PQ `process_proposer_slashing` relies on it and no longer clears the
+  payment itself; the EIP-8483 one still runs gloas's narrower clearing first,
+  which the wider one subsumes.
+
+## EIP-8483 and PQ fork choice keeps the pinned release's rules
+
+The same newer `master` changed four fork-choice rules for every fork. PQ's
+`on_block` calls `get_head`, so they reach PQ, but this repository applies none
+of them to any fork yet, EIP-8483 and PQ included:
+
+- `calculate_committee_fraction` (proposer boost, and the weak-head and
+  strong-parent reorg thresholds) sums the *unslashed* active balance; here it
+  is still `get_total_active_balance`, which counts slashed validators that
+  are still active.
+- `get_slot_component_duration_ms` rounds to the nearest millisecond; here it
+  truncates. On mainnet that moves only `ATTESTATION_DUE_BPS` (3333 bps of
+  12 s), from 3999 to 4000 ms.
+- `get_head` filters a node tree instead of a block tree (`filter_node_tree`).
+  Under gloas a leaf is a FULL or EMPTY node, so a block whose EMPTY branch
+  leads only to non-viable children can still be viable through its childless
+  FULL node, where the block-tree filter drops it. `get_head` also returns the
+  justified root's EMPTY node when nothing is viable.
+- `on_tick` takes the time in milliseconds (`store.time_ms`,
+  `compute_slot_at_time_ms`). The store here keeps milliseconds too, but
+  `on_tick` and `on_tick_per_slot` still take whole seconds, so a tick cannot
+  land between two seconds.
+
+Fork-choice fixtures generated from the `pq` branch may exercise any of these,
+so expect failures there until the rules move. Moving them changes every
+fork's fork choice, not only the PQ forks'.
+
+## `upgrade_to_pq` reads a builder only for a payment with an amount
+
+`compute_builder_pending_withdrawals` and `compute_builder_pending_payments`
+read `pre.builders[payment.withdrawal.builder_index]` for every pending
+payment, an empty one (builder index zero) included, before checking the
+amount. On a registry without builders that index raises, so the
+specification's fork cannot happen on such a chain. Here the builder is read
+only when the payment has a nonzero amount, the one case its key is used in,
+which differs from the specification only where the specification has no
+outcome to match.
+
+## PQ fixtures run with XMSS verification off
+
+consensus-specs generates its EIP-8483 and PQ fixtures with XMSS inactive, so
+their signatures are stubs and their proofs empty, which the pyspec's inactive
+`xmss.Verify` and `stark.VerifyAggregates` accept. The spec-test binary turns
+this crate's verification off the same way
+(`helpers::pq::disable_xmss_verification`, compiled only with the
+`beacon-spec-tests` feature), so no PQ fixture checks a real signature. The
+real verifier is covered by its own known-answer tests instead
+(`ethlambda_crypto::lean_xmss`) and by the PQ unit tests, which sign with real
+keys.

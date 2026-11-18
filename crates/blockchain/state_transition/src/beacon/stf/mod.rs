@@ -58,11 +58,13 @@ pub mod bellatrix;
 pub mod block;
 pub mod capella;
 pub mod deneb;
+pub mod eip8483;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod pq;
 pub mod signatures;
 
 use crate::beacon::containers;
@@ -311,6 +313,10 @@ pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> bool {
+    // [Modified in PQ] An XMSS signature at the slot's proposer leaf.
+    if let containers::SignedBeaconBlock::Pq(signed) = signed_block {
+        return pq::verify_block_signature(state, signed);
+    }
     verify_proposer_signature(
         state,
         signed_block.proposer_index(),
@@ -482,7 +488,10 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
         | BeaconState::Deneb(_)
         | BeaconState::Electra(_)
         | BeaconState::Fulu(_) => {}
-        BeaconState::Gloas(inner) => {
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
+            let inner = state
+                .gloas_family_mut()
+                .expect("a gloas-family state has the gloas-family fields");
             let next_slot = inner
                 .slot
                 .checked_add(1)

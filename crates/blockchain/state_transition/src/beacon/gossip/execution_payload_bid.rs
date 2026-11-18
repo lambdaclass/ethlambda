@@ -138,7 +138,11 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
             let header = &s.latest_execution_payload_header;
             Some((header.block_hash, header.gas_limit))
         }
-        BeaconState::Phase0(_) | BeaconState::Altair(_) | BeaconState::Gloas(_) => None,
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Gloas(_)
+        | BeaconState::Eip8483(_)
+        | BeaconState::Pq(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("execution_payload_bid::pre_gloas_payload"),
     }
 }
@@ -418,11 +422,11 @@ fn stateful_rules(
     if builder.version != PAYLOAD_BUILDER_VERSION {
         return Err(reject(RejectReason::NotPayloadBuilder));
     }
-    if !is_active_builder(inner, bid.builder_index).unwrap_or(false) {
+    if !is_active_builder(&inner.into(), bid.builder_index).unwrap_or(false) {
         return Err(reject(RejectReason::InactiveBuilder));
     }
     // [IGNORE] The builder can cover the bid.
-    if !can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false) {
+    if !can_builder_cover_bid(&inner.into(), bid.builder_index, bid.value).unwrap_or(false) {
         return Err(ignore(IgnoreReason::BuilderCannotCover));
     }
     // [IGNORE] The parent's payload does not try to exit the builder. Only a

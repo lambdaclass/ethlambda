@@ -1156,6 +1156,13 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
             }
+            // Not supported by this client: see `ProducedBlock::from_ssz`.
+            ForkName::Eip8483 | ForkName::Pq => {
+                return Err(Error::InconsistentResponse(format!(
+                    "node produced a {} aggregate, which this client does not publish",
+                    fork.as_str()
+                )));
+            }
         };
         // The same contract the other two fetches carry, enforced here so a
         // node answering about the wrong slot is failed over from rather than

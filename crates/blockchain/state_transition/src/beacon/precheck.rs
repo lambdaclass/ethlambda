@@ -23,11 +23,12 @@
 
 use crate::beacon::bls;
 use crate::beacon::config::Config;
-use crate::beacon::constants::DOMAIN_BEACON_PROPOSER;
+use crate::beacon::constants::{DOMAIN_BEACON_PROPOSER, LEAF_OFFSET_BEACON_PROPOSER};
 use crate::beacon::containers::{BeaconState, SignedBeaconBlock};
 use crate::beacon::helpers::misc::{
     compute_domain, compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
 };
+use crate::beacon::helpers::pq::{compute_xmss_leaf_index, xmss_verify};
 use crate::beacon::primitives::{Root, Slot, ValidatorIndex};
 
 /// Which rule a block broke.
@@ -85,6 +86,10 @@ pub enum Reference<'a> {
 /// epoch, not from the reference state's `fork` field: the first block of a
 /// new fork builds on a parent whose state has not been upgraded yet, and is
 /// signed under the new fork's version.
+///
+/// A PQ block's XMSS signature is checked against a PQ state only. Across the
+/// PQ fork boundary, either way round, the reference state holds the other
+/// scheme's keys, so the signature is left to the import.
 pub fn precheck_block(
     signed_block: &SignedBeaconBlock,
     block_root: Root,
@@ -128,7 +133,31 @@ pub fn precheck_block(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(block_root, domain);
-    if !bls::verify(&proposer_key, signing_root, &signed_block.signature()) {
+    let verified = match (signed_block, state) {
+        // A PQ block is signed with the proposer's XMSS key, which only a PQ
+        // state's registry holds. Before the fork the record names a BLS key,
+        // so the parent of the fork's first block cannot check it: the import
+        // does.
+        (SignedBeaconBlock::Pq(pq_block), BeaconState::Pq(_)) => {
+            let Ok(proposer_record) = state.pq_validator(proposer) else {
+                return Err(PrecheckError::UnknownProposer { proposer });
+            };
+            compute_xmss_leaf_index(slot, LEAF_OFFSET_BEACON_PROPOSER).is_ok_and(|leaf_index| {
+                xmss_verify(
+                    &proposer_record.pubkey(),
+                    leaf_index,
+                    signing_root,
+                    &pq_block.signature,
+                )
+            })
+        }
+        (SignedBeaconBlock::Pq(_), _) => return Ok(()),
+        // A PQ registry holds XMSS keys, which cannot check an earlier
+        // fork's BLS signature.
+        (_, BeaconState::Pq(_)) => return Ok(()),
+        _ => bls::verify(&proposer_key, signing_root, &signed_block.signature()),
+    };
+    if !verified {
         return Err(PrecheckError::BadSignature);
     }
     Ok(())
@@ -149,6 +178,8 @@ pub(crate) fn fixed_proposer(parent_state: &BeaconState, slot: Slot) -> Option<V
     let (state_slot, lookahead) = match parent_state {
         BeaconState::Fulu(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Gloas(state) => (state.slot, &state.proposer_lookahead),
+        BeaconState::Eip8483(state) => (state.slot, &state.proposer_lookahead),
+        BeaconState::Pq(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
@@ -164,12 +195,16 @@ pub(crate) fn fixed_proposer(parent_state: &BeaconState, slot: Slot) -> Option<V
 
 #[cfg(test)]
 mod tests {
+    use ethlambda_crypto::lean_xmss;
+
     use super::*;
-    use crate::beacon::containers::phase0;
+    use crate::beacon::containers::{phase0, pq};
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state::{secret_key_for, with_validators_at};
     use crate::beacon::preset;
-    use crate::beacon::primitives::{BlsPubkey, BlsSignature};
+    use crate::beacon::primitives::{
+        BlsPubkey, BlsSignature, HashTreeRoot as _, XmssPubkey, XmssSignature,
+    };
 
     /// A block by `proposer` at `slot`, signed by that validator's test key
     /// under `config`'s fork version for the block's epoch.
@@ -385,5 +420,117 @@ mod tests {
         );
         let block = signed_block(&parent, &config, first_fulu_slot, 3);
         assert_eq!(check(&block, Reference::Parent(&parent), &config), Ok(()));
+    }
+
+    /// A PQ block by `proposer` at `slot`, signed with `secret` at the slot's
+    /// proposer leaf under `config`'s fork version for the block's epoch.
+    fn signed_pq_block(
+        state: &BeaconState,
+        config: &Config,
+        slot: Slot,
+        proposer: ValidatorIndex,
+        secret: &lean_xmss::SecretKey,
+    ) -> SignedBeaconBlock {
+        let message = pq::BeaconBlock {
+            slot,
+            proposer_index: proposer,
+            parent_root: Root::repeat_byte(0x11),
+            state_root: Root::ZERO,
+            body: pq::BeaconBlockBody::empty(),
+        };
+        let fork_version = config.fork_version(config.fork_at_epoch(compute_epoch_at_slot(slot)));
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            fork_version,
+            state.genesis_validators_root(),
+        );
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let leaf = compute_xmss_leaf_index(slot, LEAF_OFFSET_BEACON_PROPOSER).unwrap();
+        let signature = secret
+            .sign(&signing_root.0, leaf as u32)
+            .expect("the key covers the slot's proposer leaf")
+            .to_bytes();
+        SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+            message,
+            signature: XmssSignature(signature.try_into().expect("XMSS_SIGNATURE_SIZE bytes")),
+        }))
+    }
+
+    /// A PQ state whose validator `proposer` holds `secret`'s public key, and
+    /// the slot after the state's.
+    fn pq_state_keyed(proposer: ValidatorIndex, secret: &lean_xmss::SecretKey) -> BeaconState {
+        let mut state = with_validators_at(ForkName::Pq, 8);
+        let BeaconState::Pq(inner) = &mut state else {
+            unreachable!("with_validators_at(Pq) builds a PQ state");
+        };
+        inner
+            .validators
+            .get_mut(proposer as usize)
+            .expect("the state has eight validators")
+            .record
+            .pubkey = XmssPubkey(secret.public_key().to_bytes()).to_request_key();
+        state
+    }
+
+    #[test]
+    fn a_pq_block_is_checked_against_its_proposers_xmss_key() {
+        let config = Config::mainnet();
+        let slot = with_validators_at(ForkName::Pq, 8).slot() + 1;
+        let leaf = compute_xmss_leaf_index(slot, LEAF_OFFSET_BEACON_PROPOSER).unwrap();
+        let secret = lean_xmss::range_key(&[7; 32], leaf as u32, leaf as u32 + 1);
+        let state = pq_state_keyed(3, &secret);
+        let block = signed_pq_block(&state, &config, slot, 3, &secret);
+        assert_eq!(check(&block, Reference::Recent(&state), &config), Ok(()));
+
+        let SignedBeaconBlock::Pq(mut altered) = block else {
+            unreachable!("signed_pq_block builds a PQ block");
+        };
+        altered.message.state_root = Root::repeat_byte(0x22);
+        let altered = SignedBeaconBlock::Pq(altered);
+        assert_eq!(
+            check(&altered, Reference::Recent(&state), &config),
+            Err(PrecheckError::BadSignature)
+        );
+    }
+
+    /// Either side of the PQ fork the reference state holds the other
+    /// scheme's keys, so neither block can be refused on its signature there.
+    #[test]
+    fn across_the_pq_boundary_the_signature_is_left_to_the_import() {
+        let config = Config::mainnet();
+        let eip8483 = keyed_state(ForkName::Eip8483);
+        let slot = eip8483.slot() + 1;
+        let leaf = compute_xmss_leaf_index(slot, LEAF_OFFSET_BEACON_PROPOSER).unwrap();
+        let secret = lean_xmss::range_key(&[7; 32], leaf as u32, leaf as u32 + 1);
+        let pq_block = signed_pq_block(&eip8483, &config, slot, 3, &secret);
+        assert_eq!(
+            check(&pq_block, Reference::Recent(&eip8483), &config),
+            Ok(())
+        );
+
+        let pq_state = pq_state_keyed(3, &secret);
+        let unsigned = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: pq_state.slot() + 1,
+                proposer_index: 3,
+                parent_root: Root::repeat_byte(0x11),
+                state_root: Root::ZERO,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Root::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        });
+        assert_eq!(
+            check(&unsigned, Reference::Recent(&pq_state), &config),
+            Ok(())
+        );
     }
 }

@@ -291,7 +291,9 @@ impl BeaconTopics {
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
             // Gloas adds the payload envelope and the payload attestation
             // topics, which the follower consumes.
-            ForkName::Gloas => Self::with_extra_kinds(
+            // The feature forks after gloas keep its topics; the node joins
+            // none of their digests, since it does not follow them.
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => Self::with_extra_kinds(
                 fork_digest,
                 &GLOAS_TOPIC_KINDS,
                 column_subnets,

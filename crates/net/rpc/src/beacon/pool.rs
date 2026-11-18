@@ -322,6 +322,9 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
+            // Not followed: their attestations are not gloas's to submit.
+            | ForkName::Eip8483
+            | ForkName::Pq
             | ForkName::Lean,
         )
         | None => Err(ApiError::BadRequest(

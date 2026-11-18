@@ -294,6 +294,13 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
+- Two schemes share the name. Lean consensus signs with leanVM's XMSS
+  (BLAKE2s, below). The Beacon Chain's PQ fork signs with leanXMSS over
+  Keccak-256 (`ethlambda_crypto::lean_xmss`, 32-byte keys, 2404-byte
+  signatures, a port of leanVM `4af2cddd`'s Rust implementation pinned by
+  consensus-specs' and leanVM's known answers), and proves many signatures at
+  once with the specification's reference STARK (`ethlambda_crypto::stark`, the
+  signatures concatenated). Never pass one scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
   (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
   constants in `common/crypto/src/signature.rs`
@@ -654,7 +661,7 @@ existing once per chain.
   silent wrong answer.
 - **`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
   what `parse`, `previous` and `next` search, so its absence keeps
-  `parse("lean")` at `None` and `Gloas.next()` at `None`, meaning a fork upgrade
+  `parse("lean")` at `None` and `Pq.next()` at `None`, meaning a fork upgrade
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
@@ -859,6 +866,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   Fork choice is fixture-verified too, including bellatrix's terminal-PoW
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
+- **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
+  `a4d16c5b`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
+  8 and 9, implemented in the state transition and fork choice only
+  (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
+  and refused everywhere else (`ForkName::is_followed` is false for both). The
+  gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
+  (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
+  and the PQ registry holds each XMSS key in its 48-byte request form so the
+  registry accessors keep handing out the shared `Validator`. No release ships
+  their fixtures; see [`docs/beacon_pq.md`](docs/beacon_pq.md) for the design,
+  how to generate them, and what remains.
 - **Gloas** lives in `stf/gloas.rs`, `stf/epoch/gloas.rs`, `helpers/gloas.rs`,
   the gloas section of `fork_choice.rs`, and `containers/gloas.rs` in
   `ethlambda-types`. **The live follower follows gloas.** The chain actor's
@@ -1148,10 +1166,12 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: `States` and `StateDiffs` moved from root keys to
-  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
-  so `Store::prune_finalized_states` can range-delete finalized states; a
-  directory written by an earlier version holds rows no lookup finds. (6 was
+- `DB_VERSION` is 8: `Config` gained the EIP-8483 and PQ fork versions and
+  epochs and `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, so a version 7
+  directory's stored config decodes into the wrong fields. (7 moved `States`
+  and `StateDiffs` from root keys to slot||root keys, the block's slot looked
+  up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can
+  range-delete finalized states; 6 was
   the gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded
   under `KEY_CONFIG`; 5 was the unrealized-justifications table, since a
   directory written before it has no row there for any block it already

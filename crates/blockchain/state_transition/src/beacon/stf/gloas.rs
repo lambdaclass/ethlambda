@@ -53,6 +53,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
@@ -273,7 +274,13 @@ pub fn get_builders_sweep_withdrawals(
 
     let mut processed_count: u64 = 0;
     let mut withdrawals = Vec::new();
-    let mut builder_index = inner.next_withdrawal_builder_index;
+    let mut builder_index = *inner.next_withdrawal_builder_index;
+    // The specification's `pq` branch builds on a newer gloas than this
+    // crate's pin, whose builders sweep pays out a builder's balance net of
+    // the withdrawals already taken from it in this same sweep
+    // (`get_builder_balance_after_withdrawals`). It applies from EIP-8483 on;
+    // see `docs/spec_deviations.md`.
+    let net_of_prior = inner.fork >= ForkName::Eip8483;
     for _ in 0..builders_limit {
         if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
             break;
@@ -287,12 +294,24 @@ pub fn get_builders_sweep_withdrawals(
                     index: builder_index as usize,
                     len: inner.builders.len(),
                 })?;
-        if builder.withdrawable_epoch <= epoch && builder.balance > 0 {
+        let balance = if net_of_prior {
+            let validator_index = convert_builder_index_to_validator_index(builder_index);
+            let withdrawn: Gwei = prior_withdrawals
+                .iter()
+                .chain(&withdrawals)
+                .filter(|withdrawal| withdrawal.validator_index == validator_index)
+                .map(|withdrawal| withdrawal.amount)
+                .sum();
+            builder.balance.saturating_sub(withdrawn)
+        } else {
+            builder.balance
+        };
+        if builder.withdrawable_epoch <= epoch && balance > 0 {
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
                 validator_index: convert_builder_index_to_validator_index(builder_index),
                 address: builder.execution_address,
-                amount: builder.balance,
+                amount: balance,
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
@@ -407,7 +426,7 @@ pub fn update_payload_expected_withdrawals(
     state: &mut BeaconState,
     withdrawals: &[capella::Withdrawal],
 ) -> Result<()> {
-    gloas_state(state, "update_payload_expected_withdrawals")?.payload_expected_withdrawals =
+    *gloas_state(state, "update_payload_expected_withdrawals")?.payload_expected_withdrawals =
         gloas::Withdrawals::from(withdrawals.to_vec());
     Ok(())
 }
@@ -430,9 +449,9 @@ pub fn update_builder_pending_withdrawals(
         return Ok(());
     }
     let inner = gloas_state(state, "update_builder_pending_withdrawals")?;
-    let mut owned = core::mem::take(&mut inner.builder_pending_withdrawals).into_inner();
+    let mut owned = core::mem::take(inner.builder_pending_withdrawals).into_inner();
     let remaining = owned.split_off(processed_builder_withdrawals_count as usize);
-    inner.builder_pending_withdrawals = gloas::BuilderPendingWithdrawals::from(remaining);
+    *inner.builder_pending_withdrawals = gloas::BuilderPendingWithdrawals::from(remaining);
     Ok(())
 }
 
@@ -449,9 +468,9 @@ pub fn update_pending_partial_withdrawals(
         return Ok(());
     }
     let inner = gloas_state(state, "update_pending_partial_withdrawals")?;
-    let mut owned = core::mem::take(&mut inner.pending_partial_withdrawals).into_inner();
+    let mut owned = core::mem::take(inner.pending_partial_withdrawals).into_inner();
     let remaining = owned.split_off(processed_partial_withdrawals_count as usize);
-    inner.pending_partial_withdrawals = gloas::PendingPartialWithdrawals::from(remaining);
+    *inner.pending_partial_withdrawals = gloas::PendingPartialWithdrawals::from(remaining);
     Ok(())
 }
 
@@ -475,7 +494,7 @@ pub fn update_next_withdrawal_builder_index(
             .ok_or(Error::ArithmeticOverflow(
                 "update_next_withdrawal_builder_index: next_withdrawal_builder_index + processed_builders_sweep_count",
             ))?;
-        inner.next_withdrawal_builder_index = next_index % builders_len;
+        *inner.next_withdrawal_builder_index = next_index % builders_len;
     }
     Ok(())
 }
@@ -545,7 +564,7 @@ fn update_next_withdrawal_validator_index(
 /// correctly names what the *next* revealed payload owes.
 pub fn process_withdrawals(state: &mut BeaconState) -> Result<()> {
     let inner = gloas_state_ref(state, "process_withdrawals")?;
-    if inner.latest_block_hash != inner.latest_execution_payload_bid.block_hash {
+    if *inner.latest_block_hash != inner.latest_execution_payload_bid.block_hash {
         return Ok(());
     }
 
@@ -753,7 +772,7 @@ pub fn verify_execution_payload_envelope(
         "verify_execution_payload_envelope: payload.slot_number == state.slot",
     )?;
     verify(
-        payload.parent_hash == inner.latest_block_hash,
+        payload.parent_hash == *inner.latest_block_hash,
         "verify_execution_payload_envelope: payload.parent_hash == state.latest_block_hash",
     )?;
     verify(
@@ -836,7 +855,32 @@ pub fn process_execution_payload_bid(
     config: &Config,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    let bid = signed_bid.message.clone();
+    process_execution_payload_bid_with(
+        state,
+        &signed_bid.message,
+        config,
+        signed_bid.signature == g2_point_at_infinity(),
+        |state| {
+            signatures.push(
+                execution_payload_bid_signature_set(state, signed_bid)?,
+                "process_execution_payload_bid: verify_execution_payload_bid_signature(state, signed_bid)",
+            )
+        },
+    )
+}
+
+/// The body of `process_execution_payload_bid`, which the PQ fork keeps
+/// except for its signature: `self_build_signature_empty` is whether the
+/// signature is the scheme's empty one (BLS's point at infinity, an all-zero
+/// XMSS signature), and `verify_signature` checks a builder's.
+pub(crate) fn process_execution_payload_bid_with(
+    state: &mut BeaconState,
+    bid: &gloas::ExecutionPayloadBid,
+    config: &Config,
+    self_build_signature_empty: bool,
+    verify_signature: impl FnOnce(&BeaconState) -> Result<()>,
+) -> Result<()> {
+    let bid = bid.clone();
     let builder_index = bid.builder_index;
     let amount = bid.value;
 
@@ -845,14 +889,14 @@ pub fn process_execution_payload_bid(
         // credential prefix.
         verify(amount == 0, "process_execution_payload_bid: amount == 0")?;
         verify(
-            signed_bid.signature == g2_point_at_infinity(),
-            "process_execution_payload_bid: signature == G2_POINT_AT_INFINITY",
+            self_build_signature_empty,
+            "process_execution_payload_bid: signature is the empty signature",
         )?;
     } else {
         // Verify that the builder is active.
         verify(
             is_active_builder(
-                gloas_state_ref(state, "process_execution_payload_bid")?,
+                &gloas_state_ref(state, "process_execution_payload_bid")?,
                 builder_index,
             )?,
             "process_execution_payload_bid: is_active_builder(state, builder_index)",
@@ -876,17 +920,14 @@ pub fn process_execution_payload_bid(
         // Verify that the builder has funds to cover the bid.
         verify(
             can_builder_cover_bid(
-                gloas_state_ref(state, "process_execution_payload_bid")?,
+                &gloas_state_ref(state, "process_execution_payload_bid")?,
                 builder_index,
                 amount,
             )?,
             "process_execution_payload_bid: can_builder_cover_bid(state, builder_index, amount)",
         )?;
         // Verify that the bid signature is valid.
-        signatures.push(
-            execution_payload_bid_signature_set(state, signed_bid)?,
-            "process_execution_payload_bid: verify_execution_payload_bid_signature(state, signed_bid)",
-        )?;
+        verify_signature(state)?;
     }
 
     // Verify commitments are under limit.
@@ -908,7 +949,7 @@ pub fn process_execution_payload_bid(
     // Verify that the bid is for the right parent block.
     verify(
         bid.parent_block_hash
-            == gloas_state_ref(state, "process_execution_payload_bid")?.latest_block_hash,
+            == *gloas_state_ref(state, "process_execution_payload_bid")?.latest_block_hash,
         "process_execution_payload_bid: bid.parent_block_hash == state.latest_block_hash",
     )?;
     // Verify that the bid's block hash differs from its parent block hash.
@@ -951,7 +992,7 @@ pub fn process_execution_payload_bid(
     }
 
     // Cache the signed execution payload bid.
-    gloas_state(state, "process_execution_payload_bid")?.latest_execution_payload_bid = bid;
+    *gloas_state(state, "process_execution_payload_bid")?.latest_execution_payload_bid = bid;
 
     Ok(())
 }
@@ -974,15 +1015,7 @@ pub fn apply_parent_execution_payload(
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    let (parent_bid, parent_slot, parent_epoch) = {
-        let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
-        let parent_slot = inner.latest_block_header.slot;
-        (
-            inner.latest_execution_payload_bid.clone(),
-            parent_slot,
-            compute_epoch_at_slot(parent_slot),
-        )
-    };
+    let (parent_bid, parent_slot, parent_epoch) = parent_payload_context(state)?;
 
     verify(
         requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
@@ -1001,13 +1034,53 @@ pub fn apply_parent_execution_payload(
         "apply_parent_execution_payload: len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD",
     )?;
 
-    // Process execution requests from the parent's payload. The execution
-    // requests are processed at state.slot (child's slot), not the parent's
-    // slot.
-    //
-    // Deposits, withdrawals, and consolidations are unmodified since electra
-    // (fulu, for deposits): see this module's own doc for why these three
-    // are shared calls into `stf::fulu`/`stf::electra` rather than copies.
+    process_gloas_execution_requests(
+        state,
+        requests.into(),
+        config,
+        active_balances,
+        pubkey_indices,
+    )?;
+    settle_parent_builder_payment(state, &parent_bid, parent_slot, parent_epoch)?;
+    mark_parent_payload_available(state, &parent_bid, parent_slot)
+}
+
+/// Gloas's five execution-layer request lists, borrowed from whichever
+/// fork's `ExecutionRequests` carries them: gloas's own, or EIP-8483's wider
+/// one.
+pub struct GloasRequests<'a> {
+    pub deposits: &'a gloas::DepositRequests,
+    pub withdrawals: &'a gloas::WithdrawalRequests,
+    pub consolidations: &'a gloas::ConsolidationRequests,
+    pub builder_deposits: &'a gloas::BuilderDepositRequests,
+    pub builder_exits: &'a gloas::BuilderExitRequests,
+}
+
+impl<'a> From<&'a gloas::ExecutionRequests> for GloasRequests<'a> {
+    fn from(requests: &'a gloas::ExecutionRequests) -> Self {
+        GloasRequests {
+            deposits: &requests.deposits,
+            withdrawals: &requests.withdrawals,
+            consolidations: &requests.consolidations,
+            builder_deposits: &requests.builder_deposits,
+            builder_exits: &requests.builder_exits,
+        }
+    }
+}
+
+/// Gloas's five execution-layer request lists, in the specification's order,
+/// processed at `state.slot` (the child's slot), not the parent's.
+///
+/// Deposits, withdrawals, and consolidations are unmodified since electra
+/// (fulu, for deposits): see this module's own doc for why these three are
+/// shared calls into `stf::fulu`/`stf::electra` rather than copies.
+pub(crate) fn process_gloas_execution_requests(
+    state: &mut BeaconState,
+    requests: GloasRequests<'_>,
+    config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
+) -> Result<()> {
     for deposit in requests.deposits.iter() {
         crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
     }
@@ -1035,8 +1108,31 @@ pub fn apply_parent_execution_payload(
     for builder_exit in requests.builder_exits.iter() {
         process_builder_exit_request(state, builder_exit, config)?;
     }
+    Ok(())
+}
 
-    // Settle the builder payment.
+/// The parent's bid, slot and epoch, as `apply_parent_execution_payload`
+/// reads them before touching anything.
+pub(crate) fn parent_payload_context(
+    state: &BeaconState,
+) -> Result<(gloas::ExecutionPayloadBid, Slot, u64)> {
+    let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
+    let parent_slot = inner.latest_block_header.slot;
+    Ok((
+        inner.latest_execution_payload_bid.clone(),
+        parent_slot,
+        compute_epoch_at_slot(parent_slot),
+    ))
+}
+
+/// Settles the parent's builder payment, or queues its withdrawal directly
+/// when the payment has already left the two-epoch window.
+pub(crate) fn settle_parent_builder_payment(
+    state: &mut BeaconState,
+    parent_bid: &gloas::ExecutionPayloadBid,
+    parent_slot: Slot,
+    parent_epoch: u64,
+) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     if parent_epoch == current_epoch {
         let payment_index = preset::slots_per_epoch()
@@ -1045,13 +1141,13 @@ pub fn apply_parent_execution_payload(
                 "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
             ))?;
         settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
+            &mut gloas_state(state, "apply_parent_execution_payload")?,
             payment_index,
         )?;
     } else if parent_epoch == get_previous_epoch(state) {
         let payment_index = parent_slot % preset::slots_per_epoch();
         settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
+            &mut gloas_state(state, "apply_parent_execution_payload")?,
             payment_index,
         )?;
     } else if parent_bid.value > 0 {
@@ -1066,8 +1162,16 @@ pub fn apply_parent_execution_payload(
                 builder_index: parent_bid.builder_index,
             });
     }
+    Ok(())
+}
 
-    // Update parent payload availability and latest block hash.
+/// Marks the parent's payload available and makes its hash the latest block
+/// hash: `apply_parent_execution_payload`'s last step at every fork.
+pub(crate) fn mark_parent_payload_available(
+    state: &mut BeaconState,
+    parent_bid: &gloas::ExecutionPayloadBid,
+    parent_slot: Slot,
+) -> Result<()> {
     let slot_index = (parent_slot as usize) % preset::slots_per_historical_root();
     let inner = gloas_state(state, "apply_parent_execution_payload")?;
     inner
@@ -1077,7 +1181,7 @@ pub fn apply_parent_execution_payload(
             index: err.index,
             len: err.len,
         })?;
-    inner.latest_block_hash = parent_bid.block_hash;
+    *inner.latest_block_hash = parent_bid.block_hash;
 
     Ok(())
 }
@@ -1171,7 +1275,7 @@ pub fn process_builder_deposit_request(
         return Ok(());
     }
 
-    let inner = gloas_state(state, "process_builder_deposit_request")?;
+    let mut inner = gloas_state(state, "process_builder_deposit_request")?;
     let existing = inner
         .builders
         .iter()
@@ -1180,9 +1284,9 @@ pub fn process_builder_deposit_request(
     match existing {
         None => {
             if is_valid_builder_deposit_signature(request, config) {
-                let slot = inner.slot;
+                let slot = *inner.slot;
                 add_builder_to_registry(
-                    inner,
+                    &mut inner,
                     request.pubkey,
                     constants::PAYLOAD_BUILDER_VERSION,
                     ExecutionAddress::from_slice(&request.withdrawal_credentials.0[12..]),
@@ -1192,7 +1296,7 @@ pub fn process_builder_deposit_request(
             }
         }
         Some(builder_index) => {
-            let epoch = compute_epoch_at_slot(inner.slot);
+            let epoch = compute_epoch_at_slot(*inner.slot);
             let builder = &mut inner.builders[builder_index];
 
             // If exited and swept, reset the withdrawable epoch.
@@ -1224,7 +1328,7 @@ pub fn process_builder_exit_request(
     request: &gloas::BuilderExitRequest,
     config: &Config,
 ) -> Result<()> {
-    let inner = gloas_state(state, "process_builder_exit_request")?;
+    let mut inner = gloas_state(state, "process_builder_exit_request")?;
     let Some(builder_index) = inner
         .builders
         .iter()
@@ -1234,21 +1338,21 @@ pub fn process_builder_exit_request(
     };
     let builder_index = builder_index as gloas::BuilderIndex;
 
-    if !is_active_builder(inner, builder_index)? {
+    if !is_active_builder(&inner.as_ref(), builder_index)? {
         return Ok(());
     }
     if inner.builders[builder_index as usize].execution_address != request.source_address {
         return Ok(());
     }
     if crate::beacon::helpers::gloas::get_pending_balance_to_withdraw_for_builder(
-        inner,
+        &inner.as_ref(),
         builder_index,
     )? != 0
     {
         return Ok(());
     }
 
-    initiate_builder_exit(inner, builder_index, config)
+    initiate_builder_exit(&mut inner, builder_index, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,7 +1503,41 @@ pub fn process_attestation(
     target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    let data = attestation.data;
+    process_attestation_with(
+        state,
+        attestation.data,
+        &get_committee_indices(&attestation.committee_bits),
+        &attestation.aggregation_bits,
+        parent_slot,
+        committees,
+        active_balances,
+        target_delta,
+        |state, _| {
+            let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
+            signatures.push(
+                gloas_attestation_signature_set(state, attestation, &indexed_attestation, committees),
+                "process_attestation: is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
+            )
+        },
+    )
+}
+
+/// The body of gloas's `process_attestation`, which the PQ fork keeps but for
+/// its signature: an attestation there carries none, the block's `proof`
+/// covering every attestation at once (`process_stark`). `verify_signature`
+/// is handed the attesting indices, sorted, after every structural check.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_attestation_with(
+    state: &mut BeaconState,
+    data: crate::beacon::containers::shared::AttestationData,
+    committee_indices: &[crate::beacon::primitives::CommitteeIndex],
+    aggregation_bits: &gloas::AggregationBits,
+    parent_slot: Slot,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    verify_signature: impl FnOnce(&BeaconState, &[ValidatorIndex]) -> Result<()>,
+) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let previous_epoch = get_previous_epoch(state);
 
@@ -1411,9 +1549,12 @@ pub fn process_attestation(
         data.target.epoch == compute_epoch_at_slot(data.slot),
         "process_attestation: data.target.epoch == compute_epoch_at_slot(data.slot)",
     )?;
+    // [Modified in PQ] `MIN_ATTESTATION_INCLUSION_DELAY_PQ` on a PQ state.
     let min_slot = data
         .slot
-        .checked_add(preset::MIN_ATTESTATION_INCLUSION_DELAY)
+        .checked_add(crate::beacon::helpers::pq::min_attestation_inclusion_delay(
+            state,
+        ))
         .ok_or(Error::ArithmeticOverflow(
             "process_attestation: data.slot + MIN_ATTESTATION_INCLUSION_DELAY",
         ))?;
@@ -1425,31 +1566,35 @@ pub fn process_attestation(
     // [Modified in Gloas:EIP7732] `data.index` is now a payload-availability
     // bit (0 or 1), not always zero.
     verify(data.index < 2, "process_attestation: data.index < 2")?;
-    let committee_indices = get_committee_indices(&attestation.committee_bits);
     let epoch_committees = committees.committees(state, data.target.epoch);
     let mut committee_offset = 0usize;
-    for committee_index in committee_indices {
+    let mut attesting_indices: Vec<ValidatorIndex> = Vec::new();
+    for &committee_index in committee_indices {
         verify(
             committee_index < epoch_committees.committees_per_slot(),
             "process_attestation: committee_index < get_committee_count_per_slot(state, data.target.epoch)",
         )?;
         let committee = epoch_committees.committee(data.slot, committee_index)?;
-        let committee_has_an_attester = (0..committee.len()).any(|position| {
-            attestation
-                .aggregation_bits
+        let before = attesting_indices.len();
+        for (position, &attester) in committee.iter().enumerate() {
+            if aggregation_bits
                 .get(committee_offset + position)
                 .unwrap_or(false)
-        });
+            {
+                attesting_indices.push(attester);
+            }
+        }
         verify(
-            committee_has_an_attester,
+            attesting_indices.len() > before,
             "process_attestation: len(committee_attesters) > 0",
         )?;
         committee_offset += committee.len();
     }
     verify(
-        attestation.aggregation_bits.len() == committee_offset,
+        aggregation_bits.len() == committee_offset,
         "process_attestation: len(attestation.aggregation_bits) == committee_offset",
     )?;
+    attesting_indices.sort_unstable();
 
     // Safe: `min_slot <= state.slot()` above and `min_slot >= data.slot` (the
     // inclusion delay is non-negative), so `data.slot <= state.slot()`.
@@ -1457,11 +1602,7 @@ pub fn process_attestation(
     let participation_flag_indices =
         get_attestation_participation_flag_indices(state, &data, inclusion_delay, parent_slot)?;
 
-    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    signatures.push(
-        gloas_attestation_signature_set(state, attestation, &indexed_attestation, committees),
-        "process_attestation: is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
-    )?;
+    verify_signature(state, &attesting_indices)?;
 
     let current_epoch_target = data.target.epoch == current_epoch;
     let payment_index = if current_epoch_target {
@@ -1486,7 +1627,6 @@ pub fn process_attestation(
             })?
     };
 
-    let attesting_indices: Vec<ValidatorIndex> = indexed_attestation.attesting_indices.to_vec();
     // The specification calls `is_attestation_same_slot(state, data)` inside
     // the per-attester short-circuit below, so hoisting it out to a single
     // call here changes nothing: `get_attestation_participation_flag_indices`
@@ -1702,10 +1842,44 @@ pub fn process_payload_attestation(
 /// `assert len(body.deposits) == 0` unconditionally, with no `process_deposit`
 /// call at all: like fulu, gloas has no eth1-bridge deposit path left to
 /// drain (`crate::beacon::stf::fulu::process_operations`'s own doc explains why).
+/// The operation lists of a gloas-shaped block body. EIP-8483's body carries
+/// the same lists (only its `parent_execution_requests` is wider), so
+/// [`process_operations`] reads them through this rather than one body type.
+pub struct Operations<'a> {
+    pub deposits: &'a gloas::Deposits,
+    pub proposer_slashings: &'a gloas::ProposerSlashings,
+    pub attester_slashings: &'a gloas::AttesterSlashings,
+    pub attestations: &'a gloas::Attestations,
+    pub voluntary_exits: &'a gloas::VoluntaryExits,
+    pub bls_to_execution_changes: &'a gloas::BlsToExecutionChanges,
+    pub payload_attestations: &'a gloas::PayloadAttestations,
+}
+
+macro_rules! operations_from_body {
+    ($body:ty) => {
+        impl<'a> From<&'a $body> for Operations<'a> {
+            fn from(body: &'a $body) -> Self {
+                Operations {
+                    deposits: &body.deposits,
+                    proposer_slashings: &body.proposer_slashings,
+                    attester_slashings: &body.attester_slashings,
+                    attestations: &body.attestations,
+                    voluntary_exits: &body.voluntary_exits,
+                    bls_to_execution_changes: &body.bls_to_execution_changes,
+                    payload_attestations: &body.payload_attestations,
+                }
+            }
+        }
+    };
+}
+
+operations_from_body!(gloas::BeaconBlockBody);
+operations_from_body!(crate::beacon::containers::eip8483::BeaconBlockBody);
+
 #[allow(clippy::too_many_arguments)]
-pub fn process_operations(
+pub fn process_operations<'a>(
     state: &mut BeaconState,
-    body: &gloas::BeaconBlockBody,
+    body: impl Into<Operations<'a>>,
     parent_slot: Slot,
     config: &Config,
     committees: &CommitteeCache,
@@ -1713,6 +1887,7 @@ pub fn process_operations(
     target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
+    let body: Operations<'a> = body.into();
     verify(
         body.deposits.is_empty(),
         "process_operations: len(body.deposits) == 0",
@@ -1832,7 +2007,7 @@ mod tests {
                 builder_index: constants::BUILDER_INDEX_SELF_BUILD,
                 slot: state.slot(),
                 value: 0,
-                parent_block_hash: gloas_state_ref(&state, "test").unwrap().latest_block_hash,
+                parent_block_hash: *gloas_state_ref(&state, "test").unwrap().latest_block_hash,
                 parent_block_root: get_block_root_at_slot(&state, state.slot() - 1).unwrap(),
                 prev_randao: get_randao_mix(&state, get_current_epoch(&state)),
                 block_hash: crate::beacon::primitives::ExecutionBlockHash::repeat_byte(1),
@@ -1861,7 +2036,7 @@ mod tests {
                 builder_index: constants::BUILDER_INDEX_SELF_BUILD,
                 slot: state.slot(),
                 value: 1,
-                parent_block_hash: gloas_state_ref(&state, "test").unwrap().latest_block_hash,
+                parent_block_hash: *gloas_state_ref(&state, "test").unwrap().latest_block_hash,
                 parent_block_root: get_block_root_at_slot(&state, state.slot() - 1).unwrap(),
                 prev_randao: get_randao_mix(&state, get_current_epoch(&state)),
                 block_hash: crate::beacon::primitives::ExecutionBlockHash::repeat_byte(1),
@@ -2199,9 +2374,9 @@ mod tests {
 
         {
             let inner = gloas_state(&mut state, "test").unwrap();
-            inner.latest_block_hash = parent_hash;
-            inner.latest_execution_payload_bid = bid.clone();
-            inner.payload_expected_withdrawals = gloas::Withdrawals::default();
+            *inner.latest_block_hash = parent_hash;
+            *inner.latest_execution_payload_bid = bid.clone();
+            *inner.payload_expected_withdrawals = gloas::Withdrawals::default();
         }
         // `validators` is the tree-backed field `validator_mut` above
         // buffered a write against; flush it before `state.compute_state_root()`

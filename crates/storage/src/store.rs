@@ -224,7 +224,12 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// [`Store::prune_finalized_states`]). A directory written by the previous
 /// version holds rows no lookup can find, and there is no migration, by the
 /// same policy every previous change followed.
-pub const DB_VERSION: u64 = 7;
+///
+/// 8 widened `Config` with the EIP-8483 and PQ fork versions and epochs and
+/// `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, so a directory written by
+/// version 7 decodes into the wrong fields, the same consequence as 3, 4 and
+/// 6.
+pub const DB_VERSION: u64 = 8;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -1099,6 +1104,24 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
     match block {
         SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Eip8483(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Pq(block) => {
             block
                 .message
                 .body
@@ -4378,7 +4401,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas) => true,
+                Some(ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair
@@ -7746,6 +7769,7 @@ mod tests {
         let key = ShufflingKey {
             epoch: 1,
             decision_root: H256::from([1u8; 32]),
+            max_committees_per_slot: 64,
         };
 
         let (first, first_lookup) = clone
@@ -10777,7 +10801,7 @@ mod tests {
     /// slot a full decode yields, for every fork shape the table can hold.
     #[test]
     fn peeking_a_beacon_block_slot_equals_decoding_it() {
-        use ethlambda_types::beacon::containers::{altair, electra, gloas};
+        use ethlambda_types::beacon::containers::{altair, eip8483, electra, gloas, pq};
 
         let altair_block = SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
             message: altair::BeaconBlock {
@@ -10815,10 +10839,32 @@ mod tests {
                 },
                 signature: Default::default(),
             }),
+            SignedBeaconBlock::Eip8483(eip8483::SignedBeaconBlock {
+                message: eip8483::BeaconBlock {
+                    slot: 0x0e0f,
+                    proposer_index: 6,
+                    parent_root: root(8),
+                    state_root: root(9),
+                    body: eip8483::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            }),
+            // An XMSS signature widens the fixed part ahead of `message`'s
+            // offset, which the peek reads rather than assumes.
+            SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+                message: pq::BeaconBlock {
+                    slot: 0x1011_1213,
+                    proposer_index: 7,
+                    parent_root: root(10),
+                    state_root: root(11),
+                    body: pq::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            })),
         ];
         // The fork tag is part of the value; the newest fork in `ALL` is among
         // the blocks above.
-        assert_eq!(blocks[5].fork_name(), *ForkName::ALL.last().unwrap());
+        assert_eq!(blocks[7].fork_name(), *ForkName::ALL.last().unwrap());
         for block in blocks {
             let value = encode_beacon_block_value(&block);
             assert_eq!(

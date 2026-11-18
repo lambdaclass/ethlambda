@@ -90,7 +90,7 @@ use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
-use crate::beacon::containers::{BeaconState, gloas};
+use crate::beacon::containers::{BeaconState, GloasFamily, GloasFamilyMut, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
@@ -230,7 +230,7 @@ pub fn is_builder_index(validator_index: ValidatorIndex) -> bool {
 /// Whether the builder at `builder_index` is active: its placement in the
 /// registry is finalized, and it has not initiated an exit.
 pub fn is_active_builder(
-    state: &gloas::BeaconState,
+    state: &GloasFamily<'_>,
     builder_index: gloas::BuilderIndex,
 ) -> Result<bool> {
     let builder = state
@@ -356,7 +356,7 @@ pub fn convert_validator_index_to_builder_index(
 /// checking it can cover a new bid, so a builder cannot bid its way into
 /// double-spending a balance a withdrawal has already claimed.
 pub fn get_pending_balance_to_withdraw_for_builder(
-    state: &gloas::BeaconState,
+    state: &GloasFamily<'_>,
     builder_index: gloas::BuilderIndex,
 ) -> Result<Gwei> {
     let mut balance: Gwei = 0;
@@ -385,7 +385,7 @@ pub fn get_pending_balance_to_withdraw_for_builder(
 /// after keeping [`preset::MIN_DEPOSIT_AMOUNT`] and every balance it already
 /// owes ([`get_pending_balance_to_withdraw_for_builder`]) in reserve.
 pub fn can_builder_cover_bid(
-    state: &gloas::BeaconState,
+    state: &GloasFamily<'_>,
     builder_index: gloas::BuilderIndex,
     bid_amount: Gwei,
 ) -> Result<bool> {
@@ -628,6 +628,11 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
 /// `crate::beacon::stf::deneb::attestation_participation_flag_indices`), so
 /// its absence here is inherited from deneb onward, unlike altair's own
 /// version, which still carries it.
+///
+/// PQ modifies it again: the timely-head flag needs
+/// `MIN_ATTESTATION_INCLUSION_DELAY_PQ`, and the payload vote is checked at
+/// the attested block's own slot (`get_latest_block_slot`), which a two-slot
+/// delay can put before the parent's.
 pub fn get_attestation_participation_flag_indices(
     state: &BeaconState,
     data: &AttestationData,
@@ -655,8 +660,14 @@ pub fn get_attestation_participation_flag_indices(
         )?;
         true
     } else {
+        // [Modified in PQ] With a two-slot inclusion delay the attested block
+        // may be the grandparent, so its availability is read at its own slot.
+        let block_slot = match state {
+            BeaconState::Pq(_) => super::pq::get_latest_block_slot(state, data.slot, parent_slot)?,
+            _ => parent_slot,
+        };
         let inner = gloas_state_ref(state, "get_attestation_participation_flag_indices")?;
-        let slot_index = (parent_slot % preset::slots_per_historical_root() as u64) as usize;
+        let slot_index = (block_slot % preset::slots_per_historical_root() as u64) as usize;
         let payload_index = inner.execution_payload_availability.get(slot_index).ok_or(
             Error::IndexOutOfBounds {
                 index: slot_index,
@@ -683,7 +694,8 @@ pub fn get_attestation_participation_flag_indices(
     if is_matching_target {
         participation_flag_indices.push(constants::TIMELY_TARGET_FLAG_INDEX);
     }
-    if is_matching_head && inclusion_delay == preset::MIN_ATTESTATION_INCLUSION_DELAY {
+    // [Modified in PQ] The head flag needs the PQ fork's delay there.
+    if is_matching_head && inclusion_delay == super::pq::min_attestation_inclusion_delay(state) {
         participation_flag_indices.push(constants::TIMELY_HEAD_FLAG_INDEX);
     }
 
@@ -890,11 +902,11 @@ pub(crate) fn consolidation_churn_limit_for(total_active_balance: Gwei, config: 
 /// builder-registry counterpart of
 /// [`crate::beacon::helpers::mutators::initiate_validator_exit`].
 pub fn initiate_builder_exit(
-    state: &mut gloas::BeaconState,
+    state: &mut GloasFamilyMut<'_>,
     builder_index: gloas::BuilderIndex,
     config: &Config,
 ) -> Result<()> {
-    let current_epoch = compute_epoch_at_slot(state.slot);
+    let current_epoch = compute_epoch_at_slot(*state.slot);
     let len = state.builders.len();
     let builder =
         state
@@ -924,7 +936,7 @@ pub fn initiate_builder_exit(
 /// by weight, against [`get_builder_payment_quorum_threshold`]; this settles
 /// one parent block's still-live entry unconditionally, the moment that
 /// block's payload is applied.
-pub fn settle_builder_payment(state: &mut gloas::BeaconState, payment_index: u64) -> Result<()> {
+pub fn settle_builder_payment(state: &mut GloasFamilyMut<'_>, payment_index: u64) -> Result<()> {
     let len = state.builder_pending_payments.len() as u64;
     crate::beacon::verify(
         payment_index < len,
@@ -951,8 +963,8 @@ pub fn settle_builder_payment(state: &mut gloas::BeaconState, payment_index: u64
 /// `set_or_append_list` appends a fresh entry instead of overwriting one.
 /// Builder indices are reusable this way, unlike the validator registry,
 /// which never removes an entry.
-pub fn get_index_for_new_builder(state: &gloas::BeaconState) -> gloas::BuilderIndex {
-    let current_epoch = compute_epoch_at_slot(state.slot);
+pub fn get_index_for_new_builder(state: &GloasFamily<'_>) -> gloas::BuilderIndex {
+    let current_epoch = compute_epoch_at_slot(*state.slot);
     for (index, builder) in state.builders.iter().enumerate() {
         if builder.withdrawable_epoch <= current_epoch && builder.balance == 0 {
             return index as gloas::BuilderIndex;
@@ -972,14 +984,14 @@ pub fn get_index_for_new_builder(state: &gloas::BeaconState) -> gloas::BuilderIn
 /// second lookup. Called from that one-time fork-boundary onboarding pass
 /// and from builder deposit requests (EIP-8282's ongoing onboarding path).
 pub fn add_builder_to_registry(
-    state: &mut gloas::BeaconState,
+    state: &mut GloasFamilyMut<'_>,
     pubkey: BlsPubkey,
     version: u8,
     execution_address: ExecutionAddress,
     amount: Gwei,
     slot: Slot,
 ) -> gloas::BuilderIndex {
-    let index = get_index_for_new_builder(state);
+    let index = get_index_for_new_builder(&state.as_ref());
     let builder = gloas::Builder {
         pubkey,
         version,
@@ -1000,39 +1012,32 @@ pub fn add_builder_to_registry(
 // Fork projection
 // ---------------------------------------------------------------------------
 
-/// The gloas state, mutably, or an error naming the function that needs one.
+/// The gloas-family fields of a gloas, EIP-8483 or PQ state, mutably, or an
+/// error naming the function that needs them.
 ///
-/// Kept alongside [`gloas_state_ref`] for mutating a gloas-only field
-/// through a generic [`BeaconState`] rather than one already known to be
-/// [`BeaconState::Gloas`] the way [`initiate_builder_exit`] and
-/// [`settle_builder_payment`] are always called with. The fork upgrade
-/// (`crate::beacon::upgrade::upgrade_to_gloas`) and
-/// [`crate::beacon::stf::epoch::gloas`] are its callers.
+/// A [`GloasFamilyMut`] rather than a `&mut gloas::BeaconState`: the two
+/// feature forks after gloas keep every field the gloas rules read, at the
+/// same types, in states of their own shape, and the view is what lets one
+/// copy of those rules serve all three.
 pub(crate) fn gloas_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
-) -> Result<&'a mut gloas::BeaconState> {
-    match state {
-        BeaconState::Gloas(inner) => Ok(inner),
-        other => Err(Error::UnsupportedForFork {
-            function,
-            fork: other.fork_name(),
-        }),
-    }
+) -> Result<GloasFamilyMut<'a>> {
+    let fork = state.fork_name();
+    state
+        .gloas_family_mut()
+        .ok_or(Error::UnsupportedForFork { function, fork })
 }
 
-/// The gloas state, immutably. See [`gloas_state`].
+/// The gloas-family fields, immutably. See [`gloas_state`].
 pub(crate) fn gloas_state_ref<'a>(
     state: &'a BeaconState,
     function: &'static str,
-) -> Result<&'a gloas::BeaconState> {
-    match state {
-        BeaconState::Gloas(inner) => Ok(inner),
-        other => Err(Error::UnsupportedForFork {
-            function,
-            fork: other.fork_name(),
-        }),
-    }
+) -> Result<GloasFamily<'a>> {
+    state.gloas_family().ok_or(Error::UnsupportedForFork {
+        function,
+        fork: state.fork_name(),
+    })
 }
 
 #[cfg(test)]
@@ -1229,7 +1234,7 @@ mod tests {
         let BeaconState::Gloas(state) = gloas_state_with_validators(4) else {
             panic!("gloas_state_with_validators returns a gloas state");
         };
-        assert_eq!(get_index_for_new_builder(&state), 0);
+        assert_eq!(get_index_for_new_builder(&(&state).into()), 0);
     }
 
     #[test]
@@ -1239,7 +1244,7 @@ mod tests {
         };
         state.builders.push(active_builder());
         state.builders.push(active_builder());
-        assert_eq!(get_index_for_new_builder(&state), 2);
+        assert_eq!(get_index_for_new_builder(&(&state).into()), 2);
     }
 
     #[test]
@@ -1253,7 +1258,7 @@ mod tests {
         // and fully swept (balance zero).
         state.builders.push(exited_swept_builder(current_epoch));
         state.builders.push(active_builder());
-        assert_eq!(get_index_for_new_builder(&state), 1);
+        assert_eq!(get_index_for_new_builder(&(&state).into()), 1);
     }
 
     #[test]
@@ -1269,7 +1274,7 @@ mod tests {
             balance: 1,
             ..Default::default()
         });
-        assert_eq!(get_index_for_new_builder(&state), 1);
+        assert_eq!(get_index_for_new_builder(&(&state).into()), 1);
     }
 
     #[test]
@@ -1282,7 +1287,7 @@ mod tests {
         let slot = state.slot;
 
         let index = add_builder_to_registry(
-            &mut state,
+            &mut (&mut state).into(),
             pubkey,
             constants::PAYLOAD_BUILDER_VERSION,
             ExecutionAddress::ZERO,
@@ -1307,7 +1312,7 @@ mod tests {
         let slot = state.slot;
 
         let index = add_builder_to_registry(
-            &mut state,
+            &mut (&mut state).into(),
             pubkey,
             constants::PAYLOAD_BUILDER_VERSION,
             ExecutionAddress::ZERO,
