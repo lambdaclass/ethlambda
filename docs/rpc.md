@@ -48,17 +48,21 @@ one the node does not check:
 - **Where a validator's execution rewards go.**
   `POST /eth/v1/validator/prepare_beacon_proposer` sets the fee recipient of
   any validator index, and `POST /eth/v1/validator/register_validator` sets it
-  for any registered key, for the blocks this node builds. A builder
-  registration is signed, but the node does not verify the signature (neither
-  does Lighthouse): it forwards the registration to `--builder`, which does,
-  and sets the fee recipient whatever the builder answers. A caller can
-  therefore redirect a validator's rewards from locally built blocks until the
-  validator client sends its own again, which validator clients normally do
-  every epoch.
+  for the key of any active or pending validator, for the blocks this node
+  builds. A builder registration is signed, but the node does not verify the
+  signature (neither does Lighthouse). It sets the fee recipient first, then
+  forwards the registration to `--builder`, which does verify it; the fee
+  recipient stays set whatever the builder answers, and with no `--builder` at
+  all. The last call wins, so a caller can redirect a validator's rewards from
+  locally built blocks for as long as it keeps calling: the validator client's
+  own call, normally once an epoch, restores the address only until the
+  caller's next one.
 - **Which subnets the node joins.**
   `POST /eth/v1/validator/beacon_committee_subscriptions` and
-  `/sync_committee_subscriptions` join gossip subnets on request, which costs
-  bandwidth and CPU until the subscription ends.
+  `/eth/v1/validator/sync_committee_subscriptions` join gossip subnets on
+  request, which costs bandwidth and CPU until the slot or epoch the caller
+  named. A sync committee subscription is capped at the end of the next sync
+  committee period; an attestation subnet's is not capped.
 - **When the node builds a block.** Every block production request has the
   execution client build a payload.
 - **On a lean node, who aggregates.** `POST /lean/v0/admin/aggregator` switches
