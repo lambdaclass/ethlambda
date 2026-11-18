@@ -95,6 +95,8 @@ jobs:
   assertoor:
     name: Assertoor
     needs: image
+    # Every push and pull request, and every dispatch except one that asked for
+    # the commit-boost battery alone: `assertoor` and `both` both run this job.
     if: github.event_name != 'workflow_dispatch' || inputs.battery != 'commit-boost'
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -187,7 +189,10 @@ jobs:
 
   # Dispatch-only for now: main's image does not have the builder flags until
   # the builder PR stack (#694 to #705) lands. Once it is on main, drop the
-  # event condition so the check also runs on push and on pull requests.
+  # event condition so the check also runs on push and on pull requests, and at
+  # the same time add `commit-boost` to `notify`'s `needs` and its failed.txt to
+  # the Slack text: `notify` reports pushes only, so until then it can never
+  # see this job.
   commit-boost:
     name: Commit-Boost
     needs: image
