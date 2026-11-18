@@ -100,6 +100,13 @@ pub async fn start_rpc_server(
 /// `Store`, `AggregatorController`, `SyncStatusController` or `EventBus` to
 /// build the lean API from, and would be serving lean answers for a beacon
 /// chain if it invented empty ones.
+///
+/// Returns at most `HTTP_DRAIN_TIMEOUT` after `shutdown` is cancelled, even
+/// with responses still in flight. Those are not ended: they keep running on
+/// the caller's runtime, holding the routers and whatever state the routers
+/// captured (a `Store`), until they finish or that runtime shuts down; see
+/// `serve`. `ethlambda` drops its runtime once shutdown completes, so there
+/// they end with the process.
 pub async fn start_http_servers(
     config: RpcConfig,
     api_router: Option<Router>,
@@ -143,6 +150,15 @@ pub async fn start_http_servers(
 /// axum's graceful shutdown waits with no limit, and a response can stall for
 /// as long as its client stops reading: a validator client paused mid-stream,
 /// or a slow download of a whole state.
+///
+/// The deadline runs from cancellation whatever a response is doing, so it
+/// cuts healthy ones too: a peer still reading a whole state from
+/// `/eth/v2/debug/beacon/states/{state_id}` is reset once it passes. Five
+/// seconds is sized against `docker stop`, which sends SIGKILL 10 s after its
+/// first signal unless told otherwise. The node cancels this token as it stops
+/// the actors, so the drain overlaps their stop rather than adding to it, but
+/// those 10 s still have to cover the actors and the final state flush, which
+/// a SIGKILL cuts short. Raising this eats into that room.
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bind one listener and serve `app` on it until `shutdown` is cancelled.
@@ -154,8 +170,11 @@ const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// handler can wait for shutdown and never trigger the node's.
 ///
 /// The wait is bounded by [`HTTP_DRAIN_TIMEOUT`]. Past it, this returns
-/// without the stalled responses: the listener is already closed by then, and
-/// their connection tasks end with the runtime.
+/// without the stalled responses. The listener is closed by then, but their
+/// connections are not: axum spawns each connection as a task of its own, and
+/// dropping the serve future does not end those. A stalled one keeps its clone
+/// of `app`, and any state `app` captured, until it finishes or the runtime it
+/// was spawned on shuts down.
 async fn serve(
     address: IpAddr,
     port: u16,
