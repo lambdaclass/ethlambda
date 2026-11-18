@@ -465,9 +465,10 @@ Additional features:
 ### Releases
 
 Binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are attached to
-[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases), in two
-builds: `ethlambda-<platform>`, and `ethlambda-ethrex-<platform>`, which embeds
-ethrex as the beacon node's execution client ([`docs/ethrex.md`](docs/ethrex.md)).
+[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases). Releases
+after v1.0.0 carry two builds: `ethlambda-<platform>`, and
+`ethlambda-ethrex-<platform>`, which embeds ethrex as the beacon node's
+execution client ([`docs/ethrex.md`](docs/ethrex.md)).
 Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the
 following tags:
 
