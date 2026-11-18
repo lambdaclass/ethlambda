@@ -36,13 +36,11 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.1.0
 
+      # The pinned toolchain, and the cache of the installed tool below.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: $/.github/actions/setup-rust
         with:
-          toolchain: "1.97.1"
-
-      - name: Setup cache
-        uses: Swatinem/rust-cache@v2.9.3
+          cache-key: loc
 
       - name: Install cargo-warloc
         run: cargo install cargo-warloc --locked --version 0.1.1

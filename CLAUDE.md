@@ -51,7 +51,7 @@ crates/
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
-  storage/                  # RocksDB backend, in-memory for tests
+  storage/                  # RocksDB backend (`rocksdb` feature), in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
 ```
 
@@ -102,6 +102,16 @@ make test                                    # All tests + forkchoice spec tests
 jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
 the Makefile names the first; `test-node` is the workspace minus it. Run one half
 directly when iterating on it.
+
+### Docs-only changes skip CI
+
+`ci.yml`'s `detect-changes` job skips every CI job for a pull request or merge
+group whose changed files are all documentation or repository metadata
+(`docs/**`, `theme/**`, `book.toml`, `**/*.md`, `LICENSE`, `**/.gitignore`,
+`.claude/**`; the list lives in `.github/actions/detect-changes`). That rests on
+nothing in a build or a test reading those paths. A crate that starts to (a
+`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
+take the path off the list, or a change to that file merges untested.
 
 ### Common Operations
 ```bash
@@ -1098,7 +1108,12 @@ behavior.
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**
-- `rocksdb`: Persistent backend
+- `rocksdb`: Persistent backend, behind `ethlambda-storage`'s `rocksdb` feature. Off by
+  default, so the crates that only store through `InMemoryBackend` (the state transition,
+  the chain actor, the consensus test half, both beacon spec-test builds) skip its C++
+  build; `bin/ethlambda` turns it on. `cargo test -p ethlambda-storage` alone leaves the
+  backend's own tests out: add `--features rocksdb`, or run them through the workspace
+  (`make test-node`), where the binary turns the feature on
 - In-memory backend for tests
 
 ## Resources
