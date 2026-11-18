@@ -11,6 +11,10 @@ lint: ## 🔍 Run clippy on all workspace crates
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
 	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
+	# Storage alone, with its `rocksdb` feature off: in a workspace build the
+	# binary turns the feature on, so a test that needs it would pass above
+	# and break a plain `cargo test -p ethlambda-storage`. Same as CI's Lint
+	cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
 
 # release-fast: release-grade opt-level to avoid stack overflows during
 # signature verification/aggregation, without paying for LTO on every rebuild
