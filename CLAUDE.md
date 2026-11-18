@@ -51,7 +51,7 @@ crates/
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
-  storage/                  # RocksDB backend, in-memory for tests
+  storage/                  # RocksDB backend (`rocksdb` feature), in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
 ```
 
@@ -102,6 +102,16 @@ make test                                    # All tests + forkchoice spec tests
 jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
 the Makefile names the first; `test-node` is the workspace minus it. Run one half
 directly when iterating on it.
+
+### Docs-only changes skip CI
+
+`ci.yml`'s `detect-changes` job skips every CI job for a pull request or merge
+group whose changed files are all documentation or repository metadata
+(`docs/**`, `theme/**`, `book.toml`, `**/*.md`, `LICENSE`, `**/.gitignore`,
+`.claude/**`; the list lives in `.github/actions/detect-changes`). That rests on
+nothing in a build or a test reading those paths. A crate that starts to (a
+`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
+take the path off the list, or a change to that file merges untested.
 
 ### Common Operations
 ```bash
@@ -423,10 +433,14 @@ where a bad value is reported.
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
-it must still precede key loading), `--node-key` resolution, resolving
-`--network` into a `NetworkSource` (mainnet only; must precede the next step,
-since a loaded network's own bootnode list is part of its fallback), reading
-`--bootnodes`, and building the aggregator, sync-status and event handles.
+it must still precede key loading), resolving `--network` into a
+`NetworkSource` (mainnet only; must precede the next step, since a loaded
+network's own bootnode list is part of its fallback), reading `--bootnodes`,
+building the aggregator, sync-status and event handles, opening `--data-dir`'s
+RocksDB backend, and `--node-key` resolution. That last one comes after the
+open because, without `--node-key`, the identity is `<data-dir>/node.key`,
+generated and stored on the directory's first start, and RocksDB's lock is
+what keeps two processes on one directory from racing to write it.
 
 It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainSetup`: the wire configuration, the ENR entries that describe it, the
@@ -590,6 +604,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 `checkpoint_sync.rs` and other clients' lean sync read those bytes and may send no
 `Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
 
+With `--builder`, the beacon surface also runs the **fulu builder flow
+(MEV-Boost)**. `register_validator` forwards registrations to the builder
+(`beacon/registrations.rs`, client in `beacon/builder_client/`).
+`produceBlockV3` asks for the builder's bid alongside the local build and
+serves a blinded block when the bid passes its checks and wins on value
+(`beacon/builder_flow/`: bid checks, circuit breaker, boost-factor choice).
+`blinded_blocks` hands the signed block back for the builder to publish, with
+no local fallback, since a second block for the slot would be an equivocation. Gloas
+has no blinded blocks; its builder market is separate (the **Gloas** bullet
+under Beacon Chain STF).
+
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
@@ -671,6 +696,12 @@ existing once per chain.
     validator: helpers that build the active-index `Vec` and then read each
     index back were the largest cost left in the import profile
     (`docs/beacon_stf.md`, "Registry and balances").
+- **`beacon::builder` holds builder-specs containers** (`ValidatorRegistrationV1`,
+  `BuilderBid`, `BlindedBeaconBlock`), not consensus ones: the MEV-Boost relay
+  flow's wire types. `BlindedBeaconBlock`'s root equals the full block's, which
+  is what lets a validator sign a block whose payload it never sees. Electra and
+  fulu shapes only. Tests decode builder-specs' own examples, vendored under
+  `crates/common/types/tests/fixtures/builder_specs/`.
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
@@ -847,11 +878,48 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   and a block at slot N packs only `(N-1, parent_root)`, replaced by the empty
   aggregate when `verified_sync_aggregate` fails (see `docs/spec_deviations.md`).
   `SlotClock` picks the
-  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
-  keeps EIP-3076 minimal-watermark slashing protection in
+  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
+  `--builder-proposals`, pre-gloas slots register validators with the node's builder
+  and may sign a blinded block, published to the producing node only. From the
+  epoch before gloas it signs proposer preferences every slot for its proposals in
+  the current and next epoch (`PreferencesService`, v2 duties, signed at the
+  proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
+  client do), unconditionally, re-sending each kept one once an epoch (a node
+  holds them in memory only), and `produceBlockV4` carries the boost factor and
+  `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
+  carry, which the node's own gloas payload is built toward.
+  It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
-  durable before every block and attestation signature; PTC votes have an
-  in-memory `(validator, slot)` dedup only, and envelopes are unguarded.
+  durable before every block (blinded ones included) and attestation signature;
+  PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
+  unguarded. A key can live
+  in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
+  `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
+  signer under a read guard scoped to the lookup and signs after releasing it,
+  and sends the remote signer the message in full so its own slashing
+  protection applies on top of this client's record, which a remote key is
+  registered in and checked against like a local one; the signature the
+  signer returns is verified against the pubkey and root before it is used,
+  on the blocking pool (`SigningContext::verified`), never inline on the duty
+  task. Each duty signs its batch at once through
+  `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
+  hung signer loses only its own keys' signatures, though the batch is
+  published whole and so up to the budget late, local keys included; one
+  signer is sent at most
+  `MAX_CONCURRENT_REQUESTS` at a time. The epoch's subnet subscriptions, whose
+  selection proofs are round trips for remote keys, are sent from a spawned
+  task after the slot's proposal, not from `refresh_epoch`, with a longer
+  budget of their own (`SUBSCRIPTION_SIGNING_BUDGET`). Builder
+  registrations and proposer preferences sign through the same path
+  (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
+  `Web3Signer::normalize_url`'s rendering of its URL, which is what requests
+  are built from and clients are keyed by. Remote keys are
+  `type: web3signer`
+  entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
+  `--web3signer-url`); `/keystores` and `/remotekeys` partition the store, and
+  both deletes go through `keystores::delete_keys` (one read and one save of
+  the definitions file per request, the store's write lock held only for the
+  in-memory removals).
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
@@ -876,6 +944,15 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
+- **`assemble_blinded_block` does not use a blinded STF.** It runs `process_block`
+  on a stand-in payload built from the builder's header, then patches the two
+  post-state fields that depend on the payload itself
+  (`latest_execution_payload_header`, `latest_block_header.body_root`). It
+  also checks the header's `withdrawals_root` itself: the stand-in carries the
+  expected withdrawals, so the STF's own withdrawals check passes trivially. Fulu
+  only, since it is the last fork with blinded blocks. Read the function's doc
+  before touching fulu's `process_block`;
+  `blinded_and_full_blocks_reach_the_same_state_root` fails on any drift.
 
 ## Configuration Files
 
@@ -1033,7 +1110,12 @@ behavior.
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**
-- `rocksdb`: Persistent backend
+- `rocksdb`: Persistent backend, behind `ethlambda-storage`'s `rocksdb` feature. Off by
+  default, so the crates that only store through `InMemoryBackend` (the state transition,
+  the chain actor, the consensus test half, both beacon spec-test builds) skip its C++
+  build; `bin/ethlambda` turns it on. `cargo test -p ethlambda-storage` alone leaves the
+  backend's own tests out: add `--features rocksdb`, or run them through the workspace
+  (`make test-node`), where the binary turns the feature on
 - In-memory backend for tests
 
 ## Resources
