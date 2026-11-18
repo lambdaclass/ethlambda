@@ -339,7 +339,9 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
             discovery
                 .peer_attnets
                 .insert(candidate.peer_id, candidate.subnets);
-            if let Some(enr) = candidate.enr {
+            // Encoded here, for a peer actually dialed, rather than at
+            // admission for every candidate.
+            if let Ok(enr) = candidate.record.enr_url() {
                 discovery.peer_enrs.insert(candidate.peer_id, enr);
             }
         }
