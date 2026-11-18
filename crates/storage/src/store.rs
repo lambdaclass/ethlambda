@@ -682,7 +682,8 @@ const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
 
 /// Spare entries [`Store::set_latest_message`] reserves past the index that
 /// outgrew the dense vote table, so a registry growing by a few validators an
-/// epoch reallocates the table rarely rather than on every new index.
+/// epoch reallocates the table rarely rather than on every new index. The
+/// table never shrinks, which is fine because the registry does not either.
 const LATEST_MESSAGES_HEADROOM: usize = 1 << 12;
 
 /// The dense vote table's slot for validator `index`.
@@ -9181,7 +9182,11 @@ mod tests {
         let headroom = u64::try_from(LATEST_MESSAGES_HEADROOM).unwrap();
         let slot = |index: u64| usize::try_from(index).unwrap();
 
-        // The first vote sizes the table to its index plus the headroom.
+        // The first vote sizes the table to its index plus the headroom. The
+        // upper bounds below are what tell exact growth from doubling, so they
+        // stay: `reserve_exact` promises only "at least", but std's `Vec` takes
+        // exactly what it asks for, and a doubling would overshoot by a whole
+        // table rather than by any rounding.
         let first = 100_000;
         store.set_latest_message(first, message);
         let sized = capacity(&store);

@@ -4705,9 +4705,10 @@ pub fn update_latest_messages(
     let beacon_block_root = data.beacon_block_root;
     let payload_present = rules == ForkRules::Gloas && data.index == 1;
 
-    // One reservation for the whole batch: an indexed attestation's indices
-    // are sorted, and growing the table one ascending index at a time would
-    // copy it many times over.
+    // One reservation for the whole batch. `set_latest_message` grows the
+    // table exactly (plus a fixed headroom) rather than by doubling, and an
+    // indexed attestation's indices are sorted, so without this the table
+    // would be copied every time an ascending index passed the headroom.
     if let Some(&highest) = attesting_indices.iter().max() {
         store.reserve_latest_messages(highest);
     }
