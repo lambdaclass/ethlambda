@@ -177,8 +177,8 @@ pub fn wire_params(
     //
     // A fork the node does not follow keeps its own warning: crossing its
     // digest works like any other, but the node stops tracking the chain
-    // there regardless. No fork is in that state today, since gloas is
-    // followed, so the warning is the guard for the next one.
+    // there regardless. EIP-8483 and PQ are in that state, though no built-in
+    // network schedules either.
     let schedule = ForkSchedule::new(&chain, genesis.genesis_validators_root);
     match schedule.next_boundary_after(epoch) {
         Some(next) if !next.fork.is_followed() => warn!(

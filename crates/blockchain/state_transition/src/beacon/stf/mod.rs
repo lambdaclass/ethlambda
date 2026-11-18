@@ -597,6 +597,45 @@ mod tests {
         assert_eq!(inner.execution_payload_availability.get(0), Some(false));
     }
 
+    /// `process_slots` crosses gloas's successors one fork at a time, in
+    /// order: with both boundaries at one epoch the loop upgrades twice, PQ
+    /// from the EIP-8483 state, and with them an epoch apart the state spends
+    /// that epoch as EIP-8483's.
+    #[test]
+    fn process_slots_upgrades_gloas_through_eip8483_to_pq() {
+        // Enough validators for every slot's committee to have members, which
+        // the PTC and aggregation committees sample from.
+        let gloas = test_state::with_validators_at(ForkName::Gloas, 64);
+        // The test state starts in epoch 1, so the boundaries come after it.
+        let next = gloas.slot() / preset::SLOTS_PER_EPOCH + 1;
+        let config = |eip8483, pq| {
+            Config::mainnet()
+                .with_fork_epoch(ForkName::Gloas, 0)
+                .with_fork_epoch(ForkName::Eip8483, eip8483)
+                .with_fork_epoch(ForkName::Pq, pq)
+        };
+        let epoch_start = |epoch| epoch * preset::SLOTS_PER_EPOCH;
+
+        let together = config(next, next);
+        let mut state = gloas.clone();
+        process_slots(&mut state, epoch_start(next) - 1, &together).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Gloas, "not before the epoch");
+        process_slots(&mut state, epoch_start(next), &together).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Pq);
+        assert_eq!(
+            state.fork().previous_version,
+            together.fork_version(ForkName::Eip8483),
+            "PQ upgraded from the EIP-8483 state, not from gloas's"
+        );
+
+        let apart = config(next, next + 1);
+        let mut state = gloas;
+        process_slots(&mut state, epoch_start(next), &apart).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Eip8483);
+        process_slots(&mut state, epoch_start(next + 1), &apart).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Pq);
+    }
+
     #[test]
     fn process_slot_leaves_no_buffered_registry_writes() {
         let mut state = test_state::with_validators(4);
@@ -675,16 +714,8 @@ mod tests {
         }
     }
 
-    const BEACON_FORKS: [ForkName; 8] = [
-        ForkName::Phase0,
-        ForkName::Altair,
-        ForkName::Bellatrix,
-        ForkName::Capella,
-        ForkName::Deneb,
-        ForkName::Electra,
-        ForkName::Fulu,
-        ForkName::Gloas,
-    ];
+    /// Every beacon fork, the two built on gloas included.
+    const BEACON_FORKS: [ForkName; 10] = ForkName::ALL;
 
     /// Writes one element of the field a case names, or answers `false` if the
     /// fork does not have it.
@@ -698,6 +729,8 @@ mod tests {
             BeaconState::Electra(s) => s.historical_summaries.push(summary).unwrap(),
             BeaconState::Fulu(s) => s.historical_summaries.push(summary).unwrap(),
             BeaconState::Gloas(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Eip8483(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Pq(s) => s.historical_summaries.push(summary).unwrap(),
             _ => return false,
         }
         true
@@ -741,10 +774,11 @@ mod tests {
                 s.slashings_mut()[0] += 1;
                 true
             }),
-            // Gloas keeps its scores in a flat progressive list that buffers
-            // nothing, so a write there leaves nothing pending.
+            // Gloas, and the forks built on it, keep their scores in a flat
+            // progressive list that buffers nothing, so a write there leaves
+            // nothing pending.
             ("inactivity_scores", |s| {
-                let buffered = !matches!(s, BeaconState::Gloas(_));
+                let buffered = s.gloas_family().is_none();
                 match s.inactivity_score_mut(0) {
                     Ok(score) => {
                         *score += 1;

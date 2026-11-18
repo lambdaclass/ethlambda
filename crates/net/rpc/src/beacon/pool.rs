@@ -199,9 +199,11 @@ fn validate(
         return Err("attestation is older than the previous epoch");
     }
 
-    // [REJECT] data.index == 0 (electra), or at a gloas slot 0 or 1, the
-    // payload-present flag; the target epoch is the slot's.
-    let at_gloas = config.fork_at_epoch(attestation_epoch) == ForkName::Gloas;
+    // [REJECT] data.index == 0 (electra), or from gloas on 0 or 1, the
+    // payload-present flag; the target epoch is the slot's. The forks after
+    // gloas build on it, so they keep the flag; `fork_at_epoch` never names
+    // lean, which sorts after them.
+    let at_gloas = config.fork_at_epoch(attestation_epoch) >= ForkName::Gloas;
     if at_gloas {
         if data.index > 1 {
             return Err("data.index must be 0 or 1 from gloas on");
@@ -325,13 +327,21 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
     }
 }
 
-/// Whether `header` is a version the fork at `slot` accepts: gloas's slots need
-/// the gloas header, and electra's and fulu's, whose containers are the same,
-/// accept either of theirs.
+/// Whether `header` is a version the fork at `slot` accepts: a slot from gloas
+/// on needs its own fork's header, and electra's and fulu's, whose containers
+/// are the same, accept either of theirs.
+///
+/// A slot of a fork after gloas is a gloas slot too, never an electra one, so
+/// an older header is refused there rather than judged by electra's rules.
+/// [`submission_fork`] refuses the EIP-8483 and PQ headers, which leaves no
+/// version that submits at their slots: the node does not follow them.
 fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
-    let slot_is_gloas =
-        store.config().fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Gloas;
-    slot_is_gloas == (header == ForkName::Gloas)
+    let slot_fork = store.config().fork_at_epoch(compute_epoch_at_slot(slot));
+    if slot_fork >= ForkName::Gloas {
+        header == slot_fork
+    } else {
+        header < ForkName::Gloas
+    }
 }
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
@@ -486,9 +496,11 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_validated(&store, aggregate.data.beacon_block_root) {
         return err.into_response();
     }
-    // The pool holds electra-shaped votes; a gloas slot is served the same
-    // vote in gloas's container, whose JSON is the same shape.
-    let data = if fork == ForkName::Gloas {
+    // The pool holds electra-shaped votes; a slot from gloas on is served the
+    // same vote in gloas's container, whose JSON is the same shape. EIP-8483
+    // keeps that container. PQ replaces it, but no PQ vote reaches the pool:
+    // `header_matches_slot` leaves no version that submits at a PQ slot.
+    let data = if fork >= ForkName::Gloas {
         serde_json::json!(gloas::Attestation::from(&aggregate))
     } else {
         serde_json::json!(aggregate)
@@ -584,10 +596,18 @@ mod tests {
     /// slot, as [`fixture`]'s does, so it is its own checkpoint. Its votes are
     /// gloas's, so it submits under that version.
     fn fork_boundary_fixture() -> Fixture {
+        fork_boundary_fixture_at(&[ForkName::Gloas])
+    }
+
+    /// [`fork_boundary_fixture`], with each of `forks` scheduled at the wall
+    /// clock's epoch.
+    fn fork_boundary_fixture_at(forks: &[ForkName]) -> Fixture {
         let mut state = with_signing_validators_at(ForkName::Fulu, 64);
         let (probe, _) = crate::test_utils::beacon_store_at(state.clone());
         let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
-        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, wall_epoch);
+        let config = forks.iter().fold(Config::mainnet(), |config, &fork| {
+            config.with_fork_epoch(fork, wall_epoch)
+        });
         *state.slot_mut() = compute_start_slot_at_epoch(wall_epoch - 1);
         *state.fork_mut() = Fork {
             previous_version: config.fork_version(ForkName::Electra),
@@ -1136,6 +1156,39 @@ mod tests {
         let (status, _) = submit_as(&fulu, std::slice::from_ref(&vote), "gloas").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(fulu.network.published.lock().unwrap().is_empty());
+    }
+
+    /// The forks after gloas build on it, so their slots are gloas slots, not
+    /// electra ones: a vote there under fulu's header is refused rather than
+    /// judged by electra's rules. Gloas's header names a different fork, and
+    /// the node follows neither EIP-8483 nor PQ, so no header submits there.
+    #[tokio::test]
+    async fn no_header_submits_at_a_slot_after_gloas() {
+        let schedules: [&[ForkName]; 2] = [
+            &[ForkName::Gloas, ForkName::Eip8483],
+            &[ForkName::Gloas, ForkName::Eip8483, ForkName::Pq],
+        ];
+        for forks in schedules {
+            let fixture = fork_boundary_fixture_at(forks);
+            let slot = first_slot_of_the_fork(&fixture);
+            let roots = (fixture.head_root, fixture.head_root);
+            let vote = attestation_for(&fixture, slot, roots, 0, 0, 0);
+            for version in ["fulu", "gloas"] {
+                let (status, json) =
+                    submit_as(&fixture, std::slice::from_ref(&vote), version).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{forks:?} {version}: {json}"
+                );
+                assert_eq!(
+                    json["failures"][0]["message"],
+                    "Eth-Consensus-Version does not match the attestation slot's fork",
+                    "{forks:?} {version}"
+                );
+            }
+            assert!(fixture.network.published.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
