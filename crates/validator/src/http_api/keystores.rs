@@ -37,6 +37,7 @@
 //! [`crate::slashing_protection`]), so an export lists, per validator, its
 //! highest slot and its highest source and target rather than every message.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,7 +52,7 @@ use crate::Error;
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
 use crate::keys::keystore::Keystore;
-use crate::keys::{ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
+use crate::keys::{SigningDefinition, ValidatorDefinition, ValidatorDefinitions, ValidatorStore};
 use crate::secure_fs;
 
 /// The most keystores accepted in a single import request.
@@ -121,10 +122,26 @@ pub struct KeyStatus {
 }
 
 impl KeyStatus {
-    fn error(message: impl std::fmt::Display) -> Self {
+    pub(super) fn error(message: impl std::fmt::Display) -> Self {
         Self {
             status: "error".to_string(),
             message: Some(message.to_string()),
+        }
+    }
+
+    /// The key is already known to this client, through either route.
+    pub(super) fn duplicate() -> Self {
+        Self {
+            status: "duplicate".to_string(),
+            message: None,
+        }
+    }
+
+    /// The route asked has no such key.
+    fn not_found() -> Self {
+        Self {
+            status: "not_found".to_string(),
+            message: None,
         }
     }
 }
@@ -142,11 +159,13 @@ pub struct DeleteResponse {
     pub slashing_protection: String,
 }
 
+/// The keys this process holds itself. Remote ones are `/eth/v1/remotekeys`'s
+/// to list; the two routes partition the store.
 pub async fn list(State(context): State<KeymanagerContext>) -> Json<ListResponse> {
     let store = context.store.read().await;
     Json(ListResponse {
         data: store
-            .pubkeys()
+            .local_pubkeys()
             .into_iter()
             .map(|pubkey| ListedKeystore {
                 validating_pubkey: encode_hex(&pubkey.0),
@@ -282,29 +301,52 @@ pub async fn import(
     // what it replaced: a disabled entry, which was never loaded and so may
     // have no record, must not be left enabled on disk, or the next start
     // refuses the whole client for it.
-    let before: std::collections::HashMap<BlsPubkey, ValidatorDefinition> = definitions
-        .0
-        .iter()
-        .filter_map(|definition| {
-            parse_pubkey(&definition.voting_public_key)
-                .ok()
-                .map(|pubkey| (pubkey, definition.clone()))
-        })
+    let before: HashMap<BlsPubkey, ValidatorDefinition> = definitions
+        .keyed()
+        .map(|(pubkey, definition)| (pubkey, definition.clone()))
         .collect();
 
     // Decrypt (deliberately slow: EIP-2335 key derivation) and persist every
-    // key to disk before ever touching the store's write lock. The duty
-    // loop's `attest` only ever holds a read lock across a short, synchronous
-    // signing loop (see `attestation.rs`'s doc comment on that block), but
-    // `tokio::sync::RwLock` is write-preferring: a write lock queued here
-    // while this loop ran would jump that queue and stall every signature
-    // due for as long as the whole batch takes, rather than just for the
-    // instant the inserts below actually need. `definitions_lock` above has
-    // no such reader/writer to starve: only import and delete ever take it.
+    // key to disk before ever touching the store's write lock. A duty takes
+    // the store's read lock once per signature, for the key's lookup alone
+    // (see `SigningContext::sign_under`), but `tokio::sync::RwLock` is
+    // write-preferring: a write lock queued here while this loop ran would
+    // jump that queue and stall every signature due for as long as the whole
+    // batch takes, rather than just for the instant the inserts below
+    // actually need. `definitions_lock` above has no such reader/writer to
+    // starve: only import and delete ever take it.
+    //
+    // The keys a remote signer holds, by the store or by the file, gathered
+    // once for the whole request rather than looked up again for each of its
+    // keys. The store's are read under a guard released at once.
+    // `definitions_lock` is held until the inserts below, and every
+    // keymanager writer takes it first, so neither the store nor the file
+    // can change between this read and those inserts; nothing this request
+    // does adds a remote entry either, so the set stays true to its end.
+    let mut held_remotely: HashSet<BlsPubkey> = context
+        .store
+        .read()
+        .await
+        .remote_entries()
+        .into_iter()
+        .map(|(pubkey, _)| pubkey)
+        .collect();
+    held_remotely.extend(
+        definitions
+            .keyed()
+            .filter(|(_, definition)| definition.signing.is_remote())
+            .map(|(pubkey, _)| pubkey),
+    );
     let mut prepared = Vec::with_capacity(request.keystores.len());
     for (position, json) in request.keystores.iter().enumerate() {
         let password = request.passwords.get(position).map(String::as_str);
-        prepared.push(prepare_import(&context, &mut definitions, json, password));
+        prepared.push(prepare_import(
+            &context,
+            &held_remotely,
+            &mut definitions,
+            json,
+            password,
+        ));
     }
 
     // Every persisted key is registered in one durable write, before any of
@@ -388,12 +430,18 @@ pub async fn import(
             undo_import(&context, &mut definitions, &added, &replaced, &files)
         }
     };
-    if let Err(err) = &rolled_back {
-        tracing::error!(
+    match &rolled_back {
+        Ok(()) => {}
+        Err(UndoFailure::Definitions(err)) => tracing::error!(
             %err,
-            "Could not undo a failed import; the next start refuses its keys until they have a \
-             slashing-protection record"
-        );
+            "Could not undo a failed import; the next start refuses the keys it added until \
+             they have a slashing-protection record"
+        ),
+        Err(UndoFailure::Files(left)) => tracing::error!(
+            keys = left.len(),
+            "A failed import's definitions entries are undone, so the next start loads nothing \
+             it added, but not all of its keystore and password files could be put back"
+        ),
     }
 
     // The definitions guard stays held across the store lock, in the order
@@ -406,34 +454,11 @@ pub async fn import(
         .into_iter()
         .map(|result| match (result, &registration) {
             (Ok((_, secret, _)), Ok(_)) => finish_import(&mut store, &secret),
-            (Ok((pubkey, _, _)), Err(err)) => {
-                if before.contains_key(&pubkey) {
-                    // Its keystore was rewritten; its entry is back as it was
-                    // and nothing about it changed in memory, so it stays
-                    // whatever it was, loaded since startup in the ordinary
-                    // case.
-                    let entry = if rolled_back.is_ok() {
-                        "its definitions entry is back as it was"
-                    } else {
-                        "its definitions entry could not be put back"
-                    };
-                    KeyStatus::error(format!(
-                        "keystore rewritten, but the slashing-protection record could not be \
-                         written: {err}; {entry}"
-                    ))
-                } else if rolled_back.is_err() {
-                    // Still on disk, not loaded now, and refused at the next
-                    // start until it has a record.
-                    KeyStatus::error(format!(
-                        "saved, but not loaded: its slashing-protection record could not be \
-                         written: {err}"
-                    ))
-                } else {
-                    KeyStatus::error(format!(
-                        "not imported: its slashing-protection record could not be written: {err}"
-                    ))
-                }
-            }
+            (Ok((pubkey, _, _)), Err(err)) => unregistered_status(
+                before.contains_key(&pubkey),
+                Undone::of(&rolled_back, &pubkey),
+                err,
+            ),
             (Err(status), _) => status,
         })
         .collect();
@@ -443,6 +468,83 @@ pub async fn import(
     Json(StatusResponse { data })
 }
 
+/// What [`undo_import`] could not undo, by the step that failed, since the
+/// two leave different things on disk.
+#[derive(Debug)]
+enum UndoFailure {
+    /// The definitions file could not be saved, so nothing was undone: the
+    /// entries the request wrote are the ones on disk, and so are its
+    /// keystore and password files. A key it added is listed with no record,
+    /// which the next start refuses.
+    Definitions(Error),
+    /// The definitions file is back as it was, so the next start loads
+    /// nothing the request added, but the keystore or password file of these
+    /// keys could not be put back.
+    Files(Vec<(BlsPubkey, Error)>),
+}
+
+/// What became of one saved key when its registration failed and the import
+/// was undone.
+#[derive(Debug, Clone, Copy)]
+enum Undone<'a> {
+    /// Its entry and its files are what they were before the request.
+    Fully,
+    /// Nothing was put back: its entry and its files are the request's.
+    NotAtAll,
+    /// Its entry is what it was before the request; its files are not, for
+    /// this reason.
+    EntryOnly(&'a Error),
+}
+
+impl<'a> Undone<'a> {
+    fn of(rolled_back: &'a std::result::Result<(), UndoFailure>, pubkey: &BlsPubkey) -> Self {
+        match rolled_back {
+            Ok(()) => Self::Fully,
+            Err(UndoFailure::Definitions(_)) => Self::NotAtAll,
+            Err(UndoFailure::Files(left)) => left
+                .iter()
+                .find(|(key, _)| key == pubkey)
+                .map_or(Self::Fully, |(_, err)| Self::EntryOnly(err)),
+        }
+    }
+}
+
+/// The status of a key that was saved but could not be registered: what is on
+/// disk for it now, which depends on how far the undo got. `listed_before` is
+/// whether the definitions file already listed the key, in which case the
+/// request rewrote its keystore rather than added one, and nothing about the
+/// key changed in memory: it stays whatever it was, loaded since startup in
+/// the ordinary case.
+fn unregistered_status(listed_before: bool, undone: Undone<'_>, err: &Error) -> KeyStatus {
+    let cause = format!("its slashing-protection record could not be written: {err}");
+    KeyStatus::error(match (listed_before, undone) {
+        (true, Undone::Fully) => format!(
+            "not imported: {cause}; its keystore and definitions entry are back as they were"
+        ),
+        (false, Undone::Fully) => format!("not imported: {cause}"),
+        (true, Undone::NotAtAll) => format!(
+            "keystore rewritten, but {cause}; the rewrite could not be undone, so its \
+             definitions entry, keystore and password are the ones this request wrote"
+        ),
+        // Still listed and enabled on disk, with no record: not loaded now,
+        // and `SlashingProtection::open` refuses the whole client for it.
+        (false, Undone::NotAtAll) => format!(
+            "saved, but not loaded: {cause}; it could not be taken off disk again, so the \
+             client will not start again until the key has a record or is removed"
+        ),
+        (true, Undone::EntryOnly(undo)) => format!(
+            "not imported: {cause}; its definitions entry is back as it was, but its keystore \
+             and password files could not be put back ({undo}) and may be the ones this \
+             request wrote"
+        ),
+        // Orphans: nothing lists them, so nothing loads them.
+        (false, Undone::EntryOnly(undo)) => format!(
+            "not imported: {cause}; its definitions entry is removed, but its keystore and \
+             password files could not be ({undo}) and are left behind, unused"
+        ),
+    })
+}
+
 /// Undo what a failed import did: the definitions entries it added are
 /// removed and the ones it replaced put back, in one save, then every
 /// keystore and password file it wrote goes back to what was at its path
@@ -450,41 +552,64 @@ pub async fn import(
 /// first, since it is what the next start loads from, so a crash in between
 /// leaves orphan files and never a key that would be loaded without a
 /// record. A file that is already gone is not an error.
+///
+/// Reports which step failed. A key whose files cannot be put back does not
+/// stop the others': each is tried, and the ones left are named.
 fn undo_import(
     context: &KeymanagerContext,
     definitions: &mut ValidatorDefinitions,
     added: &[BlsPubkey],
     replaced: &[(BlsPubkey, ValidatorDefinition)],
     files: &[(BlsPubkey, &Overwritten)],
-) -> crate::Result<()> {
+) -> std::result::Result<(), UndoFailure> {
     if added.is_empty() && replaced.is_empty() {
         return Ok(());
     }
-    definitions.0.retain(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| !added.contains(&parsed))
-            .unwrap_or(true)
-    });
+    definitions.remove_where(|pubkey, _| added.contains(pubkey));
     for definition in &mut definitions.0 {
-        if let Some((_, previous)) = replaced.iter().find(|(pubkey, _)| {
-            parse_pubkey(&definition.voting_public_key).is_ok_and(|parsed| parsed == *pubkey)
-        }) {
+        let Ok(named) = parse_pubkey(&definition.voting_public_key) else {
+            continue;
+        };
+        if let Some((_, previous)) = replaced.iter().find(|(pubkey, _)| *pubkey == named) {
             *definition = previous.clone();
         }
     }
-    save_definitions(context, definitions)?;
+    match save_definitions(context, definitions) {
+        Ok(()) => {}
+        // The file is replaced and every reader sees it, so the entries are
+        // undone and the files follow. Only its survival of a power loss is
+        // in doubt, and the file that would come back lists keys with no
+        // record, which the next start refuses.
+        Err(Error::Unflushed { path, source }) => warn!(
+            %path,
+            %source,
+            "Validator definitions put back, but the directory could not be flushed"
+        ),
+        Err(err) => return Err(UndoFailure::Definitions(err)),
+    }
     // Newest first: a key listed twice in one request snapshotted, the second
     // time, what the first time wrote, so the earliest snapshot must be the
     // one that lands last.
+    let mut left = Vec::new();
     for (pubkey, overwritten) in files.iter().rev() {
-        let [keystore, password] = written_paths(context, pubkey)?;
-        put_back(&keystore, overwritten.keystore.as_deref())?;
-        put_back(
-            &password,
-            overwritten.password.as_deref().map(|bytes| &bytes[..]),
-        )?;
+        // The password only after the keystore: one that stays the request's
+        // keeps the password it was encrypted under.
+        let put = written_paths(context, pubkey).and_then(|[keystore, password]| {
+            put_back(&keystore, overwritten.keystore.as_deref())?;
+            put_back(
+                &password,
+                overwritten.password.as_deref().map(|bytes| &bytes[..]),
+            )
+        });
+        if let Err(err) = put {
+            left.push((*pubkey, err));
+        }
     }
-    Ok(())
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(UndoFailure::Files(left))
+    }
 }
 
 /// Put `path` back to `previous`: its former bytes, or nothing.
@@ -503,7 +628,7 @@ fn put_back(path: &Path, previous: Option<&[u8]>) -> crate::Result<()> {
 /// Save the definitions file, keeping `definitions_unflushed` true from an
 /// after-rename flush failure until a later save flushes the directory, which
 /// makes every earlier rename in it durable too.
-fn save_definitions(
+pub(super) fn save_definitions(
     context: &KeymanagerContext,
     definitions: &ValidatorDefinitions,
 ) -> crate::Result<()> {
@@ -545,6 +670,7 @@ fn remove_if_present(path: &Path) -> crate::Result<()> {
 /// before it needs the store's write lock and its slashing-protection record.
 fn prepare_import(
     context: &KeymanagerContext,
+    held_remotely: &HashSet<BlsPubkey>,
     definitions: &mut ValidatorDefinitions,
     json: &str,
     password: Option<&str>,
@@ -556,6 +682,16 @@ fn prepare_import(
     let keystore = Keystore::from_json(json).map_err(KeyStatus::error)?;
     let secret = keystore.decrypt(password).map_err(KeyStatus::error)?;
     let pubkey = ValidatorStore::derive_pubkey(&secret).map_err(KeyStatus::error)?;
+
+    // A key a remote signer holds, by the file or by the store, is
+    // `duplicate` here, the mirror of what `/eth/v1/remotekeys` answers for a
+    // local one: neither route silently replaces the other's entry. Judged
+    // before anything is written, so a `duplicate` never leaves files behind.
+    // Re-importing a key this route already holds is still `imported`, since
+    // that is how a password is rotated.
+    if held_remotely.contains(&pubkey) {
+        return Err(KeyStatus::duplicate());
+    }
 
     // Persisted before the key is reachable through the store: a validator
     // this process is willing to sign with must already be durable, or a
@@ -599,7 +735,9 @@ fn regular_file_bytes(path: &Path) -> crate::Result<Option<Vec<u8>>> {
 
 /// Add an already-decrypted, already-persisted key to the live store. The
 /// only step of an import that needs the write lock: a cheap, synchronous
-/// scalar validation and hashmap insert, never an await.
+/// scalar validation and hashmap insert, never an await. Nothing is judged
+/// again here: `prepare_import` judged the file and the store under
+/// `definitions_lock`, which is still held.
 fn finish_import(store: &mut ValidatorStore, secret: &[u8; 32]) -> KeyStatus {
     match store.insert_secret("keymanager import", secret) {
         Ok(pubkey) => {
@@ -680,8 +818,10 @@ fn persist_import(
     let definition = ValidatorDefinition {
         enabled: true,
         voting_public_key: base.clone(),
-        voting_keystore_path: keystore_path.clone(),
-        voting_keystore_password_path: password_path.clone(),
+        signing: SigningDefinition::LocalKeystore {
+            voting_keystore_path: keystore_path.clone(),
+            voting_keystore_password_path: password_path.clone(),
+        },
     };
     // How to put `definitions` back if the save below fails.
     //
@@ -762,28 +902,23 @@ pub async fn delete(
     State(context): State<KeymanagerContext>,
     Json(request): Json<DeleteRequest>,
 ) -> Json<DeleteResponse> {
-    // Taken before `store`'s write lock below, the same order `import` uses,
-    // so the two handlers never deadlock against each other. See
-    // `KeymanagerContext::definitions_lock`: this is what makes `persist_delete`
-    // below and a concurrent import's own open-mutate-save cycle mutually
-    // exclusive, rather than racing to overwrite the definitions file.
+    // Taken before `store`'s write lock, the same order `import` uses, so the
+    // two handlers never deadlock against each other. See
+    // `KeymanagerContext::definitions_lock`: this is what makes the read and
+    // save of the definitions file in `delete_keys` and a concurrent import's
+    // own open-mutate-save cycle mutually exclusive, rather than racing to
+    // overwrite the file.
     let _definitions_guard = context.definitions_lock.lock().await;
 
-    let mut store = context.store.write().await;
-    let results: Vec<(Option<BlsPubkey>, KeyStatus)> = request
-        .pubkeys
-        .iter()
-        .map(|text| match parse_pubkey(text) {
-            Ok(pubkey) => (Some(pubkey), delete_one(&context, &mut store, &pubkey)),
-            Err(err) => (None, KeyStatus::error(err)),
-        })
-        .collect();
-    drop(store);
+    // A key of the other route comes back without its pubkey, so nothing
+    // below exports its record or reports it `not_active` while a remote
+    // signer still signs with it.
+    let results = delete_keys(&context, &request.pubkeys, Origin::Local, judge_delete).await;
 
     // Exported only now, with the keys out of the store: a signature with one
-    // of them either finished before the write lock above was granted, and is
-    // in the record, or can no longer happen. That holds because the duty
-    // services record before they take the store's read lock to sign (see
+    // of them was either asked for before the write lock above was granted,
+    // and is in the record, or can no longer happen. That holds because the
+    // duty services record before they look a key up to sign with it (see
     // `attestation.rs` and `proposal.rs`), so no signature exists without its
     // record already on disk. Only for the keys that are `deleted` or may
     // become `not_active`, as the specification requires: a key whose delete
@@ -860,132 +995,334 @@ pub async fn delete(
     })
 }
 
-fn delete_one(
+/// How this route judges one key of a delete; see [`Judge`].
+fn judge_delete(
     context: &KeymanagerContext,
     store: &mut ValidatorStore,
     pubkey: &BlsPubkey,
-) -> KeyStatus {
-    // Whether this key is on disk, read before the in-memory removal makes the
-    // store an unreliable witness. `not_found` has to mean "this client has no
-    // definitions entry for it", not "it is not in memory right now": a key
-    // removed from memory by an earlier failed attempt is still very much
-    // present on disk, and reporting `not_found` for it tells an operator the
-    // key is gone when a restart will bring it back signing.
-    let on_disk = match definitions_contain(context, pubkey) {
-        Ok(present) => present,
-        // Cannot tell. Report the failure rather than guessing either way: a
-        // wrong `not_found` here is the dangerous direction.
-        Err(err) => return KeyStatus::error(err),
-    };
+    entry: Option<Origin>,
+) -> Judged {
+    // A remote key is the other route's whatever its state: one the store
+    // holds, or one only the file lists, which the next start would load. It
+    // is `/eth/v1/remotekeys`'s to delete, and this route must not reach into
+    // the other's half of the store.
+    if store.remote_url(pubkey).is_some()
+        || (entry == Some(Origin::Remote) && !store.contains(pubkey))
+    {
+        return Judged::OtherRoutes;
+    }
     let in_memory = store.remove(pubkey);
-    // Whatever becomes of the definitions file below, this process no longer
-    // signs with the key, so its overrides have nothing left to apply to. A key
+    // Whatever becomes of the definitions file, this process no longer signs
+    // with the key, so its overrides have nothing left to apply to. A key
     // imported again starts on the defaults.
     context.settings.forget(pubkey);
 
-    if !on_disk && !in_memory {
-        // A removal whose directory flush failed is on disk but may not
-        // survive a power loss, and a retry lands here. Answering `not_found`
-        // then would tell the operator the key is gone for good; flush first,
-        // by saving the file again, and keep the error until that works.
-        if context
-            .definitions_unflushed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            let definitions = match ValidatorDefinitions::open(&context.validators_dir) {
-                Ok(definitions) => definitions,
-                Err(err) => return KeyStatus::error(err),
-            };
-            if let Err(err) = save_definitions(context, &definitions) {
-                return KeyStatus::error(format!(
-                    "an earlier removal is on disk but the directory could not be flushed: \
-                     {err}; the key may come back after a power loss"
-                ));
-            }
-        }
-        return KeyStatus {
-            status: "not_found".to_string(),
-            message: None,
-        };
+    if entry != Some(Origin::Local) && !in_memory {
+        return Judged::Absent;
     }
-
-    // The in-memory store has already stopped signing with this key, which is
-    // the safety-relevant effect and happens first, the opposite order from
-    // import. If persisting the removal below fails, this process will not
-    // sign with the key again this run, but the definitions file still lists
-    // it, so a restart would reactivate it.
-    //
-    // That is why the error is returned rather than swallowed, and why
-    // `not_found` above is gated on the file rather than on memory. An
-    // operator who retries after this error must get the same error again, not
-    // a `not_found` that reads as "already gone": acting on that, by importing
-    // the key elsewhere, is what turns a failed delete into two hosts signing
-    // for one validator.
-    match persist_delete(context, pubkey) {
-        Ok(()) => {}
-        // The removal is on disk but may not survive a power loss, and the
-        // keystore stays, so the key could come back enabled, with its
-        // record, while the operator runs it elsewhere. An error, so no
-        // caller takes the key for gone; this process does not sign with it.
-        Err(Error::Unflushed { path, source }) => {
-            return KeyStatus::error(format!(
-                "removed from {path}, but the directory could not be flushed: {source}; the key \
-                 may come back after a power loss"
-            ));
-        }
-        Err(err) => return KeyStatus::error(err),
-    }
-
-    info!(pubkey = %encode_hex(&pubkey.0), "Deleted validator key");
-    KeyStatus {
-        status: "deleted".to_string(),
-        message: None,
+    // Left on the file when the store held the key as a local one while the
+    // file lists it under a remote signer, which only a hand edit of the
+    // file under a running client produces. This route leaves that entry
+    // alone, so answering `deleted`, with the key's history attached, would
+    // tell an operator the key is free to run elsewhere while the next start
+    // loads it again and signs through a signer that never heard of what it
+    // did since.
+    Judged::Removed {
+        left: (entry == Some(Origin::Remote)).then_some(Left::OnFile),
     }
 }
 
-/// Whether the definitions file currently holds an entry for `pubkey`.
-///
-/// Read from disk rather than from the in-memory store, because the two can
-/// disagree and it is the file that decides what the next restart loads. A
-/// disabled entry counts as present: it is still there, `delete` is still what
-/// removes it, and reporting `not_found` for one would leave the operator
-/// believing a key is gone while its entry waits to be re-enabled.
-///
-/// An unparseable `voting_public_key` cannot match, matching the filter in
-/// [`persist_delete`]: if that entry will not be removed, this must not claim
-/// it was found, or a delete would report success having removed nothing.
-fn definitions_contain(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<bool> {
-    let definitions = ValidatorDefinitions::open(&context.validators_dir)?;
-    Ok(definitions.0.iter().any(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| parsed == *pubkey)
-            .unwrap_or(false)
-    }))
+/// What a route decided about one key of a delete, with the store's write
+/// lock held and before the definitions file is saved.
+pub(super) enum Judged {
+    /// The other route's key: `not_found` here, with nothing more said or
+    /// exported about it.
+    OtherRoutes,
+    /// This route holds nothing for the key, in the file or in the store.
+    Absent,
+    /// What this route holds of the key is gone: the key is out of the store
+    /// if it was there as this route's kind, and its entry of this route's
+    /// kind comes off the file in the request's one save.
+    Removed {
+        /// What the other route still holds of the key, which this one
+        /// leaves where it is. The key is then not gone, and the delete is
+        /// answered with an error rather than `deleted`.
+        left: Option<Left>,
+    },
 }
 
-/// Drop a deleted key's entry from the definitions file.
+/// What a delete through one route leaves of a key because it is the other
+/// route's to remove. Either way an operator must not take the key for gone,
+/// and free to run on another host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Left {
+    /// An entry in the definitions file, which the next start would load.
+    OnFile,
+    /// The key in the store, which this process goes on signing with.
+    InStore,
+}
+
+/// How a route judges one key of a delete: against the store, which it may
+/// take the key out of, and the kind of entry the definitions file holds for
+/// it (`None` for no entry). Called with the store's write lock held, so it
+/// must not touch the disk.
+pub(super) type Judge =
+    fn(&KeymanagerContext, &mut ValidatorStore, &BlsPubkey, Option<Origin>) -> Judged;
+
+/// Delete `pubkeys` through `origin`'s route: each one's status, beside the
+/// key it named when that was a readable key of this route's.
 ///
-/// Deliberately leaves the keystore and password files on disk: `deleted`
+/// The caller holds `definitions_lock`. The definitions file is read once and
+/// saved once for the whole request, and the store's write lock is held only
+/// while keys are taken out of memory, never across either.
+/// `tokio::sync::RwLock` is write-preferring, so a write lock held across a
+/// read and a durable save of the file per key would stall every signature's
+/// lookup, local keys' included, for as long as the request has keys.
+///
+/// The file is read before the in-memory removal makes the store an
+/// unreliable witness, and it is the file that decides `not_found`: that has
+/// to mean "this client has no definitions entry for it", not "it is not in
+/// memory right now". A key removed from memory by an earlier failed attempt
+/// is still very much present on disk, and reporting `not_found` for it tells
+/// an operator the key is gone when a restart will bring it back signing. A
+/// disabled entry counts as present for the same reason: a delete is still
+/// what removes it. An entry whose `voting_public_key` does not parse names
+/// no key (see `ValidatorDefinitions::keyed`), so it is neither found nor
+/// removed.
+///
+/// The keystore and password files are deliberately left on disk: `deleted`
 /// means this client has stopped using the key, not that it destroys operator
 /// key material on an HTTP call. A definitions file with no entry for them is
 /// enough to keep them from being loaded again.
-fn persist_delete(context: &KeymanagerContext, pubkey: &BlsPubkey) -> crate::Result<()> {
-    let mut definitions = ValidatorDefinitions::open(&context.validators_dir)?;
-    definitions.0.retain(|definition| {
-        parse_pubkey(&definition.voting_public_key)
-            .map(|parsed| parsed != *pubkey)
-            .unwrap_or(true)
-    });
-    save_definitions(context, &definitions)
+pub(super) async fn delete_keys(
+    context: &KeymanagerContext,
+    pubkeys: &[String],
+    origin: Origin,
+    judge: Judge,
+) -> Vec<(Option<BlsPubkey>, KeyStatus)> {
+    let parsed: Vec<std::result::Result<BlsPubkey, KeyStatus>> = pubkeys
+        .iter()
+        .map(|text| parse_pubkey(text).map_err(KeyStatus::error))
+        .collect();
+
+    let mut definitions = match ValidatorDefinitions::open(&context.validators_dir) {
+        Ok(definitions) => definitions,
+        // Cannot tell what is on disk. Reported rather than guessed either
+        // way, with nothing removed: a wrong `not_found` here is the
+        // dangerous direction.
+        Err(err) => {
+            return parsed
+                .into_iter()
+                .map(|key| match key {
+                    Ok(pubkey) => (Some(pubkey), KeyStatus::error(&err)),
+                    Err(status) => (None, status),
+                })
+                .collect();
+        }
+    };
+    // The kind of entry the file holds for each key, every entry decoded
+    // once for the request. The first entry naming a key speaks for it.
+    let mut on_file: HashMap<BlsPubkey, Origin> = HashMap::new();
+    for (pubkey, definition) in definitions.keyed() {
+        on_file
+            .entry(pubkey)
+            .or_insert(Origin::of(&definition.signing));
+    }
+
+    // The in-memory removals, and nothing else, under the write lock. They
+    // come first, the opposite order from import: that this process stops
+    // signing with a key is the safety-relevant effect, and it holds whatever
+    // becomes of the file below.
+    let judged: Vec<std::result::Result<(BlsPubkey, Judged), KeyStatus>> = {
+        let mut store = context.store.write().await;
+        parsed
+            .into_iter()
+            .map(|key| {
+                let pubkey = key?;
+                let entry = on_file.get(&pubkey).copied();
+                Ok((pubkey, judge(context, &mut store, &pubkey, entry)))
+            })
+            .collect()
+    };
+
+    // One save for the request. Only entries of this route's kind come off:
+    // the routes partition the store, and a delete through one must not erase
+    // the other's entry for the same key when memory and the file disagree
+    // about which kind it is. Saved even when no entry does (a key that was
+    // in memory only), since a save is also what flushes an earlier removal
+    // whose directory flush failed (see `save_definitions`).
+    //
+    // If it fails, this process will not sign with the keys again this run,
+    // but the file still lists them, so a restart would reactivate them. That
+    // is why the failure is every removed key's answer rather than swallowed:
+    // an operator who retries after it must get an error again, not a
+    // `not_found` that reads as "already gone". Acting on that, by importing
+    // the key elsewhere, is what turns a failed delete into two hosts signing
+    // for one validator.
+    let removing: HashSet<BlsPubkey> = judged
+        .iter()
+        .filter_map(|key| match key {
+            Ok((pubkey, Judged::Removed { .. })) => Some(*pubkey),
+            _ => None,
+        })
+        .collect();
+    let saved: std::result::Result<(), String> = if removing.is_empty() {
+        Ok(())
+    } else {
+        definitions
+            .remove_where(|pubkey, signing| removing.contains(pubkey) && origin.owns(signing));
+        match save_definitions(context, &definitions) {
+            Ok(()) => Ok(()),
+            // The removal is on disk but may not survive a power loss, and
+            // the keystore stays, so the key could come back enabled, with
+            // its record, while the operator runs it elsewhere. An error, so
+            // no caller takes the key for gone; this process does not sign
+            // with it.
+            Err(Error::Unflushed { path, source }) => Err(format!(
+                "removed from {path}, but the directory could not be flushed: {source}; the key \
+                 may come back after a power loss"
+            )),
+            Err(err) => Err(err.to_string()),
+        }
+    };
+
+    // `not_found`, once an earlier removal is known to be durable; asked at
+    // most once for the request, and only if some key needs the answer.
+    let mut earlier: Option<std::result::Result<(), String>> = None;
+    let mut absent = || match earlier.get_or_insert_with(|| flush_earlier_removal(context)) {
+        Ok(()) => KeyStatus::not_found(),
+        Err(message) => KeyStatus::error(message),
+    };
+    let mut answered: HashSet<BlsPubkey> = HashSet::new();
+    judged
+        .into_iter()
+        .map(|key| {
+            let (pubkey, judged) = match key {
+                Ok(judged) => judged,
+                Err(status) => return (None, status),
+            };
+            let status = match judged {
+                Judged::OtherRoutes => return (None, KeyStatus::not_found()),
+                Judged::Absent => absent(),
+                Judged::Removed { left } => {
+                    if let Err(message) = &saved {
+                        KeyStatus::error(message)
+                    } else if let Some(left) = left {
+                        // Ahead of the check below: a key the store still
+                        // holds is judged the same every time the request
+                        // names it, and must be an error every time.
+                        KeyStatus::error(origin.leaves(left))
+                    } else if !answered.insert(pubkey) {
+                        // Named earlier in this request, and removed there.
+                        absent()
+                    } else {
+                        let pubkey = encode_hex(&pubkey.0);
+                        match origin {
+                            Origin::Local => info!(%pubkey, "Deleted validator key"),
+                            Origin::Remote => info!(%pubkey, "Deleted remote validator key"),
+                        }
+                        KeyStatus {
+                            status: "deleted".to_string(),
+                            message: None,
+                        }
+                    }
+                }
+            };
+            (Some(pubkey), status)
+        })
+        .collect()
+}
+
+/// Make an earlier removal durable before a key is reported `not_found`.
+///
+/// A removal whose directory flush failed is on disk but may not survive a
+/// power loss, and a retry of that delete finds nothing left to remove.
+/// Answering `not_found` then would tell the operator the key is gone for
+/// good; this flushes first, by saving the file again, and `Err` is the
+/// message to answer with until that works.
+fn flush_earlier_removal(context: &KeymanagerContext) -> std::result::Result<(), String> {
+    if !context
+        .definitions_unflushed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+    let definitions =
+        ValidatorDefinitions::open(&context.validators_dir).map_err(|err| err.to_string())?;
+    save_definitions(context, &definitions).map_err(|err| {
+        format!(
+            "an earlier removal is on disk but the directory could not be flushed: {err}; the \
+             key may come back after a power loss"
+        )
+    })
+}
+
+/// Which route a definitions entry belongs to: the keystores route's local
+/// keys, or the remotekeys route's remote ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Origin {
+    Local,
+    Remote,
+}
+
+impl Origin {
+    fn of(signing: &SigningDefinition) -> Self {
+        if signing.is_remote() {
+            Self::Remote
+        } else {
+            Self::Local
+        }
+    }
+
+    fn owns(self, signing: &SigningDefinition) -> bool {
+        Self::of(signing) == self
+    }
+
+    /// What a delete through this route answers when it removed what was its
+    /// own and the other route still holds `left` of the key; see
+    /// [`Judged::Removed`].
+    fn leaves(self, left: Left) -> &'static str {
+        match (self, left) {
+            (Self::Local, Left::OnFile) => {
+                "no longer signing with this key, but the definitions file lists it under a \
+                 remote signer, an entry this route does not remove, so it would sign again \
+                 after a restart; delete it through /eth/v1/remotekeys"
+            }
+            (Self::Remote, Left::OnFile) => {
+                "no longer signing with this key, but the definitions file lists it as a local \
+                 keystore, an entry this route does not remove, so it would sign again after a \
+                 restart; delete it through /eth/v1/keystores"
+            }
+            (Self::Remote, Left::InStore) => {
+                "its remote entry is off the definitions file, but this client holds the key \
+                 as a local keystore, which this route does not remove, and is still signing \
+                 with it; delete it through /eth/v1/keystores"
+            }
+            // Not an answer the keystores route gives today: a key the store
+            // holds through a signer is the other route's outright
+            // (`Judged::OtherRoutes`). Worded all the same, so the pair has
+            // no case that answers nothing.
+            (Self::Local, Left::InStore) => {
+                "its local entry is off the definitions file, but this client holds the key \
+                 through a remote signer, which this route does not remove, and is still \
+                 signing with it; delete it through /eth/v1/remotekeys"
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::http_api::router;
+
     use axum::body::Body;
+
     use axum::http::{Request, StatusCode};
+
     use http_body_util::BodyExt as _;
+
     use tower::ServiceExt as _;
 
     const TOKEN: &str = "test-token";
@@ -1017,6 +1354,7 @@ mod tests {
     const PASSWORD: &str = "\u{1d531}\u{1d522}\u{1d530}\u{1d531}\u{1d52d}\u{1d51e}\u{1d530}\u{1d530}\u{1d534}\u{1d52c}\u{1d52f}\u{1d521}\u{1f511}";
 
     fn context_with_dirs(store: SharedStore, dir: &std::path::Path) -> KeymanagerContext {
+        let (beacon_node, signing, clock) = crate::http_api::tests::exit_route_context();
         KeymanagerContext {
             store,
             settings: Arc::new(crate::proposer_settings::ProposerSettings::new(
@@ -1026,8 +1364,12 @@ mod tests {
             validators_dir: dir.to_path_buf(),
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            beacon_node,
+            signing,
+            clock,
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
+            default_remote_signer: None,
         }
     }
 
@@ -1180,8 +1522,10 @@ mod tests {
         let existing = ValidatorDefinition {
             enabled: false,
             voting_public_key: encode_hex(&pubkey.0),
-            voting_keystore_path: PathBuf::from("old.json"),
-            voting_keystore_password_path: PathBuf::from("old.txt"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("old.json"),
+                voting_keystore_password_path: PathBuf::from("old.txt"),
+            },
         };
         let mut definitions = ValidatorDefinitions(vec![existing.clone()]);
 
@@ -1364,6 +1708,224 @@ mod tests {
         );
     }
 
+    /// The two routes must not replace each other's entries. A keystore for
+    /// a key a remote signer already holds is `duplicate`, and the remote
+    /// entry survives in memory and on disk; and a remote import of a key
+    /// the file already lists (here, a disabled local entry) is `duplicate`
+    /// too, rather than turning the disabled key into a signing one.
+    #[tokio::test]
+    async fn neither_route_replaces_the_others_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path()),
+            TOKEN.to_string(),
+        );
+        let pubkey = "0x9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07";
+        let signer = "https://signer.example:9000";
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [{ "pubkey": pubkey, "url": signer }] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "imported");
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({ "keystores": [keystore_json()], "passwords": [PASSWORD] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "duplicate");
+        let parsed = parse_pubkey(pubkey).expect("pubkey");
+        assert_eq!(
+            store.read().await.remote_url(&parsed).as_deref(),
+            Some(signer),
+            "the remote entry must survive in memory"
+        );
+        let reloaded = ValidatorStore::load(dir.path()).expect("loads");
+        assert_eq!(reloaded.remote_url(&parsed).as_deref(), Some(signer));
+
+        // The other direction: a disabled local entry on disk, nothing in
+        // memory, and a remote import for the same key.
+        let other = tempfile::tempdir().expect("temp dir");
+        let mut definitions = ValidatorDefinitions::default();
+        definitions.0.push(ValidatorDefinition {
+            enabled: false,
+            voting_public_key: pubkey.to_string(),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: PathBuf::from("keystore.json"),
+                voting_keystore_password_path: PathBuf::from("password.txt"),
+            },
+        });
+        definitions.save(other.path()).expect("saves");
+        let app = router(
+            context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), other.path()),
+            TOKEN.to_string(),
+        );
+        let (_, body) = send(
+            app,
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [{ "pubkey": pubkey, "url": signer }] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["data"][0]["status"], "duplicate");
+        let on_disk = ValidatorDefinitions::open(other.path()).expect("opens");
+        assert!(
+            !on_disk.0[0].enabled && !on_disk.0[0].signing.is_remote(),
+            "the disabled local entry must be untouched"
+        );
+    }
+
+    /// Memory holding a local key while the file holds a remote entry for
+    /// it, which only a hand edit under a running client produces. A delete
+    /// through `/keystores` stops the local key signing and leaves the other
+    /// route's file entry alone, and because that entry would bring the key
+    /// back at the next start, the answer is an error with no history
+    /// attached, never `deleted`.
+    #[tokio::test]
+    async fn a_delete_never_erases_the_other_routes_file_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("valid hex")
+                .try_into()
+                .expect("32 bytes");
+        let pubkey = context
+            .store
+            .write()
+            .await
+            .insert_secret("test", &secret)
+            .expect("inserts");
+        // A record the key signed under, so there is history a `deleted`
+        // would hand over.
+        {
+            let mut protection = protection.lock().expect("not poisoned");
+            protection.absorb(None, &[pubkey]).expect("registers");
+            protection
+                .check_and_record_block(&pubkey, 1 << 40)
+                .expect("written")
+                .expect("allowed");
+        }
+        let hex = encode_hex(&pubkey.0);
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: hex.clone(),
+            signing: SigningDefinition::Web3Signer {
+                url: "https://signer.example:9000".to_string(),
+            },
+        }])
+        .save(dir.path())
+        .expect("saves");
+        let store = context.store.clone();
+        let app = router(context, TOKEN.to_string());
+        let delete = || {
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({ "pubkeys": [hex] }),
+            )
+        };
+        let exported = |body: &serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(body["slashing_protection"].as_str().expect("a string"))
+                .expect("json")
+        };
+
+        let (_, body) = send(app.clone(), delete()).await;
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        let message = body["data"][0]["message"].as_str().expect("a message");
+        assert!(message.contains("/eth/v1/remotekeys"), "{message}");
+        assert!(store.read().await.is_empty(), "the local key stops signing");
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(on_disk.0.len(), 1, "the remote entry is not this route's");
+        assert!(on_disk.0[0].signing.is_remote());
+        assert_eq!(
+            exported(&body)["data"],
+            serde_json::json!([]),
+            "no history for a key the next start would load again"
+        );
+
+        // Asked again, the key is the other route's and nothing else: not
+        // `not_active`, which would hand its history over after all.
+        let (_, body) = send(app, delete()).await;
+        assert_eq!(body["data"][0]["status"], "not_found", "got {body}");
+        assert_eq!(exported(&body)["data"], serde_json::json!([]));
+    }
+
+    /// One request, many keys: every key is judged against a single read of
+    /// the file and comes off it in a single save, with a key named twice
+    /// `deleted` the first time and gone the second, and a key this client
+    /// never had `not_found`.
+    #[tokio::test]
+    async fn a_delete_of_several_keys_judges_each_and_saves_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ValidatorStore::new();
+        let mut definitions = ValidatorDefinitions::default();
+        let mut held = Vec::new();
+        for last in 1..=3u8 {
+            let mut secret = [0u8; 32];
+            secret[31] = last;
+            let pubkey = store.insert_secret("test", &secret).expect("inserts");
+            let hex = encode_hex(&pubkey.0);
+            definitions.0.push(ValidatorDefinition {
+                enabled: true,
+                voting_public_key: hex.clone(),
+                signing: SigningDefinition::LocalKeystore {
+                    voting_keystore_path: PathBuf::from(format!("{hex}.json")),
+                    voting_keystore_password_path: PathBuf::from(&hex),
+                },
+            });
+            held.push(hex);
+        }
+        definitions.save(dir.path()).expect("saves");
+        let store = Arc::new(RwLock::new(store));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path()),
+            TOKEN.to_string(),
+        );
+        let stranger = encode_hex(&[0xaa; 48]);
+
+        let (_, body) = send(
+            app,
+            authed(
+                "DELETE",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "pubkeys": [held[0], stranger, held[1], "0xnothex", held[0]]
+                }),
+            ),
+        )
+        .await;
+        let statuses: Vec<&str> = body["data"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|entry| entry["status"].as_str().expect("a status"))
+            .collect();
+        assert_eq!(
+            statuses,
+            ["deleted", "not_found", "deleted", "error", "not_found"],
+            "got {body}"
+        );
+
+        assert_eq!(store.read().await.len(), 1, "the third key still signs");
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(on_disk.0.len(), 1);
+        assert_eq!(on_disk.0[0].voting_public_key, held[2]);
+    }
+
     /// An imported key is registered in the slashing-protection record before
     /// it is loaded, so the next start finds a record for it instead of
     /// refusing it.
@@ -1376,7 +1938,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1420,7 +1982,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let store = context.store.clone();
 
         let (_, body) = send(
@@ -1485,15 +2047,17 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: false,
             voting_public_key: format!("0x{}", keystore["pubkey"].as_str().expect("pubkey")),
-            voting_keystore_path: dir.path().join("old.json"),
-            voting_keystore_password_path: dir.path().join("old"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: dir.path().join("old.json"),
+                voting_keystore_password_path: dir.path().join("old"),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1508,11 +2072,12 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Not "keystore rewritten": the undo put the files back too, so the
+        // message must not send the operator looking for a new keystore.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("not imported"), "got {body}");
         assert!(
-            body["data"][0]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("back as it was"),
+            message.ends_with("its keystore and definitions entry are back as they were"),
             "got {body}"
         );
         let definitions = ValidatorDefinitions::open(dir.path()).expect("opens");
@@ -1554,15 +2119,17 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: true,
             voting_public_key: base.clone(),
-            voting_keystore_path: keystore_path.clone(),
-            voting_keystore_password_path: password_path.clone(),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: keystore_path.clone(),
+                voting_keystore_password_path: password_path.clone(),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
             .expect("saves");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1608,8 +2175,10 @@ mod tests {
         let previous = ValidatorDefinition {
             enabled: true,
             voting_public_key: base.clone(),
-            voting_keystore_path: keystore_path.clone(),
-            voting_keystore_password_path: dir.path().join("old"),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: keystore_path.clone(),
+                voting_keystore_password_path: dir.path().join("old"),
+            },
         };
         ValidatorDefinitions(vec![previous.clone()])
             .save(dir.path())
@@ -1637,9 +2206,190 @@ mod tests {
         assert_eq!(definitions.0, vec![previous]);
     }
 
-    /// A request that carries history is refused whole, importing nothing.
+    /// The entry an import writes for `pubkey` in `dir`.
+    fn imported_entry(dir: &std::path::Path, pubkey: &BlsPubkey) -> ValidatorDefinition {
+        let base = encode_hex(&pubkey.0);
+        ValidatorDefinition {
+            enabled: true,
+            voting_public_key: base.clone(),
+            signing: SigningDefinition::LocalKeystore {
+                voting_keystore_path: dir.join(format!("{base}.json")),
+                voting_keystore_password_path: dir.join(base),
+            },
+        }
+    }
+
+    /// The keystore and password paths of a local entry, such as one
+    /// [`imported_entry`] builds.
+    fn local_paths(entry: &ValidatorDefinition) -> (&std::path::Path, &std::path::Path) {
+        match &entry.signing {
+            SigningDefinition::LocalKeystore {
+                voting_keystore_path,
+                voting_keystore_password_path,
+            } => (voting_keystore_path, voting_keystore_password_path),
+            SigningDefinition::Web3Signer { .. } => panic!("not a local entry: {entry:?}"),
+        }
+    }
+
+    /// A non-empty directory at `path`: neither a file to remove nor a place
+    /// a rename can land, whoever runs the test.
+    fn obstruct(path: &std::path::Path) {
+        std::fs::create_dir(path).expect("a directory in its place");
+        std::fs::write(path.join("inside"), b"x").expect("writes");
+    }
+
+    /// The undo's two steps leave different things on disk, and it says which
+    /// one failed. Here the definitions are saved and one key's keystore
+    /// cannot be removed: both entries are undone, that key is named, and the
+    /// other key's files still go, since one failure does not stop the rest.
+    #[test]
+    fn an_undo_names_the_keys_whose_files_it_could_not_put_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        let (stuck, fine) = (BlsPubkey([1; 48]), BlsPubkey([2; 48]));
+        let stuck_entry = imported_entry(dir.path(), &stuck);
+        let fine_entry = imported_entry(dir.path(), &fine);
+        let (stuck_keystore, stuck_password) = local_paths(&stuck_entry);
+        let (fine_keystore, fine_password) = local_paths(&fine_entry);
+        obstruct(stuck_keystore);
+        std::fs::write(stuck_password, b"password").expect("writes");
+        std::fs::write(fine_keystore, b"keystore").expect("writes");
+        std::fs::write(fine_password, b"password").expect("writes");
+        let mut definitions = ValidatorDefinitions(vec![stuck_entry.clone(), fine_entry.clone()]);
+        definitions.save(dir.path()).expect("saves");
+
+        // Neither key had files before. Undone newest first, so `stuck`
+        // fails before `fine` is reached.
+        let nothing = Overwritten {
+            keystore: None,
+            password: None,
+        };
+        let files = [(fine, &nothing), (stuck, &nothing)];
+        let failure = undo_import(&context, &mut definitions, &[stuck, fine], &[], &files)
+            .expect_err("one keystore cannot be removed");
+
+        let UndoFailure::Files(left) = &failure else {
+            panic!("the definitions were saved, got {failure:?}");
+        };
+        assert_eq!(
+            left.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![stuck]
+        );
+        assert!(
+            ValidatorDefinitions::open(dir.path())
+                .expect("opens")
+                .0
+                .is_empty(),
+            "both entries are undone, so the next start loads neither key"
+        );
+        assert!(
+            !fine_keystore.exists() && !fine_password.exists(),
+            "the other key's files still go"
+        );
+        assert!(
+            stuck_password.exists(),
+            "a keystore that stays keeps the password it was encrypted under"
+        );
+
+        let rolled_back = Err(failure);
+        assert!(matches!(
+            Undone::of(&rolled_back, &stuck),
+            Undone::EntryOnly(_)
+        ));
+        assert!(matches!(Undone::of(&rolled_back, &fine), Undone::Fully));
+    }
+
+    /// The other step: the definitions file cannot be saved, so nothing is
+    /// undone, the files the entry names are left where they are, and every
+    /// key of the request is reported that way.
+    #[test]
+    fn an_undo_that_cannot_save_the_definitions_undoes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
+        let key = BlsPubkey([1; 48]);
+        let entry = imported_entry(dir.path(), &key);
+        let (keystore, password) = local_paths(&entry);
+        std::fs::write(keystore, b"keystore").expect("writes");
+        std::fs::write(password, b"password").expect("writes");
+        let mut definitions = ValidatorDefinitions(vec![entry.clone()]);
+        obstruct(&dir.path().join(crate::keys::definitions::DEFINITIONS_FILE));
+
+        let nothing = Overwritten {
+            keystore: None,
+            password: None,
+        };
+        let failure = undo_import(&context, &mut definitions, &[key], &[], &[(key, &nothing)])
+            .expect_err("the definitions cannot be saved");
+
+        assert!(
+            matches!(failure, UndoFailure::Definitions(_)),
+            "got {failure:?}"
+        );
+        assert!(
+            keystore.exists() && password.exists(),
+            "the files a still-listed entry names are not removed from under it"
+        );
+        assert!(matches!(Undone::of(&Err(failure), &key), Undone::NotAtAll));
+    }
+
+    /// Each way the undo can end gets a status that says what is on disk for
+    /// the key, and why the files stayed when they did.
+    #[test]
+    fn the_status_of_an_unregistered_key_says_what_is_on_disk() {
+        let err = Error::SlashingProtectionUnusable {
+            reason: "the record's reason".to_string(),
+        };
+        let undo = Error::Keystore {
+            path: "a path".to_string(),
+            reason: "the undo's reason".to_string(),
+        };
+        let message = |listed_before, undone| {
+            let status = unregistered_status(listed_before, undone, &err);
+            assert_eq!(status.status, "error");
+            let message = status.message.expect("an error says why");
+            assert!(message.contains("the record's reason"), "{message}");
+            message
+        };
+
+        let added = message(false, Undone::Fully);
+        assert!(added.starts_with("not imported"), "{added}");
+        let replaced = message(true, Undone::Fully);
+        assert!(
+            replaced.ends_with("its keystore and definitions entry are back as they were"),
+            "{replaced}"
+        );
+
+        let added = message(false, Undone::NotAtAll);
+        assert!(added.starts_with("saved, but not loaded"), "{added}");
+        assert!(added.contains("will not start again"), "{added}");
+        let replaced = message(true, Undone::NotAtAll);
+        assert!(replaced.starts_with("keystore rewritten"), "{replaced}");
+        assert!(replaced.contains("could not be undone"), "{replaced}");
+
+        let added = message(false, Undone::EntryOnly(&undo));
+        assert!(added.starts_with("not imported"), "{added}");
+        assert!(
+            added.contains("its definitions entry is removed"),
+            "{added}"
+        );
+        assert!(added.contains("left behind"), "{added}");
+        assert!(added.contains("the undo's reason"), "{added}");
+        let replaced = message(true, Undone::EntryOnly(&undo));
+        assert!(replaced.starts_with("not imported"), "{replaced}");
+        assert!(
+            replaced.contains("its definitions entry is back as it was"),
+            "{replaced}"
+        );
+        assert!(replaced.contains("could not be put back"), "{replaced}");
+        assert!(replaced.contains("the undo's reason"), "{replaced}");
+    }
+
+    /// A request whose history does not parse as an interchange is refused
+    /// whole, importing nothing: `{}` has neither metadata nor data. History
+    /// that does parse is imported with its keys (see
+    /// `an_import_brings_its_slashing_protection_history`).
     #[tokio::test]
-    async fn an_import_carrying_history_is_refused_whole() {
+    async fn an_import_whose_history_does_not_parse_is_refused_whole() {
         let dir = tempfile::tempdir().expect("temp dir");
         let context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
         let store = context.store.clone();
@@ -1658,6 +2408,14 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        // Refused for the history, and for its shape: not for the keystore,
+        // and not for some later step.
+        let message = body["data"][0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("slashing_protection was not imported")
+                && message.contains("malformed"),
+            "got {body}"
+        );
         assert!(store.read().await.pubkeys().is_empty());
         assert!(
             ValidatorDefinitions::open(dir.path())
@@ -1682,7 +2440,7 @@ mod tests {
         std::fs::create_dir(&record).expect("a directory in its place");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
 
         let (_, body) = send(
             router(context, TOKEN.to_string()),
@@ -1720,6 +2478,118 @@ mod tests {
         );
     }
 
+    /// The reason the client stops gracefully. An import has saved its key
+    /// and is waiting to register it when a bug poisons the record: the
+    /// client stops, which used to drop the runtime with the request parked
+    /// there, leaving a key saved and enabled with no record, refused at
+    /// every start after. Told to stop instead, the server lets the import
+    /// meet the poisoned record, take its key off disk again and answer.
+    #[tokio::test]
+    async fn an_import_in_flight_when_the_record_is_poisoned_is_undone_before_the_client_stops() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (context, protection) = context_with_record(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("bound");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn({
+            let router = router(context, TOKEN.to_string());
+            let shutdown = shutdown.clone();
+            async move {
+                crate::http_api::serve(listener, router, shutdown)
+                    .await
+                    .expect("serves");
+            }
+        });
+
+        // Another access holds the record, so the import's registration
+        // waits for it, and will panic with it held: the bug.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let protection = protection.clone();
+            move || {
+                let _guard = protection.lock().expect("not poisoned yet");
+                locked.send(()).expect("the test is waiting");
+                held.recv().expect("released");
+                panic!("a bug while holding the record");
+            }
+        });
+        is_locked.recv().expect("the record is held");
+
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{address}/eth/v1/keystores"))
+                .bearer_auth(TOKEN)
+                .json(&serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }))
+                .send()
+                .await
+                .expect("the request in flight is answered")
+                .json::<serde_json::Value>()
+                .await
+                .expect("with a body")
+        });
+
+        // The import has saved its key once the definitions file lists it.
+        let saved = async {
+            loop {
+                let listed = ValidatorDefinitions::open(dir.path())
+                    .map(|definitions| !definitions.0.is_empty())
+                    .unwrap_or(false);
+                if listed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), saved)
+            .await
+            .expect("the import saves its key");
+        release.send(()).expect("the holder is waiting");
+        holder.join().expect_err("the holder panics");
+
+        // What `run` does from here: stop on the record, the keymanager last.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::run_until_stopped(std::future::pending(), &protection, shutdown, Some(server)),
+        )
+        .await
+        .expect("the client stops");
+        assert!(
+            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
+            "got {stopped}"
+        );
+
+        // Checked before the answer is read: by the time the client is
+        // reported stopped, which is when the runtime goes, the import has
+        // already been undone.
+        assert!(
+            ValidatorStore::load(dir.path())
+                .expect("loads")
+                .pubkeys()
+                .is_empty(),
+            "the next start finds no key to refuse"
+        );
+        assert!(
+            !dir.path().join(format!("{KEYSTORE_PUBKEY}.json")).exists(),
+            "the keystore is off disk again"
+        );
+
+        let body = request.await.expect("the request task ends");
+        assert_eq!(body["data"][0]["status"], "error", "got {body}");
+        assert!(
+            body["data"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("not imported"),
+            "got {body}"
+        );
+    }
+
     /// A key that fails to persist must leave no slashing-protection record
     /// behind: a record would later let the same keystore, copied in by hand,
     /// past the startup check as if it had been registered on purpose.
@@ -1740,7 +2610,7 @@ mod tests {
                 .expect("opens with no keys");
         let mut context =
             context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir.path());
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
 
         let (_, body) = send(
@@ -1777,7 +2647,7 @@ mod tests {
         )
         .expect("opens with no keys");
         let mut context = context_with_dirs(Arc::new(RwLock::new(ValidatorStore::new())), dir);
-        context.protection = Arc::new(std::sync::Mutex::new(protection));
+        context.protection = crate::slashing_protection::SharedProtection::new(protection);
         let protection = context.protection.clone();
         (context, protection)
     }

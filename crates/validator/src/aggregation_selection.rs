@@ -34,6 +34,7 @@
 
 use ethlambda_types::beacon::primitives::BlsSignature;
 use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
 use crate::beacon_node::dto::{AttesterDutyDto, parse_pubkey};
 use crate::error::Result;
@@ -88,13 +89,15 @@ pub fn is_aggregator(committee_length: u64, selection_proof: &BlsSignature) -> b
 /// silent `None`. Both mean the duty cannot be served at all, and reporting
 /// them as "not an aggregator" would hide a misconfiguration behind a role
 /// this validator was never going to fill anyway.
-pub fn selection_for(
+pub async fn selection_for(
     context: &SigningContext,
-    store: &ValidatorStore,
+    store: &RwLock<ValidatorStore>,
     duty: &AttesterDutyDto,
 ) -> Result<Option<BlsSignature>> {
     let pubkey = parse_pubkey(&duty.pubkey)?;
-    let proof = context.sign_selection_proof(store, &pubkey, duty.slot)?;
+    let proof = context
+        .sign_selection_proof(store, &pubkey, duty.slot)
+        .await?;
     Ok(is_aggregator(duty.committee_length, &proof).then_some(proof))
 }
 
