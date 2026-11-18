@@ -22,6 +22,7 @@
 //! inline; the late result is stored and simply goes unused by that block.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ethlambda_state_transition::beacon::fork_choice;
@@ -197,18 +198,28 @@ impl BlockChainServer {
             already_cached: cached.is_some(),
         };
         let Some(key) = decide(&inputs) else {
-            // Someone else advanced the state already (a gloas bid for the
-            // epoch's first slot does), so no worker runs: warm the sums from
-            // that state instead, or the epoch would import without them.
+            // Another path already advanced the state to the epoch's start
+            // (validating a gloas bid for the epoch's first slot does), so no
+            // worker runs, and the worker is what warms the key sums. Asked
+            // again as if nothing were cached, `decide` says whether that cache
+            // hit is the only reason no worker runs; if so, warm the sums from
+            // the cached state, or the epoch would import without them.
+            let only_the_cache_stopped_the_worker = decide(&DecisionInputs {
+                already_cached: false,
+                ..inputs
+            })
+            .is_some();
+            // One warm-only task at a time. A second would not build the sums
+            // again (they sit behind a `OnceLock`), but it would hold a
+            // blocking thread waiting on the first.
             if let Some(state) = cached
-                && decide(&DecisionInputs {
-                    already_cached: false,
-                    ..inputs
-                })
-                .is_some()
+                && only_the_cache_stopped_the_worker
+                && !self.key_sums_warming.swap(true, Ordering::AcqRel)
             {
                 let committee_cache = self.store.committee_cache();
+                let warming = ClearOnDrop(Arc::clone(&self.key_sums_warming));
                 tokio::task::spawn_blocking(move || {
+                    let _warming = warming;
                     warm_epoch_key_sums(&committee_cache, &state, candidate_epoch)
                 });
             }
@@ -263,6 +274,16 @@ fn warm_epoch_key_sums(
 ) {
     committee_cache.warm_key_sums(state, epoch);
     committee_cache.warm_key_sums(state, epoch.saturating_sub(1));
+}
+
+/// Clears the flag it holds when dropped, so a warm-only task releases
+/// `key_sums_warming` however it ends, a panic included.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Handler<EpochPrecomputeCheck> for BlockChainServer {
