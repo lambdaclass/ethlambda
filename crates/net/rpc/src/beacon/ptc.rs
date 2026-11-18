@@ -230,7 +230,8 @@ fn ptc_duties(
         ));
     }
 
-    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_))
+    // A head of a fork after gloas holds the PTC window too.
+    let readable_from_head = head_state.fork_name().has_payload_envelopes()
         && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
     let state: Arc<BeaconState> = if readable_from_head {
         head_state

@@ -2003,10 +2003,37 @@ mod tests {
     fn upgrade_state_walks_every_fork_boundary_end_to_end() {
         // A cheap integration check on top of the per-function tests above:
         // `advance_to` already exercises every arm of `upgrade_state`, so
-        // reaching fulu without an error proves the whole dispatch chain
-        // (not just each function in isolation) is wired correctly.
-        let (fulu_state, _config) = advance_to(ForkName::Fulu, 4);
-        assert_eq!(fulu_state.fork_name(), ForkName::Fulu);
+        // reaching the last fork without an error proves the whole dispatch
+        // chain (not just each function in isolation) is wired correctly,
+        // through gloas and the two forks built on it. Gloas samples its PTC
+        // from every slot's committee, so every slot needs a member.
+        let last = *ForkName::ALL.last().unwrap();
+        assert_eq!(last, ForkName::Pq);
+        let (state, _config) = advance_to(last, 64);
+        assert_eq!(state.fork_name(), last);
+    }
+
+    /// EIP-8483 builds on gloas and PQ on EIP-8483: each upgrade takes its
+    /// predecessor's state and no other, so a schedule cannot reach PQ
+    /// without passing through both.
+    #[test]
+    fn the_forks_after_gloas_upgrade_from_their_predecessor_only() {
+        let config = Config::active();
+        let (fulu, _) = advance_to(ForkName::Fulu, 64);
+        let (gloas, _) = advance_to(ForkName::Gloas, 64);
+        let (eip8483, _) = advance_to(ForkName::Eip8483, 64);
+        let (pq, _) = advance_to(ForkName::Pq, 64);
+
+        assert!(upgrade_to_eip8483(&fulu, &config).is_err());
+        assert!(upgrade_to_eip8483(&eip8483, &config).is_err());
+        assert!(upgrade_to_eip8483(&gloas, &config).is_ok());
+
+        assert!(
+            upgrade_to_pq(&gloas, &config).is_err(),
+            "PQ skipping EIP-8483"
+        );
+        assert!(upgrade_to_pq(&pq, &config).is_err());
+        assert!(upgrade_to_pq(&eip8483, &config).is_ok());
     }
 
     /// An EIP-8483 state with distinct BLS keys, two builders, and the given

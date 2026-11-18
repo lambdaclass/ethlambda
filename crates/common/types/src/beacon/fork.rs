@@ -49,6 +49,12 @@ fn beacon_snapshot_interval() -> u64 {
 /// PQ fork replaces BLS with leanXMSS, and needs the EIP-8483 registrations
 /// made before it, so the two are scheduled in that order after gloas. Other
 /// forks after gloas exist upstream but are out of scope for this crate.
+///
+/// Each builds on the fork before it, as every fork here does: EIP-8483 is
+/// gloas plus its two registration requests, and PQ is EIP-8483 with BLS
+/// replaced. So a rule gated `fork >= ForkName::Gloas` holds at both, one
+/// gated `>= ForkName::Eip8483` holds at PQ, and a rule a later fork replaces
+/// is that fork's own match arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,

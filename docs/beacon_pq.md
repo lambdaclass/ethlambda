@@ -21,6 +21,22 @@ selectors 8 and 9. Neither is scheduled on any network, and the node does not
 follow either (`ForkName::is_followed`): the state transition and fork choice
 implement them, and nothing else does yet.
 
+Each builds on the fork before it, like every other fork. EIP-8483 is gloas
+plus its two requests and PQ is EIP-8483 with BLS replaced, so a rule gated
+`fork >= ForkName::Gloas` holds at both and one gated `>= ForkName::Eip8483`
+holds at PQ. Each upgrade takes only its predecessor's state, so
+`process_slots` reaches PQ through EIP-8483 even when the two share an epoch.
+The same holds in the Beacon API wherever the question is which rules apply
+at a slot: an attestation's payload flag, the head's payload status, the PTC
+window, a state's builders. Where the question is which container a version
+names, the two stay apart from gloas. PQ replaces every signed container and
+EIP-8483 the block and envelope, but EIP-8483's attestations, aggregates,
+attester slashings and bids are gloas's own: gossip decodes the first three
+as gloas's, while the Beacon API refuses the `eip8483` version header, since
+the node does not follow the fork. Gossip's bid rules still judge only gloas
+states, because they read the parent's envelope, whose shape EIP-8483
+changes.
+
 ## What is implemented
 
 | Layer | Where | Status |

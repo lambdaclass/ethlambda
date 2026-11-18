@@ -291,8 +291,13 @@ impl BeaconTopics {
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
             // Gloas adds the payload envelope and the payload attestation
             // topics, which the follower consumes.
-            // The feature forks after gloas keep its topics; the node joins
-            // none of their digests, since it does not follow them.
+            // The forks after gloas build on it and keep its topics here;
+            // PQ's own changes to the set are not modeled. A network that
+            // schedules either has the node join its digest at the boundary
+            // like any other. There, blocks, columns and envelopes are
+            // ignored (`ForkName::is_followed`), PQ's attestations, aggregates
+            // and attester slashings fail to decode, and EIP-8483's, which
+            // are gloas's containers, decode and validate as gloas's.
             ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => Self::with_extra_kinds(
                 fork_digest,
                 &GLOAS_TOPIC_KINDS,

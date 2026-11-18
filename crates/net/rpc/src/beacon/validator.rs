@@ -811,7 +811,8 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
-    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+    // Gloas or a fork after it (`fork_at_epoch` never names lean).
+    let index = if store.config().fork_at_epoch(epoch) >= ForkName::Gloas {
         payload_present_index(store, &state, slot)?
     } else {
         0
@@ -847,7 +848,8 @@ fn payload_present_index(
     if head_state.slot() == slot {
         return Ok(0);
     }
-    if !matches!(head_state, BeaconState::Gloas(_)) {
+    // A head of a fork after gloas has a payload status too.
+    if !head_state.fork_name().has_payload_envelopes() {
         return Ok(1);
     }
     let status = match store.head_payload_status() {
