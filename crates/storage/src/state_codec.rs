@@ -76,6 +76,9 @@ mod tests {
 
         assert_eq!(bytes[0], ForkName::Electra.selector());
         assert_eq!(bytes[1..], state.to_ssz());
+        // Equality, for the reason state_transition's
+        // `ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare` gives:
+        // a regrow only raises the capacity, so `>=` would pass one.
         assert_eq!(
             bytes.capacity(),
             1 + state.ssz_append_capacity(),

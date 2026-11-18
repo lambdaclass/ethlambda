@@ -678,6 +678,10 @@ mod tests {
             let capacity = state.ssz_append_capacity();
 
             let encoded = state.to_ssz();
+            // Equality, not `>=`: a regrow can only raise the capacity, so a
+            // lower bound could never fail. `reserve_exact` promises only "at
+            // least" what it is asked for, but std's `Vec` takes exactly that,
+            // so any capacity above it here is a regrow.
             assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
             let decoded = BeaconState::from_ssz(fork, &encoded).expect("the encoding decodes");
             assert_eq!(decoded, state, "{fork}");
