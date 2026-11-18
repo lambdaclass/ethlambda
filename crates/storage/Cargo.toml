@@ -15,7 +15,7 @@ ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 
 tracing.workspace = true
-rocksdb.workspace = true
+rocksdb = { workspace = true, optional = true }
 thiserror.workspace = true
 
 libssz.workspace = true
@@ -30,6 +30,15 @@ xdelta3.workspace = true
 # costs of the head computation's tally. Already in the lockfile through other
 # crates, so this adds no new version.
 foldhash = "0.2.0"
+
+[features]
+# The persistent backend, `backend::RocksDBBackend`. Off by default: every crate
+# above this one but the binary stores through `InMemoryBackend` only, and
+# RocksDB is a C++ build that would otherwise run in every one of their test and
+# spec-test builds. `bin/ethlambda` turns it on. A `cargo test --workspace` run
+# includes the binary, so feature unification turns it on there too, and the
+# backend's own tests run with the rest of the node half.
+rocksdb = ["dep:rocksdb"]
 
 [dev-dependencies]
 tempfile = "3"
