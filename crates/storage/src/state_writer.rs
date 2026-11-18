@@ -84,12 +84,20 @@ pub(crate) struct StateWrite {
     /// `Table::StateDiffs` value. `Some` for every lean state, and for a
     /// beacon state that is not an anchor.
     pub diff: Option<Vec<u8>>,
-    /// Beacon only: the target's [`encode_state_value`] bytes, for the
-    /// writer's snapshot memo. `Some` exactly when the write is a snapshot:
-    /// only a snapshot is ever a diff base, so a diff's own bytes are never
-    /// kept. `None` on the lean arm, which diffs in the field domain and never
-    /// reads a base's bytes.
-    pub encoded: Option<Vec<u8>>,
+    /// Beacon only: `snapshot` also becomes the writer's snapshot memo, the
+    /// base the next diffs are taken against. True exactly when a beacon state
+    /// is written as a snapshot: only a snapshot is ever a diff base, so a
+    /// diff's own bytes are never kept. False on the lean arm, which diffs in
+    /// the field domain and never reads a base's bytes.
+    ///
+    /// A flag rather than a second copy of the bytes: the writer puts the
+    /// snapshot into its batch from a borrow and then moves that same buffer
+    /// into the memo, so a mainnet state is never held twice for it. The memo
+    /// therefore keeps that buffer's spare capacity, the encoder's headroom
+    /// (about 2 MiB on mainnet); `shrink_to_fit` would cost the copy this
+    /// saves. Never true without `snapshot`, which the commit asserts in debug
+    /// builds.
+    pub memoize_snapshot: bool,
 }
 
 /// States handed to the writer but not yet committed to the backend.
@@ -717,7 +725,7 @@ pub(crate) fn plan_lean_state_write(state: State, parent: &State) -> StateWrite 
     StateWrite {
         snapshot,
         diff: Some(diff),
-        encoded: None,
+        memoize_snapshot: false,
     }
 }
 
@@ -744,9 +752,9 @@ pub(crate) fn plan_beacon_state_write(
     let target = encode_state_value(state);
     match base {
         None => StateWrite {
-            snapshot: Some(target.clone()),
+            snapshot: Some(target),
             diff: None,
-            encoded: Some(target),
+            memoize_snapshot: true,
         },
         Some((snapshot_root, base)) => {
             let delta = beacon_state_delta::encode(&target, base);
@@ -765,7 +773,7 @@ pub(crate) fn plan_beacon_state_write(
             StateWrite {
                 snapshot: None,
                 diff: Some(framed),
-                encoded: None,
+                memoize_snapshot: false,
             }
         }
     }
@@ -910,17 +918,33 @@ impl StateWriter {
                 .put_batch(Table::StateDiffs, vec![(key.clone(), diff)])
                 .expect("put state diff");
         }
-        if let Some(snapshot) = write.snapshot {
-            batch
-                .put_batch(Table::States, vec![(key, snapshot)])
-                .expect("put state snapshot");
-        }
+        // A snapshot the memo keeps is put from a borrow, so the same buffer
+        // can then move into the memo; any other value is handed over.
+        debug_assert!(
+            !write.memoize_snapshot || write.snapshot.is_some(),
+            "a memoized snapshot needs a snapshot, or the memo is left stale"
+        );
+        let memo = match write.snapshot {
+            Some(snapshot) if write.memoize_snapshot => {
+                batch
+                    .put(Table::States, &key, &snapshot)
+                    .expect("put state snapshot");
+                Some(snapshot)
+            }
+            Some(snapshot) => {
+                batch
+                    .put_batch(Table::States, vec![(key, snapshot)])
+                    .expect("put state snapshot");
+                None
+            }
+            None => None,
+        };
         batch.commit().expect("commit");
 
         if matches!(&*request.state, BeaconState::Lean(_)) {
             return;
         }
-        match write.encoded {
+        match memo {
             // A snapshot is its own base, and the next diffs are taken against it.
             Some(encoded) => {
                 self.snapshot_memo = Some((root, encoded));
@@ -1183,7 +1207,7 @@ mod tests {
             Some(expected.as_slice()),
             "the snapshot holds the anchored state's own bytes, not its parent's"
         );
-        assert!(plan.encoded.is_none(), "the lean arm keeps no encoded memo");
+        assert!(!plan.memoize_snapshot, "the lean arm keeps no encoded memo");
 
         let mut inside = base_state();
         inside.slot = interval;
@@ -1207,10 +1231,9 @@ mod tests {
             "no base means nothing to diff against"
         );
         assert!(plan.diff.is_none());
-        assert_eq!(
-            plan.encoded.as_deref(),
-            plan.snapshot.as_deref(),
-            "the memo is the very bytes that were snapshotted"
+        assert!(
+            plan.memoize_snapshot,
+            "the snapshotted bytes become the memo"
         );
     }
 
@@ -1235,7 +1258,7 @@ mod tests {
             "a base means a diff, not a snapshot"
         );
         assert!(
-            plan.encoded.is_none(),
+            !plan.memoize_snapshot,
             "only a snapshot is a diff base, so a diff keeps no memo bytes"
         );
         let framed = plan.diff.expect("a non-anchor records a diff");
