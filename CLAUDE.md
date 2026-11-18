@@ -99,9 +99,11 @@ make test                                    # All tests + forkchoice spec tests
 ```
 
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
-jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
-the Makefile names the first; `test-node` is the workspace minus it. Run one half
-directly when iterating on it.
+jobs so they build and run in parallel (the split was first forced by an older
+runner's disk, which no longer binds). `CONSENSUS_CRATES` in the Makefile names
+the first; `test-node` is the workspace minus it. Run one half directly when
+iterating on it. `test-node` also runs the benchmark smoke test
+(`bin/ethlambda/tests/benchmark_smoke.rs`), which drives the built binary.
 
 ### Docs-only changes skip CI
 

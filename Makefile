@@ -26,10 +26,12 @@ lint: ## 🔍 Run clippy on all workspace crates
 # it without excluding anything.
 TEST=cargo test --locked --profile release-fast
 
-# Two halves, one CI job each: undivided, a release-grade build of every test
-# target measured 14 GiB against the 13-14 GiB a stock runner has free. Both
-# halves build the shared dependency graph, so what the split halves is the
-# linked test binaries.
+# Two halves, one CI job each. The split was first forced by disk: undivided, a
+# release-grade build of every test target measured 14 GiB against the 13-14
+# GiB a stock runner then had free. Today's hosted runners have a 145 GB root
+# disk, so that no longer binds; the halves stay split because they build and
+# run in parallel. Both halves build the shared dependency graph, so what the
+# split halves is the linked test binaries.
 #
 # Named once, and `test-node` is the workspace minus this list, so the two are
 # exhaustive by construction and a crate added later cannot silently go
@@ -58,9 +60,15 @@ BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_te
 # concurrently and each downloads only the trees its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
+# The chain actor's fixture-driven tests (`ethlambda-blockchain --lib`) ride in
+# the same cargo invocation as the spec suite rather than a second one. Cargo
+# resolves features per invocation, over the packages it selects, so a separate
+# `cargo test -p ethlambda-blockchain` resolved the shared dependency graph
+# differently and rebuilt most of it, from `libc` up, for tests that run in 5 s.
+# Package-qualified features, since an unqualified one would have to exist in
+# both packages.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
-	$(BEACON_TEST) --features beacon-spec-tests
-	cargo test -p ethlambda-blockchain --lib --profile release-fast --features beacon-spec-tests
+	$(BEACON_TEST) -p ethlambda-blockchain --features ethlambda-state-transition/beacon-spec-tests,ethlambda-blockchain/beacon-spec-tests
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal

@@ -120,9 +120,11 @@ runs:
       shell: bash
       run: make ${{ inputs.make-target }}
 
-    # How close this half is to the ceiling, which is why the suite is split in
-    # halves at all. `always()` because the reading matters most on the failure
-    # it instruments, where the build is the thing that ran out.
+    # How close this half is to the disk ceiling. No CI job frees disk space
+    # first any more (see ci.yml), so this reading is what would show a runner
+    # image or `vars.ETHLAMBDA_RUNNER` change that leaves too little room.
+    # `always()` because the reading matters most on the failure it
+    # instruments, where the build is the thing that ran out.
     - name: Report disk usage after the build
       if: always()
       shell: bash
