@@ -10,8 +10,21 @@
 //! follow that convention rather than only claim to.
 //! [`write_private_no_symlink`] is public for the binary's one secret of its
 //! own, the node key it stores in `--data-dir` when `--node-key` is absent.
+//!
+//! Both also flush what they wrote to the device before returning. An
+//! imported keystore and its password are named by a definitions entry that
+//! is made durable right after them, and a rename can survive a power loss
+//! that the data behind it did not, so an entry must never reach the disk
+//! ahead of the files it names.
 
 use std::path::Path;
+
+/// Write `contents` to `file` and flush them to the device.
+fn write_durably(mut file: std::fs::File, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(contents.as_ref())?;
+    file.sync_all()
+}
 
 /// Write `contents`, creating the file if it does not exist and truncating it
 /// if it does, at mode `0600` on unix.
@@ -24,20 +37,19 @@ use std::path::Path;
 /// validator signs.
 #[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 /// Write `contents` at mode `0600`, refusing to follow an existing symlink at
@@ -61,21 +73,20 @@ pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io:
 /// truncated and reused.
 #[cfg(unix)]
 pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
 pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 /// Why [`write_private_durably`] failed, and whether the file had already
