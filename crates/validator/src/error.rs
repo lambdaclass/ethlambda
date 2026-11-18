@@ -23,11 +23,15 @@ pub const EIP2335_KEYSTORE_VERSION: u64 = 4;
 /// construct the same variant without ever holding a real HTTP error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeaconNodeFailure {
-    /// The request outlived its timeout.
+    /// The request outlived its timeout once connected.
     Timeout,
-    /// The connection could not be established.
+    /// The connection could not be established: refused, or not made within
+    /// the connect timeout. Nothing was sent.
     Connect,
-    /// The request could not be built or sent.
+    /// The request could not be built (an invalid URL or header, say), so
+    /// nothing was sent.
+    Build,
+    /// The request failed on its way out or back, after it may have left.
     Request,
     /// The response body could not be read.
     Body,
@@ -35,11 +39,17 @@ pub enum BeaconNodeFailure {
 
 impl BeaconNodeFailure {
     /// Classify a `reqwest` failure.
+    ///
+    /// reqwest reports a connect timeout as both a connect error and a
+    /// timeout. It is a connection never made, so the connect check comes
+    /// first: [`Error::outcome_unknown`] counts it as definite.
     pub fn classify(error: &reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
+        if error.is_builder() {
+            Self::Build
         } else if error.is_connect() {
             Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
         } else if error.is_body() || error.is_decode() {
             Self::Body
         } else {
@@ -58,10 +68,35 @@ pub enum Error {
     },
     #[error("every configured beacon node failed; last error: {0}")]
     AllBeaconNodesFailed(String),
+    /// Every node failed a request, and at least one may have acted on it
+    /// first: it timed out or broke once sent, or answered a 5xx. Raised for
+    /// proposer preferences only, where whether a node may hold one decides
+    /// whether it can be signed again (see `PreferencesService`).
+    #[error("no beacon node confirmed the request, and one may have taken it; last error: {0}")]
+    NoNodeConfirmed(String),
     #[error("beacon node returned {status}: {body}")]
     BeaconNodeStatus { status: u16, body: String },
     #[error("beacon node is syncing")]
     BeaconNodeSyncing,
+    /// A signed blinded block was sent and the node's answer does not say
+    /// whether it went out: a 5xx other than 503, or no answer once connected.
+    ///
+    /// Distinct from [`Self::BeaconNodeStatus`] and [`Self::BeaconNode`],
+    /// which for this call mean a definite failure (a 4xx or a 503, or a
+    /// connection never established: the block was not published; see
+    /// `BeaconNodeApi::publish_blinded_block`). Here the node
+    /// may have handed the block to its builder before failing, and the relay
+    /// publishes on receipt, so the block may well be on the network. Nothing
+    /// can safely be retried: the slot is signed, and a second block for it
+    /// would be an equivocation. `status` is `None` for a transport failure.
+    ///
+    /// Classified retryable like the other beacon-node errors, but that governs
+    /// only whether the next duty is attempted, not this block: it is never
+    /// sent again.
+    #[error(
+        "the beacon node did not confirm the blinded block (it may still be published): {detail}"
+    )]
+    BlindedUnconfirmed { status: Option<u16>, detail: String },
     /// The slot's attestation work ran past the end of the slot and was
     /// abandoned.
     ///
@@ -72,6 +107,18 @@ pub enum Error {
     /// abandoned attestation itself is never retried, by design.
     #[error("attestation duty for slot {slot} ran past the end of its slot")]
     AttestationDeadline { slot: u64 },
+    /// The slot's proposal ran past its deadline, the point attesters stop
+    /// waiting for a block, before its block was published, and was
+    /// abandoned. Also what a self-built gloas block's envelope fails with
+    /// when the deadline cuts its publish, after the block is out: that fails
+    /// the envelope alone, not the proposal (see `ProposalService::propose_by`).
+    ///
+    /// The proposal counterpart of [`Self::AttestationDeadline`], and
+    /// retryable in the same sense only. Never raised once a blinded block is
+    /// signed: its publish goes on past the deadline (see
+    /// `ProposalService::propose_by`).
+    #[error("proposal for slot {slot} ran past the point attesters stop waiting for its block")]
+    ProposalDeadline { slot: u64 },
     /// Slashing protection refused to sign a block for this slot, or could not
     /// record it.
     ///
@@ -85,6 +132,10 @@ pub enum Error {
     ProposalRefused { slot: u64, reason: String },
     #[error("beacon node returned an inconsistent response: {0}")]
     InconsistentResponse(String),
+    /// `ethlambda voluntary-exit` refused to sign: the chain would refuse the
+    /// exit too, for the reason given. Deterministic, like a proposal refusal.
+    #[error("voluntary exit refused: {0}")]
+    ExitRefused(String),
     #[error("malformed response: {0}")]
     Decode(String),
 
@@ -97,12 +148,14 @@ pub enum Error {
 
     #[error("no signing key for validator {0:?}")]
     UnknownValidator(BlsPubkey),
-    /// Not constructed today: the only `SigningMethod` is `LocalKeystore`,
-    /// whose signing call cannot fail once a key has been resolved. Kept for
-    /// the remote-signer variant `keys::store`'s module doc already commits
-    /// to supporting, whose call to an external signer can fail in ways a
-    /// local scalar multiplication cannot; remove this only if that plan is
-    /// dropped.
+    /// A remote signer did not produce the signature: it refused the message
+    /// (its slashing protection), does not hold the key, answered badly, or
+    /// could not be reached. A local key cannot raise this; its signing call
+    /// cannot fail once the key has been resolved.
+    ///
+    /// Not retryable: it costs one signature, the duty that needed it logs
+    /// and counts it, and none of its causes is something trying again
+    /// within the slot would change.
     #[error("signing failed for {pubkey:?}: {reason}")]
     Signing { pubkey: BlsPubkey, reason: String },
 
@@ -115,15 +168,18 @@ pub enum Error {
     #[error("slashing protection {path}: {reason}")]
     SlashingProtection { path: String, reason: String },
     /// The record cannot be reached at all, as opposed to a record that
-    /// answered: its lock is poisoned because an earlier access panicked
-    /// while holding it, or the runtime is shutting down under the blocking
-    /// task.
+    /// answered: its lock is poisoned because an access panicked while
+    /// holding it, it stayed held past the wait, or the runtime is shutting
+    /// down under the blocking task.
     ///
     /// Kept apart from `SlashingProtection` and `Io` because the remedy
     /// differs: those name a file to look at, this one names a process to
     /// restart. A poisoned lock is a bug, never a disk, and it stays poisoned
-    /// for the life of the process, so every duty is refused until it is
-    /// restarted. Never retryable.
+    /// for the life of the process. Only attestations and proposals consult
+    /// the record, so those are what it refuses from then on; the other
+    /// duties would go on signing, which is why the client stops as soon as
+    /// the poisoning is seen, for its supervisor to restart (see
+    /// `slashing_protection::SharedProtection`). Never retryable.
     #[error("slashing protection is unusable: {reason}")]
     SlashingProtectionUnusable { reason: String },
 
@@ -149,6 +205,23 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether a request that failed with this may still have been acted on
+    /// by the node: no answer came once it was sent (a timeout, a broken
+    /// connection, an unreadable body), or a 5xx other than 503 said it failed
+    /// partway. A 4xx, a 503, a syncing node, a connection never made and a
+    /// request never built are definite: the node did not take it.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::NoNodeConfirmed(_) | Self::BlindedUnconfirmed { .. } => true,
+            Self::BeaconNode { failure, .. } => !matches!(
+                failure,
+                BeaconNodeFailure::Connect | BeaconNodeFailure::Build
+            ),
+            Self::BeaconNodeStatus { status, .. } => *status >= 500 && *status != 503,
+            _ => false,
+        }
+    }
+
     /// Whether the duty loop should try again rather than give up.
     ///
     /// The distinction the loop needs every slot: a beacon node that is down,
@@ -159,14 +232,18 @@ impl Error {
         match self {
             Self::BeaconNode { .. }
             | Self::AllBeaconNodesFailed(_)
+            | Self::NoNodeConfirmed(_)
             | Self::BeaconNodeStatus { .. }
             | Self::BeaconNodeSyncing
+            | Self::BlindedUnconfirmed { .. }
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
+            | Self::ProposalDeadline { .. }
             | Self::Decode(_) => true,
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.
             Self::ProposalRefused { .. }
+            | Self::ExitRefused(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)
             | Self::KeystoreBadPassword
@@ -181,3 +258,27 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request reqwest could not build never left, so no node can have
+    /// taken it: a preference that failed so is signed afresh, not kept.
+    #[test]
+    fn a_request_never_built_is_a_definite_failure() {
+        let err = reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("a URL without a scheme does not build");
+        let failure = BeaconNodeFailure::classify(&err);
+        assert_eq!(failure, BeaconNodeFailure::Build);
+
+        let failed = Error::BeaconNode {
+            url: "not a url".to_string(),
+            failure,
+            detail: err.to_string(),
+        };
+        assert!(!failed.outcome_unknown());
+    }
+}
