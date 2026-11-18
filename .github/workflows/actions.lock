@@ -7,6 +7,7 @@ workflows:
     '.github/workflows/ci.yml':
         - 'actions/cache@v5.1.0'
         - 'actions/checkout@v6.1.0'
+        - 'dorny/paths-filter@v4.0.3'
         - 'dtolnay/rust-toolchain@master'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/daily_ci.yml':
@@ -105,6 +106,11 @@ dependencies:
         commit: 'sha1-8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
         owner_id: 5429470
         repo_id: 288485773
+    'dorny/paths-filter@v4.0.3':
+        ref: 'v4.0.3'
+        commit: 'sha1-ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d'
+        owner_id: 1588572
+        repo_id: 265601040
     'dtolnay/rust-toolchain@master':
         ref: 'master'
         commit: 'sha1-683b588c487a69d01f6c6ddf40f036ff682cc2c8'
