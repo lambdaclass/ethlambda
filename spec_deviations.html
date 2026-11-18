@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-740b3d51.js";
+            window.path_to_searchindex_js = "searchindex-e42452e7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -290,6 +290,14 @@ submission is lost rather than re-signed. A second, different vote for one
 slot is equivocation that peers penalize in gossip, not a slashing.</li>
 <li><strong>What is not covered:</strong> the same keys running in another client on another
 machine. No local record can see that.</li>
+<li><strong>A key held by a remote signer:</strong> a key in a Web3Signer (see
+<a href="./cli.html#remote-signing-web3signer">Remote signing</a>) is registered in this
+record and checked against it like any other, and is then signed by the
+signer, which receives every message in full and keeps a record of its own;
+a message it refuses is dropped here and never retried. The two records are
+separate: the signer’s is neither imported into this one nor exported from
+it, so a key moved to or from a signer carries its history through the
+signer’s own tools.</li>
 <li><strong>Interchange:</strong> an import (<code>ethlambda slashing-protection import</code>, or the
 keymanager API’s <code>POST /eth/v1/keystores</code>) reduces each validator to its
 highest slot, source and target and merges them with the record by maximum,

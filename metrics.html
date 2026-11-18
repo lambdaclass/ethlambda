@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-740b3d51.js";
+            window.path_to_searchindex_js = "searchindex-e42452e7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -1019,7 +1019,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_blinded_blocks_unconfirmed_total</code></td><td>Counter</td><td>Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation</td></tr>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
 <tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
-<tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time to sign one slot’s batch, store read lock included</td></tr>
+<tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time a duty waited for its batch of signatures. With local keys that is the signing itself. With keys in a remote signer it is the batch’s slowest answer, round trip and verification included, and at most the 2 s signing budget, so a sample in the top bucket means a signer that did not answer in time</td></tr>
+<tr><td><code>ethlambda_validator_remote_signer_request_duration_seconds</code></td><td>Histogram</td><td>Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer’s 64 request slots. The number to watch for a slow signer; empty when every key is local</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_failures_total</code></td><td>Counter</td><td>Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under <code>--validators-dir</code></td></tr>
 <tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset</td></tr>
