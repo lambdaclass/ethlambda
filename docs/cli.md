@@ -507,9 +507,13 @@ pubkey, or computing another root, costs the signature rather than publishing
 one no peer accepts. That check runs off the duty loop, a core per signature,
 so a large batch of answers does not hold the loop up. Each duty asks for its
 signatures all at once
-and gives each one 2 seconds: a signer that has not answered by then costs the
-signatures it owes and nothing else, so the duty publishes whatever arrived,
-local keys and other signers' keys included. One signer is sent at most 64
+and gives each one 2 seconds: a signer that has not answered by then loses the
+signatures it owes and no others, so the duty publishes whatever arrived,
+local keys and other signers' keys included. It publishes them together,
+though, so while a signer hangs every duty's batch goes out up to 2 seconds
+late, the local keys' share of it too: an attestation is then published 2
+seconds after the attestation offset, still ahead of the aggregation one. One
+signer is sent at most 64
 requests at a time and the rest of a batch waits its turn inside the same 2
 seconds, so a signer costs this client 64 connections however many keys it
 holds; the sub-command also raises its open-file limit at startup, as `node`
@@ -518,7 +522,10 @@ remembered once produced, so the one the epoch's subnet subscription asked for
 is not asked for again by the aggregation. Those subscriptions are sent from a
 task of their own, started once the epoch's first slot has had its block, so
 the round trips for their selection proofs never stand between a slot boundary
-and a proposal. Nothing is asked of the signer at startup or at
+and a proposal. With no duty waiting on that task, its proofs get 8 seconds
+rather than 2: one that misses is a duty subscribed without the aggregator
+role, and at startup, or with thousands of remote keys, two epochs of proofs
+queue for the signer's 64 request slots. Nothing is asked of the signer at startup or at
 import: a signer may start after this client does.
 
 A voluntary exit for a remote key is signed the same way (`VOLUNTARY_EXIT`),
@@ -602,6 +609,8 @@ with it and answers `error` naming the other route, not `deleted`: the entry
 it leaves would load the key again at the next start. `DELETE /remotekeys` of
 a remote entry whose key this process runs from a local keystore removes the
 entry and leaves the local key, and its per-validator settings, as they are.
+Its answer is `error` too, naming `/eth/v1/keystores`, and never `deleted`:
+the key is still signing here until that route removes it.
 
 It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
 voluntary exit for a validator this client holds, in a local keystore or in a

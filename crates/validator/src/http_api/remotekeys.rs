@@ -39,7 +39,7 @@ use crate::Error;
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
 use crate::http_api::keystores::{
-    DeleteRequest, Judged, KeyStatus, Origin, StatusResponse, delete_keys, save_definitions,
+    DeleteRequest, Judged, KeyStatus, Left, Origin, StatusResponse, delete_keys, save_definitions,
 };
 use crate::keys::{
     SigningDefinition, ValidatorDefinition, ValidatorDefinitions, ValidatorStore, Web3Signer,
@@ -284,12 +284,27 @@ fn prepare_import(
     key: &ImportRemoteKey,
 ) -> Prepared {
     let pubkey = parse_pubkey(&key.pubkey).map_err(KeyStatus::error)?;
+
+    // Known to the store, or to the file. Judged before anything is built or
+    // staged, and before the URL is so much as looked for: a key already
+    // held is `duplicate` whatever the request says about where to find it.
+    // Tooling that repeats an import takes `duplicate` for success, and a
+    // repeat that names no URL, with no `--web3signer-url` to fall back on,
+    // must not answer an error about the URL for a key that is in place.
+    if known.contains(&pubkey) {
+        return Ok(None);
+    }
+
+    // Normalized before it is compared with the clients already built or
+    // written to the file: two spellings of one signer are one client, and
+    // the file holds the URL the requests are sent to. An unusable URL is
+    // refused here, before it is persisted and refuses the next startup.
     let url = match key
         .url
         .as_deref()
         .or(context.default_remote_signer.as_deref())
     {
-        Some(url) => url.trim_end_matches('/').to_string(),
+        Some(url) => Web3Signer::normalize_url(url).map_err(KeyStatus::error)?,
         None => {
             return Err(KeyStatus::error(
                 "no url supplied for this key and no --web3signer-url to default to",
@@ -297,16 +312,8 @@ fn prepare_import(
         }
     };
 
-    // Known to the store, or to the file. Judged before anything is built or
-    // staged.
-    if known.contains(&pubkey) {
-        return Ok(None);
-    }
-
     // Built here, outside the store's lock, and once per URL: the client is
-    // the one the store will keep, so the URL's shape is checked by building
-    // the thing that will use it, and an unusable URL is refused before it
-    // is persisted and refuses the next startup.
+    // the one the store will keep.
     let signer = match signers.get(&url) {
         Some(signer) => signer.clone(),
         None => {
@@ -363,20 +370,26 @@ fn judge_delete(
     if in_memory {
         store.remove(pubkey);
     }
-    // The key's overrides go with it, unless the store still holds it. That
-    // is the file listing a remote entry for a key this process runs as a
-    // local one, which only a hand edit under a running client produces: the
-    // entry comes off the file, but the local key is the keystores route's
-    // and keeps proposing, so its fee recipient, graffiti and gas limit stay
-    // or its next blocks would pay the default address.
-    if !store.contains(pubkey) {
-        context.settings.forget(pubkey);
+    // The store still holding the key means it holds it as a local one,
+    // while the file lists a remote entry for it, which only a hand edit
+    // under a running client produces. The entry comes off the file, but the
+    // local key is the keystores route's: it goes on signing, and keeps the
+    // fee recipient, graffiti and gas limit it proposes with, or its next
+    // blocks would pay the default address. So the answer is an error and
+    // not `deleted`, which an operator reads as "free to run elsewhere"
+    // while this process is still signing with the key.
+    if store.contains(pubkey) {
+        return Judged::Removed {
+            left: Some(Left::InStore),
+        };
     }
+    // Out of the store, so its overrides have nothing left to apply to.
+    context.settings.forget(pubkey);
     // The mirror of the keystores route's case: the store held the key
     // remotely while the file lists it as a local keystore, an entry this
     // route leaves alone and the next start would load.
     Judged::Removed {
-        stranded: in_memory && entry == Some(Origin::Local),
+        left: (in_memory && entry == Some(Origin::Local)).then_some(Left::OnFile),
     }
 }
 
@@ -642,6 +655,86 @@ mod tests {
             store.read().await.remote_url(&local).is_none(),
             "a duplicate must not replace the local key with a remote one"
         );
+
+        // A repeat that names no URL, on a client with no default to fall
+        // back on, or one that names a URL no signer could be at: the key is
+        // held, and that is the whole answer.
+        for repeat in [
+            serde_json::json!({ "pubkey": pubkey_hex(1) }),
+            serde_json::json!({ "pubkey": pubkey_hex(1), "url": "ftp://signer" }),
+        ] {
+            let request = authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [repeat] }),
+            );
+            let (_, body) = send(app.clone(), request).await;
+            assert_eq!(statuses(&body), ["duplicate"], "got {body}");
+        }
+    }
+
+    /// One signer under two spellings is one client, with one cap on its
+    /// requests in flight, and the file holds the URL the requests go to.
+    #[tokio::test]
+    async fn two_spellings_of_one_signer_share_a_client() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let app = router(
+            context_with_dirs(store.clone(), dir.path(), None),
+            TOKEN.to_string(),
+        );
+
+        let (_, body) = send(
+            app.clone(),
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [
+                    { "pubkey": pubkey_hex(1), "url": SIGNER },
+                    { "pubkey": pubkey_hex(2), "url": "https://Signer.Example:9000/ " },
+                ] }),
+            ),
+        )
+        .await;
+        assert_eq!(statuses(&body), ["imported", "imported"], "got {body}");
+        // And a third in a later request, against the client the store holds.
+        let (_, body) = send(
+            app,
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [
+                    { "pubkey": pubkey_hex(3), "url": "HTTPS://SIGNER.EXAMPLE:9000" },
+                ] }),
+            ),
+        )
+        .await;
+        assert_eq!(statuses(&body), ["imported"], "got {body}");
+
+        let store = store.read().await;
+        assert_eq!(store.remote_signers().len(), 1, "one signer, one client");
+        let signers: Vec<_> = [1, 2, 3]
+            .into_iter()
+            .map(|byte| {
+                let pubkey = parse_pubkey(&pubkey_hex(byte)).expect("pubkey");
+                match store.signer(&pubkey).expect("held") {
+                    crate::keys::SigningMethod::Web3Signer { signer } => signer,
+                    crate::keys::SigningMethod::LocalKeystore { .. } => panic!("a remote key"),
+                }
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&signers[0], &signers[1]));
+        assert!(Arc::ptr_eq(&signers[0], &signers[2]));
+
+        let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
+        for definition in &on_disk.0 {
+            assert_eq!(
+                definition.signing,
+                SigningDefinition::Web3Signer {
+                    url: SIGNER.to_string()
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -783,9 +876,11 @@ mod tests {
     /// The file listing a remote entry for a key this process runs as a local
     /// one, which only a hand edit under a running client produces. The
     /// entry is this route's to remove, but the local key is not: it keeps
-    /// signing, and it keeps the settings it proposes with.
+    /// signing, and it keeps the settings it proposes with. Since it keeps
+    /// signing, the answer is an error and never `deleted`, however often
+    /// the request names the key.
     #[tokio::test]
-    async fn a_delete_leaves_a_local_key_under_the_same_pubkey_its_settings() {
+    async fn a_delete_leaves_a_local_key_under_the_same_pubkey_signing_and_says_so() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut store = ValidatorStore::new();
         let mut secret = [0u8; 32];
@@ -812,11 +907,16 @@ mod tests {
             authed(
                 "DELETE",
                 "/eth/v1/remotekeys",
-                serde_json::json!({ "pubkeys": [hex] }),
+                serde_json::json!({ "pubkeys": [hex, hex] }),
             ),
         )
         .await;
-        assert_eq!(statuses(&body), ["deleted"], "got {body}");
+        assert_eq!(statuses(&body), ["error", "error"], "got {body}");
+        for entry in body["data"].as_array().expect("data") {
+            let message = entry["message"].as_str().expect("a message");
+            assert!(message.contains("still signing"), "{message}");
+            assert!(message.contains("/eth/v1/keystores"), "{message}");
+        }
 
         let on_disk = ValidatorDefinitions::open(dir.path()).expect("opens");
         assert!(on_disk.0.is_empty(), "the remote entry is off the file");

@@ -7,6 +7,7 @@
 //! per duty even when several share a committee.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -21,7 +22,29 @@ use crate::beacon_node::dto::{
 };
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::signing::{SigningContext, sign_all};
+use crate::signing::{SigningContext, sign_all_within};
+
+/// How long the selection proofs of one round of subscriptions may take.
+///
+/// Longer than a duty's `SIGNING_BUDGET`, because what stands behind the two
+/// differs. A duty has a slot deadline and publishes what it has. This runs
+/// in a task of its own that nothing waits on, and a proof that misses the
+/// budget is a duty subscribed without the aggregator role: the beacon node
+/// then does not keep the subnet for it, and if the aggregation tick finds
+/// the validator was selected after all, it has little or nothing to
+/// aggregate. Proofs are remembered, so in steady state a round asks for
+/// about one new proof per key and any budget fits. It is at startup, with
+/// two epochs of duties all new, or with thousands of remote keys behind a
+/// slow link, that the proofs queue for the signer's request slots and a
+/// duty's two seconds would send several hundred duties out without the
+/// role. One request's own timeout is the natural bound: a signer that has
+/// not answered in that long is not going to.
+///
+/// The subscriptions go out together, after the last proof, so a signer
+/// that hangs holds every one of them back this long. That is affordable
+/// here: the schedule covers this epoch and the next, so the duties that are
+/// near were subscribed an epoch ago.
+pub const SUBSCRIPTION_SIGNING_BUDGET: Duration = Duration::from_secs(8);
 
 /// Send one subscription per held duty, claiming the aggregator role for the
 /// duties this client was selected for.
@@ -48,14 +71,15 @@ pub async fn subscribe<B: BeaconNodeApi>(
         return Ok(());
     }
 
-    // Every selection proof is asked for at once, each within the signing
-    // budget: one request per duty in series would cost a slow or
+    // Every selection proof is asked for at once, each within this call's
+    // own budget: one request per duty in series would cost a slow or
     // unreachable signer as many round trips as there are duties before any
-    // subscription went out. Bounded this way it costs `SIGNING_BUDGET` at
-    // most, and the proofs that did arrive are remembered for the
-    // aggregation tick (see `SigningContext::sign_selection_proof`). The
-    // duty loop runs this from a task of its own, after the slot's block, so
-    // even that budget is never spent ahead of a proposal.
+    // subscription went out. Bounded this way it costs
+    // `SUBSCRIPTION_SIGNING_BUDGET` at most, and the proofs that did arrive
+    // are remembered for the aggregation tick (see
+    // `SigningContext::sign_selection_proof`). The duty loop runs this from
+    // a task of its own, after the slot's block, so that budget is never
+    // spent ahead of a proposal, or of any other duty.
     let mut is_aggregator = vec![false; duties.len()];
     let mut keyed = Vec::with_capacity(duties.len());
     for (position, duty) in duties.iter().enumerate() {
@@ -69,7 +93,8 @@ pub async fn subscribe<B: BeaconNodeApi>(
             ),
         }
     }
-    let selections = sign_all(
+    let selections = sign_all_within(
+        SUBSCRIPTION_SIGNING_BUDGET,
         keyed
             .iter()
             .map(|(_, duty, pubkey)| (*pubkey, selection_for(context, store, duty))),

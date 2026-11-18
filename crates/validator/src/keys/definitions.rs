@@ -69,6 +69,15 @@ enum SigningKind {
 /// through a connection configured differently from the one they wrote down.
 /// A local entry has no such field, so a file Lighthouse wrote, with its own
 /// per-validator settings on each entry, still loads.
+///
+/// A disabled web3signer entry is refused for such a field too, though it is
+/// never loaded and the field could not take effect while it stays disabled.
+/// The file is rewritten on every keymanager import and delete, and a
+/// rewrite keeps only the fields named here, so the entry would lose the
+/// field at the first one. Enabled afterwards, it would load with nothing
+/// left to refuse it for, which is the silent drop the refusal is there to
+/// prevent. Refused at the start, the operator is told while the field is
+/// still in the file.
 #[derive(Serialize, Deserialize)]
 struct RawDefinition {
     enabled: bool,
@@ -571,6 +580,32 @@ mod tests {
         )
         .expect_err("unimplemented field");
         assert!(untyped.contains("suggested_fee_recipient"), "{untyped}");
+    }
+
+    /// A disabled remote entry is refused for the same field, deliberately:
+    /// the file would otherwise load, and the first rewrite would drop the
+    /// field, so nothing could refuse the entry once it was enabled. The
+    /// second half is what makes that so.
+    #[test]
+    fn an_unimplemented_field_on_a_disabled_remote_entry_is_refused_too() {
+        let disabled = open_text(
+            "- enabled: false\n  voting_public_key: '0xaa'\n  type: web3signer\n  \
+             url: https://signer:9000\n  root_certificate_path: ca.pem\n",
+        )
+        .expect_err("an unimplemented field, on an entry that is not loaded");
+        assert!(disabled.contains("root_certificate_path"), "{disabled}");
+
+        // A rewrite keeps only the fields this client reads: a local entry
+        // is read past `builder_proposals`, and written back without it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let text = "- enabled: false\n  voting_public_key: '0xaa'\n  \
+                    voting_keystore_path: keystore.json\n  \
+                    voting_keystore_password_path: password.txt\n  builder_proposals: true\n";
+        std::fs::write(dir.path().join(DEFINITIONS_FILE), text).expect("writes");
+        let read = ValidatorDefinitions::open(dir.path()).expect("opens");
+        read.save(dir.path()).expect("saves");
+        let rewritten = std::fs::read_to_string(dir.path().join(DEFINITIONS_FILE)).expect("reads");
+        assert!(!rewritten.contains("builder_proposals"), "{rewritten}");
     }
 
     /// Lighthouse writes `description` on every entry, so a remote entry it

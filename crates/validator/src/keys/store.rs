@@ -236,21 +236,22 @@ impl ValidatorStore {
     /// [`Self::insert_remote_signer`] instead, and builds any missing client
     /// before taking the write lock.
     pub fn insert_remote(&mut self, pubkey: BlsPubkey, url: &str) -> Result<()> {
-        let signer = match self.signer_for_url(url) {
+        let url = Web3Signer::normalize_url(url)?;
+        let signer = match self.signer_for_url(&url) {
             Some(signer) => signer,
-            None => Arc::new(Web3Signer::new(url)?),
+            None => Arc::new(Web3Signer::new(&url)?),
         };
         self.insert_remote_signer(pubkey, signer);
         Ok(())
     }
 
     /// The client already serving `url`, if any validator still uses one.
-    /// Keyed by the URL as the client normalizes it, so `.../` and `...` name
-    /// one signer rather than two.
+    ///
+    /// `url` is one [`Web3Signer::normalize_url`] returned, which is what
+    /// the clients are keyed by: two spellings of one signer (a trailing
+    /// slash, a host in capitals) are then one client rather than two.
     pub fn signer_for_url(&self, url: &str) -> Option<Arc<Web3Signer>> {
-        self.signers
-            .get(url.trim_end_matches('/'))
-            .and_then(Weak::upgrade)
+        self.signers.get(url).and_then(Weak::upgrade)
     }
 
     /// Every client some validator still uses, by URL. Lets a caller that

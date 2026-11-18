@@ -187,7 +187,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // Checked for shape at startup rather than at the first import that
     // leans on it, which could be days later.
     if let Some(url) = &config.web3signer_url {
-        keys::Web3Signer::new(url)?;
+        keys::Web3Signer::normalize_url(url)?;
     }
 
     let store = ValidatorStore::load(&config.validators_dir)?;
@@ -466,10 +466,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 tokio::spawn(async move {
                     let subscribed =
                         subscriptions::subscribe(&beacon_node, &owed, &store, &context);
-                    if let Err(err) = subscribed.await {
+                    let _ = subscribed.await.inspect_err(|err| {
                         warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
                         metrics::set_beacon_node_available(false);
-                    }
+                    });
                 });
             }
 

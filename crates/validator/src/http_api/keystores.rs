@@ -307,14 +307,14 @@ pub async fn import(
         .collect();
 
     // Decrypt (deliberately slow: EIP-2335 key derivation) and persist every
-    // key to disk before ever touching the store's write lock. The duty
-    // loop's `attest` only ever holds a read lock across a short, synchronous
-    // signing loop (see `attestation.rs`'s doc comment on that block), but
-    // `tokio::sync::RwLock` is write-preferring: a write lock queued here
-    // while this loop ran would jump that queue and stall every signature
-    // due for as long as the whole batch takes, rather than just for the
-    // instant the inserts below actually need. `definitions_lock` above has
-    // no such reader/writer to starve: only import and delete ever take it.
+    // key to disk before ever touching the store's write lock. A duty takes
+    // the store's read lock once per signature, for the key's lookup alone
+    // (see `SigningContext::sign_under`), but `tokio::sync::RwLock` is
+    // write-preferring: a write lock queued here while this loop ran would
+    // jump that queue and stall every signature due for as long as the whole
+    // batch takes, rather than just for the instant the inserts below
+    // actually need. `definitions_lock` above has no such reader/writer to
+    // starve: only import and delete ever take it.
     //
     // The keys a remote signer holds, by the store or by the file, gathered
     // once for the whole request rather than looked up again for each of its
@@ -1020,15 +1020,15 @@ fn judge_delete(
     if entry != Some(Origin::Local) && !in_memory {
         return Judged::Absent;
     }
-    // Stranded when the store held the key as a local one while the file
-    // lists it under a remote signer, which only a hand edit of the file
-    // under a running client produces. This route leaves that entry alone,
-    // so answering `deleted`, with the key's history attached, would tell an
-    // operator the key is free to run elsewhere while the next start loads
-    // it again and signs through a signer that never heard of what it did
-    // since.
+    // Left on the file when the store held the key as a local one while the
+    // file lists it under a remote signer, which only a hand edit of the
+    // file under a running client produces. This route leaves that entry
+    // alone, so answering `deleted`, with the key's history attached, would
+    // tell an operator the key is free to run elsewhere while the next start
+    // loads it again and signs through a signer that never heard of what it
+    // did since.
     Judged::Removed {
-        stranded: entry == Some(Origin::Remote),
+        left: (entry == Some(Origin::Remote)).then_some(Left::OnFile),
     }
 }
 
@@ -1040,14 +1040,26 @@ pub(super) enum Judged {
     OtherRoutes,
     /// This route holds nothing for the key, in the file or in the store.
     Absent,
-    /// The key is out of the store, and its entry comes off the file in the
-    /// request's one save.
+    /// What this route holds of the key is gone: the key is out of the store
+    /// if it was there as this route's kind, and its entry of this route's
+    /// kind comes off the file in the request's one save.
     Removed {
-        /// The file also lists the key under the other route's kind, an
-        /// entry this route leaves where it is and the next start would load.
-        /// The delete is then answered with an error rather than `deleted`.
-        stranded: bool,
+        /// What the other route still holds of the key, which this one
+        /// leaves where it is. The key is then not gone, and the delete is
+        /// answered with an error rather than `deleted`.
+        left: Option<Left>,
     },
+}
+
+/// What a delete through one route leaves of a key because it is the other
+/// route's to remove. Either way an operator must not take the key for gone,
+/// and free to run on another host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Left {
+    /// An entry in the definitions file, which the next start would load.
+    OnFile,
+    /// The key in the store, which this process goes on signing with.
+    InStore,
 }
 
 /// How a route judges one key of a delete: against the store, which it may
@@ -1192,14 +1204,17 @@ pub(super) async fn delete_keys(
             let status = match judged {
                 Judged::OtherRoutes => return (None, KeyStatus::not_found()),
                 Judged::Absent => absent(),
-                Judged::Removed { stranded } => {
+                Judged::Removed { left } => {
                     if let Err(message) = &saved {
                         KeyStatus::error(message)
+                    } else if let Some(left) = left {
+                        // Ahead of the check below: a key the store still
+                        // holds is judged the same every time the request
+                        // names it, and must be an error every time.
+                        KeyStatus::error(origin.leaves(left))
                     } else if !answered.insert(pubkey) {
                         // Named earlier in this request, and removed there.
                         absent()
-                    } else if stranded {
-                        KeyStatus::error(origin.stranded())
                     } else {
                         let pubkey = encode_hex(&pubkey.0);
                         match origin {
@@ -1263,20 +1278,34 @@ impl Origin {
         Self::of(signing) == self
     }
 
-    /// What a delete through this route answers when the key is out of the
-    /// store but the file keeps an entry of the other route's kind for it;
-    /// see [`Judged::Removed`].
-    fn stranded(self) -> &'static str {
-        match self {
-            Self::Local => {
+    /// What a delete through this route answers when it removed what was its
+    /// own and the other route still holds `left` of the key; see
+    /// [`Judged::Removed`].
+    fn leaves(self, left: Left) -> &'static str {
+        match (self, left) {
+            (Self::Local, Left::OnFile) => {
                 "no longer signing with this key, but the definitions file lists it under a \
                  remote signer, an entry this route does not remove, so it would sign again \
                  after a restart; delete it through /eth/v1/remotekeys"
             }
-            Self::Remote => {
+            (Self::Remote, Left::OnFile) => {
                 "no longer signing with this key, but the definitions file lists it as a local \
                  keystore, an entry this route does not remove, so it would sign again after a \
                  restart; delete it through /eth/v1/keystores"
+            }
+            (Self::Remote, Left::InStore) => {
+                "its remote entry is off the definitions file, but this client holds the key \
+                 as a local keystore, which this route does not remove, and is still signing \
+                 with it; delete it through /eth/v1/keystores"
+            }
+            // Not an answer the keystores route gives today: a key the store
+            // holds through a signer is the other route's outright
+            // (`Judged::OtherRoutes`). Worded all the same, so the pair has
+            // no case that answers nothing.
+            (Self::Local, Left::InStore) => {
+                "its local entry is off the definitions file, but this client holds the key \
+                 through a remote signer, which this route does not remove, and is still \
+                 signing with it; delete it through /eth/v1/remotekeys"
             }
         }
     }

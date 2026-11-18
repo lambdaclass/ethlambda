@@ -76,16 +76,46 @@ impl Web3Signer {
 
     /// [`Self::new`], sent at most `cap` requests at once.
     pub(crate) fn with_cap(url: &str, cap: usize) -> Result<Self> {
-        let base_url = url.trim_end_matches('/').to_string();
+        let base_url = Self::normalize_url(url)?;
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|err| Error::Keystore {
+                // Already through `normalize_url`, so nothing left to redact.
+                path: base_url.clone(),
+                reason: format!("could not build an HTTP client: {err}"),
+            })?;
+        Ok(Self {
+            base_url,
+            client,
+            in_flight: Semaphore::new(cap),
+        })
+    }
+
+    /// The base URL the signer at `url` is reached at and known by, or why
+    /// `url` cannot name a signer.
+    ///
+    /// It is the URL as the parser read it, with any trailing slash trimmed,
+    /// not the text given. Every request is built from it and the store keys
+    /// its clients by it, and the parser forgives what a string does not: it
+    /// strips surrounding whitespace and lowercases the host. Built from the
+    /// text, `https://signer:9000 ` would pass every check below and then
+    /// fail at each signature, on a request URL with a space in the middle
+    /// of it, and `https://Signer:9000` would be a second signer beside
+    /// `https://signer:9000`, with a client and a cap on requests in flight
+    /// of its own.
+    ///
+    /// Anything that looks a client up by URL normalizes first.
+    pub fn normalize_url(url: &str) -> Result<String> {
         // Every error below names the URL as `redact` renders it, never as
         // given: these errors are logged, at startup and on import, and a URL
         // refused for its shape may still carry a `user:password@` that the
         // credentials check further down never got to reject.
         let invalid = |reason: &str| Error::Keystore {
-            path: redact(&base_url),
+            path: redact(url),
             reason: reason.to_string(),
         };
-        let parsed = reqwest::Url::parse(&base_url)
+        let parsed = reqwest::Url::parse(url)
             .map_err(|err| invalid(&format!("not a valid remote signer URL: {err}")))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
             return Err(invalid("a remote signer URL must be http or https"));
@@ -105,18 +135,10 @@ impl Web3Signer {
                 "a remote signer URL must not carry a query string or fragment",
             ));
         }
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|err| invalid(&format!("could not build an HTTP client: {err}")))?;
-        Ok(Self {
-            base_url,
-            client,
-            in_flight: Semaphore::new(cap),
-        })
+        Ok(parsed.as_str().trim_end_matches('/').to_string())
     }
 
-    /// The signer's base URL, with any trailing slash already stripped.
+    /// The signer's base URL, as [`Self::normalize_url`] renders it.
     pub fn url(&self) -> &str {
         &self.base_url
     }
@@ -204,26 +226,41 @@ fn truncate(body: &str) -> String {
 }
 
 /// `url` with anything that could be a credential cut out, for an error
-/// message: the userinfo before an `@` in the authority, and any query string
-/// or fragment. Works on text rather than a parsed URL, since it is what
+/// message: everything before the last `@`, and any query string or
+/// fragment. Works on text rather than a parsed URL, since it is what
 /// reports a URL that does not parse.
+///
+/// The `@` is looked for first, in the whole of what follows the scheme and
+/// not in the authority alone. A password may hold a `/`, a `?` or a `#`,
+/// and those are exactly the URLs that end up here, since each fails to
+/// parse: cutting the path, query or fragment off first would cut the
+/// password in two and print its front half (`https://admin:p#ss@signer`),
+/// or take the userinfo for a path and print all of it
+/// (`https://admin:tok/en@signer`). A path that holds an `@` of its own
+/// loses everything before it; an error naming too little of a URL is the
+/// side to err on.
 fn redact(url: &str) -> String {
+    // Only what can be a scheme is kept as one. Text before a `://` that
+    // holds anything else is a URL written without its scheme, with the
+    // `://` somewhere in its userinfo.
+    let is_scheme = |text: &str| {
+        text.starts_with(|first: char| first.is_ascii_alphabetic())
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
     let (scheme, rest) = match url.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, url),
+        Some((scheme, rest)) if is_scheme(scheme) => (Some(scheme), rest),
+        _ => (None, url),
+    };
+    let rest = match rest.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => rest,
     };
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
-    let (authority, path) = match rest.find('/') {
-        Some(cut) => rest.split_at(cut),
-        None => (rest, ""),
-    };
-    let host = match authority.rsplit_once('@') {
-        Some((_, host)) => host,
-        None => authority,
-    };
     match scheme {
-        Some(scheme) => format!("{scheme}://{host}{path}"),
-        None => format!("{host}{path}"),
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest.to_string(),
     }
 }
 
@@ -799,6 +836,57 @@ mod tests {
         }
     }
 
+    /// A password holding a `#`, a `/` or a `?` makes the URL unparseable,
+    /// so it is reported, and the character must not be where the report
+    /// stops looking for the userinfo: no part of the password, before or
+    /// after it, may be printed.
+    #[test]
+    fn a_password_holding_a_delimiter_is_not_echoed_either() {
+        for url in [
+            "https://admin:s3c#ret@signer:9000",
+            "https://admin:s3c/ret@signer:9000",
+            "https://admin:s3c?ret@signer:9000",
+            "https://admin:s3c@ret@signer:9000",
+            // No scheme, and a `://` inside the password.
+            "admin:s3c://ret@signer:9000",
+        ] {
+            let Err(err) = Web3Signer::new(url) else {
+                panic!("{url} must be refused");
+            };
+            let message = err.to_string();
+            assert!(
+                !message.contains("s3c") && !message.contains("ret"),
+                "{url}: {message}"
+            );
+            assert!(message.contains("signer:9000"), "{url}: {message}");
+        }
+    }
+
+    /// The base URL is the parsed one. The text given can pass every check
+    /// and still not be what a request can be built from, or name a signer
+    /// the store already has a client for under another spelling.
+    #[test]
+    fn the_base_url_is_the_parsed_one_not_the_text_given() {
+        for url in [
+            "https://signer:9000",
+            "https://signer:9000/",
+            "https://signer:9000 ",
+            " https://signer:9000",
+            "https://Signer:9000",
+            "HTTPS://SIGNER:9000//",
+        ] {
+            let signer = Web3Signer::new(url).unwrap_or_else(|err| panic!("{url:?}: {err}"));
+            assert_eq!(signer.url(), "https://signer:9000", "{url:?}");
+        }
+        // A path prefix is the signer's own and is kept as written.
+        assert_eq!(
+            Web3Signer::new("https://signer:9000/Prefix/")
+                .expect("builds")
+                .url(),
+            "https://signer:9000/Prefix"
+        );
+    }
+
     #[test]
     fn a_url_with_a_query_or_fragment_is_refused() {
         assert!(Web3Signer::new("https://signer:9000?token=abc").is_err());
@@ -814,5 +902,14 @@ mod tests {
         );
         assert_eq!(redact("signer:9000"), "signer:9000");
         assert_eq!(redact("a@b"), "b");
+        // A `#` and a `/` inside the password: the `@` is found first.
+        assert_eq!(
+            redact("https://admin:p#ss@signer:9000"),
+            "https://signer:9000"
+        );
+        assert_eq!(
+            redact("https://admin:tok/en@signer:9000"),
+            "https://signer:9000"
+        );
     }
 }

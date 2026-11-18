@@ -891,12 +891,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   on the blocking pool (`SigningContext::verified`), never inline on the duty
   task. Each duty signs its batch at once through
   `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
-  hung signer costs only its own keys; one signer is sent at most
+  hung signer loses only its own keys' signatures, though the batch is
+  published whole and so up to the budget late, local keys included; one
+  signer is sent at most
   `MAX_CONCURRENT_REQUESTS` at a time. The epoch's subnet subscriptions, whose
   selection proofs are round trips for remote keys, are sent from a spawned
-  task after the slot's proposal, not from `refresh_epoch`. Builder
+  task after the slot's proposal, not from `refresh_epoch`, with a longer
+  budget of their own (`SUBSCRIPTION_SIGNING_BUDGET`). Builder
   registrations and proposer preferences sign through the same path
-  (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). Remote keys are
+  (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
+  `Web3Signer::normalize_url`'s rendering of its URL, which is what requests
+  are built from and clients are keyed by. Remote keys are
   `type: web3signer`
   entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
   `--web3signer-url`); `/keystores` and `/remotekeys` partition the store, and

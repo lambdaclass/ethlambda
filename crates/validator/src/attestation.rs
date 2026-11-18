@@ -248,9 +248,13 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // behind it for as long as the guard was held.
         //
         // Each signature gets `SIGNING_BUDGET` and no more, so a hung signer
-        // costs only its own keys: the batch below goes out with every
-        // signature that arrived, rather than the slot's deadline dropping
-        // the whole batch, local keys included, while it waits.
+        // loses only its own keys' votes: the batch below goes out with
+        // every signature that arrived, rather than the slot's deadline
+        // dropping the whole batch, local keys included, while it waits. It
+        // does go out late, though. The batch is published whole, so while
+        // a signer hangs every vote in it, a local key's too, is published
+        // the full budget after the attestation offset (see
+        // `SIGNING_BUDGET` for what that leaves before aggregation).
         let signatures =
             {
                 let _timing = crate::metrics::time_signing();

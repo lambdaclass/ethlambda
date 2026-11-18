@@ -100,25 +100,52 @@ const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
 /// for.
 ///
 /// Well inside every duty's own budget (the rest of its slot, at least a
-/// third of one), so a signer that hangs costs the signatures it owes and
-/// nothing else: the batch is published with whatever arrived in time, local
-/// keys and other signers' keys included. A healthy Web3Signer answers in
-/// milliseconds; one slower than this is one whose signatures would land too
-/// late to be worth much anyway.
+/// third of one), so a signer that hangs loses the signatures it owes and no
+/// others: the batch is published with whatever arrived in time, local keys
+/// and other signers' keys included.
+///
+/// What it does cost the others is time. The batch is published whole, once
+/// its last signature is in or the budget is spent, so while a signer hangs
+/// every batch goes out this much later than it would have, every slot, the
+/// local keys' share with it: an attestation due a third of the way into the
+/// slot is published two seconds after that. That is still ahead of the
+/// aggregation offset, so no vote is lost to it, but it is two seconds of
+/// propagation the votes do not get, and at a gloas slot, where the two
+/// offsets are three seconds apart, it leaves them one. Publishing each
+/// signature as it arrives would spare the keys that answered; nothing does
+/// that yet.
+///
+/// A healthy Web3Signer answers in milliseconds; one slower than this is one
+/// whose signatures would land too late to be worth much anyway.
 pub const SIGNING_BUDGET: Duration = Duration::from_secs(2);
 
 /// Ask for every signature in `requests` at once, and give each until
 /// [`SIGNING_BUDGET`] from now.
 ///
-/// One result per request, in order. A request still outstanding at the
-/// deadline is dropped and reported as an [`Error::Signing`] for its key, so
-/// one unresponsive signer delays the batch by the budget at most and never
-/// takes the signatures that did arrive down with it.
+/// One result per request, in order, returned together: when the last
+/// request answers or at the deadline, whichever is first. A request still
+/// outstanding then is dropped and reported as an [`Error::Signing`] for its
+/// key, so one unresponsive signer never takes the signatures that did
+/// arrive down with it, but it does hold all of them back until the
+/// deadline; see [`SIGNING_BUDGET`].
 pub async fn sign_all<T, F>(requests: impl IntoIterator<Item = (BlsPubkey, F)>) -> Vec<Result<T>>
 where
     F: Future<Output = Result<T>>,
 {
-    let deadline = tokio::time::Instant::now() + SIGNING_BUDGET;
+    sign_all_within(SIGNING_BUDGET, requests).await
+}
+
+/// [`sign_all`], with `budget` in place of [`SIGNING_BUDGET`]: for a batch
+/// no slot deadline stands behind, which can afford to wait longer for a
+/// signature than a duty can.
+pub async fn sign_all_within<T, F>(
+    budget: Duration,
+    requests: impl IntoIterator<Item = (BlsPubkey, F)>,
+) -> Vec<Result<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
     futures_util::future::join_all(requests.into_iter().map(|(pubkey, request)| async move {
         tokio::time::timeout_at(deadline, request)
             .await
@@ -127,7 +154,7 @@ where
                     pubkey,
                     reason: format!(
                         "no signature within the {}s signing budget",
-                        SIGNING_BUDGET.as_secs()
+                        budget.as_secs()
                     ),
                 })
             })
@@ -994,6 +1021,40 @@ mod tests {
             matches!(&results[1], Err(Error::Signing { pubkey, .. }) if *pubkey == hung),
             "the late one is a signing failure for its own key"
         );
+    }
+
+    /// A batch given a budget of its own waits that long and no longer, and
+    /// an answer that needed more than a duty's budget is kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_with_its_own_budget_waits_that_long() {
+        use futures_util::FutureExt as _;
+
+        let budget = 3 * SIGNING_BUDGET;
+        let started = tokio::time::Instant::now();
+        let slow = BlsPubkey([1; 48]);
+        let hung = BlsPubkey([2; 48]);
+        let results = sign_all_within(
+            budget,
+            [
+                (
+                    slow,
+                    async {
+                        tokio::time::sleep(2 * SIGNING_BUDGET).await;
+                        Ok(7u8)
+                    }
+                    .boxed(),
+                ),
+                (hung, std::future::pending().boxed()),
+            ],
+        )
+        .await;
+
+        assert_eq!(started.elapsed(), budget);
+        assert!(
+            matches!(results[0], Ok(7)),
+            "past a duty's budget, inside this one"
+        );
+        assert!(matches!(&results[1], Err(Error::Signing { pubkey, .. }) if *pubkey == hung));
     }
 
     /// A remembered proof is for a validator this client serves. Once the
