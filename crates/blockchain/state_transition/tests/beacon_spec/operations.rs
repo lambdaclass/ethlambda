@@ -179,22 +179,19 @@ fn apply(
     // run, which is how a block's own driver treats them: a case whose only
     // defect is a bad signature is still rejected, only later.
     //
-    // `run`'s outer `Err` (no handler for the case) is not a verdict, so the
-    // closure parks it in `unhandled` and returns `Ok`: the batch, empty since
-    // nothing ran, then passes, and the parked error is what is reported. The
-    // crate's own `Err` is returned from the closure as is, which skips the
-    // batch, as a block's driver does.
-    let mut unhandled = None;
-    let outcome = SignatureBatch::deferred(|signatures| {
-        run(handler, case, state, config, committees, signatures).unwrap_or_else(|err| {
-            unhandled = Some(err);
-            Ok(())
-        })
-    });
-    if let Some(err) = unhandled {
-        return Err(err);
-    }
-    outcome.map_err(|err| format!("{err:?}"))
+    // The closure turns `run`'s nesting inside out. The crate's own `Err` is
+    // the closure's error, which skips the batch as a block's driver does. A
+    // case no handler covers ran nothing, so it passes through the batch
+    // (empty, so it verifies) as the closure's `Ok(Err(..))`, and the last
+    // step hands that error back.
+    SignatureBatch::deferred(|signatures| {
+        match run(handler, case, state, config, committees, signatures) {
+            Ok(verdict) => verdict.map(Ok),
+            Err(unhandled) => Ok(Err(unhandled)),
+        }
+    })
+    .map_err(|err| format!("{err:?}"))
+    .and_then(|handled| handled)
 }
 
 /// [`apply`]'s dispatch, pushing every deferred signature into `signatures`.

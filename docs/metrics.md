@@ -454,6 +454,7 @@ spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_gossipsub_peers_by_score` | Gauge | Gossipsub peers by score band | Every 10 s, in the swarm task | band=non_negative,negative,below_gossip,below_publish,below_graylist | |
 | `lean_gossipsub_score_disconnects_total` | Counter | Peers disconnected for a gossipsub score below the graylist (-16000) | When the 10 s check disconnects one | | |
+| `lean_gossipsub_slow_peer_disconnects_total` | Counter | Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory). A report counts only above `SLOW_PEER_REPORT_THRESHOLD` failures, and one check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers | When the 10 s check disconnects one | | |
 | `lean_gossipsub_mesh_delivery_scoring` | Gauge | 1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up | Every slot, on the scoring refresh | | |
 
 The bands are mutually exclusive and split at the gossip (-4000), publish
@@ -499,6 +500,7 @@ leanMetrics spec.
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCacheExt::committees` call: the state transition's, fork choice's and p2p's gossip validation's attestation processing | result=hit,miss,unkeyable |
+| `lean_beacon_signature_batch_disagreements_total` | Counter | Signature batches that failed while every set in them verified on its own: a bug in the batch check. The block is rejected anyway, so any non-zero value means valid blocks may be refused | When a block's deferred signature batch fails and no single set does | |
 
 **Read the miss rate against the epoch rate, not the hit rate.** A follower on
 one chain misses about once per epoch, when the first block of a new epoch asks

@@ -346,6 +346,9 @@ pub fn indexed_payload_attestation_signature_set(
     attestation: &gloas::IndexedPayloadAttestation,
 ) -> Option<SignatureSet> {
     let indices: &[ValidatorIndex] = &attestation.attesting_indices;
+    // `<=`, not the `<` of the other attestation kinds: the spec checks only
+    // `indices == sorted(indices)`, since the PTC is drawn with replacement
+    // and a member can repeat, so duplicates are valid.
     if indices.is_empty() || !indices.windows(2).all(|pair| pair[0] <= pair[1]) {
         return None;
     }

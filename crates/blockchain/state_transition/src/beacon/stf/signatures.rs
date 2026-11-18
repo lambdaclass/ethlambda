@@ -1,9 +1,10 @@
 //! The signatures a block's processing defers, so they can be checked together.
 //!
 //! The specification checks every signature the moment its operation is
-//! processed, and each check is a full pairing. A block carries a dozen or so
-//! signature sets (the RANDAO reveal, every attestation, the sync aggregate,
-//! any exits and slashings), and checking them in one random-linear-combination
+//! processed, and each check is a full pairing. A block carries from a dozen
+//! signature sets to well over a hundred (the RANDAO reveal, every attestation,
+//! up to 128 of them before electra, the sync aggregate, any exits and
+//! slashings), and checking them in one random-linear-combination
 //! batch costs a fraction of checking them one by one (see
 //! [`ethlambda_crypto::bls::verify_signature_sets`]). So processing *builds*
 //! each set where the specification verifies it, pushes it here, and the block
@@ -21,6 +22,16 @@
 //! reject the block but changes what happens next: a deposit with a bad
 //! signature is skipped and the block carries on, so that check cannot wait.
 //!
+//! Deferring lets an operation with a forged signature change the state the
+//! rest of the block runs on (a forged slashing slashes before the sync
+//! aggregate's rewards are paid), but it reaches no state a valid block could
+//! not: what an operation does never depends on its signature, so the same
+//! effects follow from the same operation genuinely signed (a validator that
+//! did equivocate, an exit that was signed). Any panic a later operation hits
+//! there is one a valid block can reach too. Every path that applies outside
+//! input checks signatures (`validate_result` is true on import and in era
+//! replay), and the proposer's signature is checked before the body runs.
+//!
 //! # What a late failure names
 //!
 //! Every error is the check's own label (the same `&'static str` the immediate
@@ -35,6 +46,8 @@
 //! specification, only that the block is invalid.
 
 use ethlambda_crypto::bls::{SignatureSet, verify_signature_sets};
+use rayon::prelude::*;
+use tracing::error;
 
 use crate::beacon::error::{Result, verify};
 
@@ -47,8 +60,11 @@ use crate::beacon::error::{Result, verify};
 /// callers that apply an operation to a scratch state and must learn at once
 /// whether it was accepted. A deferring batch that could be dropped
 /// unverified would turn every function taking one into "valid except for
-/// its signatures".
-#[derive(Default)]
+/// its signatures", which is also why it does not implement `Default`: a
+/// public `default()` would be exactly such a batch. Inside the crate the
+/// same holds outside tests: [`Self::new`] exists only under `cfg(test)`, so
+/// no production path can hold a deferring batch [`Self::deferred`] did not
+/// make.
 pub struct SignatureBatch {
     sets: Vec<SignatureSet>,
     /// `sets[i]`'s label, apart from the sets so the batch check reads them
@@ -58,18 +74,28 @@ pub struct SignatureBatch {
 }
 
 impl SignatureBatch {
-    /// An empty batch that defers every set pushed to it. Crate-internal: the
-    /// caller must [`Self::verify`] it, which [`Self::deferred`] guarantees.
+    fn empty(immediate: bool) -> Self {
+        Self {
+            sets: Vec::new(),
+            labels: Vec::new(),
+            immediate,
+        }
+    }
+
+    /// An empty batch that defers every set pushed to it, for tests that run
+    /// one operation and then [`Self::verify`] (or inspect) what it deferred.
+    /// Test-only, so production code defers only through [`Self::deferred`].
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self::empty(false)
     }
 
     /// Runs `f` with a batch that defers every set pushed to it, then verifies
-    /// them all: what a block's driver does, and the only way outside this
-    /// crate to defer signatures. An error from `f` is returned as is, since
-    /// it rejects whatever `f` was processing whatever the signatures say.
+    /// them all: what a block's driver does, and the only way outside tests
+    /// to defer signatures. An error from `f` is returned as is, since it
+    /// rejects whatever `f` was processing whatever the signatures say.
     pub fn deferred<T>(f: impl FnOnce(&mut SignatureBatch) -> Result<T>) -> Result<T> {
-        let mut batch = Self::new();
+        let mut batch = Self::empty(false);
         let out = f(&mut batch)?;
         batch.verify()?;
         Ok(out)
@@ -84,15 +110,12 @@ impl SignatureBatch {
     /// happening, so its calls check as they go and behave exactly as the
     /// immediate checks did.
     pub fn immediate() -> Self {
-        Self {
-            immediate: true,
-            ..Self::default()
-        }
+        Self::empty(true)
     }
 
     /// Defers `set`, or rejects now with `what` when the set could not be built
     /// (an invalid key or signature, an empty signer list): the same moment and
-    /// the same label today's immediate check fails with.
+    /// the same label the immediate check fails with.
     pub fn push(&mut self, set: Option<SignatureSet>, what: &'static str) -> Result<()> {
         let Some(set) = set else {
             return verify(false, what);
@@ -105,30 +128,34 @@ impl SignatureBatch {
         Ok(())
     }
 
-    /// One batch check. On failure, re-checks the sets one by one and rejects with
-    /// the first failing set's `what`, so the error names the same check it does
-    /// today.
+    /// One batch check. On failure, re-checks the sets one by one and rejects
+    /// with the first failing set's `what` in push order, so the error names
+    /// the check the immediate path would have stopped at.
     ///
-    /// A failing batch therefore costs the batch plus up to one single check
-    /// per set, roughly twice what checking each set on push would. That stays
+    /// The re-checks run on rayon's pool, so a failing batch costs the batch
+    /// plus one round of single checks spread over the cores. That stays
     /// bounded: only a block that is rejected pays it, the block's operation
     /// limits cap how many sets it pushes, and on import `apply_block` checks
     /// the proposer's signature (and the header its proposer index) before
     /// this runs, so making such a block takes the slot proposer's key.
-    /// Bisecting the failed batch would cut the re-checks if this ever shows
-    /// up in a profile.
     pub(crate) fn verify(self) -> Result<()> {
+        debug_assert_eq!(self.sets.len(), self.labels.len(), "one label per set");
         if verify_signature_sets(&self.sets) {
             return Ok(());
         }
-        // A batch of valid sets always passes, so one of these fails. Should
-        // none do (which would be a bug in the batch check), the block is
-        // still rejected, with the last label, rather than accepted.
-        let mut last = "block signatures";
-        for (set, what) in self.sets.iter().zip(self.labels) {
-            last = what;
-            verify(set.verify(), what)?;
+        if let Some(first_bad) = self.sets.par_iter().position_first(|set| !set.verify()) {
+            return verify(false, self.labels[first_bad]);
         }
+        // A batch of valid sets always passes, so a set should have failed
+        // above. None did, which is a bug in the batch check: the block is
+        // still rejected rather than accepted, but loudly, since a block every
+        // single check accepts is valid and rejecting it can fork this node off.
+        error!(
+            sets = self.sets.len(),
+            "Signature batch failed but every set verifies on its own; rejecting the block"
+        );
+        crate::metrics::inc_signature_batch_disagreements();
+        let last = self.labels.last().copied().unwrap_or("block signatures");
         verify(false, last)
     }
 

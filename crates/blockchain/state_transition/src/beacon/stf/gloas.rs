@@ -1732,6 +1732,7 @@ mod tests {
     use crate::beacon::containers::BeaconBlockHeader;
     use crate::beacon::fork::ForkName;
     use crate::beacon::primitives::{BlsPubkey, BlsSignature, ExecutionBlockHash, Uint256};
+    use crate::beacon::stf::signatures::checked;
 
     fn gloas_state_with_validators(count: usize) -> BeaconState {
         crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, count)
@@ -1756,10 +1757,7 @@ mod tests {
             signature: g2_point_at_infinity(),
         };
 
-        crate::beacon::stf::signatures::checked(|s| {
-            process_execution_payload_bid(&mut state, &signed_bid, &config, s)
-        })
-        .unwrap();
+        checked(|s| process_execution_payload_bid(&mut state, &signed_bid, &config, s)).unwrap();
         assert_eq!(
             gloas_state_ref(&state, "test")
                 .unwrap()
@@ -1788,9 +1786,8 @@ mod tests {
             signature: g2_point_at_infinity(),
         };
 
-        let result = crate::beacon::stf::signatures::checked(|s| {
-            process_execution_payload_bid(&mut state, &signed_bid, &config, s)
-        });
+        let result =
+            checked(|s| process_execution_payload_bid(&mut state, &signed_bid, &config, s));
         assert!(
             matches!(
                 result,
@@ -2006,7 +2003,7 @@ mod tests {
         for (expected_message, body) in cases {
             let mut state = state.clone();
             let committees = CommitteeCache::default();
-            let result = crate::beacon::stf::signatures::checked(|s| {
+            let result = checked(|s| {
                 process_operations(
                     &mut state,
                     &body,
