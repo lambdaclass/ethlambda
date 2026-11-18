@@ -839,4 +839,6 @@ signature, whichever way the node answered. Three departures:
   node holds them in memory only
   and gossip does not replay them, so a node that restarts would otherwise
   self-build without them, and ignore builders' bids, until the next dependent
-  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.
+  root. `prepare_beacon_proposer`, which a restart loses too, is re-sent every
+  slot instead: it is one small request, where a preference is a signature per
+  proposal.
