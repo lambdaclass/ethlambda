@@ -190,7 +190,21 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         keys::Web3Signer::normalize_url(url)?;
     }
 
-    let store = ValidatorStore::load(&config.validators_dir)?;
+    // Read once, for the settings its entries carry and then for the keys.
+    let definitions = keys::ValidatorDefinitions::open(&config.validators_dir)?;
+    // The per-validator fee recipients, graffiti and gas limits the keymanager
+    // persisted, or the operator wrote by hand. A malformed one is fatal, as a
+    // bad keystore is: a validator paying an address the operator did not
+    // mean is worse than a refused start. Ahead of the keys, so that refusal
+    // comes before every keystore has been decrypted rather than after.
+    let seeded = definitions.seed_overrides(&settings)?;
+    if seeded > 0 {
+        info!(
+            count = seeded,
+            "Loaded per-validator proposer settings from the definitions file"
+        );
+    }
+    let store = ValidatorStore::from_definitions(&config.validators_dir, &definitions)?;
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
     }
