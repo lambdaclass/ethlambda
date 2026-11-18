@@ -46,7 +46,7 @@ pub struct KeymanagerContext {
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     /// Serializes the open-mutate-save cycle over the validator definitions
-    /// file across concurrent import/delete requests.
+    /// file across concurrent import, delete and proposer-settings requests.
     ///
     /// `store`'s `RwLock` does not close this on its own: an import or delete
     /// takes a fresh [`crate::keys::ValidatorDefinitions`] snapshot from disk
@@ -66,7 +66,9 @@ pub struct KeymanagerContext {
     ///
     /// The duty loop never takes it, so holding it across the slow EIP-2335
     /// key derivation an import performs stalls only other keymanager
-    /// requests. Where a handler needs both, it takes this one first and
+    /// requests, a `feerecipient`, `graffiti` or `gas_limit` call among
+    /// them: one made during a full import waits for the import to finish.
+    /// Where a handler needs both, it takes this one first and
     /// `store` second, consistently, so the two never deadlock against each
     /// other, and it holds `store` only for in-memory work, never across file
     /// I/O or the derivation.
