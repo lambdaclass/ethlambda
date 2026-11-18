@@ -14,7 +14,8 @@ docker build --build-arg FEATURES=include-ethrex -t ethlambda:ethrex .
 
 Releases attach this build for every platform as `ethlambda-ethrex-<platform>`,
 next to the ethlambda-only `ethlambda-<platform>` (see
-[`RELEASE.md`](../RELEASE.md#release-binaries)). The published Docker images are
+[`RELEASE.md`](https://github.com/lambdaclass/ethlambda/blob/main/RELEASE.md#release-binaries)).
+The published Docker images are
 ethlambda-only, so an image with ethrex embedded is built as above.
 
 ## Choosing the execution client
