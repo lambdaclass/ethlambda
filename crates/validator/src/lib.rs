@@ -99,6 +99,10 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// `--web3signer-url`: the remote signer a key imported through
+    /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
+    /// Keys the definitions file already names a signer for need no default.
+    pub web3signer_url: Option<String>,
     /// The gas limit every validator targets unless the keymanager API gives
     /// it its own: its builder registrations' before gloas, and its proposer
     /// preferences' from gloas, which is what the node's own payload is built
@@ -180,6 +184,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
              directory"
         );
     }
+    // Checked for shape at startup rather than at the first import that
+    // leans on it, which could be days later.
+    if let Some(url) = &config.web3signer_url {
+        keys::Web3Signer::normalize_url(url)?;
+    }
+
     let store = ValidatorStore::load(&config.validators_dir)?;
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
@@ -230,7 +240,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
-    // have a record, unless the operator said otherwise.
+    // have a record, unless the operator said otherwise. That includes a key
+    // a remote signer holds: the signer keeps its own record, and this one is
+    // kept as well, so a key is covered whichever of the two it meets first.
     let keys = store.read().await.pubkeys();
     let protection = slashing_protection::SlashingProtection::open_locked(
         record_lock,
@@ -246,10 +258,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
     let protection = slashing_protection::SharedProtection::new(protection);
 
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -309,6 +318,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             validators_dir: config.validators_dir.clone(),
             secrets_dir: config.secrets_dir.clone(),
             definitions_lock: Arc::new(Mutex::new(())),
+            default_remote_signer: config.web3signer_url.clone(),
             beacon_node: beacon_node.clone(),
             signing: context.clone(),
             clock: clock.clone(),
@@ -360,18 +370,24 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
             let epoch = clock.epoch_of(slot);
 
+            // What the refresh below leaves owing once the slot's block is
+            // out: the subnet subscriptions when it moved the attester
+            // schedule, and the builder registrations of the validators it
+            // resolved.
+            let mut resubscribe = false;
+            let mut to_register = None;
             if last_epoch != Some(epoch) {
                 // Snapshot the pubkeys and let the guard drop right here, before
                 // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
-                // validator lookup, a subscription POST). Passing the guard
-                // itself in used to extend it across that whole call, because
-                // `&*store.read().await` as a match scrutinee has its temporary
-                // lifetime extended to the entire match. Holding a read lock
-                // that long lets the keymanager's write lock
-                // (`http_api::keystores::import`, held across slow EIP-2335
-                // derivation) queue ahead of it, and since `tokio::sync::RwLock`
-                // is write-preferring, every read after that point, including
-                // this one next epoch, would starve until the import finished.
+                // validator lookup). Passing the guard itself in used to extend
+                // it across that whole call, because `&*store.read().await` as a
+                // match scrutinee has its temporary lifetime extended to the
+                // entire match. Holding a read lock that long lets the
+                // keymanager's write lock (`http_api::keystores::import`, held
+                // across slow EIP-2335 derivation) queue ahead of it, and since
+                // `tokio::sync::RwLock` is write-preferring, every read after
+                // that point, including this one next epoch, would starve until
+                // the import finished.
                 let pubkeys = store.read().await.pubkeys();
                 let refreshed = refresh_epoch(
                     &beacon_node,
@@ -379,22 +395,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     &pubkeys,
                     epoch,
                     &settings,
-                    &store,
                     &context,
                 );
                 match refreshed.await {
-                    Ok(resolved) => {
+                    Ok(Refreshed { moved, registrable }) => {
                         last_epoch = Some(epoch);
-                        // Only after a refresh that got all the way through, so a
-                        // failing one does not respawn a full send every slot, and
-                        // spawned so a slow or hung node never delays this epoch's
-                        // duties: a missed registration costs at most a builder
-                        // block, never a duty.
-                        if let Some(registration) = &registration {
-                            let registration = registration.clone();
-                            let store = store.clone();
-                            tokio::spawn(registration.register_all(epoch, resolved, store));
-                        }
+                        resubscribe = moved;
+                        to_register = Some(registrable);
                     }
                     // A beacon node that is down, syncing or answering badly will
                     // likely answer next epoch, so keep the schedule already held
@@ -435,6 +442,49 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // loop, since it is single-flight and a slow node must not delay this
             // slot's duties.
             tokio::spawn(preferences.clone().poll(slot, store.clone()));
+
+            // The subscriptions the refresh above left owing, sent from a task
+            // of their own and only now, after the block.
+            //
+            // Each one needs a selection proof, and for a remote key that is a
+            // round trip to its signer: awaited here, or inside the refresh as
+            // they once were, a slow signer would stand between the slot
+            // boundary and this slot's block, a block from a local key
+            // included, for as long as the signing budget lets it. Started
+            // after the proposal rather than beside it so the proofs do not
+            // queue ahead of the block's own signatures at the same signer
+            // either (requests to one signer are capped, see `Web3Signer`).
+            //
+            // Nothing waits on them. The schedule covers this epoch and the
+            // next, so the duties that are near were subscribed an epoch ago,
+            // and the proofs are remembered for the aggregation whenever they
+            // land.
+            if resubscribe {
+                let (beacon_node, store, context) =
+                    (beacon_node.clone(), store.clone(), context.clone());
+                let owed = duties.all();
+                tokio::spawn(async move {
+                    let subscribed =
+                        subscriptions::subscribe(&beacon_node, &owed, &store, &context);
+                    let _ = subscribed.await.inspect_err(|err| {
+                        warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
+                        metrics::set_beacon_node_available(false);
+                    });
+                });
+            }
+
+            // The epoch's full registration send, after the block for the
+            // subscriptions' reason: each registration it signs anew is a
+            // request to a remote key's signer, which must not queue ahead of
+            // the block's own. Only after a refresh that got all the way
+            // through, so a failing one does not respawn a full send every
+            // slot, and spawned so a slow or hung node never delays this
+            // epoch's duties: a missed registration costs at most a builder
+            // block, never a duty.
+            if let (Some(registration), Some(registrable)) = (&registration, to_register) {
+                let registration = registration.clone();
+                tokio::spawn(registration.register_all(epoch, registrable, store.clone()));
+            }
 
             // The rest of the way to the first of the slot's remaining duties:
             // the attester offset, or the sync committee offset when the network
@@ -877,26 +927,39 @@ async fn propose<B: BeaconNodeApi + 'static>(
     }
 }
 
-/// Resolve any newly activated validators, refresh the duty schedule, and
-/// re-send subnet subscriptions if it moved.
+/// What one epoch's [`refresh_epoch`] leaves the duty loop to do.
+#[derive(Debug, Default)]
+struct Refreshed {
+    /// Whether the attester schedule moved. When it did, the beacon node is
+    /// owed this client's subnet subscriptions, which the caller sends once
+    /// the slot's block is out rather than having them sent from the refresh:
+    /// each needs a selection proof, a round trip per remote key, and the
+    /// refresh runs ahead of the proposal. See the duty loop in [`run`].
+    moved: bool,
+    /// The pubkeys a builder registration is signed for: those the beacon
+    /// node resolved to an index whose validator is pending or active (see
+    /// [`is_registrable`]).
+    registrable: Vec<BlsPubkey>,
+}
+
+/// Resolve any newly activated validators and refresh the duty schedule.
 ///
-/// Returns the pubkeys a builder registration is signed for: those the beacon
-/// node resolved to an index whose validator is pending or active (see
-/// [`is_registrable`]).
+/// Sends no subnet subscription and no builder registration itself: both
+/// need signatures, so the duty loop sends them from tasks of their own, off
+/// the path to the slot's block. See [`Refreshed`].
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
     pubkeys: &[BlsPubkey],
     epoch: u64,
     settings: &ProposerSettings,
-    store: &RwLock<ValidatorStore>,
     context: &SigningContext,
-) -> Result<Vec<BlsPubkey>> {
+) -> Result<Refreshed> {
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Refreshed::default());
     }
 
     if beacon_node.is_optimistic_or_syncing().await? {
@@ -963,12 +1026,12 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    if changed {
-        subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
-    }
     metrics::set_beacon_node_available(true);
     let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
-    Ok(registrable.map(|entry| entry.pubkey).collect())
+    Ok(Refreshed {
+        moved: changed,
+        registrable: registrable.map(|entry| entry.pubkey).collect(),
+    })
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
@@ -1103,10 +1166,10 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            Root::ZERO,
+        )
     }
 
     fn empty_store() -> RwLock<ValidatorStore> {
@@ -1124,17 +1187,9 @@ mod tests {
     async fn refresh_with(node: Arc<MockBeaconNode>, settings: &ProposerSettings) {
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
-        refresh_epoch(
-            &node,
-            &mut duties,
-            &keys,
-            3,
-            settings,
-            &empty_store(),
-            &context(),
-        )
-        .await
-        .expect("refreshes");
+        refresh_epoch(&node, &mut duties, &keys, 3, settings, &context())
+            .await
+            .expect("refreshes");
     }
 
     /// One preparation per resolved validator, every epoch. The node keeps a
@@ -1164,6 +1219,33 @@ mod tests {
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         assert_eq!(node.preparations().len(), 4);
+    }
+
+    /// The refresh says when the attester schedule moved, which is what owes
+    /// the node its subnet subscriptions, and sends none itself: they wait
+    /// for the slot's block, since each costs a remote key a round trip to
+    /// its signer.
+    #[tokio::test]
+    async fn a_refresh_reports_a_moved_schedule_and_leaves_the_subscriptions_to_the_caller() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let settings = settings(None);
+        let context = context();
+
+        let Refreshed { moved, .. } =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context)
+                .await
+                .expect("refreshes");
+        assert!(moved, "a schedule fetched for the first time is a new one");
+
+        let Refreshed { moved, .. } =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context)
+                .await
+                .expect("refreshes");
+        assert!(!moved, "the same dependent roots are the same schedule");
+
+        assert!(node.subscriptions().is_empty());
     }
 
     #[tokio::test]
@@ -1228,7 +1310,6 @@ mod tests {
             &keys,
             3,
             &settings(Some(H160([0xab; 20]))),
-            &empty_store(),
             &context(),
         )
         .await
@@ -1254,7 +1335,6 @@ mod tests {
             &[],
             3,
             &settings(Some(H160([0xab; 20]))),
-            &empty_store(),
             &context(),
         )
         .await
@@ -1326,19 +1406,15 @@ mod tests {
         ];
         let settings = settings(Some(H160([0xab; 20])));
 
-        let registered = refresh_epoch(
-            &node,
-            &mut duties,
-            &keys,
-            3,
-            &settings,
-            &empty_store(),
-            &context(),
-        )
-        .await
-        .expect("refreshes");
+        let Refreshed { registrable, .. } =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context())
+                .await
+                .expect("refreshes");
 
-        assert_eq!(registered, vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]);
+        assert_eq!(
+            registrable,
+            vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]
+        );
         assert_eq!(node.preparations().len(), 6);
     }
 
@@ -1358,11 +1434,11 @@ mod tests {
     // ---- gloas ----------------------------------------------------------
 
     fn gloas_context(epoch: u64) -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, epoch),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn ptc_duty(index: u64, slot: u64) -> crate::beacon_node::dto::PtcDutyDto {
@@ -1394,7 +1470,6 @@ mod tests {
             &keys,
             3,
             &settings(None),
-            &empty_store(),
             &gloas_context(4),
         )
         .await
@@ -1409,17 +1484,9 @@ mod tests {
         // A chain with no gloas scheduled is never asked at all.
         let node = Arc::new(node_without_ptc());
         let mut duties = DutiesService::new(node.clone(), Vec::new());
-        refresh_epoch(
-            &node,
-            &mut duties,
-            &keys,
-            3,
-            &settings(None),
-            &empty_store(),
-            &context(),
-        )
-        .await
-        .expect("refreshes");
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context())
+            .await
+            .expect("refreshes");
         assert_eq!(node.ptc_call_count(), 0);
     }
 
@@ -1439,7 +1506,6 @@ mod tests {
             &keys,
             3,
             &settings(None),
-            &empty_store(),
             &gloas_context(0),
         )
         .await
@@ -1458,10 +1524,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1515,11 +1578,11 @@ mod tests {
     }
 
     fn altair_context() -> SigningContext {
-        SigningContext {
-            config: ethlambda_types::beacon::config::Config::mainnet()
+        SigningContext::new(
+            ethlambda_types::beacon::config::Config::mainnet()
                 .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0),
-            genesis_validators_root: Root::ZERO,
-        }
+            Root::ZERO,
+        )
     }
 
     fn sync_duty(index: u64, seats: Vec<u64>) -> crate::beacon_node::dto::SyncDutyDto {
@@ -1550,7 +1613,6 @@ mod tests {
                 &keys,
                 3,
                 &settings(None),
-                &empty_store(),
                 &altair_context(),
             )
             .await
@@ -1591,7 +1653,6 @@ mod tests {
             &keys,
             3,
             &settings(None),
-            &empty_store(),
             &altair_context(),
         )
         .await
@@ -1607,10 +1668,7 @@ mod tests {
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0);
         config.slot_duration_ms = 1_000;
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let now_secs = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -1666,10 +1724,7 @@ mod tests {
         use crate::beacon_node::mock::MockBeaconNode;
 
         let config = ethlambda_types::beacon::config::Config::mainnet();
-        let context = Arc::new(SigningContext {
-            config: config.clone(),
-            genesis_validators_root: Root::ZERO,
-        });
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
         let clock = SlotClock::from_config(0, &config);
         let node = Arc::new(MockBeaconNode::new());
         let store = empty_store();
