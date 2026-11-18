@@ -280,20 +280,21 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
 /// twice) and returns the same group element as the sequential sum; only the
 /// order of additions differs, and the group is commutative.
 ///
-/// From 384 points up, on a host with two or more CPUs, blst splits the work
-/// over its own thread pool, which is separate from rayon's; below that, or on
-/// one CPU, it runs on the calling thread. The pool is the one blst's pairing
-/// already ran on before this helper existed, so the sums join the same queue
-/// rather than adding threads. Either way the answer is the same, so the
-/// caller needs no size check.
+/// In blst 0.3.16, from 384 points up on a host with two or more CPUs, the sum
+/// is split over blst's own thread pool (not rayon's; the one its pairing
+/// already runs on), and below that it runs on the calling thread. The answer
+/// is the same either way, so the caller needs no size check.
 ///
 /// The empty slice is guarded here because `MultiPoint::add` indexes the
-/// slice's first element and would panic on it.
+/// slice's first element and would panic on it. A single point is its own
+/// sum, so an aggregate with one signer skips the batched routine and its
+/// conversion back to affine coordinates.
 fn sum_validated_points(points: &[PublicKey]) -> Option<PublicKey> {
-    if points.is_empty() {
-        return None;
+    match points {
+        [] => None,
+        [single] => Some(*single),
+        _ => Some(MultiPoint::add(points).to_public_key()),
     }
-    Some(points.add().to_public_key())
 }
 
 /// Builds `specs/altair/bls.md`'s `G2_POINT_AT_INFINITY` constant: the
@@ -619,11 +620,11 @@ mod tests {
     #[test]
     fn the_batched_sum_matches_the_sequential_one_at_every_size() {
         // One point, a pair, then both sides of blst's 384-point thread-pool
-        // threshold, then larger runs. Which side of the threshold runs also
-        // depends on the host: on one CPU everything stays on the calling
-        // thread. On more, every pool worker's chunk stays below
-        // `blst_p1s_add`'s scratch stride, so that inner loop is never
-        // reached through the safe API.
+        // threshold, then larger runs. Which paths run depends on the host. On
+        // one CPU everything stays on the calling thread, and the 2000-point
+        // run takes two passes through `blst_p1s_add`'s 1024-point scratch
+        // buffer. On two or more, the pool hands each worker about 256 points,
+        // so the threaded split runs instead and no sum takes a second pass.
         for count in [1u64, 2, 3, 17, 383, 384, 385, 767, 2000] {
             let points = validated_run(1000..1000 + count);
             assert_eq!(
