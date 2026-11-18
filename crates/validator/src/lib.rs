@@ -40,7 +40,7 @@ pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
-pub(crate) mod secure_fs;
+pub mod secure_fs;
 pub mod signing;
 pub mod slashing_protection;
 pub mod slot_clock;
