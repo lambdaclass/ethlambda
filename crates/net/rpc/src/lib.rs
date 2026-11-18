@@ -56,20 +56,17 @@ pub struct RpcConfig {
 /// stub. The driver swaps its own `Store` on every `fork_choice/init`, so we
 /// don't share state with the regular consensus path (which isn't running in
 /// driver mode anyway — see `bin/ethlambda/src/main.rs`).
+///
+/// Served through `serve` like the node's own servers, so a simulator
+/// connection that stops reading holds shutdown for at most
+/// `HTTP_DRAIN_TIMEOUT`.
 pub async fn start_test_driver_rpc_server(
     config: RpcConfig,
     driver: test_driver::DriverState,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let app = test_driver::build_router(driver);
-    let addr = SocketAddr::new(config.http_address, config.api_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await?;
-    Ok(())
+    serve(config.http_address, config.api_port, app, shutdown).await
 }
 
 pub async fn start_rpc_server(
