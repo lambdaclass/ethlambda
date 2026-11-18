@@ -101,12 +101,12 @@ pub struct SetGasLimitRequest {
 }
 
 /// The key in the path, or a 400 when it is not one.
-fn parse_path_key(text: &str) -> Result<BlsPubkey, ApiError> {
+pub(crate) fn parse_path_key(text: &str) -> Result<BlsPubkey, ApiError> {
     parse_pubkey(text).map_err(|err| ApiError::BadRequest(err.to_string()))
 }
 
 /// A 404 unless the store holds `pubkey`.
-fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiError> {
+pub(crate) fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiError> {
     if store.contains(pubkey) {
         Ok(())
     } else {
@@ -137,17 +137,18 @@ fn parse_address(text: &str) -> Result<ExecutionAddress, ApiError> {
 
 /// A decimal `u64` with no sign and no leading zero, the specification's
 /// `Uint64` pattern. Stricter than `str::parse`, which takes a leading `+`.
-fn parse_uint64(text: &str) -> Result<u64, ApiError> {
+/// `field` names the value in the 400.
+pub(crate) fn parse_uint64(field: &str, text: &str) -> Result<u64, ApiError> {
     let well_formed = !text.is_empty()
         && text.bytes().all(|byte| byte.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
     if !well_formed {
         return Err(ApiError::BadRequest(format!(
-            "gas_limit {text:?} is not a decimal unsigned integer"
+            "{field} {text:?} is not a decimal unsigned integer"
         )));
     }
     text.parse()
-        .map_err(|_| ApiError::BadRequest(format!("gas_limit {text} does not fit in 64 bits")))
+        .map_err(|_| ApiError::BadRequest(format!("{field} {text} does not fit in 64 bits")))
 }
 
 pub async fn get_fee_recipient(
@@ -292,7 +293,15 @@ pub async fn set_gas_limit(
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
     let Json(request) = body?;
-    let gas_limit = parse_uint64(&request.gas_limit)?;
+    let gas_limit = parse_uint64("gas_limit", &request.gas_limit)?;
+    // Refused as `--gas-limit` refuses it. From gloas this value is signed
+    // into the proposer preferences, which cannot be replaced for their
+    // dependent root, and the node builds this client's payload toward it.
+    if gas_limit == 0 {
+        return Err(ApiError::BadRequest(
+            "a gas limit of zero cannot be set".to_string(),
+        ));
+    }
 
     let store = context.store.read().await;
     require_held(&store, &pubkey)?;
@@ -330,6 +339,7 @@ mod tests {
 
     use super::*;
     use crate::http_api::router;
+    use crate::http_api::tests::exit_route_context;
     use crate::proposer_settings::{DEFAULT_GAS_LIMIT, ProposerSettings};
 
     const TOKEN: &str = "test-token";
@@ -361,12 +371,17 @@ mod tests {
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let settings = Arc::new(ProposerSettings::new(default_graffiti(), fee_recipient));
         let dir = tempfile::tempdir().expect("temp dir");
+        let (beacon_node, signing, clock) = exit_route_context();
         let context = KeymanagerContext {
             store: Arc::new(RwLock::new(store)),
             settings: settings.clone(),
             validators_dir: dir.path().to_path_buf(),
             secrets_dir: dir.path().to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            default_remote_signer: None,
+            beacon_node,
+            signing,
+            clock,
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
         };
@@ -569,6 +584,22 @@ mod tests {
             harness.settings.gas_limit(&harness.pubkey),
             DEFAULT_GAS_LIMIT
         );
+    }
+
+    /// `"0"` is a well-formed `Uint64`, but refused as `--gas-limit` refuses
+    /// it, and an override already set is left as it was.
+    #[tokio::test]
+    async fn a_zero_gas_limit_is_refused() {
+        let harness = harness(None);
+        let path = uri(&harness.pubkey, "gas_limit");
+        let set = serde_json::json!({ "gas_limit": "30000000" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let zero = serde_json::json!({ "gas_limit": "0" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(zero))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(harness.settings.gas_limit(&harness.pubkey), 30_000_000);
     }
 
     #[tokio::test]

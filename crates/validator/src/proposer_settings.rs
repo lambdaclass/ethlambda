@@ -20,8 +20,15 @@
 //! change is registered at the next epoch boundary. A block proposed before
 //! then pays the address the node was last told, which the check before
 //! signing reports as a mismatch.
+//!
+//! From gloas a node pays the address in the proposer preferences it holds for
+//! the slot instead, and gas limit likewise, and a preference cannot be
+//! replaced for its dependent root: a change reaches gloas blocks from the next
+//! dependent root on. The check before signing accepts the address of a
+//! preference a node accepted.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H256};
@@ -57,11 +64,16 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
     String::from_utf8_lossy(&graffiti.0[..GRAFFITI_BYTES - padding]).into_owned()
 }
 
-/// The gas limit a validator with no override reports.
+/// The gas limit a validator with no override reports, unless `--gas-limit`
+/// names another.
 ///
-/// Lighthouse's and Nimbus's default. Nothing in this client uses it yet: it
-/// matters only to builder registrations, and there is no builder flow. It is
-/// held so the keymanager API can serve it as the specification requires.
+/// Lighthouse's and Nimbus's default (Lighthouse's when the network config
+/// names no gas limit schedule, which this client does not read). Builder
+/// registrations carry it as the gas limit the builder should target, from
+/// gloas the proposer preferences carry it as the target the node's own
+/// payload is built toward too, and the keymanager API serves it as the
+/// specification requires. A network whose gas limit is elsewhere needs
+/// `--gas-limit`, or every proposal pulls its limit toward this one.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// One validator's overrides; `None` means the default applies.
@@ -75,6 +87,11 @@ struct Overrides {
 impl Overrides {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The overrides a builder registration carries.
+    fn registered(&self) -> (Option<ExecutionAddress>, Option<u64>) {
+        (self.fee_recipient, self.gas_limit)
     }
 }
 
@@ -98,6 +115,11 @@ struct Inner {
 #[derive(Debug)]
 pub struct ProposerSettings {
     inner: RwLock<Inner>,
+    /// Bumped whenever a write or delete changes a fee recipient or gas limit
+    /// override, so a reader that caches something derived from those (the
+    /// builder registrations) can tell that nothing changed without reading
+    /// every key. A graffiti write leaves it alone: nothing cached reads it.
+    generation: AtomicU64,
 }
 
 impl ProposerSettings {
@@ -111,7 +133,26 @@ impl ProposerSettings {
                 default_gas_limit: DEFAULT_GAS_LIMIT,
                 overrides: HashMap::new(),
             }),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// These settings with `gas_limit` as the gas limit of every validator
+    /// with no override of its own, in place of [`DEFAULT_GAS_LIMIT`].
+    pub fn with_default_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .default_gas_limit = gas_limit;
+        self
+    }
+
+    /// A counter that moves whenever a write or delete changes a fee
+    /// recipient or gas limit override; one that leaves them as they were
+    /// does not move it. Equal readings mean no per-key fee recipient or gas
+    /// limit changed between them.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn read<T>(&self, f: impl FnOnce(&Inner) -> T) -> T {
@@ -123,9 +164,16 @@ impl ProposerSettings {
     fn update(&self, pubkey: &BlsPubkey, f: impl FnOnce(&mut Overrides)) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let entry = inner.overrides.entry(*pubkey).or_default();
+        let before = entry.registered();
         f(entry);
+        let changed = entry.registered() != before;
         if entry.is_empty() {
             inner.overrides.remove(pubkey);
+        }
+        // Inside the write lock, so a reader that sees the new generation also
+        // sees the new value.
+        if changed {
+            self.generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -135,6 +183,29 @@ impl ProposerSettings {
         self.read(|inner| {
             let overridden = inner.overrides.get(pubkey).and_then(|o| o.fee_recipient);
             overridden.or(inner.default_fee_recipient)
+        })
+    }
+
+    /// `pubkey`'s fee recipient and gas limit read together, under one lock, or
+    /// `None` when it has no fee recipient.
+    ///
+    /// For a signed message that carries both (a builder registration, proposer
+    /// preferences): two separate reads could straddle a keymanager write and
+    /// pair an old address with a new gas limit, a combination the operator
+    /// never configured, which the builder then keeps.
+    pub fn fee_recipient_and_gas_limit(
+        &self,
+        pubkey: &BlsPubkey,
+    ) -> Option<(ExecutionAddress, u64)> {
+        self.read(|inner| {
+            let overrides = inner.overrides.get(pubkey);
+            let fee_recipient = overrides
+                .and_then(|o| o.fee_recipient)
+                .or(inner.default_fee_recipient)?;
+            let gas_limit = overrides
+                .and_then(|o| o.gas_limit)
+                .unwrap_or(inner.default_gas_limit);
+            Some((fee_recipient, gas_limit))
         })
     }
 
@@ -182,7 +253,11 @@ impl ProposerSettings {
     /// signs with. A key imported again later starts on the defaults.
     pub fn forget(&self, pubkey: &BlsPubkey) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        inner.overrides.remove(pubkey);
+        let removed = inner.overrides.remove(pubkey);
+        let unset = (None, None);
+        if removed.is_some_and(|overrides| overrides.registered() != unset) {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -221,6 +296,47 @@ mod tests {
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
         assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+    }
+
+    /// `--gas-limit` replaces the default every key without an override gets,
+    /// in the pair a preference signs too; an override still wins, and
+    /// clearing it falls back to the configured default, not the built-in one.
+    #[test]
+    fn a_configured_default_gas_limit_replaces_the_built_in_one() {
+        let settings = settings().with_default_gas_limit(200_000_000);
+        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1)),
+            Some((H160([0xaa; 20]), 200_000_000))
+        );
+
+        settings.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(2)), 200_000_000);
+        settings.clear_gas_limit(&key(1));
+        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+    }
+
+    /// The pair a signed registration or preference carries agrees with the
+    /// two separate reads, and is `None` exactly when there is no address.
+    #[test]
+    fn the_fee_recipient_and_gas_limit_read_together_match_the_single_reads() {
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+
+        settings.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        settings.set_fee_recipient(&key(1), H160([0xbb; 20]));
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1)),
+            Some((H160([0xbb; 20]), 30_000_000))
+        );
+
+        let defaults = self::settings();
+        assert_eq!(
+            defaults.fee_recipient_and_gas_limit(&key(2)),
+            Some((H160([0xaa; 20]), DEFAULT_GAS_LIMIT))
+        );
     }
 
     /// Clearing one field leaves the others overridden.
@@ -282,5 +398,36 @@ mod tests {
         settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
         settings.clear_graffiti(&key(1));
         assert!(settings.read(|inner| inner.overrides.is_empty()));
+    }
+
+    /// The generation moves with what a registration carries, and only then:
+    /// a graffiti write, a write of the value already held, or forgetting a
+    /// key with no such override makes no reader re-check every key.
+    #[test]
+    fn the_generation_moves_only_with_a_fee_recipient_or_gas_limit() {
+        let settings = settings();
+        let moved = |settings: &ProposerSettings, write: &dyn Fn(&ProposerSettings)| {
+            let before = settings.generation();
+            write(settings);
+            settings.generation() != before
+        };
+        let address = H160([0x33; 20]);
+
+        assert!(moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
+        assert!(!moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
+        assert!(moved(&settings, &|s| s.set_gas_limit(&key(1), 30_000_000)));
+        assert!(!moved(&settings, &|s| s
+            .set_graffiti(&key(1), Bytes32::repeat_byte(0x22))));
+        assert!(!moved(&settings, &|s| s.clear_graffiti(&key(1))));
+        assert!(moved(&settings, &|s| s.clear_gas_limit(&key(1))));
+        assert!(!moved(&settings, &|s| s.clear_gas_limit(&key(1))));
+        assert!(moved(&settings, &|s| s.clear_fee_recipient(&key(1))));
+        assert!(!moved(&settings, &|s| s.clear_fee_recipient(&key(1))));
+        assert!(moved(&settings, &|s| s.set_fee_recipient(&key(1), address)));
+        assert!(moved(&settings, &|s| s.forget(&key(1))));
+
+        settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x22));
+        assert!(!moved(&settings, &|s| s.forget(&key(2))));
+        assert!(!moved(&settings, &|s| s.forget(&key(3))));
     }
 }

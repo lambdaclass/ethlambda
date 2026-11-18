@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{checkpoint_state, get_current_store_epoch, get_head_node},
+    fork_choice::{
+        checkpoint_state, compute_shuffling_dependent_slot, get_current_store_epoch, get_head_node,
+    },
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
@@ -535,11 +537,11 @@ impl DependentRoot {
     /// definition names the genesis block where its subtraction would
     /// underflow, which is slot 0.
     fn slot(self, epoch: Epoch) -> Slot {
-        let epoch = match self {
-            Self::V1 => epoch,
-            Self::V2 => epoch.saturating_sub(1),
-        };
-        compute_start_slot_at_epoch(epoch).saturating_sub(1)
+        match self {
+            Self::V1 => compute_start_slot_at_epoch(epoch).saturating_sub(1),
+            // The state transition's own definition, so the two cannot drift.
+            Self::V2 => compute_shuffling_dependent_slot(epoch),
+        }
     }
 }
 
@@ -866,7 +868,7 @@ fn payload_present_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{beacon_store_at, idle_engine};
+    use crate::test_utils::{beacon_store_at, idle_engine, slot_root};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -882,6 +884,22 @@ mod tests {
 
     const COUNT: usize = 64;
 
+    /// Each definition's slot where its subtraction saturates and past it. V2
+    /// is beacon-APIs' `compute_start_slot_at_epoch(epoch - 1) - 1`, which the
+    /// state transition's helper computes; an off-by-one there would still
+    /// pass this node's own preference check and fail every other client's.
+    #[test]
+    fn each_dependent_root_names_the_slot_beacon_apis_defines() {
+        let slots = preset::SLOTS_PER_EPOCH;
+        assert_eq!(DependentRoot::V1.slot(0), 0);
+        assert_eq!(DependentRoot::V1.slot(1), slots - 1);
+        assert_eq!(DependentRoot::V1.slot(100), 100 * slots - 1);
+        assert_eq!(DependentRoot::V2.slot(0), 0);
+        assert_eq!(DependentRoot::V2.slot(1), 0);
+        assert_eq!(DependentRoot::V2.slot(2), slots - 1);
+        assert_eq!(DependentRoot::V2.slot(100), 99 * slots - 1);
+    }
+
     /// A fulu state one epoch past genesis with its lookahead filled in, as
     /// every real fulu state has it, and distinct block roots per slot so a
     /// `dependent_root` taken from the wrong slot shows up.
@@ -893,7 +911,7 @@ mod tests {
         };
         fulu.proposer_lookahead = lookahead.try_into().unwrap();
         for slot in 0..fulu.block_roots.len() {
-            fulu.block_roots[slot] = H256::repeat_byte(slot as u8 + 1);
+            fulu.block_roots[slot] = slot_root(slot as u64);
         }
         state
     }
