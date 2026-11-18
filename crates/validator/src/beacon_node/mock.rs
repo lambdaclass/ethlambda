@@ -1361,10 +1361,12 @@ impl BeaconNodeApi for MockBeaconNode {
     /// empty request is answered without asking, and a syncing or optimistic
     /// node answers `BeaconNodeSyncing`.
     async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
-        self.guard("liveness")?;
+        // Ahead of the configured failures: an empty request never reaches
+        // a node, so no node can fail it.
         if indices.is_empty() {
             return Ok(Vec::new());
         }
+        self.guard("liveness")?;
         if self.syncing || self.optimistic {
             return Err(Error::BeaconNodeSyncing);
         }

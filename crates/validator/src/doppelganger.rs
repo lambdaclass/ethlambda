@@ -63,7 +63,10 @@
 //! - Only an explicit `is_live: false` counts towards a clean epoch, and only
 //!   when both of the tick's questions were answered. A failed query, or a
 //!   node that is syncing (see [`BeaconNodeApi::liveness`]), makes no
-//!   progress; the epoch is checked again at its next chance.
+//!   progress. The epoch it was deciding is not asked about again, since a
+//!   node answers only for the previous, current and next epoch; the key
+//!   waits for the next epoch to be seen clean instead, so a failure costs
+//!   an epoch of signing, never an epoch of checking.
 //!
 //! # What it cannot do
 //!
@@ -188,6 +191,16 @@ impl Doppelganger {
     /// import does for each key it adds.
     pub fn register_now(&self, pubkey: BlsPubkey, clock: &SlotClock) {
         self.register(pubkey, current_epoch(clock));
+    }
+
+    /// Stop checking `pubkey`: what a keymanager delete does for each key it
+    /// takes out of the store, so a check already in flight cannot read the
+    /// copy the operator now runs elsewhere as a doppelganger. The next check
+    /// would forget it anyway (see [`Self::reconcile`]); this closes the gap
+    /// before it.
+    pub fn forget(&self, pubkey: &BlsPubkey) {
+        self.watched().remove(pubkey);
+        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
     }
 
     /// [`Self::register`] for every key, under one lock.
@@ -334,7 +347,9 @@ impl Doppelganger {
                 let Some(watch) = watched.get(pubkey) else {
                     continue;
                 };
-                if answered_epoch >= watch.first_checked_epoch {
+                // Once per validator, at the earlier epoch it was seen in.
+                let seen = applied.sightings.iter().any(|s| s.index == answer.index);
+                if answered_epoch >= watch.first_checked_epoch && !seen {
                     applied.sightings.push(Sighting {
                         index: answer.index,
                         pubkey: *pubkey,
@@ -444,11 +459,36 @@ impl Doppelganger {
         let mut indices: Vec<ValidatorIndex> = asked.keys().copied().collect();
         indices.sort_unstable();
 
-        let previous = match epoch.checked_sub(1) {
-            Some(previous) => liveness(beacon_node, slot, previous, &indices).await,
-            None => None,
+        // Both at once: through `HttpBeaconNode` each is a syncing check and
+        // then the query, and the tick at an epoch's last slot, the only one
+        // that can clear a key, should be done well before the next epoch's
+        // first duties.
+        let previous_epoch = epoch.checked_sub(1);
+        let ask_previous = async {
+            match previous_epoch {
+                Some(previous) => Some(beacon_node.liveness(previous, &indices).await),
+                None => None,
+            }
         };
-        let current = liveness(beacon_node, slot, epoch, &indices).await;
+        let (previous, current) = tokio::join!(ask_previous, beacon_node.liveness(epoch, &indices));
+        let failures: Vec<String> = previous_epoch
+            .zip(previous.as_ref())
+            .into_iter()
+            .chain([(epoch, &current)])
+            .filter_map(|(asked_epoch, answer)| {
+                let err = answer.as_ref().err()?;
+                Some(format!("epoch {asked_epoch}: {err}"))
+            })
+            .collect();
+        if !failures.is_empty() {
+            warn!(
+                %slot,
+                ?failures,
+                "Doppelganger liveness query failed; this tick counts no epoch as clean"
+            );
+        }
+        let previous = previous.and_then(Result::ok);
+        let current = current.ok();
         let applied = self.apply(slot, &asked, previous.as_deref(), current.as_deref());
         crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
 
@@ -474,6 +514,21 @@ impl Doppelganger {
         }
         if !applied.progressed {
             crate::metrics::inc_doppelganger_check_failures();
+            // Said at error once an epoch, at the one tick whose failure
+            // costs something: an operator whose node never answers (one
+            // without the endpoint, say) otherwise sees only missed
+            // attestations and a warning among many.
+            if (slot + 1).is_multiple_of(SLOTS_PER_EPOCH) {
+                error!(
+                    %slot,
+                    epoch = previous_epoch,
+                    validators = self.detecting(),
+                    "Doppelganger protection could not count this epoch as clean, for want of a \
+                     liveness answer: the validators under the check stay withheld at least \
+                     another epoch. A beacon node without /eth/v1/validator/liveness never \
+                     clears them"
+                );
+            }
         }
         if !applied.cleared.is_empty() {
             info!(
@@ -484,28 +539,6 @@ impl Doppelganger {
             );
         }
     }
-}
-
-/// Ask `beacon_node` about `indices` in `epoch`, or `None` (logged) when it
-/// does not answer.
-async fn liveness<B: BeaconNodeApi>(
-    beacon_node: &B,
-    slot: Slot,
-    epoch: Epoch,
-    indices: &[ValidatorIndex],
-) -> Option<Vec<Liveness>> {
-    beacon_node
-        .liveness(epoch, indices)
-        .await
-        .inspect_err(|err| {
-            warn!(
-                %slot,
-                epoch,
-                %err,
-                "Doppelganger liveness query failed; this epoch's check makes no progress"
-            )
-        })
-        .ok()
 }
 
 /// When the check for `slot` runs.
@@ -714,6 +747,23 @@ mod tests {
         let applied = doppelganger.apply(first_slot(E + 3), &asked, Some(&live), None);
         assert_eq!(applied.sightings.len(), 1);
         assert!(doppelganger.is_detected());
+    }
+
+    /// Live in both epochs asked about is one sighting, at the earlier.
+    #[test]
+    fn a_key_live_in_both_epochs_is_sighted_once() {
+        let (doppelganger, asked) = watching_one();
+        let live = answers(&[(7, true)]);
+        let applied = doppelganger.apply(first_slot(E + 2), &asked, Some(&live), Some(&live));
+        assert_eq!(
+            applied.sightings,
+            vec![Sighting {
+                index: 7,
+                pubkey: pubkey(1),
+                epoch: E + 1
+            }]
+        );
+        assert_eq!(doppelganger.sightings(), applied.sightings);
     }
 
     /// A key imported again starts over, as Lighthouse's does.

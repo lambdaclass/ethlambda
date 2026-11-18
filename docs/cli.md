@@ -474,8 +474,13 @@ silent for a full epoch, through the standard
   no progress. With several `--beacon-nodes`, a syncing one is skipped for the
   next.
 - So a key registered in `E` signs from `E + 3`, missing two to three epochs of
-  attestations. At genesis keys sign at once, as Lighthouse's do: every
-  validator missing those epochs together could stall a new chain.
+  attestations. A key registered in epoch 0 (before genesis or during the
+  chain's first epoch, at startup or by import) signs at once, as Lighthouse's
+  do: every validator missing those epochs together could stall a new chain.
+- An epoch that could not be counted clean (no beacon node answered at its
+  deciding slot) is not asked about again, since a node answers only for the
+  previous, current and next epoch: the key waits for the next epoch instead,
+  and the miss is logged at error.
 
 Withheld while a key is checked: attestations, blocks (with the RANDAO reveal)
 and aggregates, the last because a node marks an aggregator live and would
@@ -485,7 +490,10 @@ cleared, and sync committee messages and contributions, payload timeliness
 votes, builder registrations, proposer preferences and voluntary exits are
 signed as usual, as Lighthouse's client signs them during its own check. None
 of them is slashable, and an ethlambda beacon node counts none of them as
-liveness: it counts attestations, aggregates and block proposers.
+liveness: it counts attestations, aggregates and block proposers. A beacon node
+that did count one of them (a sync committee message, say) would report this
+client's own message back as a doppelganger and stop it; against such a node,
+leave the flag off.
 
 A key with no validator index yet is not asked about and stays withheld; with
 no index it has no duties either. A key deleted through the keymanager API is

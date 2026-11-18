@@ -254,7 +254,10 @@ pub async fn import(
             Ok(Some((pubkey, signer))) => {
                 info!(pubkey = %encode_hex(&pubkey.0), url = signer.url(), "Imported remote validator key");
                 // Under the store's write guard with the insert, so the duty
-                // loop never sees the key before it is checked.
+                // loop never sees the key before it is checked. Always a key
+                // this process did not hold: `prepare_import` answers
+                // `duplicate` for one the store holds, so unlike the
+                // keystores route there is no re-import to spare.
                 if let Some(doppelganger) = context.signing.doppelganger() {
                     doppelganger.register_now(pubkey, &context.clock);
                 }
@@ -377,6 +380,10 @@ fn judge_delete(
 
     if in_memory {
         store.remove(pubkey);
+        // No longer checked, for the reason the keystores route gives.
+        if let Some(doppelganger) = context.signing.doppelganger() {
+            doppelganger.forget(pubkey);
+        }
     }
     // The store still holding the key means it holds it as a local one,
     // while the file lists a remote entry for it, which only a hand edit
@@ -495,7 +502,9 @@ mod tests {
     }
 
     /// With doppelganger protection on, an imported remote key is checked
-    /// before it signs, like every key loaded at startup.
+    /// before it signs, like every key loaded at startup; importing it again
+    /// is a duplicate that leaves its standing alone, and deleting it stops
+    /// the check.
     #[tokio::test]
     async fn an_imported_remote_key_is_withheld_by_doppelganger_protection() {
         use ethlambda_types::beacon::config::Config;
@@ -510,22 +519,36 @@ mod tests {
                 .with_doppelganger(doppelganger.clone()),
         );
         let app = router(context, TOKEN.to_string());
-
-        let (status, body) = send(
-            app,
+        let import = || {
             authed(
                 "POST",
                 "/eth/v1/remotekeys",
                 serde_json::json!({ "remote_keys": [{ "pubkey": pubkey_hex(1), "url": SIGNER }] }),
-            ),
-        )
-        .await;
+            )
+        };
+
+        let (status, body) = send(app.clone(), import()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(statuses(&body), ["imported"]);
         let pubkey = BlsPubkey([1; 48]);
         assert!(store.read().await.contains(&pubkey));
         assert!(!doppelganger.allows_signing(&pubkey));
         assert_eq!(doppelganger.detecting(), 1);
+
+        // Cleared since, as at genesis; a repeat import changes nothing.
+        doppelganger.register(pubkey, 0);
+        let (_, body) = send(app.clone(), import()).await;
+        assert_eq!(statuses(&body), ["duplicate"]);
+        assert!(doppelganger.allows_signing(&pubkey));
+
+        let delete = serde_json::json!({ "pubkeys": [pubkey_hex(1)] });
+        let (_, body) = send(app, authed("DELETE", "/eth/v1/remotekeys", delete)).await;
+        assert_eq!(statuses(&body), ["deleted"]);
+        assert!(
+            !doppelganger.allows_signing(&pubkey),
+            "forgotten, so an unknown key"
+        );
+        assert_eq!(doppelganger.detecting(), 0, "and not counted as checked");
     }
 
     #[tokio::test]

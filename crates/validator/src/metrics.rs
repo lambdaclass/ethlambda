@@ -431,12 +431,13 @@ static DOPPELGANGER_DETECTING: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Doppelganger checks that could not count their epoch as clean because a
-/// liveness query failed or a beacon node was syncing.
+/// Doppelganger checks (one a slot while a key is withheld) that got no
+/// liveness answer: a query failed, or every beacon node was syncing. Only a
+/// failure at an epoch's last slot costs anything, an epoch of signing.
 static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ethlambda_validator_doppelganger_check_failures_total",
-        "Doppelganger checks that made no progress for want of a liveness answer"
+        "Doppelganger checks, one a slot while a key is withheld, that got no liveness answer"
     )
     .unwrap()
 });

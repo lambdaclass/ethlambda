@@ -1109,6 +1109,12 @@ fn judge_delete(
     // with the key, so its overrides have nothing left to apply to. A key
     // imported again starts on the defaults.
     context.settings.forget(pubkey);
+    // Nor is it checked any more: the copy the operator may now run elsewhere
+    // is not a doppelganger of this client's. One imported again is checked
+    // from the start.
+    if in_memory && let Some(doppelganger) = context.signing.doppelganger() {
+        doppelganger.forget(pubkey);
+    }
 
     if entry != Some(Origin::Local) && !in_memory {
         return Judged::Absent;

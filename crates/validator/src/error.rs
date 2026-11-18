@@ -10,7 +10,7 @@
 //! any other config can fail this way; it carries the path so the caller does
 //! not have to guess which file it was.
 
-use ethlambda_types::beacon::primitives::BlsPubkey;
+use ethlambda_types::beacon::primitives::{BlsPubkey, ValidatorIndex};
 
 /// The EIP-2335 keystore schema version this client understands.
 pub const EIP2335_KEYSTORE_VERSION: u64 = 4;
@@ -175,7 +175,13 @@ pub enum Error {
         "doppelganger detected for validators {validators:?}: another client is running their \
          keys"
     )]
-    DoppelgangerDetected { validators: Vec<u64> },
+    DoppelgangerDetected { validators: Vec<ValidatorIndex> },
+    /// The doppelganger check's task ended, which it only does by panicking.
+    /// Its keys would stay withheld for the rest of the process with nothing
+    /// saying why, so the client stops for its supervisor to restart, as it
+    /// does for an unusable slashing-protection record. Never retryable.
+    #[error("the doppelganger check stopped: {reason}")]
+    DoppelgangerCheckStopped { reason: String },
 
     /// The slashing-protection record could not be opened, read or written,
     /// or refuses to start: a key with no record, another chain's record,
@@ -269,6 +275,7 @@ impl Error {
             | Self::Signing { .. }
             | Self::DoppelgangerProtected(_)
             | Self::DoppelgangerDetected { .. }
+            | Self::DoppelgangerCheckStopped { .. }
             | Self::SlashingProtection { .. }
             | Self::SlashingProtectionUnusable { .. }
             | Self::Io { .. }

@@ -391,16 +391,16 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     // The check runs on its own clock, three quarters into each slot, so a
     // slow duty never delays it and a slow liveness query never delays a
-    // duty.
-    if let Some(doppelganger) = &doppelganger {
-        let check = doppelganger::run(
+    // duty. Its handle is kept: the duties race it below, and it is aborted
+    // once the client stops.
+    let mut check = doppelganger.as_ref().map(|doppelganger| {
+        tokio::spawn(doppelganger::run(
             doppelganger.clone(),
             beacon_node.clone(),
             store.clone(),
             clock.clone(),
-        );
-        tokio::spawn(check);
-    }
+        ))
+    });
 
     // The duty loop, as a future that ends only with the error that stopped
     // it. Not awaited here: `run_until_stopped` races it against the
@@ -596,12 +596,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // does: what is left of them signs nothing slashable anyway (see
     // `Doppelganger::allows_signing`), and the operator has to find the
     // other client before this one runs again.
+    //
+    // The check's task ending stops them too. It loops for the life of the
+    // client, so it ends only by panicking, which would leave every key it
+    // had not cleared withheld for good with nothing to say why; stopping
+    // hands the supervisor the restart, as an unusable record does.
     let duties = async {
-        let Some(doppelganger) = &doppelganger else {
+        let (Some(doppelganger), Some(check)) = (&doppelganger, &mut check) else {
             return duty_loop.await;
         };
         tokio::select! {
-            err = duty_loop => err,
+            // A sighting is reported as one even when the check's task ends
+            // in the same poll.
+            biased;
             () = doppelganger.detected() => {
                 let validators = doppelganger
                     .sightings()
@@ -610,10 +617,26 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     .collect();
                 Error::DoppelgangerDetected { validators }
             }
+            ended = check => {
+                let reason = match ended {
+                    Err(err) => err.to_string(),
+                    Ok(()) => "its task returned".to_string(),
+                };
+                let err = Error::DoppelgangerCheckStopped { reason };
+                error!(%err, "Stopping so the validator client can be restarted");
+                err
+            }
+            err = duty_loop => err,
         }
     };
 
-    Err(run_until_stopped(duties, &protection, shutdown, keymanager).await)
+    let stopped = run_until_stopped(duties, &protection, shutdown, keymanager).await;
+    // Whatever stopped the client, the check stops with it rather than
+    // polling the beacon node for a runtime that outlives `run`.
+    if let Some(check) = check {
+        check.abort();
+    }
+    Err(stopped)
 }
 
 /// Whether doppelganger protection lets the validator a duty names act on
@@ -630,7 +653,7 @@ fn doppelganger_cleared(context: &SigningContext, pubkey: &str) -> bool {
 /// anything for them.
 fn withhold_uncleared(
     context: &SigningContext,
-    slot: u64,
+    slot: ethlambda_types::beacon::primitives::Slot,
     duties: Vec<crate::beacon_node::dto::AttesterDutyDto>,
 ) -> Vec<crate::beacon_node::dto::AttesterDutyDto> {
     if context.doppelganger().is_none() {
