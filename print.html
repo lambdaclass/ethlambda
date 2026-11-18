@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6bc2ad9e.js";
+            window.path_to_searchindex_js = "searchindex-9e00b40f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2888,6 +2888,41 @@ validators, P3 off) until the first refresh, which runs at startup. Every 10
 s the swarm task disconnects peers below the graylist. There is no ban list:
 a peer’s negative score is kept for <code>retain_score</code> (100 epochs) after it
 leaves, so a peer that reconnects comes back graylisted and is dropped again.</p>
+<p>The same check also disconnects a peer gossipsub reported as slow (<code>SlowPeer</code>:
+its send queue refused a message, or a message expired in it) in each of the
+last <code>SLOW_PEER_CHECK_LIMIT</code> checks. This is for a dead gossipsub stream, not
+for slowness in general. The connection handler disables itself for good after
+a few substream negotiations on one connection, successful ones included, and
+then never takes another message off the queue. Gossipsub keeps queueing for
+the peer until the queue is full, and a queued message is only dropped when
+the handler takes it off, so the queue’s message copies stay in memory for as
+long as other protocols keep the connection open. On the mainnet follower,
+such queues held about 490 MB. Gossipsub’s own penalty for these failures
+(<code>slow_peer_weight</code>) left the peer in the <code>negative</code> band, never near the
+graylist. Lighthouse penalizes <code>SlowPeer</code> reports through its peer manager
+instead.</p>
+<p>Two limits keep a slow node of our own from costing it its peers. Gossipsub
+counts a forward that waited too long in a peer’s queue as the same failure as
+a full queue, so a saturated uplink or a stalled runtime on our side makes
+every peer look slow at once:</p>
+<ul>
+<li>A report counts only when its priority or its non-priority failures exceed
+<code>SLOW_PEER_REPORT_THRESHOLD</code>. Lighthouse applies the same cut. A dead stream
+fails every message queued for the peer; a few failures in a heartbeat are
+more likely late forwards.</li>
+<li>One check disconnects at most <code>MAX_SLOW_PEER_DISCONNECTS_PER_CHECK</code> peers,
+the ones with the most failed messages first. The others keep their streak,
+so a peer still failing at the next check is disconnected then. Peers held
+back this way are logged as a warning, since many peers failing together
+points at our side.</li>
+</ul>
+<p>The cap bounds the rate, not the total. A node whose own uplink stays too slow
+for gossip past the streak still loses up to <code>MAX_SLOW_PEER_DISCONNECTS_PER_CHECK</code>
+peers per check while discovery refills them. That case is deliberately left
+alone: bandwidth that slow is not something the node can solve from its side.</p>
+<p>A dead stream on a peer that gets little traffic, such as one gossipsub has
+already pruned from the mesh, may stay under the threshold. Its queue then
+stays pinned until the connection closes, as it did before this check existed.</p>
 <p>Around a fork-digest boundary the node holds two digests’ topics, and every
 held digest gets the whole parameter set (exits and slashings included),
 scored by its role:</p>
@@ -3379,6 +3414,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><td><code>lean_beacon_aggregates_deferred</code></td><td>Aggregates held until their own slot has passed</td></tr>
 <tr><td><code>lean_gossipsub_peers_by_score{band}</code></td><td>Gossipsub peers by score band; see <a href="#peer-scoring">Peer scoring</a></td></tr>
 <tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Peers disconnected for a score below the graylist</td></tr>
+<tr><td><code>lean_gossipsub_slow_peer_disconnects_total</code></td><td>Peers disconnected for persistently failing to take gossipsub messages; see <a href="#peer-scoring">Peer scoring</a></td></tr>
 <tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>1 while P3 is scored, 0 while the head lags or is warming up</td></tr>
 <tr><td><code>lean_beacon_publish_data_columns_seconds</code></td><td>Time to compute and verify a published block’s cells and build its sidecars; see <a href="#metrics-2">metrics.md</a></td></tr>
 </tbody>
@@ -4731,6 +4767,7 @@ data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 </table>
 </div>
 <p>Events are fanned out over a single bounded broadcast channel shared by all topics. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line <code>: error - dropped N messages</code> marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.</p>
+<p>The stream ends when the node shuts down; expect the connection to close and reconnect once the node is back. A client that has stopped reading can still stall its response, as it can any other, so the HTTP servers wait at most <code>HTTP_DRAIN_TIMEOUT</code> (<code>crates/net/rpc/src/lib.rs</code>) for responses still in flight before they stop waiting. The bound applies to every response, one still being read included: a long download, such as a whole state, is cut off if it has not finished by then.</p>
 <p>Because the ring buffer is shared, the high-rate <code>attestation</code> events (roughly one per validator per slot) dominate its occupancy: a subscriber’s tolerable stall is <code>capacity / total_event_rate</code>, not per-topic, so filtering with <code>?topics=</code> narrows what you receive but does <strong>not</strong> widen the lag window against an attestation flood. Subscribers that only need low-rate topics (<code>head</code>, <code>finalized_checkpoint</code>, …) are still evicted at the aggregate rate. If real usage shows this biting, the fix is a per-topic channel split behind the event bus (the <code>subscribe(TopicSet)</code> API is unaffected).</p>
 <h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
 <p><code>block_id</code> is either:</p>
@@ -5565,7 +5602,8 @@ alone: the p2p specification counts it separately from the ENR’s <code>seq</co
 <h3 id="get-ethv1events"><a class="header" href="#get-ethv1events"><code>GET /eth/v1/events</code></a></h3>
 <p>The Beacon API eventstream: the same Server-Sent Events stream as
 <a href="#get-leanv0events"><code>/lean/v0/events</code></a> (topic on the <code>event:</code> line, payload on
-<code>data:</code>, one shared best-effort ring, <code>: error - dropped N messages</code> on a gap),
+<code>data:</code>, one shared best-effort ring, <code>: error - dropped N messages</code> on a gap,
+ended at shutdown),
 with the Beacon API’s own topics and payloads. The response also sets
 <code>X-Accel-Buffering: no</code>, so a reverse proxy does not hold events back.</p>
 <pre><code class="language-bash">curl -N 'http://127.0.0.1:5052/eth/v1/events?topics=head&amp;topics=block,finalized_checkpoint'
@@ -6190,6 +6228,7 @@ spec.</p>
 <tbody>
 <tr><td><code>lean_gossipsub_peers_by_score</code></td><td>Gauge</td><td>Gossipsub peers by score band</td><td>Every 10 s, in the swarm task</td><td>band=non_negative,negative,below_gossip,below_publish,below_graylist</td><td></td></tr>
 <tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for a gossipsub score below the graylist (-16000)</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
+<tr><td><code>lean_gossipsub_slow_peer_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory). A report counts only above <code>SLOW_PEER_REPORT_THRESHOLD</code> failures, and one check disconnects at most <code>MAX_SLOW_PEER_DISCONNECTS_PER_CHECK</code> peers</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
 <tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>Gauge</td><td>1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up</td><td>Every slot, on the scoring refresh</td><td></td><td></td></tr>
 </tbody>
 </table>

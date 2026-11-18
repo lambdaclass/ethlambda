@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6bc2ad9e.js";
+            window.path_to_searchindex_js = "searchindex-9e00b40f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -691,6 +691,7 @@ spec.</p>
 <tbody>
 <tr><td><code>lean_gossipsub_peers_by_score</code></td><td>Gauge</td><td>Gossipsub peers by score band</td><td>Every 10 s, in the swarm task</td><td>band=non_negative,negative,below_gossip,below_publish,below_graylist</td><td></td></tr>
 <tr><td><code>lean_gossipsub_score_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for a gossipsub score below the graylist (-16000)</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
+<tr><td><code>lean_gossipsub_slow_peer_disconnects_total</code></td><td>Counter</td><td>Peers disconnected for failing to take gossipsub messages in every 10 s check for a minute (a dead gossipsub stream pins its send queue in memory). A report counts only above <code>SLOW_PEER_REPORT_THRESHOLD</code> failures, and one check disconnects at most <code>MAX_SLOW_PEER_DISCONNECTS_PER_CHECK</code> peers</td><td>When the 10 s check disconnects one</td><td></td><td></td></tr>
 <tr><td><code>lean_gossipsub_mesh_delivery_scoring</code></td><td>Gauge</td><td>1 while mesh message deliveries (P3) are scored, 0 while the head lags the wall clock or is warming up after catching up</td><td>Every slot, on the scoring refresh</td><td></td><td></td></tr>
 </tbody>
 </table>
