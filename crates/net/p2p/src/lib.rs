@@ -387,9 +387,11 @@ pub(crate) enum PendingRequestKind {
     /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
     /// the root and the columns this one request asked its peer for: the
     /// attempts and failed-peer set live in `pending_column_requests`, keyed
-    /// by the root, but one lookup fans out across peers with a subset each and
-    /// retires its entry on the first answer, so what a later answer may
-    /// contain has to travel with the request itself.
+    /// by the root, but one lookup fans out across peers with a subset each,
+    /// and an answer is judged against its own request's subset (whether its
+    /// peer left anything out), and may arrive after a sibling's answer has
+    /// already retired the entry, so what it may contain has to travel with
+    /// the request itself.
     Columns(H256, Vec<u64>),
     /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
     /// slots the matching `BlocksByRange` asked for.

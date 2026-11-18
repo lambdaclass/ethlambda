@@ -1577,13 +1577,26 @@ async fn handle_column_fetch_failure(
         return;
     };
 
-    match retire_column_attempt(pending, peer) {
+    let outcome = retire_column_attempt(pending, peer);
+    follow_column_attempt(server, block_root, peer, outcome, ctx);
+}
+
+/// Carry out what [`retire_column_attempt`] or [`settle_column_answer`]
+/// decided for `block_root`'s lookup.
+fn follow_column_attempt(
+    server: &mut P2PServer,
+    block_root: H256,
+    peer: PeerId,
+    outcome: ColumnAttemptOutcome,
+    ctx: &Context<P2PServer>,
+) {
+    match outcome {
         ColumnAttemptOutcome::RoundIncomplete { in_flight } => {
             trace!(
                 %block_root,
                 %peer,
                 in_flight,
-                "One peer of this column lookup failed; waiting for the rest of the round"
+                "One peer of this column lookup reported back; waiting for the rest of the round"
             );
         }
         ColumnAttemptOutcome::GiveUp { attempts } => {
@@ -1593,7 +1606,7 @@ async fn handle_column_fetch_failure(
             metrics::inc_data_column_fetch_failure("max_retries");
         }
         ColumnAttemptOutcome::Retry { attempts, backoff } => {
-            debug!(%block_root, %peer, attempts, ?backoff, "Data column fetch failed, scheduling retry");
+            debug!(%block_root, %peer, attempts, ?backoff, "Data column lookup still missing columns, scheduling retry");
             send_after(
                 backoff,
                 ctx.clone(),
@@ -1629,6 +1642,43 @@ enum ColumnAttemptOutcome {
 /// fan-out per failure, which squares with every retry.
 fn retire_column_attempt(pending: &mut PendingColumnRequest, peer: PeerId) -> ColumnAttemptOutcome {
     pending.failed_peers.insert(peer);
+    close_column_request(pending)
+}
+
+/// Take a non-empty answer's columns off what `pending` still asks for, and
+/// say what follows: `None` once nothing is left, for the caller to retire the
+/// lookup.
+///
+/// A lookup is split across the peers that custody its columns, so one peer's
+/// answer is often only part of it. Retiring the lookup on that first answer
+/// left every column asked of another peer in the same round to wait for the
+/// chain actor's next per-slot re-drive, however soon it could have come: on a
+/// devnet, about one gloas envelope in twenty waited ~11.7 s for its columns.
+/// A short answer now ends its request the way a failure does, so the rest is
+/// asked again on the same ladder.
+///
+/// Charged to `peer` only if it left out a column it was itself asked for. A
+/// peer that sent its whole share did nothing wrong: what remains is another
+/// request's, or a column merged into the lookup after this request went out.
+fn settle_column_answer(
+    pending: &mut PendingColumnRequest,
+    peer: PeerId,
+    requested: &[u64],
+    delivered: &[u64],
+) -> Option<ColumnAttemptOutcome> {
+    pending.columns.retain(|column| !delivered.contains(column));
+    if pending.columns.is_empty() {
+        return None;
+    }
+    if requested.iter().any(|column| !delivered.contains(column)) {
+        pending.failed_peers.insert(peer);
+    }
+    Some(close_column_request(pending))
+}
+
+/// One request of `pending`'s round has reported back without completing the
+/// lookup: the round's outcome once it was the last one open.
+fn close_column_request(pending: &mut PendingColumnRequest) -> ColumnAttemptOutcome {
     pending.in_flight = pending.in_flight.saturating_sub(1);
 
     if pending.in_flight > 0 {
@@ -2550,10 +2600,22 @@ async fn handle_data_column_sidecars_response(
         return;
     }
 
-    // The lookup is done, whether or not every requested column arrived; see
-    // this function's own doc comment for why a partial answer still retires
-    // the entry rather than triggering a same-lookup retry for the rest.
-    server.pending_column_requests.remove(&block_root);
+    // The lookup is done once every column it asks for has arrived; a short
+    // answer leaves it open for the rest (see `settle_column_answer`). No entry
+    // means a sibling's answer already completed it, or the ladder gave up:
+    // the sidecars are still forwarded below.
+    let delivered: Vec<u64> = sidecars.iter().map(|sidecar| sidecar.index()).collect();
+    let settled = server
+        .pending_column_requests
+        .get_mut(&block_root)
+        .map(|pending| settle_column_answer(pending, peer, requested, &delivered));
+    match settled {
+        Some(None) => {
+            server.pending_column_requests.remove(&block_root);
+        }
+        Some(Some(outcome)) => follow_column_attempt(server, block_root, peer, outcome, ctx),
+        None => {}
+    }
 
     if server.blockchain.is_none() {
         debug!(%peer, %block_root, "No blockchain handler available");
@@ -3077,6 +3139,99 @@ pub(crate) mod tests {
                 attempts: MAX_FETCH_RETRIES
             }
         );
+    }
+
+    fn column_lookup(columns: Vec<u64>, in_flight: usize) -> PendingColumnRequest {
+        PendingColumnRequest {
+            columns,
+            attempts: 1,
+            failed_peers: HashSet::new(),
+            in_flight,
+            last_asked: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn an_answer_carrying_every_missing_column_completes_the_lookup() {
+        let mut pending = column_lookup(vec![1, 2], 1);
+        let peer = PeerId::random();
+
+        assert_eq!(
+            settle_column_answer(&mut pending, peer, &[1, 2], &[1, 2]),
+            None
+        );
+        assert!(pending.failed_peers.is_empty());
+    }
+
+    #[test]
+    fn a_short_answer_keeps_the_lookup_and_retries_the_rest() {
+        // The lookup used to be retired by any non-empty answer, leaving the
+        // columns this peer left out for the chain actor's next per-slot
+        // re-drive.
+        let mut pending = column_lookup(vec![1, 2, 3], 1);
+        let peer = PeerId::random();
+
+        assert_eq!(
+            settle_column_answer(&mut pending, peer, &[1, 2, 3], &[1]),
+            Some(ColumnAttemptOutcome::Retry {
+                attempts: 1,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+            })
+        );
+        assert_eq!(pending.columns, vec![2, 3], "only what is still missing");
+        assert!(
+            pending.failed_peers.contains(&peer),
+            "it left out a column it was asked for"
+        );
+    }
+
+    #[test]
+    fn a_split_lookup_waits_for_every_share_and_charges_only_the_short_one() {
+        // Custody-aware splitting: a custodian of column 1 and a random peer
+        // for 2 and 3, the shape a node gets when no peer custodies most of
+        // its columns. The custodian answering first must not retire the
+        // lookup the other request still serves.
+        let mut pending = column_lookup(vec![1, 2, 3], 2);
+        let custodian = PeerId::random();
+        let other = PeerId::random();
+
+        assert_eq!(
+            settle_column_answer(&mut pending, custodian, &[1], &[1]),
+            Some(ColumnAttemptOutcome::RoundIncomplete { in_flight: 1 })
+        );
+        assert!(
+            pending.failed_peers.is_empty(),
+            "the custodian sent its whole share"
+        );
+
+        assert_eq!(
+            settle_column_answer(&mut pending, other, &[2, 3], &[2]),
+            Some(ColumnAttemptOutcome::Retry {
+                attempts: 1,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+            })
+        );
+        assert_eq!(pending.columns, vec![3]);
+        assert_eq!(pending.failed_peers, HashSet::from([other]));
+    }
+
+    #[test]
+    fn a_whole_share_still_retries_a_column_merged_in_after_the_request() {
+        // `fetch_missing_columns` merges a re-ask's new column into the lookup
+        // in flight; the request on the wire cannot carry it, so the round's
+        // end has to ask for it.
+        let mut pending = column_lookup(vec![1, 4], 1);
+        let peer = PeerId::random();
+
+        assert_eq!(
+            settle_column_answer(&mut pending, peer, &[1], &[1]),
+            Some(ColumnAttemptOutcome::Retry {
+                attempts: 1,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+            })
+        );
+        assert_eq!(pending.columns, vec![4]);
+        assert!(pending.failed_peers.is_empty());
     }
 
     #[test]
