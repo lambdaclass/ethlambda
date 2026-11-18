@@ -29,13 +29,16 @@ use ethlambda_blockchain::{EventBus, Topic};
 use ethlambda_storage::Store;
 
 use super::ApiError;
+use crate::events::ShutdownSignal;
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
+    shutdown: Option<Extension<ShutdownSignal>>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let shutdown = shutdown.map(|Extension(signal)| signal);
     match requested_topics(&params) {
-        Ok(topics) => crate::events::sse_response(&events, topics),
+        Ok(topics) => crate::events::sse_response(&events, topics, shutdown),
         Err(err) => err.into_response(),
     }
 }
@@ -94,6 +97,8 @@ mod tests {
 
     async fn events_response(events: &EventBus, uri: &str) -> Response {
         let fixture = beacon_fixture(64);
+        // No `ShutdownSignal` layer: a router served outside `crate::serve`
+        // must still answer.
         let app = routes()
             .with_state(fixture.store)
             .layer(Extension(events.clone()));

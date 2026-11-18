@@ -520,6 +520,7 @@ mod tests {
         BlsPubkey, BlsSignature, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
         ValidatorIndex,
     };
+    use crate::beacon::stf::signatures::checked;
     use libssz_types::SszVector;
 
     /// A capella state with `count` fully active, full-balance validators, one
@@ -760,10 +761,8 @@ mod tests {
         );
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
-        crate::beacon::stf::signatures::checked(|s| {
-            process_bls_to_execution_change(&mut state, &signed_change, &config, s)
-        })
-        .unwrap();
+        checked(|s| process_bls_to_execution_change(&mut state, &signed_change, &config, s))
+            .unwrap();
 
         let validator = state.validator(0).unwrap();
         assert_eq!(
@@ -813,7 +812,7 @@ mod tests {
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
         assert!(
-            crate::beacon::stf::signatures::checked(|s| {
+            checked(|s| {
                 process_bls_to_execution_change(&mut state, &signed_change, &config, s)
             })
             .is_err()
@@ -839,7 +838,7 @@ mod tests {
         };
 
         assert!(
-            crate::beacon::stf::signatures::checked(|s| {
+            checked(|s| {
                 process_bls_to_execution_change(&mut state, &signed_change, &config, s)
             })
             .is_err()

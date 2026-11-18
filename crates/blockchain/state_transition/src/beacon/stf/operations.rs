@@ -700,6 +700,7 @@ mod tests {
         AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader,
     };
     use crate::beacon::primitives::{BlsPubkey, BlsSignature, Root};
+    use crate::beacon::stf::signatures::checked;
 
     #[test]
     fn identical_proposer_slashing_headers_are_rejected() {
@@ -724,10 +725,7 @@ mod tests {
         };
 
         assert!(
-            crate::beacon::stf::signatures::checked(|s| {
-                process_proposer_slashing(&mut state, &slashing, &config, s)
-            })
-            .is_err()
+            checked(|s| { process_proposer_slashing(&mut state, &slashing, &config, s) }).is_err()
         );
     }
 
@@ -814,10 +812,7 @@ mod tests {
         };
 
         assert!(
-            crate::beacon::stf::signatures::checked(|s| {
-                process_attester_slashing(&mut state, &slashing, &config, s)
-            })
-            .is_err()
+            checked(|s| { process_attester_slashing(&mut state, &slashing, &config, s) }).is_err()
         );
     }
 }
