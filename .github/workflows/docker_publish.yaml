@@ -116,10 +116,18 @@ jobs:
           tags: ${{ steps.prep.outputs.tags }}
           platforms: linux/${{ matrix.arch.name }}
           # In the registry rather than the Actions cache, under the same tags
-          # release.yaml uses; that workflow says why. This one always logs in,
-          # so it always exports.
+          # release.yaml uses; that workflow says why.
+          #
+          # Only a run dispatched on main exports, the rule every cache here
+          # follows (see the setup-rust action). This workflow is dispatched
+          # from any branch for devnet images, and these tags feed every main
+          # and release-candidate build: a branch's export would carry its
+          # layers into a release, and a branch with a different Cargo.lock
+          # would replace the dependency layer, so main's next build would
+          # recompile every dependency. Every run still reads main's cache,
+          # which is a hit whenever the lockfile matches.
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch.name }}-${{ matrix.variant.name }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch.name }}-${{ matrix.variant.name }},mode=max,ignore-error=true
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0}/{1}:buildcache-{2}-{3},mode=max,ignore-error=true', env.REGISTRY, env.IMAGE_NAME, matrix.arch.name, matrix.variant.name) || '' }}
 
   publish-manifest:
     name: Create and push multi-arch manifest
