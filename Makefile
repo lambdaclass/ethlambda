@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
+.PHONY: help fmt lint inert-paths-check bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -6,7 +6,7 @@ help: ## 📚 Show help for each of the Makefile recipes
 fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
-lint: ## 🔍 Run clippy on all workspace crates
+lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
@@ -15,6 +15,24 @@ lint: ## 🔍 Run clippy on all workspace crates
 	# binary turns the feature on, so a test that needs it would pass above
 	# and break a plain `cargo test -p ethlambda-storage`. Same as CI's Lint
 	cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
+
+# The docs-only CI skip (.github/actions/detect-changes) assumes no build or test
+# reads the paths it treats as inert: docs/, theme/, book.toml, Markdown files,
+# .claude/, LICENSE and .gitignore. This checks the compile-time half of that: it
+# fails if an `include_str!` or `include_bytes!` names one of them. It reads one
+# line at a time, so a path assembled across lines (`concat!`) gets past it, as
+# does a file opened at run time; CLAUDE.md ("Docs-only changes skip CI") states
+# the rule for those. CI's Lint job runs this target too.
+INERT_PATH_PATTERN='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'
+
+inert-paths-check: ## 🔎 Fail if a crate compiles in a path the docs-only CI skip treats as unread
+	@hits=$$(grep -rnE --include='*.rs' 'include_(str|bytes)!' crates bin tooling | grep -E $(INERT_PATH_PATTERN) || true); \
+	if [ -n "$$hits" ]; then \
+		echo "ERROR: these compile in a path .github/actions/detect-changes treats as docs-only."; \
+		echo "Take the path off that action's inert list, or stop reading it:"; \
+		echo "$$hits"; \
+		exit 1; \
+	fi
 
 # release-fast: release-grade opt-level to avoid stack overflows during
 # signature verification/aggregation, without paying for LTO on every rebuild

@@ -95,6 +95,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # The compile-time half of what the docs-only skip in `detect-changes`
+      # assumes. The Makefile target says what it checks and what it cannot;
+      # `make lint` runs it too.
+      - name: No build reads a docs-only path
+        run: make inert-paths-check
+
       - name: Cargo check
         run: cargo check --locked --workspace --all-targets
 

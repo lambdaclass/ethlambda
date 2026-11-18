@@ -12,6 +12,19 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # The preset names a make target and a cache key below, so anything else
+    # fails here with a clear message rather than as an unknown make target.
+    # Read through the environment, never spliced into the script.
+    - name: Check the preset
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+      run: |
+        case "$PRESET" in
+          mainnet|minimal) ;;
+          *) echo "::error::preset must be mainnet or minimal, got '$PRESET'"; exit 1 ;;
+        esac
+
     # Keyed per preset. The preset fixes the beacon containers' SSZ bounds,
     # which are const-generic arguments, so the two jobs share no artifacts at
     # all; on one key they would evict each other on every single run.
@@ -56,7 +69,8 @@ runs:
       shell: bash
       env:
         CONSENSUS_SPEC_TESTS_CONFIGS: ${{ inputs.preset }}
-      run: make test-beacon-${{ inputs.preset }}
+        PRESET: ${{ inputs.preset }}
+      run: make "test-beacon-$PRESET"
 
     # See the same step in the run-fixture-tests action.
     - name: Report disk usage after the build

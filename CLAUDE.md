@@ -114,6 +114,9 @@ group whose changed files are all documentation or repository metadata
 nothing in a build or a test reading those paths. A crate that starts to (a
 `#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
 take the path off the list, or a change to that file merges untested.
+`make inert-paths-check` (run by `make lint` and CI's Lint job) enforces the
+compile-time half: it fails on an `include_str!`/`include_bytes!` naming one of
+those paths. A path assembled across lines or opened at run time gets past it.
 
 ### Common Operations
 ```bash
