@@ -510,7 +510,8 @@ pub(crate) struct HeadWatch {
     /// tick may never have seen running.
     watermark: u64,
     /// The wall-clock slot of the last [`Self::flat_for`], to tell a tick
-    /// from a resume after the process was not running.
+    /// from a resume after the process was not running, or from a wall clock
+    /// stepped back.
     ticked_at: Option<u64>,
     /// The batch handed over last, when its blocks stopped short of the end
     /// it was asked for; see [`Self::note_delivery`].
@@ -556,13 +557,18 @@ impl HeadWatch {
     /// returning how many slots it has stayed at `head_slot` since the first
     /// delivery after it last moved (since it moved, with none). Zero
     /// whenever it has just moved, in either direction. A gap since the last
-    /// call counts as [`Self::MAX_TICK_STEP`] slots at most.
+    /// call counts as [`Self::MAX_TICK_STEP`] slots at most, and a wall clock
+    /// stepped back since counts nothing.
     pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64, delivering: bool) -> u64 {
         // Slots not watched are not counted: the starts move forward by them.
+        // A wall clock stepped back (one that ran ahead, corrected) moves them
+        // back by the step, or the count would stop until the clock passed
+        // them again.
         if let Some(ticked_at) = self.ticked_at.replace(wall_slot) {
             let unwatched = wall_slot
                 .saturating_sub(ticked_at)
                 .saturating_sub(Self::MAX_TICK_STEP);
+            let stepped_back = ticked_at.saturating_sub(wall_slot);
             for since in self
                 .seen
                 .as_mut()
@@ -570,7 +576,7 @@ impl HeadWatch {
                 .into_iter()
                 .chain(self.delivering_since.as_mut())
             {
-                *since = since.saturating_add(unwatched);
+                *since = since.saturating_add(unwatched).saturating_sub(stepped_back);
             }
         }
         if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
@@ -667,12 +673,16 @@ impl HeadWatch {
         let ends = self.deliverers.entry(peer).or_default();
         ends.push_back(end);
         if ends.len() > Self::MAX_TRACKED_BATCHES {
+            // One copy of the lowest and one of the highest stay, whatever
+            // order the ends came in: the one at index 1 may be the only copy
+            // of either.
             let lowest = ends.iter().copied().min();
             let highest = ends.iter().copied().max();
-            let forgettable = ends
-                .iter()
-                .position(|end| Some(*end) != lowest && Some(*end) != highest);
-            // With every end the lowest or the highest, any one goes.
+            let kept_lowest = ends.iter().position(|end| Some(*end) == lowest);
+            let kept_highest = ends.iter().rposition(|end| Some(*end) == highest);
+            let forgettable = (0..ends.len())
+                .find(|index| Some(*index) != kept_lowest && Some(*index) != kept_highest);
+            // Over the cap there are more than two ends, so one is found.
             ends.remove(forgettable.unwrap_or(1));
         }
     }
@@ -2373,7 +2383,9 @@ impl P2PServer {
     /// them that has not moved the head is not importing. A head that is
     /// still importing moves. A gap between ticks counts as two slots at
     /// most (`HeadWatch::flat_for`), so a process that was paused does not
-    /// find the window spent at its first tick after the resume. On a drop,
+    /// find the window spent at its first tick after the resume, and a wall
+    /// clock stepped back counts nothing, rather than stopping the count until
+    /// it passes its old reading again. On a drop,
     /// the session running ends with its batch in flight, and the senders of
     /// the lowest batch the head never reached become suspects until the head
     /// passes what they handed over (see `PeerHeads::suspects`); batches

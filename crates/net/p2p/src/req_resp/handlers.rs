@@ -444,7 +444,9 @@ pub async fn handle_req_resp_message(
                             // An untracked request. A `Status` answered with
                             // an error (`RateLimited`, say) ends a handshake
                             // as surely as a failure does, or the peer would
-                            // never be refreshed.
+                            // never be refreshed. Carrying no head, it does
+                            // not count as the handshake's answer (see
+                            // `PeerHeads::answered`).
                             None => {
                                 if is_status_protocol(request_id.protocol) {
                                     server.peer_heads.end_status_request(&peer);
@@ -1704,8 +1706,11 @@ fn fail_range_request(server: &mut P2PServer, peer: &PeerId, end_slot: u64) {
         false
     };
 
+    // With no peer left the session ends the one way every other path ends
+    // it, its requests with it. None should be out, one batch being in
+    // flight at a time, but one left would complete a later session's batch.
     if should_clear {
-        server.range_sync_state = None;
+        server.end_range_session();
     }
 }
 
@@ -4127,6 +4132,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn over_the_cap_the_only_lowest_or_highest_end_is_kept_wherever_it_sits() {
+        // Finding: with every end the lowest or the highest, the one at index
+        // 1 was forgotten, which can be the only copy of either.
+        let (low, mid, high) = (300, 400, 500);
+        let over_cap = 17;
+
+        // The only lowest at index 1: forgotten, the drop blamed the honest
+        // peer in between.
+        let mut watch = crate::HeadWatch::default();
+        let (liar, honest) = (PeerId::random(), PeerId::random());
+        watch.note_whole_batch(honest, mid);
+        watch.note_whole_batch(liar, high);
+        watch.note_whole_batch(liar, low);
+        for _ in 2..over_cap {
+            watch.note_whole_batch(liar, high);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, high)]);
+
+        // The only highest at index 1: forgotten, the suspicion ran only
+        // through the lowest.
+        let mut watch = crate::HeadWatch::default();
+        watch.note_whole_batch(liar, low);
+        watch.note_whole_batch(liar, high);
+        for _ in 2..over_cap {
+            watch.note_whole_batch(liar, low);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, high)]);
+    }
+
+    #[test]
     fn a_short_batch_the_next_one_builds_on_is_held_to_its_last_block() {
         // Finding: a batch whose last slots were missed on the chain was held
         // to the end it was asked for, which the head never reaches, so its
@@ -4242,6 +4277,22 @@ pub(crate) mod tests {
         server.expire_range_watermark(last_watched + 1);
         assert_eq!(server.range_fetched_through, head);
         assert!(server.peer_heads.is_suspect(&honest));
+    }
+
+    #[test]
+    fn a_clock_stepped_back_does_not_stop_the_head_watch() {
+        // Finding: the count was a difference of wall-clock slots, so a clock
+        // that ran ahead and was then stepped back read zero until it passed
+        // the old reading again, and blocks that never imported were not
+        // fetched again for as long as the step.
+        let mut watch = crate::HeadWatch::default();
+        assert_eq!(watch.flat_for(5, 100, true), 0);
+        assert_eq!(flat_through(&mut watch, 5, 101..=103, true), 3);
+        // One tick with the clock a hundred slots ahead, a gap counted as
+        // two slots; then the clock is stepped back to the right time.
+        assert_eq!(watch.flat_for(5, 203, true), 5);
+        assert_eq!(watch.flat_for(5, 104, true), 5);
+        assert_eq!(flat_through(&mut watch, 5, 105..=110, true), 11);
     }
 
     #[tokio::test]

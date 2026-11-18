@@ -60,6 +60,7 @@ impl Default for SyncStatusController {
 /// | a judgment behind on the peers' word | slots added to the count (`StallCount`): a stretch in full up to half a window (a longer gap between judgments is a pause), a slot after a short lapse once |
 /// | a claim after a lapse longer than the window, with something counted | count back to zero, once per count (`renewed`) |
 /// | the count past the window | stall: synced until progress |
+/// | a judgment more than half a window older than the last | the wall clock stepped back: the count's slots move back with it |
 ///
 /// With the head flat, no schedule of claims and lapses keeps the node
 /// syncing for more than about two windows' worth of slots at one head:
@@ -74,9 +75,10 @@ pub(crate) struct SyncStatusTracker {
     /// `--disable-duty-sync-gate` flag (gating stays on by default).
     gate_duties: bool,
     thresholds: SyncThresholds,
-    /// The latest wall-clock slot judged at. A judgment carrying an older one
-    /// is judged at this one, so time never runs backwards between judgments
-    /// whatever clock a caller reads.
+    /// The latest wall-clock slot judged at. A judgment carrying an older one,
+    /// by up to half a window, is judged at this one, so time never runs
+    /// backwards between judgments whatever clock a caller reads. One further
+    /// back is the wall clock stepping back, and moves this back with it.
     last_slot: u64,
     /// The highest head reached since the stall window last started over.
     /// Only an advance past it is progress. Set by the first update.
@@ -198,6 +200,15 @@ impl StallCount {
         self.counted_at = Some(current_slot);
         self.behind_for
     }
+
+    /// Move the count's slots back by `back`, for a wall clock that stepped
+    /// back that far: what was counted stays counted, and the next slot
+    /// counts once.
+    fn step_back(&mut self, back: u64) {
+        for slot in self.counted_at.iter_mut().chain(self.lapsed_at.iter_mut()) {
+            *slot = slot.saturating_sub(back);
+        }
+    }
 }
 
 impl SyncStatusTracker {
@@ -261,8 +272,21 @@ impl SyncStatusTracker {
         } = self.thresholds;
 
         // Time never runs backwards between judgments, or the stall window
-        // would count the same slots twice.
-        let current_slot = current_slot.max(self.last_slot);
+        // would count the same slots twice: a judgment a little older than
+        // the last (a tick judging at the slot it read on entry, after work
+        // that judged at a fresher one) is judged at the last. Further back
+        // than one judgment counts forward (half a window), it is the wall
+        // clock stepping back (a clock that ran ahead, corrected). Judged at
+        // the last, the count would then stop until the clock passed it
+        // again, holding a node behind out of its duties for as long as the
+        // step on top of the window. The count's slots move back instead.
+        let back = self.last_slot.saturating_sub(current_slot);
+        let current_slot = if back > StallCount::max_stretch(stall_window) {
+            self.stall.step_back(back);
+            current_slot
+        } else {
+            current_slot.max(self.last_slot)
+        };
         self.last_slot = current_slot;
 
         let high_water = *self.high_water.get_or_insert(head_slot);
@@ -622,6 +646,52 @@ mod tests {
             assert_eq!(
                 tracker.update(tripped, head, Some(tripped)),
                 SyncStatus::Synced
+            );
+        }
+    }
+
+    #[test]
+    fn a_clock_stepped_back_does_not_stop_the_stall_window() {
+        // Finding: a judgment older than the last was judged at the last, so
+        // a wall clock that ran ahead and was then stepped back stopped the
+        // count until the clock passed the old reading again, holding a node
+        // behind out of its duties for as long as the step on top of the
+        // window.
+        for thresholds in [LEAN, BEACON] {
+            let window = thresholds.stall_window;
+            let half = window / 2;
+            let mut tracker = SyncStatusTracker::new(true, thresholds);
+            let head = 50;
+            let start = head + 2 * thresholds.clock_lag + 1;
+            assert_eq!(
+                tracker.update(start, head, Some(start)),
+                SyncStatus::Syncing
+            );
+            behind_through(&mut tracker, start + 1..=start + 3, head);
+            // One judgment with the clock ten windows ahead, counting half a
+            // window, then the clock is stepped back to the right time.
+            let ahead = start + 3 + 10 * window;
+            assert_eq!(
+                tracker.update(ahead, head, Some(start + 3)),
+                SyncStatus::Syncing
+            );
+            assert_eq!(tracker.judged_through(), ahead);
+            assert_eq!(
+                tracker.update(start + 4, head, Some(start + 4)),
+                SyncStatus::Syncing
+            );
+            assert_eq!(tracker.judged_through(), start + 4);
+            // Three slots before, half a window for the jump ahead, the slot
+            // after the step back counts nothing, the rest one a slot.
+            let last_syncing = start + 1 + window - half;
+            assert_eq!(
+                behind_through(&mut tracker, start + 5..=last_syncing, head),
+                SyncStatus::Syncing
+            );
+            assert_eq!(
+                tracker.update(last_syncing + 1, head, Some(last_syncing + 1)),
+                SyncStatus::Synced,
+                "window {window}"
             );
         }
     }

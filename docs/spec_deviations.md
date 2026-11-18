@@ -52,8 +52,9 @@ head trails the wall clock **and** its peers report a head ahead of it.
   head the node has already imported not counted (the peer is not ahead of
   it, whatever its slot). A node whose own clock runs slow therefore drops
   honest heads too, and reads as synced however far behind it is: when most
-  connected peers report a head past its clock it warns, at most once a stall
-  window, and counts them in `lean_sync_peers_held_back{reason="future"}`.
+  connected peers, and at least two, report a head past its clock it warns,
+  at most once a stall window, and counts them in
+  `lean_sync_peers_held_back{reason="future"}`.
   The peer lead is smaller
   than the clock lag because a report is up to 2 slots old: a node 5 slots
   behind a producing network sees its peers' 2-slot-old heads 2 slots ahead.
@@ -73,8 +74,12 @@ head trails the wall clock **and** its peers report a head ahead of it.
   window pauses the count rather than restarting it. One judgment counts at
   most half a window: judgments come at least once a slot, so a longer gap is
   the process not running (a `docker pause`, a host suspend), and a resume
-  must not find the window spent before range sync has had a chance. A lead
-  absent for longer
+  must not find the window spent before range sync has had a chance. A
+  judgment older than the last by up to that much is judged at the last, so
+  no slot counts twice; one further back is the wall clock stepping back (a
+  clock that ran ahead, corrected), and the count's slots move back with it
+  rather than the count stopping until the clock passes its old reading. A
+  lead absent for longer
   than that (an outage) ends the count once per head position, and the next
   claim gets a whole window, unless the node already gave up on a lead at
   that head. A peer that claims a head it does not serve (an empty answer,

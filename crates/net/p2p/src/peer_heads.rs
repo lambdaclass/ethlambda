@@ -134,11 +134,15 @@ pub(crate) struct PeerHeads {
     /// is not one this node holds, and the report is not older than
     /// `SyncThresholds::report_lifetime`.
     heads: HashMap<PeerId, Claim>,
-    /// Peers that have answered a `Status` of ours on this connection. The
-    /// first answer is the handshake's, and every later one is a refresh's,
-    /// which needs a larger lead to start a range sync. No refresh goes out
-    /// while the handshake is (see [`Self::awaiting_answer`]), so the
-    /// answers cannot arrive out of order.
+    /// Peers that have answered a `Status` of ours with their own on this
+    /// connection. The first answer carrying a `Status` is the handshake's,
+    /// and every later one is a refresh's, which needs a larger lead to start
+    /// a range sync. An error answer (`RateLimited`, say) or a failed request
+    /// carries no head and does not count: after a handshake that got none,
+    /// the first `Status` the peer does send is the first head this node
+    /// learns of it, and is judged as the handshake's would have been. No
+    /// refresh goes out while the handshake is (see
+    /// [`Self::awaiting_answer`]), so the answers cannot arrive out of order.
     answered: HashSet<PeerId>,
     /// Peers whose `Status` request (the handshake or a refresh) is still
     /// out, neither answered nor failed, with the wall-clock slot it went out
@@ -276,9 +280,11 @@ impl PeerHeads {
         self.future.remove(peer);
     }
 
-    /// Whether to warn, at `wall_slot`, that most of the `connected` peers
-    /// report a head past the wall clock: at most once every `every` slots.
-    /// Returns how many do when it is time.
+    /// Whether to warn, at `wall_slot`, that most of the `connected` peers,
+    /// and at least two, report a head past the wall clock: at most once
+    /// every `every` slots. Returns how many do when it is time. One peer
+    /// alone, even the only one connected, is as likely to be lying as to
+    /// show a slow clock, so a node with a single peer gets no warning.
     ///
     /// The tolerance stays as it is: a head past the clock is what a lying
     /// peer sends, and the clock is what bounds it. But a node whose clock
@@ -295,7 +301,7 @@ impl PeerHeads {
         let due = self
             .slow_clock_warned_at
             .is_none_or(|warned_at| warned_at.saturating_add(every) <= wall_slot);
-        (due && future.saturating_mul(2) > connected).then(|| {
+        (due && future >= 2 && future.saturating_mul(2) > connected).then(|| {
             self.slow_clock_warned_at = Some(wall_slot);
             future
         })
@@ -511,9 +517,9 @@ impl PeerHeads {
         self.awaiting_answer.remove(peer);
     }
 
-    /// Note an answer from `peer` to a `Status` of ours, returning whether it
-    /// is a refresh's: every answer on a connection after the first, which
-    /// is the handshake's.
+    /// Note an answer from `peer` carrying its `Status`, to one of ours,
+    /// returning whether it is a refresh's: every such answer on a connection
+    /// after the first, which is the handshake's (see [`Self::answered`]).
     pub(crate) fn answer_is_refresh(&mut self, peer: PeerId) -> bool {
         !self.answered.insert(peer)
     }
@@ -813,6 +819,20 @@ mod tests {
             heads.slow_clock_warning_due(100 + 2 * every, peers.len() - 1, every),
             None
         );
+    }
+
+    #[test]
+    fn one_peer_past_the_clock_is_no_warning() {
+        // Finding: with one peer connected, its head past the clock alone
+        // warned of a slow local clock, which a single lying peer can send.
+        let mut heads = PeerHeads::default();
+        let every = 16;
+        let (first, second) = (PeerId::random(), PeerId::random());
+        heads.record(first, 103, H256::ZERO, 100, false);
+        assert_eq!(heads.slow_clock_warning_due(100, 1, every), None);
+        // Two of two are.
+        heads.record(second, 103, H256::ZERO, 100, false);
+        assert_eq!(heads.slow_clock_warning_due(100, 2, every), Some(2));
     }
 
     #[test]
