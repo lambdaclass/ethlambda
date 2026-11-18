@@ -127,7 +127,7 @@ use crate::beacon::bls::{AggregatePubkey, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{AttestationData, Validator};
-use crate::beacon::containers::{BeaconState, electra, fulu, gloas};
+use crate::beacon::containers::{BeaconState, GloasFamily, GloasFamilyMut, electra, fulu, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
@@ -886,10 +886,12 @@ pub fn compute_exit_epoch_and_update_churn(
             total_active_balance_or_compute(state, active_balances)?,
             config,
         ),
-        ForkName::Gloas => crate::beacon::helpers::gloas::exit_churn_limit_for(
-            total_active_balance_or_compute(state, active_balances)?,
-            config,
-        ),
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+            crate::beacon::helpers::gloas::exit_churn_limit_for(
+                total_active_balance_or_compute(state, active_balances)?,
+                config,
+            )
+        }
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -1033,7 +1035,7 @@ pub fn get_consolidation_churn_limit_for_fork(
             total_active_balance_or_compute(state, active_balances)?,
             config,
         )),
-        ForkName::Gloas => Ok(
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => Ok(
             crate::beacon::helpers::gloas::consolidation_churn_limit_for(
                 total_active_balance_or_compute(state, active_balances)?,
                 config,
@@ -1157,7 +1159,13 @@ pub fn queue_excess_active_balance(state: &mut BeaconState, index: ValidatorInde
     // this cannot fail.
     *state.balance_mut(index)? = preset::MIN_ACTIVATION_BALANCE;
 
-    let deposit = placeholder_pending_deposit(state.validator(index)?, excess_balance);
+    let mut deposit = placeholder_pending_deposit(state.validator(index)?, excess_balance);
+    // [Modified in PQ] An empty signature field rather than the point at
+    // infinity; the key is already the 48-byte request form the registry
+    // holds an XMSS key in.
+    if state.fork_name() == ForkName::Pq {
+        deposit.signature = BlsSignature::default();
+    }
     pending_queue_fields(state, "queue_excess_active_balance")?.push_pending_deposit(deposit)
 }
 
@@ -1263,10 +1271,15 @@ fn placeholder_pending_deposit(validator: &Validator, amount: Gwei) -> electra::
 /// exit/consolidation churn cursor fields, which nothing here reads or
 /// writes, and every gloas caller that needs those reaches them through
 /// `ChurnCursorsMut` directly, not through this projection.
+// The gloas variant holds the gloas-family view, a borrow of each field rather
+// than one of the state, so it is far wider than the others. The value lives on
+// the stack for one call and is never stored, where a box would only add an
+// allocation per use.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PendingQueueFields<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
-    Gloas(&'a mut gloas::BeaconState),
+    Gloas(GloasFamilyMut<'a>),
 }
 
 impl<'a> PendingQueueFields<'a> {
@@ -1284,7 +1297,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
             PendingQueueFields::Fulu(state) => state.deposit_requests_start_index,
-            PendingQueueFields::Gloas(state) => state.deposit_requests_start_index,
+            PendingQueueFields::Gloas(state) => *state.deposit_requests_start_index,
         }
     }
 
@@ -1293,7 +1306,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
-            PendingQueueFields::Gloas(state) => state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => *state.deposit_balance_to_consume,
         }
     }
 
@@ -1301,7 +1314,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
-            PendingQueueFields::Gloas(state) => &mut state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => &mut *state.deposit_balance_to_consume,
         }
     }
 
@@ -1336,7 +1349,7 @@ impl<'a> PendingQueueFields<'a> {
                 core::mem::take(&mut state.pending_deposits).to_vec()
             }
             PendingQueueFields::Gloas(state) => {
-                core::mem::take(&mut state.pending_deposits).to_vec()
+                core::mem::take(&mut *state.pending_deposits).to_vec()
             }
         }
     }
@@ -1356,7 +1369,7 @@ impl<'a> PendingQueueFields<'a> {
                 state.pending_deposits = electra::PendingDeposits::try_from(deposits)?;
             }
             PendingQueueFields::Gloas(state) => {
-                state.pending_deposits = gloas::PendingDeposits::from(deposits);
+                *state.pending_deposits = gloas::PendingDeposits::from(deposits);
             }
         }
         Ok(())
@@ -1370,7 +1383,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => &state.pending_partial_withdrawals,
             PendingQueueFields::Fulu(state) => &state.pending_partial_withdrawals,
-            PendingQueueFields::Gloas(state) => &state.pending_partial_withdrawals,
+            PendingQueueFields::Gloas(state) => &*state.pending_partial_withdrawals,
         }
     }
 
@@ -1399,7 +1412,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => &state.pending_consolidations,
             PendingQueueFields::Fulu(state) => &state.pending_consolidations,
-            PendingQueueFields::Gloas(state) => &state.pending_consolidations,
+            PendingQueueFields::Gloas(state) => &*state.pending_consolidations,
         }
     }
 
@@ -1435,7 +1448,7 @@ impl<'a> PendingQueueFields<'a> {
                 core::mem::take(&mut state.pending_consolidations).into_inner()
             }
             PendingQueueFields::Gloas(state) => {
-                core::mem::take(&mut state.pending_consolidations).into_inner()
+                core::mem::take(&mut *state.pending_consolidations).into_inner()
             }
         }
     }
@@ -1457,7 +1470,7 @@ impl<'a> PendingQueueFields<'a> {
                     electra::PendingConsolidations::try_from(consolidations)?;
             }
             PendingQueueFields::Gloas(state) => {
-                state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
+                *state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
             }
         }
         Ok(())
@@ -1501,7 +1514,9 @@ pub(crate) fn pending_queue_fields<'a>(
     match state {
         BeaconState::Electra(state) => Ok(PendingQueueFields::Electra(state)),
         BeaconState::Fulu(state) => Ok(PendingQueueFields::Fulu(state)),
-        BeaconState::Gloas(state) => Ok(PendingQueueFields::Gloas(state)),
+        state @ (BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_)) => Ok(
+            PendingQueueFields::Gloas(state.gloas_family_mut().expect("a gloas-family state")),
+        ),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -1512,10 +1527,15 @@ pub(crate) fn pending_queue_fields<'a>(
 /// The read-only counterpart of [`PendingQueueFields`], for a caller (like
 /// [`get_pending_balance_to_withdraw`]) that only ever reads a pending queue
 /// and so only ever holds a `&BeaconState`.
+// The gloas variant holds the gloas-family view, a borrow of each field rather
+// than one of the state, so it is far wider than the others. The value lives on
+// the stack for one call and is never stored, where a box would only add an
+// allocation per use.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PendingQueueFieldsRef<'a> {
     Electra(&'a electra::BeaconState),
     Fulu(&'a fulu::BeaconState),
-    Gloas(&'a gloas::BeaconState),
+    Gloas(GloasFamily<'a>),
 }
 
 impl<'a> PendingQueueFieldsRef<'a> {
@@ -1523,7 +1543,7 @@ impl<'a> PendingQueueFieldsRef<'a> {
         match self {
             PendingQueueFieldsRef::Electra(state) => &state.pending_partial_withdrawals,
             PendingQueueFieldsRef::Fulu(state) => &state.pending_partial_withdrawals,
-            PendingQueueFieldsRef::Gloas(state) => &state.pending_partial_withdrawals,
+            PendingQueueFieldsRef::Gloas(state) => state.pending_partial_withdrawals,
         }
     }
 }
@@ -1536,7 +1556,9 @@ pub(crate) fn pending_queue_fields_ref<'a>(
     match state {
         BeaconState::Electra(state) => Ok(PendingQueueFieldsRef::Electra(state)),
         BeaconState::Fulu(state) => Ok(PendingQueueFieldsRef::Fulu(state)),
-        BeaconState::Gloas(state) => Ok(PendingQueueFieldsRef::Gloas(state)),
+        state @ (BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_)) => Ok(
+            PendingQueueFieldsRef::Gloas(state.gloas_family().expect("a gloas-family state")),
+        ),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -1557,10 +1579,15 @@ pub(crate) fn pending_queue_fields_ref<'a>(
 /// deposit-balance churn cursor and the three pending queues, none of which
 /// this projection reads or writes. This one carries only the four
 /// exit/consolidation churn cursor fields.
+// The gloas variant holds the gloas-family view, a borrow of each field rather
+// than one of the state, so it is far wider than the others. The value lives on
+// the stack for one call and is never stored, where a box would only add an
+// allocation per use.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ChurnCursorsMut<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
-    Gloas(&'a mut gloas::BeaconState),
+    Gloas(GloasFamilyMut<'a>),
 }
 
 impl<'a> ChurnCursorsMut<'a> {
@@ -1568,7 +1595,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => state.earliest_exit_epoch,
             ChurnCursorsMut::Fulu(state) => state.earliest_exit_epoch,
-            ChurnCursorsMut::Gloas(state) => state.earliest_exit_epoch,
+            ChurnCursorsMut::Gloas(state) => *state.earliest_exit_epoch,
         }
     }
 
@@ -1576,7 +1603,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => &mut state.earliest_exit_epoch,
             ChurnCursorsMut::Fulu(state) => &mut state.earliest_exit_epoch,
-            ChurnCursorsMut::Gloas(state) => &mut state.earliest_exit_epoch,
+            ChurnCursorsMut::Gloas(state) => &mut *state.earliest_exit_epoch,
         }
     }
 
@@ -1584,7 +1611,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => state.exit_balance_to_consume,
             ChurnCursorsMut::Fulu(state) => state.exit_balance_to_consume,
-            ChurnCursorsMut::Gloas(state) => state.exit_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => *state.exit_balance_to_consume,
         }
     }
 
@@ -1592,7 +1619,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => &mut state.exit_balance_to_consume,
             ChurnCursorsMut::Fulu(state) => &mut state.exit_balance_to_consume,
-            ChurnCursorsMut::Gloas(state) => &mut state.exit_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => &mut *state.exit_balance_to_consume,
         }
     }
 
@@ -1600,7 +1627,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => state.earliest_consolidation_epoch,
             ChurnCursorsMut::Fulu(state) => state.earliest_consolidation_epoch,
-            ChurnCursorsMut::Gloas(state) => state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Gloas(state) => *state.earliest_consolidation_epoch,
         }
     }
 
@@ -1608,7 +1635,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => &mut state.earliest_consolidation_epoch,
             ChurnCursorsMut::Fulu(state) => &mut state.earliest_consolidation_epoch,
-            ChurnCursorsMut::Gloas(state) => &mut state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Gloas(state) => &mut *state.earliest_consolidation_epoch,
         }
     }
 
@@ -1616,7 +1643,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => state.consolidation_balance_to_consume,
             ChurnCursorsMut::Fulu(state) => state.consolidation_balance_to_consume,
-            ChurnCursorsMut::Gloas(state) => state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => *state.consolidation_balance_to_consume,
         }
     }
 
@@ -1624,7 +1651,7 @@ impl<'a> ChurnCursorsMut<'a> {
         match self {
             ChurnCursorsMut::Electra(state) => &mut state.consolidation_balance_to_consume,
             ChurnCursorsMut::Fulu(state) => &mut state.consolidation_balance_to_consume,
-            ChurnCursorsMut::Gloas(state) => &mut state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => &mut *state.consolidation_balance_to_consume,
         }
     }
 }
@@ -1638,7 +1665,9 @@ pub(crate) fn churn_cursors_mut<'a>(
     match state {
         BeaconState::Electra(state) => Ok(ChurnCursorsMut::Electra(state)),
         BeaconState::Fulu(state) => Ok(ChurnCursorsMut::Fulu(state)),
-        BeaconState::Gloas(state) => Ok(ChurnCursorsMut::Gloas(state)),
+        state @ (BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_)) => Ok(
+            ChurnCursorsMut::Gloas(state.gloas_family_mut().expect("a gloas-family state")),
+        ),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

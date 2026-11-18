@@ -192,6 +192,14 @@ pub fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
             !b.message.body.proposer_slashings.is_empty()
                 || !b.message.body.attester_slashings.is_empty()
         }
+        SignedBeaconBlock::Eip8483(b) => {
+            !b.message.body.proposer_slashings.is_empty()
+                || !b.message.body.attester_slashings.is_empty()
+        }
+        SignedBeaconBlock::Pq(b) => {
+            !b.message.body.proposer_slashings.is_empty()
+                || !b.message.body.attester_slashings.is_empty()
+        }
         // Not a Beacon Chain block: nothing here ever carries one.
         SignedBeaconBlock::Lean(_) => true,
     }

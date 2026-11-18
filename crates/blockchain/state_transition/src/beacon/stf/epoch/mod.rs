@@ -24,6 +24,7 @@ pub mod gloas;
 pub mod justification;
 #[cfg(test)]
 mod participation_equivalence;
+pub mod pq;
 pub mod registry;
 pub mod rewards;
 mod single_pass;
@@ -105,7 +106,11 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         // EIP-7688's progressive participation, inactivity, and pending-queue
         // lists need their own copies of several more (see `gloas`'s own
         // module doc for which), so gloas gets its own driver too.
-        ForkName::Gloas => gloas::process_epoch(state, config),
+        // EIP-8483 changes no epoch processing.
+        ForkName::Gloas | ForkName::Eip8483 => gloas::process_epoch(state, config),
+        // Without sync committees, and with the aggregation committee window
+        // and preregistration expiry appended.
+        ForkName::Pq => pq::process_epoch(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -140,7 +145,9 @@ pub fn process_justification_and_finalization(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
-        | ForkName::Gloas => altair::process_justification_and_finalization(state),
+        | ForkName::Gloas
+        | ForkName::Eip8483
+        | ForkName::Pq => altair::process_justification_and_finalization(state),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

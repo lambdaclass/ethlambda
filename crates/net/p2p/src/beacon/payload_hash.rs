@@ -276,6 +276,8 @@ pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Eip8483(_)
+        | SignedBeaconBlock::Pq(_)
         | SignedBeaconBlock::Lean(_) => Ok(()),
     }
 }

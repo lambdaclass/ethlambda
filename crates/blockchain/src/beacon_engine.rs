@@ -82,6 +82,10 @@ pub fn gloas_new_payload_request<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_)
+        // EIP-8483's and PQ's envelopes are their own shapes, and their
+        // execution requests have no engine API method yet.
+        | SignedBeaconBlock::Eip8483(_)
+        | SignedBeaconBlock::Pq(_)
         | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
     };
 
@@ -134,6 +138,8 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Gloas(_)
+        | SignedBeaconBlock::Eip8483(_)
+        | SignedBeaconBlock::Pq(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 

@@ -98,7 +98,12 @@ pub fn process_operations(
     let altair_attestations = match state.fork_name() {
         ForkName::Phase0 => false,
         ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => true,
-        fork @ (ForkName::Deneb | ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+        fork @ (ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Eip8483
+        | ForkName::Pq) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_operations",
                 fork,
@@ -521,7 +526,11 @@ pub fn add_validator_to_registry(
         // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
         // own documentation), so it is refused for both reasons rather than
         // folded into either branch above.
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+        fork @ (ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Gloas
+        | ForkName::Eip8483
+        | ForkName::Pq) => {
             return Err(Error::UnsupportedForFork {
                 function: "add_validator_to_registry",
                 fork,

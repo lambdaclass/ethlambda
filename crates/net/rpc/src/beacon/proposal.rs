@@ -383,6 +383,9 @@ pub(crate) fn require_gloas_slot(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
+        // Not followed, and no block production for them.
+        | ForkName::Eip8483
+        | ForkName::Pq
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }
@@ -448,6 +451,8 @@ pub(super) fn require_fulu_slot(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Gloas
+        | ForkName::Eip8483
+        | ForkName::Pq
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }

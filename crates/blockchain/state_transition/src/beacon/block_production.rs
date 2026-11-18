@@ -93,7 +93,7 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
         }
         // Gloas builds its block around a builder's bid rather than an
         // execution payload the proposer requests, which nothing here models.
-        BeaconState::Gloas(_) => {
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
         BeaconState::Lean(_) => lean_state_unreachable("payload_inputs"),
@@ -624,7 +624,7 @@ fn post_state(
         | BeaconState::Deneb(_) => {
             return Err(Error::SpecAssert("block production is electra and later"));
         }
-        BeaconState::Gloas(_) => {
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
             return Err(Error::SpecAssert("block production does not support gloas"));
         }
         BeaconState::Lean(_) => lean_state_unreachable("post_state"),

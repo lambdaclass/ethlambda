@@ -130,7 +130,8 @@ fn highest_attestation_index(fork: ForkName) -> u64 {
         // a block whose payload was seen. Which of the two is right depends
         // on the node's view of the block, which this client does not have,
         // so only the range is checked.
-        ForkName::Gloas => 1,
+        // EIP-8483 and PQ keep gloas's payload signal.
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => 1,
         // Not a Beacon Chain fork: `Config::fork_at_epoch` never names it, so
         // a caller that does has a bug of its own. A panic rather than an
         // `Err`, because this runs after the node has answered: an `Err`

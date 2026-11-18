@@ -25,6 +25,7 @@ pub mod mutators;
 pub mod participation;
 #[cfg(any(test, debug_assertions))]
 pub mod participation_reference;
+pub mod pq;
 pub mod predicates;
 pub mod shuffling;
 pub mod sync_committee;

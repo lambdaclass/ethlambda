@@ -283,8 +283,14 @@ pub fn decode_aggregate_and_proof(
         }
         // Electra's bytes, but a progressive `Attestation` (EIP-7688), so the
         // root the aggregator signs differs; `data.index` is the payload flag.
-        ForkName::Gloas => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
-            .map(SignedAggregateAndProof::Gloas),
+        ForkName::Gloas | ForkName::Eip8483 => {
+            gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
+                .map(SignedAggregateAndProof::Gloas)
+        }
+        // The PQ fork's aggregate carries a proof and an XMSS signature, a
+        // container the gossip layer does not model: the node does not
+        // follow that fork.
+        ForkName::Pq => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -336,9 +342,11 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
     match fork {
         // Gloas's `SingleAttestation` has electra's bytes; its `data.index`
         // carries the payload flag, which the gossip rules read.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
+        // XMSS-signed: see `decode_aggregate_and_proof`.
+        ForkName::Pq => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -373,9 +381,11 @@ pub fn decode_gossip(
                 ForkName::Electra | ForkName::Fulu => {
                     electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
                 }
-                ForkName::Gloas => {
+                ForkName::Gloas | ForkName::Eip8483 => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
+                // Proof-carrying: see `decode_aggregate_and_proof`.
+                ForkName::Pq => return Err(DecodeError::UnsupportedFork),
                 ForkName::Phase0
                 | ForkName::Altair
                 | ForkName::Bellatrix

@@ -43,12 +43,16 @@ pub mod altair;
 pub mod bellatrix;
 pub mod capella;
 pub mod deneb;
+pub mod eip8483;
 pub mod electra;
 pub mod fulu;
 pub mod gloas;
+pub mod gloas_family;
 pub mod phase0;
+pub mod pq;
 pub mod shared;
 
+pub use gloas_family::{GloasFamily, GloasFamilyMut};
 pub use shared::*;
 
 use libssz::{SszDecode as _, SszEncode as _};
@@ -57,7 +61,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{
     BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _,
-    ParticipationFlags, Root, Slot, ValidatorIndex, WithdrawalIndex,
+    ParticipationFlags, Root, Slot, ValidatorIndex, WithdrawalIndex, XmssSignature,
 };
 use crate::beacon::{beacon_value_unreachable, lean_block_unreachable, lean_state_unreachable};
 
@@ -78,6 +82,8 @@ macro_rules! dispatch_state {
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
+            BeaconState::Eip8483($state) => $body,
+            BeaconState::Pq($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
     };
@@ -108,6 +114,8 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
             BeaconState::Gloas($state) => $body,
+            BeaconState::Eip8483($state) => $body,
+            BeaconState::Pq($state) => $body,
             BeaconState::Lean($state) => $body,
         }
     };
@@ -153,6 +161,8 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
+            SignedBeaconBlock::Eip8483($block) => $body,
+            SignedBeaconBlock::Pq($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
     };
@@ -178,6 +188,8 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
             SignedBeaconBlock::Gloas($block) => $body,
+            SignedBeaconBlock::Eip8483($block) => $body,
+            SignedBeaconBlock::Pq($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
     };
@@ -204,6 +216,12 @@ pub enum BeaconState {
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
     Gloas(gloas::BeaconState),
+    /// EIP-8483, a consensus-specs feature fork: gloas plus PQ registrations.
+    Eip8483(eip8483::BeaconState),
+    /// The post-quantum fork. Its registry element is [`pq::Validator`], which
+    /// the registry accessors hand out as the [`Validator`] record every other
+    /// fork stores (see [`pq`]'s module doc).
+    Pq(pq::BeaconState),
     Lean(crate::state::State),
 }
 
@@ -248,6 +266,8 @@ impl serde::Serialize for BeaconState {
             BeaconState::Electra(state) => state.serialize(serializer),
             BeaconState::Fulu(state) => state.serialize(serializer),
             BeaconState::Gloas(state) => state.serialize(serializer),
+            BeaconState::Eip8483(state) => state.serialize(serializer),
+            BeaconState::Pq(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
             )),
@@ -289,6 +309,8 @@ impl BeaconState {
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
             BeaconState::Gloas(_) => ForkName::Gloas,
+            BeaconState::Eip8483(_) => ForkName::Eip8483,
+            BeaconState::Pq(_) => ForkName::Pq,
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -354,6 +376,10 @@ impl BeaconState {
             ForkName::Gloas => Ok(BeaconState::Gloas(gloas::BeaconState::from_ssz_bytes(
                 bytes,
             )?)),
+            ForkName::Eip8483 => Ok(BeaconState::Eip8483(eip8483::BeaconState::from_ssz_bytes(
+                bytes,
+            )?)),
+            ForkName::Pq => Ok(BeaconState::Pq(pq::BeaconState::from_ssz_bytes(bytes)?)),
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
             )?)),
@@ -419,6 +445,7 @@ impl BeaconState {
                 <shared::BlockRoots as SszEncode>::fixed_size(),
                 <altair::SyncCommittee as SszEncode>::fixed_size(),
                 <gloas::PayloadTimelinessCommitteeWindow as SszEncode>::fixed_size(),
+                <pq::VrfProof as SszEncode>::fixed_size(),
             ]),
         }
     }
@@ -529,6 +556,14 @@ tree_fields!(
 // scores are not listed. Every other field is the shared tree type.
 tree_fields!(
     gloas::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
+    historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
+);
+tree_fields!(
+    eip8483::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
+    historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
+);
+tree_fields!(
+    pq::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings,
     historical_summaries, previous_epoch_participation, current_epoch_participation, pending_deposits
 );
 
@@ -670,6 +705,9 @@ impl BeaconState {
 enum Registry<'a> {
     Bounded(&'a Validators, &'a Balances),
     Progressive(&'a ProgressiveValidators, &'a ProgressiveBalances),
+    /// The PQ fork's registry, whose element wraps the shared record with the
+    /// validator's VRF root (see [`pq::Validator`]).
+    Pq(&'a pq::Validators, &'a ProgressiveBalances),
 }
 
 /// [`Registry`], mutably. A separate type rather than a lifetime trick on the
@@ -679,6 +717,7 @@ enum Registry<'a> {
 enum RegistryMut<'a> {
     Bounded(&'a mut Validators, &'a mut Balances),
     Progressive(&'a mut ProgressiveValidators, &'a mut ProgressiveBalances),
+    Pq(&'a mut pq::Validators, &'a mut ProgressiveBalances),
 }
 
 /// One of a state's participation lists, whichever list kind its fork uses.
@@ -1009,6 +1048,70 @@ impl<'a> Iterator for ScoresIter<'a> {
 
 impl ExactSizeIterator for ScoresIter<'_> {}
 
+/// The iterator behind [`BeaconState::iter_validators`]: either list kind of
+/// shared records, or the PQ registry read as its elements' shared records.
+enum ValidatorIter<'a> {
+    Shared(RegistryIter<'a, Validator, std::collections::BTreeMap<usize, Validator>>),
+    Pq(
+        ethlambda_ssz_tree::ProgressiveIter<
+            'a,
+            pq::Validator,
+            std::collections::BTreeMap<usize, pq::Validator>,
+        >,
+    ),
+}
+
+impl<'a> Iterator for ValidatorIter<'a> {
+    type Item = &'a Validator;
+
+    fn next(&mut self) -> Option<&'a Validator> {
+        match self {
+            Self::Shared(it) => it.next(),
+            Self::Pq(it) => it.next().map(|validator| &validator.record),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Shared(it) => it.size_hint(),
+            Self::Pq(it) => it.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for ValidatorIter<'_> {}
+
+/// One validator in [`BeaconState::try_update_validators_with_balances`]'s
+/// write cursor, whichever registry kind the state keeps: reads go through
+/// `Deref`, writes through [`ValidatorCow::make_mut`], and both see the shared
+/// record, the PQ element's included.
+pub enum ValidatorCow<'c> {
+    Shared(ethlambda_ssz_tree::ElemCow<'c, Validator>),
+    Pq(ethlambda_ssz_tree::ElemCow<'c, pq::Validator>),
+}
+
+impl core::ops::Deref for ValidatorCow<'_> {
+    type Target = Validator;
+
+    fn deref(&self) -> &Validator {
+        match self {
+            Self::Shared(cow) => cow,
+            Self::Pq(cow) => &cow.record,
+        }
+    }
+}
+
+impl ValidatorCow<'_> {
+    /// The record, to be written. See `ElemCow::make_mut` for what the first
+    /// write costs.
+    pub fn make_mut(&mut self) -> &mut Validator {
+        match self {
+            Self::Shared(cow) => cow.make_mut(),
+            Self::Pq(cow) => &mut cow.make_mut().record,
+        }
+    }
+}
+
 /// An iterator over either registry list kind, so [`BeaconState::iter_validators`]
 /// and [`BeaconState::iter_balances`] can promise one return type across every
 /// fork despite [`Registry`]'s two underlying list types having different
@@ -1062,8 +1165,11 @@ impl BeaconState {
     /// descent, where this walks the registry once, sequentially.
     pub fn iter_validators(&self) -> impl ExactSizeIterator<Item = &Validator> {
         match self.registry() {
-            Some(Registry::Bounded(v, _)) => RegistryIter::Bounded(v.iter()),
-            Some(Registry::Progressive(v, _)) => RegistryIter::Progressive(v.iter()),
+            Some(Registry::Bounded(v, _)) => ValidatorIter::Shared(RegistryIter::Bounded(v.iter())),
+            Some(Registry::Progressive(v, _)) => {
+                ValidatorIter::Shared(RegistryIter::Progressive(v.iter()))
+            }
+            Some(Registry::Pq(v, _)) => ValidatorIter::Pq(v.iter()),
             None => lean_state_unreachable("iter_validators"),
         }
     }
@@ -1073,8 +1179,13 @@ impl BeaconState {
     /// registry's appended tail that must not walk the part before it.
     pub fn iter_validators_from(&self, start: usize) -> impl ExactSizeIterator<Item = &Validator> {
         match self.registry() {
-            Some(Registry::Bounded(v, _)) => RegistryIter::Bounded(v.iter_from(start)),
-            Some(Registry::Progressive(v, _)) => RegistryIter::Progressive(v.iter_from(start)),
+            Some(Registry::Bounded(v, _)) => {
+                ValidatorIter::Shared(RegistryIter::Bounded(v.iter_from(start)))
+            }
+            Some(Registry::Progressive(v, _)) => {
+                ValidatorIter::Shared(RegistryIter::Progressive(v.iter_from(start)))
+            }
+            Some(Registry::Pq(v, _)) => ValidatorIter::Pq(v.iter_from(start)),
             None => lean_state_unreachable("iter_validators_from"),
         }
     }
@@ -1084,7 +1195,9 @@ impl BeaconState {
     pub fn iter_balances(&self) -> impl ExactSizeIterator<Item = Gwei> {
         match self.registry() {
             Some(Registry::Bounded(_, b)) => RegistryIter::Bounded(b.iter()),
-            Some(Registry::Progressive(_, b)) => RegistryIter::Progressive(b.iter()),
+            Some(Registry::Progressive(_, b) | Registry::Pq(_, b)) => {
+                RegistryIter::Progressive(b.iter())
+            }
             None => lean_state_unreachable("iter_balances"),
         }
         .copied()
@@ -1095,9 +1208,12 @@ impl BeaconState {
     /// A named error rather than an `Option`, since the specification indexes the
     /// registry in many places and an out-of-range index is always a fault.
     pub fn validator(&self, index: ValidatorIndex) -> Result<&Validator> {
-        dispatch_state!(self, "validator", |state| state
-            .validators
-            .get(index as usize))
+        match self.registry() {
+            Some(Registry::Bounded(v, _)) => v.get(index as usize),
+            Some(Registry::Progressive(v, _)) => v.get(index as usize),
+            Some(Registry::Pq(v, _)) => v.get(index as usize).map(|validator| &validator.record),
+            None => lean_state_unreachable("validator"),
+        }
         .ok_or(Error::UnknownValidator(index))
     }
 
@@ -1105,10 +1221,31 @@ impl BeaconState {
     /// the underlying list clones the element into its update buffer on this
     /// call alone, whether or not the caller goes on to change it.
     pub fn validator_mut(&mut self, index: ValidatorIndex) -> Result<&mut Validator> {
-        dispatch_state!(self, "validator_mut", |state| state
-            .validators
-            .get_mut(index as usize))
+        match self.registry_mut() {
+            Some(RegistryMut::Bounded(v, _)) => v.get_mut(index as usize),
+            Some(RegistryMut::Progressive(v, _)) => v.get_mut(index as usize),
+            Some(RegistryMut::Pq(v, _)) => v
+                .get_mut(index as usize)
+                .map(|validator| &mut validator.record),
+            None => lean_state_unreachable("validator_mut"),
+        }
         .ok_or(Error::UnknownValidator(index))
+    }
+
+    /// The PQ registry element at `index`: the shared record and the
+    /// validator's VRF root. [`Error::UnsupportedForFork`] before PQ.
+    pub fn pq_validator(&self, index: ValidatorIndex) -> Result<&pq::Validator> {
+        match self {
+            BeaconState::Pq(state) => state
+                .validators
+                .get(index as usize)
+                .ok_or(Error::UnknownValidator(index)),
+            BeaconState::Lean(_) => lean_state_unreachable("pq_validator"),
+            other => Err(Error::UnsupportedForFork {
+                function: "pq_validator",
+                fork: other.fork_name(),
+            }),
+        }
     }
 
     /// The balance of the validator at `index`.
@@ -1136,12 +1273,45 @@ impl BeaconState {
     /// forks still push to them separately, through
     /// [`Self::altair_validator_lists_mut`], since this function only owns
     /// the two lists every fork has.
+    ///
+    /// [`Error::UnsupportedForFork`] on a PQ state, whose element also carries
+    /// a VRF root: [`Self::push_pq_validator`] appends there.
     pub fn push_validator(&mut self, validator: Validator, balance: Gwei) -> Result<()> {
-        dispatch_state!(self, "push_validator", |state| {
-            state.validators.push(validator)?;
-            state.balances.push(balance)?;
-            Ok(())
-        })
+        match self.registry_mut() {
+            Some(RegistryMut::Bounded(v, b)) => {
+                v.push(validator)?;
+                b.push(balance)?;
+            }
+            Some(RegistryMut::Progressive(v, b)) => {
+                v.push(validator)?;
+                b.push(balance)?;
+            }
+            Some(RegistryMut::Pq(..)) => {
+                return Err(Error::UnsupportedForFork {
+                    function: "push_validator",
+                    fork: ForkName::Pq,
+                });
+            }
+            None => lean_state_unreachable("push_validator"),
+        }
+        Ok(())
+    }
+
+    /// [`Self::push_validator`] for the PQ registry, whose element carries the
+    /// validator's VRF root beside the shared record.
+    pub fn push_pq_validator(&mut self, validator: pq::Validator, balance: Gwei) -> Result<()> {
+        match self {
+            BeaconState::Pq(state) => {
+                state.validators.push(validator)?;
+                state.balances.push(balance)?;
+                Ok(())
+            }
+            BeaconState::Lean(_) => lean_state_unreachable("push_pq_validator"),
+            other => Err(Error::UnsupportedForFork {
+                function: "push_pq_validator",
+                fork: other.fork_name(),
+            }),
+        }
     }
 
     /// The registry's own root: the value genesis records as
@@ -1163,6 +1333,7 @@ impl BeaconState {
         match (self.registry(), other.registry()) {
             (Some(Registry::Bounded(v, _)), Some(Registry::Bounded(ov, _))) => v.ptr_eq(ov),
             (Some(Registry::Progressive(v, _)), Some(Registry::Progressive(ov, _))) => v.ptr_eq(ov),
+            (Some(Registry::Pq(v, _)), Some(Registry::Pq(ov, _))) => v.ptr_eq(ov),
             _ => false,
         }
     }
@@ -1185,6 +1356,8 @@ impl BeaconState {
             BeaconState::Electra(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
             BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
+            BeaconState::Eip8483(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
+            BeaconState::Pq(s) => Some(Registry::Pq(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
         }
     }
@@ -1214,6 +1387,10 @@ impl BeaconState {
             BeaconState::Gloas(s) => {
                 Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
             }
+            BeaconState::Eip8483(s) => {
+                Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Pq(s) => Some(RegistryMut::Pq(&mut s.validators, &mut s.balances)),
             BeaconState::Lean(_) => None,
         }
     }
@@ -1281,12 +1458,17 @@ impl BeaconState {
                 v.rebase_on(bv);
                 b.rebase_on(bb);
             }
+            (Some(RegistryMut::Pq(v, b)), Registry::Pq(bv, bb)) => {
+                v.rebase_on(bv);
+                b.rebase_on(bb);
+            }
             // Self is lean (no registry at all), or the two states disagree
             // on list kind: exactly the fork-boundary case this function's
             // own doc names as a no-op.
             (None, _)
-            | (Some(RegistryMut::Bounded(..)), Registry::Progressive(..))
-            | (Some(RegistryMut::Progressive(..)), Registry::Bounded(..)) => {}
+            | (Some(RegistryMut::Bounded(..)), _)
+            | (Some(RegistryMut::Progressive(..)), _)
+            | (Some(RegistryMut::Pq(..)), _) => {}
         }
         self.block_roots_mut().rebase_on(base.block_roots());
         self.state_roots_mut().rebase_on(base.state_roots());
@@ -1313,6 +1495,7 @@ impl BeaconState {
         match self.registry() {
             Some(Registry::Bounded(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
             Some(Registry::Progressive(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
+            Some(Registry::Pq(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
             None => false,
         }
     }
@@ -1347,28 +1530,26 @@ impl BeaconState {
                 previous.rebase_on(base_previous);
                 current.rebase_on(base_current);
             }
-        } else if let (BeaconState::Gloas(state), BeaconState::Gloas(base)) = (self, base) {
+        } else if let (Some(state), Some(base)) = (self.gloas_family_mut(), base.gloas_family()) {
             state
                 .previous_epoch_participation
-                .rebase_on(&base.previous_epoch_participation);
+                .rebase_on(base.previous_epoch_participation);
             state
                 .current_epoch_participation
-                .rebase_on(&base.current_epoch_participation);
+                .rebase_on(base.current_epoch_participation);
         }
     }
 
     /// Shares `pending_deposits` with `base`'s where both keep the same list
     /// kind (electra and fulu, or both gloas).
     fn rebase_pending_deposits_on(&mut self, base: &BeaconState) {
+        if let (Some(state), Some(base)) = (self.gloas_family_mut(), base.gloas_family()) {
+            state.pending_deposits.rebase_on(base.pending_deposits);
+            return;
+        }
         let base_deposits = match base {
             BeaconState::Electra(state) => &state.pending_deposits,
             BeaconState::Fulu(state) => &state.pending_deposits,
-            BeaconState::Gloas(base) => {
-                if let BeaconState::Gloas(state) = self {
-                    state.pending_deposits.rebase_on(&base.pending_deposits);
-                }
-                return;
-            }
             _ => return,
         };
         match self {
@@ -1388,6 +1569,8 @@ impl BeaconState {
             BeaconState::Electra(state) => &state.historical_summaries,
             BeaconState::Fulu(state) => &state.historical_summaries,
             BeaconState::Gloas(state) => &state.historical_summaries,
+            BeaconState::Eip8483(state) => &state.historical_summaries,
+            BeaconState::Pq(state) => &state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
             | BeaconState::Bellatrix(_)
@@ -1399,6 +1582,8 @@ impl BeaconState {
             BeaconState::Electra(state) => &mut state.historical_summaries,
             BeaconState::Fulu(state) => &mut state.historical_summaries,
             BeaconState::Gloas(state) => &mut state.historical_summaries,
+            BeaconState::Eip8483(state) => &mut state.historical_summaries,
+            BeaconState::Pq(state) => &mut state.historical_summaries,
             BeaconState::Phase0(_)
             | BeaconState::Altair(_)
             | BeaconState::Bellatrix(_)
@@ -1435,26 +1620,29 @@ impl BeaconState {
     /// list is an error.
     pub fn try_update_validators_with_balances<E>(
         &mut self,
-        mut f: impl FnMut(
-            &mut ethlambda_ssz_tree::ElemCow<'_, Validator>,
-            Gwei,
-        ) -> core::result::Result<(), E>,
+        mut f: impl FnMut(&mut ValidatorCow<'_>, Gwei) -> core::result::Result<(), E>,
     ) -> core::result::Result<(), E> {
-        dispatch_state!(
-            self,
-            "BeaconState::try_update_validators_with_balances",
-            |state| {
-                let mut balances = state.balances.iter();
-                let mut pass = state.validators.iter_cow();
-                while let Some(mut validator) = pass.next_cow() {
+        // One loop per registry kind: the cursors' element types differ, and
+        // `ValidatorCow` is what makes the closure see one type.
+        macro_rules! pass {
+            ($validators:expr, $balances:expr, $wrap:path) => {{
+                let mut balances = $balances.iter();
+                let mut pass = $validators.iter_cow();
+                while let Some(validator) = pass.next_cow() {
                     let Some(&balance) = balances.next() else {
                         break;
                     };
-                    f(&mut validator, balance)?;
+                    f(&mut $wrap(validator), balance)?;
                 }
                 Ok(())
-            }
-        )
+            }};
+        }
+        match self.registry_mut() {
+            Some(RegistryMut::Bounded(v, b)) => pass!(v, b, ValidatorCow::Shared),
+            Some(RegistryMut::Progressive(v, b)) => pass!(v, b, ValidatorCow::Shared),
+            Some(RegistryMut::Pq(v, b)) => pass!(v, b, ValidatorCow::Pq),
+            None => lean_state_unreachable("BeaconState::try_update_validators_with_balances"),
+        }
     }
 
     /// The randao mix for `epoch`, which the specification indexes modulo the
@@ -1486,7 +1674,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Eip8483, Pq],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1500,7 +1688,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas, Eip8483, Pq],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -1550,7 +1738,7 @@ impl BeaconState {
                 ParticipationRef::from(&state.current_epoch_participation),
                 InactivityScoresRef::from(&state.inactivity_scores),
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Eip8483, Pq],
             absent_from: [Phase0],
         )
     }
@@ -1604,7 +1792,7 @@ impl BeaconState {
                 &mut state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0, Gloas],
+            absent_from: [Phase0, Gloas, Eip8483, Pq],
         )
     }
 
@@ -1636,7 +1824,7 @@ impl BeaconState {
                     .get_mut(index)
                     .ok_or(Error::IndexOutOfBounds { index, len })?
             },
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Eip8483, Pq],
             absent_from: [Phase0],
         )
     }
@@ -1663,7 +1851,7 @@ impl BeaconState {
             } else {
                 &mut state.previous_epoch_participation
             }),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Eip8483, Pq],
             absent_from: [Phase0],
         )
     }
@@ -1684,8 +1872,8 @@ impl BeaconState {
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-            absent_from: [Phase0],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Eip8483],
+            absent_from: [Phase0, Pq],
         )
     }
 
@@ -1707,8 +1895,8 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
-            absent_from: [Phase0],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas, Eip8483],
+            absent_from: [Phase0, Pq],
         )
     }
 }
@@ -1927,6 +2115,13 @@ pub enum SignedBeaconBlock {
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
     Gloas(gloas::SignedBeaconBlock),
+    Eip8483(eip8483::SignedBeaconBlock),
+    /// The PQ fork's block, signed with leanXMSS: [`SignedBeaconBlock::signature`]
+    /// does not answer for it, [`SignedBeaconBlock::xmss_signature`] does.
+    ///
+    /// Boxed: its 2404-byte signature is inline, and unboxed it would make
+    /// every fork's block several kilobytes.
+    Pq(Box<pq::SignedBeaconBlock>),
 
     /// The Lean consensus protocol's block.
     ///
@@ -1982,7 +2177,12 @@ impl SignedBeaconBlock {
     /// (`is_payload_verified(store, root)`) rather than this accessor.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Eip8483(_)
+            | Self::Pq(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
@@ -2037,6 +2237,20 @@ impl SignedBeaconBlock {
                 .message
                 .blob_kzg_commitments
                 .len(),
+            Self::Eip8483(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
+            Self::Pq(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
         }
     }
 
@@ -2050,7 +2264,12 @@ impl SignedBeaconBlock {
     /// would describe.
     pub fn execution_payload_timestamp(&self) -> Option<u64> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Gloas(_)
+            | Self::Eip8483(_)
+            | Self::Pq(_)
+            | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
@@ -2076,6 +2295,8 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
             SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
+            SignedBeaconBlock::Eip8483(_) => ForkName::Eip8483,
+            SignedBeaconBlock::Pq(_) => ForkName::Pq,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -2112,6 +2333,12 @@ impl SignedBeaconBlock {
             ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(
                 gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
+            ForkName::Eip8483 => Ok(SignedBeaconBlock::Eip8483(
+                eip8483::SignedBeaconBlock::from_ssz_bytes(bytes)?,
+            )),
+            ForkName::Pq => Ok(SignedBeaconBlock::Pq(Box::new(
+                pq::SignedBeaconBlock::from_ssz_bytes(bytes)?,
+            ))),
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
             )),
@@ -2207,10 +2434,75 @@ signed_beacon_block_accessors!(
         (parent_root, Root),
         (state_root, Root),
     ],
-    outer: [
-        (signature, BlsSignature),
-    ],
+    outer: [],
 );
+
+impl SignedBeaconBlock {
+    /// The proposer's BLS signature, at every fork that has one.
+    ///
+    /// # Panics
+    ///
+    /// On [`SignedBeaconBlock::Pq`], whose block is signed with leanXMSS
+    /// ([`SignedBeaconBlock::xmss_signature`]), and on
+    /// [`SignedBeaconBlock::Lean`]. Every BLS verification path dispatches on
+    /// the fork before it gets here, so reaching either arm is a caller bug,
+    /// named the way `dispatch_block!`'s lean arm names one.
+    pub fn signature(&self) -> BlsSignature {
+        match self {
+            SignedBeaconBlock::Pq(_) => {
+                crate::beacon::xmss_fork_has_no_bls("SignedBeaconBlock::signature")
+            }
+            other => dispatch_block!(other, "signature", |block| bls_signature_of(block)),
+        }
+    }
+
+    /// The proposer's leanXMSS signature: `Some` only for
+    /// [`SignedBeaconBlock::Pq`].
+    pub fn xmss_signature(&self) -> Option<&XmssSignature> {
+        match self {
+            SignedBeaconBlock::Pq(block) => Some(&block.signature),
+            _ => None,
+        }
+    }
+}
+
+/// The `signature` field of a block whose fork signs with BLS. A trait rather
+/// than a field read in `dispatch_block!`'s body, since the PQ block's field
+/// has another type and the macro inserts one body into every arm.
+trait BlsSigned {
+    fn bls_signature(&self) -> BlsSignature;
+}
+
+macro_rules! bls_signed {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl BlsSigned for $ty {
+            fn bls_signature(&self) -> BlsSignature {
+                self.signature
+            }
+        })+
+    };
+}
+
+bls_signed!(
+    phase0::SignedBeaconBlock,
+    altair::SignedBeaconBlock,
+    bellatrix::SignedBeaconBlock,
+    capella::SignedBeaconBlock,
+    deneb::SignedBeaconBlock,
+    electra::SignedBeaconBlock,
+    gloas::SignedBeaconBlock,
+    eip8483::SignedBeaconBlock,
+);
+
+impl BlsSigned for Box<pq::SignedBeaconBlock> {
+    fn bls_signature(&self) -> BlsSignature {
+        crate::beacon::xmss_fork_has_no_bls("SignedBeaconBlock::signature")
+    }
+}
+
+fn bls_signature_of(block: &impl BlsSigned) -> BlsSignature {
+    block.bls_signature()
+}
 
 /// A data column sidecar in either shape: fulu's carries a signed header and
 /// an inclusion proof, gloas's names its block by root and reads its
@@ -2271,9 +2563,10 @@ impl DataColumnSidecar {
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
-            ForkName::Gloas => Ok(Self::Gloas(gloas::DataColumnSidecar::from_ssz_bytes(
-                bytes,
-            )?)),
+            // Neither feature fork changes the sidecar: theirs is gloas's.
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => Ok(Self::Gloas(
+                gloas::DataColumnSidecar::from_ssz_bytes(bytes)?,
+            )),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix

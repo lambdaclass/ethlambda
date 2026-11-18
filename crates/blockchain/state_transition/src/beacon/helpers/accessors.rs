@@ -138,16 +138,39 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
 /// for p2p's gossipsub scoring, which sizes expected aggregate traffic from
 /// a validator count rather than from a state.
 pub fn committee_count_per_slot(active_count: u64) -> u64 {
+    committee_count_per_slot_for(ForkName::Gloas, active_count)
+}
+
+/// The most committees a slot of `fork` has: `MAX_COMMITTEES_PER_SLOT`, or
+/// the PQ fork's `MAX_COMMITTEES_PER_SLOT_PQ`.
+///
+/// The PQ fork's cap applies to every epoch a PQ state is asked about,
+/// including a previous epoch that ran before the fork: the specification's
+/// modified `get_committee_count_per_slot` reads no fork, so those committees
+/// are recomputed under the new cap.
+pub fn max_committees_per_slot(fork: ForkName) -> u64 {
+    if fork == ForkName::Pq {
+        preset::MAX_COMMITTEES_PER_SLOT_PQ as u64
+    } else {
+        preset::MAX_COMMITTEES_PER_SLOT as u64
+    }
+}
+
+/// [`committee_count_per_slot`] under `fork`'s cap.
+pub fn committee_count_per_slot_for(fork: ForkName, active_count: u64) -> u64 {
     let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
-    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+    ideal.clamp(1, max_committees_per_slot(fork))
 }
 
 /// How many committees each slot of `epoch` has.
 ///
 /// At least one, so a small chain still produces committees, and at most
-/// `MAX_COMMITTEES_PER_SLOT`.
+/// `MAX_COMMITTEES_PER_SLOT` (`MAX_COMMITTEES_PER_SLOT_PQ` on a PQ state).
 pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
-    committee_count_per_slot(get_active_validator_indices(state, epoch).len() as u64)
+    committee_count_per_slot_for(
+        state.fork_name(),
+        get_active_validator_indices(state, epoch).len() as u64,
+    )
 }
 
 /// `epoch`'s committees as `state` names them: one scan of the active
@@ -189,7 +212,8 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// what [`ShufflingKey`] does; see [`shuffling_key`].
 pub fn build_epoch_committees(state: &BeaconState, epoch: Epoch) -> EpochCommittees {
     let active_indices = get_active_validator_indices(state, epoch);
-    let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
+    let committees_per_slot =
+        committee_count_per_slot_for(state.fork_name(), active_indices.len() as u64);
     let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
     // The active set's own buffer becomes the shuffled set, so a build holds
     // one validator-sized list at a time, not a permutation and a gathered
@@ -244,6 +268,7 @@ fn shuffling_key(state: &BeaconState, epoch: Epoch) -> Option<ShufflingKey> {
     Some(ShufflingKey {
         epoch,
         decision_root,
+        max_committees_per_slot: max_committees_per_slot(state.fork_name()),
     })
 }
 
@@ -627,7 +652,8 @@ pub fn get_beacon_committee(
 ) -> Result<Vec<ValidatorIndex>> {
     let epoch = compute_epoch_at_slot(slot);
     let active_indices = get_active_validator_indices(state, epoch);
-    let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
+    let committees_per_slot =
+        committee_count_per_slot_for(state.fork_name(), active_indices.len() as u64);
     compute_committee(
         &active_indices,
         get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER),
@@ -664,7 +690,9 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
         // Gloas's own `proposer_lookahead` is unchanged from fulu (see
         // `containers::gloas`'s module doc) and gloas does not redefine
         // this function, so both forks share fulu's exact same lookup.
-        ForkName::Fulu | ForkName::Gloas => return super::fulu::get_beacon_proposer_index(state),
+        ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+            return super::fulu::get_beacon_proposer_index(state);
+        }
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -698,7 +726,9 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
             |index| Ok(state.validator(index)?.effective_balance),
         ),
         ForkName::Fulu => unreachable!("Fulu returns via the dispatch match above"),
-        ForkName::Gloas => unreachable!("Gloas returns via the dispatch match above"),
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+            unreachable!("Gloas returns via the dispatch match above")
+        }
         ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 }

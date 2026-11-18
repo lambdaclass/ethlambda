@@ -72,6 +72,9 @@ fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
             };
             Some(BlockPayloadLink::Gloas { parent_status })
         }
+        // Not followed (`ForkName::is_followed`): no store holds one, and
+        // no payload link is recorded for one.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => None,
         // A lean block is never in a beacon store.
         SignedBeaconBlock::Lean(_) => None,
     }

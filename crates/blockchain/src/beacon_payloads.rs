@@ -49,6 +49,12 @@ pub(crate) fn bid_of(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPaylo
         SignedBeaconBlock::Gloas(inner) => {
             Some(&inner.message.body.signed_execution_payload_bid.message)
         }
+        SignedBeaconBlock::Eip8483(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Pq(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)

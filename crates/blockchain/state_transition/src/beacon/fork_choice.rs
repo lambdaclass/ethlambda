@@ -180,7 +180,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::Validator;
 use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
-use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
+use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0, pq};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
@@ -193,6 +193,7 @@ use crate::beacon::helpers::gloas as gloas_helpers;
 use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_start_slot_at_epoch, is_valid_merkle_branch,
 };
+use crate::beacon::helpers::pq as pq_helpers;
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::beacon::helpers::target_balances::{
     TargetBalanceDelta, block_has_slashings, compute_target_balances, extend_parent_totals,
@@ -243,7 +244,11 @@ pub use ethlambda_types::beacon::fork_choice::{
 pub enum Attestation {
     Phase0(phase0::Attestation),
     Electra(electra::Attestation),
+    /// Gloas's shape, which EIP-8483 keeps.
     Gloas(gloas::Attestation),
+    /// The PQ fork's: no signature, the attesters' signatures being checked by
+    /// gossip validation or by the block's `proof`.
+    Pq(pq::Attestation),
 }
 
 /// Which fork's handler rules apply: to an attestation's `data.index` and to
@@ -284,7 +289,7 @@ impl ForkRules {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => ForkRules::PreGloas,
-            ForkName::Gloas => ForkRules::Gloas,
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
     }
@@ -311,6 +316,7 @@ impl Attestation {
             Attestation::Phase0(attestation) => attestation.data,
             Attestation::Electra(attestation) => attestation.data,
             Attestation::Gloas(attestation) => attestation.data,
+            Attestation::Pq(attestation) => attestation.data,
         }
     }
 
@@ -319,7 +325,7 @@ impl Attestation {
     pub fn rules(&self) -> ForkRules {
         match self {
             Attestation::Phase0(_) | Attestation::Electra(_) => ForkRules::PreGloas,
-            Attestation::Gloas(_) => ForkRules::Gloas,
+            Attestation::Gloas(_) | Attestation::Pq(_) => ForkRules::Gloas,
         }
     }
 
@@ -401,6 +407,15 @@ impl Attestation {
                 }
                 Ok(indexed.attesting_indices.iter().copied().collect())
             }
+            // [Modified in PQ] An attestation carries no signature, so
+            // `on_attestation` only checks that it has attesters.
+            Attestation::Pq(attestation) => {
+                let indices = pq_helpers::get_attesting_indices(state, attestation, committees)?;
+                if verify_signature {
+                    verify(!indices.is_empty(), "len(attesting_indices) > 0")?;
+                }
+                Ok(indices)
+            }
         }
     }
 }
@@ -413,6 +428,8 @@ pub enum AttesterSlashing {
     Phase0(phase0::AttesterSlashing),
     Electra(electra::AttesterSlashing),
     Gloas(gloas::AttesterSlashing),
+    /// The PQ fork's, each half carrying a proof of its attesters' signatures.
+    Pq(pq::AttesterSlashing),
 }
 
 impl AttesterSlashing {
@@ -429,6 +446,9 @@ impl AttesterSlashing {
                 (slashing.attestation_1.data, slashing.attestation_2.data)
             }
             AttesterSlashing::Gloas(slashing) => {
+                (slashing.attestation_1.data, slashing.attestation_2.data)
+            }
+            AttesterSlashing::Pq(slashing) => {
                 (slashing.attestation_1.data, slashing.attestation_2.data)
             }
         }
@@ -521,6 +541,30 @@ impl AttesterSlashing {
                         .collect(),
                 ))
             }
+            AttesterSlashing::Pq(slashing) => {
+                verify(
+                    pq_helpers::is_valid_indexed_attestation(state, &slashing.attestation_1)?,
+                    "is_valid_indexed_attestation(state, attestation_1)",
+                )?;
+                verify(
+                    pq_helpers::is_valid_indexed_attestation(state, &slashing.attestation_2)?,
+                    "is_valid_indexed_attestation(state, attestation_2)",
+                )?;
+                Ok((
+                    slashing
+                        .attestation_1
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                    slashing
+                        .attestation_2
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                ))
+            }
         }
     }
 }
@@ -585,6 +629,18 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             block.message.body.attester_slashings.iter(),
             Attestation::Gloas,
             AttesterSlashing::Gloas,
+        ),
+        SignedBeaconBlock::Eip8483(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Gloas,
+            AttesterSlashing::Gloas,
+        ),
+        SignedBeaconBlock::Pq(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Pq,
+            AttesterSlashing::Pq,
         ),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
@@ -3351,6 +3407,13 @@ fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
         SignedBeaconBlock::Gloas(inner) => {
             Ok(&inner.message.body.signed_execution_payload_bid.message)
         }
+        // The feature forks after gloas keep its bid.
+        SignedBeaconBlock::Eip8483(inner) => {
+            Ok(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Pq(inner) => {
+            Ok(&inner.message.body.signed_execution_payload_bid.message)
+        }
         other => Err(Error::UnsupportedForFork {
             function: "gloas_bid",
             fork: other.fork_name(),
@@ -5435,6 +5498,11 @@ pub fn on_block_speculative(
         // imported, and its full payload branch stays unreachable, since
         // building on it requires `is_payload_verified` above.
         SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
+        SignedBeaconBlock::Eip8483(block) => Some(&block.message.body.payload_attestations),
+        // [Modified in PQ] Blocks no longer carry payload attestations, so
+        // `notify_ptc_messages` is gone: the committee's votes reach fork
+        // choice from the wire only.
+        SignedBeaconBlock::Pq(_) => None,
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 
@@ -5845,8 +5913,85 @@ fn apply_payload_attestation_message(
     source: PtcMessageSource,
     config: &Config,
 ) -> Result<()> {
-    let data = ptc_message.data;
+    apply_ptc_vote(
+        store,
+        state,
+        ptc_message.validator_index,
+        ptc_message.data,
+        source,
+        config,
+        |state| {
+            let indexed = gloas::IndexedPayloadAttestation {
+                attesting_indices: gloas::PayloadTimelinessCommitteeIndices::try_from(vec![
+                    ptc_message.validator_index,
+                ])?,
+                data: ptc_message.data,
+                signature: ptc_message.signature,
+            };
+            verify(
+                gloas_helpers::is_valid_indexed_payload_attestation(state, &indexed),
+                "is_valid_indexed_payload_attestation(state, indexed_payload_attestation)",
+            )
+        },
+    )
+}
 
+/// `on_payload_attestation_message` (modified in PQ): a message always comes
+/// from the wire now, blocks carrying no payload attestations, so its slot and
+/// its XMSS signature, at the slot's PTC leaf, are always checked.
+pub fn on_pq_payload_attestation_message(
+    store: &mut Store,
+    ptc_message: &pq::PayloadAttestationMessage,
+    config: &Config,
+) -> Result<()> {
+    let state = store
+        .get_state(&ptc_message.data.beacon_block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.block_states",
+        ))?;
+    apply_ptc_vote(
+        store,
+        &state,
+        ptc_message.validator_index,
+        ptc_message.data,
+        PtcMessageSource::Wire,
+        config,
+        |state| {
+            let data = &ptc_message.data;
+            let domain = crate::beacon::helpers::accessors::get_domain(
+                state,
+                constants::DOMAIN_PTC_ATTESTER,
+                Some(compute_epoch_at_slot(data.slot)),
+            );
+            let signing_root =
+                crate::beacon::helpers::misc::compute_signing_root(data.hash_tree_root(), domain);
+            let leaf_index = pq_helpers::compute_xmss_leaf_index(
+                data.slot,
+                constants::LEAF_OFFSET_PTC_ATTESTER,
+            )?;
+            let pubkey = state.pq_validator(ptc_message.validator_index)?.pubkey();
+            verify(
+                pq_helpers::xmss_verify(&pubkey, leaf_index, signing_root, &ptc_message.signature),
+                "xmss.Verify(pubkey, leaf_index, signing_root, ptc_message.signature)",
+            )
+        },
+    )
+}
+
+/// The fork-independent body of a payload timeliness committee vote: `data`
+/// from `validator_index`, checked against `state` (the state of the block it
+/// names), with `verify_signature` run where `source` says the signature is
+/// still unchecked.
+fn apply_ptc_vote(
+    store: &mut Store,
+    state: &BeaconState,
+    validator_index: ValidatorIndex,
+    data: gloas::PayloadAttestationData,
+    source: PtcMessageSource,
+    config: &Config,
+    verify_signature: impl FnOnce(&BeaconState) -> Result<()>,
+) -> Result<()> {
     // PTC votes can only change the vote for their assigned beacon block,
     // return early otherwise.
     if data.slot != state.slot() {
@@ -5858,7 +6003,7 @@ fn apply_payload_attestation_message(
     let ptc_indices: Vec<usize> = ptc
         .iter()
         .enumerate()
-        .filter(|&(_, &validator_index)| validator_index == ptc_message.validator_index)
+        .filter(|&(_, &member)| member == validator_index)
         .map(|(ptc_index, _)| ptc_index)
         .collect();
 
@@ -5874,17 +6019,7 @@ fn apply_payload_attestation_message(
         )?;
     }
     if source == PtcMessageSource::Wire {
-        let indexed = gloas::IndexedPayloadAttestation {
-            attesting_indices: gloas::PayloadTimelinessCommitteeIndices::try_from(vec![
-                ptc_message.validator_index,
-            ])?,
-            data,
-            signature: ptc_message.signature,
-        };
-        verify(
-            gloas_helpers::is_valid_indexed_payload_attestation(state, &indexed),
-            "is_valid_indexed_payload_attestation(state, indexed_payload_attestation)",
-        )?;
+        verify_signature(state)?;
     }
 
     // Update the votes for the block.

@@ -752,6 +752,11 @@ fn gloas_before_kzg(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => return Err(Outcome::Reject(RejectReason::BlockNotGloas)),
+        // Not followed (`ForkName::is_followed`): no column of theirs is
+        // judged here.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => {
+            return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::stateful_checks_gloas"),
     };
     // [REJECT] The sidecar passes structural validation.

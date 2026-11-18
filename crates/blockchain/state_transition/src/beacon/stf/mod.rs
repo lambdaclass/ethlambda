@@ -58,11 +58,13 @@ pub mod bellatrix;
 pub mod block;
 pub mod capella;
 pub mod deneb;
+pub mod eip8483;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod pq;
 pub mod signatures;
 
 use crate::beacon::containers;
@@ -292,16 +294,26 @@ pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> bool {
+    // [Modified in PQ] An XMSS signature at the slot's proposer leaf.
+    if let containers::SignedBeaconBlock::Pq(signed) = signed_block {
+        return pq::verify_block_signature(state, signed);
+    }
     block_signature_set(state, signed_block).is_some_and(|set| set.verify())
 }
 
 /// The proposer's signature check [`verify_block_signature`] makes, resolved
 /// but not yet run. `None` is a proposer index outside the registry, or a key
 /// or signature that does not validate.
+///
+/// `None` for a PQ block too: it carries an XMSS signature, which
+/// [`verify_block_signature`] checks on its own.
 pub fn block_signature_set(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> Option<bls::SignatureSet> {
+    if matches!(signed_block, containers::SignedBeaconBlock::Pq(_)) {
+        return None;
+    }
     let index = signed_block.proposer_index();
     let proposer = state.validator(index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
@@ -461,7 +473,10 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
         | BeaconState::Deneb(_)
         | BeaconState::Electra(_)
         | BeaconState::Fulu(_) => {}
-        BeaconState::Gloas(inner) => {
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
+            let inner = state
+                .gloas_family_mut()
+                .expect("a gloas-family state has the gloas-family fields");
             let next_slot = inner
                 .slot
                 .checked_add(1)

@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{
-    BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
-    electra, fulu, gloas, phase0,
+    BeaconState, EpochParticipation, Fork, GloasFamilyMut, InactivityScores, altair, bellatrix,
+    capella, deneb, eip8483, electra, fulu, gloas, phase0, pq,
 };
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
@@ -31,11 +31,12 @@ use crate::beacon::helpers::attestation::get_attesting_indices;
 use crate::beacon::helpers::misc::{
     compute_activation_exit_epoch, compute_epoch_at_slot, compute_start_slot_at_epoch,
 };
+use crate::beacon::helpers::pq::{compute_legacy_vrf_root, compute_legacy_xmss_pubkey};
 use crate::beacon::lean_fork_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, HashTreeRoot as _,
-    Root, Uint256, ValidatorIndex,
+    BlsPubkey, BlsSignature, Bytes32, Epoch, ExecutionAddress, ExecutionBlockHash, Gwei,
+    HashTreeRoot as _, Root, Uint256, ValidatorIndex, XmssPubkey,
 };
 
 /// Replays `pending_attestations` into `post`'s `previous_epoch_participation`.
@@ -1049,7 +1050,7 @@ fn onboard_builders_from_pending_deposits(
                 }
 
                 let index = crate::beacon::helpers::gloas::add_builder_to_registry(
-                    state,
+                    &mut GloasFamilyMut::from(&mut *state),
                     deposit.pubkey,
                     constants::PAYLOAD_BUILDER_VERSION,
                     ExecutionAddress::from_slice(&deposit.withdrawal_credentials.0[12..]),
@@ -1237,15 +1238,405 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
 
     // [New in Gloas:EIP7732]
     let ptc_window = initialize_ptc_window(&post)?;
-    crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?.ptc_window =
-        ptc_window;
+    let BeaconState::Gloas(inner) = &mut post else {
+        unreachable!("`post` was built as a gloas state just above")
+    };
+    inner.ptc_window = ptc_window;
 
     // [New in Gloas:EIP7732]
-    onboard_builders_from_pending_deposits(
-        crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?,
-        config,
-    )?;
+    onboard_builders_from_pending_deposits(inner, config)?;
 
+    Ok(post)
+}
+
+/// `upgrade_to_eip8483` (consensus-specs `_features/eip8483/fork.md`): gloas's
+/// state with the fork version advanced and the two registration lists
+/// appended, empty.
+///
+/// `latest_execution_payload_bid` is copied unchanged, and its
+/// `execution_requests_root` may commit to gloas's `ExecutionRequests`, whose
+/// root differs from EIP-8483's even for identical content. The specification
+/// leaves how the first post-fork block validates a full pre-fork parent to
+/// the coordinated upgrade that activates the feature; this follows it as
+/// written.
+pub fn upgrade_to_eip8483(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let BeaconState::Gloas(pre) = pre else {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_eip8483",
+            fork: pre.fork_name(),
+        });
+    };
+    let pre = pre.clone();
+    let fork = Fork {
+        previous_version: pre.fork.current_version,
+        current_version: config.eip8483_fork_version,
+        epoch: compute_epoch_at_slot(pre.slot),
+    };
+    Ok(BeaconState::Eip8483(eip8483::BeaconState {
+        genesis_time: pre.genesis_time,
+        genesis_validators_root: pre.genesis_validators_root,
+        slot: pre.slot,
+        fork,
+        latest_block_header: pre.latest_block_header,
+        block_roots: pre.block_roots,
+        state_roots: pre.state_roots,
+        historical_roots: pre.historical_roots,
+        eth1_data: pre.eth1_data,
+        eth1_data_votes: pre.eth1_data_votes,
+        eth1_deposit_index: pre.eth1_deposit_index,
+        validators: pre.validators,
+        balances: pre.balances,
+        randao_mixes: pre.randao_mixes,
+        slashings: pre.slashings,
+        previous_epoch_participation: pre.previous_epoch_participation,
+        current_epoch_participation: pre.current_epoch_participation,
+        justification_bits: pre.justification_bits,
+        previous_justified_checkpoint: pre.previous_justified_checkpoint,
+        current_justified_checkpoint: pre.current_justified_checkpoint,
+        finalized_checkpoint: pre.finalized_checkpoint,
+        inactivity_scores: pre.inactivity_scores,
+        current_sync_committee: pre.current_sync_committee,
+        next_sync_committee: pre.next_sync_committee,
+        latest_block_hash: pre.latest_block_hash,
+        next_withdrawal_index: pre.next_withdrawal_index,
+        next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
+        historical_summaries: pre.historical_summaries,
+        deposit_requests_start_index: pre.deposit_requests_start_index,
+        deposit_balance_to_consume: pre.deposit_balance_to_consume,
+        exit_balance_to_consume: pre.exit_balance_to_consume,
+        earliest_exit_epoch: pre.earliest_exit_epoch,
+        consolidation_balance_to_consume: pre.consolidation_balance_to_consume,
+        earliest_consolidation_epoch: pre.earliest_consolidation_epoch,
+        pending_deposits: pre.pending_deposits,
+        pending_partial_withdrawals: pre.pending_partial_withdrawals,
+        pending_consolidations: pre.pending_consolidations,
+        proposer_lookahead: pre.proposer_lookahead,
+        builders: pre.builders,
+        next_withdrawal_builder_index: pre.next_withdrawal_builder_index,
+        execution_payload_availability: pre.execution_payload_availability,
+        builder_pending_payments: pre.builder_pending_payments,
+        builder_pending_withdrawals: pre.builder_pending_withdrawals,
+        latest_execution_payload_bid: pre.latest_execution_payload_bid,
+        payload_expected_withdrawals: pre.payload_expected_withdrawals,
+        ptc_window: pre.ptc_window,
+        // [New in EIP8483]
+        validator_pq_registrations: Default::default(),
+        // [New in EIP8483]
+        builder_pq_registrations: Default::default(),
+    }))
+}
+
+/// `get_validator_pq_registrations` (PQ `fork.md`): the validator
+/// registrations, except those whose XMSS key is the legacy key of some
+/// validator's BLS key, which anyone can compute and so must not be claimable.
+fn get_validator_pq_registrations(
+    pre: &eip8483::BeaconState,
+) -> HashMap<ValidatorIndex, eip8483::PqData> {
+    let legacy: HashSet<XmssPubkey> = pre
+        .validators
+        .iter()
+        .map(|validator| compute_legacy_xmss_pubkey(&validator.pubkey))
+        .collect();
+    // Later entries win, as the specification's dict comprehension does; the
+    // state holds at most one entry per validator anyway.
+    pre.validator_pq_registrations
+        .iter()
+        .filter(|registration| {
+            !legacy.contains(&XmssPubkey(
+                registration.pq_data[..32]
+                    .try_into()
+                    .expect("PQ data's first half is 32 bytes"),
+            ))
+        })
+        .map(|registration| (registration.validator_index, registration.pq_data))
+        .collect()
+}
+
+/// `get_builder_pq_registrations` (PQ `fork.md`): the builder registrations,
+/// except those whose key is the legacy key of some builder's BLS key.
+fn get_builder_pq_registrations(pre: &eip8483::BeaconState) -> HashMap<BlsPubkey, XmssPubkey> {
+    let legacy: HashSet<XmssPubkey> = pre
+        .builders
+        .iter()
+        .map(|builder| compute_legacy_xmss_pubkey(&builder.pubkey))
+        .collect();
+    pre.builder_pq_registrations
+        .iter()
+        .filter(|registration| !legacy.contains(&XmssPubkey(registration.pq_data.0)))
+        .map(|registration| {
+            (
+                registration.builder_pubkey,
+                XmssPubkey(registration.pq_data.0),
+            )
+        })
+        .collect()
+}
+
+/// `compute_validators` (PQ `fork.md`): a registered validator takes its XMSS
+/// key and VRF root; one that did not takes the legacy derivations of its BLS
+/// key and is exited at the fork, withdrawable
+/// `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` epochs later unless it was
+/// due sooner (a slashed one keeps its withdrawable epoch, so
+/// `process_slashings` still applies its penalty).
+fn compute_validators(
+    pre: &eip8483::BeaconState,
+    epoch: Epoch,
+    config: &Config,
+) -> Result<pq::Validators> {
+    let registered = get_validator_pq_registrations(pre);
+    let unregistered_withdrawable = epoch
+        .checked_add(config.unregistered_validator_withdrawability_delay)
+        .ok_or(Error::ArithmeticOverflow(
+            "epoch + UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY",
+        ))?;
+    let validators: Vec<pq::Validator> = pre
+        .validators
+        .iter()
+        .enumerate()
+        .map(|(index, validator)| {
+            let mut record = validator.clone();
+            let (pubkey, vrf_root) = match registered.get(&(index as ValidatorIndex)) {
+                Some(pq_data) => (
+                    XmssPubkey(pq_data[..32].try_into().expect("32 bytes")),
+                    Root::from_slice(&pq_data[32..]),
+                ),
+                None => {
+                    record.exit_epoch = record.exit_epoch.min(epoch);
+                    if !record.slashed {
+                        record.withdrawable_epoch =
+                            record.withdrawable_epoch.min(unregistered_withdrawable);
+                    }
+                    (
+                        compute_legacy_xmss_pubkey(&validator.pubkey),
+                        compute_legacy_vrf_root(&validator.pubkey),
+                    )
+                }
+            };
+            record.pubkey = pubkey.to_request_key();
+            pq::Validator { record, vrf_root }
+        })
+        .collect();
+    Ok(validators.into())
+}
+
+/// `compute_builders` (PQ `fork.md`): a registered builder takes its XMSS key;
+/// one that did not takes the legacy derivation of its BLS key and becomes
+/// withdrawable at the fork.
+fn compute_builders(pre: &eip8483::BeaconState, epoch: Epoch) -> pq::Builders {
+    let registered = get_builder_pq_registrations(pre);
+    let builders: Vec<gloas::Builder> = pre
+        .builders
+        .iter()
+        .map(|builder| {
+            let mut builder = builder.clone();
+            let pubkey = match registered.get(&builder.pubkey) {
+                Some(pubkey) => *pubkey,
+                None => {
+                    builder.withdrawable_epoch = builder.withdrawable_epoch.min(epoch);
+                    compute_legacy_xmss_pubkey(&builder.pubkey)
+                }
+            };
+            builder.pubkey = pubkey.to_request_key();
+            builder
+        })
+        .collect();
+    pq::Builders(builders.into())
+}
+
+/// `compute_pending_deposits` (PQ `fork.md`): a pending deposit for an
+/// existing validator is renamed to that validator's XMSS key, so it still
+/// tops it up; one for a new validator keeps its BLS key, a legacy deposit.
+fn compute_pending_deposits(
+    pre: &eip8483::BeaconState,
+    validators: &pq::Validators,
+) -> gloas::PendingDeposits {
+    // The specification's `validator_pubkeys.index`: the first index holding
+    // the key (a registry never holds a key twice, so there is only one).
+    let mut index_of: HashMap<BlsPubkey, usize> = HashMap::new();
+    for (index, validator) in pre.validators.iter().enumerate() {
+        index_of.entry(validator.pubkey).or_insert(index);
+    }
+    let deposits: Vec<electra::PendingDeposit> = pre
+        .pending_deposits
+        .iter()
+        .map(|deposit| {
+            let mut deposit = deposit.clone();
+            if let Some(&index) = index_of.get(&deposit.pubkey) {
+                deposit.pubkey = validators
+                    .get(index)
+                    .expect("validators has an entry for every pre-state index")
+                    .record
+                    .pubkey;
+            }
+            deposit
+        })
+        .collect();
+    deposits.into()
+}
+
+/// The keys of the builders that registered a PQ key, read from the
+/// registrations the fork honors.
+fn registered_builders(pre: &eip8483::BeaconState) -> HashSet<BlsPubkey> {
+    get_builder_pq_registrations(pre).into_keys().collect()
+}
+
+/// `compute_builder_pending_withdrawals` (PQ `fork.md`): the pending
+/// withdrawals, plus each unregistered builder's pending payment that has
+/// reached the payment quorum, settled at the fork.
+fn compute_builder_pending_withdrawals(
+    pre: &eip8483::BeaconState,
+    quorum: Gwei,
+) -> Result<gloas::BuilderPendingWithdrawals> {
+    let registered = registered_builders(pre);
+    let mut withdrawals: Vec<gloas::BuilderPendingWithdrawal> =
+        pre.builder_pending_withdrawals.to_vec();
+    for payment in pre.builder_pending_payments.iter() {
+        if payment.withdrawal.amount > 0
+            && !registered.contains(&builder_of(pre, payment)?.pubkey)
+            && payment.weight >= quorum
+        {
+            withdrawals.push(payment.withdrawal.clone());
+        }
+    }
+    Ok(withdrawals.into())
+}
+
+/// `compute_builder_pending_payments` (PQ `fork.md`): an unregistered
+/// builder's pending payment is dropped (settled into the withdrawals above if
+/// it reached the quorum).
+fn compute_builder_pending_payments(
+    pre: &eip8483::BeaconState,
+) -> Result<gloas::BuilderPendingPayments> {
+    let registered = registered_builders(pre);
+    let mut payments = Vec::with_capacity(pre.builder_pending_payments.len());
+    for payment in pre.builder_pending_payments.iter() {
+        if payment.withdrawal.amount > 0 && !registered.contains(&builder_of(pre, payment)?.pubkey)
+        {
+            payments.push(gloas::BuilderPendingPayment::default());
+        } else {
+            payments.push(payment.clone());
+        }
+    }
+    Ok(payments
+        .try_into()
+        .expect("one entry per BUILDER_PENDING_PAYMENTS_LENGTH slot"))
+}
+
+/// The builder a pending payment names.
+///
+/// Read only for a payment with a nonzero amount, the one case the result is
+/// used in. The specification reads `pre.builders[payment.withdrawal.builder_index]`
+/// for every payment, an empty one (builder index zero) included, which raises
+/// on a registry without builders: the fork could not happen on such a chain.
+/// Reading it lazily differs only there, where the specification has no
+/// outcome to match (`docs/spec_deviations.md`).
+fn builder_of<'a>(
+    pre: &'a eip8483::BeaconState,
+    payment: &gloas::BuilderPendingPayment,
+) -> Result<&'a gloas::Builder> {
+    let index = payment.withdrawal.builder_index as usize;
+    pre.builders.get(index).ok_or(Error::IndexOutOfBounds {
+        index,
+        len: pre.builders.len(),
+    })
+}
+
+/// `upgrade_to_pq` (consensus-specs `_features/pq/fork.md`).
+///
+/// Validators and builders keep their indices and take the XMSS keys (and, for
+/// validators, the VRF roots) they registered through EIP-8483; those that did
+/// not are exited (validators) or made withdrawable (builders) at the fork.
+/// Pending deposits for existing validators are renamed to their XMSS keys,
+/// unregistered builders' pending payments are settled or dropped, the sync
+/// committees and EIP-8483's registrations leave the state, and the aggregation
+/// committee window is initialized from the upgraded state.
+pub fn upgrade_to_pq(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let quorum = crate::beacon::helpers::gloas::get_builder_payment_quorum_threshold(pre)?;
+    let BeaconState::Eip8483(pre) = pre else {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_pq",
+            fork: pre.fork_name(),
+        });
+    };
+    let epoch = compute_epoch_at_slot(pre.slot);
+    let validators = compute_validators(pre, epoch, config)?;
+    let pending_deposits = compute_pending_deposits(pre, &validators);
+    let builders = compute_builders(pre, epoch);
+    let builder_pending_payments = compute_builder_pending_payments(pre)?;
+    let builder_pending_withdrawals = compute_builder_pending_withdrawals(pre, quorum)?;
+    let pre = pre.clone();
+
+    let post = pq::BeaconState {
+        genesis_time: pre.genesis_time,
+        genesis_validators_root: pre.genesis_validators_root,
+        slot: pre.slot,
+        fork: Fork {
+            previous_version: pre.fork.current_version,
+            current_version: config.pq_fork_version,
+            epoch,
+        },
+        latest_block_header: pre.latest_block_header,
+        block_roots: pre.block_roots,
+        state_roots: pre.state_roots,
+        historical_roots: pre.historical_roots,
+        eth1_data: pre.eth1_data,
+        eth1_data_votes: pre.eth1_data_votes,
+        eth1_deposit_index: pre.eth1_deposit_index,
+        // [Modified in PQ]
+        validators,
+        balances: pre.balances,
+        randao_mixes: pre.randao_mixes,
+        slashings: pre.slashings,
+        previous_epoch_participation: pre.previous_epoch_participation,
+        current_epoch_participation: pre.current_epoch_participation,
+        justification_bits: pre.justification_bits,
+        previous_justified_checkpoint: pre.previous_justified_checkpoint,
+        current_justified_checkpoint: pre.current_justified_checkpoint,
+        finalized_checkpoint: pre.finalized_checkpoint,
+        inactivity_scores: pre.inactivity_scores,
+        // [Modified in PQ] Removed `current_sync_committee` and
+        // `next_sync_committee`.
+        latest_block_hash: pre.latest_block_hash,
+        next_withdrawal_index: pre.next_withdrawal_index,
+        next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
+        historical_summaries: pre.historical_summaries,
+        deposit_requests_start_index: pre.deposit_requests_start_index,
+        deposit_balance_to_consume: pre.deposit_balance_to_consume,
+        exit_balance_to_consume: pre.exit_balance_to_consume,
+        earliest_exit_epoch: pre.earliest_exit_epoch,
+        consolidation_balance_to_consume: pre.consolidation_balance_to_consume,
+        earliest_consolidation_epoch: pre.earliest_consolidation_epoch,
+        // [Modified in PQ]
+        pending_deposits,
+        pending_partial_withdrawals: pre.pending_partial_withdrawals,
+        pending_consolidations: pre.pending_consolidations,
+        proposer_lookahead: pre.proposer_lookahead,
+        // [Modified in PQ]
+        builders,
+        next_withdrawal_builder_index: pre.next_withdrawal_builder_index,
+        execution_payload_availability: pre.execution_payload_availability,
+        // [Modified in PQ]
+        builder_pending_payments,
+        // [Modified in PQ]
+        builder_pending_withdrawals,
+        latest_execution_payload_bid: pre.latest_execution_payload_bid,
+        payload_expected_withdrawals: pre.payload_expected_withdrawals,
+        ptc_window: pre.ptc_window,
+        // [Modified in PQ] Removed `validator_pq_registrations` and
+        // `builder_pq_registrations`.
+        // [New in PQ:EIP8205]
+        validator_preregistrations: Default::default(),
+        // [New in PQ:EIP8205]
+        builder_preregistrations: Default::default(),
+        // [New in PQ] Overwritten below, once `post` is a whole state.
+        aggregation_committee_window: pq::empty_aggregation_committee_window(),
+    };
+    let mut post = BeaconState::Pq(post);
+    let window = crate::beacon::helpers::pq::initialize_aggregation_committee_window(&post)?;
+    let BeaconState::Pq(inner) = &mut post else {
+        unreachable!("`post` was built as a PQ state just above")
+    };
+    inner.aggregation_committee_window = window;
     Ok(post)
 }
 
@@ -1280,6 +1671,8 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
         ForkName::Gloas => upgrade_to_gloas(state, config),
+        ForkName::Eip8483 => upgrade_to_eip8483(state, config),
+        ForkName::Pq => upgrade_to_pq(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),
@@ -1614,5 +2007,200 @@ mod tests {
         // (not just each function in isolation) is wired correctly.
         let (fulu_state, _config) = advance_to(ForkName::Fulu, 4);
         assert_eq!(fulu_state.fork_name(), ForkName::Fulu);
+    }
+
+    /// An EIP-8483 state with distinct BLS keys, two builders, and the given
+    /// validator and builder registrations.
+    fn eip8483_with_registrations() -> BeaconState {
+        let mut state =
+            crate::beacon::helpers::test_state::with_validators_at(ForkName::Eip8483, 64);
+        for index in 0..64u64 {
+            let mut key = [0u8; 48];
+            key[0] = 0x80;
+            key[1] = index as u8 + 1;
+            state.validator_mut(index).unwrap().pubkey = BlsPubkey(key);
+        }
+        let BeaconState::Eip8483(inner) = &mut state else {
+            unreachable!()
+        };
+        for (index, byte) in [(1u64, 0x11u8), (2, 0x22)] {
+            let mut pq_data = [byte; 64];
+            pq_data[32..].fill(byte + 1);
+            inner
+                .validator_pq_registrations
+                .push(eip8483::ValidatorPqRegistration {
+                    validator_index: index,
+                    pq_data,
+                });
+        }
+        for byte in [0xa1u8, 0xb2] {
+            let mut key = [0u8; 48];
+            key[0] = 0x80;
+            key[1] = byte;
+            inner.builders.push(gloas::Builder {
+                pubkey: BlsPubkey(key),
+                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+                balance: 1,
+                ..Default::default()
+            });
+        }
+        let first_builder = inner.builders[0].pubkey;
+        inner
+            .builder_pq_registrations
+            .push(eip8483::BuilderPqRegistration {
+                builder_pubkey: first_builder,
+                pq_data: Bytes32::repeat_byte(0x33),
+            });
+        // A pending payment to the unregistered builder, short of the quorum.
+        inner.builder_pending_payments[0] = gloas::BuilderPendingPayment {
+            weight: 0,
+            withdrawal: gloas::BuilderPendingWithdrawal {
+                amount: 5,
+                builder_index: 1,
+                ..Default::default()
+            },
+            proposer_index: 0,
+        };
+        // A deposit topping up validator 2, and one for a new validator.
+        let top_up = inner.validators.get(2).unwrap().pubkey;
+        let mut new_key = [0u8; 48];
+        new_key[0] = 0x80;
+        new_key[1] = 0xee;
+        for pubkey in [top_up, BlsPubkey(new_key)] {
+            inner
+                .pending_deposits
+                .push(electra::PendingDeposit {
+                    pubkey,
+                    withdrawal_credentials: Bytes32::ZERO,
+                    amount: 1,
+                    signature: BlsSignature::default(),
+                    slot: 0,
+                })
+                .unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn upgrade_to_pq_adopts_registrations_and_exits_the_rest() {
+        let config = Config::active();
+        let pre = eip8483_with_registrations();
+        let BeaconState::Eip8483(pre_inner) = &pre else {
+            unreachable!()
+        };
+        let epoch = compute_epoch_at_slot(pre_inner.slot);
+        let post = upgrade_to_pq(&pre, &config).unwrap();
+        let BeaconState::Pq(inner) = &post else {
+            panic!("upgrade_to_pq returns a PQ state")
+        };
+        assert_eq!(inner.fork.current_version, config.pq_fork_version);
+        assert_eq!(inner.fork.previous_version, pre_inner.fork.current_version);
+
+        // Registered: the key and VRF root of its registration, still active.
+        let registered = inner.validators.get(1).unwrap();
+        assert_eq!(registered.pubkey(), XmssPubkey([0x11; 32]));
+        assert_eq!(registered.vrf_root, Root::repeat_byte(0x12));
+        assert_eq!(registered.record.exit_epoch, constants::FAR_FUTURE_EPOCH);
+
+        // Unregistered: the legacy derivations, exited now, withdrawable after
+        // the delay.
+        let bls = pre_inner.validators.get(0).unwrap().pubkey;
+        let unregistered = inner.validators.get(0).unwrap();
+        assert_eq!(unregistered.pubkey(), compute_legacy_xmss_pubkey(&bls));
+        assert_eq!(unregistered.vrf_root, compute_legacy_vrf_root(&bls));
+        assert_eq!(unregistered.record.exit_epoch, epoch);
+        assert_eq!(
+            unregistered.record.withdrawable_epoch,
+            epoch + config.unregistered_validator_withdrawability_delay
+        );
+
+        // A top-up is renamed to its validator's XMSS key; a new validator's
+        // deposit keeps its BLS key.
+        let deposits: Vec<_> = inner.pending_deposits.iter().cloned().collect();
+        assert_eq!(deposits[0].pubkey, XmssPubkey([0x22; 32]).to_request_key());
+        assert_eq!(deposits[1].pubkey.0[1], 0xee);
+
+        // The registered builder takes its key; the other is withdrawable now,
+        // and its payment short of the quorum is dropped.
+        assert_eq!(
+            inner.builders[0].pubkey,
+            XmssPubkey([0x33; 32]).to_request_key()
+        );
+        assert_eq!(
+            inner.builders[0].withdrawable_epoch,
+            constants::FAR_FUTURE_EPOCH
+        );
+        assert_eq!(inner.builders[1].withdrawable_epoch, epoch);
+        assert_eq!(
+            inner.builder_pending_payments[0],
+            gloas::BuilderPendingPayment::default()
+        );
+        assert!(inner.builder_pending_withdrawals.is_empty());
+
+        // The window's current and lookahead epochs are filled, the previous
+        // one empty.
+        let slots = preset::SLOTS_PER_EPOCH as usize;
+        assert!(
+            inner.aggregation_committee_window[..slots]
+                .iter()
+                .all(|slot| slot.is_empty())
+        );
+        assert!(
+            inner.aggregation_committee_window[slots..]
+                .iter()
+                .all(|slot| !slot.is_empty())
+        );
+
+        // The upgraded state encodes and decodes back to itself.
+        let decoded = BeaconState::from_ssz(ForkName::Pq, &post.to_ssz()).unwrap();
+        assert_eq!(decoded, post);
+        assert_eq!(decoded.hash_tree_root(), post.hash_tree_root());
+    }
+
+    #[test]
+    fn a_legacy_key_cannot_be_registered_for_another_validator() {
+        let config = Config::active();
+        let mut pre = eip8483_with_registrations();
+        let BeaconState::Eip8483(inner) = &mut pre else {
+            unreachable!()
+        };
+        // Validator 3 claims the key validator 0 takes for not registering.
+        let legacy = compute_legacy_xmss_pubkey(&inner.validators.get(0).unwrap().pubkey);
+        let mut pq_data = [0x44u8; 64];
+        pq_data[..32].copy_from_slice(&legacy.0);
+        inner
+            .validator_pq_registrations
+            .push(eip8483::ValidatorPqRegistration {
+                validator_index: 3,
+                pq_data,
+            });
+        let post = upgrade_to_pq(&pre, &config).unwrap();
+        let BeaconState::Pq(post) = &post else {
+            unreachable!()
+        };
+        let BeaconState::Eip8483(pre) = &pre else {
+            unreachable!()
+        };
+        let validator = post.validators.get(3).unwrap();
+        assert_eq!(
+            validator.pubkey(),
+            compute_legacy_xmss_pubkey(&pre.validators.get(3).unwrap().pubkey),
+            "the claim is ignored and validator 3 takes its own legacy key"
+        );
+    }
+
+    #[test]
+    fn gloas_upgrades_to_eip8483_with_empty_registrations() {
+        let config = Config::active();
+        let pre = crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 8);
+        let post = upgrade_to_eip8483(&pre, &config).unwrap();
+        let BeaconState::Eip8483(inner) = &post else {
+            panic!("an EIP-8483 state")
+        };
+        assert!(inner.validator_pq_registrations.is_empty());
+        assert!(inner.builder_pq_registrations.is_empty());
+        assert_eq!(inner.fork.current_version, config.eip8483_fork_version);
+        let decoded = BeaconState::from_ssz(ForkName::Eip8483, &post.to_ssz()).unwrap();
+        assert_eq!(decoded.hash_tree_root(), post.hash_tree_root());
     }
 }

@@ -280,11 +280,15 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Gloas => Ok(SignedAggregateAndProof::Gloas(
+        ForkName::Gloas | ForkName::Eip8483 => Ok(SignedAggregateAndProof::Gloas(
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
+        // The PQ fork's aggregate carries a proof and an XMSS signature, which
+        // the gossip rules here do not model.
+        ForkName::Pq | ForkName::Lean => {
+            Err(format!("no aggregate shape for fork {:?}", case.fork))
+        }
     }
 }
 

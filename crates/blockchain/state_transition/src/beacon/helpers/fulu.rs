@@ -141,6 +141,8 @@ fn proposer_lookahead<'a>(
     match state {
         BeaconState::Fulu(inner) => Ok(&inner.proposer_lookahead),
         BeaconState::Gloas(inner) => Ok(&inner.proposer_lookahead),
+        BeaconState::Eip8483(inner) => Ok(&inner.proposer_lookahead),
+        BeaconState::Pq(inner) => Ok(&inner.proposer_lookahead),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -161,6 +163,8 @@ pub(crate) fn proposer_lookahead_mut<'a>(
     match state {
         BeaconState::Fulu(inner) => Ok(&mut inner.proposer_lookahead),
         BeaconState::Gloas(inner) => Ok(&mut inner.proposer_lookahead),
+        BeaconState::Eip8483(inner) => Ok(&mut inner.proposer_lookahead),
+        BeaconState::Pq(inner) => Ok(&mut inner.proposer_lookahead),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),

@@ -29,8 +29,8 @@ use crate::beacon::containers::shared::{
     Balances, EpochParticipation, InactivityScores, Validator,
 };
 use crate::beacon::containers::{
-    BeaconState, BlockRoots, RandaoMixes, Slashings, altair, bellatrix, capella, deneb, electra,
-    fulu, gloas, phase0,
+    BeaconState, BlockRoots, RandaoMixes, Slashings, altair, bellatrix, capella, deneb, eip8483,
+    electra, fulu, gloas, phase0, pq,
 };
 use crate::beacon::fork::ForkName;
 use crate::beacon::preset;
@@ -141,6 +141,8 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
         ForkName::Gloas => BeaconState::Gloas(gloas_state(count)),
+        ForkName::Eip8483 => BeaconState::Eip8483(eip8483_state(count)),
+        ForkName::Pq => BeaconState::Pq(pq_state(count)),
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.
@@ -170,6 +172,8 @@ pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
         BeaconState::Electra(state) => state.balances = bounded(balances),
         BeaconState::Fulu(state) => state.balances = bounded(balances),
         BeaconState::Gloas(state) => state.balances = balances.into(),
+        BeaconState::Eip8483(state) => state.balances = balances.into(),
+        BeaconState::Pq(state) => state.balances = balances.into(),
         BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }
 }
@@ -650,6 +654,83 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
         ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
             .try_into()
             .expect("the vector is built at its exact length"),
+    }
+}
+
+/// [`gloas_state`] in EIP-8483's shape: no registrations yet.
+fn eip8483_state(count: usize) -> eip8483::BeaconState {
+    let BeaconState::Eip8483(state) = crate::beacon::upgrade::upgrade_to_eip8483(
+        &BeaconState::Gloas(gloas_state(count)),
+        &crate::beacon::config::Config::active(),
+    )
+    .expect("a gloas state upgrades to EIP-8483") else {
+        unreachable!("upgrade_to_eip8483 returns an EIP-8483 state")
+    };
+    state
+}
+
+/// [`gloas_state`] in the PQ shape: every validator keeps its all-zero key
+/// (in the 48-byte request form, which the all-zero key already is) and a zero
+/// VRF root, and the aggregation committee window starts empty. A test that
+/// needs real keys, VRF roots or a filled window sets them afterward.
+fn pq_state(count: usize) -> pq::BeaconState {
+    let gloas = gloas_state(count);
+    let validators: Vec<pq::Validator> = gloas
+        .validators
+        .iter()
+        .map(|validator| pq::Validator {
+            record: validator.clone(),
+            vrf_root: Root::ZERO,
+        })
+        .collect();
+    pq::BeaconState {
+        genesis_time: gloas.genesis_time,
+        genesis_validators_root: gloas.genesis_validators_root,
+        slot: gloas.slot,
+        fork: gloas.fork,
+        latest_block_header: gloas.latest_block_header,
+        block_roots: gloas.block_roots,
+        state_roots: gloas.state_roots,
+        historical_roots: gloas.historical_roots,
+        eth1_data: gloas.eth1_data,
+        eth1_data_votes: gloas.eth1_data_votes,
+        eth1_deposit_index: gloas.eth1_deposit_index,
+        validators: validators.into(),
+        balances: gloas.balances,
+        randao_mixes: gloas.randao_mixes,
+        slashings: gloas.slashings,
+        previous_epoch_participation: gloas.previous_epoch_participation,
+        current_epoch_participation: gloas.current_epoch_participation,
+        justification_bits: gloas.justification_bits,
+        previous_justified_checkpoint: gloas.previous_justified_checkpoint,
+        current_justified_checkpoint: gloas.current_justified_checkpoint,
+        finalized_checkpoint: gloas.finalized_checkpoint,
+        inactivity_scores: gloas.inactivity_scores,
+        latest_block_hash: gloas.latest_block_hash,
+        next_withdrawal_index: gloas.next_withdrawal_index,
+        next_withdrawal_validator_index: gloas.next_withdrawal_validator_index,
+        historical_summaries: gloas.historical_summaries,
+        deposit_requests_start_index: gloas.deposit_requests_start_index,
+        deposit_balance_to_consume: gloas.deposit_balance_to_consume,
+        exit_balance_to_consume: gloas.exit_balance_to_consume,
+        earliest_exit_epoch: gloas.earliest_exit_epoch,
+        consolidation_balance_to_consume: gloas.consolidation_balance_to_consume,
+        earliest_consolidation_epoch: gloas.earliest_consolidation_epoch,
+        pending_deposits: gloas.pending_deposits,
+        pending_partial_withdrawals: gloas.pending_partial_withdrawals,
+        pending_consolidations: gloas.pending_consolidations,
+        proposer_lookahead: gloas.proposer_lookahead,
+        builders: pq::Builders(gloas.builders),
+        next_withdrawal_builder_index: gloas.next_withdrawal_builder_index,
+        execution_payload_availability: gloas.execution_payload_availability,
+        builder_pending_payments: gloas.builder_pending_payments,
+        builder_pending_withdrawals: gloas.builder_pending_withdrawals,
+        latest_execution_payload_bid: gloas.latest_execution_payload_bid,
+        payload_expected_withdrawals: gloas.payload_expected_withdrawals,
+        ptc_window: gloas.ptc_window,
+        validator_preregistrations: Default::default(),
+        builder_preregistrations: Default::default(),
+        aggregation_committee_window: pq::empty_aggregation_committee_window(),
     }
 }
 
