@@ -76,7 +76,7 @@ impl SeenAttestations {
     /// Read-only ([`LruCache::contains`] does not touch recency), so
     /// [`cheap_checks`] can use it without mutating anything on a message
     /// that turns out invalid.
-    fn contains(&self, target_epoch: Epoch, attester_index: ValidatorIndex) -> bool {
+    pub(crate) fn contains(&self, target_epoch: Epoch, attester_index: ValidatorIndex) -> bool {
         self.0.contains(&(target_epoch, attester_index))
     }
 
@@ -86,7 +86,13 @@ impl SeenAttestations {
     /// two racing `Accept`s here too, and this settles the second as
     /// `Ignore(AlreadySeen)` rather than double-recording.
     pub fn record(&mut self, attestation: &SingleAttestation) -> bool {
-        let key = (attestation.data.target.epoch, attestation.attester_index);
+        self.record_key(attestation.data.target.epoch, attestation.attester_index)
+    }
+
+    /// [`Self::record`] by its key, for an attestation of a shape this
+    /// module's own type does not carry (the PQ fork's, in `super::pq`).
+    pub fn record_key(&mut self, target_epoch: Epoch, attester_index: ValidatorIndex) -> bool {
+        let key = (target_epoch, attester_index);
         if self.0.contains(&key) {
             return false;
         }

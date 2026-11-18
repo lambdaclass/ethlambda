@@ -139,7 +139,10 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
     // topic had parameters when the peer was grafted, and joining grafts at
     // once.
     if let Some(scoring) = &mut server.peer_scoring {
-        let digests = held.iter().map(|entry| entry.digest).collect();
+        let digests = held
+            .iter()
+            .map(|entry| (entry.digest, entry.fork))
+            .collect();
         scoring.hold(
             digests,
             current.digest,
@@ -164,21 +167,29 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             entry.fork,
             entry.digest,
             &column_subnets,
-            &wire.attestation_subnets,
+            topics::backbone_subnets(
+                entry.fork,
+                &wire.attestation_subnets,
+                &wire.attestation_subnets_pq,
+            ),
         );
         for topic in &joined.topics {
             server.swarm_handle.subscribe(topic.clone());
             changes.subscribed.push(topic.to_string());
         }
-        for &subnet_id in server.aggregator_subnets.keys() {
-            let topic = attestation_topic(entry.digest, subnet_id);
-            changes.subscribed.push(topic.to_string());
-            server.swarm_handle.subscribe(topic);
-        }
-        for &subnet_id in wire.sync_committee_subnets.keys() {
-            let topic = sync_committee_topic(entry.digest, subnet_id);
-            changes.subscribed.push(topic.to_string());
-            server.swarm_handle.subscribe(topic);
+        // A validator client's aggregator and sync committee subnets come from
+        // BLS duties, which a PQ digest has neither of.
+        if !joined.pq {
+            for &subnet_id in server.aggregator_subnets.keys() {
+                let topic = attestation_topic(entry.digest, subnet_id);
+                changes.subscribed.push(topic.to_string());
+                server.swarm_handle.subscribe(topic);
+            }
+            for &subnet_id in wire.sync_committee_subnets.keys() {
+                let topic = sync_committee_topic(entry.digest, subnet_id);
+                changes.subscribed.push(topic.to_string());
+                server.swarm_handle.subscribe(topic);
+            }
         }
         info!(
             fork_digest = %hex::encode(entry.digest),
@@ -196,15 +207,17 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             server.swarm_handle.unsubscribe(topic.clone());
             changes.unsubscribed.push(topic.to_string());
         }
-        for &subnet_id in server.aggregator_subnets.keys() {
-            let topic = attestation_topic(left.fork_digest, subnet_id);
-            changes.unsubscribed.push(topic.to_string());
-            server.swarm_handle.unsubscribe(topic);
-        }
-        for &subnet_id in wire.sync_committee_subnets.keys() {
-            let topic = sync_committee_topic(left.fork_digest, subnet_id);
-            changes.unsubscribed.push(topic.to_string());
-            server.swarm_handle.unsubscribe(topic);
+        if !left.pq {
+            for &subnet_id in server.aggregator_subnets.keys() {
+                let topic = attestation_topic(left.fork_digest, subnet_id);
+                changes.unsubscribed.push(topic.to_string());
+                server.swarm_handle.unsubscribe(topic);
+            }
+            for &subnet_id in wire.sync_committee_subnets.keys() {
+                let topic = sync_committee_topic(left.fork_digest, subnet_id);
+                changes.unsubscribed.push(topic.to_string());
+                server.swarm_handle.unsubscribe(topic);
+            }
         }
         info!(
             fork_digest = %hex::encode(left.fork_digest),
@@ -423,6 +436,47 @@ mod tests {
         let wire = server.wire.beacon().unwrap();
         assert!(has_gloas_kinds(&wire.topics));
         assert!(has_no_gloas_kinds(&wire.window_topics[0]));
+    }
+
+    /// A PQ digest is joined with PQ's own topic set and backbone, and without
+    /// the aggregator and sync committee subnets a validator client asked for,
+    /// which come from BLS duties.
+    #[tokio::test]
+    async fn a_pq_digest_is_joined_with_its_own_topics_and_no_duty_subnets() {
+        const EIP8483: Epoch = 6_000;
+        const PQ: Epoch = 7_000;
+        let config = config()
+            .with_fork_epoch(ForkName::Eip8483, EIP8483)
+            .with_fork_epoch(ForkName::Pq, PQ);
+        let mut server = unconnected_beacon_server(config, 0).await;
+        {
+            let Wire::Beacon(wire) = &mut server.wire else {
+                unreachable!("a beacon wire")
+            };
+            wire.attestation_subnets = vec![40];
+            wire.attestation_subnets_pq = vec![7];
+            wire.sync_committee_subnets.insert(2, u64::MAX);
+        }
+        server.aggregator_subnets.insert(9, u64::MAX);
+        apply(&mut server, PQ - 2);
+        let joined = apply(&mut server, PQ - 1).subscribed;
+        let wire = server.wire.beacon().unwrap();
+        let pq = wire.schedule.digest_at(PQ);
+        assert!(wire.window_topics[0].pq);
+
+        for kind in topics::PQ_TOPIC_KINDS {
+            assert!(joined.contains(&topics::topic_name(pq, kind)), "{kind}");
+        }
+        for absent in [
+            topics::topic_name(pq, topics::VOLUNTARY_EXIT),
+            topics::topic_name(pq, topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF),
+            topics::attestation_topic_name(pq, 40),
+            topics::attestation_topic_name(pq, 9),
+            topics::sync_committee_topic_name(pq, 2),
+        ] {
+            assert!(!joined.contains(&absent), "{absent}");
+        }
+        assert!(joined.contains(&topics::attestation_topic_name(pq, 7)));
     }
 
     #[tokio::test]

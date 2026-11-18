@@ -19,7 +19,8 @@ against a quantum adversary. It comes as two feature forks after gloas:
 Both are `ForkName`s (`Eip8483`, `Pq`), between `Gloas` and `Lean`, on-disk
 selectors 8 and 9. Neither is scheduled on any network, and the node does not
 follow either (`ForkName::is_followed`): the state transition and fork choice
-implement them, and nothing else does yet.
+implement them, and so does PQ's gossip validation (see [Gossip](#gossip)),
+whose accepted messages are relayed and consumed by nothing.
 
 Each builds on the fork before it, like every other fork. EIP-8483 is gloas
 plus its two requests and PQ is EIP-8483 with BLS replaced, so a rule gated
@@ -33,8 +34,9 @@ names, the two stay apart from gloas. PQ replaces every signed container and
 EIP-8483 the block and envelope, but EIP-8483's attestations, aggregates,
 attester slashings and bids are gloas's own: gossip decodes the first three
 as gloas's, while the Beacon API refuses the `eip8483` version header, since
-the node does not follow the fork. Gossip's bid rules still judge only gloas
-states, because they read the parent's envelope, whose shape EIP-8483
+the node does not follow the fork. Gossip's bid rules judge a gloas bid
+against a gloas state and a PQ bid against a PQ state, and leave EIP-8483's
+states out, because they read the parent's envelope, whose shape EIP-8483
 changes.
 
 ## What is implemented
@@ -50,7 +52,49 @@ changes.
 | Fork choice | `fork_choice` (`Attestation::Pq`, `AttesterSlashing::Pq`, `on_pq_payload_attestation_message`, no `notify_ptc_messages` for PQ blocks) | compiles, untested; no `on_execution_payload_envelope` for the EIP-8483 or PQ envelope types |
 | Envelope verification | `stf::pq::verify_execution_payload_envelope_signature` | the signature only; gloas's `verify_execution_payload_envelope` takes gloas's envelope type |
 | Spec-fixture runners | `tests/beacon_spec` | wired, but no fixtures exist yet |
-| Gossip, req/resp, Beacon API, validator client | | refuse both forks |
+| PQ gossip | `gossip::pq`, `ethlambda_p2p::beacon::pq` | every reshaped topic's rules, XMSS signatures and STARK proofs unit-tested with real keys; accepted messages are relayed, consumed by nothing |
+| EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
+| Req/resp, Beacon API, validator client | | refuse both forks |
+
+## Gossip
+
+A PQ digest's topics are `pq/p2p-interface.md`'s: gloas's set without
+`voluntary_exit`, `bls_to_execution_change` and the sync committee topics
+(`topics::PQ_TOPIC_KINDS`), and `ATTESTATION_SUBNET_COUNT_PQ` (16) attestation
+subnets, of which the node backbones its own set
+(`subnets::compute_subscribed_subnets_pq`, the specification's function over
+16 subnets). `attnets` advertises that set while the current digest is PQ's.
+The aggregator and sync committee subnets a validator client asks for come
+from BLS duties, so they are never joined under a PQ digest.
+
+Every reshaped topic decodes by its topic's digest into PQ's container
+(`decode::decode_pq_gossip`, with the `MAX_*_SIZE_PQ` bounds) and is judged by
+`state_transition::beacon::gossip::pq`:
+
+| Topic | What PQ changes |
+| --- | --- |
+| `beacon_aggregate_and_proof` | the aggregator's XMSS signature at its slot's aggregate leaf; aggregators are the aggregation committee, not a selection proof; the aggregate's STARK proof proves its attesters' signatures |
+| `beacon_attestation_{subnet_id}` | the XMSS signature at the target epoch's attestation leaf; the subnet is one of 16 |
+| `proposer_slashing`, `attester_slashing` | XMSS header signatures; each indexed attestation's STARK proof |
+| `payload_attestation_message` | the XMSS signature at the slot's PTC leaf |
+| `execution_payload_bid`, `proposer_preferences` | gloas's rules over the PQ builder market, with XMSS signatures and the builder-exit key compared on its last 32 bytes |
+| `execution_payload` | PQ's execution request limits and the envelope's XMSS signature |
+| `beacon_block` | PQ's operation and request limits (`gossip::pq::block_cheap_checks`), behind the `is_followed` gate |
+
+The rules are gloas's with only the `[Modified in PQ]` and `[New in PQ]` lines
+applied; see `docs/spec_deviations.md`. A rule that needs a PQ state (every
+stateful one) ignores the message when the state it reads is of another fork,
+which on a live node is always: the node imports no PQ block. So the cheap
+rules judge what arrives on a PQ digest a network schedules, and the rest end
+in an ignore. An accepted message is relayed and recorded in the seen caches
+the other forks share (bids and preferences in a PQ builder market of their
+own, which block production never reads), and goes no further: no pool, event
+stream or chain actor takes one. A message that does not decode as PQ's
+container is ignored, not rejected, as on every topic of a fork the node does
+not follow.
+
+Blocks, data column sidecars and the topic set the node holds keep the shared
+path. A block of a fork the node does not follow is ignored before any rule.
 
 ## The XMSS scheme
 
@@ -195,9 +239,15 @@ generated.
 
 - Generate and run the fixtures above, and add the PQ containers to the
   `ssz_static` runner.
-- Gossip validation for the PQ topics (XMSS signatures, aggregation
-  committees, `ATTESTATION_SUBNET_COUNT_PQ`, the same superset rule for
-  aggregates as earlier forks), and the PQ `SignedAggregateAndProof`.
+- Consumers for accepted PQ gossip: fork choice's aggregates and payload
+  attestations, the operation and attestation pools, the event stream. Today
+  they are relayed only.
+- EIP-8483's gossip: its blocks and envelopes are their own containers (its
+  attestations, aggregates and slashings already decode and validate as
+  gloas's), and its execution request limits.
+- The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
+  `DiscoveryServer` cannot replace the served record at runtime (the same gap
+  as its `eth2` entry, see `CLAUDE.md`).
 - Envelopes of the EIP-8483 and PQ shapes: `verify_execution_payload_envelope`
   and fork choice's `on_execution_payload_envelope` over them, the chain
   actor's envelope pipeline, and an engine API path for their execution

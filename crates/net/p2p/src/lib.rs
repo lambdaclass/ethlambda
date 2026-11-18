@@ -66,7 +66,8 @@ use ethlambda_state_transition::beacon::gossip::{
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::{SharedBuilderMarket, SharedPqBuilderMarket},
+    payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
@@ -1461,7 +1462,11 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 beacon.fork,
                 beacon.fork_digest,
                 &column_subnets,
-                &beacon.attestation_subnets,
+                beacon::topics::backbone_subnets(
+                    beacon.fork,
+                    &beacon.attestation_subnets,
+                    &beacon.attestation_subnets_pq,
+                ),
             );
             for topic in &topics.topics {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
@@ -1498,6 +1503,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
+                attestation_subnets_pq: beacon.attestation_subnets_pq,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
                 metadata: MetaDataController::default(),
             };
@@ -1583,10 +1589,9 @@ impl P2P {
             .wire
             .beacon()
             .map_or(0, |beacon| beacon.attestation_subnets.len());
-        let peer_scoring = built
-            .wire
-            .beacon()
-            .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
+        let peer_scoring = built.wire.beacon().map(|beacon| {
+            beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest, beacon.fork)
+        });
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
         let first_status_refresh = status_refresh_tick(&store);
         let peer_table = PeerTableController::default();
@@ -1644,6 +1649,7 @@ impl P2P {
             )),
             payload_attestation_pool,
             builder_market,
+            pq_builder_market: Default::default(),
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 BUILDER_VALIDATION_PERMITS,
             )),
@@ -1868,6 +1874,10 @@ pub struct P2PServer {
     /// Gossip's stateful checks read it from blocking threads, so it cannot
     /// live in the chain actor; lean never touches it.
     pub(crate) builder_market: SharedBuilderMarket,
+    /// The PQ fork's bids and preferences, kept apart from
+    /// [`Self::builder_market`]: they carry XMSS signatures, and block
+    /// production must never read one. Only gossip touches it.
+    pub(crate) pq_builder_market: SharedPqBuilderMarket,
     /// Permits for `execution_payload_bid` and `proposer_preferences` stateful
     /// checks, see [`BUILDER_VALIDATION_PERMITS`].
     pub(crate) builder_validation_permits: Arc<tokio::sync::Semaphore>,
@@ -4011,6 +4021,7 @@ pub(crate) mod test_support {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                attestation_subnets_pq: Vec::new(),
             })),
         })
         .expect("swarm builds");
@@ -4137,6 +4148,7 @@ pub(crate) mod test_support {
             )),
             payload_attestation_pool: Default::default(),
             builder_market: Default::default(),
+            pq_builder_market: Default::default(),
             builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
@@ -4576,6 +4588,7 @@ mod tests {
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
                     attestation_subnets: Vec::new(),
+                    attestation_subnets_pq: Vec::new(),
                 })),
             })
             .expect("swarm builds")
@@ -5700,6 +5713,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                attestation_subnets_pq: Vec::new(),
             })),
         })
         .expect("swarm builds");

@@ -124,6 +124,17 @@ impl PackedBits {
     }
 }
 
+/// What [`SeenAggregates`] keys an aggregate by: the specification's
+/// `aggregate_data_roots` key `(hash_tree_root(data), committee_index)` and its
+/// `aggregator_epochs` key `(target_epoch, aggregator_index)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateKey {
+    pub data_root: Root,
+    pub committee_index: CommitteeIndex,
+    pub target_epoch: Epoch,
+    pub aggregator_index: ValidatorIndex,
+}
+
 /// Accepted aggregates, keyed the way the specification's `Seen` keys them.
 ///
 /// Bounded by capacity, like [`super::SeenBlocks`], rather than pruned on
@@ -178,13 +189,26 @@ impl SeenAggregates {
         committee_index: CommitteeIndex,
     ) -> Result<(), Outcome> {
         let data = aggregate.data();
-        let bits = aggregate.aggregation_bits();
+        self.verdict_parts(
+            &AggregateKey {
+                data_root: data.hash_tree_root(),
+                committee_index,
+                target_epoch: data.target.epoch,
+                aggregator_index: aggregate.aggregator_index(),
+            },
+            &aggregate.aggregation_bits(),
+        )
+    }
+
+    /// [`Self::verdict`] over the keys alone, for an aggregate of a shape the
+    /// shared enum does not carry (the PQ fork's, in `super::pq`).
+    pub(crate) fn verdict_parts(&self, key: &AggregateKey, bits: &[bool]) -> Result<(), Outcome> {
         // Checked in the specification's own order: the superset rule first,
         // then the aggregator/epoch rule.
-        if self.covered(data.hash_tree_root(), committee_index, &bits) {
+        if self.covered(key.data_root, key.committee_index, bits) {
             return Err(Outcome::Ignore(IgnoreReason::CoveredBits));
         }
-        if self.aggregator_seen(data.target.epoch, aggregate.aggregator_index()) {
+        if self.aggregator_seen(key.target_epoch, key.aggregator_index) {
             return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
         }
         Ok(())
@@ -208,23 +232,29 @@ impl SeenAggregates {
         let Some(committee_index) = aggregate.committee_index() else {
             return false;
         };
-        if self.verdict(aggregate, committee_index).is_err() {
+        let data = aggregate.data();
+        let key = AggregateKey {
+            data_root: data.hash_tree_root(),
+            committee_index,
+            target_epoch: data.target.epoch,
+            aggregator_index: aggregate.aggregator_index(),
+        };
+        self.record_parts(&key, &aggregate.aggregation_bits())
+    }
+
+    /// [`Self::record`] over the keys alone; see [`Self::verdict_parts`].
+    pub fn record_parts(&mut self, key: &AggregateKey, bits: &[bool]) -> bool {
+        if self.verdict_parts(key, bits).is_err() {
             return false;
         }
-
-        let data = aggregate.data();
-        let bits = aggregate.aggregation_bits();
         self.aggregator_epochs
-            .put((data.target.epoch, aggregate.aggregator_index()), ());
-        let packed = PackedBits::from_bits(&bits);
-        match self
-            .data_roots
-            .get_mut(&(data.hash_tree_root(), committee_index))
-        {
+            .put((key.target_epoch, key.aggregator_index), ());
+        let packed = PackedBits::from_bits(bits);
+        let data_key = (key.data_root, key.committee_index);
+        match self.data_roots.get_mut(&data_key) {
             Some(existing) => existing.push(packed),
             None => {
-                self.data_roots
-                    .put((data.hash_tree_root(), committee_index), vec![packed]);
+                self.data_roots.put(data_key, vec![packed]);
             }
         }
         true

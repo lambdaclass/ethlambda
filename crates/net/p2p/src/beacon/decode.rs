@@ -25,10 +25,14 @@
 //! | `data_column_sidecar_{subnet_id}` | Yes, at gloas, by topic digest |
 //! | `execution_payload`, `payload_attestation_message` | No, gloas onward |
 //! | `execution_payload_bid`, `proposer_preferences` | No, gloas onward |
+//!
+//! A PQ digest's topics are the exception to all of the above: every one
+//! whose container PQ reshapes (all but the block and column topics) decodes
+//! as PQ's by the topic's digest alone, through [`decode_pq_gossip`].
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, phase0, pq, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -287,9 +291,10 @@ pub fn decode_aggregate_and_proof(
             gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
                 .map(SignedAggregateAndProof::Gloas)
         }
-        // The PQ fork's aggregate carries a proof and an XMSS signature, a
-        // container the gossip layer does not model: the node does not
-        // follow that fork.
+        // The PQ fork's aggregate carries a proof and an XMSS signature. A PQ
+        // digest's topic decodes it by the digest instead
+        // (`decode_pq_gossip`); by the slot, here, it is not a container
+        // this decoder returns.
         ForkName::Pq => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
@@ -345,7 +350,8 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
         ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
-        // XMSS-signed: see `decode_aggregate_and_proof`.
+        // XMSS-signed, decoded by a PQ digest's topic: see
+        // `decode_aggregate_and_proof`.
         ForkName::Pq => return Err(DecodeError::UnsupportedFork),
         ForkName::Phase0
         | ForkName::Altair
@@ -384,7 +390,8 @@ pub fn decode_gossip(
                 ForkName::Gloas | ForkName::Eip8483 => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
-                // Proof-carrying: see `decode_aggregate_and_proof`.
+                // Proof-carrying, decoded by a PQ digest's topic: see
+                // `decode_aggregate_and_proof`.
                 ForkName::Pq => return Err(DecodeError::UnsupportedFork),
                 ForkName::Phase0
                 | ForkName::Altair
@@ -416,6 +423,96 @@ pub fn decode_gossip(
             altair::SignedContributionAndProof::from_ssz_bytes(bytes)
                 .map(|value| BeaconGossip::SyncCommitteeContribution(Box::new(value)))
                 .map_err(|_| DecodeError::Ssz)
+        }
+        _ => Err(DecodeError::UnknownTopic),
+    }
+}
+
+/// A message on one of the topics whose container the PQ fork reshapes,
+/// decoded as PQ's. Every one carries an XMSS signature where gloas's carries
+/// a BLS one; an aggregate also carries a STARK proof in place of a
+/// selection proof. Kept apart from [`BeaconGossip`] and the shared
+/// containers, which the chain actor, the pools and the Beacon API read: the
+/// node does not follow PQ, and nothing past gossip consumes these.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PqGossip {
+    Aggregate(Box<pq::SignedAggregateAndProof>),
+    Attestation(Box<pq::SingleAttestation>),
+    ProposerSlashing(Box<pq::ProposerSlashing>),
+    AttesterSlashing(Box<pq::AttesterSlashing>),
+    PayloadAttestation(Box<pq::PayloadAttestationMessage>),
+    ExecutionPayloadBid(Box<pq::SignedExecutionPayloadBid>),
+    ProposerPreferences(Box<pq::SignedProposerPreferences>),
+    Envelope(Box<pq::SignedExecutionPayloadEnvelope>),
+}
+
+/// Whether `kind` is a topic whose container the PQ fork reshapes, the ones
+/// [`decode_pq_gossip`] decodes. A block, whose fork the payload names, and a
+/// data column sidecar, unchanged since gloas, are not.
+pub fn is_pq_reshaped(kind: &str) -> bool {
+    matches!(
+        kind,
+        topics::BEACON_AGGREGATE_AND_PROOF
+            | topics::PROPOSER_SLASHING
+            | topics::ATTESTER_SLASHING
+            | topics::PAYLOAD_ATTESTATION_MESSAGE
+            | topics::EXECUTION_PAYLOAD_BID
+            | topics::PROPOSER_PREFERENCES
+            | topics::EXECUTION_PAYLOAD
+    ) || topics::attestation_subnet(kind).is_some()
+}
+
+/// Decode a message from a PQ digest's topic `kind` as PQ's container.
+///
+/// The fork comes from the topic's digest, not the payload: every container
+/// here changed shape at PQ, so the digest is what says which shape the bytes
+/// are. The three with a type-specific bound in `pq/p2p-interface.md`
+/// (`MAX_*_SIZE_PQ`, sized for XMSS signatures) are refused past it before
+/// any decode.
+pub fn decode_pq_gossip(kind: &str, bytes: &[u8]) -> Result<PqGossip, DecodeError> {
+    fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], DecodeError> {
+        if bytes.len() > max {
+            Err(DecodeError::Ssz)
+        } else {
+            Ok(bytes)
+        }
+    }
+    let ssz = |_| DecodeError::Ssz;
+    match kind {
+        topics::BEACON_AGGREGATE_AND_PROOF => pq::SignedAggregateAndProof::from_ssz_bytes(bounded(
+            bytes,
+            preset::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ,
+        )?)
+        .map(|value| PqGossip::Aggregate(Box::new(value)))
+        .map_err(ssz),
+        topics::PROPOSER_SLASHING => pq::ProposerSlashing::from_ssz_bytes(bytes)
+            .map(|value| PqGossip::ProposerSlashing(Box::new(value)))
+            .map_err(ssz),
+        topics::ATTESTER_SLASHING => pq::AttesterSlashing::from_ssz_bytes(bounded(
+            bytes,
+            preset::MAX_ATTESTER_SLASHING_SIZE_PQ,
+        )?)
+        .map(|value| PqGossip::AttesterSlashing(Box::new(value)))
+        .map_err(ssz),
+        topics::PAYLOAD_ATTESTATION_MESSAGE => pq::PayloadAttestationMessage::from_ssz_bytes(bytes)
+            .map(|value| PqGossip::PayloadAttestation(Box::new(value)))
+            .map_err(ssz),
+        topics::EXECUTION_PAYLOAD_BID => pq::SignedExecutionPayloadBid::from_ssz_bytes(bounded(
+            bytes,
+            preset::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ,
+        )?)
+        .map(|value| PqGossip::ExecutionPayloadBid(Box::new(value)))
+        .map_err(ssz),
+        topics::PROPOSER_PREFERENCES => pq::SignedProposerPreferences::from_ssz_bytes(bytes)
+            .map(|value| PqGossip::ProposerPreferences(Box::new(value)))
+            .map_err(ssz),
+        topics::EXECUTION_PAYLOAD => pq::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes)
+            .map(|value| PqGossip::Envelope(Box::new(value)))
+            .map_err(ssz),
+        kind if topics::attestation_subnet(kind).is_some() => {
+            pq::SingleAttestation::from_ssz_bytes(bytes)
+                .map(|value| PqGossip::Attestation(Box::new(value)))
+                .map_err(ssz)
         }
         _ => Err(DecodeError::UnknownTopic),
     }
@@ -815,5 +912,85 @@ mod tests {
                 assert!(result.is_err(), "{kind} accepted {length} junk bytes");
             }
         }
+    }
+
+    /// Each reshaped topic decodes as PQ's own container, by the topic alone.
+    #[test]
+    fn pq_topics_decode_as_pq_containers() {
+        let slashing = pq::ProposerSlashing::default();
+        assert_eq!(
+            decode_pq_gossip(topics::PROPOSER_SLASHING, &slashing.to_ssz()),
+            Ok(PqGossip::ProposerSlashing(Box::new(slashing)))
+        );
+        let attestation = pq::SingleAttestation::default();
+        let subnet = topics::attestation_topic_name([0; 4], 3);
+        let kind = topics::topic_kind(&subnet).unwrap();
+        assert_eq!(
+            decode_pq_gossip(kind, &attestation.to_ssz()),
+            Ok(PqGossip::Attestation(Box::new(attestation)))
+        );
+        let message = pq::PayloadAttestationMessage::default();
+        assert_eq!(
+            decode_pq_gossip(topics::PAYLOAD_ATTESTATION_MESSAGE, &message.to_ssz()),
+            Ok(PqGossip::PayloadAttestation(Box::new(message)))
+        );
+        let bid = pq::SignedExecutionPayloadBid::default();
+        assert_eq!(
+            decode_pq_gossip(topics::EXECUTION_PAYLOAD_BID, &bid.to_ssz()),
+            Ok(PqGossip::ExecutionPayloadBid(Box::new(bid)))
+        );
+        let preferences = pq::SignedProposerPreferences::default();
+        assert_eq!(
+            decode_pq_gossip(topics::PROPOSER_PREFERENCES, &preferences.to_ssz()),
+            Ok(PqGossip::ProposerPreferences(Box::new(preferences)))
+        );
+        // A gloas container is not a PQ one: its BLS signature is the wrong
+        // width.
+        let gloas_slashing = shared::ProposerSlashing::default();
+        assert_eq!(
+            decode_pq_gossip(topics::PROPOSER_SLASHING, &gloas_slashing.to_ssz()),
+            Err(DecodeError::Ssz)
+        );
+    }
+
+    /// The type-specific bounds `pq/p2p-interface.md` sizes for XMSS
+    /// signatures refuse a larger payload before it is decoded.
+    #[test]
+    fn pq_payloads_past_their_size_bound_are_refused() {
+        for (kind, bound) in [
+            (
+                topics::BEACON_AGGREGATE_AND_PROOF,
+                preset::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ,
+            ),
+            (
+                topics::ATTESTER_SLASHING,
+                preset::MAX_ATTESTER_SLASHING_SIZE_PQ,
+            ),
+            (
+                topics::EXECUTION_PAYLOAD_BID,
+                preset::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ,
+            ),
+        ] {
+            assert_eq!(
+                decode_pq_gossip(kind, &vec![0u8; bound + 1]),
+                Err(DecodeError::Ssz),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            decode_pq_gossip(topics::VOLUNTARY_EXIT, &[]),
+            Err(DecodeError::UnknownTopic)
+        );
+    }
+
+    /// Blocks and columns are not reshaped: they take the shared path.
+    #[test]
+    fn only_the_reshaped_topics_are_pq_decoded() {
+        assert!(is_pq_reshaped(topics::BEACON_AGGREGATE_AND_PROOF));
+        assert!(is_pq_reshaped("beacon_attestation_15"));
+        assert!(is_pq_reshaped(topics::EXECUTION_PAYLOAD));
+        assert!(!is_pq_reshaped(topics::BEACON_BLOCK));
+        assert!(!is_pq_reshaped("data_column_sidecar_3"));
+        assert!(!is_pq_reshaped(topics::VOLUNTARY_EXIT));
     }
 }

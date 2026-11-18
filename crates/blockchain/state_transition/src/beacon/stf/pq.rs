@@ -376,7 +376,7 @@ pub fn process_proposer_slashing(
     slash_validator(state, proposer_index, None, config)
 }
 
-fn header_signature_valid(
+pub(crate) fn header_signature_valid(
     state: &BeaconState,
     pubkey: &XmssPubkey,
     header: &BeaconBlockHeader,

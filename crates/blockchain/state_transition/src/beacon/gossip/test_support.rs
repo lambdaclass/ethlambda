@@ -353,7 +353,7 @@ pub(crate) mod builder_scene {
 
         let dependent_root = dependent_root_at(&state, PARENT, bid_slot).expect("in the window");
         let proposer = crate::beacon::precheck::fixed_proposer(&state, bid_slot).expect("window");
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let preferences = test_support::sign_preferences(
             &state,
             gloas::ProposerPreferences {
