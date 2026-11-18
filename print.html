@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0994f316.js";
+            window.path_to_searchindex_js = "searchindex-740b3d51.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -456,10 +456,12 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
 <ol>
 <li>Install the tracing subscriber, parse CLI options, register metrics, raise the
 file-descriptor limit for RocksDB’s unbounded table cache.</li>
-<li>Load the node key, then genesis config, validator config, bootnode ENRs and validator keys.</li>
-<li>Open the database, then pick an anchor: resume from disk if the on-disk head is recent
-enough, otherwise <a href="#checkpoint-sync">checkpoint sync</a> from the configured URLs, and
-otherwise build the genesis state. A stale database with no checkpoint URL configured is
+<li>Load genesis config, validator config, bootnode ENRs and validator keys.</li>
+<li>Open the database, then load the node key: <code>--node-key</code>, else the <code>node.key</code> stored in
+the data directory, generated there on its first start. Then pick an anchor: resume from
+disk if the on-disk head is recent enough, otherwise
+<a href="#checkpoint-sync">checkpoint sync</a> from the configured URLs, and otherwise build the
+genesis state. A stale database with no checkpoint URL configured is
 resumed anyway, with a warning, since that is the setup the node was given.</li>
 <li>Build the shared handles: aggregator controller, sync-status controller, event bus, and
 the subnet set that both the swarm and the actor need to agree on.</li>
@@ -3887,7 +3889,7 @@ one <code>CommonOptions</code> struct flattened into each.</p>
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for both HTTP servers</td></tr>
 <tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port. <code>beacon</code> binds it too, off its own anchored store rather than an empty one; the lean-shaped <code>/lean/v0</code> routes still don’t answer for it (see <a href="#beacon-flags"><code>beacon</code> flags</a> below)</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics and debug server port. Equal to <code>--api-port</code> merges the routers onto one listener</td></tr>
-<tr><td><code>--node-key</code></td><td>generates an ephemeral key</td><td>Hex file holding the secp256k1 key that is this node’s libp2p and discv5 identity. When omitted, a fresh key is generated in memory each start (logged as a warning), so the PeerId and ENR differ on every restart</td></tr>
+<tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code></td><td>Hex file holding the secp256k1 key that is this node’s libp2p and discv5 identity. When omitted, the key stored in <code>--data-dir</code> as <code>node.key</code> is used, generated and stored there (mode <code>0600</code>) on the directory’s first start, so the PeerId and ENR stay the same across restarts until the directory is wiped</td></tr>
 <tr><td><code>--bootnodes</code></td><td>see below</td><td>Bootnode ENR list: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated)</td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>see below</td><td>API base URLs, tried in order until one answers. Supplies <code>node</code>’s starting state on the lean API, and <code>beacon</code>’s anchor on a standard Beacon API; required on a fresh <code>beacon</code> data directory only for a built-in network, since a loaded network anchors at its own <code>genesis.ssz</code> instead. See <a href="#checkpoint-sync"><code>checkpoint_sync.md</code></a></td></tr>
 <tr><td><code>--discovery.port</code></td><td><code>9000</code></td><td>discv5 UDP port; must differ from <code>--gossipsub-port</code>. See <a href="#peer-discovery-discv5">Peer discovery</a></td></tr>
@@ -3905,7 +3907,7 @@ carries none and each chain resolves an absent value itself:</p>
 <tr><th>Flag</th><th>Absent on <code>node</code></th><th>Absent on <code>beacon</code></th></tr>
 </thead>
 <tbody>
-<tr><td><code>--node-key</code></td><td>ephemeral in-memory key, warned about</td><td>same</td></tr>
+<tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code>, generated on the directory’s first start</td><td>same</td></tr>
 <tr><td><code>--bootnodes</code></td><td>no bootnodes: peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed, warned about</td><td>falls back to the resolved network’s own bootnode list: a built-in network’s embedded list, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>start from a resumable DB, else from genesis</td><td>start from a resumable DB, else anchor at the resolved network’s own genesis (loaded network only), else abort</td></tr>
 </tbody>
@@ -4081,11 +4083,11 @@ not chain-specific, branches once, and shares the shutdown:</p>
 <tr><td>register metrics, print the banner, log the version</td><td>shared</td><td>shared</td></tr>
 <tr><td>raise <code>RLIMIT_NOFILE</code></td><td>shared</td><td>shared</td></tr>
 <tr><td><code>HIVE_LEAN_TEST_DRIVER</code> early return</td><td>yes</td><td>no: those endpoints are lean’s</td></tr>
-<tr><td>resolve <code>--node-key</code></td><td>shared</td><td>shared</td></tr>
 <tr><td>resolve <code>--network</code> into a <code>NetworkSource</code></td><td>n/a: lean has no <code>--network</code></td><td>classify the value (built-in name vs. directory); parse the <code>config.yaml</code> (embedded, or the directory’s) and check <code>PRESET_BASE</code> against the compiled preset and the constant-backed keys against their constants; for a directory, then decode <code>genesis.ssz</code></td></tr>
 <tr><td>read <code>--bootnodes</code> (falls back to the chain’s default list; see the table above)</td><td>shared</td><td>shared</td></tr>
 <tr><td>build the aggregator, sync-status and event handles</td><td>shared</td><td>shared</td></tr>
 <tr><td>open <code>--data-dir</code>’s RocksDB backend</td><td>shared</td><td>shared</td></tr>
+<tr><td>resolve <code>--node-key</code>, else load <code>&lt;data-dir&gt;/node.key</code>, generating it on first start (after the open, so RocksDB’s lock covers the write)</td><td>shared</td><td>shared</td></tr>
 <tr><td><strong>the one <code>match</code></strong>: produce a <code>ChainSetup</code></td><td>genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets</td><td><code>beacon::wire_params</code> (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend</td></tr>
 <tr><td>build the swarm, spawn P2P, start discv5</td><td>shared; discv5 only with <code>--discovery.enable</code></td><td>shared</td></tr>
 <tr><td>start the HTTP server</td><td>shared</td><td>shared</td></tr>
@@ -7582,6 +7584,14 @@ current slot: ~30 minutes at lean’s four-second slots, ~90 minutes at beacon�
 twelve-second ones. A staler DB, or one whose anchor checkpoint state is
 missing, falls through to checkpoint sync, which writes a fresh anchor on top
 of the existing data.</p>
+<p>One file in <code>--data-dir</code> is not RocksDB’s: <code>node.key</code>, the node’s secp256k1
+libp2p and discv5 identity. When <code>--node-key</code> is absent, <code>run_node</code> reads it on
+every start and generates it on the first (hex, mode <code>0600</code>). It never goes
+through the <code>StorageBackend</code>, is written only after the DB is open so RocksDB’s
+lock covers it, and is lost with the directory when the directory is wiped,
+together with the custody columns that identity selected. A <code>node.key</code> that
+fails to load stops startup rather than being replaced; deleting it is how to
+ask for a new identity.</p>
 <h2 id="key-files-1"><a class="header" href="#key-files-1">Key Files</a></h2>
 <div class="table-wrapper">
 <table>

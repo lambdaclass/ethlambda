@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0994f316.js";
+            window.path_to_searchindex_js = "searchindex-740b3d51.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -398,10 +398,12 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
 <ol>
 <li>Install the tracing subscriber, parse CLI options, register metrics, raise the
 file-descriptor limit for RocksDB’s unbounded table cache.</li>
-<li>Load the node key, then genesis config, validator config, bootnode ENRs and validator keys.</li>
-<li>Open the database, then pick an anchor: resume from disk if the on-disk head is recent
-enough, otherwise <a href="./checkpoint_sync.html">checkpoint sync</a> from the configured URLs, and
-otherwise build the genesis state. A stale database with no checkpoint URL configured is
+<li>Load genesis config, validator config, bootnode ENRs and validator keys.</li>
+<li>Open the database, then load the node key: <code>--node-key</code>, else the <code>node.key</code> stored in
+the data directory, generated there on its first start. Then pick an anchor: resume from
+disk if the on-disk head is recent enough, otherwise
+<a href="./checkpoint_sync.html">checkpoint sync</a> from the configured URLs, and otherwise build the
+genesis state. A stale database with no checkpoint URL configured is
 resumed anyway, with a warning, since that is the setup the node was given.</li>
 <li>Build the shared handles: aggregator controller, sync-status controller, event bus, and
 the subnet set that both the swarm and the actor need to agree on.</li>
