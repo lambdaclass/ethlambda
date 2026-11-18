@@ -60,9 +60,7 @@ it the node advertises `0.0.0.0` and logs a warning. It still dials out and
 follows the chain, but peers cannot reach it until discovery learns the address
 from their replies. The Beacon API binds `127.0.0.1:5052` by default, so
 `--http-address` is only needed to reach it from another host. Stop the node
-with `Ctrl+C` or SIGTERM, which is what systemd sends by default. v1.0.0 shuts
-down gracefully on SIGINT only, so a systemd unit running that release needs
-`KillSignal=SIGINT`.
+with `Ctrl+C` or SIGTERM.
 
 - `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
   (Haswell or later), and glibc 2.35 or newer.
