@@ -122,26 +122,36 @@ fn run(case: &Case) -> Result<(), String> {
         SlashingProtection::open(dir.path(), root, &keys, true).map_err(|err| err.to_string())?;
 
     for (index, step) in case.steps.iter().enumerate() {
-        let imported = protection.import(&step.interchange.to_string());
-        match (imported.is_ok(), step.should_succeed) {
-            (true, true) | (false, false) => {}
+        let imported = protection
+            .import(&step.interchange.to_string())
+            .map_err(|err| err.to_string());
+        match (&imported, step.should_succeed) {
+            (Ok(_), true) | (Err(_), false) => {}
             // The README lets an importer refuse an interchange holding
             // slashable data, in which case the rest of the case is skipped.
             // This one absorbs all of it but an attestation whose source is at
-            // or past its target, so a refusal on such a step ends the case,
-            // as it does in Lighthouse; on any other step it is a failure.
-            (false, true) if step.contains_slashable_data => return Ok(()),
-            (false, true) => {
+            // or past its target, so a refusal ends the case, as it does in
+            // Lighthouse, only when the step's interchange holds one and that
+            // is what the importer says it refused. Every other refusal is a
+            // failure: skipping on the flag alone, or on the interchange
+            // alone, would pass a suite whose importer had started refusing,
+            // say, a duplicated pubkey or a surround, with that case's blocks
+            // and attestations never attempted.
+            (Err(refusal), true)
+                if step.contains_slashable_data
+                    && holds_impossible_source(&step.interchange)
+                    && refusal.contains(IMPOSSIBLE_SOURCE_REFUSAL) =>
+            {
+                return Ok(());
+            }
+            (Err(refusal), true) => {
                 return Err(format!(
-                    "step {index}: import failed but should succeed (slashable data: {}): {}",
-                    step.contains_slashable_data,
-                    imported
-                        .err()
-                        .map(|err| err.to_string())
-                        .unwrap_or_default()
+                    "step {index}: import failed but should succeed (slashable data: {}): \
+                     {refusal}",
+                    step.contains_slashable_data
                 ));
             }
-            (true, false) => {
+            (Ok(_), false) => {
                 return Err(format!("step {index}: import succeeded but should fail"));
             }
         }
@@ -180,6 +190,35 @@ fn run(case: &Case) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What the importer says when it refuses an interchange for an attestation
+/// whose source is at or past its target (`slashing_protection::file`).
+const IMPOSSIBLE_SOURCE_REFUSAL: &str = "is at or after its target epoch";
+
+/// Whether `interchange` holds an attestation whose source is at or past its
+/// target outside genesis: the one shape this importer refuses rather than
+/// absorbs. The rule is restated here rather than borrowed from the crate, so
+/// that the importer widening what it refuses cannot widen what this runner
+/// forgives along with it.
+fn holds_impossible_source(interchange: &serde_json::Value) -> bool {
+    // Quoted, as EIP-3076 writes them and the vectors do, or bare, which the
+    // importer reads too.
+    let epoch = |value: &serde_json::Value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    };
+    interchange["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["signed_attestations"].as_array().into_iter().flatten())
+        .any(|attestation| {
+            let source = epoch(&attestation["source_epoch"]);
+            let target = epoch(&attestation["target_epoch"]);
+            matches!((source, target), (Some(source), Some(target)) if source >= target && source != 0)
+        })
 }
 
 /// Only the epochs are judged; the rest of the data is filler.

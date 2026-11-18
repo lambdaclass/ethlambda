@@ -114,6 +114,14 @@ anything that does not advance past them.
   slot is equivocation that peers penalize in gossip, not a slashing.
 - **What is not covered:** the same keys running in another client on another
   machine. No local record can see that.
+- **A key held by a remote signer:** a key in a Web3Signer (see
+  [Remote signing](./cli.md#remote-signing-web3signer)) is registered in this
+  record and checked against it like any other, and is then signed by the
+  signer, which receives every message in full and keeps a record of its own;
+  a message it refuses is dropped here and never retried. The two records are
+  separate: the signer's is neither imported into this one nor exported from
+  it, so a key moved to or from a signer carries its history through the
+  signer's own tools.
 - **Interchange:** an import (`ethlambda slashing-protection import`, or the
   keymanager API's `POST /eth/v1/keystores`) reduces each validator to its
   highest slot, source and target and merges them with the record by maximum,
@@ -158,7 +166,62 @@ from the Beacon API, and no other way.
   the bid's.
 - **Why:** gossip and API bids need only a pool and the gossip rules. A builder
   API client is a separate crate with its own failure modes and timeouts, and
-  is left for a later phase.
+  is left for a later phase for gloas. Fulu's builder API (MEV-Boost) is now
+  served (`produceBlockV3` and `blinded_blocks`); gloas's is not.
+
+## Builder bids: the fee recipient is not checked
+
+- **The specification:** builder-specs' `process_bid` asserts
+  `header.fee_recipient == fee_recipient`.
+- **ethlambda:** a mismatch is logged at `debug` only.
+- **Why:** a builder names its own address as the payload's fee recipient
+  (the coinbase), so priority fees and MEV accrue to it, and pays the proposer
+  with a transaction to the registered fee recipient, worth the bid's `value`,
+  as the payload's last transaction. A mismatch is therefore the normal case,
+  and the assertion would refuse nearly every real bid. Every client reviewed
+  (Lighthouse, Teku, Prysm, Nimbus, Lodestar, Grandine) skips it. A counter of
+  mismatches would rise on nearly every bid and tell an operator nothing.
+- **The payment itself is not checked either, by this node or any client
+  reviewed.** A bid carries only the payload's header: the transactions,
+  payment included, stay with the builder until the proposer has signed. After
+  signing, `submitBlindedBlockV2` returns no payload; the builder publishes
+  the block, which reaches this node over gossip like any other, by which time
+  nothing can be undone.
+- **Who does check it:** the relay. Before serving a builder's bid, a relay
+  validates the submission on an execution node, and that validation requires
+  the proposer payment. Flashbots' block-validation API
+  (`flashbots_validateBuilderSubmission*`) passes the registered fee
+  recipient and the bid's value to `ValidatePayload`, which requires the
+  block's last transaction to pay that address at least that much (or, if the
+  relay configures it, the address's balance to rise by it). The proposer
+  relies on the relay for this, as for the payload's validity. A relay
+  publishes what it delivered on its data API
+  (`/relay/v1/data/bidtraces/proposer_payload_delivered`), which is where an
+  underpayment would surface. An operator who wants more than that trust must
+  choose relays accordingly. A check after the fact, comparing a published
+  block's last transaction with the bid it won, is possible but not
+  implemented.
+
+## `builder_boost_factor` scales the bid before rounding
+
+- **The specification:** beacon-APIs' `produceBlockV3` serves the local payload
+  iff `exec_node_payload_value >= builder_boost_factor *
+  (builder_payload_value // 100)`: the bid is rounded down to a multiple of
+  100 wei, then scaled.
+- **ethlambda:** the local payload wins iff its value is at least
+  `(builder_boost_factor * builder_payload_value) // 100`, scaled first and
+  rounded down once (`builder_flow::choice::boosted`), saturating at
+  `u128::MAX`. A tie still goes local, and the factors 0, 100 and `2^64 - 1`
+  keep the meanings the specification gives them.
+- **Why:** rounding first loses up to 99 wei of the bid before it is weighed,
+  so even at the default factor of 100 a bid slightly better than the local
+  payload lost to it. Scaling first makes 100 an exact comparison. The two
+  differ by less than `factor` wei, only ever in the bid's favour. The gloas
+  `produceBlockV4` comparison (`bid_selection::choose_payload`) already
+  multiplies first. Teku and Lodestar compare `local * 100` against
+  `factor * bid`, and Nimbus computes `(factor * bid) div 100` (giving a tie to
+  the builder). Lighthouse follows the specification's order but skips the
+  arithmetic at factor 100 for the same reason (sigp/lighthouse#5352).
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 
@@ -242,12 +305,14 @@ from the Beacon API, and no other way.
   and a bid is compatible with it when it builds on that head and its payload.
   The builder-exit check is skipped for a pre-gloas parent, which carries no
   envelope.
-- **Preference signatures** are accepted under the lookahead state's own
-  `DOMAIN_PROPOSER_PREFERENCES` domain (the specification's), the fork version of
-  the epoch before the proposal's, or the proposal epoch's. They coincide outside
-  the first epoch of a fork. Lighthouse signs with the proposal epoch's version
-  and the specification gives the earlier one, so accepting both avoids
-  rejecting an honest client's messages around the gloas upgrade.
+- **Preference signatures** are accepted under `DOMAIN_PROPOSER_PREFERENCES` at
+  the proposal epoch's fork version, which consensus-specs v1.7.0-beta.4 signs
+  and verifies with and every client signs with, and also under the two that
+  v1.7.0-beta.2's rule (`get_domain` on the lookahead state) could give: that
+  state's own fork, and the fork version of the epoch before the proposal's.
+  They coincide outside the first epoch of a fork. The older two are kept for a
+  client still signing by beta.2, until the fixtures (pinned to beta.2) move
+  past it.
 - **Consequence:** builders onboarded at the fork are inactive until their
   deposit epoch is finalized, so gossip bids are rejected for the first epochs of
   gloas and `produceBlockV4` self-builds.
@@ -747,3 +812,73 @@ comes first. The validator client signs once, at the deadline
 (`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
+
+## The validator client's builder proposals
+
+With `--builder-proposals` the validator client registers its validators with
+the beacon node's builder and may sign a blinded block (builder-specs and
+`validator.md`'s builder flow), for fulu and earlier slots. A blinded block
+has the root of the full block it stands for, so slashing protection records
+its slot like any other block's, durably and before it is signed: one slot, one
+signature, whichever way the node answered. Three departures:
+
+- **A blinded block is published only on the beacon node that produced it, with
+  no failover.** This is this client's choice, not the specification's: only
+  that node's builder holds the payload and only that node claimed the slot, so
+  offering the signed block to another node would hand it to a builder that
+  never saw the bid. If the producing node fails, the publish fails, and
+  slashing protection has already recorded the slot, so nothing retries. A 5xx
+  other than 503, or no answer once connected, is reported as unconfirmed
+  (logged at error, counted on `blinded_blocks_unconfirmed_total`) and not as a
+  missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+  a connection never made (refused, or past the client's 3 s connect timeout)
+  is a missed proposal: the node cannot have handed the block on. The block
+  carries the node that produced it (`Producer`, filled in by the fallback),
+  and the proposal path sends the signed block back to it; Teku pins a blinded
+  block to its producer too, in a cache keyed by slot and root, while
+  Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+  Two status codes are read the wrong way: some of ethlambda's own 500s are
+  definite (no builder configured, the block failing the node's checks) and
+  count as unconfirmed, and a proxy's 503 sent after it forwarded the request
+  counts as definite. Neither leads to a retry or a second signature.
+- **A blinded block stays signed but undelivered for longer.** The node waits
+  up to 5 s on the relay and the client up to 8 s on the node, against well
+  under a second for a full block. The publish runs on its own task so the
+  proposal budget cannot cut it off: past the budget the proposal returns
+  "still publishing" and the task reports the outcome itself. The process
+  handles no signals, though: a SIGINT in that window ends the task with the
+  request.
+- **Registrations stop at gloas.** The client sends no `register_validator` from
+  the gloas fork epoch on: the builder market works through proposer
+  preferences there (see the next section), and `produceBlockV4` sends the
+  configured boost factor and `--builder-min-bid` (default `0`), and no
+  builders.
+  Validators with no fee recipient are not registered either (the field is
+  required), and only validators the beacon node resolved, pending or active,
+  are signed for: the flashbots relay refuses a whole batch over an exited or
+  withdrawn key, as Teku's validator client and Lighthouse's beacon node
+  account for.
+
+## The validator client's proposer preferences
+
+- **Signing domain: no departure, but ahead of the fixtures.** The validator
+  client signs under `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork
+  version (`SigningContext::sign_proposer_preferences`), as consensus-specs
+  v1.7.0-beta.4's `get_signed_proposer_preferences` does with
+  `compute_fork_version(proposal_epoch)`, and as Lighthouse, Prysm, Teku,
+  Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
+  v1.7.0-beta.2, whose gossip rule verified with `get_domain` on the dependent
+  block's state advanced to the lookahead start, the fork of the epoch before
+  the proposal's. The two differ only for a proposal in the first epoch of a
+  fork, where Lighthouse refuses beta.2's signature as a bad one. This node
+  still accepts beta.2's domain too (see the fulu-to-gloas boundary entry).
+- **Published unconditionally,** not gated on `--builder-proposals`, since from
+  gloas the preferences carry every proposal's fee recipient. Validators with no
+  fee recipient are skipped (the field is required), and a preference cannot be
+  replaced for the same slot and dependent root.
+- **Re-sent once an epoch,** as signed, to every node, while its slot is ahead.
+  The specification says nothing about re-sending; it is here because a beacon
+  node holds them in memory only
+  and gossip does not replay them, so a node that restarts would otherwise
+  self-build without them, and ignore builders' bids, until the next dependent
+  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.
