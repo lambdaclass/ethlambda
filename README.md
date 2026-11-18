@@ -151,11 +151,7 @@ docker run -d --name ethrex --network ethereum \
   --authrpc.addr      0.0.0.0 \
   --authrpc.jwtsecret /jwt.hex
 
-# `docker stop` sends SIGTERM, which ends v1.0.0 without a graceful shutdown (later images handle
-# it), so `--stop-signal` makes it send SIGINT instead.
-# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
-# unflushed state is lost, so `--stop-timeout` gives it a minute.
-docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --stop-timeout 60 \
+docker run -d --name ethlambda-beacon --network ethereum \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
@@ -183,11 +179,7 @@ mkdir -p beacon-data
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
-# `docker stop` sends SIGTERM, which ends v1.0.0 without a graceful shutdown (later images handle
-# it), so `--stop-signal` makes it send SIGINT instead.
-# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
-# unflushed state is lost, so `--stop-timeout` gives it a minute.
-docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
+docker run -d --name ethlambda-beacon \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
