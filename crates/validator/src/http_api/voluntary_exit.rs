@@ -84,13 +84,15 @@ pub async fn create_signed_voluntary_exit(
         epoch,
         validator_index: entry.index,
     };
-    // The read lock is not held across the round trip to the beacon node, so
-    // a keystore delete can land between the check above and here. Signing
-    // then finds no key, which is the same 404 the check gives.
-    let store = context.store.read().await;
+    // No guard on the store is held here or across the round trip to the
+    // beacon node above: the signing path takes its own for the lookup alone,
+    // since for a key in a remote signer the signature is a round trip too.
+    // So a delete can land between the check above and here. Signing then
+    // finds no key, which is the same 404 the check gives.
     let signature = context
         .signing
-        .sign_voluntary_exit(&store, &pubkey, &exit, current_epoch)
+        .sign_voluntary_exit(&context.store, &pubkey, &exit, current_epoch)
+        .await
         .map_err(|err| match err {
             crate::Error::UnknownValidator(_) => ApiError::NotFound(format!(
                 "no validator with pubkey {} is held by this client",
@@ -98,7 +100,6 @@ pub async fn create_signed_voluntary_exit(
             )),
             other => ApiError::Internal(format!("signing failed: {other}")),
         })?;
-    drop(store);
 
     info!(
         pubkey = %encode_hex(&pubkey.0),
@@ -182,10 +183,7 @@ mod tests {
             .as_secs()
             - epochs * 32 * 12;
         let clock = SlotClock::from_config(genesis_time, &config);
-        let signing = Arc::new(SigningContext {
-            config,
-            genesis_validators_root: Root::repeat_byte(3),
-        });
+        let signing = Arc::new(SigningContext::new(config, Root::repeat_byte(3)));
         let dir = tempfile::tempdir().expect("temp dir");
         let context = KeymanagerContext {
             store: Arc::new(RwLock::new(store)),
@@ -195,6 +193,7 @@ mod tests {
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
+            default_remote_signer: None,
             beacon_node: Arc::new(node),
             signing: signing.clone(),
             clock: clock.clone(),

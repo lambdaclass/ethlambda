@@ -480,6 +480,44 @@ impl ProducedBlock {
         }
     }
 
+    /// The block's header: the block with its body replaced by the body's
+    /// root. It merkleizes to [`Self::block_root`], which is what lets the
+    /// signing path take the header (a remote signer reads it) and sign the
+    /// block's root all the same.
+    pub fn header(&self) -> ethlambda_types::beacon::containers::shared::BeaconBlockHeader {
+        use ethlambda_types::beacon::containers::shared::BeaconBlockHeader;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        match &self.contents {
+            Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
+                BeaconBlockHeader {
+                    slot: block.slot,
+                    proposer_index: block.proposer_index,
+                    parent_root: block.parent_root,
+                    state_root: block.state_root,
+                    body_root: block.body.hash_tree_root(),
+                }
+            }
+            Contents::Gloas { block, .. } => BeaconBlockHeader {
+                slot: block.slot,
+                proposer_index: block.proposer_index,
+                parent_root: block.parent_root,
+                state_root: block.state_root,
+                body_root: block.body.hash_tree_root(),
+            },
+            // A blinded body merkleizes to the full body's root, the payload
+            // header standing in for the payload, so its header is the full
+            // block's as well, and a remote signer is asked for the block the
+            // builder will publish.
+            Contents::Blinded { block } => BeaconBlockHeader {
+                slot: block.slot,
+                proposer_index: block.proposer_index,
+                parent_root: block.parent_root,
+                state_root: block.state_root,
+                body_root: block.body.hash_tree_root(),
+            },
+        }
+    }
+
     /// Where the block pays its execution-layer rewards: the payload's fee
     /// recipient before gloas, the bid's from it on. For a blinded block, the
     /// header's, which is the builder's address rather than the validator's.
@@ -886,6 +924,11 @@ mod tests {
         assert_eq!(produced.slot(), 5);
         assert_eq!(produced.proposer_index(), 7);
         assert_eq!(produced.block_root(), full.hash_tree_root());
+        assert_eq!(
+            produced.header().hash_tree_root(),
+            full.hash_tree_root(),
+            "the header the signer is sent is the full block's"
+        );
         assert_eq!(produced.blob_count(), 0);
     }
 

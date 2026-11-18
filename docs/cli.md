@@ -61,7 +61,7 @@ one `CommonOptions` struct flattened into each.
 | `--http-address` | `127.0.0.1` | Bind address for both HTTP servers |
 | `--api-port` | `5052` | API server port. `beacon` binds it too, off its own anchored store rather than an empty one; the lean-shaped `/lean/v0` routes still don't answer for it (see [`beacon` flags](#beacon-flags) below) |
 | `--metrics-port` | `5054` | Metrics and debug server port. Equal to `--api-port` merges the routers onto one listener |
-| `--node-key` | generates an ephemeral key | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, a fresh key is generated in memory each start (logged as a warning), so the PeerId and ENR differ on every restart |
+| `--node-key` | `<data-dir>/node.key` | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, the key stored in `--data-dir` as `node.key` is used, generated and stored there (mode `0600`) on the directory's first start, so the PeerId and ENR stay the same across restarts until the directory is wiped |
 | `--bootnodes` | see below | Bootnode ENR list: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated) |
 | `--checkpoint-sync-url` | see below | API base URLs, tried in order until one answers. Supplies `node`'s starting state on the lean API, and `beacon`'s anchor on a standard Beacon API; required on a fresh `beacon` data directory only for a built-in network, since a loaded network anchors at its own `genesis.ssz` instead. See [`checkpoint_sync.md`](checkpoint_sync.md) |
 | `--discovery.port` | `9000` | discv5 UDP port; must differ from `--gossipsub-port`. See [Peer discovery](./discovery.md) |
@@ -74,7 +74,7 @@ carries none and each chain resolves an absent value itself:
 
 | Flag | Absent on `node` | Absent on `beacon` |
 |---|---|---|
-| `--node-key` | ephemeral in-memory key, warned about | same |
+| `--node-key` | `<data-dir>/node.key`, generated on the directory's first start | same |
 | `--bootnodes` | no bootnodes: peers only via discv5 (with `--discovery.enable`) or by being dialed, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
 | `--checkpoint-sync-url` | start from a resumable DB, else from genesis | start from a resumable DB, else anchor at the resolved network's own genesis (loaded network only), else abort |
 
@@ -240,11 +240,11 @@ not chain-specific, branches once, and shares the shutdown:
 | register metrics, print the banner, log the version | shared | shared |
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
-| resolve `--node-key` | shared | shared |
 | resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's) and check `PRESET_BASE` against the compiled preset and the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
 | read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
+| resolve `--node-key`, else load `<data-dir>/node.key`, generating it on first start (after the open, so RocksDB's lock covers the write) | shared | shared |
 | **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | `beacon::wire_params` (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend |
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
@@ -300,7 +300,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
-| `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
+| `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
@@ -308,7 +308,8 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
-| `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
 | `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in `produceBlockV4`. Without it that factor is `0`, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do |
 | `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is also sent in `produceBlockV4`'s body, so a pooled p2p bid can win on value; without `--builder-proposals` the body carries `0`, which still lets a node whose local build fails build on such a bid. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
 | `--prefer-builder-proposals` | off | Take the builder's block whenever there is a valid bid: this client sends `builder_boost_factor = u64::MAX`. The beacon node still keeps its local payload when its execution client sets `shouldOverrideBuilder`. Requires `--builder-proposals`; conflicts with `--builder-boost-factor` |
@@ -445,8 +446,8 @@ for wall slot `S` are those of the period containing `S + 1`, since members
 assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
-Not implemented: doppelganger protection and remote signing. Voluntary exits
-are signed by the keymanager API's `voluntary_exit` route and by
+Not implemented: doppelganger protection. Voluntary exits are signed by the
+keymanager API's `voluntary_exit` route and by
 [`ethlambda voluntary-exit`](#voluntary-exit).
 
 ### Duty offsets come from the network
@@ -475,6 +476,108 @@ attester duties untouched can still move a proposer between slots. This client
 fetches proposer duties once per epoch, at the boundary, so a reorg inside the
 epoch is not picked up until the next one.
 
+### Remote signing (Web3Signer)
+
+A validator's key can stay in a [Web3Signer](https://docs.web3signer.consensys.io/)
+instead of this process. Each signature is then one `POST
+/api/v1/eth2/sign/{pubkey}` carrying the message in full (the attestation
+data, the block header, the aggregate, and so on), the fork it is signed under
+and the signing root, and the signer answers with the signature. Every duty
+this client performs signs this way when the key is remote, the gloas envelope
+and payload attestation included; a slot's attestations are requested
+concurrently, so a hundred keys behind one signer cost one round trip rather
+than a hundred in series.
+
+Because the message travels in full, the signer's own slashing protection
+applies to it, on top of this client's: a remote key has a record in
+[`slashing_protection.json`](#slashing-protection) like a local one, and a
+block or attestation is checked against it and recorded before the signer is
+asked. So a remote key written into the definitions file by hand is refused at
+startup until it has a record, the same as a local keystore; one imported
+through the keymanager API is registered as it is imported. The two records
+are separate (see
+[Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history)):
+a key moved to or from a signer carries its history through the signer's own
+tools. A signer refusal (`412`) is logged, counted as a
+signing failure and never retried; so is a key the signer does not hold, a
+signer that cannot be reached, and an answer that does not verify: every
+signature a signer returns is checked against the validator's public key and
+the signing root before it is used, so a signer holding another key under that
+pubkey, or computing another root, costs the signature rather than publishing
+one no peer accepts. That check runs off the duty loop, a core per signature,
+so a large batch of answers does not hold the loop up. Each duty asks for its
+signatures all at once
+and gives each one 2 seconds: a signer that has not answered by then loses the
+signatures it owes and no others, so the duty publishes whatever arrived,
+local keys and other signers' keys included. It publishes them together,
+though, so while a signer hangs every duty's batch goes out up to 2 seconds
+late, the local keys' share of it too: an attestation is then published 2
+seconds after the attestation offset, still ahead of the aggregation one. One
+signer is sent at most 64
+requests at a time and the rest of a batch waits its turn inside the same 2
+seconds, so a signer costs this client 64 connections however many keys it
+holds; the sub-command also raises its open-file limit at startup, as `node`
+and `beacon` do. Aggregator selection proofs are
+remembered once produced, so the one the epoch's subnet subscription asked for
+is not asked for again by the aggregation. Those subscriptions are sent from a
+task of their own, started once the epoch's first slot has had its block, so
+the round trips for their selection proofs never stand between a slot boundary
+and a proposal. With no duty waiting on that task, its proofs get 8 seconds
+rather than 2: one that misses is a duty subscribed without the aggregator
+role, and at startup, or with thousands of remote keys, two epochs of proofs
+queue for the signer's 64 request slots. Nothing is asked of the signer at startup or at
+import: a signer may start after this client does.
+
+A voluntary exit for a remote key is signed the same way (`VOLUNTARY_EXIT`),
+through the keymanager API's `voluntary_exit` route. The signer derives an
+exit's root itself and refuses a request naming another, so it is told the one
+fork version the exit is signed under, as both `previous_version` and
+`current_version`: from deneb on that is the capella version (EIP-7044), not
+the fork the schedule has at the exit's epoch. [`ethlambda
+voluntary-exit`](#voluntary-exit) decrypts a keystore file, so it signs for
+local keys only.
+
+Builder registrations (`VALIDATOR_REGISTRATION`, with `--builder-proposals`)
+and gloas proposer preferences (`PROPOSER_PREFERENCES`) are signed by the
+signer too. A registration is sent with no `fork_info`: its domain is the
+genesis fork version under a zero validators root, which the signer takes from
+its own network configuration. A preference is told the fork at its proposal
+epoch, the one its domain comes from. Like the subscriptions, the epoch's full
+registration send starts after the slot's block, and each chunk of it gets the
+same 2-second budget; a registration that fails to sign is left out until the
+next epoch's send.
+
+A remote key is declared in `validator_definitions.yml` with `type:
+web3signer` and a `url` where a local entry has `type: local_keystore` and its
+two keystore paths:
+
+```yaml
+- enabled: true
+  voting_public_key: "0x9612…0d07"
+  type: web3signer
+  url: https://signer:9000
+```
+
+or imported at runtime through `POST /eth/v1/remotekeys` (below). A `url`
+left out of that request means `--web3signer-url`. An entry written without a
+`type` (every entry from before remote signing) is read by its fields; one
+naming both keystore paths and a `url` is refused at startup rather than read
+as either. So is a `web3signer` entry carrying a field this client does not
+implement, such as Lighthouse's `root_certificate_path`: skipping it would sign
+through a connection the operator did not describe. `description` is the one
+exception, since Lighthouse writes it on every entry. A local entry is read
+past such fields, so a file Lighthouse wrote for local keystores loads as it
+is; the fields are not kept when the file is next rewritten. The `url` must not
+carry credentials, a query string or a fragment.
+
+The signer is reached over HTTP or HTTPS. HTTPS is verified against the Mozilla
+root store bundled into the binary (`webpki-roots`), **not** the operating
+system's trust store, and no other CA can be added: a signer behind an internal
+or self-signed CA fails every TLS handshake, and every signature for its keys
+is then counted as a signing failure. Client certificates are not supported
+either. Put such a signer behind a certificate from a public CA, or reach it
+over plain HTTP on a private network.
+
 ### The keymanager API
 
 Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
@@ -483,10 +586,36 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 if absent. The token file is written `0600` and a file too short to be a real
 token is refused rather than accepted.
 
+It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
+Web3Signer holds. The two routes partition the store: `/keystores` lists and
+deletes local keys only, `/remotekeys` remote keys only, and a key asked of the
+wrong route is `not_found`. An import of a key either route already holds is
+`duplicate`. `POST /remotekeys` persists each key to the definitions file and
+registers it in the slashing-protection record before it starts signing, the
+same order the keystores import uses, and `readonly` is always `false`: this
+client has no key it cannot delete. These routes carry no slashing-protection
+history, since the specification gives them no field for it: a remote key
+imported with no record starts as never having signed, and `DELETE
+/remotekeys` leaves the record in place. `DELETE /keystores` exports nothing
+for a key a remote signer holds.
+
+A delete through either route reads the definitions file once and saves it
+once for the whole request, and takes the keys out of memory in between, so a
+request naming hundreds of keys does not hold up the duties' signatures. The
+two routes can only disagree with the file about a key's kind after the file
+was edited by hand under a running client. A delete that then finds the key in
+memory as its own kind, and in the file as the other route's, stops signing
+with it and answers `error` naming the other route, not `deleted`: the entry
+it leaves would load the key again at the next start. `DELETE /remotekeys` of
+a remote entry whose key this process runs from a local keystore removes the
+entry and leaves the local key, and its per-validator settings, as they are.
+Its answer is `error` too, naming `/eth/v1/keystores`, and never `deleted`:
+the key is still signing here until that route removes it.
+
 It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
-voluntary exit for a validator this client holds and answers with the
-`SignedVoluntaryExit`, for the exit's `epoch` query parameter or the current
-epoch when none is given. **It does not publish the exit.** As the
+voluntary exit for a validator this client holds, in a local keystore or in a
+remote signer, and answers with the `SignedVoluntaryExit`, for the exit's
+`epoch` query parameter or the current epoch when none is given. **It does not publish the exit.** As the
 specification has it, the caller hands the message to a beacon node's
 `POST /eth/v1/beacon/pool/voluntary_exits`, or holds on to it. The validator
 index comes from the beacon node on each call, so a key whose deposit the chain
