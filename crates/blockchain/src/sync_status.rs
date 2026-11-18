@@ -57,7 +57,7 @@ impl Default for SyncStatusController {
 /// | head advances past `high_water` | progress: window starts over, stall released |
 /// | head climbs past the highest reached since a move back (`climb`) | progress, likewise |
 /// | first move back below a high-water mark, or (once per mark) a new low below the climb's | window starts over, stall released |
-/// | a judgment behind on the peers' word | slots added to the count (`StallCount`): a stretch in full, a slot after a short lapse once |
+/// | a judgment behind on the peers' word | slots added to the count (`StallCount`): a stretch in full up to half a window (a longer gap between judgments is a pause), a slot after a short lapse once |
 /// | a claim after a lapse longer than the window, with something counted | count back to zero, once per count (`renewed`) |
 /// | the count past the window | stall: synced until progress |
 ///
@@ -128,8 +128,9 @@ struct StallCount {
     /// claim that lapses for a moment (a peer reporting a block this node
     /// holds, a reconnect) would otherwise restart the window, and a peer
     /// doing that every few slots could keep the node idle indefinitely. A
-    /// stretch behind counts in full; a slot reached after a lapse counts
-    /// once, so a lapse at every slot boundary pauses nothing.
+    /// stretch behind counts in full, up to half a window per judgment; a
+    /// slot reached after a lapse counts once, so a lapse at every slot
+    /// boundary pauses nothing.
     behind_for: u64,
     /// The wall-clock slot of the last judgment that found the node behind on
     /// its peers' word, already counted into `behind_for`.
@@ -147,6 +148,11 @@ struct StallCount {
 }
 
 impl StallCount {
+    /// Most slots one judgment adds: half the window, and at least one.
+    fn max_stretch(stall_window: u64) -> u64 {
+        (stall_window / 2).max(1)
+    }
+
     /// Note a judgment at `current_slot`, behind on the peers' word or not,
     /// and return the slots counted so far.
     fn count(&mut self, current_slot: u64, on_peers_word: bool, stall_window: u64) -> u64 {
@@ -155,10 +161,19 @@ impl StallCount {
             return self.behind_for;
         }
         self.behind_for = match (self.counted_at, self.lapsed_at.take()) {
-            // Behind since the last judgment: the whole stretch counts.
-            (Some(counted), None) => self
-                .behind_for
-                .saturating_add(current_slot.saturating_sub(counted)),
+            // Behind since the last judgment: the whole stretch counts, up to
+            // half a window. Judgments come at least once a slot, so a longer
+            // gap is time the process was not running (a `docker pause`, a
+            // host suspend), when no peer could deliver anything either: the
+            // first judgment after a resume must not spend the window before
+            // range sync has had a chance. Half a window is far above what
+            // one handler holds the actor for, so a slow node's window does
+            // not stretch.
+            (Some(counted), None) => self.behind_for.saturating_add(
+                current_slot
+                    .saturating_sub(counted)
+                    .min(Self::max_stretch(stall_window)),
+            ),
             // Back after a lapse longer than the window: a new claim, with a
             // window of its own, once per count. Only once something was
             // counted: the first claim after a quiet stretch starts from zero
@@ -393,6 +408,20 @@ mod tests {
         steady(LEAN)
     }
 
+    /// Judge once a slot through `walls`, as the tick does, with the head at
+    /// `head` and a peer claiming a head at the clock; returns the last
+    /// status.
+    fn behind_through(
+        tracker: &mut SyncStatusTracker,
+        walls: std::ops::RangeInclusive<u64>,
+        head: u64,
+    ) -> SyncStatus {
+        walls
+            .map(|current| tracker.update(current, head, Some(current)))
+            .last()
+            .expect("at least one slot")
+    }
+
     #[test]
     fn behind_both_the_clock_and_the_peers_is_syncing() {
         let mut tracker = steady_lean();
@@ -481,7 +510,7 @@ mod tests {
         assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
         let last_syncing = 100 + LEAN.stall_window;
         assert_eq!(
-            tracker.update(last_syncing, 50, Some(last_syncing)),
+            behind_through(&mut tracker, 101..=last_syncing, 50),
             SyncStatus::Syncing
         );
         assert_eq!(
@@ -515,7 +544,7 @@ mod tests {
         tracker.update(100, 50, Some(100));
         let tripped = 101 + LEAN.stall_window;
         assert_eq!(
-            tracker.update(tripped, 50, Some(tripped)),
+            behind_through(&mut tracker, 101..=tripped, 50),
             SyncStatus::Synced
         );
         // A block lands but leaves the node behind: the peers were right
@@ -525,7 +554,10 @@ mod tests {
             SyncStatus::Syncing
         );
         let end = tripped + 1 + LEAN.stall_window;
-        assert_eq!(tracker.update(end, 51, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            behind_through(&mut tracker, tripped + 2..=end, 51),
+            SyncStatus::Syncing
+        );
         assert_eq!(
             tracker.update(end + 1, 51, Some(end + 1)),
             SyncStatus::Synced
@@ -560,6 +592,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_does_not_spend_the_stall_window() {
+        // Finding: one judgment added the whole gap since the last, so a
+        // process paused for longer than the window (`docker pause`, a host
+        // suspend) gave up on its peers at the first judgment after the
+        // resume, before range sync could move its head, and read as synced
+        // on its stale head.
+        for thresholds in [LEAN, BEACON] {
+            let window = thresholds.stall_window;
+            let mut tracker = SyncStatusTracker::new(true, thresholds);
+            let head = 50;
+            let start = head + 2 * thresholds.clock_lag + 1;
+            assert_eq!(
+                tracker.update(start, head, Some(start)),
+                SyncStatus::Syncing
+            );
+            // Paused for ten windows: the resume counts half of one.
+            let resumed = start + 10 * window;
+            let half = window / 2;
+            for current in resumed..=resumed + (window - half) {
+                assert_eq!(
+                    tracker.update(current, head, Some(current)),
+                    SyncStatus::Syncing,
+                    "slot {current}"
+                );
+            }
+            // Still flat, the rest of the window runs out as before.
+            let tripped = resumed + (window - half) + 1;
+            assert_eq!(
+                tracker.update(tripped, head, Some(tripped)),
+                SyncStatus::Synced
+            );
+        }
+    }
+
+    #[test]
     fn a_head_climbing_back_after_a_move_back_is_progress() {
         // An `INVALID` execution verdict moves the head back: the window
         // starts over there, and each re-imported block past the highest
@@ -578,7 +645,10 @@ mod tests {
         // Flat again: the window then runs out as usual.
         let flat_from = 205;
         let end = flat_from + LEAN.stall_window;
-        assert_eq!(tracker.update(end, 60, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            behind_through(&mut tracker, flat_from + 1..=end, 60),
+            SyncStatus::Syncing
+        );
         assert_eq!(
             tracker.update(end + 1, 60, Some(end + 1)),
             SyncStatus::Synced
@@ -595,7 +665,7 @@ mod tests {
         assert_eq!(tracker.update(102, 55, Some(102)), SyncStatus::Syncing);
         let tripped = 103 + LEAN.stall_window;
         assert_eq!(
-            tracker.update(tripped, 55, Some(tripped)),
+            behind_through(&mut tracker, 103..=tripped, 55),
             SyncStatus::Synced
         );
         // Back to 52: above the climb's low, so not on its own a new cut.
@@ -662,11 +732,14 @@ mod tests {
         // the next arrival counted the same slots again.
         let mut tracker = steady_lean();
         assert_eq!(tracker.update(100, 50, Some(100)), SyncStatus::Syncing);
-        tracker.update(110, 50, Some(110));
+        behind_through(&mut tracker, 101..=110, 50);
         tracker.update(105, 50, Some(105));
         tracker.update(110, 50, Some(110));
         let end = 100 + LEAN.stall_window;
-        assert_eq!(tracker.update(end, 50, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            behind_through(&mut tracker, 111..=end, 50),
+            SyncStatus::Syncing
+        );
         assert_eq!(
             tracker.update(end + 1, 50, Some(end + 1)),
             SyncStatus::Synced
@@ -682,7 +755,7 @@ mod tests {
         assert_eq!(tracker.update(100, 60, Some(100)), SyncStatus::Syncing);
         let tripped = 101 + LEAN.stall_window;
         assert_eq!(
-            tracker.update(tripped, 60, Some(tripped)),
+            behind_through(&mut tracker, 101..=tripped, 60),
             SyncStatus::Synced
         );
         assert_eq!(
@@ -691,7 +764,10 @@ mod tests {
         );
         // And gets a whole window from there.
         let end = tripped + 1 + LEAN.stall_window;
-        assert_eq!(tracker.update(end, 55, Some(end)), SyncStatus::Syncing);
+        assert_eq!(
+            behind_through(&mut tracker, tripped + 2..=end, 55),
+            SyncStatus::Syncing
+        );
         assert_eq!(
             tracker.update(end + 1, 55, Some(end + 1)),
             SyncStatus::Synced

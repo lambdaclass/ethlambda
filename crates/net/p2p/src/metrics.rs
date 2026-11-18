@@ -493,16 +493,26 @@ static LEAN_SYNC_PEERS_HELD_BACK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// Publish how many peers' `Status` heads are held back from the network head
 /// the sync gate reads: `suspect` for peers whose range blocks never imported
 /// or that kept failing range requests, `cooling` for the others cooling down
-/// from a failed range request. Set from a full count whenever the network
-/// head is published, which is at least once a slot.
-pub fn set_sync_peers_held_back(suspects: usize, cooling: usize) {
+/// from a failed range request, `future` for the others whose latest head sat
+/// past the wall clock (most peers there points at a slow local clock). Set
+/// from a full count whenever the network head is published, which is at
+/// least once a slot.
+pub(crate) fn set_sync_peers_held_back(held_back: crate::peer_heads::HeldBack) {
     let as_gauge = |count: usize| i64::try_from(count).unwrap_or(i64::MAX);
-    LEAN_SYNC_PEERS_HELD_BACK
-        .with_label_values(&["suspect"])
-        .set(as_gauge(suspects));
-    LEAN_SYNC_PEERS_HELD_BACK
-        .with_label_values(&["cooling"])
-        .set(as_gauge(cooling));
+    let crate::peer_heads::HeldBack {
+        suspects,
+        cooling,
+        future,
+    } = held_back;
+    for (reason, count) in [
+        ("suspect", suspects),
+        ("cooling", cooling),
+        ("future", future),
+    ] {
+        LEAN_SYNC_PEERS_HELD_BACK
+            .with_label_values(&[reason])
+            .set(as_gauge(count));
+    }
 }
 
 /// Publish the current fork digest as a label, so a dashboard can tell at a

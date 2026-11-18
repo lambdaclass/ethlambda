@@ -56,10 +56,10 @@ use crate::lean::protocols::MAX_REQUEST_BLOCKS;
 use crate::peer_heads::{self, Report};
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
-    BACKOFF_MULTIPLIER, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE,
-    P2PServer, PendingColumnRequest, PendingRequest, PendingRequestKind, RANGE_BATCH_CUSTODY_WAIT,
-    RangeSyncState, ReqRespProtocol, ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics,
-    p2p_protocol,
+    BACKOFF_MULTIPLIER, BatchBlock, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES,
+    MAX_SYNC_RANGE, P2PServer, PendingColumnRequest, PendingRequest, PendingRequestKind,
+    RANGE_BATCH_CUSTODY_WAIT, RangeSyncState, ReqRespProtocol, ReqRespRequestId,
+    UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
 };
 use ethlambda_types::time::unix_now_ms;
 use libp2p::request_response::ResponseChannel;
@@ -956,7 +956,17 @@ async fn handle_lean_blocks_by_range_response(
         return;
     };
 
-    let mut handed_over_through: Option<u64> = None;
+    // The lowest block's parent links this batch to the one below it; see
+    // `HeadWatch::note_delivery`.
+    let first = blocks
+        .iter()
+        .map(|block| &block.message)
+        .min_by_key(|block| block.slot)
+        .map(|block| BatchBlock {
+            slot: block.slot,
+            root: block.parent_root,
+        });
+    let mut handed_over_through: Option<BatchBlock> = None;
     for block in blocks {
         let slot = block.message.slot;
         let block_root = block.message.hash_tree_root();
@@ -971,7 +981,12 @@ async fn handle_lean_blocks_by_range_response(
             // `range_sync_target`.
             Ok(_) => {
                 server.range_fetched_through = server.range_fetched_through.max(slot);
-                handed_over_through = handed_over_through.max(Some(slot));
+                if handed_over_through.is_none_or(|last| last.slot < slot) {
+                    handed_over_through = Some(BatchBlock {
+                        slot,
+                        root: block_root,
+                    });
+                }
             }
             Err(err) => error!(
                 %err, %slot, %peer,
@@ -984,16 +999,17 @@ async fn handle_lean_blocks_by_range_response(
     // Whether what was handed over imports is judged by the head: reaching it
     // ends the peer's run of failures, and a whole window without reaching it
     // makes the peer a suspect (see `expire_range_watermark`).
-    if handed_over_through.is_none() {
+    let (Some(first), Some(last)) = (first, handed_over_through) else {
         // Nothing reached the chain actor, whose mailbox is gone: the session
         // makes no progress, and the peer is not to blame.
         server.end_range_session();
         return;
-    }
-    // Judged by the end it was asked for, not the last block it handed over:
-    // the session's cursor moves past the whole span, so a batch cut short
-    // of a real gap is what the batches above it fail to connect through.
-    server.head_watch.note_delivery(peer, end_slot);
+    };
+    // Judged by the end it was asked for, unless the next batch shows the
+    // slots after its last block empty (see `HeadWatch::note_delivery`).
+    server
+        .head_watch
+        .note_delivery(peer, end_slot, first, Some(last));
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -2902,6 +2918,25 @@ async fn handle_beacon_blocks_by_range_response(
 
     let in_range = blocks.len();
     let mut highest_forwarded_slot: Option<u64> = None;
+    // As on lean: the lowest block's parent links this batch to the one
+    // below it, and the highest block's root, when it stops short of the end
+    // asked for, to the one above. That root is a whole-block merkleization,
+    // so it is paid for a short batch alone.
+    let first = blocks
+        .iter()
+        .min_by_key(|block| block.slot())
+        .map(|block| BatchBlock {
+            slot: block.slot(),
+            root: block.parent_root(),
+        });
+    let short_tail = blocks
+        .iter()
+        .max_by_key(|block| block.slot())
+        .filter(|block| block.slot() < end_slot)
+        .map(|block| BatchBlock {
+            slot: block.slot(),
+            root: block.message_hash_tree_root(),
+        });
 
     for block in blocks {
         let slot = block.slot();
@@ -2928,7 +2963,7 @@ async fn handle_beacon_blocks_by_range_response(
     }
 
     debug!(%peer, received, in_range, "Beacon blocks received");
-    let Some(highest) = highest_forwarded_slot else {
+    let (Some(first), Some(highest)) = (first, highest_forwarded_slot) else {
         // As on lean: nothing reached the chain actor, whose mailbox is gone.
         server.end_range_session();
         return;
@@ -2951,8 +2986,13 @@ async fn handle_beacon_blocks_by_range_response(
     // head rather than the head alone.
     // As on lean: what was handed over is judged by the head.
     server.range_fetched_through = server.range_fetched_through.max(highest);
-    // As on lean: judged by the end it was asked for.
-    server.head_watch.note_delivery(peer, end_slot);
+    // As on lean: judged by the end it was asked for, unless the next batch
+    // shows the slots after its last block empty. A last block that never
+    // reached the actor links nothing.
+    let short_tail = short_tail.filter(|last| last.slot == highest);
+    server
+        .head_watch
+        .note_delivery(peer, end_slot, first, short_tail);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -3983,38 +4023,64 @@ pub(crate) mod tests {
         assert_eq!(asked, share);
     }
 
+    /// [`crate::HeadWatch::flat_for`] once a slot through `walls`, as the
+    /// refresh timer calls it, returning the last count.
+    fn flat_through(
+        watch: &mut crate::HeadWatch,
+        head: u64,
+        walls: std::ops::RangeInclusive<u64>,
+        delivering: bool,
+    ) -> u64 {
+        walls
+            .map(|wall| watch.flat_for(head, wall, delivering))
+            .last()
+            .expect("at least one slot")
+    }
+
+    /// [`P2PServer::expire_range_watermark`] once a slot through `walls`, as
+    /// the refresh timer runs it.
+    fn expire_through(server: &mut P2PServer, walls: std::ops::RangeInclusive<u64>) {
+        for wall in walls {
+            server.expire_range_watermark(wall);
+        }
+    }
+
     #[test]
     fn a_head_watch_counts_from_the_first_delivery_since_the_head_moved() {
         let mut watch = crate::HeadWatch::default();
         assert_eq!(watch.flat_for(5, 10, false), 0);
-        assert_eq!(watch.flat_for(5, 20, false), 10);
+        assert_eq!(flat_through(&mut watch, 5, 11..=20, false), 10);
         // A delivery starts the count afresh, once: later ones do not move it.
+        flat_through(&mut watch, 5, 21..=29, false);
         assert_eq!(watch.flat_for(5, 30, true), 0);
-        assert_eq!(watch.flat_for(5, 40, true), 10);
-        assert_eq!(watch.flat_for(5, 45, false), 15);
+        assert_eq!(flat_through(&mut watch, 5, 31..=40, true), 10);
+        assert_eq!(flat_through(&mut watch, 5, 41..=45, false), 15);
         // A head that keeps moving, however slowly, is never flat for long.
         for (head, wall) in [(6, 50), (7, 65), (8, 80)] {
             assert_eq!(watch.flat_for(head, wall, true), 0);
-            assert_eq!(watch.flat_for(head, wall + 14, true), 14);
+            assert_eq!(
+                flat_through(&mut watch, head, wall + 1..=wall + 14, true),
+                14
+            );
         }
         // Moving back counts as moving.
         assert_eq!(watch.flat_for(4, 100, false), 0);
         // The head reaching what a peer handed over takes it off the list:
         // that, not an answer reaching the chain actor, clears its failures.
         let served = PeerId::random();
-        watch.note_delivery(served, 105);
+        watch.note_whole_batch(served, 105);
         assert!(watch.reached(104).is_empty());
         assert_eq!(watch.reached(105), vec![served]);
         // A peer whose blocks the head has not reached is still on the hook
         // after the head moves: a valid prefix does not clear the rest.
         let partly_valid = PeerId::random();
-        watch.note_delivery(partly_valid, 120);
+        watch.note_whole_batch(partly_valid, 120);
         assert_eq!(watch.flat_for(110, 101, false), 0);
         assert_eq!(watch.note_drop(110, 102), vec![(partly_valid, 120)]);
         assert_eq!(watch.flat_for(4, 103, false), 0);
         // A drop hands back who delivered; each drop at a head doubles the
         // wait, and moving resets it.
-        watch.note_delivery(PeerId::random(), 200);
+        watch.note_whole_batch(PeerId::random(), 200);
         assert_eq!(watch.patience(16), 16);
         assert_eq!(watch.note_drop(4, 110).len(), 1);
         assert_eq!(watch.patience(16), 32);
@@ -4036,10 +4102,10 @@ pub(crate) mod tests {
         // could not connect without the bad batch below them.
         let mut watch = crate::HeadWatch::default();
         let (first, later) = (PeerId::random(), PeerId::random());
-        watch.note_delivery(first, 164);
-        watch.note_delivery(later, 228);
-        watch.note_delivery(later, 292);
-        watch.note_delivery(first, 356);
+        watch.note_whole_batch(first, 164);
+        watch.note_whole_batch(later, 228);
+        watch.note_whole_batch(later, 292);
+        watch.note_whole_batch(first, 356);
         assert_eq!(watch.note_drop(100, 200), vec![(first, 356)]);
         // The rest are forgotten, not held for the next drop.
         assert!(watch.note_drop(100, 300).is_empty());
@@ -4052,12 +4118,63 @@ pub(crate) mod tests {
         // more had a lowest end above an honest peer's and escaped the blame.
         let mut watch = crate::HeadWatch::default();
         let (liar, honest) = (PeerId::random(), PeerId::random());
-        watch.note_delivery(liar, 1_124);
-        watch.note_delivery(honest, 2_148);
+        watch.note_whole_batch(liar, 1_124);
+        watch.note_whole_batch(honest, 2_148);
         for batch in 3..=20u64 {
-            watch.note_delivery(liar, batch * 1_024 + 100);
+            watch.note_whole_batch(liar, batch * 1_024 + 100);
         }
         assert_eq!(watch.note_drop(100, 200), vec![(liar, 20 * 1_024 + 100)]);
+    }
+
+    #[test]
+    fn a_short_batch_the_next_one_builds_on_is_held_to_its_last_block() {
+        // Finding: a batch whose last slots were missed on the chain was held
+        // to the end it was asked for, which the head never reaches, so its
+        // honest sender took the blame when the batch above never imported.
+        let (honest, liar) = (PeerId::random(), PeerId::random());
+        let last = BatchBlock {
+            slot: 560,
+            root: H256::repeat_byte(0x56),
+        };
+        let deliver_short = |watch: &mut crate::HeadWatch| {
+            let first = BatchBlock {
+                slot: 501,
+                root: H256::repeat_byte(0x50),
+            };
+            watch.note_delivery(honest, 564, first, Some(last));
+        };
+
+        // The batch above names its last block as the parent, past its end:
+        // slots 561 to 564 are empty on that chain.
+        let mut watch = crate::HeadWatch::default();
+        deliver_short(&mut watch);
+        let builds_on = BatchBlock {
+            slot: 565,
+            root: last.root,
+        };
+        watch.note_delivery(liar, 628, builds_on, None);
+        assert_eq!(watch.reached(560), vec![honest]);
+        assert_eq!(watch.note_drop(560, 600), vec![(liar, 628)]);
+
+        // Any other parent, or a first block within its span, leaves it held
+        // to its end: the chain has a block there it did not hand over.
+        let elsewhere = [
+            BatchBlock {
+                slot: 565,
+                root: H256::repeat_byte(0x99),
+            },
+            BatchBlock {
+                slot: 563,
+                root: last.root,
+            },
+        ];
+        for first in elsewhere {
+            let mut watch = crate::HeadWatch::default();
+            deliver_short(&mut watch);
+            watch.note_delivery(liar, 628, first, None);
+            assert!(watch.reached(560).is_empty());
+            assert_eq!(watch.note_drop(560, 600), vec![(honest, 564)]);
+        }
     }
 
     #[tokio::test]
@@ -4082,8 +4199,7 @@ pub(crate) mod tests {
         // The count starts at the first tick that sees blocks handed over,
         // however long the head was flat before, so they get a whole window.
         server.range_fetched_through = 2000;
-        server.expire_range_watermark(100);
-        server.expire_range_watermark(100 + window);
+        expire_through(&mut server, 100..=100 + window);
         assert_eq!(server.range_fetched_through, 2000);
         server.expire_range_watermark(101 + window);
         assert_eq!(server.range_fetched_through, head);
@@ -4091,11 +4207,41 @@ pub(crate) mod tests {
         // Handed over again at the same head: a window twice as long.
         server.range_fetched_through = 2000;
         let delivered = 102 + window;
-        server.expire_range_watermark(delivered);
-        server.expire_range_watermark(delivered + 2 * window);
+        expire_through(&mut server, delivered..=delivered + 2 * window);
         assert_eq!(server.range_fetched_through, 2000);
         server.expire_range_watermark(delivered + 2 * window + 1);
         assert_eq!(server.range_fetched_through, head);
+    }
+
+    #[tokio::test]
+    async fn a_pause_is_not_time_the_head_sat_flat() {
+        // Finding: the count was a difference of wall-clock slots, so a
+        // process paused for longer than the window (`docker pause`, a host
+        // suspend) found it spent on its first tick after the resume, before
+        // the chain actor had imported anything: the session was purged and
+        // the lowest batch's sender suspected, its blocks being fine.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        let honest = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, honest, 2000));
+        server.range_fetched_through = 64;
+        server.head_watch.note_whole_batch(honest, 64);
+        expire_through(&mut server, 100..=103);
+        // Paused for ten windows: the resume's tick counts a step.
+        let resumed = 103 + 10 * window;
+        server.expire_range_watermark(resumed);
+        assert_eq!(server.range_fetched_through, 64);
+        assert!(server.range_sync_state.is_some());
+        assert!(!server.peer_heads.is_suspect(&honest));
+        // A head that stays flat while watched still runs the window out:
+        // three slots before the pause, two for the resume, the rest after.
+        let last_watched = resumed + window - 5;
+        expire_through(&mut server, resumed + 1..=last_watched);
+        assert_eq!(server.range_fetched_through, 64);
+        server.expire_range_watermark(last_watched + 1);
+        assert_eq!(server.range_fetched_through, head);
+        assert!(server.peer_heads.is_suspect(&honest));
     }
 
     #[tokio::test]
@@ -4111,7 +4257,7 @@ pub(crate) mod tests {
         // A session was running, with a batch delivered by a peer.
         let peer = connected_peer(&mut server);
         server.range_sync_state = Some(RangeSyncState::new(101..200, peer, 200));
-        server.head_watch.note_delivery(peer, 100);
+        server.head_watch.note_whole_batch(peer, 100);
         server.store.set_judged_head_slot(Some(90));
         server.expire_range_watermark(201);
         assert_eq!(server.range_fetched_through, 90);
@@ -4138,10 +4284,9 @@ pub(crate) mod tests {
         }
         // The first batch lands: it gets a whole window from here.
         server.range_fetched_through = 64;
-        server.head_watch.note_delivery(honest, 64);
+        server.head_watch.note_whole_batch(honest, 64);
         let delivered = 101 + 2 * window;
-        server.expire_range_watermark(delivered);
-        server.expire_range_watermark(delivered + window);
+        expire_through(&mut server, delivered..=delivered + window);
         assert_eq!(server.range_fetched_through, 64);
         assert!(!server.peer_heads.is_suspect(&honest));
         server.expire_range_watermark(delivered + window + 1);
@@ -4197,7 +4342,7 @@ pub(crate) mod tests {
             server.range_fetched_through = 100 * (batch as u64 + 1);
             server
                 .head_watch
-                .note_delivery(liar, server.range_fetched_through);
+                .note_whole_batch(liar, server.range_fetched_through);
             server.expire_range_watermark(wall);
         }
         let head = server.store.head_slot();

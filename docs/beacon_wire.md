@@ -766,9 +766,13 @@ requests in flight, and makes the senders of the lowest batch the head never
 reached suspects (`PeerHeads::suspects`): not synced towards and not counted
 towards the network head until the head passes what they handed over, or for
 4 stall windows at most. Batches above that one could not connect without
-it, so their senders are not held to them; a batch is judged by the end it
-was asked for, not the last block it handed over. Each drop at the same head doubles the wait before the
-next. A peer that fails a range request is not
+it, so their senders are not held to them. A batch is judged by the end it
+was asked for, not the last block it handed over, unless the next batch's
+first block sits past that end and names that last block as its parent,
+which shows the slots between empty on that chain. A gap between the
+once-a-slot ticks counts as two slots at most, so a process that was paused
+does not find the window spent at its first tick after the resume. Each drop
+at the same head doubles the wait before the next. A peer that fails a range request is not
 synced towards again for a refresh interval, since its own `Status` requests
 are not rate limited and the highest head gets the next batch.
 

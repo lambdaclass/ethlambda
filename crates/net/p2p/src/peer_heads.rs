@@ -70,6 +70,15 @@ pub(crate) enum Report {
     Disconnected,
 }
 
+/// The peers whose `Status` heads do not count towards the network head, by
+/// reason, each peer under one reason only; see [`PeerHeads::held_back`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldBack {
+    pub(crate) suspects: usize,
+    pub(crate) cooling: usize,
+    pub(crate) future: usize,
+}
+
 /// A peer's run of failed range requests: when the last one failed, and how
 /// many in a row since its last successful answer.
 #[derive(Debug, Clone, Copy)]
@@ -184,6 +193,15 @@ pub(crate) struct PeerHeads {
     /// The `Status` version each beacon peer last exchanged in, so a refresh
     /// asks in the version the peer is known to speak.
     status_versions: HashMap<PeerId, StatusVersion>,
+    /// Connected peers whose latest `Status` head sat past the wall clock. A
+    /// few are liars; most of them at once points at this node's own clock
+    /// running slow, which drops every honest claim and leaves the node
+    /// reading as synced however far behind it is (see
+    /// [`Self::slow_clock_warning_due`]).
+    future: HashSet<PeerId>,
+    /// The wall-clock slot of the last warning that most peers report a head
+    /// past the clock.
+    slow_clock_warned_at: Option<u64>,
 }
 
 impl PeerHeads {
@@ -204,8 +222,10 @@ impl PeerHeads {
         self.last_exchange.insert(peer, wall_slot);
         if head_slot > wall_slot.saturating_add(FUTURE_HEAD_TOLERANCE) {
             self.heads.remove(&peer);
+            self.future.insert(peer);
             return Report::Future;
         }
+        self.future.remove(&peer);
         if held {
             self.heads.remove(&peer);
             return Report::Held;
@@ -253,6 +273,32 @@ impl PeerHeads {
         self.last_exchange.remove(peer);
         self.foreign_digest.remove(peer);
         self.status_versions.remove(peer);
+        self.future.remove(peer);
+    }
+
+    /// Whether to warn, at `wall_slot`, that most of the `connected` peers
+    /// report a head past the wall clock: at most once every `every` slots.
+    /// Returns how many do when it is time.
+    ///
+    /// The tolerance stays as it is: a head past the clock is what a lying
+    /// peer sends, and the clock is what bounds it. But a node whose clock
+    /// runs two slots slow drops every honest claim that way, never syncs
+    /// towards any peer, and reads as synced however far behind it is, with
+    /// nothing above `debug` to say why.
+    pub(crate) fn slow_clock_warning_due(
+        &mut self,
+        wall_slot: u64,
+        connected: usize,
+        every: u64,
+    ) -> Option<usize> {
+        let future = self.future.len();
+        let due = self
+            .slow_clock_warned_at
+            .is_none_or(|warned_at| warned_at.saturating_add(every) <= wall_slot);
+        (due && future.saturating_mul(2) > connected).then(|| {
+            self.slow_clock_warned_at = Some(wall_slot);
+            future
+        })
     }
 
     /// The network's head as the peers report it: the highest counted report
@@ -282,18 +328,29 @@ impl PeerHeads {
         !self.suspects.is_empty()
     }
 
-    /// How many peers are suspects, and how many others are cooling down from
-    /// a failed range request at `wall_slot`: the claims held back from the
-    /// network head. Both count peers since disconnected, whose suspicion and
-    /// failure runs outlive the connection.
-    pub(crate) fn held_back(&self, wall_slot: u64, interval: u64) -> (usize, usize) {
-        let cooling = self
+    /// The claims held back from the network head at `wall_slot`: how many
+    /// peers are suspects, how many others are cooling down from a failed
+    /// range request, and how many others still last reported a head past
+    /// the wall clock. The first two count peers since disconnected, whose
+    /// suspicion and failure runs outlive the connection.
+    pub(crate) fn held_back(&self, wall_slot: u64, interval: u64) -> HeldBack {
+        let cooling = |peer: &PeerId| self.range_cooling_down(peer, wall_slot, interval);
+        let cooling_down = self
             .range_failures
             .keys()
             .filter(|peer| !self.suspects.contains_key(*peer))
-            .filter(|peer| self.range_cooling_down(peer, wall_slot, interval))
+            .filter(|peer| cooling(peer))
             .count();
-        (self.suspects.len(), cooling)
+        let future = self
+            .future
+            .iter()
+            .filter(|peer| !self.suspects.contains_key(*peer) && !cooling(peer))
+            .count();
+        HeldBack {
+            suspects: self.suspects.len(),
+            cooling: cooling_down,
+            future,
+        }
     }
 
     /// Whether `peer` is a suspect (see [`Self::suspects`]).
@@ -532,6 +589,23 @@ pub(crate) fn observe(
             wall_slot,
             "Ignoring a Status head past the wall clock"
         );
+        let connected_peers = server.connected_peers.len();
+        let every = thresholds(&server.store).stall_window;
+        if let Some(future_peers) =
+            server
+                .peer_heads
+                .slow_clock_warning_due(wall_slot, connected_peers, every)
+        {
+            warn!(
+                wall_slot,
+                peer_head_slot = head_slot,
+                future_peers,
+                connected_peers,
+                "Most peers report a head past this node's wall clock; their heads are \
+                 ignored, so the node neither syncs towards them nor reads as syncing. \
+                 Check the local clock (NTP)"
+            );
+        }
     }
     // Not synced from on a head it merged in before: one claiming the future
     // is not to be believed about the present, and one whose head this node
@@ -669,8 +743,8 @@ pub(crate) fn publish(server: &mut P2PServer) {
         }
     };
     server.store.set_network_head(network_head);
-    let (suspects, cooling) = server.peer_heads.held_back(wall_slot, interval);
-    crate::metrics::set_sync_peers_held_back(suspects, cooling);
+    let held_back = server.peer_heads.held_back(wall_slot, interval);
+    crate::metrics::set_sync_peers_held_back(held_back);
 }
 
 #[cfg(test)]
@@ -686,10 +760,59 @@ mod tests {
         heads.note_range_failure(suspect, 10);
         heads.suspect(suspect, 100, 10);
         heads.note_range_failure(cooling, 10);
-        heads.record(counted, 50, H256::ZERO, 10, false);
-        assert_eq!(heads.held_back(10, 4), (1, 1));
+        heads.record(counted, 10, H256::ZERO, 10, false);
+        // Past the clock too: counted under the one reason it already has.
+        heads.record(cooling, 12, H256::ZERO, 10, false);
+        let ahead = PeerId::random();
+        heads.record(ahead, 12, H256::ZERO, 10, false);
+        let held_back = |suspects, cooling, future| HeldBack {
+            suspects,
+            cooling,
+            future,
+        };
+        assert_eq!(heads.held_back(10, 4), held_back(1, 1, 1));
         // The cooldown runs out; the suspicion stays.
-        assert_eq!(heads.held_back(14, 4), (1, 0));
+        assert_eq!(heads.held_back(14, 4), held_back(1, 0, 2));
+        // A head back within the clock counts again.
+        heads.record(ahead, 11, H256::ZERO, 10, false);
+        assert_eq!(heads.held_back(14, 4), held_back(1, 0, 1));
+    }
+
+    #[test]
+    fn most_peers_past_the_clock_is_a_warning_now_and_then() {
+        // Finding: a node whose own clock runs two slots slow took every
+        // honest `Status` for one past the clock and dropped it, so it never
+        // synced and read as synced however far behind, with only a `debug!`
+        // to say why.
+        let mut heads = PeerHeads::default();
+        let every = 16;
+        let peers: Vec<_> = (0..4).map(|_| PeerId::random()).collect();
+        // Half of them is no majority.
+        for peer in &peers[..2] {
+            heads.record(*peer, 103, H256::ZERO, 100, false);
+        }
+        assert_eq!(heads.slow_clock_warning_due(100, peers.len(), every), None);
+        heads.record(peers[2], 103, H256::ZERO, 100, false);
+        assert_eq!(
+            heads.slow_clock_warning_due(100, peers.len(), every),
+            Some(3)
+        );
+        // Not again until `every` slots have passed.
+        assert_eq!(
+            heads.slow_clock_warning_due(100 + every - 1, peers.len(), every),
+            None
+        );
+        assert_eq!(
+            heads.slow_clock_warning_due(100 + every, peers.len(), every),
+            Some(3)
+        );
+        // Peers back within the clock, or gone, no longer count.
+        heads.record(peers[0], 101, H256::ZERO, 100, false);
+        heads.forget(&peers[1]);
+        assert_eq!(
+            heads.slow_clock_warning_due(100 + 2 * every, peers.len() - 1, every),
+            None
+        );
     }
 
     #[test]

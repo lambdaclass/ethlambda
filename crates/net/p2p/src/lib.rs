@@ -509,6 +509,33 @@ pub(crate) struct HeadWatch {
     /// since means blocks were handed over, by a range session the once-a-slot
     /// tick may never have seen running.
     watermark: u64,
+    /// The wall-clock slot of the last [`Self::flat_for`], to tell a tick
+    /// from a resume after the process was not running.
+    ticked_at: Option<u64>,
+    /// The batch handed over last, when its blocks stopped short of the end
+    /// it was asked for; see [`Self::note_delivery`].
+    short_tail: Option<ShortTail>,
+}
+
+/// A batch whose last block handed over sits below the end it was asked for:
+/// either the chain has no block in the slots between (missed slots), or its
+/// sender withheld them. The next batch's first block tells which.
+#[derive(Debug, Clone, Copy)]
+struct ShortTail {
+    peer: PeerId,
+    /// The last slot the batch was asked for, which its sender answers for.
+    end: u64,
+    /// The last block it handed over.
+    last: BatchBlock,
+}
+
+/// A block at one edge of a range batch, as [`HeadWatch::note_delivery`]
+/// links batches by.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchBlock {
+    pub(crate) slot: u64,
+    /// Its own root for the batch's last block; its parent's for the first.
+    pub(crate) root: H256,
 }
 
 impl HeadWatch {
@@ -519,11 +546,33 @@ impl HeadWatch {
     /// Batches kept per deliverer; older ones are forgotten.
     const MAX_TRACKED_BATCHES: usize = 16;
 
+    /// Most wall-clock slots one tick counts. The timer ticks once a slot, so
+    /// a longer gap is time the process was not running (a `docker pause`, a
+    /// host suspend): the chain actor imported nothing then either, and a
+    /// resume must not find the head flat for longer than it was watched.
+    const MAX_TICK_STEP: u64 = 2;
+
     /// Note the head at `wall_slot`, and whether blocks are being handed over,
     /// returning how many slots it has stayed at `head_slot` since the first
     /// delivery after it last moved (since it moved, with none). Zero
-    /// whenever it has just moved, in either direction.
+    /// whenever it has just moved, in either direction. A gap since the last
+    /// call counts as [`Self::MAX_TICK_STEP`] slots at most.
     pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64, delivering: bool) -> u64 {
+        // Slots not watched are not counted: the starts move forward by them.
+        if let Some(ticked_at) = self.ticked_at.replace(wall_slot) {
+            let unwatched = wall_slot
+                .saturating_sub(ticked_at)
+                .saturating_sub(Self::MAX_TICK_STEP);
+            for since in self
+                .seen
+                .as_mut()
+                .map(|(_, since)| since)
+                .into_iter()
+                .chain(self.delivering_since.as_mut())
+            {
+                *since = since.saturating_add(unwatched);
+            }
+        }
         if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
             self.seen = Some((head_slot, wall_slot));
             self.delivering_since = None;
@@ -551,6 +600,7 @@ impl HeadWatch {
     pub(crate) fn forget_deliveries(&mut self) {
         self.deliverers.clear();
         self.delivering_since = None;
+        self.short_tail = None;
     }
 
     /// Forget when deliveries started, nothing being above the head.
@@ -582,7 +632,38 @@ impl HeadWatch {
     /// Note that `peer` handed over a batch it was asked for through slot
     /// `end`. Over the cap, a batch end is forgotten, never the lowest (which
     /// a drop blames by) or the highest (which a suspicion runs through).
-    pub(crate) fn note_delivery(&mut self, peer: PeerId, end: u64) {
+    ///
+    /// A batch is held to the end it was asked for, not to its last block:
+    /// one cut short of a real gap is what the batches above it fail to
+    /// connect through. But a batch whose tail is empty on the chain (missed
+    /// slots) would then wait for the head to pass blocks that do not exist,
+    /// and take the blame for the next batch if that one never imports. The
+    /// next batch tells the two apart: when its first block sits past the
+    /// short batch's end and names the short batch's last block as its parent,
+    /// the slots between are empty on that chain, and the short batch is held
+    /// only to its last block.
+    ///
+    /// `first` is the batch's lowest block, with its parent's root;
+    /// `short_tail` its highest block handed over, with its own root, when
+    /// that sits below `end` (`None` otherwise).
+    pub(crate) fn note_delivery(
+        &mut self,
+        peer: PeerId,
+        end: u64,
+        first: BatchBlock,
+        short_tail: Option<BatchBlock>,
+    ) {
+        if let Some(below) = self.short_tail.take()
+            && first.slot > below.end
+            && first.root == below.last.root
+            && let Some(ends) = self.deliverers.get_mut(&below.peer)
+            && let Some(held_to) = ends.iter_mut().find(|held_to| **held_to == below.end)
+        {
+            *held_to = below.last.slot;
+        }
+        self.short_tail = short_tail
+            .filter(|last| last.slot < end)
+            .map(|last| ShortTail { peer, end, last });
         let ends = self.deliverers.entry(peer).or_default();
         ends.push_back(end);
         if ends.len() > Self::MAX_TRACKED_BATCHES {
@@ -594,6 +675,17 @@ impl HeadWatch {
             // With every end the lowest or the highest, any one goes.
             ends.remove(forgettable.unwrap_or(1));
         }
+    }
+
+    /// [`Self::note_delivery`] for a batch whose last block sits at its end,
+    /// linking to no batch below it.
+    #[cfg(test)]
+    pub(crate) fn note_whole_batch(&mut self, peer: PeerId, end: u64) {
+        let first = BatchBlock {
+            slot: end,
+            root: H256::ZERO,
+        };
+        self.note_delivery(peer, end, first, None);
     }
 
     /// How long the head must stay flat before the next drop: `window`,
@@ -615,6 +707,7 @@ impl HeadWatch {
     pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<(PeerId, u64)> {
         self.seen = Some((head_slot, wall_slot));
         self.delivering_since = None;
+        self.short_tail = None;
         self.watermark = head_slot;
         self.drops = self.drops.saturating_add(1);
         let lowest = self.deliverers.values().flatten().copied().min();
@@ -2278,14 +2371,17 @@ impl P2PServer {
     /// after the head last moved, so the first batch gets a whole window to
     /// import; later deliveries do not restart it, since a whole window of
     /// them that has not moved the head is not importing. A head that is
-    /// still importing moves. On a drop, the session running ends with its
-    /// batch in flight, and the senders of the lowest batch the head never
-    /// reached become suspects until the head passes what they handed over
-    /// (see `PeerHeads::suspects`); batches above it could not connect
-    /// without it, so their senders are not held to them. Each drop at the
-    /// same head
-    /// doubles the wait before the next one, so a head that cannot move at
-    /// all re-fetches the gap ever more rarely.
+    /// still importing moves. A gap between ticks counts as two slots at
+    /// most (`HeadWatch::flat_for`), so a process that was paused does not
+    /// find the window spent at its first tick after the resume. On a drop,
+    /// the session running ends with its batch in flight, and the senders of
+    /// the lowest batch the head never reached become suspects until the head
+    /// passes what they handed over (see `PeerHeads::suspects`); batches
+    /// above it could not connect without it, so their senders are not held
+    /// to them. A batch is held to the end it was asked for unless the batch
+    /// above shows its tail empty (`HeadWatch::note_delivery`). Each drop at
+    /// the same head doubles the wait before the next one, so a head that
+    /// cannot move at all re-fetches the gap ever more rarely.
     pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
         let head_slot = self.head_slot();
         // Peers whose blocks the head has reached served what they handed
