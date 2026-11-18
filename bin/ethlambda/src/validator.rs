@@ -166,6 +166,18 @@ pub(crate) struct ValidatorOptions {
     /// one; remove it once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
+
+    /// Doppelganger protection: sign no attestation or block for a validator
+    /// until the beacon node has seen it stay silent for a full epoch, and
+    /// stop if it sees one of them act meanwhile, since that is another
+    /// client running the same key.
+    ///
+    /// Applies at every start and to every key the keymanager API imports.
+    /// The price is two to three epochs of missed attestations each time; at
+    /// genesis keys sign at once. Needs a beacon node serving
+    /// `/eth/v1/validator/liveness`.
+    #[arg(long, default_value = "false")]
+    pub(crate) enable_doppelganger_protection: bool,
 }
 
 impl ValidatorOptions {
@@ -270,6 +282,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder,
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
+        doppelganger_protection: options.enable_doppelganger_protection,
     })
     .await
     .map_err(Into::into)
@@ -297,6 +310,7 @@ mod tests {
             prefer_builder_proposals: false,
             builder_min_bid: 0,
             init_slashing_protection: false,
+            enable_doppelganger_protection: false,
         }
     }
 
@@ -340,6 +354,15 @@ mod tests {
     #[test]
     fn builder_proposals_are_off_by_default() {
         assert_eq!(parse(&[]).expect("parses").builder(), None);
+    }
+
+    /// Opt-in, as in Lighthouse and Prysm: it costs every start two to three
+    /// epochs of attestations.
+    #[test]
+    fn doppelganger_protection_is_off_unless_asked_for() {
+        assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
+        let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
+        assert!(options.enable_doppelganger_protection);
     }
 
     #[test]

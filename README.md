@@ -363,6 +363,7 @@ beacon node.
 | `--gas-limit` | The gas limit validators target (default `60000000`). From gloas the beacon node builds this client's own payloads toward it, so set it on a network whose limit is elsewhere. Sepolia and Platåberget schedule `200000000`: pass `--gas-limit 200000000` there (until [#795](https://github.com/lambdaclass/ethlambda/issues/795)) |
 | `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, a node that cannot build the payload itself may build on a builder's p2p bid, and that block is signed |
 | `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
+| `--enable-doppelganger-protection` | Sign no attestation or block for a key until the beacon node has seen it stay silent for a full epoch, and stop if another client turns out to be running it. Costs two to three epochs of attestations per start. Off by default |
 
 Metrics are served on `--metrics-port` (default `5064`). See
 [`docs/cli.md`](./docs/cli.md#validator-flags) for the remaining flags and what

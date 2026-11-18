@@ -27,7 +27,7 @@ use crate::beacon_node::dto::{
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
     ValidatorEntry, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -215,6 +215,12 @@ pub struct MockBeaconNode {
     /// reason and records nothing: an exit the node judged invalid, as
     /// opposed to a node that could not be reached (`failures`).
     pub exit_refusal: Option<String>,
+    /// The (epoch, validator) pairs `liveness` answers live; every other pair
+    /// it is asked about is answered not live.
+    pub live: Mutex<Vec<(Epoch, ValidatorIndex)>>,
+    /// Every `liveness` request that got past the configured failures and the
+    /// syncing check, as (epoch, indices), in call order.
+    pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
 }
 
 impl MockBeaconNode {
@@ -744,6 +750,11 @@ impl MockBeaconNode {
     /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_call_count(&self) -> usize {
         *self.proposer_duties_calls.lock().expect("lock")
+    }
+
+    /// The `liveness` requests answered so far, in call order.
+    pub fn liveness_requests(&self) -> Vec<(Epoch, Vec<ValidatorIndex>)> {
+        self.liveness_requests.lock().expect("lock").clone()
     }
 
     /// How many times `attestation_data` has been called, successes and
@@ -1344,5 +1355,30 @@ impl BeaconNodeApi for MockBeaconNode {
             self.set_validator_details(Some(details));
         }
         Ok(())
+    }
+
+    /// Honours the trait's contracts the way a real implementation does: an
+    /// empty request is answered without asking, and a syncing or optimistic
+    /// node answers `BeaconNodeSyncing`.
+    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
+        self.guard("liveness")?;
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.syncing || self.optimistic {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        self.liveness_requests
+            .lock()
+            .expect("lock")
+            .push((epoch, indices.to_vec()));
+        let live = self.live.lock().expect("lock");
+        Ok(indices
+            .iter()
+            .map(|&index| Liveness {
+                index,
+                is_live: live.contains(&(epoch, index)),
+            })
+            .collect())
     }
 }

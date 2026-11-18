@@ -890,7 +890,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded. A key can live
+  unguarded. `--enable-doppelganger-protection` (`crate::doppelganger`,
+  Lighthouse's rule) withholds a key's attestations, blocks, RANDAO reveals and
+  aggregates from its registration epoch `E` (startup or keymanager import)
+  until `/eth/v1/validator/liveness` shows `E + 1` clean at the last slot of
+  `E + 2`, and stops the client if the key is seen live meanwhile; the duty
+  loop drops those duties before slashing protection records anything, and
+  `SigningContext` refuses the four signatures on its own too. A key can live
   in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
   `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
   signer under a read guard scoped to the lookup and signs after releasing it,

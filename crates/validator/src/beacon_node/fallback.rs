@@ -23,7 +23,7 @@ use crate::beacon_node::dto::{
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis,
+    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
 use crate::error::{Error, Result};
@@ -762,6 +762,15 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         })
         .await?
     }
+
+    /// First answer wins. A syncing node answers `BeaconNodeSyncing` (see
+    /// the trait's contract), which `try_each` walks past like any failure,
+    /// so a node that has not caught up never clears a key while one behind
+    /// it in the list has the chain.
+    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
+        self.try_each("liveness", |node| node.liveness(epoch, indices))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +897,31 @@ mod tests {
             !fallback.is_optimistic_or_syncing().await.expect("answers"),
             "a healthy node behind a syncing one must be found"
         );
+    }
+
+    /// Liveness is answered by a node that has the chain: a syncing one
+    /// first in the list is asked nothing and walked past, so its empty
+    /// view never clears a key the second node saw act.
+    #[tokio::test]
+    async fn liveness_skips_a_syncing_node_for_one_that_has_the_chain() {
+        let syncing = MockBeaconNode {
+            syncing: true,
+            ..MockBeaconNode::new()
+        };
+        let seeing = MockBeaconNode::new();
+        seeing.live.lock().expect("lock").push((12, 7));
+        let fallback = FallbackBeaconNode::new(vec![syncing, seeing]);
+
+        let answers = fallback.liveness(12, &[7]).await.expect("answers");
+        assert_eq!(
+            answers,
+            vec![Liveness {
+                index: 7,
+                is_live: true
+            }]
+        );
+        assert!(fallback.nodes[0].liveness_requests().is_empty());
+        assert_eq!(fallback.nodes[1].liveness_requests(), vec![(12, vec![7])]);
     }
 
     #[tokio::test]

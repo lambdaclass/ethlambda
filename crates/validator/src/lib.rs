@@ -28,6 +28,7 @@ pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
+pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
@@ -121,6 +122,10 @@ pub struct ValidatorConfig {
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
     pub init_slashing_protection: bool,
+    /// Withhold every key's attestations and blocks until the beacon network
+    /// has seen it stay silent for a full epoch, and stop if it does not. See
+    /// [`doppelganger`].
+    pub doppelganger_protection: bool,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -272,7 +277,36 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
     let protection = slashing_protection::SharedProtection::new(protection);
 
-    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
+    // Every key loaded is registered before anything that signs exists, in
+    // the epoch the clock is in now, so this process's own activity before a
+    // restart within the epoch is never mistaken for a doppelganger.
+    let doppelganger = config.doppelganger_protection.then(|| {
+        let doppelganger = Arc::new(doppelganger::Doppelganger::new());
+        let epoch = doppelganger::current_epoch(&clock);
+        doppelganger.register_all(&keys, epoch);
+        let withheld = doppelganger.detecting();
+        if withheld > 0 {
+            info!(
+                validators = withheld,
+                %epoch,
+                earliest_signing_epoch = epoch + doppelganger::DETECTION_EPOCHS + 2,
+                "Doppelganger protection on: no attestation or block is signed until the beacon \
+                 network has seen none of these validators act for a full epoch"
+            );
+        } else if !keys.is_empty() {
+            info!(
+                "Doppelganger protection on; the chain is at genesis, so the loaded validators \
+                 sign at once"
+            );
+        }
+        doppelganger
+    });
+
+    let mut context = SigningContext::new(spec, genesis.genesis_validators_root);
+    if let Some(doppelganger) = &doppelganger {
+        context = context.with_doppelganger(doppelganger.clone());
+    }
+    let context = Arc::new(context);
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -353,6 +387,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 error!(%err, "Keymanager API stopped");
             }
         }));
+    }
+
+    // The check runs on its own clock, three quarters into each slot, so a
+    // slow duty never delays it and a slow liveness query never delays a
+    // duty.
+    if let Some(doppelganger) = &doppelganger {
+        let check = doppelganger::run(
+            doppelganger.clone(),
+            beacon_node.clone(),
+            store.clone(),
+            clock.clone(),
+        );
+        tokio::spawn(check);
     }
 
     // The duty loop, as a future that ends only with the error that stopped
@@ -445,7 +492,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // is three small fields, and holding a borrow of the schedule across
             // the proposal would stop the next epoch's refresh from replacing it.
             if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
-                propose(&proposal, &clock, slot, &duty, &store).await;
+                if doppelganger_cleared(&context, &duty.pubkey) {
+                    propose(&proposal, &clock, slot, &duty, &store).await;
+                } else {
+                    warn!(
+                        %slot,
+                        validator = duty.validator_index,
+                        "Not proposing: doppelganger protection has not cleared this validator yet"
+                    );
+                }
             }
 
             // Right after the proposal and ahead of the slot's other duties: the
@@ -507,7 +562,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // Each branch of `serve_slot_duties` waits for its own offset.
             tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
 
-            let slot_duties = duties.at_slot(slot, epoch);
+            // Attesting and aggregating both start from these, so a key
+            // doppelganger protection still withholds does neither; its sync
+            // committee and payload committee duties go on (see
+            // `doppelganger`).
+            let slot_duties = withhold_uncleared(&context, slot, duties.at_slot(slot, epoch));
             let committee = duties.ptc_at_slot(slot, epoch);
             let sync_duties = duties.sync_at_slot(slot);
             serve_slot_duties(
@@ -533,7 +592,63 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         }
     };
 
-    Err(run_until_stopped(duty_loop, &protection, shutdown, keymanager).await)
+    // A doppelganger stops the duties where they stand, as an unusable record
+    // does: what is left of them signs nothing slashable anyway (see
+    // `Doppelganger::allows_signing`), and the operator has to find the
+    // other client before this one runs again.
+    let duties = async {
+        let Some(doppelganger) = &doppelganger else {
+            return duty_loop.await;
+        };
+        tokio::select! {
+            err = duty_loop => err,
+            () = doppelganger.detected() => {
+                let validators = doppelganger
+                    .sightings()
+                    .iter()
+                    .map(|sighting| sighting.index)
+                    .collect();
+                Error::DoppelgangerDetected { validators }
+            }
+        }
+    };
+
+    Err(run_until_stopped(duties, &protection, shutdown, keymanager).await)
+}
+
+/// Whether doppelganger protection lets the validator a duty names act on
+/// it. A pubkey that does not parse is not cleared: with the protection on,
+/// a key it cannot name is a key it cannot vouch for.
+fn doppelganger_cleared(context: &SigningContext, pubkey: &str) -> bool {
+    context.doppelganger().is_none()
+        || crate::beacon_node::dto::parse_pubkey(pubkey)
+            .is_ok_and(|pubkey| context.doppelganger_allows(&pubkey))
+}
+
+/// `duties`, less those of validators doppelganger protection has not
+/// cleared: dropped before the attestation service records or fetches
+/// anything for them.
+fn withhold_uncleared(
+    context: &SigningContext,
+    slot: u64,
+    duties: Vec<crate::beacon_node::dto::AttesterDutyDto>,
+) -> Vec<crate::beacon_node::dto::AttesterDutyDto> {
+    if context.doppelganger().is_none() {
+        return duties;
+    }
+    let before = duties.len();
+    let cleared: Vec<_> = duties
+        .into_iter()
+        .filter(|duty| doppelganger_cleared(context, &duty.pubkey))
+        .collect();
+    if cleared.len() < before {
+        tracing::debug!(
+            %slot,
+            withheld = before - cleared.len(),
+            "Attester duties withheld by doppelganger protection"
+        );
+    }
+    cleared
 }
 
 /// How long the keymanager gets to finish its requests in flight once the
@@ -1855,6 +1970,61 @@ mod tests {
         .await;
         assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
         assert_eq!(before.elapsed(), KEYMANAGER_DRAIN);
+    }
+
+    fn attester_duty(
+        pubkey: &BlsPubkey,
+        validator_index: u64,
+    ) -> beacon_node::dto::AttesterDutyDto {
+        beacon_node::dto::AttesterDutyDto {
+            pubkey: beacon_node::dto::encode_hex(&pubkey.0),
+            validator_index,
+            committee_index: 0,
+            committee_length: 128,
+            committees_at_slot: 64,
+            validator_committee_index: 0,
+            slot: 3200,
+        }
+    }
+
+    /// The duty loop drops a withheld key's attester duties, and with them
+    /// its aggregation, before anything is recorded or fetched for it; a
+    /// cleared key's duties go through.
+    #[test]
+    fn only_cleared_keys_keep_their_attester_and_proposer_duties() {
+        let doppelganger = Arc::new(doppelganger::Doppelganger::new());
+        doppelganger.register(pubkey(1), 0);
+        doppelganger.register(pubkey(2), 100);
+        let context = context().with_doppelganger(doppelganger);
+
+        let duties = vec![
+            attester_duty(&pubkey(1), 11),
+            attester_duty(&pubkey(2), 22),
+            attester_duty(&pubkey(3), 33),
+        ];
+        let kept: Vec<u64> = withhold_uncleared(&context, 3200, duties)
+            .iter()
+            .map(|duty| duty.validator_index)
+            .collect();
+        assert_eq!(kept, vec![11], "under the check, and never registered");
+
+        assert!(doppelganger_cleared(
+            &context,
+            &beacon_node::dto::encode_hex(&pubkey(1).0)
+        ));
+        assert!(!doppelganger_cleared(
+            &context,
+            &beacon_node::dto::encode_hex(&pubkey(2).0)
+        ));
+        assert!(!doppelganger_cleared(&context, "not a pubkey"));
+    }
+
+    /// With the protection off the filter is not there at all.
+    #[test]
+    fn without_doppelganger_protection_every_duty_is_kept() {
+        let duties = vec![attester_duty(&pubkey(1), 11), attester_duty(&pubkey(2), 22)];
+        assert_eq!(withhold_uncleared(&context(), 3200, duties).len(), 2);
+        assert!(doppelganger_cleared(&context(), "not a pubkey"));
     }
 
     /// With no keymanager there is nothing to wait for.

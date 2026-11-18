@@ -41,15 +41,16 @@ use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
     CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
-    ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto,
-    ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response,
-    encode_hex, parse_pubkey, parse_root,
+    LivenessDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
+    SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    SyncingDto, ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse,
+    config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
-    ValidatorEntry, validate_attestation_data, validate_produced_block, validate_sync_contribution,
+    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    ValidatorEntry, validate_attestation_data, validate_liveness, validate_produced_block,
+    validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -1335,6 +1336,32 @@ impl BeaconNodeApi for HttpBeaconNode {
         self.post_no_content("/eth/v1/beacon/pool/voluntary_exits", exit, None)
             .await
     }
+
+    /// Asks this node whether it is syncing first, per the trait's contract:
+    /// the answer that clears a key must come from a node that has the
+    /// chain, and only this node's own status says whether this one does.
+    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.is_optimistic_or_syncing().await? {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        let body: Vec<String> = indices.iter().map(ValidatorIndex::to_string).collect();
+        let response: DataResponse<Vec<LivenessDto>> = self
+            .post(&format!("/eth/v1/validator/liveness/{epoch}"), &body, None)
+            .await?;
+        let answers: Vec<Liveness> = response
+            .data
+            .into_iter()
+            .map(|entry| Liveness {
+                index: entry.index,
+                is_live: entry.is_live,
+            })
+            .collect();
+        validate_liveness(indices, &answers)?;
+        Ok(answers)
+    }
 }
 
 #[cfg(test)]
@@ -1907,5 +1934,108 @@ mod tests {
             None
         );
         HttpBeaconNode::bool_header(Some("yes".into()), "Included").expect_err("not a boolean");
+    }
+
+    /// Every liveness request a [`serve_liveness`] node received, as (path,
+    /// JSON body).
+    type LivenessSeen = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A node that answers `/eth/v1/node/syncing` with `is_syncing` and every
+    /// liveness request with `reply`, recording what it was asked.
+    async fn serve_liveness(
+        is_syncing: bool,
+        reply: serde_json::Value,
+    ) -> (HttpBeaconNode, LivenessSeen) {
+        use axum::extract::{Json, State};
+        use axum::http::Uri;
+        use axum::routing::{get, post};
+
+        let seen: LivenessSeen = Default::default();
+        let syncing = serde_json::json!({
+            "data": { "head_slot": "1", "sync_distance": "0", "is_syncing": is_syncing,
+                      "is_optimistic": false, "el_offline": false }
+        });
+        let app = axum::Router::new()
+            .route(
+                "/eth/v1/node/syncing",
+                get(move || async move { Json(syncing) }),
+            )
+            .route(
+                "/eth/v1/validator/liveness/{epoch}",
+                post(
+                    |State((seen, reply)): State<(LivenessSeen, serde_json::Value)>,
+                     uri: Uri,
+                     Json(body): Json<serde_json::Value>| async move {
+                        seen.lock()
+                            .expect("lock")
+                            .push((uri.path().to_string(), body));
+                        Json(reply)
+                    },
+                ),
+            )
+            .with_state((seen.clone(), reply));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let node = HttpBeaconNode::new(format!("http://{address}")).expect("builds");
+        (node, seen)
+    }
+
+    /// The wire shape both ways: the epoch in the path, the indices a JSON
+    /// array of quoted integers, and the answer's quoted `index` read back.
+    #[tokio::test]
+    async fn liveness_posts_quoted_indices_and_reads_quoted_ones_back() {
+        let reply = serde_json::json!({ "data": [
+            { "index": "7", "is_live": true },
+            { "index": "3", "is_live": false },
+        ]});
+        let (node, seen) = serve_liveness(false, reply).await;
+        let answers = node.liveness(12, &[3, 7]).await.expect("answers");
+        assert_eq!(
+            answers,
+            vec![
+                Liveness {
+                    index: 7,
+                    is_live: true
+                },
+                Liveness {
+                    index: 3,
+                    is_live: false
+                },
+            ]
+        );
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/eth/v1/validator/liveness/12");
+        assert_eq!(seen[0].1, serde_json::json!(["3", "7"]));
+    }
+
+    /// A syncing node is not asked: its "nobody is live" would clear keys
+    /// it has not watched the network for.
+    #[tokio::test]
+    async fn a_syncing_node_is_not_asked_about_liveness() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, seen) = serve_liveness(true, reply).await;
+        let err = node.liveness(12, &[3]).await.expect_err("syncing");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// An answer that leaves an index out is one to fail over from.
+    #[tokio::test]
+    async fn a_liveness_answer_missing_an_index_is_refused() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, _) = serve_liveness(false, reply).await;
+        let err = node.liveness(12, &[3, 7]).await.expect_err("incomplete");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn no_liveness_request_is_sent_for_no_indices() {
+        let (node, seen) = serve_liveness(false, serde_json::json!({ "data": [] })).await;
+        assert!(node.liveness(12, &[]).await.expect("empty").is_empty());
+        assert!(seen.lock().expect("lock").is_empty());
     }
 }

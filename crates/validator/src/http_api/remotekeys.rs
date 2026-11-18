@@ -253,6 +253,11 @@ pub async fn import(
         .map(|result| match result {
             Ok(Some((pubkey, signer))) => {
                 info!(pubkey = %encode_hex(&pubkey.0), url = signer.url(), "Imported remote validator key");
+                // Under the store's write guard with the insert, so the duty
+                // loop never sees the key before it is checked.
+                if let Some(doppelganger) = context.signing.doppelganger() {
+                    doppelganger.register_now(pubkey, &context.clock);
+                }
                 store.insert_remote_signer(pubkey, signer);
                 KeyStatus {
                     status: "imported".to_string(),
@@ -487,6 +492,40 @@ mod tests {
             .expect("request");
         let (status, _) = send(app, request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// With doppelganger protection on, an imported remote key is checked
+    /// before it signs, like every key loaded at startup.
+    #[tokio::test]
+    async fn an_imported_remote_key_is_withheld_by_doppelganger_protection() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::{BlsPubkey, Root};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let doppelganger = Arc::new(crate::doppelganger::Doppelganger::new());
+        let mut context = context_with_dirs(store.clone(), dir.path(), None);
+        context.signing = Arc::new(
+            crate::signing::SigningContext::new(Config::mainnet(), Root::ZERO)
+                .with_doppelganger(doppelganger.clone()),
+        );
+        let app = router(context, TOKEN.to_string());
+
+        let (status, body) = send(
+            app,
+            authed(
+                "POST",
+                "/eth/v1/remotekeys",
+                serde_json::json!({ "remote_keys": [{ "pubkey": pubkey_hex(1), "url": SIGNER }] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(statuses(&body), ["imported"]);
+        let pubkey = BlsPubkey([1; 48]);
+        assert!(store.read().await.contains(&pubkey));
+        assert!(!doppelganger.allows_signing(&pubkey));
+        assert_eq!(doppelganger.detecting(), 1);
     }
 
     #[tokio::test]

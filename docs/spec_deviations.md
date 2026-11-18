@@ -85,8 +85,9 @@ anything that does not advance past them.
   past the value written. The same holds for a clock that jumps forward: the
   target is pinned to the slot the local clock asked for, so a beacon node
   that answers for a slot far ahead lets the record run ahead of the chain.
-  A bound against the clock would be circular; the guard is the beacon
-  node's own view of the head, which doppelganger protection will bring.
+  A bound against the clock would be circular; the guard would be the beacon
+  node's own view of the head, which nothing here checks the clock against
+  yet.
 - **No checksum, and rewritten minimal at every start:** the record is an
   EIP-3076 minimal interchange and nothing more, by design: readable by other
   tools and editable by the operator, which the hand edit above relies on. A
@@ -100,8 +101,11 @@ anything that does not advance past them.
   keymanager API with no history is registered the same way before it is
   loaded. Nothing here stops such a key from signing again what it signed
   elsewhere a moment ago, so the flag is only for keys that have signed nothing
-  anywhere for at least two epochs; the migration window is doppelganger
-  protection's to close, which this client does not have yet.
+  anywhere for at least two epochs. `--enable-doppelganger-protection` narrows
+  that migration window: with it on, such a key signs no attestation or block
+  until the beacon network has seen it silent for a full epoch, though like any
+  doppelganger check it cannot see a client that is down while it looks (see
+  [Doppelganger protection](./cli.md#doppelganger-protection)).
 - **Messages outside the rule:** sync committee messages and contributions
   are not slashable, and are not recorded. A gloas proposer also signs an
   execution payload envelope, and a payload timeliness committee member signs
