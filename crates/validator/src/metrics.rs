@@ -113,6 +113,82 @@ static BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL: LazyLock<IntCounter> = LazyLock::new
     .unwrap()
 });
 
+/// Builder registrations a beacon node accepted, counted per registration so a
+/// full `REGISTRATION_BATCH` reads as that many.
+static BUILDER_REGISTRATIONS_SENT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registrations_sent_total",
+        "Builder registrations a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Registration batches no beacon node accepted. A missed registration costs
+/// at most a builder block, never a duty, so this is a warning sign rather
+/// than a failure.
+static BUILDER_REGISTRATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_builder_registration_failures_total",
+        "Registration batches no beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Proposer preferences a beacon node accepted. Counted per preference, so a
+/// full epoch's worth reads as that many, and once, when the first node
+/// accepts it: the re-sends to nodes that missed it do not count again.
+static PROPOSER_PREFERENCES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_published_total",
+        "Proposer preferences a beacon node accepted"
+    )
+    .unwrap()
+});
+
+/// Proposer preference sends some beacon node refused or did not answer, one
+/// count per preference per attempt, re-sends included. The next slot retries,
+/// so this is a warning sign: a node that misses one never gossips it, and
+/// until some node accepts it, builders' bids for the slot are ignored. A send
+/// whose slot started before the nodes answered is not counted.
+static PROPOSER_PREFERENCES_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_failures_total",
+        "Proposer preference sends some beacon node refused or did not answer"
+    )
+    .unwrap()
+});
+
+/// v2 proposer-duty fetches no beacon node answered, one count per target epoch
+/// per attempt. Without the duties no preference is signed for that epoch, so a
+/// node that is syncing or lacks the endpoint shows up here and not as refused
+/// preferences.
+static PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_proposer_preferences_duty_fetch_failures_total",
+        "v2 proposer-duty fetches no beacon node answered"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks a beacon node handed to its builder.
+static BLINDED_BLOCKS_PROPOSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_proposed_total",
+        "Blinded blocks a beacon node handed to its builder"
+    )
+    .unwrap()
+});
+
+/// Blinded blocks the beacon node did not confirm. The relay may still have
+/// published them, so this is not a count of missed proposals.
+static BLINDED_BLOCKS_UNCONFIRMED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_blinded_blocks_unconfirmed_total",
+        "Blinded blocks the beacon node did not confirm, which the relay may still have published"
+    )
+    .unwrap()
+});
+
 /// Blocks this process declined to sign because slashing protection judged
 /// them unsafe, or could not record them.
 ///
@@ -237,12 +313,35 @@ static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// How long a duty waited for its batch of signatures.
+///
+/// For local keys that is the signing itself, well under a millisecond a key.
+/// With remote keys it is the batch's slowest answer, round trip and
+/// verification included, and at most the signing budget
+/// (`signing::SIGNING_BUDGET`): a sample at the top bucket means a signer
+/// that did not answer in time, not slow arithmetic. What one signer request
+/// takes is `remote_signer_request_duration_seconds`.
 static SIGNING_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_signing_duration_seconds",
-        "Time spent signing one slot's batch of attestations, read lock included",
+        "Time a duty waited for its batch of signatures, remote signer round trips included",
         vec![
-            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5
+        ]
+    )
+    .unwrap()
+});
+
+/// One request to a remote signer, from sending it to its answer or failure.
+///
+/// The top bucket is the client's own request timeout; a request the signing
+/// budget cut off before that is recorded at the moment it was dropped.
+static REMOTE_SIGNER_REQUEST_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "ethlambda_validator_remote_signer_request_duration_seconds",
+        "Time one signing request to a remote signer took, whatever its outcome",
+        vec![
+            0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 8.0
         ]
     )
     .unwrap()
@@ -341,6 +440,13 @@ pub fn init() {
     LazyLock::force(&ATTESTATION_DEADLINE_MISSED_TOTAL);
     LazyLock::force(&BLOCKS_PROPOSED_TOTAL);
     LazyLock::force(&BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATIONS_SENT_TOTAL);
+    LazyLock::force(&BUILDER_REGISTRATION_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_PUBLISHED_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_FAILURES_TOTAL);
+    LazyLock::force(&PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_PROPOSED_TOTAL);
+    LazyLock::force(&BLINDED_BLOCKS_UNCONFIRMED_TOTAL);
     LazyLock::force(&BLOCKS_REFUSED_TOTAL);
     LazyLock::force(&BLOCK_PROPOSAL_FAILURES_TOTAL);
     LazyLock::force(&ENVELOPES_PUBLISHED_TOTAL);
@@ -358,6 +464,7 @@ pub fn init() {
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
+    LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
@@ -405,6 +512,34 @@ pub fn inc_blocks_proposed() {
 
 pub fn inc_blocks_broadcast_not_imported() {
     BLOCKS_BROADCAST_NOT_IMPORTED_TOTAL.inc();
+}
+
+pub fn inc_builder_registrations_sent(count: usize) {
+    BUILDER_REGISTRATIONS_SENT_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_builder_registration_failures() {
+    BUILDER_REGISTRATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_published(count: usize) {
+    PROPOSER_PREFERENCES_PUBLISHED_TOTAL.inc_by(count as u64);
+}
+
+pub fn inc_proposer_preferences_failures() {
+    PROPOSER_PREFERENCES_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_proposer_preferences_duty_fetch_failures() {
+    PROPOSER_PREFERENCES_DUTY_FETCH_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_proposed() {
+    BLINDED_BLOCKS_PROPOSED_TOTAL.inc();
+}
+
+pub fn inc_blinded_blocks_unconfirmed() {
+    BLINDED_BLOCKS_UNCONFIRMED_TOTAL.inc();
 }
 
 pub fn inc_blocks_refused() {
@@ -472,13 +607,19 @@ pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
 }
 
-/// Time one slot's signing loop. The returned guard records to
-/// `ethlambda_validator_signing_duration_seconds` when dropped; hold it only
-/// across the synchronous signing loop, never across an await, or the sample
-/// stops meaning "how long the signing took" and starts meaning "how long
-/// the signing took plus whatever else shared the guard's scope".
+/// Time one duty's batch of signatures. The returned guard records to
+/// `ethlambda_validator_signing_duration_seconds` when dropped; hold it
+/// across the `signing::sign_all` call and nothing else, or the sample stops
+/// meaning "how long the duty waited for its signatures" and starts meaning
+/// that plus whatever else shared the guard's scope.
 pub fn time_signing() -> TimingGuard {
     TimingGuard::new(&SIGNING_DURATION_SECONDS)
+}
+
+/// Time one request to a remote signer. The returned guard records to
+/// `ethlambda_validator_remote_signer_request_duration_seconds` when dropped.
+pub fn time_remote_signer_request() -> TimingGuard {
+    TimingGuard::new(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS)
 }
 
 pub fn time_slashing_protection_write() -> TimingGuard {
