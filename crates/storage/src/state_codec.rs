@@ -76,13 +76,15 @@ mod tests {
 
         assert_eq!(bytes[0], ForkName::Electra.selector());
         assert_eq!(bytes[1..], state.to_ssz());
-        // Equality, for the reason state_transition's
-        // `ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare` gives:
-        // a regrow only raises the capacity, so `>=` would pass one.
-        assert_eq!(
-            bytes.capacity(),
-            1 + state.ssz_append_capacity(),
-            "the buffer was regrown"
+        // The buffer holds `ssz_append`'s headroom, so the encoding went into
+        // it directly rather than being made apart and copied in (which would
+        // size it to the encoding alone). That the headroom suffices, so the
+        // append never regrows the buffer, is state_transition's
+        // `ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare`.
+        let tag_and_headroom = 1 + state.ssz_append_capacity();
+        assert!(
+            bytes.capacity() >= tag_and_headroom,
+            "the encoding was not appended in place"
         );
         assert_eq!(decode_state_value(&bytes), state);
     }

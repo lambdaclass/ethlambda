@@ -678,20 +678,28 @@ mod tests {
             let capacity = state.ssz_append_capacity();
 
             let encoded = state.to_ssz();
-            // Equality, not `>=`: a regrow can only raise the capacity, so a
-            // lower bound could never fail. `reserve_exact` promises only "at
-            // least" what it is asked for, but std's `Vec` takes exactly that,
-            // so any capacity above it here is a regrow.
-            assert_eq!(encoded.capacity(), capacity, "{fork}: to_ssz regrew");
             let decoded = BeaconState::from_ssz(fork, &encoded).expect("the encoding decodes");
             assert_eq!(decoded, state, "{fork}");
 
-            // Appending after a prefix reserves past the prefix, not from the
-            // start of the buffer.
-            let mut framed = vec![0xAB];
-            state.ssz_append(&mut framed);
-            assert_eq!(framed.capacity(), 1 + capacity, "{fork}: ssz_append regrew");
-            assert_eq!(framed[1..], encoded, "{fork}");
+            // Given the headroom it advertises, the append must not reallocate:
+            // the buffer's address and capacity are the same before and after.
+            // That holds whatever `reserve_exact` rounds to, which its docs
+            // leave open, so the test does not lean on std's exact capacities.
+            // With no prefix this is `to_ssz`'s own path; with one, the
+            // storage layer's, where the encoding starts past a fork tag.
+            for prefix in [&[][..], &[0xAB][..]] {
+                let mut buf = prefix.to_vec();
+                buf.reserve_exact(capacity);
+                let before = (buf.as_ptr(), buf.capacity());
+                state.ssz_append(&mut buf);
+                let after = (buf.as_ptr(), buf.capacity());
+                let len = prefix.len();
+                assert_eq!(
+                    after, before,
+                    "{fork}: ssz_append regrew after {len} prefix bytes"
+                );
+                assert_eq!(buf[len..], encoded, "{fork}");
+            }
         }
     }
 }
