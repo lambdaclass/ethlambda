@@ -4328,6 +4328,14 @@ impl Store {
     /// index at a time, the table would be copied whenever an index passed the
     /// headroom: hundreds of copies of a table sized to the registry, for a
     /// single aggregate that spans it.
+    ///
+    /// The same precondition as [`Store::set_latest_message`]: `highest` must
+    /// come from a validated attestation, since this allocates a table up to it
+    /// at once. Its one caller, fork choice's `update_latest_messages`, runs
+    /// only on attestations whose committees were already resolved against
+    /// the registry. Today it is also the only production caller recording
+    /// votes at all; the table is rebuilt from fresh attestations through it
+    /// after a restart.
     pub fn reserve_latest_messages(&mut self, highest: u64) {
         let slot = latest_message_slot(highest);
         let mut beacon = self.beacon.lock().unwrap();
