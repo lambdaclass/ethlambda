@@ -91,8 +91,8 @@ pub(crate) struct ValidatorOptions {
     )]
     pub(crate) gas_limit: u64,
 
-    /// Serve the keymanager API: keystores, plus each validator's own fee
-    /// recipient, graffiti and gas limit, which are held in memory only.
+    /// Serve the keymanager API: keystores, remote keys, plus each validator's
+    /// own fee recipient, graffiti and gas limit.
     ///
     /// Off by default because it mutates key material. It binds to
     /// `--http-address` with bearer-token auth; a deployment that exposes it

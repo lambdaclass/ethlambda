@@ -10,8 +10,21 @@
 //! follow that convention rather than only claim to.
 //! [`write_private_no_symlink`] is public for the binary's one secret of its
 //! own, the node key it stores in `--data-dir` when `--node-key` is absent.
+//!
+//! Both also flush what they wrote to the device before returning. An
+//! imported keystore and its password are named by a definitions entry that
+//! is made durable right after them (see [`write_private_durably`]), and an
+//! entry that outlived the data it names is a keystore the next start cannot
+//! read.
 
 use std::path::Path;
+
+/// Write `contents` to `file` and flush them to the device.
+fn write_durably(mut file: std::fs::File, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(contents.as_ref())?;
+    file.sync_all()
+}
 
 /// Write `contents`, creating the file if it does not exist and truncating it
 /// if it does, at mode `0600` on unix.
@@ -24,20 +37,19 @@ use std::path::Path;
 /// validator signs.
 #[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 /// Write `contents` at mode `0600`, refusing to follow an existing symlink at
@@ -61,21 +73,20 @@ pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io:
 /// truncated and reused.
 #[cfg(unix)]
 pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    file.write_all(contents.as_ref())
+    write_durably(file, contents)
 }
 
 #[cfg(not(unix))]
 pub fn write_private_no_symlink(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
+    write_durably(std::fs::File::create(path)?, contents)
 }
 
 /// Why [`write_private_durably`] failed, and whether the file had already
@@ -198,7 +209,8 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Flush the directory, so a rename into it is itself durable.
+/// Flush the directory, so a rename into it, or a file created in it, is
+/// itself durable.
 ///
 /// `File::sync_all` is `fsync` everywhere but macOS, where it is
 /// `F_FULLFSYNC`, the only request there that reaches the disk rather than
@@ -210,7 +222,7 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// while the kernel has already dropped the writeback error with the data,
 /// which would make a flush that did not happen look durable.
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     let directory = std::fs::File::open(directory)?;
     let result = directory.sync_all();
     #[cfg(target_os = "macos")]
@@ -224,6 +236,16 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
         }
     });
     result
+}
+
+/// Refused, as [`write_private_durably`] is off unix and for its reason: an
+/// `Ok` here would vouch for a flush that did not happen.
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "flushing a directory is only implemented on unix",
+    ))
 }
 
 #[cfg(all(test, unix))]
@@ -243,6 +265,17 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "shh");
+    }
+
+    /// An import flushes the directory its password file was created in
+    /// before the definitions entry naming that file is made durable, and
+    /// fails if it cannot. A platform that refused to flush a directory
+    /// would therefore fail every import, and this is where that would show.
+    #[test]
+    fn sync_directory_flushes_a_directory_a_file_was_created_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_private_no_symlink(&dir.path().join("secret"), "shh").expect("writes");
+        sync_directory(dir.path()).expect("a directory can be flushed");
     }
 
     #[test]
