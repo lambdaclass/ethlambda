@@ -327,6 +327,9 @@ fn prepare_import(
         enabled: true,
         voting_public_key: encode_hex(&pubkey.0),
         signing: SigningDefinition::Web3Signer { url },
+        suggested_fee_recipient: None,
+        graffiti: None,
+        gas_limit: None,
     });
     known.insert(pubkey);
     Ok(Some((pubkey, signer)))
@@ -893,6 +896,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: SIGNER.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves");
@@ -949,6 +955,9 @@ mod tests {
                 voting_keystore_path: "keystore.json".into(),
                 voting_keystore_password_path: "password.txt".into(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves");
