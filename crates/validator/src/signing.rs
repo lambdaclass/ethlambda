@@ -6,38 +6,70 @@
 //! beacon node sent: the wire representation is a transport detail, and the
 //! chain only ever agrees about the merkle root.
 
+use ethlambda_types::beacon::builder::ValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use ethlambda_types::beacon::containers::altair::{
     ContributionAndProof, SyncAggregatorSelectionData,
 };
 use ethlambda_types::beacon::containers::gloas::{
-    ExecutionPayloadEnvelope, PayloadAttestationData,
+    ExecutionPayloadEnvelope, PayloadAttestationData, ProposerPreferences,
 };
-use ethlambda_types::beacon::containers::shared::{AttestationData, VoluntaryExit};
+use ethlambda_types::beacon::containers::shared::{
+    AttestationData, BeaconBlockHeader, Fork, VoluntaryExit,
+};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Domain, DomainType, Epoch, HashTreeRoot as _,
-    Root, Slot,
+    Root, Slot, Version,
 };
 // `AttestationData`, `Checkpoint`, `Fork` and `SigningData` all live in
 // `containers::shared`, verified against `containers/shared.rs:158,120,97,220`.
 use ethlambda_types::beacon::signing::{
-    compute_domain, compute_epoch_at_slot, compute_signing_root,
+    compute_builder_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
 };
 
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use tokio::sync::{RwLock, Semaphore};
+
 use crate::error::{Error, Result};
+use crate::keys::web3signer::{
+    AggregationSlot, ForkInfo, RandaoReveal, SigningBody, SigningRequest, SyncCommitteeMessage,
+    Versioned, VersionedHeader,
+};
 use crate::keys::{SigningMethod, ValidatorStore};
+
+pub use crate::keys::web3signer::AggregateAndProofRef;
 
 /// The ciphersuite the consensus layer pins BLS signatures to. It must match
 /// `ethlambda_state_transition::beacon::bls`'s own constant, or nothing this
 /// client signs will ever verify.
 const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// Whether `signature` is `pubkey`'s signature over `root`. A pubkey or a
+/// signature that is not a point on the curve verifies nothing.
+fn verifies(pubkey: &BlsPubkey, root: Root, signature: &BlsSignature) -> bool {
+    use blst::min_pk::{PublicKey, Signature};
+
+    let (Ok(public_key), Ok(signature)) = (
+        PublicKey::from_bytes(&pubkey.0),
+        Signature::from_bytes(&signature.0),
+    ) else {
+        return false;
+    };
+    signature.verify(true, root.as_slice(), DST, &[], &public_key, true)
+        == blst::BLST_ERROR::BLST_SUCCESS
+}
 
 /// The chain-wide half of a signing domain, fixed for the life of the process.
 ///
@@ -52,9 +84,123 @@ pub struct SigningContext {
     /// signature from one chain never verifies on another running the same
     /// fork schedule.
     pub genesis_validators_root: Root,
+    /// Selection proofs already produced; see [`Self::sign_selection_proof`].
+    selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+    /// One permit per remote signature being verified; see [`Self::verified`].
+    verifications: Arc<Semaphore>,
+}
+
+/// How long a selection proof is remembered past its slot: the duty
+/// schedule holds the current epoch and the next, so a proof computed for a
+/// subscription at the start of an epoch is still wanted by the aggregation
+/// up to two epochs later.
+const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
+
+/// How long one duty's batch of signatures may take, from when it is asked
+/// for.
+///
+/// Well inside every duty's own budget (the rest of its slot, at least a
+/// third of one), so a signer that hangs loses the signatures it owes and no
+/// others: the batch is published with whatever arrived in time, local keys
+/// and other signers' keys included.
+///
+/// What it does cost the others is time. The batch is published whole, once
+/// its last signature is in or the budget is spent, so while a signer hangs
+/// every batch goes out this much later than it would have, every slot, the
+/// local keys' share with it: an attestation due a third of the way into the
+/// slot is published two seconds after that. That is still ahead of the
+/// aggregation offset, so no vote is lost to it, but it is two seconds of
+/// propagation the votes do not get, and at a gloas slot, where the two
+/// offsets are three seconds apart, it leaves them one. Publishing each
+/// signature as it arrives would spare the keys that answered; nothing does
+/// that yet.
+///
+/// A healthy Web3Signer answers in milliseconds; one slower than this is one
+/// whose signatures would land too late to be worth much anyway.
+pub const SIGNING_BUDGET: Duration = Duration::from_secs(2);
+
+/// Ask for every signature in `requests` at once, and give each until
+/// [`SIGNING_BUDGET`] from now.
+///
+/// One result per request, in order, returned together: when the last
+/// request answers or at the deadline, whichever is first. A request still
+/// outstanding then is dropped and reported as an [`Error::Signing`] for its
+/// key, so one unresponsive signer never takes the signatures that did
+/// arrive down with it, but it does hold all of them back until the
+/// deadline; see [`SIGNING_BUDGET`].
+pub async fn sign_all<T, F>(requests: impl IntoIterator<Item = (BlsPubkey, F)>) -> Vec<Result<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    sign_all_within(SIGNING_BUDGET, requests).await
+}
+
+/// [`sign_all`], with `budget` in place of [`SIGNING_BUDGET`]: for a batch
+/// no slot deadline stands behind, which can afford to wait longer for a
+/// signature than a duty can.
+pub async fn sign_all_within<T, F>(
+    budget: Duration,
+    requests: impl IntoIterator<Item = (BlsPubkey, F)>,
+) -> Vec<Result<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    futures_util::future::join_all(requests.into_iter().map(|(pubkey, request)| async move {
+        tokio::time::timeout_at(deadline, request)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Signing {
+                    pubkey,
+                    reason: format!(
+                        "no signature within the {}s signing budget",
+                        budget.as_secs()
+                    ),
+                })
+            })
+    }))
+    .await
 }
 
 impl SigningContext {
+    pub fn new(config: Config, genesis_validators_root: Root) -> Self {
+        // One verification per core: each is a pairing, pure CPU, so more at
+        // once would only take turns on the same cores.
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Self {
+            config,
+            genesis_validators_root,
+            selection_proofs: Mutex::new(HashMap::new()),
+            verifications: Arc::new(Semaphore::new(cores)),
+        }
+    }
+
+    /// Whether `signature` is `pubkey`'s signature over `root`, checked on
+    /// the blocking pool rather than on the task that asked.
+    ///
+    /// A verification is a pairing, about a millisecond of CPU with no await
+    /// in it. Run inline, a batch's answers would be verified one after
+    /// another on the duty task, where [`sign_all`]'s deadline cannot cut in:
+    /// a thousand remote keys would hold the duty loop for a second or more
+    /// that the signing budget does not bound, ahead of whatever the slot
+    /// owes next. Here they run a core each, and waiting for a core is an
+    /// await the budget covers.
+    async fn verified(&self, pubkey: BlsPubkey, root: Root, signature: BlsSignature) -> bool {
+        let Ok(permit) = self.verifications.clone().acquire_owned().await else {
+            return false;
+        };
+        // The permit goes into the blocking task and is released when the
+        // pairing ends, not when this future is dropped: a batch cut off at
+        // its deadline leaves its verifications running, and they must still
+        // count against the bound.
+        let verification = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verifies(&pubkey, root, &signature)
+        });
+        // A verification that did not run to its end vouches for nothing.
+        verification.await.unwrap_or(false)
+    }
+
     /// The domain for `domain_type` as of `epoch`.
     pub fn domain(&self, domain_type: DomainType, epoch: Epoch) -> Domain {
         let fork = self.config.fork_at_epoch(epoch);
@@ -195,6 +341,34 @@ impl SigningContext {
         compute_signing_root(message.hash_tree_root(), domain)
     }
 
+    /// The fork a message domained at `epoch` is signed under, told the way a
+    /// remote signer wants it: the fork active at that epoch as `current`,
+    /// the one before it as `previous`, and the epoch the current one took
+    /// effect. Phase0 has no predecessor and names itself twice, as the
+    /// genesis state's own `Fork` does.
+    pub fn fork_info(&self, epoch: Epoch) -> ForkInfo {
+        let fork = self.config.fork_at_epoch(epoch);
+        let current_version = self.config.fork_version(fork);
+        let previous_version = fork
+            .previous()
+            .map(|previous| self.config.fork_version(previous))
+            .unwrap_or(current_version);
+        ForkInfo {
+            fork: Fork {
+                previous_version,
+                current_version,
+                epoch: self.config.fork_epoch(fork),
+            },
+            genesis_validators_root: self.genesis_validators_root,
+        }
+    }
+
+    /// Web3Signer's name for the fork at `epoch`: the specification's
+    /// lowercase name in capitals (`ELECTRA`, `GLOAS`).
+    fn fork_label(&self, epoch: Epoch) -> String {
+        self.config.fork_at_epoch(epoch).as_str().to_uppercase()
+    }
+
     /// The root a voluntary exit's signature is computed over.
     ///
     /// Every other signature here follows the fork at its message's own epoch.
@@ -219,54 +393,163 @@ impl SigningContext {
     /// pre-deneb epoch under that epoch's version, which no node on a chain
     /// past deneb accepts.
     pub fn voluntary_exit_signing_root(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> Root {
-        let fork = self.config.fork_at_epoch(current_epoch.max(exit.epoch));
-        let fork_version = if fork >= ForkName::Deneb {
-            self.config.capella_fork_version
-        } else if exit.epoch < self.config.fork_epoch(fork) {
-            self.config.fork_version(fork.previous().unwrap_or(fork))
-        } else {
-            self.config.fork_version(fork)
-        };
         let domain = compute_domain(
             DOMAIN_VOLUNTARY_EXIT,
-            fork_version,
+            self.voluntary_exit_fork_version(exit, current_epoch),
             self.genesis_validators_root,
         );
         compute_signing_root(exit.hash_tree_root(), domain)
     }
 
+    /// The fork version `exit`'s domain is built from; the rule is spelled
+    /// out on [`Self::voluntary_exit_signing_root`].
+    fn voluntary_exit_fork_version(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> Version {
+        let fork = self.config.fork_at_epoch(current_epoch.max(exit.epoch));
+        if fork >= ForkName::Deneb {
+            self.config.capella_fork_version
+        } else if exit.epoch < self.config.fork_epoch(fork) {
+            self.config.fork_version(fork.previous().unwrap_or(fork))
+        } else {
+            self.config.fork_version(fork)
+        }
+    }
+
+    /// The fork a remote signer is told `exit` is signed under: the one
+    /// version its domain is built from, as both `previous` and `current`.
+    ///
+    /// Not [`Self::fork_info`] at the exit's epoch, which names the fork the
+    /// schedule has there and so, from deneb on, a version the exit is not
+    /// signed under. A signer derives the root itself from what it is told
+    /// and refuses a request whose `signingRoot` disagrees, and Web3Signer
+    /// has derived an exit's two ways: older releases pick the rule by the
+    /// exit's epoch, current ones by this fork's epoch, and either then
+    /// answers the capella version from its own configuration (deneb on) or
+    /// picks `previous` or `current` by comparing the two epochs (before).
+    /// With both versions the same, every one of those paths lands on the
+    /// version this client signs under, whichever epoch the exit names.
+    /// Lighthouse tells its signer the same thing for the same reason.
+    fn voluntary_exit_fork_info(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> ForkInfo {
+        let version = self.voluntary_exit_fork_version(exit, current_epoch);
+        ForkInfo {
+            fork: Fork {
+                previous_version: version,
+                current_version: version,
+                epoch: exit.epoch,
+            },
+            genesis_validators_root: self.genesis_validators_root,
+        }
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
-    /// a signature is actually produced and one place the remote-signer
-    /// variant will need to be added. Deliberately private: a caller that can
-    /// hand in an arbitrary root can make this client sign anything at all,
-    /// and the domain separation that keeps an attestation from being read as
-    /// a block lives in the callers above.
-    fn sign_root(
+    /// a signature is actually produced. Deliberately private: a caller that
+    /// can hand in an arbitrary root can make this client sign anything at
+    /// all, and the domain separation that keeps an attestation from being
+    /// read as a block lives in the callers above.
+    ///
+    /// `epoch` is the epoch the root's domain was taken at, and `body` the
+    /// message itself; a local key needs neither, a remote signer needs both.
+    async fn sign(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         root: Root,
+        epoch: Epoch,
+        body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
-        let method = store.get(pubkey).ok_or(Error::UnknownValidator(*pubkey))?;
+        let fork_info = self.fork_info(epoch);
+        self.sign_under(store, pubkey, root, epoch, Some(fork_info), body)
+            .await
+    }
+
+    /// [`Self::sign`], with the fork a remote signer is told given outright
+    /// rather than read off the schedule at `epoch`. Only two messages need
+    /// that, every other being domained by the fork at its own epoch: a
+    /// voluntary exit, told the one version it is signed under, and a builder
+    /// registration, told none (`None`), since its domain is the genesis
+    /// version's whatever the schedule says.
+    ///
+    /// The store's read guard is held for the lookup alone and released before
+    /// anything is signed. `tokio::sync::RwLock` is write-preferring, so a
+    /// guard held across the remote signer's round trip would let one queued
+    /// keymanager writer stall every other duty behind it for that long.
+    async fn sign_under(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        root: Root,
+        epoch: Epoch,
+        fork_info: Option<ForkInfo>,
+        body: SigningBody<'_>,
+    ) -> Result<BlsSignature> {
+        let method = store
+            .read()
+            .await
+            .signer(pubkey)
+            .ok_or(Error::UnknownValidator(*pubkey))?;
         match method {
             SigningMethod::LocalKeystore { secret_key } => {
                 let signature = secret_key.sign(root.as_slice(), DST, &[]);
                 let bytes: [u8; BLS_SIGNATURE_SIZE] = signature.to_bytes();
                 Ok(BlsSignature(bytes))
             }
+            SigningMethod::Web3Signer { signer } => {
+                // Web3Signer's `BLOCK_V2` takes the full block before
+                // bellatrix and the header only from bellatrix on, and this
+                // client only ever sends the header. Refused here rather than
+                // sent in a shape the signer answers with a 400; the proposal
+                // path refuses those forks long before this anyway.
+                if matches!(body, SigningBody::Block { .. })
+                    && self.config.fork_at_epoch(epoch) < ForkName::Bellatrix
+                {
+                    return Err(Error::Signing {
+                        pubkey: *pubkey,
+                        reason: "a remote signer is only asked for blocks from bellatrix on"
+                            .to_string(),
+                    });
+                }
+                let request = SigningRequest::new(fork_info, root, body);
+                let signature = signer.sign(pubkey, &request).await?;
+                // Checked before it leaves this function. The signer is
+                // another process on the far side of a network: one holding a
+                // different key under this pubkey, computing another root
+                // for a fork it does not know, or answering through a proxy
+                // that rewrote the body would otherwise have this client
+                // publish a signature no peer accepts, and decide
+                // `is_aggregator` on bytes that are not the selection proof.
+                // A local key needs no such check: its signature is computed
+                // here, over this root.
+                if !self.verified(*pubkey, root, signature).await {
+                    return Err(Error::Signing {
+                        pubkey: *pubkey,
+                        reason: format!(
+                            "remote signer {} answered with a signature that does not verify \
+                             for this key and message",
+                            signer.url()
+                        ),
+                    });
+                }
+                Ok(signature)
+            }
         }
     }
 
     /// Sign `data` on behalf of `pubkey`.
-    pub fn sign_attestation(
+    pub async fn sign_attestation(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &AttestationData,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.attestation_signing_root(data))
+        self.sign(
+            store,
+            pubkey,
+            self.attestation_signing_root(data),
+            data.target.epoch,
+            SigningBody::Attestation { attestation: data },
+        )
+        .await
     }
 
     /// Sign the RANDAO reveal for `epoch` on behalf of `pubkey`.
@@ -275,13 +558,22 @@ impl SigningContext {
     /// it commits to an epoch, not to a chain position, and producing one for
     /// an epoch a validator is not proposing in reveals nothing and risks
     /// nothing. It is therefore not guarded, and does not need to be.
-    pub fn sign_randao(
+    pub async fn sign_randao(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         epoch: Epoch,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.randao_signing_root(epoch))
+        self.sign(
+            store,
+            pubkey,
+            self.randao_signing_root(epoch),
+            epoch,
+            SigningBody::RandaoReveal {
+                randao_reveal: RandaoReveal { epoch },
+            },
+        )
+        .await
     }
 
     /// Sign the selection proof for `slot` on behalf of `pubkey`.
@@ -290,17 +582,58 @@ impl SigningContext {
     /// to a chain position, so producing one twice is producing the same bytes
     /// twice: BLS signatures are deterministic, which is the property the
     /// selection rule rests on.
-    pub fn sign_selection_proof(
+    ///
+    /// That determinism is also why the answer is remembered. The same proof
+    /// is wanted once when the epoch's subscriptions are sent and again by the
+    /// aggregation tick, and for a remote key each ask is a round trip; a
+    /// remembered proof is the very signature the signer would return. Only
+    /// a proof that was produced is remembered, so a failure is asked again.
+    ///
+    /// The store is asked before the memory is. A proof outlives its key
+    /// there, so answering from it first would hand a key the keymanager
+    /// deleted mid-epoch its selection: the aggregation would go on to fetch
+    /// an aggregate it then cannot sign. A key this client no longer holds
+    /// is [`Error::UnknownValidator`] here, as it is on every other path.
+    pub async fn sign_selection_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.selection_proof_signing_root(slot))
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
+        if let Some(proof) = remembered {
+            return Ok(proof);
+        }
+        let proof = self
+            .sign(
+                store,
+                pubkey,
+                self.selection_proof_signing_root(slot),
+                compute_epoch_at_slot(slot),
+                SigningBody::AggregationSlot {
+                    aggregation_slot: AggregationSlot { slot },
+                },
+            )
+            .await?;
+        let mut proofs = self.selection_proofs();
+        proofs.retain(|(_, held), _| held + SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.insert((*pubkey, slot), proof);
+        Ok(proof)
     }
 
-    /// Sign the aggregate whose `AggregateAndProof` root is `root`, for `slot`,
-    /// on behalf of `pubkey`.
+    /// The remembered selection proofs. A poisoned map is still a map of
+    /// valid proofs, since an entry is inserted whole or not at all.
+    fn selection_proofs(&self) -> MutexGuard<'_, HashMap<(BlsPubkey, Slot), BlsSignature>> {
+        self.selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sign `message`, an aggregator's `AggregateAndProof`, on behalf of
+    /// `pubkey`.
     ///
     /// Not slashable either, which is worth stating because it is the only
     /// signature here that covers an attestation and is not. The slashing
@@ -308,18 +641,34 @@ impl SigningContext {
     /// republishing other validators' votes with a wrapper saying who
     /// collected them, and publishing two different aggregates for one slot is
     /// wasteful rather than punishable.
-    pub fn sign_aggregate_and_proof(
+    ///
+    /// Takes the whole wrapper rather than its root: a remote signer wants to
+    /// read what it signs, and the wrapper's own fork decides its JSON shape.
+    pub async fn sign_aggregate_and_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        root: Root,
-        slot: Slot,
+        message: AggregateAndProofRef<'_>,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        let slot = message.slot();
+        let epoch = compute_epoch_at_slot(slot);
+        let version = match message {
+            AggregateAndProofRef::Gloas(_) => ForkName::Gloas.as_str().to_uppercase(),
+            AggregateAndProofRef::Electra(_) => self.fork_label(epoch),
+        };
+        self.sign(
             store,
             pubkey,
-            self.aggregate_and_proof_signing_root(root, slot),
+            self.aggregate_and_proof_signing_root(message.hash_tree_root(), slot),
+            epoch,
+            SigningBody::AggregateAndProof {
+                aggregate_and_proof: Versioned {
+                    version,
+                    data: message,
+                },
+            },
         )
+        .await
     }
 
     /// Sign the envelope revealing the payload of the block proposed for `slot`
@@ -330,14 +679,104 @@ impl SigningContext {
     /// condition to an envelope: signing two for one slot is at worst a
     /// payload the network ignores one of. The block it belongs to is the
     /// guarded signature.
-    pub fn sign_execution_payload_envelope(
+    pub async fn sign_execution_payload_envelope(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         envelope: &ExecutionPayloadEnvelope,
         slot: Slot,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
+        self.sign(
+            store,
+            pubkey,
+            self.envelope_signing_root(envelope, slot),
+            compute_epoch_at_slot(slot),
+            SigningBody::ExecutionPayloadEnvelope {
+                execution_payload_envelope: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data: envelope,
+                },
+            },
+        )
+        .await
+    }
+
+    /// A builder registration's signature.
+    ///
+    /// Signed under `compute_builder_domain(genesis_fork_version)`: the genesis
+    /// fork version and a zero validators root, per builder-specs, so a
+    /// registration verifies whatever fork the chain is in. Not
+    /// `DOMAIN_BEACON_BUILDER`, which is gloas's envelope domain. Not
+    /// slashable: a registration commits to nothing about the chain, and a
+    /// builder keeps only the newest one per validator.
+    ///
+    /// A remote signer is told no fork: Web3Signer builds this domain from the
+    /// genesis version of its own configuration, as this client does from
+    /// its.
+    pub async fn sign_validator_registration(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        registration: &ValidatorRegistrationV1,
+    ) -> Result<BlsSignature> {
+        let domain = compute_builder_domain(self.config.genesis_fork_version);
+        let root = compute_signing_root(registration.hash_tree_root(), domain);
+        // The epoch is only read for a block; a registration has none.
+        self.sign_under(
+            store,
+            &registration.pubkey,
+            root,
+            0,
+            None,
+            SigningBody::ValidatorRegistration {
+                validator_registration: registration,
+            },
+        )
+        .await
+    }
+
+    /// A proposer preferences message's signature, under
+    /// `DOMAIN_PROPOSER_PREFERENCES` at the fork version of the proposal
+    /// epoch itself.
+    ///
+    /// That is `get_signed_proposer_preferences` as of consensus-specs
+    /// v1.7.0-beta.4, `compute_fork_version(proposal_epoch)` read off the
+    /// schedule, and the `proposer_preferences` gossip rule verifies under the
+    /// same domain. Every other client signs and verifies this way
+    /// (Lighthouse, Prysm, Teku, Lodestar and Nimbus all take the fork of the
+    /// proposal's epoch).
+    ///
+    /// The rule before it, beta.2's, verified with `get_domain` on the
+    /// dependent block's state advanced to the lookahead start, which gives
+    /// the fork of the epoch before the proposal's. That differs only for a
+    /// proposal in the first epoch of a fork, and there Lighthouse refuses it
+    /// as a bad signature: it did so for every first-gloas-epoch preference
+    /// this client signed that way on a devnet. Not slashable.
+    ///
+    /// A remote signer is told the fork at the proposal epoch, from which
+    /// Web3Signer derives the same domain (Teku's
+    /// `signingRootForSignProposerPreferences` takes it at that epoch too).
+    pub async fn sign_proposer_preferences(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        preferences: &ProposerPreferences,
+    ) -> Result<BlsSignature> {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        let root = compute_signing_root(preferences.hash_tree_root(), domain);
+        self.sign(
+            store,
+            pubkey,
+            root,
+            proposal_epoch,
+            SigningBody::ProposerPreferences {
+                proposer_preferences: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data: preferences,
+                },
+            },
+        )
+        .await
     }
 
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.
@@ -345,13 +784,25 @@ impl SigningContext {
     /// Not slashable by the specification, and deduplicated per validator and
     /// slot by [`crate::payload_attestation`] only to avoid publishing the same
     /// vote twice.
-    pub fn sign_payload_attestation(
+    pub async fn sign_payload_attestation(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &PayloadAttestationData,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
+        self.sign(
+            store,
+            pubkey,
+            self.payload_attestation_signing_root(data),
+            compute_epoch_at_slot(data.slot),
+            SigningBody::PayloadAttestationMessage {
+                payload_attestation_message: Versioned {
+                    version: ForkName::Gloas.as_str().to_uppercase(),
+                    data,
+                },
+            },
+        )
+        .await
     }
 
     /// Sign a sync committee message for `slot` over `beacon_block_root`.
@@ -359,49 +810,70 @@ impl SigningContext {
     /// Not slashable, and deduplicated per validator and slot by
     /// [`crate::sync_committee`] only to avoid publishing the same message
     /// twice.
-    pub fn sign_sync_committee_message(
+    pub async fn sign_sync_committee_message(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
         beacon_block_root: Root,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.sync_committee_message_signing_root(slot, beacon_block_root),
+            compute_epoch_at_slot(slot),
+            SigningBody::SyncCommitteeMessage {
+                sync_committee_message: SyncCommitteeMessage {
+                    beacon_block_root,
+                    slot,
+                },
+            },
         )
+        .await
     }
 
     /// Sign the sync committee selection proof for `slot` and one
     /// subcommittee. Deterministic, so not guarded, for the reason
     /// [`Self::sign_selection_proof`] is not.
-    pub fn sign_sync_selection_proof(
+    pub async fn sign_sync_selection_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         slot: Slot,
         subcommittee_index: u64,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.sync_selection_proof_signing_root(slot, subcommittee_index),
+            compute_epoch_at_slot(slot),
+            SigningBody::SyncCommitteeSelectionProof {
+                sync_aggregator_selection_data: SyncAggregatorSelectionData {
+                    slot,
+                    subcommittee_index,
+                },
+            },
         )
+        .await
     }
 
     /// Sign a `ContributionAndProof` on behalf of its aggregator `pubkey`.
-    pub fn sign_contribution_and_proof(
+    pub async fn sign_contribution_and_proof(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         message: &ContributionAndProof,
     ) -> Result<BlsSignature> {
-        self.sign_root(
+        self.sign(
             store,
             pubkey,
             self.contribution_and_proof_signing_root(message),
+            compute_epoch_at_slot(message.contribution.slot),
+            SigningBody::SyncCommitteeContributionAndProof {
+                contribution_and_proof: message,
+            },
         )
+        .await
     }
 
     /// Sign a voluntary exit on behalf of `pubkey`.
@@ -414,20 +886,35 @@ impl SigningContext {
     /// signed message to its caller, which is what then decides to publish.
     ///
     /// `current_epoch` is the chain's, by the caller's clock; see
-    /// [`Self::voluntary_exit_signing_root`] for why the domain needs it.
-    pub fn sign_voluntary_exit(
+    /// [`Self::voluntary_exit_signing_root`] for why the domain needs it, and
+    /// [`Self::voluntary_exit_fork_info`] for what a remote signer is told.
+    pub async fn sign_voluntary_exit(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         exit: &VoluntaryExit,
         current_epoch: Epoch,
     ) -> Result<BlsSignature> {
-        let root = self.voluntary_exit_signing_root(exit, current_epoch);
-        self.sign_root(store, pubkey, root)
+        self.sign_under(
+            store,
+            pubkey,
+            self.voluntary_exit_signing_root(exit, current_epoch),
+            exit.epoch,
+            Some(self.voluntary_exit_fork_info(exit, current_epoch)),
+            SigningBody::VoluntaryExit {
+                voluntary_exit: exit,
+            },
+        )
+        .await
     }
 
-    /// Sign the block whose root is `block_root`, proposed for `slot`, on
-    /// behalf of `pubkey`.
+    /// Sign the block whose header is `header` on behalf of `pubkey`.
+    ///
+    /// The root signed is the header's, which is the block's: a header is the
+    /// block with its body replaced by that body's root, and the two
+    /// merkleize to the same value. The header rather than the root travels
+    /// because a remote signer reads it to keep its slashing-protection
+    /// record.
     ///
     /// This one *is* slashable, and is the most expensive signature this
     /// client can get wrong: two distinct blocks for one slot need no second
@@ -435,14 +922,26 @@ impl SigningContext {
     /// evidence. Callers must have it allowed and recorded by
     /// [`crate::slashing_protection::SlashingProtection::check_and_record_block`]
     /// first.
-    pub fn sign_block(
+    pub async fn sign_block(
         &self,
-        store: &ValidatorStore,
+        store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        block_root: Root,
-        slot: Slot,
+        header: &BeaconBlockHeader,
     ) -> Result<BlsSignature> {
-        self.sign_root(store, pubkey, self.block_signing_root(block_root, slot))
+        let epoch = compute_epoch_at_slot(header.slot);
+        self.sign(
+            store,
+            pubkey,
+            self.block_signing_root(header.hash_tree_root(), header.slot),
+            epoch,
+            SigningBody::Block {
+                beacon_block: VersionedHeader {
+                    version: self.fork_label(epoch),
+                    block_header: header.clone(),
+                },
+            },
+        )
+        .await
     }
 }
 
@@ -460,10 +959,7 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(Config::mainnet(), Root::ZERO)
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {
@@ -482,17 +978,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_signature_verifies_under_the_signing_root() {
+    #[tokio::test]
+    async fn a_signature_verifies_under_the_signing_root() {
         use blst::min_pk::{PublicKey, Signature};
 
-        let mut store = ValidatorStore::new();
-        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let (store, pubkey) = store_with_key();
         let context = context();
         let data = attestation_data(100);
 
         let signature = context
             .sign_attestation(&store, &pubkey, &data)
+            .await
             .expect("signs");
 
         let root = context.attestation_signing_root(&data);
@@ -502,6 +998,84 @@ mod tests {
             sig.verify(true, root.as_slice(), DST, &[], &pk, true),
             blst::BLST_ERROR::BLST_SUCCESS
         );
+    }
+
+    /// One request that never answers costs its own signature, after the
+    /// budget, and nothing else: the others come back as they were.
+    #[tokio::test(start_paused = true)]
+    async fn a_signature_past_the_budget_does_not_hold_back_the_rest() {
+        use futures_util::FutureExt as _;
+
+        let started = tokio::time::Instant::now();
+        let answered = BlsPubkey([1; 48]);
+        let hung = BlsPubkey([2; 48]);
+        let results = sign_all([
+            (answered, async { Ok(7u8) }.boxed()),
+            (hung, std::future::pending().boxed()),
+        ])
+        .await;
+
+        assert_eq!(started.elapsed(), SIGNING_BUDGET);
+        assert!(matches!(results[0], Ok(7)));
+        assert!(
+            matches!(&results[1], Err(Error::Signing { pubkey, .. }) if *pubkey == hung),
+            "the late one is a signing failure for its own key"
+        );
+    }
+
+    /// A batch given a budget of its own waits that long and no longer, and
+    /// an answer that needed more than a duty's budget is kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_with_its_own_budget_waits_that_long() {
+        use futures_util::FutureExt as _;
+
+        let budget = 3 * SIGNING_BUDGET;
+        let started = tokio::time::Instant::now();
+        let slow = BlsPubkey([1; 48]);
+        let hung = BlsPubkey([2; 48]);
+        let results = sign_all_within(
+            budget,
+            [
+                (
+                    slow,
+                    async {
+                        tokio::time::sleep(2 * SIGNING_BUDGET).await;
+                        Ok(7u8)
+                    }
+                    .boxed(),
+                ),
+                (hung, std::future::pending().boxed()),
+            ],
+        )
+        .await;
+
+        assert_eq!(started.elapsed(), budget);
+        assert!(
+            matches!(results[0], Ok(7)),
+            "past a duty's budget, inside this one"
+        );
+        assert!(matches!(&results[1], Err(Error::Signing { pubkey, .. }) if *pubkey == hung));
+    }
+
+    /// A remembered proof is for a validator this client serves. Once the
+    /// keymanager has deleted the key its proofs answer nothing, so the
+    /// aggregation stops at the selection rather than fetching an aggregate
+    /// it then cannot sign.
+    #[tokio::test]
+    async fn a_remembered_selection_proof_is_not_handed_out_for_a_deleted_key() {
+        let (store, pubkey) = store_with_key();
+        let context = context();
+        context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect("signs");
+
+        assert!(store.write().await.remove(&pubkey));
+        let err = context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect_err("the key is gone");
+        assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
 
     #[test]
@@ -545,11 +1119,12 @@ mod tests {
         assert_eq!(context.attestation_signing_root(&data), from_target);
     }
 
-    #[test]
-    fn signing_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
             .sign_attestation(&store, &BlsPubkey::default(), &attestation_data(1))
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
@@ -566,18 +1141,175 @@ mod tests {
         sig.verify(true, root.as_slice(), DST, &[], &pk, true) == blst::BLST_ERROR::BLST_SUCCESS
     }
 
-    fn store_with_key() -> (ValidatorStore, BlsPubkey) {
+    fn store_with_key() -> (RwLock<ValidatorStore>, BlsPubkey) {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
-        (store, pubkey)
+        (RwLock::new(store), pubkey)
     }
 
-    #[test]
-    fn a_randao_reveal_verifies_under_the_randao_signing_root() {
+    fn header(slot: Slot) -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot,
+            proposer_index: 7,
+            parent_root: Root::repeat_byte(1),
+            state_root: Root::repeat_byte(2),
+            body_root: Root::repeat_byte(3),
+        }
+    }
+
+    fn registration(pubkey: BlsPubkey) -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            gas_limit: 36_000_000,
+            timestamp: 1_700_000_000,
+            pubkey,
+        }
+    }
+
+    /// A context whose genesis validators root is not zero, so the builder
+    /// domain (which zeroes it) and a context-derived one cannot coincide.
+    fn context_with_validators_root() -> SigningContext {
+        SigningContext::new(Config::mainnet(), Root::repeat_byte(0x42))
+    }
+
+    #[tokio::test]
+    async fn a_registration_is_signed_under_the_builder_domain() {
+        use ethlambda_types::beacon::constants::DOMAIN_APPLICATION_BUILDER;
+
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .await
+            .expect("signs");
+
+        let root = compute_signing_root(
+            registration.hash_tree_root(),
+            compute_builder_domain(Config::mainnet().genesis_fork_version),
+        );
+        assert!(verify(&pubkey, &signature, root));
+
+        // The same domain type under this chain's validators root is a
+        // different domain: a context-derived one would not verify.
+        let with_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_APPLICATION_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, with_root));
+    }
+
+    /// The registration domain is not gloas's envelope domain, whose type
+    /// constant is similar in name only: a signature under one must not verify
+    /// under the other.
+    #[tokio::test]
+    async fn a_registration_does_not_verify_under_the_envelope_domain() {
+        let (store, pubkey) = store_with_key();
+        let context = context_with_validators_root();
+        let registration = registration(pubkey);
+
+        let signature = context
+            .sign_validator_registration(&store, &registration)
+            .await
+            .expect("signs");
+
+        let envelope_root = compute_signing_root(
+            registration.hash_tree_root(),
+            context.domain(DOMAIN_BEACON_BUILDER, 0),
+        );
+        assert!(!verify(&pubkey, &signature, envelope_root));
+    }
+
+    /// A config whose gloas fork starts at epoch 500000, fulu being active
+    /// well before it, with a non-zero validators root.
+    fn gloas_scheduled_context() -> (SigningContext, Epoch) {
+        const GLOAS_EPOCH: Epoch = 500_000;
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = GLOAS_EPOCH;
+        (
+            SigningContext::new(config, Root::repeat_byte(0x42)),
+            GLOAS_EPOCH,
+        )
+    }
+
+    fn preferences_for(slot: Slot) -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: Root::repeat_byte(0x11),
+            proposal_slot: slot,
+            validator_index: 3,
+            fee_recipient: ethlambda_types::beacon::primitives::H160([0xab; 20]),
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Whether a preference for `slot`, signed by the client, verifies under
+    /// fulu's and under gloas's version of `DOMAIN_PROPOSER_PREFERENCES`, in
+    /// that order. The domains are spelled out rather than asked of
+    /// [`SigningContext::domain`], so the test does not share the signer's
+    /// choice of epoch.
+    async fn preference_verifies_under_fulu_and_gloas(slot: Slot) -> (bool, bool) {
+        let (store, pubkey) = store_with_key();
+        let (context, _) = gloas_scheduled_context();
+        let preferences = preferences_for(slot);
+
+        let signature = context
+            .sign_proposer_preferences(&store, &pubkey, &preferences)
+            .await
+            .expect("signs");
+
+        let verifies_under = |version| {
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), domain);
+            verify(&pubkey, &signature, root)
+        };
+        (
+            verifies_under(context.config.fulu_fork_version),
+            verifies_under(context.config.gloas_fork_version),
+        )
+    }
+
+    /// The first gloas epoch's preference is signed at gloas's version, the
+    /// proposal epoch's own, which is what beta.4's gossip rule and every
+    /// other client verify. Fulu's, the version beta.2's rule gave (the epoch
+    /// before the proposal's), is what Lighthouse refused as a bad signature.
+    #[tokio::test]
+    async fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
+
+        assert!(under_gloas, "the proposal epoch's version");
+        assert!(!under_fulu, "not the version of the epoch before it");
+    }
+
+    /// One epoch later beta.2's rule gives gloas's version too, so the two
+    /// rules agree from here on.
+    #[tokio::test]
+    async fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
+        let (_, gloas_epoch) = gloas_scheduled_context();
+        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+
+        let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
+
+        assert!(under_gloas);
+        assert!(!under_fulu);
+    }
+
+    #[tokio::test]
+    async fn a_randao_reveal_verifies_under_the_randao_signing_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
-        let signature = context.sign_randao(&store, &pubkey, 100).expect("signs");
+        let signature = context
+            .sign_randao(&store, &pubkey, 100)
+            .await
+            .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
@@ -585,19 +1317,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_block_signature_verifies_under_the_block_signing_root() {
+    #[tokio::test]
+    async fn a_block_signature_verifies_under_the_block_signing_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
-        let block_root = Root::repeat_byte(7);
+        let header = header(3200);
 
         let signature = context
-            .sign_block(&store, &pubkey, block_root, 3200)
+            .sign_block(&store, &pubkey, &header)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
-            context.block_signing_root(block_root, 3200)
+            context.block_signing_root(header.hash_tree_root(), 3200)
         ));
     }
 
@@ -700,22 +1433,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signing_a_block_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_a_block_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
-            .sign_block(&store, &BlsPubkey::default(), Root::ZERO, 1)
+            .sign_block(&store, &BlsPubkey::default(), &header(1))
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
     }
 
-    #[test]
-    fn a_selection_proof_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_selection_proof_verifies_under_its_own_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
         let signature = context
             .sign_selection_proof(&store, &pubkey, 3200)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -724,30 +1459,43 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn an_aggregate_signature_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn an_aggregate_signature_verifies_under_its_own_root() {
+        use ethlambda_types::beacon::containers::electra;
+
         let (store, pubkey) = store_with_key();
         let context = context();
-        let root = Root::repeat_byte(4);
+        let message = electra::AggregateAndProof {
+            aggregator_index: 9,
+            aggregate: electra::Attestation {
+                aggregation_bits: Default::default(),
+                data: attestation_data(100),
+                signature: BlsSignature([2; 96]),
+                committee_bits: Default::default(),
+            },
+            selection_proof: BlsSignature([3; 96]),
+        };
 
         let signature = context
-            .sign_aggregate_and_proof(&store, &pubkey, root, 3200)
+            .sign_aggregate_and_proof(&store, &pubkey, AggregateAndProofRef::Electra(&message))
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
             &signature,
-            context.aggregate_and_proof_signing_root(root, 3200)
+            context.aggregate_and_proof_signing_root(message.hash_tree_root(), 3200)
         ));
     }
 
-    #[test]
-    fn a_sync_committee_message_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_sync_committee_message_verifies_under_its_own_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
         let root = Root::repeat_byte(5);
 
         let signature = context
             .sign_sync_committee_message(&store, &pubkey, 3200, root)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -772,13 +1520,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_sync_selection_proof_verifies_and_names_the_subcommittee() {
+    #[tokio::test]
+    async fn a_sync_selection_proof_verifies_and_names_the_subcommittee() {
         let (store, pubkey) = store_with_key();
         let context = context();
 
         let signature = context
             .sign_sync_selection_proof(&store, &pubkey, 3200, 2)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -797,8 +1546,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_contribution_and_proof_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_contribution_and_proof_verifies_under_its_own_root() {
         use ethlambda_types::beacon::containers::altair::SyncCommitteeContribution;
 
         let (store, pubkey) = store_with_key();
@@ -817,6 +1566,7 @@ mod tests {
 
         let signature = context
             .sign_contribution_and_proof(&store, &pubkey, &message)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -835,8 +1585,8 @@ mod tests {
         compute_signing_root(exit.hash_tree_root(), domain)
     }
 
-    #[test]
-    fn a_voluntary_exit_verifies_under_its_own_root() {
+    #[tokio::test]
+    async fn a_voluntary_exit_verifies_under_its_own_root() {
         let (store, pubkey) = store_with_key();
         let context = context();
         let exit = VoluntaryExit {
@@ -846,6 +1596,7 @@ mod tests {
 
         let signature = context
             .sign_voluntary_exit(&store, &pubkey, &exit, exit.epoch)
+            .await
             .expect("signs");
         assert!(verify(
             &pubkey,
@@ -917,6 +1668,74 @@ mod tests {
         );
     }
 
+    /// A remote signer derives an exit's root itself, from the fork it is
+    /// told, and refuses a request whose `signingRoot` is another. So what it
+    /// derives has to be the root this client signs, for every pairing of
+    /// the exit's epoch and the chain's.
+    ///
+    /// `derived` is Teku's rule, which Web3Signer signs through: the capella
+    /// version from deneb on, `get_domain` over the fork it was told before.
+    /// Older releases pick between the two by the exit's epoch and current
+    /// ones by the told fork's epoch; the fork told names the exit's epoch,
+    /// so here the two readings are one.
+    #[test]
+    fn a_remote_signer_derives_the_exits_root_from_the_fork_it_is_told() {
+        let context = context();
+        let config = &context.config;
+        let derived = |exit: &VoluntaryExit, told: &ForkInfo| {
+            let version = if config.fork_at_epoch(told.fork.epoch) >= ForkName::Deneb {
+                config.capella_fork_version
+            } else if exit.epoch < told.fork.epoch {
+                told.fork.previous_version
+            } else {
+                told.fork.current_version
+            };
+            exit_root_under(&context, exit, version)
+        };
+
+        let past_deneb = config.electra_fork_epoch + 1_000;
+        let in_bellatrix = config.bellatrix_fork_epoch + 5;
+        for (exit_epoch, current_epoch) in [
+            // On a chain past deneb: the current epoch, epoch 0, and the last
+            // epoch before deneb.
+            (past_deneb, past_deneb),
+            (0, past_deneb),
+            (config.deneb_fork_epoch - 1, past_deneb),
+            // Pre-signed for a deneb epoch while the chain is still before it.
+            (config.deneb_fork_epoch, config.altair_fork_epoch),
+            // On a chain before deneb: this fork, one fork back, two back.
+            (in_bellatrix, in_bellatrix),
+            (config.altair_fork_epoch + 1, in_bellatrix),
+            (config.altair_fork_epoch - 1, in_bellatrix),
+        ] {
+            let exit = VoluntaryExit {
+                epoch: exit_epoch,
+                validator_index: 1,
+            };
+            let told = context.voluntary_exit_fork_info(&exit, current_epoch);
+            assert_eq!(told.fork.epoch, exit.epoch);
+            assert_eq!(
+                derived(&exit, &told),
+                context.voluntary_exit_signing_root(&exit, current_epoch),
+                "exit epoch {exit_epoch} on a chain at epoch {current_epoch}"
+            );
+        }
+
+        // What the schedule says at the exit's epoch is not it: from deneb on
+        // that is a version no exit is signed under.
+        let exit = VoluntaryExit {
+            epoch: past_deneb,
+            validator_index: 1,
+        };
+        assert_ne!(
+            context.fork_info(exit.epoch).fork.current_version,
+            context
+                .voluntary_exit_fork_info(&exit, past_deneb)
+                .fork
+                .current_version
+        );
+    }
+
     /// Before deneb the ordinary rule held: the version of the fork at the
     /// exit's epoch, for an exit processed in that fork.
     #[test]
@@ -965,12 +1784,575 @@ mod tests {
         );
     }
 
-    #[test]
-    fn signing_a_randao_reveal_for_an_unknown_validator_is_an_error() {
-        let store = ValidatorStore::new();
+    #[tokio::test]
+    async fn signing_a_randao_reveal_for_an_unknown_validator_is_an_error() {
+        let store = RwLock::new(ValidatorStore::new());
         let err = context()
             .sign_randao(&store, &BlsPubkey::default(), 1)
+            .await
             .expect_err("must fail");
         assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
+    }
+
+    /// `fork_info` must describe the fork at the epoch the domain was taken
+    /// at, since the remote signer recomputes the domain from it. Mainnet's
+    /// altair boundary pins all three fields on either side.
+    #[test]
+    fn fork_info_names_the_fork_at_the_epoch_and_its_predecessor() {
+        let context = context();
+        let altair = context.config.altair_fork_epoch;
+
+        let before = context.fork_info(altair - 1);
+        assert_eq!(
+            before.fork.current_version,
+            context.config.genesis_fork_version
+        );
+        assert_eq!(
+            before.fork.previous_version, before.fork.current_version,
+            "phase0 has no predecessor and names itself twice"
+        );
+        assert_eq!(before.fork.epoch, 0);
+
+        let after = context.fork_info(altair);
+        assert_eq!(
+            after.fork.current_version,
+            context.config.altair_fork_version
+        );
+        assert_eq!(
+            after.fork.previous_version,
+            context.config.genesis_fork_version
+        );
+        assert_eq!(after.fork.epoch, altair);
+        assert_eq!(
+            after.genesis_validators_root,
+            context.genesis_validators_root
+        );
+    }
+
+    /// A remote signer, stood in for by a local HTTP server: the request it
+    /// receives is the one Web3Signer documents, and the signature it returns
+    /// is what the caller gets back.
+    mod remote {
+        use super::*;
+        use axum::Router;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// What the fake signer does: records every request and answers with
+        /// a signature, or with a fixed status.
+        #[derive(Clone)]
+        struct Fake {
+            requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+            answer: Arc<Mutex<Answer>>,
+            /// How many requests are being answered right now, and the most
+            /// that ever were at once.
+            in_flight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Answer {
+            /// The test key's signature over the request's `signingRoot`, as
+            /// a signer holding that key would give.
+            Signature,
+            /// The same, after a pause long enough for requests to overlap.
+            SlowSignature,
+            /// A well-formed signature over the request's `signingRoot`, by a
+            /// key other than the one asked for.
+            AnotherKeysSignature,
+            /// The test key's signature, over a root other than the request's.
+            AnotherRootsSignature,
+            /// 96 bytes that are not a signature at all.
+            Garbage,
+            Status(u16),
+        }
+
+        /// `secret`'s signature over `root`, as hex.
+        fn signature_hex(secret: &[u8; 32], root: &[u8]) -> String {
+            let secret_key = blst::min_pk::SecretKey::from_bytes(secret).expect("a valid scalar");
+            hex::encode(secret_key.sign(root, DST, &[]).to_bytes())
+        }
+
+        /// A second key, for a signer that answers with the wrong one.
+        fn other_secret() -> [u8; 32] {
+            let mut bytes = secret();
+            bytes[31] ^= 0x01;
+            bytes
+        }
+
+        async fn handle(
+            State(fake): State<Fake>,
+            Path(pubkey): Path<String>,
+            body: String,
+        ) -> (StatusCode, String) {
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+            let root = hex::decode(
+                json["signingRoot"]
+                    .as_str()
+                    .expect("a signing root")
+                    .trim_start_matches("0x"),
+            )
+            .expect("hex");
+            fake.requests.lock().expect("lock").push((pubkey, json));
+            let signed = |signature: String| {
+                (
+                    StatusCode::OK,
+                    format!("{{\"signature\":\"0x{signature}\"}}"),
+                )
+            };
+            let answer = *fake.answer.lock().expect("lock");
+            if matches!(answer, Answer::SlowSignature) {
+                let now = fake.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                fake.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                fake.in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            match answer {
+                Answer::Signature | Answer::SlowSignature => {
+                    signed(signature_hex(&secret(), &root))
+                }
+                Answer::AnotherKeysSignature => signed(signature_hex(&other_secret(), &root)),
+                Answer::AnotherRootsSignature => signed(signature_hex(&secret(), &[0x11; 32])),
+                Answer::Garbage => signed("ab".repeat(96)),
+                Answer::Status(code) => (
+                    StatusCode::from_u16(code).expect("status"),
+                    "refused".to_string(),
+                ),
+            }
+        }
+
+        /// Start the fake on an ephemeral port and return it with its URL.
+        async fn serve(answer: Answer) -> (Fake, String) {
+            let fake = Fake {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                answer: Arc::new(Mutex::new(answer)),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+            };
+            let app = Router::new()
+                .route("/api/v1/eth2/sign/{pubkey}", post(handle))
+                .with_state(fake.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("binds");
+            let address = listener.local_addr().expect("address");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serves");
+            });
+            (fake, format!("http://{address}"))
+        }
+
+        /// A store whose one key, the test key's, is held by the signer at
+        /// `url` and not by this process.
+        fn remote_store(url: &str) -> (RwLock<ValidatorStore>, BlsPubkey) {
+            let pubkey = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
+            let mut store = ValidatorStore::new();
+            store.insert_remote(pubkey, url).expect("inserts");
+            (RwLock::new(store), pubkey)
+        }
+
+        #[tokio::test]
+        async fn an_attestation_is_signed_by_the_remote_signer() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let data = attestation_data(context.config.altair_fork_epoch + 1);
+
+            let signature = context
+                .sign_attestation(&store, &pubkey, &data)
+                .await
+                .expect("signs");
+            assert!(
+                verify(&pubkey, &signature, context.attestation_signing_root(&data)),
+                "the signer's signature is the one returned"
+            );
+
+            let requests = fake.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 1);
+            let (path_pubkey, body) = &requests[0];
+            assert_eq!(path_pubkey, &format!("0x{}", hex::encode(pubkey.0)));
+            assert_eq!(body["type"], "ATTESTATION");
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(context.attestation_signing_root(&data)).expect("root")
+            );
+            assert_eq!(
+                body["attestation"]["target"]["epoch"],
+                data.target.epoch.to_string()
+            );
+            assert_eq!(
+                body["fork_info"],
+                serde_json::to_value(context.fork_info(data.target.epoch)).expect("fork info"),
+                "the fork is the target epoch's, where the domain came from"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_block_request_names_the_fork_and_carries_the_header() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let slot = context.config.electra_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let header = header(slot);
+
+            context
+                .sign_block(&store, &pubkey, &header)
+                .await
+                .expect("signs");
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "BLOCK_V2");
+            assert_eq!(body["beacon_block"]["version"], "ELECTRA");
+            assert_eq!(
+                body["beacon_block"]["block_header"]["slot"],
+                slot.to_string()
+            );
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(context.block_signing_root(header.hash_tree_root(), slot))
+                    .expect("root")
+            );
+        }
+
+        /// A builder registration for a key in a remote signer: the signer
+        /// is told no fork, since it builds the builder domain from its own
+        /// genesis version, and the root sent is that domain's.
+        #[tokio::test]
+        async fn a_registration_is_signed_by_the_remote_signer_and_told_no_fork() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context_with_validators_root();
+            let registration = registration(pubkey);
+
+            let signature = context
+                .sign_validator_registration(&store, &registration)
+                .await
+                .expect("signs");
+            let root = compute_signing_root(
+                registration.hash_tree_root(),
+                compute_builder_domain(context.config.genesis_fork_version),
+            );
+            assert!(verify(&pubkey, &signature, root));
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "VALIDATOR_REGISTRATION");
+            assert!(body.get("fork_info").is_none(), "got {body}");
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(root).expect("root")
+            );
+            assert_eq!(body["validator_registration"]["gas_limit"], "36000000");
+        }
+
+        /// The registration service signs each chunk on the blocking pool, a
+        /// remote key's request included: it goes out and comes back from
+        /// there, beside a local key's signature, on a runtime like the
+        /// client's own. A signer that refuses costs its own key only.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_registration_service_signs_remote_and_local_keys_together() {
+            use crate::beacon_node::mock::MockBeaconNode;
+            use crate::registration::RegistrationService;
+            use ethlambda_types::beacon::primitives::H160;
+
+            for (answer, remote_registered) in
+                [(Answer::Signature, true), (Answer::Status(412), false)]
+            {
+                let (fake, url) = serve(answer).await;
+                let remote = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
+                let mut store = ValidatorStore::new();
+                store.insert_remote(remote, &url).expect("inserts");
+                let local = store
+                    .insert_secret("local", &other_secret())
+                    .expect("inserts");
+                let store = Arc::new(RwLock::new(store));
+
+                let node = Arc::new(MockBeaconNode::new());
+                let context = Arc::new(context_with_validators_root());
+                let settings = crate::test_support::settings(Some(H160([0xab; 20])));
+                let service = Arc::new(RegistrationService::new(
+                    node.clone(),
+                    context.clone(),
+                    settings,
+                ));
+
+                service.register_all(0, vec![remote, local], store).await;
+
+                let sent = node.registrations.lock().expect("lock").clone();
+                let domain = compute_builder_domain(context.config.genesis_fork_version);
+                for registration in &sent {
+                    let root = compute_signing_root(registration.message.hash_tree_root(), domain);
+                    assert!(verify(
+                        &registration.message.pubkey,
+                        &registration.signature,
+                        root
+                    ));
+                }
+                let registered = |pubkey| sent.iter().any(|r| r.message.pubkey == pubkey);
+                assert!(registered(local), "the local key is registered either way");
+                assert_eq!(registered(remote), remote_registered);
+
+                let requests = fake.requests.lock().expect("lock");
+                assert_eq!(requests.len(), 1, "one request, for the remote key");
+                assert_eq!(requests[0].1["type"], "VALIDATOR_REGISTRATION");
+            }
+        }
+
+        /// Proposer preferences for the first gloas epoch: the fork told is
+        /// the proposal epoch's, gloas, from which the signer derives the
+        /// domain this client signs under.
+        #[tokio::test]
+        async fn proposer_preferences_are_signed_remotely_under_the_proposal_epochs_fork() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let (context, gloas_epoch) = gloas_scheduled_context();
+            let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+            let preferences = preferences_for(slot);
+
+            let signature = context
+                .sign_proposer_preferences(&store, &pubkey, &preferences)
+                .await
+                .expect("signs");
+            let gloas_domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                context.config.gloas_fork_version,
+                context.genesis_validators_root,
+            );
+            let root = compute_signing_root(preferences.hash_tree_root(), gloas_domain);
+            assert!(verify(&pubkey, &signature, root));
+
+            let requests = fake.requests.lock().expect("lock");
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "PROPOSER_PREFERENCES");
+            assert_eq!(body["proposer_preferences"]["version"], "GLOAS");
+            assert_eq!(
+                body["proposer_preferences"]["data"]["proposal_slot"],
+                slot.to_string()
+            );
+            assert_eq!(
+                body["fork_info"],
+                serde_json::to_value(context.fork_info(gloas_epoch)).expect("fork info"),
+                "the fork at the proposal epoch, where the domain came from"
+            );
+        }
+
+        /// An exit for a key in a remote signer: the message travels in
+        /// full, under the root this client derived, and the fork told is
+        /// the capella version twice over (EIP-7044) rather than the fork
+        /// the schedule has at the exit's epoch.
+        #[tokio::test]
+        async fn a_voluntary_exit_is_signed_by_the_remote_signer() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let now = context.config.electra_fork_epoch + 1_000;
+            // Naming an epoch from before deneb, on a chain well past it.
+            let exit = VoluntaryExit {
+                epoch: context.config.altair_fork_epoch,
+                validator_index: 42,
+            };
+
+            let signature = context
+                .sign_voluntary_exit(&store, &pubkey, &exit, now)
+                .await
+                .expect("signs");
+            let root = context.voluntary_exit_signing_root(&exit, now);
+            assert!(verify(&pubkey, &signature, root));
+
+            let requests = fake.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 1);
+            let body = &requests[0].1;
+            assert_eq!(body["type"], "VOLUNTARY_EXIT");
+            assert_eq!(body["voluntary_exit"]["epoch"], exit.epoch.to_string());
+            assert_eq!(body["voluntary_exit"]["validator_index"], "42");
+            assert_eq!(
+                body["signingRoot"],
+                serde_json::to_value(root).expect("root")
+            );
+            let capella = serde_json::to_value(Fork {
+                previous_version: context.config.capella_fork_version,
+                current_version: context.config.capella_fork_version,
+                epoch: exit.epoch,
+            })
+            .expect("fork");
+            assert_eq!(body["fork_info"]["fork"], capella);
+        }
+
+        /// Before bellatrix the signer wants the full block, which this
+        /// client never sends, so the request is refused rather than made.
+        #[tokio::test]
+        async fn a_pre_bellatrix_block_is_not_sent_to_the_signer() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+            let err = context
+                .sign_block(&store, &pubkey, &header(slot))
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(fake.requests.lock().expect("lock").is_empty());
+        }
+
+        /// What the signer answers is checked before it is used: a signature
+        /// by another key, over another root, or that is no signature at all
+        /// is a signing failure for that key, never something to publish.
+        #[tokio::test]
+        async fn a_signature_that_does_not_verify_is_a_signing_error() {
+            for answer in [
+                Answer::AnotherKeysSignature,
+                Answer::AnotherRootsSignature,
+                Answer::Garbage,
+            ] {
+                let (fake, url) = serve(answer).await;
+                let (store, pubkey) = remote_store(&url);
+
+                let err = context()
+                    .sign_attestation(&store, &pubkey, &attestation_data(100))
+                    .await
+                    .expect_err("must fail");
+                assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+                assert!(err.to_string().contains("does not verify"), "{err}");
+                assert!(!err.is_retryable());
+                assert_eq!(fake.requests.lock().expect("lock").len(), 1, "asked once");
+            }
+        }
+
+        /// The signer is asked for a selection proof once: the same key and
+        /// slot again is answered from memory, another slot is another ask.
+        #[tokio::test]
+        async fn a_selection_proof_is_remembered_once_produced() {
+            let (fake, url) = serve(Answer::Signature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+
+            let first = context
+                .sign_selection_proof(&store, &pubkey, 3200)
+                .await
+                .expect("signs");
+            let again = context
+                .sign_selection_proof(&store, &pubkey, 3200)
+                .await
+                .expect("remembered");
+            assert_eq!(first, again);
+            assert_eq!(fake.requests.lock().expect("lock").len(), 1, "asked once");
+
+            context
+                .sign_selection_proof(&store, &pubkey, 3201)
+                .await
+                .expect("signs");
+            assert_eq!(
+                fake.requests.lock().expect("lock").len(),
+                2,
+                "another slot is another proof"
+            );
+        }
+
+        /// A batch larger than the signer's cap is sent a capful at a time,
+        /// and every signature in it still arrives. Without the cap each
+        /// request in flight is a socket of its own, and a thousand keys at
+        /// an epoch boundary are a thousand sockets.
+        #[tokio::test]
+        async fn a_signer_is_never_sent_more_than_its_cap_at_once() {
+            use crate::keys::Web3Signer;
+
+            const CAP: usize = 4;
+            const ASKED: usize = 4 * CAP;
+
+            let (fake, url) = serve(Answer::SlowSignature).await;
+            let pubkey = ValidatorStore::derive_pubkey(&secret()).expect("a valid key");
+            let signer = Arc::new(Web3Signer::with_cap(&url, CAP).expect("a usable url"));
+            let mut store = ValidatorStore::new();
+            store.insert_remote_signer(pubkey, signer);
+            let store = RwLock::new(store);
+            let context = context();
+
+            let proofs = sign_all((0..ASKED as Slot).map(|slot| {
+                (
+                    pubkey,
+                    context.sign_selection_proof(&store, &pubkey, 3200 + slot),
+                )
+            }))
+            .await;
+
+            assert!(proofs.iter().all(Result::is_ok), "every proof arrives");
+            assert_eq!(fake.requests.lock().expect("lock").len(), ASKED);
+            assert_eq!(
+                fake.peak.load(Ordering::SeqCst),
+                CAP,
+                "the batch fills the cap and never passes it"
+            );
+        }
+
+        /// A selection proof that does not verify is not remembered: the
+        /// next ask goes to the signer again rather than being answered from
+        /// bytes that were never the proof.
+        #[tokio::test]
+        async fn an_unverified_selection_proof_is_not_remembered() {
+            let (fake, url) = serve(Answer::AnotherKeysSignature).await;
+            let (store, pubkey) = remote_store(&url);
+            let context = context();
+
+            context
+                .sign_selection_proof(&store, &pubkey, 100)
+                .await
+                .expect_err("must fail");
+            *fake.answer.lock().expect("lock") = Answer::Signature;
+            let proof = context
+                .sign_selection_proof(&store, &pubkey, 100)
+                .await
+                .expect("signs");
+            assert!(verify(
+                &pubkey,
+                &proof,
+                context.selection_proof_signing_root(100)
+            ));
+            assert_eq!(fake.requests.lock().expect("lock").len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_slashing_protection_refusal_is_a_signing_error() {
+            let (_fake, url) = serve(Answer::Status(412)).await;
+            let (store, pubkey) = remote_store(&url);
+
+            let err = context()
+                .sign_attestation(&store, &pubkey, &attestation_data(100))
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(err.to_string().contains("slashing protection"), "{err}");
+            assert!(!err.is_retryable());
+        }
+
+        #[tokio::test]
+        async fn a_key_the_signer_does_not_hold_is_a_signing_error() {
+            let (_fake, url) = serve(Answer::Status(404)).await;
+            let (store, pubkey) = remote_store(&url);
+
+            let err = context()
+                .sign_randao(&store, &pubkey, 1)
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+            assert!(err.to_string().contains("does not hold"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_signer_is_a_signing_error() {
+            // Nothing listens on port 9 (discard), and a connection refused
+            // comes back at once rather than after the request timeout.
+            let (store, pubkey) = remote_store("http://127.0.0.1:9");
+
+            let err = context()
+                .sign_randao(&store, &pubkey, 1)
+                .await
+                .expect_err("must fail");
+            assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
+        }
     }
 }

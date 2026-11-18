@@ -7,9 +7,10 @@
 //! per duty even when several share a committee.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::aggregation_selection::selection_for;
 use crate::beacon_node::BeaconNodeApi;
@@ -17,10 +18,33 @@ use ethlambda_types::beacon::primitives::Epoch;
 
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    parse_pubkey,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all_within};
+
+/// How long the selection proofs of one round of subscriptions may take.
+///
+/// Longer than a duty's `SIGNING_BUDGET`, because what stands behind the two
+/// differs. A duty has a slot deadline and publishes what it has. This runs
+/// in a task of its own that nothing waits on, and a proof that misses the
+/// budget is a duty subscribed without the aggregator role: the beacon node
+/// then does not keep the subnet for it, and if the aggregation tick finds
+/// the validator was selected after all, it has little or nothing to
+/// aggregate. Proofs are remembered, so in steady state a round asks for
+/// about one new proof per key and any budget fits. It is at startup, with
+/// two epochs of duties all new, or with thousands of remote keys behind a
+/// slow link, that the proofs queue for the signer's request slots and a
+/// duty's two seconds would send several hundred duties out without the
+/// role. One request's own timeout is the natural bound: a signer that has
+/// not answered in that long is not going to.
+///
+/// The subscriptions go out together, after the last proof, so a signer
+/// that hangs holds every one of them back this long. That is affordable
+/// here: the schedule covers this epoch and the next, so the duties that are
+/// near were subscribed an epoch ago.
+pub const SUBSCRIPTION_SIGNING_BUDGET: Duration = Duration::from_secs(8);
 
 /// Send one subscription per held duty, claiming the aggregator role for the
 /// duties this client was selected for.
@@ -47,37 +71,70 @@ pub async fn subscribe<B: BeaconNodeApi>(
         return Ok(());
     }
 
-    // The read guard is scoped to this block and never held across the await
-    // below, for the reason spelled out in `crate::attestation`: the lock is
-    // write-preferring, so one queued keymanager writer blocks every reader
-    // behind it.
-    let subscriptions: Vec<CommitteeSubscriptionDto> = {
-        let store = store.read().await;
-        duties
+    // Every selection proof is asked for at once, each within this call's
+    // own budget: one request per duty in series would cost a slow or
+    // unreachable signer as many round trips as there are duties before any
+    // subscription went out. Bounded this way it costs
+    // `SUBSCRIPTION_SIGNING_BUDGET` at most, and the proofs that did arrive
+    // are remembered for the aggregation tick (see
+    // `SigningContext::sign_selection_proof`). The duty loop runs this from
+    // a task of its own, after the slot's block, so that budget is never
+    // spent ahead of a proposal, or of any other duty.
+    let mut is_aggregator = vec![false; duties.len()];
+    let mut keyed = Vec::with_capacity(duties.len());
+    for (position, duty) in duties.iter().enumerate() {
+        match parse_pubkey(&duty.pubkey) {
+            Ok(pubkey) => keyed.push((position, duty, pubkey)),
+            Err(err) => warn!(
+                slot = duty.slot,
+                validator = duty.validator_index,
+                %err,
+                "Duty carried an unreadable pubkey; subscribing without the role"
+            ),
+        }
+    }
+    let selections = sign_all_within(
+        SUBSCRIPTION_SIGNING_BUDGET,
+        keyed
             .iter()
-            .map(|duty| {
-                let is_aggregator = match selection_for(context, &store, duty) {
-                    Ok(selection) => selection.is_some(),
-                    Err(err) => {
-                        warn!(
-                            slot = duty.slot,
-                            validator = duty.validator_index,
-                            %err,
-                            "Could not compute aggregator selection; subscribing without the role"
-                        );
-                        false
-                    }
-                };
-                CommitteeSubscriptionDto {
-                    validator_index: duty.validator_index,
-                    committee_index: duty.committee_index,
-                    committees_at_slot: duty.committees_at_slot,
-                    slot: duty.slot,
-                    is_aggregator,
-                }
-            })
-            .collect()
-    };
+            .map(|(_, duty, pubkey)| (*pubkey, selection_for(context, store, duty))),
+    )
+    .await;
+    for ((position, duty, _), selection) in keyed.into_iter().zip(selections) {
+        match selection {
+            Ok(selection) => is_aggregator[position] = selection.is_some(),
+            // A key the keymanager deleted since the schedule was fetched:
+            // nothing failed to sign, so nothing is counted. Its subscription
+            // still goes out, without the role, like any other it cannot
+            // claim one for.
+            Err(Error::UnknownValidator(_)) => debug!(
+                slot = duty.slot,
+                validator = duty.validator_index,
+                "Duty names a key this client no longer holds; subscribing without the role"
+            ),
+            Err(err) => {
+                warn!(
+                    slot = duty.slot,
+                    validator = duty.validator_index,
+                    %err,
+                    "Could not compute aggregator selection; subscribing without the role"
+                );
+                crate::metrics::inc_signing_failures();
+            }
+        }
+    }
+
+    let subscriptions: Vec<CommitteeSubscriptionDto> = duties
+        .iter()
+        .zip(is_aggregator)
+        .map(|(duty, is_aggregator)| CommitteeSubscriptionDto {
+            validator_index: duty.validator_index,
+            committee_index: duty.committee_index,
+            committees_at_slot: duty.committees_at_slot,
+            slot: duty.slot,
+            is_aggregator,
+        })
+        .collect();
 
     let aggregating = subscriptions
         .iter()
@@ -134,10 +191,7 @@ mod tests {
     }
 
     fn context() -> SigningContext {
-        SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        }
+        SigningContext::new(Config::mainnet(), Root::ZERO)
     }
 
     fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {
@@ -236,10 +290,10 @@ mod tests {
             .await
             .expect("subscribes");
 
-        let guard = store.read().await;
         for (duty, sent) in duties.iter().zip(node.subscriptions()) {
             let proof = context
-                .sign_selection_proof(&guard, &pubkey, duty.slot)
+                .sign_selection_proof(&store, &pubkey, duty.slot)
+                .await
                 .expect("signs");
             assert_eq!(
                 sent.is_aggregator,

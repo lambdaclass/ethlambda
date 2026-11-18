@@ -1,0 +1,86 @@
+name: "Setup Rust"
+description: >-
+  Installs the toolchain rust-toolchain.toml pins and restores the Rust build
+  cache. Every Rust cache in the repository goes through here, so the rule
+  that only main saves is written once, except the mdBook workflow's: it
+  installs its tools with `stable` rather than the pinned toolchain, so it
+  sets the same `save-if` on its own step. Modeled on ethrex's action of the
+  same name.
+
+inputs:
+  cache-key:
+    description: >-
+      Names this job's cache entry. Give each build that compiles a different
+      dependency graph its own (a profile, a preset, a package set), and give a
+      build that runs from two workflows (`ci.yml` and `daily_ci.yml` both run
+      the test halves) the same one, so the two share an entry.
+    required: true
+  components:
+    description: "Rust components to install (e.g. rustfmt, clippy)"
+    required: false
+    default: ""
+  workspaces:
+    description: >-
+      Cargo workspaces whose target dirs to cache, in rust-cache's
+      `workspace -> target` syntax. The default covers the repository root.
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Read the pinned toolchain and the runner image
+      id: env
+      shell: bash
+      run: |
+        # Either quote style, and anything after the closing quote (a comment,
+        # a CR from a CRLF checkout). A file this cannot read is an error
+        # rather than a silent fallback to some other toolchain.
+        toolchain=$(sed -nE "s/^[[:space:]]*channel[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" rust-toolchain.toml)
+        if [ -z "$toolchain" ]; then
+          echo "::error::no channel found in rust-toolchain.toml"
+          exit 1
+        fi
+        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+        # The image family (ubuntu24, ubuntu26, ...) goes into the key because
+        # rust-cache keys on `runner.os` and `runner.arch` only, which read
+        # `Linux`/`x64` on every Ubuntu image. Cached proc-macro `.so`s link
+        # against the glibc of the image that built them, so an entry from a
+        # newer image restored into an older one fails with `GLIBC_x.y not
+        # found` the moment rustc loads the macro. `ubuntu-latest` moves
+        # between families, and `vars.ETHLAMBDA_RUNNER` can point anywhere.
+        # Not `ImageVersion`, which changes weekly and would void every entry.
+        #
+        # `ImageOS` is set on GitHub-hosted images only. A self-hosted runner
+        # falls back to its distribution and release from /etc/os-release
+        # (`ubuntu24.04`), which separates glibc versions the same way.
+        image="${ImageOS:-}"
+        if [ -z "$image" ] && [ -r /etc/os-release ]; then
+          image=$(. /etc/os-release && echo "${ID:-}${VERSION_ID:-}")
+        fi
+        echo "image=${image:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.env.outputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    # The Actions cache holds 10 GB per repository and evicts least recently
+    # used first, while one target dir here is 1.2-2.2 GB, so it fits only a
+    # handful. Two rules keep them from evicting each other:
+    #
+    # - Only main saves. An entry saved on a PR or merge-queue ref can be
+    #   restored by that ref alone, so it costs budget and is never read again.
+    #   Each PR run used to save about 10 GB of them, which evicted main's
+    #   entries, so most PR jobs started from nothing.
+    # - The key is the `cache-key` input, not the job id, so a job's entry
+    #   does not move when a job is renamed, and `daily_ci.yml`'s test halves
+    #   share `ci.yml`'s entries instead of each saving a copy.
+    - name: Restore the build cache
+      uses: Swatinem/rust-cache@v2.9.3
+      with:
+        key: ${{ inputs.cache-key }}-${{ steps.env.outputs.image }}
+        add-job-id-key: false
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+        workspaces: ${{ inputs.workspaces }}
