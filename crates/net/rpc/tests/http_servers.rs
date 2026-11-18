@@ -21,18 +21,34 @@ use tokio_util::sync::CancellationToken;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-/// A port nothing is listening on, from an ephemeral bind that is then
+/// `N` ports nothing is listening on, from ephemeral binds that are then
 /// released. Racy in principle; the window is one test's worth of microseconds
 /// and the alternative is threading the bound address back out of
 /// `start_http_servers` for the tests' sake alone.
+///
+/// Every probe stays bound until all the ports are read, so the `N` are
+/// distinct: probing one at a time, the OS could hand out again the port the
+/// previous probe had just released.
+async fn free_ports<const N: usize>() -> [u16; N] {
+    let mut probes = Vec::with_capacity(N);
+    for _ in 0..N {
+        let probe = TcpListener::bind(SocketAddr::new(LOCALHOST, 0))
+            .await
+            .expect("an ephemeral port is available");
+        probes.push(probe);
+    }
+    std::array::from_fn(|i| {
+        probes[i]
+            .local_addr()
+            .expect("the probe socket has an addr")
+            .port()
+    })
+}
+
+/// One port nothing is listening on; see [`free_ports`].
 async fn free_port() -> u16 {
-    let probe = TcpListener::bind(SocketAddr::new(LOCALHOST, 0))
-        .await
-        .expect("an ephemeral port is available");
-    probe
-        .local_addr()
-        .expect("the probe socket has an addr")
-        .port()
+    let [port] = free_ports().await;
+    port
 }
 
 /// GET `path`, retrying the connect until the server is accepting.
@@ -68,13 +84,13 @@ fn status_line(response: &str) -> &str {
 
 #[tokio::test]
 async fn with_no_api_router_metrics_and_debug_are_served_on_the_metrics_port() {
-    let port = free_port().await;
+    let [port, api_port] = free_ports().await;
     let shutdown = CancellationToken::new();
     let config = RpcConfig {
         http_address: LOCALHOST,
         // Deliberately different from `metrics_port`: with no API router this
         // must not be bound at all, which the assertion below pins.
-        api_port: free_port().await,
+        api_port,
         metrics_port: port,
         version: "ethlambda/test",
     };
@@ -199,12 +215,7 @@ async fn a_connected_event_stream_does_not_hold_up_shutdown() {
 /// ports' shape, which starts two servers rather than one.
 #[tokio::test]
 async fn a_connected_event_stream_does_not_hold_up_shutdown_on_separate_ports() {
-    let api_port = free_port().await;
-    let metrics_port = free_port().await;
-    assert_ne!(
-        api_port, metrics_port,
-        "the probe handed out one port twice"
-    );
+    let [api_port, metrics_port] = free_ports().await;
     assert_an_event_stream_ends_on_shutdown(api_port, metrics_port).await;
 }
 
