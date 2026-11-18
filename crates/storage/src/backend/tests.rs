@@ -14,6 +14,7 @@ use crate::api::{StorageBackend, Table};
 /// Run the full test suite against a backend.
 pub fn run_backend_tests(backend: &dyn StorageBackend) {
     test_put_and_get(backend);
+    test_put_from_borrowed_bytes(backend);
     test_delete(backend);
     test_prefix_iterator(backend);
     test_nonexistent_key(backend);
@@ -45,6 +46,23 @@ fn test_put_and_get(backend: &dyn StorageBackend) {
         let value = view.get(Table::BlockHeaders, b"test_put_get_key").unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
     }
+}
+
+fn test_put_from_borrowed_bytes(backend: &dyn StorageBackend) {
+    let value = b"borrowed_value".to_vec();
+    {
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .put(Table::BlockHeaders, b"test_put_borrowed_key", &value)
+            .unwrap();
+        batch.commit().unwrap();
+    }
+
+    let view = backend.begin_read().unwrap();
+    let stored = view
+        .get(Table::BlockHeaders, b"test_put_borrowed_key")
+        .unwrap();
+    assert_eq!(stored, Some(value), "the caller's buffer is still its own");
 }
 
 fn test_contains(backend: &dyn StorageBackend) {
