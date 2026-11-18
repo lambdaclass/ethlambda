@@ -51,7 +51,7 @@ crates/
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
-  storage/                  # RocksDB backend, in-memory for tests
+  storage/                  # RocksDB backend (`rocksdb` feature), in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
 ```
 
@@ -102,6 +102,16 @@ make test                                    # All tests + forkchoice spec tests
 jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
 the Makefile names the first; `test-node` is the workspace minus it. Run one half
 directly when iterating on it.
+
+### Docs-only changes skip CI
+
+`ci.yml`'s `detect-changes` job skips every CI job for a pull request or merge
+group whose changed files are all documentation or repository metadata
+(`docs/**`, `theme/**`, `book.toml`, `**/*.md`, `LICENSE`, `**/.gitignore`,
+`.claude/**`; the list lives in `.github/actions/detect-changes`). That rests on
+nothing in a build or a test reading those paths. A crate that starts to (a
+`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
+take the path off the list, or a change to that file merges untested.
 
 ### Common Operations
 ```bash
@@ -880,7 +890,34 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded.
+  unguarded. A key can live
+  in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
+  `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
+  signer under a read guard scoped to the lookup and signs after releasing it,
+  and sends the remote signer the message in full so its own slashing
+  protection applies on top of this client's record, which a remote key is
+  registered in and checked against like a local one; the signature the
+  signer returns is verified against the pubkey and root before it is used,
+  on the blocking pool (`SigningContext::verified`), never inline on the duty
+  task. Each duty signs its batch at once through
+  `signing::sign_all`, every signature bounded by `SIGNING_BUDGET`, so one
+  hung signer loses only its own keys' signatures, though the batch is
+  published whole and so up to the budget late, local keys included; one
+  signer is sent at most
+  `MAX_CONCURRENT_REQUESTS` at a time. The epoch's subnet subscriptions, whose
+  selection proofs are round trips for remote keys, are sent from a spawned
+  task after the slot's proposal, not from `refresh_epoch`, with a longer
+  budget of their own (`SUBSCRIPTION_SIGNING_BUDGET`). Builder
+  registrations and proposer preferences sign through the same path
+  (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
+  `Web3Signer::normalize_url`'s rendering of its URL, which is what requests
+  are built from and clients are keyed by. Remote keys are
+  `type: web3signer`
+  entries in `validator_definitions.yml` or `POST /eth/v1/remotekeys` (default signer
+  `--web3signer-url`); `/keystores` and `/remotekeys` partition the store, and
+  both deletes go through `keystores::delete_keys` (one read and one save of
+  the definitions file per request, the store's write lock held only for the
+  in-memory removals).
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
@@ -1071,7 +1108,12 @@ behavior.
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**
-- `rocksdb`: Persistent backend
+- `rocksdb`: Persistent backend, behind `ethlambda-storage`'s `rocksdb` feature. Off by
+  default, so the crates that only store through `InMemoryBackend` (the state transition,
+  the chain actor, the consensus test half, both beacon spec-test builds) skip its C++
+  build; `bin/ethlambda` turns it on. `cargo test -p ethlambda-storage` alone leaves the
+  backend's own tests out: add `--features rocksdb`, or run them through the workspace
+  (`make test-node`), where the binary turns the feature on
 - In-memory backend for tests
 
 ## Resources

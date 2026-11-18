@@ -140,7 +140,7 @@ use crate::beacon_node::{BeaconNodeApi, Delivery};
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 use crate::slot_clock::SlotClock;
 
 /// Where one `(proposal_slot, dependent_root)`'s preference stands.
@@ -510,25 +510,29 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
     /// it since the poll took its snapshot of the keys. The others are signed
     /// all the same.
     ///
-    /// At most one per slot of the epoch (see [`within_epoch`]), so signing
-    /// inline is cheap. The read guard is released before the submits, and is
-    /// not taken at all when nothing is owed, so a quiet slot neither waits on
-    /// nor holds up a keymanager write.
+    /// At most one per slot of the epoch (see [`within_epoch`]). They are
+    /// asked for together through [`sign_all`], so a remote signer that hangs
+    /// costs these preferences the signing budget at most, and the store's
+    /// read guard is taken per lookup and released before each signature, so
+    /// a keymanager write never waits on a remote signer's round trip.
     async fn sign(
         &self,
-        store: &Arc<RwLock<ValidatorStore>>,
+        store: &RwLock<ValidatorStore>,
         owed: Vec<(BlsPubkey, ProposerPreferences, Before)>,
     ) -> Vec<(SignedProposerPreferences, Before)> {
         if owed.is_empty() {
             return Vec::new();
         }
-        let store = store.read().await;
-        let mut signed = Vec::with_capacity(owed.len());
-        for (pubkey, message, before) in owed {
-            match self
+        let requests = owed.iter().map(|(pubkey, message, _)| {
+            let signature = self
                 .context
-                .sign_proposer_preferences(&store, &pubkey, &message)
-            {
+                .sign_proposer_preferences(store, pubkey, message);
+            (*pubkey, signature)
+        });
+        let signatures = sign_all(requests).await;
+        let mut signed = Vec::with_capacity(owed.len());
+        for ((pubkey, message, before), signature) in owed.into_iter().zip(signatures) {
+            match signature {
                 Ok(signature) => {
                     signed.push((SignedProposerPreferences { message, signature }, before));
                 }
@@ -736,10 +740,7 @@ mod tests {
     fn context() -> Arc<SigningContext> {
         let mut config = Config::mainnet();
         config.gloas_fork_epoch = GLOAS_EPOCH;
-        Arc::new(SigningContext {
-            config,
-            genesis_validators_root: Root::repeat_byte(0x42),
-        })
+        Arc::new(SigningContext::new(config, Root::repeat_byte(0x42)))
     }
 
     /// Where each kept `(slot, dependent_root)` stands, by name.
