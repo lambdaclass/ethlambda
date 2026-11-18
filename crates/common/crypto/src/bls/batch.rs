@@ -307,6 +307,51 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_aggregate_among_valid_sets_fails_the_batch() {
+        // The batch check goes through blst's multi-signature routine and the
+        // single check through `fast_aggregate_verify_pre_aggregated`, so an
+        // aggregate both must refuse is checked inside a batch, where a false
+        // accept would pass a block.
+        let keys: Vec<SecretKey> = (20..24).map(secret_key).collect();
+        let pubkeys: Vec<BlsPubkey> = keys.iter().map(pubkey_of).collect();
+        let msg = message(77);
+        let signed_by = |keys: &[SecretKey], msg: Root| {
+            let signatures: Vec<BlsSignature> = keys.iter().map(|key| sign(key, msg)).collect();
+            bls::aggregate(&signatures).unwrap()
+        };
+        let cases = [
+            // One signer's share is missing from the signature.
+            (
+                "missing signer",
+                pubkeys.clone(),
+                signed_by(&keys[1..], msg),
+            ),
+            // Every signer signed, but another message.
+            (
+                "other message",
+                pubkeys.clone(),
+                signed_by(&keys, message(78)),
+            ),
+            // A key is claimed that never signed.
+            (
+                "extra key",
+                [pubkeys.clone(), vec![pubkey_of(&secret_key(30))]].concat(),
+                signed_by(&keys, msg),
+            ),
+        ];
+        for (case, claimed, signature) in cases {
+            let bad = SignatureSet::fast_aggregate(&claimed, msg, &signature).unwrap();
+            assert!(!bad.verify(), "{case}: the single check accepted it");
+            let mut sets = valid_sets(5);
+            sets.insert(2, bad);
+            assert!(
+                !verify_signature_sets(&sets),
+                "{case}: the batch accepted it"
+            );
+        }
+    }
+
+    #[test]
     fn verify_agrees_with_bls_verify() {
         let key = secret_key(3);
         let pubkey = pubkey_of(&key);
