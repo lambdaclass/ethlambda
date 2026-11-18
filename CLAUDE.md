@@ -51,7 +51,7 @@ crates/
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
-  storage/                  # RocksDB backend, in-memory for tests
+  storage/                  # RocksDB backend (`rocksdb` feature), in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
 ```
 
@@ -1071,7 +1071,12 @@ behavior.
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**
-- `rocksdb`: Persistent backend
+- `rocksdb`: Persistent backend, behind `ethlambda-storage`'s `rocksdb` feature. Off by
+  default, so the crates that only store through `InMemoryBackend` (the state transition,
+  the chain actor, the consensus test half, both beacon spec-test builds) skip its C++
+  build; `bin/ethlambda` turns it on. `cargo test -p ethlambda-storage` alone leaves the
+  backend's own tests out: add `--features rocksdb`, or run them through the workspace
+  (`make test-node`), where the binary turns the feature on
 - In-memory backend for tests
 
 ## Resources

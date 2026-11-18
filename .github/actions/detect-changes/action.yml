@@ -1,0 +1,63 @@
+name: "Detect changes"
+description: >-
+  Decides whether a pull request or merge group changes anything CI builds or
+  runs. Modeled on ethrex's action of the same name.
+
+outputs:
+  run_tests:
+    description: >-
+      'false' only when the change is a non-empty set of files that are all
+      documentation or repository metadata. 'true' otherwise, including for
+      every push and manual run.
+    value: ${{ steps.classify.outputs.run_tests }}
+
+runs:
+  using: "composite"
+  steps:
+    # A push to main always runs everything: it is what saves the caches PRs
+    # restore (see the setup-rust action), and it is the last check a change
+    # gets.
+    - uses: dorny/paths-filter@v4.0.3
+      id: filter
+      if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      with:
+        # `inert` is a positive list, compared by count against `all_files` in
+        # the next step, rather than a list of `!` negations. paths-filter ORs
+        # a filter's patterns together, so `['!docs/**', '!**/*.md']` still
+        # matches `README.md`: the file is not under `docs/`, so the first
+        # negation accepts it.
+        #
+        # Nothing on this list is read by a build or a test: no crate
+        # `include_str!`s a Markdown file, and `docs/`, `theme/` and
+        # `book.toml` are the mdBook site, which `pr-main_mdbook.yml` builds.
+        filters: |
+          all_files:
+            - '**'
+          inert:
+            - 'docs/**'
+            - 'theme/**'
+            - 'book.toml'
+            - '**/*.md'
+            - 'LICENSE'
+            - '**/.gitignore'
+            - '.claude/**'
+
+    # Skip only on a positive signal: at least one changed file, and every one
+    # of them inert. An empty or missing count (an empty diff, a filter step
+    # that did not run or did not report) runs the tests, because the merge
+    # queue path is the one a PR cannot exercise before it merges.
+    - name: Classify the change
+      id: classify
+      shell: bash
+      env:
+        ALL_FILES: ${{ steps.filter.outputs.all_files_count }}
+        INERT: ${{ steps.filter.outputs.inert_count }}
+      run: |
+        set -euo pipefail
+        if [[ "$ALL_FILES" =~ ^[1-9][0-9]*$ && "$INERT" == "$ALL_FILES" ]]; then
+          run_tests=false
+        else
+          run_tests=true
+        fi
+        echo "run_tests=$run_tests" >> "$GITHUB_OUTPUT"
+        echo "run_tests=$run_tests (event=${GITHUB_EVENT_NAME}, changed=${ALL_FILES:-n/a}, inert=${INERT:-n/a})"

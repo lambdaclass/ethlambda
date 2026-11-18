@@ -11,9 +11,11 @@
 //!   Suitable for production nodes.
 
 mod in_memory;
+#[cfg(feature = "rocksdb")]
 mod rocksdb;
 #[cfg(test)]
 mod tests;
 
 pub use in_memory::InMemoryBackend;
+#[cfg(feature = "rocksdb")]
 pub use rocksdb::RocksDBBackend;

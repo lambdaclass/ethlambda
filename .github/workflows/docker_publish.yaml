@@ -115,8 +115,11 @@ jobs:
           push: true
           tags: ${{ steps.prep.outputs.tags }}
           platforms: linux/${{ matrix.arch.name }}
-          cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant.name }}
-          cache-to: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant.name }},mode=max
+          # In the registry rather than the Actions cache, under the same tags
+          # release.yaml uses; that workflow says why. This one always logs in,
+          # so it always exports.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch.name }}-${{ matrix.variant.name }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch.name }}-${{ matrix.variant.name }},mode=max,ignore-error=true
 
   publish-manifest:
     name: Create and push multi-arch manifest

@@ -41,8 +41,12 @@ jobs:
         with:
           toolchain: "1.97.1"
 
+      # Saved from main only, like every Rust cache here (see the setup-rust
+      # action); a manual run from another branch restores but does not save.
       - name: Setup cache
         uses: Swatinem/rust-cache@v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-warloc
         run: cargo install cargo-warloc --locked --version 0.1.1
