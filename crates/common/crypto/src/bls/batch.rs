@@ -46,17 +46,6 @@ use super::{DST, validated_pubkey, validated_pubkeys};
 /// How many bits of each random weight the batch check uses.
 const RAND_BITS: usize = 64;
 
-/// The bit of a compressed G1 point's first byte that marks the point at
-/// infinity.
-///
-/// A compressed BLS12-381 point (the ZCash serialization the consensus specs'
-/// 48-byte keys use, and what blst's `to_bytes` writes) keeps three flags in
-/// the top bits of its first byte: bit 7 says the encoding is compressed, bit
-/// 6 that the point is the identity, and bit 5 which of the two `y` values
-/// goes with `x`. The identity is therefore `0xc0` followed by zeros, and
-/// bit 6 is set on no other point.
-const INFINITY_FLAG: u8 = 0b0100_0000;
-
 /// One signature check, resolved and ready, that may be verified alone or in a
 /// batch.
 ///
@@ -65,7 +54,10 @@ const INFINITY_FLAG: u8 = 0b0100_0000;
 /// everything a check does short of the pairing. That split is what lets a
 /// caller decide *when* to pay for the pairing: at once ([`Self::verify`]) or
 /// together with the other sets of a block ([`verify_signature_sets`]).
-#[derive(Clone, Copy)]
+///
+/// `Clone` but not `Copy`: at about 300 bytes, a copy should be one the code
+/// asks for.
+#[derive(Clone)]
 pub struct SignatureSet {
     pubkey: PublicKey,
     message: Root,
@@ -147,8 +139,13 @@ impl SignatureSet {
     /// blst rejects the same input itself (`BLST_PK_IS_INFINITY`, from the
     /// pairing aggregation both the single and the batch check go through),
     /// so this makes the existing rule explicit and changes no behavior.
+    ///
+    /// Read off the affine point, with no serialization: blst stores the
+    /// identity as the all-zero point, which is `PublicKey::default()`, and its
+    /// `PartialEq` compares those bytes (the same test as its
+    /// `blst_p1_affine_is_inf`, without the `unsafe` call).
     fn key_is_identity(&self) -> bool {
-        self.pubkey.to_bytes()[0] & INFINITY_FLAG != 0
+        self.aggregated && self.pubkey == PublicKey::default()
     }
 }
 
