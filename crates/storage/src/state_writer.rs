@@ -89,7 +89,11 @@ pub(crate) struct StateWrite {
     ///
     /// A flag rather than a second copy of the bytes: the writer puts the
     /// snapshot into its batch from a borrow and then moves that same buffer
-    /// into the memo, so a mainnet state is never held twice for it.
+    /// into the memo, so a mainnet state is never held twice for it. The memo
+    /// therefore keeps that buffer's spare capacity, the encoder's headroom
+    /// (about 2 MiB on mainnet); `shrink_to_fit` would cost the copy this
+    /// saves. Never true without `snapshot`, which the commit asserts in debug
+    /// builds.
     pub memoize_snapshot: bool,
 }
 
@@ -699,6 +703,10 @@ impl StateWriter {
         }
         // A snapshot the memo keeps is put from a borrow, so the same buffer
         // can then move into the memo; any other value is handed over.
+        debug_assert!(
+            !write.memoize_snapshot || write.snapshot.is_some(),
+            "a memoized snapshot needs a snapshot, or the memo is left stale"
+        );
         let memo = match write.snapshot {
             Some(snapshot) if write.memoize_snapshot => {
                 batch

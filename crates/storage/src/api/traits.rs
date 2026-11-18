@@ -102,7 +102,9 @@ pub trait StorageWriteBatch: Send {
     /// For a value the caller keeps after the write, so it need not clone one
     /// only to hand it over: a beacon snapshot is hundreds of megabytes, and
     /// RocksDB copies the value into its batch either way. The default goes
-    /// through [`put_batch`](Self::put_batch).
+    /// through [`put_batch`](Self::put_batch), cloning the value, so a backend
+    /// that can copy from a borrow should override it: on the snapshot path
+    /// the default brings back a full-state clone.
     fn put(&mut self, table: Table, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.put_batch(table, vec![(key.to_vec(), value.to_vec())])
     }

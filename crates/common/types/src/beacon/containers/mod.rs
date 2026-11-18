@@ -370,7 +370,8 @@ impl BeaconState {
     /// Goes through [`BeaconState::ssz_append`] rather than libssz's own
     /// `to_ssz`, which reserves only the encoding's length and so holds a fulu
     /// or gloas state twice while encoding it (see
-    /// [`BeaconState::ssz_append_capacity`]).
+    /// [`BeaconState::ssz_append_capacity`]). The returned buffer keeps that
+    /// headroom as spare capacity, so its `capacity()` exceeds its `len()`.
     pub fn to_ssz(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.ssz_append(&mut buf);
@@ -405,6 +406,10 @@ impl BeaconState {
     /// a different container with fields a few hundred bytes wide, and
     /// reserving a beacon state's megabytes for it would often outweigh the
     /// state itself.
+    ///
+    /// The lists are kept by hand: a fork that adds a larger fixed-size field
+    /// must add it here. `ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare`
+    /// (in `ethlambda-state-transition`, run on both presets) fails until it does.
     fn largest_fixed_field(&self) -> usize {
         use libssz::SszEncode;
         let largest = |sizes: &[usize]| sizes.iter().copied().max().unwrap_or(0);
