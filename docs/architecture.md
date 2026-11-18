@@ -259,7 +259,7 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
    swarm, spawn `P2PServer`, and wire the two together with `InitP2P` and `InitBlockChain`.
 6. Spawn the API and metrics servers.
 
-Shutdown runs in reverse: the first ctrl+c stops both actors and cancels the servers'
+Shutdown runs in reverse: the first ctrl+c or SIGTERM stops both actors and cancels the servers'
 shutdown token, and three more force the process to exit if a graceful stop hangs.
 
 > Note: booting with `HIVE_LEAN_TEST_DRIVER=1` short-circuits everything from step 2 on and

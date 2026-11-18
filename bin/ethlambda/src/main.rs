@@ -1019,10 +1019,13 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Wait for ctrl-c, then stop and join whatever is running.
+/// Wait for ctrl-c or SIGTERM, then stop and join whatever is running.
 ///
 /// A 2nd, 3rd and 4th ctrl-c escalate to `std::process::exit(1)` rather than
-/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`.
+/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`. A
+/// repeated SIGTERM does not: once [`shutdown_signal`] listens for it, it no
+/// longer kills the process, so a supervisor that wants the process gone
+/// sends SIGKILL, as `docker stop` and systemd do after their timeout.
 ///
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
@@ -1030,10 +1033,13 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 async fn wait_for_shutdown(node: RunningNode) {
     info!("Node initialized");
 
-    // 1st ctrl+c: start graceful shutdown
-    tokio::signal::ctrl_c().await.ok();
+    // 1st ctrl+c or SIGTERM: start graceful shutdown
+    let signal = shutdown_signal().await;
 
-    info!("Shutdown signal received, stopping actors and servers...");
+    info!(
+        signal,
+        "Shutdown signal received, stopping actors and servers..."
+    );
 
     tokio::spawn(async move {
         // This can be turned into a loop
@@ -1062,6 +1068,28 @@ async fn wait_for_shutdown(node: RunningNode) {
     let _ = node.http.await;
 
     info!("Shutdown complete");
+}
+
+/// Resolve on the first SIGINT (ctrl-c) or SIGTERM, naming which one.
+///
+/// SIGTERM is what `docker stop`, systemd and Kubernetes send, so a container
+/// no longer needs `--stop-signal SIGINT` to shut down gracefully.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                return tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                };
+            }
+            Err(err) => warn!(%err, "Cannot listen for SIGTERM; only ctrl-c shuts down gracefully"),
+        }
+    }
+    tokio::signal::ctrl_c().await.ok();
+    "SIGINT"
 }
 
 /// The ENRs to start from when `--bootnodes` was not given.
@@ -1174,8 +1202,11 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 
     info!("Test-driver RPC ready");
 
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received, stopping test-driver RPC...");
+    let signal = shutdown_signal().await;
+    info!(
+        signal,
+        "Shutdown signal received, stopping test-driver RPC..."
+    );
     shutdown_token.cancel();
     let _ = rpc_handle.await;
     info!("Shutdown complete");

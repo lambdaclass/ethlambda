@@ -60,7 +60,8 @@ it the node advertises `0.0.0.0` and logs a warning. It still dials out and
 follows the chain, but peers cannot reach it until discovery learns the address
 from their replies. The Beacon API binds `127.0.0.1:5052` by default, so
 `--http-address` is only needed to reach it from another host. Stop the node
-with `Ctrl+C`; it shuts down gracefully on SIGINT only, so a systemd unit needs
+with `Ctrl+C` or SIGTERM, which is what systemd sends by default. v1.0.0 shuts
+down gracefully on SIGINT only, so a systemd unit running that release needs
 `KillSignal=SIGINT`.
 
 - `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
@@ -150,7 +151,8 @@ docker run -d --name ethrex --network ethereum \
   --authrpc.addr      0.0.0.0 \
   --authrpc.jwtsecret /jwt.hex
 
-# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# `docker stop` sends SIGTERM, which ends v1.0.0 without a graceful shutdown (later images handle
+# it), so `--stop-signal` makes it send SIGINT instead.
 # Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
 # unflushed state is lost, so `--stop-timeout` gives it a minute.
 docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --stop-timeout 60 \
@@ -181,7 +183,8 @@ mkdir -p beacon-data
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
-# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# `docker stop` sends SIGTERM, which ends v1.0.0 without a graceful shutdown (later images handle
+# it), so `--stop-signal` makes it send SIGINT instead.
 # Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
 # unflushed state is lost, so `--stop-timeout` gives it a minute.
 docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
