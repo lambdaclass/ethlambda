@@ -23,6 +23,7 @@ pub mod fork_schedule;
 pub mod handler;
 pub mod messages;
 pub mod payload_hash;
+pub mod pq;
 pub mod protocols;
 pub mod scoring;
 pub mod subnets;
@@ -85,6 +86,10 @@ pub struct BeaconWire {
     /// Read by `build_metadata` for the `attnets` bitfield it advertises, so
     /// what this node claims to serve is what it actually subscribed to.
     pub attestation_subnets: Vec<u64>,
+    /// The attestation subnets this node backbones under a PQ digest, among
+    /// `ATTESTATION_SUBNET_COUNT_PQ`. `attnets` advertises them while the
+    /// current digest is PQ's.
+    pub attestation_subnets_pq: Vec<u64>,
     /// The sync committee subnets joined on a validator client's request, each
     /// with the epoch (exclusive) it is needed until.
     ///
@@ -192,6 +197,11 @@ pub mod constants {
     /// `ATTESTATION_SUBNET_COUNT`. The `attnets` bitfield is this wide even
     /// though this node subscribes to none of them.
     pub const ATTESTATION_SUBNET_COUNT: u64 = 64;
+
+    /// `ATTESTATION_SUBNET_COUNT_PQ`: the attestation subnets a PQ digest
+    /// carries. `attnets` stays [`ATTESTATION_SUBNET_COUNT`] wide; only the
+    /// first this many bits may be set under PQ.
+    pub const ATTESTATION_SUBNET_COUNT_PQ: u64 = 16;
 
     /// The width of `MetaData`'s `syncnets`. Re-exported so the bitfield and
     /// the sync subcommittee size divide by one value.

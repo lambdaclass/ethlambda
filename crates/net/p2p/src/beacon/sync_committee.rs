@@ -143,9 +143,10 @@ fn join(server: &mut P2PServer, subnets: Vec<(u64, Epoch)>) -> Vec<String> {
     }
     // Under every digest the node holds, like the aggregator subnets: while a
     // boundary's window is open, messages are published on either side of it.
+    // Not a PQ digest's, which carries no sync committee.
     let mut subscribed = Vec::new();
     for &subnet_id in &joined {
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
             let name = topics::sync_committee_topic_name(held.fork_digest, subnet_id);
             server.swarm_handle.subscribe(IdentTopic::new(name.clone()));
             subscribed.push(name);
@@ -188,7 +189,7 @@ fn leave_expired(server: &mut P2PServer, epoch: Epoch) -> Vec<String> {
     let mut unsubscribed = Vec::new();
     for subnet_id in &expired {
         wire.sync_committee_subnets.remove(subnet_id);
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
             let name = topics::sync_committee_topic_name(held.fork_digest, *subnet_id);
             server
                 .swarm_handle

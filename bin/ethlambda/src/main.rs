@@ -1955,6 +1955,7 @@ fn first_config_difference(
         attestation_propagation_slot_range: _,
         attestation_subnet_count: _,
         attestation_subnet_extra_bits: _,
+        attestation_subnet_count_pq: _,
         blob_sidecar_subnet_count: _,
         blob_sidecar_subnet_count_electra: _,
         data_column_sidecar_subnet_count: _,

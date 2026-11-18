@@ -227,6 +227,11 @@ pub fn wire_params(
     let attestation_subnets =
         ethlambda_p2p::beacon::subnets::compute_subscribed_subnets(node_id, epoch, &chain)
             .map_err(|err| eyre::eyre!("computing the attestation subnet backbone: {err:?}"))?;
+    // A PQ digest's backbone, the same function over `ATTESTATION_SUBNET_COUNT_PQ`:
+    // held only while a PQ digest is.
+    let attestation_subnets_pq =
+        ethlambda_p2p::beacon::subnets::compute_subscribed_subnets_pq(node_id, epoch, &chain)
+            .map_err(|err| eyre::eyre!("computing the PQ attestation subnet backbone: {err:?}"))?;
     info!(
         subnets_per_node = chain.subnets_per_node,
         subnets = ?attestation_subnets,
@@ -250,6 +255,7 @@ pub fn wire_params(
             genesis_validators_root: genesis.genesis_validators_root,
             custody_columns,
             attestation_subnets,
+            attestation_subnets_pq,
         },
         fork_id,
     })

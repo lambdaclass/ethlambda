@@ -91,8 +91,8 @@ pub fn compute_subnet_for_attestation(
 /// to mainnet's 6 and would shuffle over a space its own subnet count does not
 /// match. `the_shipped_configs_agree_with_the_derivation` pins the two
 /// together for the configurations that do carry it.
-fn attestation_subnet_prefix_bits(config: &Config) -> u32 {
-    let count = config.attestation_subnet_count.max(1);
+fn attestation_subnet_prefix_bits(config: &Config, subnet_count: u64) -> u32 {
+    let count = subnet_count.max(1);
     // ceillog2: how many bits it takes to index `count` values. Exact for the
     // powers of two every shipped configuration uses, and rounds up for
     // anything else, which is what `ceillog2` means.
@@ -122,7 +122,27 @@ pub fn compute_subscribed_subnet(
     index: u64,
     config: &Config,
 ) -> Result<u64> {
-    let prefix_bits = attestation_subnet_prefix_bits(config);
+    compute_subscribed_subnet_among(
+        node_id,
+        epoch,
+        index,
+        config.attestation_subnet_count,
+        config,
+    )
+}
+
+/// [`compute_subscribed_subnet`] over `subnet_count` subnets: the
+/// specification's own for `ATTESTATION_SUBNET_COUNT`, and its PQ
+/// modification for `ATTESTATION_SUBNET_COUNT_PQ`, which changes nothing but
+/// the count (`compute_attestation_subnet_prefix_bits` and the final modulo).
+fn compute_subscribed_subnet_among(
+    node_id: [u8; 32],
+    epoch: u64,
+    index: u64,
+    subnet_count: u64,
+    config: &Config,
+) -> Result<u64> {
+    let prefix_bits = attestation_subnet_prefix_bits(config, subnet_count);
     // Strictly less than `u64::BITS`: `1u64 << prefix_bits` below requires a
     // shift strictly less than the type's width, and `prefix_bits ==
     // u64::BITS` would overflow it (a panic in debug, `1` itself in release,
@@ -145,7 +165,7 @@ pub fn compute_subscribed_subnet(
     // `compute_shuffled_index`'s own precondition.
     let permutated_prefix =
         compute_shuffled_index(node_id_prefix, 1u64 << prefix_bits, permutation_seed)?;
-    Ok(permutated_prefix.saturating_add(index) % config.attestation_subnet_count)
+    Ok(permutated_prefix.saturating_add(index) % subnet_count.max(1))
 }
 
 /// Every subnet `node_id` subscribes to at `epoch`, sorted ascending and
@@ -164,9 +184,29 @@ pub fn compute_subscribed_subnets(
     epoch: u64,
     config: &Config,
 ) -> Result<Vec<u64>> {
+    subscribed_subnets_among(node_id, epoch, config.attestation_subnet_count, config)
+}
+
+/// The subnets `node_id` backbones under a PQ digest, among
+/// `ATTESTATION_SUBNET_COUNT_PQ` (`compute_subscribed_subnet` modified in PQ).
+/// Sorted and deduplicated, as [`compute_subscribed_subnets`].
+pub fn compute_subscribed_subnets_pq(
+    node_id: [u8; 32],
+    epoch: u64,
+    config: &Config,
+) -> Result<Vec<u64>> {
+    subscribed_subnets_among(node_id, epoch, config.attestation_subnet_count_pq, config)
+}
+
+fn subscribed_subnets_among(
+    node_id: [u8; 32],
+    epoch: u64,
+    subnet_count: u64,
+    config: &Config,
+) -> Result<Vec<u64>> {
     let mut subnets = Vec::with_capacity(config.subnets_per_node as usize);
     for index in 0..config.subnets_per_node {
-        let subnet = compute_subscribed_subnet(node_id, epoch, index, config)?;
+        let subnet = compute_subscribed_subnet_among(node_id, epoch, index, subnet_count, config)?;
         if !subnets.contains(&subnet) {
             subnets.push(subnet);
         }
@@ -220,7 +260,10 @@ mod tests {
     fn the_shipped_configs_agree_with_the_derivation() {
         for config in [Config::mainnet(), Config::minimal()] {
             assert_eq!(
-                u64::from(attestation_subnet_prefix_bits(&config)),
+                u64::from(attestation_subnet_prefix_bits(
+                    &config,
+                    config.attestation_subnet_count
+                )),
                 config.attestation_subnet_prefix_bits,
                 "the derived prefix must match the configured one"
             );
@@ -240,14 +283,20 @@ mod tests {
             attestation_subnet_extra_bits: 58,
             ..Config::mainnet()
         };
-        assert_eq!(attestation_subnet_prefix_bits(&config), u64::BITS);
+        assert_eq!(
+            attestation_subnet_prefix_bits(&config, config.attestation_subnet_count),
+            u64::BITS
+        );
         assert!(compute_subscribed_subnet([0u8; 32], 0, 0, &config).is_err());
     }
 
     #[test]
     fn mainnet_takes_the_top_six_bits_of_the_node_id() {
         let config = Config::mainnet();
-        assert_eq!(attestation_subnet_prefix_bits(&config), 6);
+        assert_eq!(
+            attestation_subnet_prefix_bits(&config, config.attestation_subnet_count),
+            6
+        );
         // 0b1010_1100: the top six bits are 0b101011, which is 43.
         let mut node_id = [0u8; 32];
         node_id[0] = 0b1010_1100;
@@ -372,6 +421,23 @@ mod tests {
             for index in 0..4 {
                 assert!(compute_subnet_for_attestation(4, slot, index, &config) < count);
             }
+        }
+    }
+
+    /// The PQ backbone is the same function over `ATTESTATION_SUBNET_COUNT_PQ`:
+    /// every subnet it names is one of those.
+    #[test]
+    fn the_pq_backbone_stays_within_the_pq_subnets() {
+        let config = Config::mainnet();
+        for seed in 0..32u8 {
+            let subnets = compute_subscribed_subnets_pq([seed; 32], 0, &config).unwrap();
+            assert!(!subnets.is_empty());
+            assert!(
+                subnets
+                    .iter()
+                    .all(|&subnet| subnet < config.attestation_subnet_count_pq),
+                "{subnets:?}"
+            );
         }
     }
 }

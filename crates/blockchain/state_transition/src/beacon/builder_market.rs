@@ -16,12 +16,58 @@ use std::{
 
 use lru::LruCache;
 
-use super::containers::gloas;
+use super::containers::{gloas, pq};
 use super::gossip::IgnoreReason;
 use super::primitives::{BlsPubkey, ExecutionAddress, ExecutionBlockHash, Root, Slot};
 
 /// Exactly one per node.
 pub type SharedBuilderMarket = Arc<BuilderMarket>;
+
+/// The PQ fork's market: its bids and preferences carry XMSS signatures, so
+/// they are a different container from gloas's, and none of them may reach
+/// the gloas market that block production reads. One per node, beside
+/// [`SharedBuilderMarket`].
+pub type PqBuilderMarket =
+    BuilderMarket<pq::SignedExecutionPayloadBid, pq::SignedProposerPreferences>;
+
+/// Exactly one per node, beside [`SharedBuilderMarket`].
+pub type SharedPqBuilderMarket = Arc<PqBuilderMarket>;
+
+/// A signed builder bid, whichever fork's signature it carries: gloas's BLS
+/// or PQ's XMSS. The message is the same `ExecutionPayloadBid` at both.
+pub trait SignedBid: Clone + PartialEq + std::fmt::Debug {
+    fn message(&self) -> &gloas::ExecutionPayloadBid;
+}
+
+impl SignedBid for gloas::SignedExecutionPayloadBid {
+    fn message(&self) -> &gloas::ExecutionPayloadBid {
+        &self.message
+    }
+}
+
+impl SignedBid for pq::SignedExecutionPayloadBid {
+    fn message(&self) -> &gloas::ExecutionPayloadBid {
+        &self.message
+    }
+}
+
+/// Signed proposer preferences, whichever fork's signature they carry. The
+/// message is the same `ProposerPreferences` at gloas and PQ.
+pub trait SignedPreferences: Clone + std::fmt::Debug {
+    fn message(&self) -> &gloas::ProposerPreferences;
+}
+
+impl SignedPreferences for gloas::SignedProposerPreferences {
+    fn message(&self) -> &gloas::ProposerPreferences {
+        &self.message
+    }
+}
+
+impl SignedPreferences for pq::SignedProposerPreferences {
+    fn message(&self) -> &gloas::ProposerPreferences {
+        &self.message
+    }
+}
 
 /// Bids pooled per `(slot, parent hash, parent root)`, top values kept.
 pub const MAX_BIDS_PER_PARENT: usize = 16;
@@ -43,31 +89,57 @@ pub struct KnownPayload {
 }
 
 /// Bids for one `(parent_block_hash, parent_block_root)` of a slot.
-#[derive(Debug, Default)]
-struct ParentBids {
+#[derive(Debug)]
+struct ParentBids<B> {
     /// The highest value recorded, which a later bid must strictly beat. Kept
     /// apart from `bids` because the pool is truncated and the bar is not.
     best_value: Option<u64>,
     /// Value descending, then builder index ascending.
-    bids: Vec<gloas::SignedExecutionPayloadBid>,
+    bids: Vec<B>,
+}
+
+impl<B> Default for ParentBids<B> {
+    fn default() -> Self {
+        Self {
+            best_value: None,
+            bids: Vec::new(),
+        }
+    }
 }
 
 type ParentKey = (ExecutionBlockHash, Root);
 
-#[derive(Debug, Default)]
-struct SlotBids {
+#[derive(Debug)]
+struct SlotBids<B> {
     /// The spec's `seen.execution_payload_bids`: one bid per builder per
     /// `(slot, parent_hash, parent_root)`.
     seen: BTreeSet<(ParentKey, u64)>,
-    parents: BTreeMap<ParentKey, ParentBids>,
+    parents: BTreeMap<ParentKey, ParentBids<B>>,
 }
 
-#[derive(Debug, Default)]
-struct BidPool {
-    slots: BTreeMap<Slot, SlotBids>,
+impl<B> Default for SlotBids<B> {
+    fn default() -> Self {
+        Self {
+            seen: BTreeSet::new(),
+            parents: BTreeMap::new(),
+        }
+    }
 }
 
-impl BidPool {
+#[derive(Debug)]
+struct BidPool<B> {
+    slots: BTreeMap<Slot, SlotBids<B>>,
+}
+
+impl<B> Default for BidPool<B> {
+    fn default() -> Self {
+        Self {
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
+impl<B> BidPool<B> {
     fn check(&self, bid: &gloas::ExecutionPayloadBid) -> Result<(), IgnoreReason> {
         let Some(slot) = self.slots.get(&bid.slot) else {
             return Ok(());
@@ -86,16 +158,20 @@ impl BidPool {
 }
 
 /// Preferences by `(proposal_slot, dependent_root)`: the first valid one wins.
-type PreferencesCache = BTreeMap<(Slot, Root), gloas::SignedProposerPreferences>;
+type PreferencesCache<P> = BTreeMap<(Slot, Root), P>;
 
+/// Generic over the signed bid and preferences containers so the PQ fork's
+/// XMSS-signed ones get a market of their own ([`PqBuilderMarket`]) with the
+/// same rules; the defaults are gloas's, the one block production reads.
 #[derive(Debug)]
-pub struct BuilderMarket {
-    bids: Mutex<BidPool>,
-    preferences: Mutex<PreferencesCache>,
+pub struct BuilderMarket<B = gloas::SignedExecutionPayloadBid, P = gloas::SignedProposerPreferences>
+{
+    bids: Mutex<BidPool<B>>,
+    preferences: Mutex<PreferencesCache<P>>,
     payloads: Mutex<LruCache<ExecutionBlockHash, KnownPayload>>,
 }
 
-impl Default for BuilderMarket {
+impl<B, P> Default for BuilderMarket<B, P> {
     fn default() -> Self {
         Self {
             bids: Mutex::default(),
@@ -114,7 +190,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl BuilderMarket {
+impl<B: SignedBid, P: SignedPreferences> BuilderMarket<B, P> {
     // Bids: seen.execution_payload_bids + seen.best_execution_payload_bid + pool.
 
     /// The spec's two seen rules, in order: `(slot, parent_hash, parent_root,
@@ -127,29 +203,29 @@ impl BuilderMarket {
     /// Re-runs [`Self::check_bid_seen`] under the lock. If it passes, records
     /// both seen keys and pools the bid. `false` = not recorded (race, or the
     /// per-slot key cap). Prunes slots below `bid.slot - 1`.
-    pub fn record_bid(&self, signed: gloas::SignedExecutionPayloadBid) -> bool {
+    pub fn record_bid(&self, signed: B) -> bool {
         let mut pool = lock(&self.bids);
-        if pool.check(&signed.message).is_err() {
+        if pool.check(signed.message()).is_err() {
             return false;
         }
-        let bid_slot = signed.message.slot;
+        let bid_slot = signed.message().slot;
         let slot = pool.slots.entry(bid_slot).or_default();
         if slot.seen.len() >= MAX_SEEN_BID_KEYS_PER_SLOT {
             return false;
         }
         let parent = (
-            signed.message.parent_block_hash,
-            signed.message.parent_block_root,
+            signed.message().parent_block_hash,
+            signed.message().parent_block_root,
         );
-        slot.seen.insert((parent, signed.message.builder_index));
+        slot.seen.insert((parent, signed.message().builder_index));
         let entry = slot.parents.entry(parent).or_default();
-        entry.best_value = Some(signed.message.value);
+        entry.best_value = Some(signed.message().value);
         entry.bids.push(signed);
         entry.bids.sort_by(|a, b| {
-            b.message
+            b.message()
                 .value
-                .cmp(&a.message.value)
-                .then(a.message.builder_index.cmp(&b.message.builder_index))
+                .cmp(&a.message().value)
+                .then(a.message().builder_index.cmp(&b.message().builder_index))
         });
         entry.bids.truncate(MAX_BIDS_PER_PARENT);
         let keep_from = bid_slot.saturating_sub(1);
@@ -158,14 +234,14 @@ impl BuilderMarket {
     }
 
     /// The identical message and signature is pooled (API idempotency).
-    pub fn contains_bid(&self, signed: &gloas::SignedExecutionPayloadBid) -> bool {
+    pub fn contains_bid(&self, signed: &B) -> bool {
         let pool = lock(&self.bids);
         pool.slots
-            .get(&signed.message.slot)
+            .get(&signed.message().slot)
             .and_then(|slot| {
                 slot.parents.get(&(
-                    signed.message.parent_block_hash,
-                    signed.message.parent_block_root,
+                    signed.message().parent_block_hash,
+                    signed.message().parent_block_root,
                 ))
             })
             .is_some_and(|parent| parent.bids.contains(signed))
@@ -177,7 +253,7 @@ impl BuilderMarket {
         slot: Slot,
         parent_block_root: Root,
         parent_block_hash: ExecutionBlockHash,
-    ) -> Vec<gloas::SignedExecutionPayloadBid> {
+    ) -> Vec<B> {
         lock(&self.bids)
             .slots
             .get(&slot)
@@ -200,11 +276,7 @@ impl BuilderMarket {
 
     // Proposer preferences: seen.proposer_preferences.
 
-    pub fn preferences(
-        &self,
-        proposal_slot: Slot,
-        dependent_root: Root,
-    ) -> Option<gloas::SignedProposerPreferences> {
+    pub fn preferences(&self, proposal_slot: Slot, dependent_root: Root) -> Option<P> {
         lock(&self.preferences)
             .get(&(proposal_slot, dependent_root))
             .cloned()
@@ -212,13 +284,12 @@ impl BuilderMarket {
 
     /// The first valid preferences per key win. `false` if one is held. Prunes
     /// `proposal_slot < current_slot`.
-    pub fn record_preferences(
-        &self,
-        signed: gloas::SignedProposerPreferences,
-        current_slot: Slot,
-    ) -> bool {
+    pub fn record_preferences(&self, signed: P, current_slot: Slot) -> bool {
         let mut cache = lock(&self.preferences);
-        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        let key = (
+            signed.message().proposal_slot,
+            signed.message().dependent_root,
+        );
         if cache.contains_key(&key) {
             return false;
         }
@@ -249,7 +320,28 @@ impl BuilderMarket {
             beacon_block_root: envelope.beacon_block_root,
             builder_exits,
         };
-        lock(&self.payloads).put(envelope.payload.block_hash, known);
+        self.record_known_payload(envelope.payload.block_hash, known);
+    }
+
+    /// Record a payload an envelope of the PQ fork's shape revealed, whose
+    /// execution requests are not gloas's container.
+    pub fn record_pq_execution_payload(&self, envelope: &pq::ExecutionPayloadEnvelope) {
+        let builder_exits = envelope
+            .execution_requests
+            .builder_exits
+            .iter()
+            .map(|exit| (exit.pubkey, exit.source_address))
+            .collect();
+        let known = KnownPayload {
+            gas_limit: envelope.payload.gas_limit,
+            beacon_block_root: envelope.beacon_block_root,
+            builder_exits,
+        };
+        self.record_known_payload(envelope.payload.block_hash, known);
+    }
+
+    fn record_known_payload(&self, block_hash: ExecutionBlockHash, known: KnownPayload) {
+        lock(&self.payloads).put(block_hash, known);
     }
 
     pub fn known_payload(&self, block_hash: ExecutionBlockHash) -> Option<KnownPayload> {
@@ -431,7 +523,7 @@ mod tests {
 
     #[test]
     fn a_builder_bids_once_per_parent() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         assert!(market.record_bid(bid(10, 1, 5)));
         assert_eq!(
             market.check_bid_seen(&bid(10, 1, 9).message),
@@ -446,7 +538,7 @@ mod tests {
 
     #[test]
     fn a_bid_must_strictly_beat_the_best() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         assert!(market.record_bid(bid(10, 1, 5)));
         assert_eq!(
             market.check_bid_seen(&bid(10, 2, 5).message),
@@ -464,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_stale_check_fails_the_record() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let racing = bid(10, 2, 7);
         assert_eq!(market.check_bid_seen(&racing.message), Ok(()));
         assert!(market.record_bid(bid(10, 1, 8)));
@@ -473,7 +565,7 @@ mod tests {
 
     #[test]
     fn a_full_slot_refuses_new_keys() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         for builder in 0..MAX_SEEN_BID_KEYS_PER_SLOT as u64 {
             assert!(market.record_bid(bid(10, builder, builder + 1)));
         }
@@ -485,7 +577,7 @@ mod tests {
 
     #[test]
     fn bids_for_orders_by_value_and_keeps_the_top() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let total = MAX_BIDS_PER_PARENT as u64 + 4;
         for builder in 0..total {
             assert!(market.record_bid(bid(10, builder, builder + 1)));
@@ -505,7 +597,7 @@ mod tests {
 
     #[test]
     fn contains_bid_matches_the_exact_message() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let signed = bid(10, 1, 5);
         assert!(!market.contains_bid(&signed));
         assert!(market.record_bid(signed.clone()));
@@ -519,7 +611,7 @@ mod tests {
 
     #[test]
     fn bids_prune_below_the_previous_slot() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         assert!(market.record_bid(bid(10, 1, 5)));
         assert!(market.record_bid(bid(11, 1, 5)));
         assert!(market.has_bids_for_slot(10));
@@ -533,7 +625,7 @@ mod tests {
 
     #[test]
     fn the_first_preferences_win() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let first = prefs(40, 1, 3);
         assert!(market.record_preferences(first.clone(), 38));
         assert!(!market.record_preferences(prefs(40, 1, 4), 38));
@@ -545,7 +637,7 @@ mod tests {
 
     #[test]
     fn preferences_prune_by_proposal_slot() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         assert!(market.record_preferences(prefs(40, 1, 3), 38));
         assert!(market.record_preferences(prefs(41, 1, 3), 41));
         assert!(market.preferences(40, Root::repeat_byte(1)).is_none());
@@ -556,7 +648,7 @@ mod tests {
 
     #[test]
     fn preferences_over_the_cap_evict_the_lowest_slot() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         for slot in 0..MAX_PREFERENCES as u64 {
             assert!(market.record_preferences(prefs(100 + slot, 1, 3), 0));
         }
@@ -570,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_revealed_payload_is_known_with_its_exits() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let pubkey = BlsPubkey([7; 48]);
         let source = ExecutionAddress::repeat_byte(9);
         let envelope = envelope_with_gas_limit(
@@ -593,7 +685,7 @@ mod tests {
 
     #[test]
     fn known_payloads_are_a_bounded_lru() {
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let capacity = KNOWN_PAYLOADS_CAPACITY.get();
         for index in 0..capacity {
             let mut block_hash = ExecutionBlockHash::ZERO;

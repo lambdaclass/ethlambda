@@ -172,6 +172,9 @@ pub struct BeaconWireConfig {
     /// set, and a peer computes the same set from this node's id, so deriving
     /// it twice is how the two would come to disagree.
     pub attestation_subnets: Vec<u64>,
+    /// The attestation subnets this node backbones under a PQ digest, from
+    /// the same node id among `ATTESTATION_SUBNET_COUNT_PQ`.
+    pub attestation_subnets_pq: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -284,6 +287,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: custody_columns.clone(),
                 attestation_subnets: Vec::new(),
+                attestation_subnets_pq: Vec::new(),
             })),
         })
         .expect("swarm builds");

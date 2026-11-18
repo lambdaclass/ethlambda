@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod execution_payload_bid;
 pub mod operations;
 pub mod payload_attestation;
+pub mod pq;
 pub mod proposer_preferences;
 pub mod sync_committee;
 #[cfg(test)]
@@ -287,6 +288,8 @@ pub enum RejectReason {
     AggregatorSignature,
     /// The aggregate attestation's own signature is invalid.
     AggregateSignature,
+    /// A PQ aggregate's STARK proof does not prove its attesters' signatures.
+    AggregateProof,
     /// The target is not the voted block's ancestor at the target epoch.
     TargetNotAncestor,
     /// A bid promises a payment outside the bid value.
@@ -372,6 +375,7 @@ impl RejectReason {
             Self::SelectionProof => "selection_proof",
             Self::AggregatorSignature => "aggregator_signature",
             Self::AggregateSignature => "aggregate_signature",
+            Self::AggregateProof => "aggregate_proof",
             Self::TargetNotAncestor => "target_not_ancestor",
             Self::ExecutionPaymentNonZero => "execution_payment_nonzero",
             Self::BlockHashEqualsParent => "block_hash_equals_parent",

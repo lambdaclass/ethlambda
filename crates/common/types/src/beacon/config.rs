@@ -570,6 +570,12 @@ pub struct Config {
     pub attestation_subnet_count: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_subnet_extra_bits: u64,
+    /// PQ: how many attestation subnets the PQ fork's digests carry
+    /// (`ATTESTATION_SUBNET_COUNT_PQ`, `specs/_features/pq/p2p-interface.md`).
+    /// `attnets` keeps [`Self::attestation_subnet_count`] bits; only the first
+    /// this many may be set under a PQ digest.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub attestation_subnet_count_pq: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub blob_sidecar_subnet_count: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -809,6 +815,7 @@ impl Config {
             attestation_propagation_slot_range: 32,
             attestation_subnet_count: 64,
             attestation_subnet_extra_bits: 0,
+            attestation_subnet_count_pq: 16,
             blob_sidecar_subnet_count: 6,
             blob_sidecar_subnet_count_electra: 9,
             data_column_sidecar_subnet_count: 128,
@@ -935,6 +942,7 @@ impl Config {
             attestation_propagation_slot_range: 32,
             attestation_subnet_count: 64,
             attestation_subnet_extra_bits: 0,
+            attestation_subnet_count_pq: 16,
             blob_sidecar_subnet_count: 6,
             blob_sidecar_subnet_count_electra: 9,
             data_column_sidecar_subnet_count: 128,

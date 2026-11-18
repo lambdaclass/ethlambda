@@ -578,7 +578,7 @@ fn run_case(case: &Case) -> Result<(), String> {
         fork_choice::get_head(&mut store, &config)
             .map_err(|err| format!("computing the head: {err:?}"))?;
     }
-    let market = BuilderMarket::default();
+    let market: BuilderMarket = BuilderMarket::default();
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
     let mut seen_columns = SeenColumns::new(capacity);

@@ -28,10 +28,10 @@ use super::{
     IgnoreReason, Outcome, RejectReason, ancestor_at, is_future_slot, is_gloas_slot, slot_start_ms,
 };
 use crate::beacon::bls;
-use crate::beacon::builder_market::BuilderMarket;
+use crate::beacon::builder_market::{BuilderMarket, SignedBid, SignedPreferences};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{DOMAIN_PROPOSER_PREFERENCES, MAXIMUM_GOSSIP_CLOCK_DISPARITY};
-use crate::beacon::containers::{BeaconState, gloas};
+use crate::beacon::containers::{BeaconState, gloas, pq};
 use crate::beacon::fork_choice::{
     Store, compute_shuffling_dependent_slot, compute_shuffling_lookahead_start_slot,
 };
@@ -43,13 +43,13 @@ use crate::beacon::primitives::{Domain, Epoch, HashTreeRoot as _, Root, Slot};
 
 /// The rules that read only the message, the market's seen state and the
 /// clock.
-pub fn cheap_checks(
-    market: &BuilderMarket,
+pub fn cheap_checks<B: SignedBid, P: SignedPreferences>(
+    market: &BuilderMarket<B, P>,
     store: &Store,
-    signed: &gloas::SignedProposerPreferences,
+    signed: &P,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    let preferences = &signed.message;
+    let preferences = signed.message();
     let config = store.config();
     // [IGNORE] The first valid preferences for this dependent root and slot.
     if market
@@ -77,15 +77,103 @@ pub fn cheap_checks(
 
 /// The rules that need the dependent block and a state, then the signature.
 /// Runs on a blocking thread.
-pub fn stateful_checks(store: &Store, signed: &gloas::SignedProposerPreferences) -> Outcome {
+/// What a preferences message's rules need from its fork beyond the shared
+/// message: which state shape holds the proposer's key, and the signature.
+/// Gloas's preferences are BLS-signed, PQ's XMSS-signed
+/// (`specs/_features/pq/p2p-interface.md`'s modified `proposer_preferences`).
+pub trait PreferencesRules: SignedPreferences {
+    /// How many epochs the dependent block's state may be advanced to reach
+    /// the proposal's lookahead, or `None` for no bound. Advancing runs every
+    /// slot between, on a peer's say-so.
+    const MAX_LOOKAHEAD_ADVANCE_EPOCHS: Option<Epoch>;
+    /// Whether `state` holds the proposer key this message is checked
+    /// against.
+    fn judged_by(state: &BeaconState) -> bool;
+    /// The proposer's signature, against the lookahead `state`.
+    fn signature_valid(&self, state: &BeaconState, config: &Config, proposal_epoch: Epoch) -> bool;
+}
+
+impl PreferencesRules for gloas::SignedProposerPreferences {
+    /// Unbounded, as before: a followed chain's dependent block is recent.
+    const MAX_LOOKAHEAD_ADVANCE_EPOCHS: Option<Epoch> = None;
+
+    /// Any state with a BLS registry: the lookahead state of a proposal at
+    /// the first gloas epochs may still be fulu's.
+    fn judged_by(state: &BeaconState) -> bool {
+        !matches!(state, BeaconState::Pq(_))
+    }
+
+    /// Under any candidate domain; see [`proposer_preferences_domains`].
+    fn signature_valid(&self, state: &BeaconState, config: &Config, proposal_epoch: Epoch) -> bool {
+        let preferences = &self.message;
+        let Ok(validator) = state.validator(preferences.validator_index) else {
+            return false;
+        };
+        let pubkey = bls::IndexedPubkey {
+            index: preferences.validator_index,
+            pubkey: validator.pubkey,
+        };
+        let message_root = preferences.hash_tree_root();
+        proposer_preferences_domains(state, config, proposal_epoch)
+            .into_iter()
+            .any(|domain| {
+                bls::verify(
+                    &pubkey,
+                    compute_signing_root(message_root, domain),
+                    &self.signature,
+                )
+            })
+    }
+}
+
+impl PreferencesRules for pq::SignedProposerPreferences {
+    /// Bounded: the node does not follow PQ, so its head, a valid dependent
+    /// root, can be any distance behind a PQ proposal.
+    const MAX_LOOKAHEAD_ADVANCE_EPOCHS: Option<Epoch> = Some(preset::MIN_SEED_LOOKAHEAD + 1);
+
+    fn judged_by(state: &BeaconState) -> bool {
+        matches!(state, BeaconState::Pq(_))
+    }
+
+    /// `[Modified in PQ]` an XMSS signature at the proposal slot's
+    /// preferences leaf, under the domain of the proposal epoch's own fork
+    /// version, the one domain the specification names.
+    fn signature_valid(&self, state: &BeaconState, config: &Config, proposal_epoch: Epoch) -> bool {
+        use crate::beacon::constants::LEAF_OFFSET_PROPOSER_PREFERENCES;
+        use crate::beacon::helpers::pq::{compute_xmss_leaf_index, xmss_verify};
+        let preferences = &self.message;
+        let Ok(validator) = state.pq_validator(preferences.validator_index) else {
+            return false;
+        };
+        let domain = compute_domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            config.fork_version(config.fork_at_epoch(proposal_epoch)),
+            state.genesis_validators_root(),
+        );
+        let signing_root = compute_signing_root(preferences.hash_tree_root(), domain);
+        let Ok(leaf_index) =
+            compute_xmss_leaf_index(preferences.proposal_slot, LEAF_OFFSET_PROPOSER_PREFERENCES)
+        else {
+            return false;
+        };
+        xmss_verify(
+            &validator.pubkey(),
+            leaf_index,
+            signing_root,
+            &self.signature,
+        )
+    }
+}
+
+pub fn stateful_checks<P: PreferencesRules>(store: &Store, signed: &P) -> Outcome {
     match stateful_rules(store, signed) {
         Ok(()) => Outcome::Accept,
         Err(outcome) => outcome,
     }
 }
 
-fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> Result<(), Outcome> {
-    let preferences = &signed.message;
+fn stateful_rules<P: PreferencesRules>(store: &Store, signed: &P) -> Result<(), Outcome> {
+    let preferences = signed.message();
     let config = store.config();
     let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
     let dependent_slot = compute_shuffling_dependent_slot(proposal_epoch);
@@ -113,32 +201,25 @@ fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> R
         return Err(Outcome::Ignore(IgnoreReason::ImpossibleDependentRoot));
     }
 
-    let state = lookahead_state(store, preferences, proposal_epoch)
-        .ok_or(Outcome::Ignore(IgnoreReason::StateUnavailable))?;
+    let state = lookahead_state(
+        store,
+        preferences,
+        proposal_epoch,
+        P::MAX_LOOKAHEAD_ADVANCE_EPOCHS,
+    )
+    .ok_or(Outcome::Ignore(IgnoreReason::StateUnavailable))?;
 
     // [REJECT] The validator is the proposer for the slot in the lookahead.
     if fixed_proposer(&state, preferences.proposal_slot) != Some(preferences.validator_index) {
         return Err(Outcome::Reject(RejectReason::WrongProposer));
     }
-    // [REJECT] The signature is valid, under any candidate domain.
-    let pubkey = bls::IndexedPubkey {
-        index: preferences.validator_index,
-        pubkey: state
-            .validator(preferences.validator_index)
-            .map_err(|_| Outcome::Reject(RejectReason::WrongProposer))?
-            .pubkey,
-    };
-    let message_root = preferences.hash_tree_root();
-    let valid = proposer_preferences_domains(&state, &config, proposal_epoch)
-        .into_iter()
-        .any(|domain| {
-            bls::verify(
-                &pubkey,
-                compute_signing_root(message_root, domain),
-                &signed.signature,
-            )
-        });
-    if !valid {
+    // [REJECT] The signature is valid. A state of another registry's shape
+    // (a PQ message checked against a BLS registry, or the reverse) cannot
+    // judge it, which is not the sender's fault.
+    if !P::judged_by(&state) {
+        return Err(Outcome::Ignore(IgnoreReason::StateUnavailable));
+    }
+    if !signed.signature_valid(&state, &config, proposal_epoch) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -146,11 +227,13 @@ fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> R
 
 /// A cached state whose proposer lookahead answers for `preferences`: the
 /// head's when the head shares the dependent root, else the dependent block's
-/// state advanced to the epoch before the proposal's.
+/// state advanced to the epoch before the proposal's, by at most
+/// `max_advance` epochs when one is given.
 fn lookahead_state(
     store: &Store,
     preferences: &gloas::ProposerPreferences,
     proposal_epoch: Epoch,
+    max_advance: Option<Epoch>,
 ) -> Option<std::sync::Arc<BeaconState>> {
     if let Ok(head_root) = store.head()
         && let Some(head_state) = store.cached_state(CacheKey::BlockState(head_root))
@@ -167,19 +250,24 @@ fn lookahead_state(
             return Some(head_state);
         }
     }
-    cached_checkpoint_state(
-        store,
-        proposal_epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD),
-        preferences.dependent_root,
-    )
+    let target_epoch = proposal_epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD);
+    if let Some(max_advance) = max_advance {
+        let dependent_state =
+            store.cached_state(CacheKey::BlockState(preferences.dependent_root))?;
+        let state_epoch = compute_epoch_at_slot(dependent_state.slot());
+        if target_epoch.saturating_sub(state_epoch) > max_advance {
+            return None;
+        }
+    }
+    cached_checkpoint_state(store, target_epoch, preferences.dependent_root)
 }
 
 /// Both halves. The caller records the preferences on `Accept`: the
 /// specification's `validate_proposer_preferences_gossip`.
-pub fn validate(
-    market: &BuilderMarket,
+pub fn validate<B: SignedBid, P: PreferencesRules>(
+    market: &BuilderMarket<B, P>,
     store: &Store,
-    signed: &gloas::SignedProposerPreferences,
+    signed: &P,
     now_ms: u64,
 ) -> Outcome {
     if let Err(outcome) = cheap_checks(market, store, signed, now_ms) {

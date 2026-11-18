@@ -42,6 +42,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
+use crate::beacon::pq::PqValidated;
 use crate::beacon::{builder_market, column_checks};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
@@ -112,6 +113,10 @@ pub(crate) enum Validated {
     },
     /// A `sync_committee_contribution_and_proof`.
     SyncContribution(Box<SignedContributionAndProof>),
+    /// A message off a PQ digest's topic, in the PQ fork's container. Never
+    /// forwarded, pooled or announced: the node does not follow PQ. See
+    /// [`crate::beacon::pq`].
+    Pq(Box<PqValidated>),
 }
 
 impl Validated {
@@ -151,7 +156,7 @@ impl Validated {
                 gossip::execution_payload_bid::stateful_checks(store, market, bid)
             }
             Self::ProposerPreferences(preferences) => {
-                gossip::proposer_preferences::stateful_checks(store, preferences)
+                gossip::proposer_preferences::stateful_checks(store, &**preferences)
             }
             Self::PayloadAttestation(message) => {
                 gossip::payload_attestation::stateful_checks(store, message)
@@ -173,6 +178,7 @@ impl Validated {
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
             }
+            Self::Pq(object) => object.stateful_checks(store),
         }
     }
 
@@ -230,6 +236,7 @@ impl Validated {
                     .record(message.slot, message.validator_index, *subnet_id)
             }
             Self::SyncContribution(signed) => server.seen_sync_contributions.record(signed),
+            Self::Pq(object) => object.record_seen(server),
         }
     }
 
@@ -269,6 +276,11 @@ impl Validated {
     /// validators it names as live for its target epoch; see
     /// [`record_liveness`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
+        // Relayed on `Accept` by gossipsub itself, and nothing more: no pool,
+        // event or chain actor takes a PQ object.
+        if let Self::Pq(_) = self {
+            return;
+        }
         if outcome == Outcome::Accept {
             record_liveness(server, &self);
             publish_gossip_event(server, &self);
@@ -415,7 +427,8 @@ impl Validated {
             | Self::PayloadAttestation(_)
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
-            | Self::SyncContribution(_) => {}
+            | Self::SyncContribution(_)
+            | Self::Pq(_) => {}
         }
     }
 }
@@ -490,7 +503,8 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::ProposerPreferences(_)
         | Validated::Operation(_)
         | Validated::SyncCommitteeMessage { .. }
-        | Validated::SyncContribution(_) => {}
+        | Validated::SyncContribution(_)
+        | Validated::Pq(_) => {}
     }
 }
 
@@ -677,6 +691,7 @@ fn pool_of(object: &Validated) -> &'static str {
         | Validated::Operation(_) => "attestation",
         Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => "builder",
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => "sync",
+        Validated::Pq(object) => object.pool(),
     }
 }
 

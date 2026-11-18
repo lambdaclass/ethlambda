@@ -248,7 +248,14 @@ fn handle_beacon_gossip(
     let topic_fork = beacon_topics::topic_digest(topic)
         .and_then(|digest| wire.schedule.fork_for_digest(digest))
         .unwrap_or(wire.fork);
-    let dispatch = if kind == beacon_topics::BEACON_BLOCK {
+    // A PQ digest's reshaped topics decode as PQ's containers; its block and
+    // column topics take the shared path below.
+    let pq_dispatch = (topic_fork == ForkName::Pq)
+        .then(|| crate::beacon::pq::triage(server, kind, payload, id.received_at))
+        .flatten();
+    let dispatch = if let Some(dispatch) = pq_dispatch {
+        dispatch
+    } else if kind == beacon_topics::BEACON_BLOCK {
         triage_block(server, wire, payload)
     } else if let Some(subnet_id) = beacon_topics::data_column_subnet(kind) {
         triage_data_column(server, topic_fork, payload, subnet_id)
@@ -1197,9 +1204,10 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
         *until = (*until).max(slot);
     }
     // Under every digest the node holds: while a boundary's window is open,
-    // attestations are published on either side of it.
+    // attestations are published on either side of it. Not a PQ digest's: the
+    // subnet comes from a BLS duty over `ATTESTATION_SUBNET_COUNT` subnets.
     for &subnet_id in &joined {
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
             let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
             server.swarm_handle.subscribe(IdentTopic::new(topic));
         }
@@ -1284,7 +1292,7 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
         .collect();
     for subnet_id in &expired {
         server.aggregator_subnets.remove(subnet_id);
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
             let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
             server.swarm_handle.unsubscribe(IdentTopic::new(topic));
         }

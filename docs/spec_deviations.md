@@ -947,3 +947,41 @@ this crate's verification off the same way
 real verifier is covered by its own known-answer tests instead
 (`ethlambda_crypto::lean_xmss`) and by the PQ unit tests, which sign with real
 keys.
+
+## PQ gossip is gloas's rules with the PQ lines applied
+
+consensus-specs' `pq` branch restates every gossip rule it touches
+(`specs/_features/pq/p2p-interface.md`) on a `master` newer than this
+repository's pin, as `validate_*_gossip` functions that read the head's state
+and order their checks differently. `gossip::pq` applies only the lines that
+branch marks `[Modified in PQ]` or `[New in PQ]` to the gloas rules the other
+gossip modules implement, so their deliberate departures carry over:
+
+- **The vote block's own post-state**, not the head's, for aggregates and
+  attestations, advanced to the attestation's epoch when its aggregation
+  committee window does not reach it (the branch's own `[New in PQ]`
+  `process_slots`, applied to this state rather than the head's), and only
+  by `MAX_VOTE_STATE_ADVANCE_EPOCHS` (2): advancing runs every slot between,
+  on any peer's say-so, and a node that does not follow PQ has every head
+  far behind a PQ slot. A vote block further behind is ignored. PQ proposer
+  preferences bound the advance of their dependent block's state the same
+  way.
+- **The pubkey-only XMSS signature before any committee derivation.**
+- **"Passes validation" is "post-state is cached".**
+- **The newer master's bid rules are not taken**: the builder bid limit
+  (`get_builder_bid_limit`) and the per-builder bid counts. PQ's bid rule is
+  this repository's gloas bid rule over a PQ builder market, with XMSS
+  signatures and `[Modified in PQ]`'s builder-exit key comparison.
+- **The proposer preferences domain is the one the specification names**
+  (`compute_fork_version(proposal_epoch)`), where gloas's rule accepts any of
+  three candidate domains for other clients' sake.
+
+Two more, which the node's not following PQ decides:
+
+- **A rule whose state is not a PQ one ignores the message.** The XMSS keys a
+  rule reads exist only in a PQ state, and the node imports no PQ block, so on
+  a live node every stateful PQ rule ends in an ignore. Rejecting would score
+  down every honest peer on a PQ digest.
+- **A message that does not decode as PQ's container is ignored, not
+  rejected**, as on every topic of a fork the node does not follow: the
+  containers are modelled from a moving specification branch.

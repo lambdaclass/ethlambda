@@ -78,6 +78,37 @@ fn slashed_indices(slashing: &AttesterSlashing) -> Vec<ValidatorIndex> {
 }
 
 impl SeenOperations {
+    /// Whether no slashing of `proposer_index` has been accepted yet.
+    pub(crate) fn proposer_slashing_is_new(&self, proposer_index: ValidatorIndex) -> bool {
+        !self.proposer_slashings.contains(&proposer_index)
+    }
+
+    /// Whether any of `slashed` has not been slashed by an accepted attester
+    /// slashing yet.
+    pub(crate) fn attester_slashing_is_new(&self, slashed: &[ValidatorIndex]) -> bool {
+        slashed
+            .iter()
+            .any(|index| !self.attester_slashed.contains(index))
+    }
+
+    /// Record an accepted proposer slashing of a shape [`BeaconOperation`]
+    /// does not carry (the PQ fork's). `false` if one was recorded first.
+    pub fn record_proposer_slashing(&mut self, proposer_index: ValidatorIndex) -> bool {
+        self.proposer_slashings.insert(proposer_index)
+    }
+
+    /// Record an accepted attester slashing of a shape [`BeaconOperation`]
+    /// does not carry (the PQ fork's), by the indices it slashes. `false` if
+    /// none of them is new.
+    pub fn record_attester_slashing(&mut self, slashed: &[ValidatorIndex]) -> bool {
+        // An explicit loop rather than `any`, which would short-circuit.
+        let mut any_new = false;
+        for &index in slashed {
+            any_new |= self.attester_slashed.insert(index);
+        }
+        any_new
+    }
+
     /// `false` when the specification's IGNORE condition holds.
     pub fn is_new(&self, operation: &BeaconOperation) -> bool {
         match operation {

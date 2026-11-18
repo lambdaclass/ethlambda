@@ -77,15 +77,20 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use ethlambda_state_transition::beacon::helpers::accessors::committee_count_per_slot;
+use ethlambda_state_transition::beacon::helpers::accessors::{
+    committee_count_per_slot, committee_count_per_slot_for,
+};
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::constants::TARGET_AGGREGATORS_PER_COMMITTEE;
+use ethlambda_types::beacon::constants::{
+    AGGREGATORS_PER_COMMITTEE, TARGET_AGGREGATORS_PER_COMMITTEE,
+};
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::gossipsub::{IdentTopic, PeerScoreParams, PeerScoreThresholds, TopicScoreParams};
 use tracing::info;
 
-use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
+use crate::beacon::constants::{ATTESTATION_SUBNET_COUNT, ATTESTATION_SUBNET_COUNT_PQ};
 use crate::beacon::topics::{
     ATTESTER_SLASHING, BEACON_AGGREGATE_AND_PROOF, BEACON_BLOCK, PROPOSER_SLASHING, VOLUNTARY_EXIT,
     attestation_topic_name, topic_name,
@@ -324,6 +329,47 @@ impl ScoreSettings {
         topics
     }
 
+    /// [`Self::digest_topic_params`] for a digest of `fork`. A PQ digest
+    /// scores its own topic set: no `voluntary_exit`, and
+    /// `ATTESTATION_SUBNET_COUNT_PQ` attestation subnets, each carrying that
+    /// share of the attesters, with aggregates from aggregation committees.
+    pub fn digest_topic_params_at(
+        &self,
+        fork: ForkName,
+        fork_digest: ForkDigest,
+        role: DigestRole,
+        inputs: ScoreInputs,
+    ) -> Vec<(IdentTopic, TopicScoreParams)> {
+        if fork != ForkName::Pq {
+            return self.digest_topic_params(fork_digest, role, inputs);
+        }
+        let inputs = ScoreInputs {
+            mesh_deliveries_scored: inputs.mesh_deliveries_scored && role == DigestRole::Current,
+            ..inputs
+        };
+        let voluntary_exit = IdentTopic::new(topic_name(fork_digest, VOLUNTARY_EXIT)).hash();
+        let mut topics: Vec<_> = self
+            .fixed_topic_params(fork_digest)
+            .into_iter()
+            .filter(|(topic, _)| topic.hash() != voluntary_exit)
+            .collect();
+        let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
+        let (aggregators_per_slot, committees_per_slot) = expected_pq_aggregators_per_slot(active);
+        topics.extend(self.dynamic_topic_params_with(
+            fork_digest,
+            inputs,
+            aggregators_per_slot,
+            committees_per_slot,
+            ATTESTATION_SUBNET_COUNT_PQ,
+        ));
+        if role == DigestRole::Previous {
+            for (_, params) in &mut topics {
+                params.topic_weight = 0.0;
+            }
+        }
+        topics
+    }
+
     /// Exits and slashings: rare enough that their rates do not depend on
     /// the validator count, and never mesh-delivery scored.
     fn fixed_topic_params(&self, fork_digest: ForkDigest) -> Vec<(IdentTopic, TopicScoreParams)> {
@@ -362,10 +408,30 @@ impl ScoreSettings {
         // it, which gossipsub rejects.
         let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
         let (aggregators_per_slot, committees_per_slot) = expected_aggregators_per_slot(active);
+        self.dynamic_topic_params_with(
+            fork_digest,
+            inputs,
+            aggregators_per_slot,
+            committees_per_slot,
+            ATTESTATION_SUBNET_COUNT,
+        )
+    }
+
+    /// [`Self::dynamic_topic_params`] for `subnet_count` attestation subnets
+    /// and an expected aggregate rate, the parts a PQ digest changes.
+    fn dynamic_topic_params_with(
+        &self,
+        fork_digest: ForkDigest,
+        inputs: ScoreInputs,
+        aggregators_per_slot: f64,
+        committees_per_slot: u64,
+        subnet_count: u64,
+    ) -> Vec<(IdentTopic, TopicScoreParams)> {
+        let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
         // Whether each subnet sees more than one committee's burst an epoch,
         // which shortens its decay windows.
         let multiple_bursts_per_subnet_per_epoch =
-            committees_per_slot >= 2 * ATTESTATION_SUBNET_COUNT / SLOTS_PER_EPOCH;
+            committees_per_slot >= 2 * subnet_count / SLOTS_PER_EPOCH;
         // Lighthouse's young-chain rule and this node's sync gate: P3 needs
         // both a chain older than the topic's decay window and a node that
         // has kept up with it.
@@ -416,9 +482,16 @@ impl ScoreSettings {
         } else {
             self.epoch * 4
         };
+        // The subnets share one unit of weight between them, as lighthouse's
+        // do, so fewer subnets weigh each more and the sum is unchanged.
+        let attestation_subnet_weight = if subnet_count == ATTESTATION_SUBNET_COUNT {
+            self.attestation_subnet_weight
+        } else {
+            1.0 / subnet_count.max(1) as f64
+        };
         let attestation = self.topic_params(
-            self.attestation_subnet_weight,
-            active as f64 / ATTESTATION_SUBNET_COUNT as f64 / SLOTS_PER_EPOCH as f64,
+            attestation_subnet_weight,
+            active as f64 / subnet_count.max(1) as f64 / SLOTS_PER_EPOCH as f64,
             attestation_fmd_decay_time,
             Some(&attestation_mesh),
             scored(attestation_mesh.decay_slots),
@@ -434,7 +507,7 @@ impl ScoreSettings {
                 aggregate,
             ),
         ];
-        topics.extend((0..ATTESTATION_SUBNET_COUNT).map(|subnet_id| {
+        topics.extend((0..subnet_count).map(|subnet_id| {
             let topic = IdentTopic::new(attestation_topic_name(fork_digest, subnet_id));
             (topic, attestation.clone())
         }));
@@ -539,6 +612,19 @@ fn expected_aggregators_per_slot(active: u64) -> (f64, u64) {
     (per_epoch / SLOTS_PER_EPOCH as f64, committees_per_slot)
 }
 
+/// [`expected_aggregators_per_slot`] at PQ: every committee, under PQ's cap,
+/// has an aggregation committee of up to `AGGREGATORS_PER_COMMITTEE` members,
+/// fewer only when the committee itself is smaller.
+fn expected_pq_aggregators_per_slot(active: u64) -> (f64, u64) {
+    let committees_per_slot = committee_count_per_slot_for(ForkName::Pq, active);
+    let committee_size = active / (committees_per_slot * SLOTS_PER_EPOCH).max(1);
+    let per_committee = AGGREGATORS_PER_COMMITTEE.min(committee_size.max(1));
+    (
+        (committees_per_slot * per_committee) as f64,
+        committees_per_slot,
+    )
+}
+
 /// Whether mesh-delivery scoring (P3) is safe to switch on: the head has
 /// kept up with the wall clock long enough that the delivery counters
 /// reflect what mesh peers sent, not what this node was able to accept.
@@ -590,8 +676,9 @@ pub(crate) struct PeerScoring {
     active_validators: u64,
     /// The gate's last verdict, so a change is logged once.
     mesh_deliveries_scored: bool,
-    /// The fork digests whose topics the node holds, in activation order.
-    held: Vec<ForkDigest>,
+    /// The fork digests whose topics the node holds, in activation order,
+    /// each with its fork, whose topic set it scores.
+    held: Vec<(ForkDigest, ForkName)>,
     /// The one among [`Self::held`] this node publishes under.
     current: ForkDigest,
 }
@@ -599,13 +686,13 @@ pub(crate) struct PeerScoring {
 impl PeerScoring {
     /// `fork_digest` is the digest the swarm was built on, the only one held
     /// until the fork schedule is first applied.
-    pub(crate) fn new(config: &Config, fork_digest: ForkDigest) -> Self {
+    pub(crate) fn new(config: &Config, fork_digest: ForkDigest, fork: ForkName) -> Self {
         Self {
             settings: ScoreSettings::new(config, crate::MESH_N),
             gate: MeshDeliveryGate::default(),
             active_validators: PLACEHOLDER_ACTIVE_VALIDATORS,
             mesh_deliveries_scored: false,
-            held: vec![fork_digest],
+            held: vec![(fork_digest, fork)],
             current: fork_digest,
         }
     }
@@ -618,7 +705,7 @@ impl PeerScoring {
     /// swarm's one command channel, so sending these first is enough.
     pub(crate) fn hold(
         &mut self,
-        held: Vec<ForkDigest>,
+        held: Vec<(ForkDigest, ForkName)>,
         current: ForkDigest,
         wall_slot: u64,
         swarm: &SwarmHandle,
@@ -651,18 +738,22 @@ impl PeerScoring {
         };
         // `apply` checks that the current digest is held before it calls
         // `hold`, so `None` (every digest previous) is never reached.
-        let current_index = self.held.iter().position(|&digest| digest == self.current);
+        let current_index = self
+            .held
+            .iter()
+            .position(|&(digest, _)| digest == self.current);
         let topics = self
             .held
             .iter()
             .enumerate()
-            .flat_map(|(index, &digest)| {
+            .flat_map(|(index, &(digest, fork))| {
                 let role = match current_index.map(|current| index.cmp(&current)) {
                     Some(Ordering::Equal) => DigestRole::Current,
                     Some(Ordering::Greater) => DigestRole::Upcoming,
                     Some(Ordering::Less) | None => DigestRole::Previous,
                 };
-                self.settings.digest_topic_params(digest, role, inputs)
+                self.settings
+                    .digest_topic_params_at(fork, digest, role, inputs)
             })
             .collect();
         swarm.set_topic_score_params(topics);
@@ -962,6 +1053,43 @@ mod tests {
 
     /// Mainnet's committees saturate at `MAX_COMMITTEES_PER_SLOT`, so about
     /// sixteen aggregators each: lighthouse's figure of 1041.67 per slot.
+    /// A PQ digest is scored for its own topics: no `voluntary_exit`, and
+    /// `ATTESTATION_SUBNET_COUNT_PQ` subnets sharing one unit of weight.
+    #[test]
+    fn a_pq_digest_scores_its_own_topics() {
+        let settings = settings(crate::MESH_N);
+        let topics = settings.digest_topic_params_at(
+            ForkName::Pq,
+            DIGEST,
+            DigestRole::Current,
+            inputs(1_000_000, true),
+        );
+        assert_eq!(
+            topics.len(),
+            2 + 2 + crate::beacon::constants::ATTESTATION_SUBNET_COUNT_PQ as usize
+        );
+        let exit = IdentTopic::new(topic_name(DIGEST, VOLUNTARY_EXIT)).hash();
+        assert!(topics.iter().all(|(topic, _)| topic.hash() != exit));
+        let subnet_weight: f64 = topics
+            .iter()
+            .filter(|(topic, _)| topic.to_string().contains("beacon_attestation_"))
+            .map(|(_, params)| params.topic_weight)
+            .sum();
+        assert_close(subnet_weight, 1.0, "the PQ subnets' summed weight");
+        for (_, params) in &topics {
+            params.validate().expect("a valid topic parameter set");
+        }
+
+        // Every fork before PQ keeps the shared set.
+        let gloas = settings.digest_topic_params_at(
+            ForkName::Gloas,
+            DIGEST,
+            DigestRole::Current,
+            inputs(1_000_000, true),
+        );
+        assert_eq!(gloas.len(), 2 + 3 + ATTESTATION_SUBNET_COUNT as usize);
+    }
+
     #[test]
     fn a_million_validators_expect_about_a_thousand_aggregators_a_slot() {
         let (per_slot, committees_per_slot) = expected_aggregators_per_slot(1_000_000);
@@ -1138,7 +1266,7 @@ mod tests {
         let (swarm_handle, commands) = SwarmHandle::capturing();
         server.swarm_handle = swarm_handle;
         // The digest `unconnected_beacon_server` builds its swarm on.
-        server.peer_scoring = Some(PeerScoring::new(config, [0; 4]));
+        server.peer_scoring = Some(PeerScoring::new(config, [0; 4], ForkName::Fulu));
         (server, commands)
     }
 
@@ -1326,6 +1454,7 @@ mod tests {
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
                     attestation_subnets: Vec::new(),
+                    attestation_subnets_pq: Vec::new(),
                 })),
             })
             .expect("beacon swarm builds")
@@ -1429,6 +1558,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: vec![3],
                 attestation_subnets: vec![5],
+                attestation_subnets_pq: Vec::new(),
             },
         ))))
         .expect("beacon swarm builds");

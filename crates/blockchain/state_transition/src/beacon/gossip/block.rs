@@ -28,10 +28,15 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    // The feature forks after gloas (EIP-8483, PQ) have no gossip rules here:
-    // the node does not follow them.
+    // The feature forks after gloas (EIP-8483, PQ) stop here: the node does
+    // not follow them, and a block that passed would be handed to the chain
+    // actor, which cannot import past them.
     if !block.fork_name().is_followed() {
         return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
+    // PQ's rules, ready for when it is followed.
+    if let SignedBeaconBlock::Pq(pq_block) = block {
+        return super::pq::block_cheap_checks(seen, store, pq_block, now_ms);
     }
     if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
         return cheap_checks_gloas(seen, store, gloas_block, now_ms);
@@ -76,9 +81,9 @@ fn as_gloas<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => None,
-        // No gossip rules for the feature forks after gloas: the node does
-        // not follow them (`ForkName::is_followed`), and `cheap_checks`
-        // ignores their blocks before any rule reads them.
+        // Not followed (`ForkName::is_followed`): `cheap_checks` ignores
+        // their blocks before any rule reads them. PQ's rules are
+        // `super::pq::block_cheap_checks`.
         SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => None,
         SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
     }

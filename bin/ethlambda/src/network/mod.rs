@@ -188,6 +188,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
     }
     check!(
         attestation_subnet_count == p2p::ATTESTATION_SUBNET_COUNT,
+        attestation_subnet_count_pq == p2p::ATTESTATION_SUBNET_COUNT_PQ,
         data_column_sidecar_subnet_count == constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
         number_of_custody_groups == constants::NUMBER_OF_CUSTODY_GROUPS,
         custody_requirement == constants::CUSTODY_REQUIREMENT,

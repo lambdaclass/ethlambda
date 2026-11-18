@@ -821,9 +821,12 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
   `a4d16c5b`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
-  8 and 9, implemented in the state transition and fork choice only
+  8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
-  and refused everywhere else (`ForkName::is_followed` is false for both). The
+  and PQ's gossip rules (`gossip/pq.rs`, `p2p/src/beacon/pq.rs`: a PQ digest's
+  reshaped topics decode by the digest, are judged with XMSS signatures and
+  STARK proofs, and relayed, never consumed), and refused everywhere else
+  (`ForkName::is_followed` is false for both). The
   gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
   (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
   and the PQ registry holds each XMSS key in its 48-byte request form so the
@@ -1080,7 +1083,8 @@ behavior.
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
 - `DB_VERSION` is 8: `Config` gained the EIP-8483 and PQ fork versions and
-  epochs and `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, so a version 7
+  epochs, `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
+  `ATTESTATION_SUBNET_COUNT_PQ`, so a version 7
   directory's stored config decodes into the wrong fields. (7 moved `States`
   and `StateDiffs` from root keys to slot||root keys, the block's slot looked
   up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can
