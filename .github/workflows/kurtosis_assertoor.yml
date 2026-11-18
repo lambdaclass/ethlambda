@@ -234,8 +234,11 @@ jobs:
           ' "$RUNNER_TEMP/args.yaml"
           cat "$RUNNER_TEMP/args.yaml"
 
+      # pipefail, or the step takes tee's status: a Starlark error that rolled
+      # back a service would pass here and surface only in the next step.
       - name: Start the devnet
         run: |
+          set -o pipefail
           kurtosis run "$RUNNER_TEMP/ethereum-package" \
             --enclave "$COMMIT_BOOST_ENCLAVE" --args-file "$RUNNER_TEMP/args.yaml" \
             | tee "$RUNNER_TEMP/kurtosis_output.txt"
