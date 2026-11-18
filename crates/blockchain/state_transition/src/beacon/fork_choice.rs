@@ -1885,16 +1885,16 @@ pub fn get_voting_source(
 /// overflowed that stack once a stall had left a few thousand blocks below the
 /// justified one, and a stack overflow aborts the whole process.
 ///
-/// Takes `index`, [`Store::block_index`] built once by
-/// [`get_filtered_block_tree`] and read throughout the walk, rather than
-/// re-scanning the store's blocks at each node, and `children_of`, the
-/// parent-to-children map [`get_filtered_block_tree`] builds from `index` in
-/// one pass. The specification finds a block's children by scanning every
-/// block in the store; doing that here at every node visited made the walk
-/// quadratic in the live window, which is what a finality stall or a range
-/// catch-up grows. `blocks`' value is `index`'s own `(slot, parent_root)`
-/// shape rather than a whole [`SignedBeaconBlock`], since [`get_head`], the
-/// only reader of this function's output, never needs more than that.
+/// Takes `index`, the [`Store::block_index`] its caller already holds, read
+/// throughout the walk rather than re-scanning the store's blocks at each
+/// node, and `children_of`, the parent-to-children map
+/// [`get_filtered_block_tree`] builds from `index` in one pass. The
+/// specification finds a block's children by scanning every block in the
+/// store; doing that here at every node visited made the walk quadratic in
+/// the live window, which is what a finality stall or a range catch-up
+/// grows. `blocks`' value is `index`'s own `(slot, parent_root)` shape rather
+/// than a whole [`SignedBeaconBlock`], since [`get_head`], the only reader of
+/// this function's output, never needs more than that.
 pub fn filter_block_tree(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -3386,10 +3386,12 @@ pub fn is_parent_node_full(store: &Store, block: &SignedBeaconBlock) -> Result<b
 /// `get_checkpoint_block`, which is this walk from a `Pending` node keeping
 /// only `.root`, has no gloas function here: it answers what the pre-gloas,
 /// index-only [`get_checkpoint_block`] does on any chain both could answer.
-/// [`filter_block_tree`] (the only caller of [`get_checkpoint_block`] in this
-/// file; [`get_voting_source`] never calls it) therefore keeps calling the
-/// pre-gloas version, which is what lets [`get_filtered_block_tree`] serve
-/// [`gloas_get_head`] with no per-block fetch.
+/// Every caller of [`get_checkpoint_block`] in this file
+/// ([`filter_block_tree`]'s leaf check, `validate_on_attestation_indexed` and
+/// [`on_block`]; [`get_voting_source`] never calls it) therefore keeps calling
+/// the pre-gloas version, and the leaf check doing so is what lets
+/// [`get_filtered_block_tree`] serve [`gloas_get_head`] with no per-block
+/// fetch.
 pub fn gloas_get_ancestor(
     store: &Store,
     node: ForkChoiceNode,
@@ -6560,7 +6562,7 @@ mod tests {
     /// finalized checkpoint names epoch 1, whose start slot nobody built a
     /// block for, so the finalized block itself sits at the slot before. Once
     /// finalization advances (a real `update_checkpoints` call, which prunes
-    /// `LiveChain` as a side effect), `filter_block_tree`'s own
+    /// `LiveChain` as a side effect), the leaf check's (`is_viable_leaf`)
     /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
     /// rather than fail: `on_block` and `get_head` both call it on every
     /// leaf, and either one erroring here is `get_head` freezing on a live
