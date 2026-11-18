@@ -45,8 +45,14 @@ use tracing::error;
 
 /// Beacon Chain BLS12-381 signatures (the specification's `bls` module).
 pub mod bls;
+/// The Beacon Chain PQ fork's leanXMSS signatures (the specification's `xmss`
+/// module), over Keccak-256. Not the XMSS of [`signature`].
+pub mod lean_xmss;
 mod metrics;
 pub mod signature;
+/// The Beacon Chain PQ fork's proofs of many leanXMSS signatures (the
+/// specification's `stark` module), in its reference concatenation encoding.
+pub mod stark;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
