@@ -17,6 +17,10 @@
 //! The stream itself ([`sse_response`]) is shared with the Beacon API's
 //! `/eth/v1/events` (`crate::beacon::events`), which differs only in how it
 //! reads `topics` and words a refusal.
+//!
+//! Shutdown: a stream ends when the server's [`ShutdownSignal`] fires. Without
+//! that, a connected subscriber would keep graceful shutdown waiting forever,
+//! since the router's own [`EventBus`] clone keeps the channel open.
 
 use std::convert::Infallible;
 
@@ -29,9 +33,39 @@ use axum::{
 };
 use ethlambda_blockchain::{ChainEvent, EventBus, Topic};
 use ethlambda_storage::Store;
-use futures_util::{Stream, stream::unfold};
+use futures_util::{Stream, StreamExt as _, stream::unfold};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+
+/// What a response waits on to learn that the HTTP server it arrived on is
+/// shutting down.
+///
+/// Every router the server serves carries it as an [`Extension`] (see
+/// `crate::serve`), so a response that would otherwise never finish can end
+/// itself when the server starts shutting down. It holds a child of the
+/// server's token and exposes only [`ShutdownSignal::cancelled`], so a handler
+/// can wait for shutdown but never trigger it.
+///
+/// Handlers extract it as an `Option`: a router served some other way (a
+/// test, or a caller of `build_beacon_api_router` serving it with plain
+/// `axum::serve`) has no signal, and its streams then end only when the
+/// client leaves, rather than the request failing for a missing extension.
+#[derive(Clone)]
+pub(crate) struct ShutdownSignal(CancellationToken);
+
+impl ShutdownSignal {
+    /// A signal that fires when `server` is cancelled. It holds a child token,
+    /// which cannot cancel `server`.
+    pub(crate) fn of(server: &CancellationToken) -> Self {
+        Self(server.child_token())
+    }
+
+    /// Resolves once the server starts shutting down.
+    pub(crate) fn cancelled(self) -> WaitForCancellationFutureOwned {
+        self.0.cancelled_owned()
+    }
+}
 
 #[derive(Deserialize)]
 struct EventsParams {
@@ -40,6 +74,7 @@ struct EventsParams {
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
+    shutdown: Option<Extension<ShutdownSignal>>,
     Query(params): Query<EventsParams>,
 ) -> Response {
     // `topics` is required, matching the Beacon API: a missing or empty value
@@ -65,18 +100,30 @@ async fn get_events(
         },
     };
 
-    sse_response(&events, topics)
+    sse_response(&events, topics, shutdown.map(|Extension(signal)| signal))
 }
 
 /// An SSE response streaming every event on `events` whose topic is in
-/// `topics`, from now on.
+/// `topics`, from now on, until `shutdown` fires. With no signal, the stream
+/// ends only when the client leaves; see [`ShutdownSignal`].
 ///
 /// `X-Accel-Buffering: no` tells an nginx reverse proxy not to buffer the
 /// stream, which would otherwise hold events back until a buffer fills; axum's
 /// [`Sse`] already sets `content-type: text/event-stream` and
 /// `cache-control: no-cache`.
-pub(crate) fn sse_response(events: &EventBus, topics: Vec<Topic>) -> Response {
-    let mut response = Sse::new(event_stream(events.subscribe(), topics))
+pub(crate) fn sse_response(
+    events: &EventBus,
+    topics: Vec<Topic>,
+    shutdown: Option<ShutdownSignal>,
+) -> Response {
+    let shutdown = async move {
+        match shutdown {
+            Some(signal) => signal.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let stream = event_stream(events.subscribe(), topics).take_until(shutdown);
+    let mut response = Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response();
     response
@@ -125,7 +172,8 @@ fn event_stream(
                         Event::default().comment(format!("error - dropped {skipped} messages"));
                     return Some((Ok(frame), (rx, topics)));
                 }
-                // Publisher dropped: the node is shutting down.
+                // Every sender dropped. The router holds one, so in practice
+                // shutdown ends the stream through `ShutdownSignal` instead.
                 Err(RecvError::Closed) => return None,
             }
         }
@@ -143,12 +191,13 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use ethlambda_blockchain::{ChainEvent, EventBus};
+    use ethlambda_blockchain::{ChainEvent, EventBus, Topic};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     use crate::test_utils::create_test_state;
@@ -159,6 +208,8 @@ mod tests {
             create_test_state(),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
+        // No `ShutdownSignal` layer: a router served outside `crate::serve`
+        // must still answer.
         let app = crate::test_utils::test_api_router(store).layer(Extension(events.clone()));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
@@ -395,5 +446,22 @@ mod tests {
             let resp = events_response(&events, uri).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn events_stream_ends_when_the_server_shuts_down() {
+        let events = EventBus::new(16);
+        let server = tokio_util::sync::CancellationToken::new();
+        let shutdown = super::ShutdownSignal::of(&server);
+        let resp = super::sse_response(&events, vec![Topic::Head], Some(shutdown));
+
+        server.cancel();
+
+        // The bus stays open (`events` is still alive), so only the signal
+        // can end the body; before it did, this waited forever.
+        tokio::time::timeout(Duration::from_secs(5), resp.into_body().collect())
+            .await
+            .expect("the stream ends once shutdown fires")
+            .expect("the body reads");
     }
 }
