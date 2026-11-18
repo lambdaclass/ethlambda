@@ -335,6 +335,11 @@ pub trait CommitteeCacheExt {
     /// `state` cannot key, since there is nowhere to file the result, nor
     /// before electra, whose attestations never read the sums. Idempotent, so
     /// a caller unsure whether an epoch is warm can just ask again.
+    ///
+    /// Deriving the committees, when they are not resident yet, is part of a
+    /// warm-up's cost, but `lean_beacon_committee_key_sums_warm_seconds`
+    /// times the sums alone: the committees are the shuffling every
+    /// attestation of the epoch needs anyway, warm or not.
     fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch);
 }
 
@@ -395,6 +400,13 @@ impl CommitteeCacheExt for CommitteeCache {
 /// whole active set is read), then committees are summed in parallel. An entry
 /// is `None` for a committee with a member whose key fails validation or whose
 /// index is outside the registry, and for an empty committee.
+///
+/// The flat key list is transient, about 48 MB on a mainnet-sized registry.
+/// The parallel sums run on rayon's global pool, which block import's key
+/// validation also uses (blst's pairings and leanVM's prover have pools of
+/// their own). A warm-up is short, about 70 ms per epoch measured on a mainnet
+/// node, and runs once or twice an epoch, so it delays import's key work only
+/// briefly when the two coincide.
 fn build_committee_key_sums(
     state: &BeaconState,
     committees: &EpochCommittees,

@@ -599,8 +599,11 @@ pub(crate) fn attesters_aggregate_pubkey(
 
         let number = committee_number(slot, committees_per_slot, committee_index)?;
         let sum = key_sums.as_ref().and_then(|sums| sums.get(number as usize));
+        // A strict majority attested (`attester_count * 2 > len`, written
+        // without the multiplication): subtracting the absent minority from
+        // the sum then takes fewer additions than summing the attesters.
         match sum {
-            Some(sum) if attester_count * 2 > committee.len() => {
+            Some(sum) if attester_count > committee.len() / 2 => {
                 let absent: Option<Vec<_>> = committee
                     .iter()
                     .zip(&attested)
