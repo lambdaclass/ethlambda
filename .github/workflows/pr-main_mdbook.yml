@@ -44,10 +44,13 @@ jobs:
         with:
           toolchain: stable
 
+      # Saved from main only, like every Rust cache here (see the setup-rust
+      # action): an entry saved on a PR ref is readable by that ref alone.
       - name: Cache cargo install
         uses: Swatinem/rust-cache@v2.9.3
         with:
           cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # mdbook-linkcheck2 runs as part of `mdbook build` and fails the build
       # on broken internal links (see book.toml `warning-policy = "error"`).
