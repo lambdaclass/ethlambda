@@ -74,7 +74,7 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{HashTreeRoot as _, Slot};
+use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::{bls, config::Config, constants};
 use crate::metrics::{StfPhase, observe_stf_phase, timed};
 use std::time::{Duration, Instant};
@@ -311,6 +311,25 @@ pub fn block_signature_set(
         pubkey: proposer.pubkey,
     };
     bls::SignatureSet::single(&proposer, signing_root, &signed_block.signature())
+}
+
+/// Whether `signature` is `proposer_index`'s over the block whose root is
+/// `block_root`, under `state`'s proposer domain.
+///
+/// A blinded block has the root of its full block, so one check serves
+/// both.
+pub fn verify_proposer_signature(
+    state: &BeaconState,
+    proposer_index: ValidatorIndex,
+    block_root: Root,
+    signature: &BlsSignature,
+) -> bool {
+    let Ok(proposer) = state.validator(proposer_index) else {
+        return false;
+    };
+    let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
+    let signing_root = compute_signing_root(block_root, domain);
+    bls::verify(&proposer.pubkey, signing_root, signature)
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and

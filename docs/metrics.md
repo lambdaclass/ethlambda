@@ -269,7 +269,7 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
-| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block whose import waits for its answer (not an optimistic candidate, or no mailbox: replay and the import benchmark), asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
+| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
 | `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload*`, from the request to the answer, retry ladder included: a pre-gloas block's payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `engine` phase) | Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks | outcome=valid,optimistic,invalidated,no_verdict | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
@@ -348,6 +348,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 | `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
 | `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss that reads a state back from storage, or takes one from a rebuild under way; a miss that finds no state or fails counts as neither | role=led,joined |
 
 **`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
 The beacon head computation reads vote weights the store keeps current as votes
@@ -387,6 +388,15 @@ or `has_state` miss means the state was not resident and came from the writer's
 buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
 choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
 epoch boundary when the checkpoint's block precedes it.
+
+**`lean_state_rebuilds_total{role="led"}` is the number of states actually
+read and decoded from storage.** A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. `role="joined"` counts misses that found a rebuild of
+the same root already under way and took its state instead. A lookup that
+finds no state for its root, or fails, counts under neither. A burst of joins
+next to a single lead is the pattern a late block's custody columns produce,
+each checked on its own task against a parent state that has left the cache.
 
 ### Beacon Gossip Validation
 
@@ -559,6 +569,11 @@ ethlambda-specific, not part of the leanMetrics spec.
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_publish_data_columns_seconds` | Histogram | Time to compute and verify a published block's cells and build its data column sidecars | On every published block that carries blobs and whose cells verify | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
+| `lean_beacon_builder_request_seconds` | Histogram | Time a builder API call took | On every `getHeader`, `registerValidator`, `submitBlindedBlockV2` and `status` call to the configured builder | call=get_header,register_validators,submit_blinded_block,status<br>outcome=ok,no_bid,timeout,unreachable,bad_request,unexpected_status,unexpected_success,redirected,invalid_response,unsupported_fork,encode | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 5, 10 |
+| `lean_beacon_builder_registrations_total` | Counter | Validator registrations received, by what became of them (`duplicate`: superseded by a newer registration of the same validator in the request) | On every `register_validator` request | outcome=forwarded,failed,dropped,duplicate | |
+| `lean_beacon_builder_bid_rejections_total` | Counter | Builder bids refused before selection, by reason | On every bid that fails validation or the state transition | reason=parent_hash,prev_randao,timestamp,block_number,withdrawals,too_many_blobs,blob_gas,gas_limit,signature,state_transition | |
+| `lean_beacon_builder_payload_source_total` | Counter | Blocks produced with a builder configured, by where the payload came from | On every produced block when `--builder` is set | source=local,builder | |
+| `lean_beacon_builder_fallback_total` | Counter | Proposals the circuit breaker kept from the builder, by reason | On every proposal by a registered proposer that the breaker trips for | reason=syncing,optimistic_head,no_finality,consecutive_skips,skips_per_epoch | |
 
 ### Beacon Committee Cache
 
@@ -682,26 +697,6 @@ worker, checkpoint-state advances, block production, gossip validation) writes
 `context="import"`; one that wants the precompute worker's reads `other`, which
 also holds the other callers, so `lean_beacon_epoch_precompute_seconds` is the
 cleaner series for the worker alone.
-
-### Beacon Execution Payload Verdicts
-
-A beacon block (before gloas) or envelope (from it) is imported before the
-execution client answers `engine_newPayload`, and the answer is applied when it
-arrives. See "Asking without waiting" in [`beacon_engine.md`](beacon_engine.md).
-This is ethlambda-specific, not part of the leanMetrics spec.
-
-| Name | Type | Usage | Sample collection event | Labels | Buckets |
-|------|------|-------|-------------------------|--------|---------|
-| `lean_engine_new_payload_in_flight` | Gauge | `engine_newPayload` requests sent and not yet answered | On every send, answer and per-slot redrive | | |
-| `lean_engine_payloads_awaiting_verdict` | Gauge | Imported payloads with no answer yet, in flight or queued | On every send, answer and per-slot redrive | | |
-| `lean_engine_new_payload_answers_total` | Counter | Answers by what was asked about and how it was answered | When an answer is applied | kind=block,envelope; outcome=valid,optimistic,invalid,reverted,no_answer,stale | |
-| `lean_engine_no_verdict_total` | Counter | Requests that got no answer after the whole retry ladder (the payload stays, and is asked again next slot) | When the ladder is exhausted | | |
-
-**Read the waiting gauge against `MAX_PAYLOADS_AWAITING_VERDICT`.** At the cap,
-imports are held for room: expected during catch-up, a sign of a slow or stuck
-execution client otherwise. `outcome=stale` is an answer for a payload that left
-fork choice (or was finalized) while its request was out, and `reverted` an
-envelope taken back out because its contents do not hash to its block hash.
 
 ### Beacon Pubkey Cache
 
@@ -902,6 +897,13 @@ and absent is not the same as zero.
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
+| `ethlambda_validator_builder_registrations_sent_total` | Counter | Builder registrations a beacon node accepted (`--builder-proposals`) |
+| `ethlambda_validator_builder_registration_failures_total` | Counter | Registration batches no beacon node accepted. A missed registration costs at most a builder block, never a duty |
+| `ethlambda_validator_proposer_preferences_published_total` | Counter | Signed proposer preferences a beacon node accepted, counted once per preference, when the first node accepts it (re-sends to nodes that missed it do not count). Published for every proposal from the epoch before gloas, whether or not `--builder-proposals` is set |
+| `ethlambda_validator_proposer_preferences_failures_total` | Counter | Proposer preference sends some beacon node refused or did not answer (one count per preference per attempt, re-sends included, so a node that keeps refusing shows up here even while another accepts). After a restart with other settings, a node holding the preference signed before it refuses the new one every slot until the slot starts, so a steady climb then is expected rather than a fault. So is one while the beacon nodes follow different heads: a node whose dependent root differs from the one the duties came from refuses the preference until the root changes or the slot starts. The next slot retries; a node that misses a preference never gossips it, and until some node accepts it, builders' bids for its slot are ignored. A send whose slot started before the nodes answered is not counted |
+| `ethlambda_validator_proposer_preferences_duty_fetch_failures_total` | Counter | v2 proposer-duty fetches no beacon node answered (one count per target epoch per attempt). Without the duties no preference is signed for that epoch; a syncing node, or one without the v2 endpoint, shows up here |
+| `ethlambda_validator_blinded_blocks_proposed_total` | Counter | Blinded blocks a beacon node handed to its builder. A subset of `blocks_proposed_total` |
+| `ethlambda_validator_blinded_blocks_unconfirmed_total` | Counter | Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation |
 | `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
 | `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
 | `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
@@ -918,13 +920,17 @@ second points at the beacon nodes; a rise in the third points at the clock or
 the duty schedule and is worth investigating even though the attestation was
 correctly suppressed.
 
-The proposal series split the same way, plus one that is neither a success nor
+The proposal series split the same way, plus two that are neither a success nor
 a failure. `blocks_proposed_total` counts blocks a node accepted;
 `block_proposal_failures_total` counts duties that produced none;
 `blocks_refused_total` counts blocks deliberately not signed. Between them,
 `blocks_broadcast_not_imported_total` counts blocks that did reach the network
 but that the node answering could not import, which is a beacon-node fault
 rather than a validator one and is why it is not folded into either.
+`blinded_blocks_unconfirmed_total` is the other: a blinded block the node did
+not confirm, which the relay may still have published. It is not in
+`blocks_proposed_total` nor in the publication delay histogram, and it is not a
+failure either.
 
 Gloas adds two pairs. A gloas proposal ends in a block and then an envelope,
 and the envelope's failure does not fail the proposal: `blocks_proposed_total`

@@ -222,7 +222,7 @@ pub enum IgnoreReason {
     NoConsumer,
     /// Every stateful-validation permit was taken.
     Overloaded,
-    /// Validation panicked.
+    /// Validation panicked, or a store read it needed failed.
     Internal,
     /// The message's own fork is one this build does not validate or decode
     /// (currently gloas): not the sender's fault, and not malformed, so this
@@ -615,7 +615,7 @@ pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
 
 /// The specification's `is_future_slot`: `slot` starts later than `now_ms`
 /// plus the gossip clock disparity allowance.
-pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
+pub fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
     slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
 }
 

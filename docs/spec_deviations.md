@@ -158,7 +158,62 @@ from the Beacon API, and no other way.
   the bid's.
 - **Why:** gossip and API bids need only a pool and the gossip rules. A builder
   API client is a separate crate with its own failure modes and timeouts, and
-  is left for a later phase.
+  is left for a later phase for gloas. Fulu's builder API (MEV-Boost) is now
+  served (`produceBlockV3` and `blinded_blocks`); gloas's is not.
+
+## Builder bids: the fee recipient is not checked
+
+- **The specification:** builder-specs' `process_bid` asserts
+  `header.fee_recipient == fee_recipient`.
+- **ethlambda:** a mismatch is logged at `debug` only.
+- **Why:** a builder names its own address as the payload's fee recipient
+  (the coinbase), so priority fees and MEV accrue to it, and pays the proposer
+  with a transaction to the registered fee recipient, worth the bid's `value`,
+  as the payload's last transaction. A mismatch is therefore the normal case,
+  and the assertion would refuse nearly every real bid. Every client reviewed
+  (Lighthouse, Teku, Prysm, Nimbus, Lodestar, Grandine) skips it. A counter of
+  mismatches would rise on nearly every bid and tell an operator nothing.
+- **The payment itself is not checked either, by this node or any client
+  reviewed.** A bid carries only the payload's header: the transactions,
+  payment included, stay with the builder until the proposer has signed. After
+  signing, `submitBlindedBlockV2` returns no payload; the builder publishes
+  the block, which reaches this node over gossip like any other, by which time
+  nothing can be undone.
+- **Who does check it:** the relay. Before serving a builder's bid, a relay
+  validates the submission on an execution node, and that validation requires
+  the proposer payment. Flashbots' block-validation API
+  (`flashbots_validateBuilderSubmission*`) passes the registered fee
+  recipient and the bid's value to `ValidatePayload`, which requires the
+  block's last transaction to pay that address at least that much (or, if the
+  relay configures it, the address's balance to rise by it). The proposer
+  relies on the relay for this, as for the payload's validity. A relay
+  publishes what it delivered on its data API
+  (`/relay/v1/data/bidtraces/proposer_payload_delivered`), which is where an
+  underpayment would surface. An operator who wants more than that trust must
+  choose relays accordingly. A check after the fact, comparing a published
+  block's last transaction with the bid it won, is possible but not
+  implemented.
+
+## `builder_boost_factor` scales the bid before rounding
+
+- **The specification:** beacon-APIs' `produceBlockV3` serves the local payload
+  iff `exec_node_payload_value >= builder_boost_factor *
+  (builder_payload_value // 100)`: the bid is rounded down to a multiple of
+  100 wei, then scaled.
+- **ethlambda:** the local payload wins iff its value is at least
+  `(builder_boost_factor * builder_payload_value) // 100`, scaled first and
+  rounded down once (`builder_flow::choice::boosted`), saturating at
+  `u128::MAX`. A tie still goes local, and the factors 0, 100 and `2^64 - 1`
+  keep the meanings the specification gives them.
+- **Why:** rounding first loses up to 99 wei of the bid before it is weighed,
+  so even at the default factor of 100 a bid slightly better than the local
+  payload lost to it. Scaling first makes 100 an exact comparison. The two
+  differ by less than `factor` wei, only ever in the bid's favour. The gloas
+  `produceBlockV4` comparison (`bid_selection::choose_payload`) already
+  multiplies first. Teku and Lodestar compare `local * 100` against
+  `factor * bid`, and Nimbus computes `(factor * bid) div 100` (giving a tie to
+  the builder). Lighthouse follows the specification's order but skips the
+  arithmetic at factor 100 for the same reason (sigp/lighthouse#5352).
 
 ## Fee recipient and gas target come from proposer preferences, with fallbacks
 
@@ -242,12 +297,14 @@ from the Beacon API, and no other way.
   and a bid is compatible with it when it builds on that head and its payload.
   The builder-exit check is skipped for a pre-gloas parent, which carries no
   envelope.
-- **Preference signatures** are accepted under the lookahead state's own
-  `DOMAIN_PROPOSER_PREFERENCES` domain (the specification's), the fork version of
-  the epoch before the proposal's, or the proposal epoch's. They coincide outside
-  the first epoch of a fork. Lighthouse signs with the proposal epoch's version
-  and the specification gives the earlier one, so accepting both avoids
-  rejecting an honest client's messages around the gloas upgrade.
+- **Preference signatures** are accepted under `DOMAIN_PROPOSER_PREFERENCES` at
+  the proposal epoch's fork version, which consensus-specs v1.7.0-beta.4 signs
+  and verifies with and every client signs with, and also under the two that
+  v1.7.0-beta.2's rule (`get_domain` on the lookahead state) could give: that
+  state's own fork, and the fork version of the epoch before the proposal's.
+  They coincide outside the first epoch of a fork. The older two are kept for a
+  client still signing by beta.2, until the fixtures (pinned to beta.2) move
+  past it.
 - **Consequence:** builders onboarded at the fork are inactive until their
   deposit epoch is finalized, so gossip bids are rejected for the first epochs of
   gloas and `produceBlockV4` self-builds.
@@ -603,92 +660,50 @@ newer than the release the fixtures are pinned to.
   before it checks the head. Remove this entry when the pin reaches
   `v1.7.0-beta.4`.
 
-## Payloads are applied before the execution client answers
+## The execution client judges a gloas payload before the envelope is applied
 
-The specification asks the execution engine inside the state transition
-(`process_execution_payload` before gloas, `verify_execution_payload_envelope`
-from it), so a block or envelope enters the store only with an answer in hand,
-and `optimistic-sync.md` relaxes that only for an answer of `NOT_VALIDATED`. The
-running follower does not wait for the answer at all
-(`crates/blockchain/src/beacon_new_payload.rs`):
+`verify_execution_payload_envelope` asks the execution engine last, as part of
+one boolean function. The follower runs the pure consensus checks first
+(`check_execution_payload_envelope`: signature, bid, state, data availability),
+then asks the engine with `engine_newPayloadV5` only about an envelope that
+passed them, and records it with `accept_execution_payload_envelope`. The
+engine's part is answered "valid" inside the checks because its answer has
+three outcomes and the specification's `ExecutionEngine` has two.
 
-- A pre-gloas block that is an optimistic candidate is imported as optimistic
-  (`optimistic_roots`) as soon as its consensus checks pass, with its
-  `engine_newPayloadV4` sent first from a task of its own. A gloas envelope is
-  applied as soon as the consensus checks below pass, its payload recorded
-  `NOT_VALIDATED`. Everything that reads optimism reads both as optimistic, so
-  the Beacon API refuses attestation and payload attestation data for them with
-  a `503` until the answer arrives.
-- The answer is applied when it arrives, to what is already in fork choice:
-  `VALID` validates (and sends `head` again for a head that was optimistic),
-  `SYNCING`/`ACCEPTED` changes nothing, `INVALID` removes the block's branch or
-  condemns the gloas payload, exactly as a `forkchoiceUpdated` verdict about an
-  imported block already did.
-- **No answer after the retry ladder** is where this departs from the letter of
-  `optimistic-sync.md`, which says such a block MUST NOT be applied to fork
-  choice. It already is, so it stays, optimistic, and is asked again once a
-  slot. Taking it back out would need an un-import that re-holds its
-  descendants, for a state the next answer resolves anyway.
-- A payload is sent only once the one it builds on has been answered, at most
-  `MAX_NEW_PAYLOADS_IN_FLIGHT` at once, and `forkchoiceUpdated` names the newest
-  payload on the head's chain whose request is not queued or in flight: the
-  Engine API orders only `forkchoiceUpdated`, and a payload the execution client
-  receives before its parent is answered `SYNCING` and may start a sync from
-  peers.
-- At most `MAX_PAYLOADS_AWAITING_VERDICT` payloads wait for an answer; past that
-  the import waits (a pre-gloas block is held, an envelope waits in
-  `awaiting_engine`). Only catch-up reaches it.
-- A block that is not an optimistic candidate (around the merge transition)
-  still waits for its answer inline, as does a server with no mailbox
-  (offline replay): those are the specification's order.
-
-For a gloas payload the follower also orders the checks differently:
-`verify_execution_payload_envelope` asks the engine last, as part of one boolean
-function, while the follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability)
-and asks with `engine_newPayloadV5` only about an envelope that passed them,
-recording it with `accept_execution_payload_envelope`. The engine's part is
-answered "valid" inside the checks because its answer has three outcomes and
-the specification's `ExecutionEngine` has two.
-
-- **`VALID`:** the payload is recorded `VALID`.
-- **`SYNCING` / `ACCEPTED`:** recorded `SYNCING`, which the attestation gossip
-  rules already read as not yet validated. A later `forkchoiceUpdated` `VALID`
-  for the head, or for a descendant payload, moves it and every optimistic
-  payload on that chain to `VALID`. Unlike a pre-gloas block there is no
-  `is_optimistic_candidate_block` gate: a payload is applied to a block the
-  consensus layer already imported, so there is no merge-transition poisoning
-  to guard against.
-- **`INVALID`:** the FULL node of the block is removed and the payload is
-  recorded `INVALID`; blocks waiting on it are dropped and later blocks that
-  name it as their FULL parent are dropped instead of held. The block itself and
-  its EMPTY branch stay. `latestValidHash` can reach further back, in which case
-  the first payload after it is condemned the same way
+- **`VALID`:** applied; the payload is recorded `VALID`.
+- **`SYNCING` / `ACCEPTED`:** applied, since the consensus checks passed and the
+  payload is `NOT_VALIDATED` (`optimistic-sync.md`); recorded `SYNCING`, which
+  the attestation gossip rules already read as not yet validated. A later
+  `forkchoiceUpdated` `VALID` for the head, or for a descendant payload, moves
+  it and every optimistic payload on that chain to `VALID`. Unlike a pre-gloas
+  block there is no `is_optimistic_candidate_block` gate: a payload is applied
+  to a block the consensus layer already imported, so there is no
+  merge-transition poisoning to guard against.
+- **`INVALID`:** not applied, so the FULL node of the block never exists; the
+  payload is recorded `INVALID`, children held for it are dropped and later
+  blocks that name it as their FULL parent are dropped instead of held. The
+  block itself and its EMPTY branch stay. `latestValidHash` can reach further
+  back, in which case the first payload after it is condemned the same way
   (`beacon_payloads::resolve_invalid_payload`, which skips blocks that carry no
   payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
-  `INVALID` for a payload already applied removes it the same way.
+  `INVALID` for a payload already applied removes it again (its FULL node, its
+  stored envelope, and every child built on it).
 - **A hash mismatch (`INVALID_BLOCK_HASH`, or `INVALID` with a null
   `latestValidHash`):** the envelope's contents do not hash to the block hash it
-  claims, so the envelope is taken back out (`revert_envelope`: no FULL node,
-  no recorded verdict, no arrival time) and only that envelope (by its own root)
-  is refused; the root's payload is not condemned, since the builder's real
-  envelope may still arrive. Since `engine_newPayloadV2` a block hash mismatch
-  is answered `INVALID` with a null `latestValidHash` (`INVALID_BLOCK_HASH` is
-  "supplanted by `INVALID`", execution-apis `shanghai.md`), and an
-  executed-and-failed payload `INVALID` with its last valid ancestor. So a null
-  one is read as a mismatch and a non-null one as the payload being invalid. A
-  payload that failed with no valid ancestor to name is read as a mismatch too,
-  which only costs a refused envelope. Lighthouse and Prysm reject only the
-  envelope too; they never apply it before the answer, so they have nothing to
-  take back out.
-- **Blocks built on a FULL payload wait for its answer**, not only for its
-  envelope, which is what lets a refused envelope be taken back out with nothing
-  on top of it. `on_block` would accept them as soon as the envelope is applied;
-  Lighthouse (`get_parent_import_status`) and Prysm (`ParentPayloadReady`) hold
-  the same blocks, since their FULL node exists only after the answer.
-- **No answer after the retry ladder:** the envelope stays applied and
-  `NOT_VALIDATED`, the blocks waiting on it keep waiting, and it is asked again
-  once a slot, as for a pre-gloas block.
+  claims, so only that envelope (by its own root) is refused; the root's
+  payload is not condemned, since the builder's real envelope may still arrive.
+  ethrex has no `INVALID_BLOCK_HASH` status: it answers a block hash mismatch
+  with `INVALID` and a null `latestValidHash`, and an executed-and-failed
+  payload with `INVALID` and its last valid ancestor. So a null one is read as
+  a mismatch and a non-null one as the payload being invalid. A payload that
+  failed with no valid ancestor to name is read as a mismatch too, which only
+  costs a refused envelope.
+- **No answer after the retry ladder:** the payload is not applied, as for a
+  block, but unlike a block the envelope is consensus-valid and already held,
+  so it is kept and the per-slot redrive asks again, about the oldest held
+  envelope only and the rest once that ask is answered, so a down client costs
+  one retry ladder per slot however many wait. It is not fetched again:
+  that would repeat the ladder for every copy that arrives.
 
 `latestValidHash` and `VALID` follow the execution-layer chain, not every
 verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
@@ -782,3 +797,73 @@ comes first. The validator client signs once, at the deadline
 (`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
+
+## The validator client's builder proposals
+
+With `--builder-proposals` the validator client registers its validators with
+the beacon node's builder and may sign a blinded block (builder-specs and
+`validator.md`'s builder flow), for fulu and earlier slots. A blinded block
+has the root of the full block it stands for, so slashing protection records
+its slot like any other block's, durably and before it is signed: one slot, one
+signature, whichever way the node answered. Three departures:
+
+- **A blinded block is published only on the beacon node that produced it, with
+  no failover.** This is this client's choice, not the specification's: only
+  that node's builder holds the payload and only that node claimed the slot, so
+  offering the signed block to another node would hand it to a builder that
+  never saw the bid. If the producing node fails, the publish fails, and
+  slashing protection has already recorded the slot, so nothing retries. A 5xx
+  other than 503, or no answer once connected, is reported as unconfirmed
+  (logged at error, counted on `blinded_blocks_unconfirmed_total`) and not as a
+  missed proposal, since the relay may still publish the block. A 4xx, a 503 or
+  a connection never made (refused, or past the client's 3 s connect timeout)
+  is a missed proposal: the node cannot have handed the block on. The block
+  carries the node that produced it (`Producer`, filled in by the fallback),
+  and the proposal path sends the signed block back to it; Teku pins a blinded
+  block to its producer too, in a cache keyed by slot and root, while
+  Lighthouse, Lodestar and Nimbus fail over or broadcast instead.
+  Two status codes are read the wrong way: some of ethlambda's own 500s are
+  definite (no builder configured, the block failing the node's checks) and
+  count as unconfirmed, and a proxy's 503 sent after it forwarded the request
+  counts as definite. Neither leads to a retry or a second signature.
+- **A blinded block stays signed but undelivered for longer.** The node waits
+  up to 5 s on the relay and the client up to 8 s on the node, against well
+  under a second for a full block. The publish runs on its own task so the
+  proposal budget cannot cut it off: past the budget the proposal returns
+  "still publishing" and the task reports the outcome itself. The process
+  handles no signals, though: a SIGINT in that window ends the task with the
+  request.
+- **Registrations stop at gloas.** The client sends no `register_validator` from
+  the gloas fork epoch on: the builder market works through proposer
+  preferences there (see the next section), and `produceBlockV4` sends the
+  configured boost factor and `--builder-min-bid` (default `0`), and no
+  builders.
+  Validators with no fee recipient are not registered either (the field is
+  required), and only validators the beacon node resolved, pending or active,
+  are signed for: the flashbots relay refuses a whole batch over an exited or
+  withdrawn key, as Teku's validator client and Lighthouse's beacon node
+  account for.
+
+## The validator client's proposer preferences
+
+- **Signing domain: no departure, but ahead of the fixtures.** The validator
+  client signs under `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork
+  version (`SigningContext::sign_proposer_preferences`), as consensus-specs
+  v1.7.0-beta.4's `get_signed_proposer_preferences` does with
+  `compute_fork_version(proposal_epoch)`, and as Lighthouse, Prysm, Teku,
+  Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
+  v1.7.0-beta.2, whose gossip rule verified with `get_domain` on the dependent
+  block's state advanced to the lookahead start, the fork of the epoch before
+  the proposal's. The two differ only for a proposal in the first epoch of a
+  fork, where Lighthouse refuses beta.2's signature as a bad one. This node
+  still accepts beta.2's domain too (see the fulu-to-gloas boundary entry).
+- **Published unconditionally,** not gated on `--builder-proposals`, since from
+  gloas the preferences carry every proposal's fee recipient. Validators with no
+  fee recipient are skipped (the field is required), and a preference cannot be
+  replaced for the same slot and dependent root.
+- **Re-sent once an epoch,** as signed, to every node, while its slot is ahead.
+  The specification says nothing about re-sending; it is here because a beacon
+  node holds them in memory only
+  and gossip does not replay them, so a node that restarts would otherwise
+  self-build without them, and ignore builders' bids, until the next dependent
+  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.

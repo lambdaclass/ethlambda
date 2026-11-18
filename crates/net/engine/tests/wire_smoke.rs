@@ -298,3 +298,63 @@ async fn get_blobs_v2_with_a_different_length_than_requested_is_a_decode_error()
         .expect_err("one blob for two hashes is malformed");
     assert!(matches!(err, EngineError::Decode(_)), "got {err:?}");
 }
+/// Accepts every connection, reads its request, and never answers. Returns
+/// the endpoint and a count of the connections it took.
+async fn serve_silently() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Kept open, so the client waits on an answer rather than seeing
+            // the connection close.
+            held.push(socket);
+        }
+    });
+
+    (format!("http://{addr}"), connections)
+}
+
+/// `getPayload` is one attempt at its own timeout: a ladder of three would
+/// take seconds more and open a connection per attempt.
+#[tokio::test]
+async fn get_payload_gives_up_after_one_attempt_at_its_own_timeout() {
+    use ethlambda_engine::building::PayloadId;
+    use ethlambda_engine::client::ENGINE_GET_PAYLOAD_TIMEOUT;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    for v6 in [false, true] {
+        let (endpoint, connections) = serve_silently().await;
+        let client = client(endpoint);
+        let started = Instant::now();
+        let err = if v6 {
+            client.get_payload_v6(PayloadId([1; 8])).await.map(drop)
+        } else {
+            client.get_payload(PayloadId([1; 8])).await.map(drop)
+        }
+        .expect_err("the mock never answers");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, EngineError::Timeout(timeout) if timeout == ENGINE_GET_PAYLOAD_TIMEOUT),
+            "v6 {v6}: {err:?}"
+        );
+        assert!(
+            elapsed >= ENGINE_GET_PAYLOAD_TIMEOUT,
+            "v6 {v6}: {elapsed:?}"
+        );
+        // A second attempt would add the backoff and another full timeout.
+        let retry_floor = ENGINE_GET_PAYLOAD_TIMEOUT * 2 + Duration::from_millis(500);
+        assert!(elapsed < retry_floor, "v6 {v6}: {elapsed:?}");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "v6 {v6}");
+    }
+}
