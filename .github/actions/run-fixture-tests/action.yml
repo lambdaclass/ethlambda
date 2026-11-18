@@ -116,9 +116,13 @@ runs:
       with:
         cache-key: ${{ inputs.make-target }}
 
+    # The target is read through the environment, never spliced into the
+    # script, the same as the beacon action's preset.
     - name: Run tests
       shell: bash
-      run: make ${{ inputs.make-target }}
+      env:
+        MAKE_TARGET: ${{ inputs.make-target }}
+      run: make "$MAKE_TARGET"
 
     # How close this half is to the disk ceiling. No CI job frees disk space
     # first any more (see ci.yml), so this reading is what would show a runner

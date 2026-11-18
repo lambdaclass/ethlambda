@@ -19,14 +19,23 @@ lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 # The docs-only CI skip (.github/actions/detect-changes) assumes no build or test
 # reads the paths it treats as inert: docs/, theme/, book.toml, Markdown files,
 # .claude/, LICENSE and .gitignore. This checks the compile-time half of that: it
-# fails if an `include_str!` or `include_bytes!` names one of them. It reads one
-# line at a time, so a path assembled across lines (`concat!`) gets past it, as
-# does a file opened at run time; CLAUDE.md ("Docs-only changes skip CI") states
-# the rule for those. CI's Lint job runs this target too.
-INERT_PATH_PATTERN='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'
-
+# fails if an `include_str!` or `include_bytes!` names one of them. CI's Lint job
+# runs this target too.
+#
+# - Every tracked `.rs` file (`git ls-files`), wherever it lives, so a crate
+#   added outside crates/ and bin/ is covered too.
+# - Each macro line plus the two after it, which catches the form rustfmt
+#   produces for a long path: `include_str!(` with the path on the next line. A
+#   path assembled further away (`concat!` across many lines) or a file opened
+#   at run time still gets past it; CLAUDE.md ("Docs-only changes skip CI")
+#   states the rule for those.
+# - The pattern is unanchored on purpose: `docs/` anywhere in a path, even
+#   `fixtures/docs/x.ssz`, fails. A false positive fails loudly, while a
+#   narrower pattern can miss the real thing, so widen the list rather than
+#   anchoring it. Keep it in step with the action's `inert` list.
 inert-paths-check: ## 🔎 Fail if a crate compiles in a path the docs-only CI skip treats as unread
-	@hits=$$(grep -rnE --include='*.rs' 'include_(str|bytes)!' crates bin tooling | grep -E $(INERT_PATH_PATTERN) || true); \
+	@pattern='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'; \
+	hits=$$(git ls-files -z '*.rs' | xargs -0 grep -HnE -A2 'include_(str|bytes)!' | grep -E "$$pattern" || true); \
 	if [ -n "$$hits" ]; then \
 		echo "ERROR: these compile in a path .github/actions/detect-changes treats as docs-only."; \
 		echo "Take the path off that action's inert list, or stop reading it:"; \
