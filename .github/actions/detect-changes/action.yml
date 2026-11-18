@@ -17,9 +17,15 @@ runs:
     # A push to main always runs everything: it is what saves the caches PRs
     # restore (see the setup-rust action), and it is the last check a change
     # gets.
+    #
+    # `continue-on-error`: a filter that fails (an API or fetch hiccup) leaves
+    # its counts empty, which the next step reads as "run everything". The job
+    # then stays green rather than turning the run red over a check that only
+    # ever saves time; the next step annotates the failure instead.
     - uses: dorny/paths-filter@v4.0.3
       id: filter
       if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+      continue-on-error: true
       with:
         # `inert` is a positive list, compared by count against `all_files` in
         # the next step, rather than a list of `!` negations. paths-filter ORs
@@ -30,6 +36,9 @@ runs:
         # Nothing on this list is read by a build or a test: no crate
         # `include_str!`s a Markdown file, and `docs/`, `theme/` and
         # `book.toml` are the mdBook site, which `pr-main_mdbook.yml` builds.
+        # That is an invariant the code has to keep (CLAUDE.md, "Docs-only
+        # changes skip CI"): a crate that starts reading one of these paths,
+        # e.g. `#![doc = include_str!("../README.md")]`, must take it off.
         filters: |
           all_files:
             - '**'
@@ -50,10 +59,14 @@ runs:
       id: classify
       shell: bash
       env:
+        FILTER_OUTCOME: ${{ steps.filter.outcome }}
         ALL_FILES: ${{ steps.filter.outputs.all_files_count }}
         INERT: ${{ steps.filter.outputs.inert_count }}
       run: |
         set -euo pipefail
+        if [[ "$FILTER_OUTCOME" == "failure" ]]; then
+          echo "::warning title=Change detection failed::paths-filter failed; running every job"
+        fi
         if [[ "$ALL_FILES" =~ ^[1-9][0-9]*$ && "$INERT" == "$ALL_FILES" ]]; then
           run_tests=false
         else

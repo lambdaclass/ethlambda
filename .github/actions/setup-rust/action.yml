@@ -1,10 +1,11 @@
 name: "Setup Rust"
 description: >-
   Installs the toolchain rust-toolchain.toml pins and restores the Rust build
-  cache. Every job that builds this workspace goes through here, so the rule
-  that only main saves is written once; the two workflows that cache only
-  `cargo install`ed tools (the mdBook and LoC report workflows) set the same
-  `save-if` on their own step. Modeled on ethrex's action of the same name.
+  cache. Every Rust cache in the repository goes through here, so the rule
+  that only main saves is written once, except the mdBook workflow's: it
+  installs its tools with `stable` rather than the pinned toolchain, so it
+  sets the same `save-if` on its own step. Modeled on ethrex's action of the
+  same name.
 
 inputs:
   cache-key:
@@ -32,7 +33,10 @@ runs:
       id: env
       shell: bash
       run: |
-        toolchain=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+        # Either quote style, and anything after the closing quote (a comment,
+        # a CR from a CRLF checkout). A file this cannot read is an error
+        # rather than a silent fallback to some other toolchain.
+        toolchain=$(sed -nE "s/^[[:space:]]*channel[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" rust-toolchain.toml)
         if [ -z "$toolchain" ]; then
           echo "::error::no channel found in rust-toolchain.toml"
           exit 1
@@ -46,7 +50,15 @@ runs:
         # found` the moment rustc loads the macro. `ubuntu-latest` moves
         # between families, and `vars.ETHLAMBDA_RUNNER` can point anywhere.
         # Not `ImageVersion`, which changes weekly and would void every entry.
-        echo "image=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+        #
+        # `ImageOS` is set on GitHub-hosted images only. A self-hosted runner
+        # falls back to its distribution and release from /etc/os-release
+        # (`ubuntu24.04`), which separates glibc versions the same way.
+        image="${ImageOS:-}"
+        if [ -z "$image" ] && [ -r /etc/os-release ]; then
+          image=$(. /etc/os-release && echo "${ID:-}${VERSION_ID:-}")
+        fi
+        echo "image=${image:-unknown}" >> "$GITHUB_OUTPUT"
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master

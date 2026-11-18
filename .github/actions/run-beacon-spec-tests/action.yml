@@ -34,18 +34,22 @@ runs:
     # `?=` and so defers to the environment. A run reads its own preset's tree
     # and nothing else, so fetching the other preset's would be the largest
     # single download in the workflow spent on files no case opens. It is set
-    # on the test step too, not only here: the fixture stamp is named after it,
-    # so a test step that did not see it would name a different stamp, wipe the
-    # tree and fetch both presets again before running.
+    # on every make step below, not only here: the fixture stamp is named after
+    # it, so a step that reached the stamp without it (the test step does,
+    # through its prerequisites) would name a different stamp, wipe the tree
+    # and fetch both presets again before running.
     - name: Download the consensus spec test fixtures
       shell: bash
       env:
         CONSENSUS_SPEC_TESTS_CONFIGS: ${{ inputs.preset }}
       run: make consensus-spec-tests
 
-    # The preset-independent BLS/KZG vectors, a separate download.
+    # The preset-independent BLS/KZG vectors, a separate download. The variable
+    # is set here too only so that no make step runs without it.
     - name: Download the BLS/KZG test vectors
       shell: bash
+      env:
+        CONSENSUS_SPEC_TESTS_CONFIGS: ${{ inputs.preset }}
       run: make cryptography-specs
 
     - name: Run the Beacon Chain spec tests

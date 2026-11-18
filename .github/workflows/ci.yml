@@ -41,6 +41,9 @@ jobs:
   # a failure here would skip every dependent job, and a skipped job satisfies
   # a required check, so a broken change detector would let anything merge
   # untested. With it, a failure leaves the output empty and everything runs.
+  # (The filter step itself cannot fail the job: it continues on error and
+  # reports `true`. What remains is a failure of the job around it, e.g. its
+  # checkout.)
   #
   # The jobs gate at job level, so a skip shows as skipped, which GitHub counts
   # as passing for a required check. That only holds for a check name that
@@ -99,6 +102,14 @@ jobs:
       # they keep compiling until they run again.
       - name: Clippy (skipped spectests)
         run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
+
+      # `ethlambda-storage` with its `rocksdb` feature off, test targets
+      # included. Every other build of its tests goes through the workspace,
+      # where `bin/ethlambda` turns the feature on, so a test or helper that
+      # names `RocksDBBackend` without the feature would break a plain
+      # `cargo test -p ethlambda-storage` and nothing else would notice.
+      - name: Clippy (storage without RocksDB)
+        run: cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
 
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.

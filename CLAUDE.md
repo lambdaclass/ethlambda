@@ -103,6 +103,16 @@ jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
 the Makefile names the first; `test-node` is the workspace minus it. Run one half
 directly when iterating on it.
 
+### Docs-only changes skip CI
+
+`ci.yml`'s `detect-changes` job skips every CI job for a pull request or merge
+group whose changed files are all documentation or repository metadata
+(`docs/**`, `theme/**`, `book.toml`, `**/*.md`, `LICENSE`, `**/.gitignore`,
+`.claude/**`; the list lives in `.github/actions/detect-changes`). That rests on
+nothing in a build or a test reading those paths. A crate that starts to (a
+`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
+take the path off the list, or a change to that file merges untested.
+
 ### Common Operations
 ```bash
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
