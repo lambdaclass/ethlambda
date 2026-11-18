@@ -26,7 +26,26 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// for the older methods.
 pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// How many times one call is attempted before it is given up on.
+/// Timeout for `engine_getPayloadV5` and `engine_getPayloadV6`, which get this
+/// one attempt and no retry.
+///
+/// execution-apis #958 (merged 2026-10-26) dropped `getPayload`'s timeout: the
+/// method "MUST respond immediately", and the consensus client "MAY abort such
+/// a call at its own discretion". One second is the value it replaced, and the
+/// one Nimbus uses (`GETPAYLOAD_TIMEOUT`, `el/el_manager.nim:53`) and Prysm
+/// uses before gloas (300 ms from gloas, `execution/engine_jsonrpc.go:116-118`
+/// and `:300-304`). Lighthouse (`engine_api/http.rs:52`) and Teku
+/// (`AbstractExecutionEngineClient.java:85`) allow 2 s.
+///
+/// Not retried, unlike every other method: the payload is due at the start of
+/// the slot, so an answer a retry ladder could still get (seconds later) is
+/// one the block cannot use, and an execution client may stop the build
+/// process once it has served the call, so a retry after a lost answer can
+/// find the payload gone.
+pub const ENGINE_GET_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many times one call is attempted before it is given up on, for every
+/// method but `getPayload` (see [`ENGINE_GET_PAYLOAD_TIMEOUT`]).
 ///
 /// Three, not the ten `ethlambda-p2p` uses for a peer fetch. Those are different
 /// numbers measuring different things: a peer ladder is bounded by a millisecond
@@ -102,10 +121,22 @@ impl EngineClient {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<T, EngineError> {
+        self.call_with_attempts(method, params, timeout, ENGINE_MAX_ATTEMPTS)
+            .await
+    }
+
+    /// [`Self::call_with_timeout`], attempted at most `attempts` times.
+    async fn call_with_attempts<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        attempts: u32,
+    ) -> Result<T, EngineError> {
         let mut backoff = ENGINE_INITIAL_BACKOFF;
         let mut last = EngineError::Transport("no attempt was made".to_string());
 
-        for attempt in 1..=ENGINE_MAX_ATTEMPTS {
+        for attempt in 1..=attempts {
             match self.call_once(method, &params, timeout).await {
                 Ok(value) => return Ok(value),
                 // An answer, not a failure to get one. Do not retry.
@@ -115,7 +146,7 @@ impl EngineClient {
                     last = err;
                 }
             }
-            if attempt < ENGINE_MAX_ATTEMPTS {
+            if attempt < attempts {
                 tokio::time::sleep(backoff).await;
                 backoff *= BACKOFF_MULTIPLIER;
             }
@@ -301,12 +332,16 @@ impl EngineClient {
 
     /// `engine_getPayloadV5`: the payload a build process has assembled so
     /// far, with its blobs bundle and execution requests.
+    ///
+    /// One attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], never retried; see there
+    /// for why.
     pub async fn get_payload(
         &self,
         payload_id: crate::building::PayloadId,
     ) -> Result<crate::building::BuiltPayload, EngineError> {
+        let params = json!([payload_id]);
         let response: crate::building::GetPayloadV5Response = self
-            .call("engine_getPayloadV5", json!([payload_id]))
+            .call_with_attempts("engine_getPayloadV5", params, ENGINE_GET_PAYLOAD_TIMEOUT, 1)
             .await?;
         response.try_into()
     }
@@ -331,12 +366,17 @@ impl EngineClient {
 
     /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
     /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included).
+    ///
+    /// One attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], like V5. Prysm tightens
+    /// its own to 300 ms from gloas; this keeps the second until an execution
+    /// client's gloas build times are known.
     pub async fn get_payload_v6(
         &self,
         payload_id: crate::building::PayloadId,
     ) -> Result<crate::building::BuiltGloasPayload, EngineError> {
+        let params = json!([payload_id]);
         let response: crate::building::GetPayloadV6Response = self
-            .call("engine_getPayloadV6", json!([payload_id]))
+            .call_with_attempts("engine_getPayloadV6", params, ENGINE_GET_PAYLOAD_TIMEOUT, 1)
             .await?;
         response.try_into()
     }
