@@ -1,5 +1,7 @@
+use std::future::IntoFuture as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
@@ -54,20 +56,17 @@ pub struct RpcConfig {
 /// stub. The driver swaps its own `Store` on every `fork_choice/init`, so we
 /// don't share state with the regular consensus path (which isn't running in
 /// driver mode anyway — see `bin/ethlambda/src/main.rs`).
+///
+/// Served through `serve` like the node's own servers, so a simulator
+/// connection that stops reading holds shutdown for at most
+/// `HTTP_DRAIN_TIMEOUT`.
 pub async fn start_test_driver_rpc_server(
     config: RpcConfig,
     driver: test_driver::DriverState,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let app = test_driver::build_router(driver);
-    let addr = SocketAddr::new(config.http_address, config.api_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await?;
-    Ok(())
+    serve(config.http_address, config.api_port, app, shutdown).await
 }
 
 pub async fn start_rpc_server(
@@ -101,6 +100,13 @@ pub async fn start_rpc_server(
 /// `Store`, `AggregatorController`, `SyncStatusController` or `EventBus` to
 /// build the lean API from, and would be serving lean answers for a beacon
 /// chain if it invented empty ones.
+///
+/// Returns at most `HTTP_DRAIN_TIMEOUT` after `shutdown` is cancelled, even
+/// with responses still in flight. Those are not ended: they keep running on
+/// the caller's runtime, holding the routers and whatever state the routers
+/// captured (a `Store`), until they finish or that runtime shuts down; see
+/// `serve`. `ethlambda` drops its runtime once shutdown completes, so there
+/// they end with the process.
 pub async fn start_http_servers(
     config: RpcConfig,
     api_router: Option<Router>,
@@ -138,7 +144,37 @@ pub async fn start_http_servers(
     Ok(())
 }
 
+/// How long [`serve`] waits, once shutdown starts, for responses still in
+/// flight before it stops waiting on them.
+///
+/// axum's graceful shutdown waits with no limit, and a response can stall for
+/// as long as its client stops reading: a validator client paused mid-stream,
+/// or a slow download of a whole state.
+///
+/// The deadline runs from cancellation whatever a response is doing, so it
+/// cuts healthy ones too: a peer still reading a whole state from
+/// `/eth/v2/debug/beacon/states/{state_id}` is reset once it passes. Five
+/// seconds is sized against `docker stop`, which sends SIGKILL 10 s after its
+/// first signal unless told otherwise. The node cancels this token as it stops
+/// the actors, so the drain overlaps their stop rather than adding to it, but
+/// those 10 s still have to cover the actors and the final state flush, which
+/// a SIGKILL cuts short. Raising this eats into that room.
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+///
+/// Graceful shutdown waits for every in-flight response, so `app` gets the
+/// token as a [`events::ShutdownSignal`] too: the event streams, which never
+/// finish on their own, end on it. The signal holds a child of the token, not
+/// a clone: a child is cancelled with its parent but cannot cancel it, so a
+/// handler can wait for shutdown and never trigger the node's.
+///
+/// The wait is bounded by [`HTTP_DRAIN_TIMEOUT`]. Past it, this returns
+/// without the stalled responses. The listener is closed by then, but their
+/// connections are not: axum spawns each connection as a task of its own, and
+/// dropping the serve future does not end those. A stalled one keeps its clone
+/// of `app`, and any state `app` captured, until it finishes or the runtime it
+/// was spawned on shuts down.
 async fn serve(
     address: IpAddr,
     port: u16,
@@ -148,11 +184,28 @@ async fn serve(
     let addr = SocketAddr::new(address, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await
+    let app = app.layer(Extension(events::ShutdownSignal::of(&shutdown)));
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    let drain_deadline = async move {
+        shutdown.cancelled().await;
+        tokio::time::sleep(HTTP_DRAIN_TIMEOUT).await;
+    };
+    tokio::select! {
+        // The server first: when it finishes in the same wake the deadline
+        // fires, its own result stands, an error included, rather than an
+        // `Ok(())` and a warning about responses no longer in flight.
+        biased;
+        served = server => served,
+        () = drain_deadline => {
+            tracing::warn!(
+                %addr,
+                "HTTP responses still in flight after the shutdown drain timeout; no longer waiting on them"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Build the API router with the given store, client version, and peer ID.
