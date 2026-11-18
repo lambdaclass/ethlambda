@@ -174,9 +174,21 @@ jobs:
           push: ${{ needs.meta.outputs.publish == 'true' }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}${{ env.SUFFIX }}-${{ matrix.arch.name }}
           platforms: linux/${{ matrix.arch.name }}
-          # Same scopes docker_publish.yaml uses, so either workflow warms the other.
-          cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
-          cache-to: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }},mode=max
+          # The layer cache lives in the registry, beside the images, not in the
+          # Actions cache: `mode=max` exports every intermediate layer, which
+          # took 3.7 GB of the repository's 10 GB Actions cache budget and
+          # evicted the Rust build caches CI restores. Same tags
+          # docker_publish.yaml uses, so either workflow warms the other.
+          #
+          # The package is public, so reading needs no login. Writing does, and
+          # follows the rule every cache here follows (see the setup-rust
+          # action): only a push to main that publishes (and so has logged in
+          # above) exports. A release-candidate tag build and a dry run read
+          # the cache and leave it alone, so nothing but main's own builds
+          # feeds the next one. `ignore-error` keeps a failed export from
+          # failing a release whose image already pushed.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.arch.name }}-${{ matrix.variant }}
+          cache-to: ${{ needs.meta.outputs.publish == 'true' && github.ref == 'refs/heads/main' && format('type=registry,ref={0}/{1}:buildcache-{2}-{3},mode=max,ignore-error=true', env.REGISTRY, env.IMAGE_NAME, matrix.arch.name, matrix.variant) || '' }}
 
   publish-docker:
     name: Create and push multi-arch manifests

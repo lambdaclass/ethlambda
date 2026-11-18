@@ -3,6 +3,8 @@
 pub mod definitions;
 pub mod keystore;
 pub mod store;
+pub mod web3signer;
 
-pub use definitions::{ValidatorDefinition, ValidatorDefinitions};
+pub use definitions::{SigningDefinition, ValidatorDefinition, ValidatorDefinitions};
 pub use store::{SigningMethod, ValidatorStore};
+pub use web3signer::Web3Signer;
