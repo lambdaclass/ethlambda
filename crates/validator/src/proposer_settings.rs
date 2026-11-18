@@ -8,11 +8,17 @@
 //!
 //! Each override is persisted on its validator's entry in
 //! `validator_definitions.yml` (`suggested_fee_recipient`, `graffiti`,
-//! `gas_limit`, Lighthouse's layout, so a file written by either client reads
-//! in the other). The keymanager writes the file before it changes anything
-//! here, and startup seeds this from the file, so what an operator set is what
-//! the next restart runs with. An operator may also put the fields in the file
-//! by hand before starting the client.
+//! `gas_limit`, Lighthouse's layout, so a file Lighthouse wrote loads here
+//! with the three in effect). The keymanager writes the file before it
+//! changes anything here, and startup seeds this from the file, so what an
+//! operator set is what the next restart runs with. An operator may also put
+//! the fields in the file by hand before starting the client.
+//!
+//! That is why nothing outside the tests changes one setting without the
+//! file: the only ways in are [`ProposerSettings::apply`], which the
+//! keymanager calls once the same change is on disk, and
+//! [`ProposerSettings::seed`], which installs what an entry read from the
+//! file carries.
 //!
 //! # When a change takes effect
 //!
@@ -289,26 +295,36 @@ impl ProposerSettings {
         self.update(pubkey, |entry| *entry = overrides);
     }
 
+    // The six below change one setting in memory and nothing in the file,
+    // which is the drift `apply`'s contract rules out. They are for tests,
+    // which have no file to keep in step.
+
+    #[cfg(test)]
     pub fn set_fee_recipient(&self, pubkey: &BlsPubkey, address: ExecutionAddress) {
         self.apply(pubkey, SettingChange::FeeRecipient(Some(address)));
     }
 
+    #[cfg(test)]
     pub fn clear_fee_recipient(&self, pubkey: &BlsPubkey) {
         self.apply(pubkey, SettingChange::FeeRecipient(None));
     }
 
+    #[cfg(test)]
     pub fn set_graffiti(&self, pubkey: &BlsPubkey, graffiti: Bytes32) {
         self.apply(pubkey, SettingChange::Graffiti(Some(graffiti)));
     }
 
+    #[cfg(test)]
     pub fn clear_graffiti(&self, pubkey: &BlsPubkey) {
         self.apply(pubkey, SettingChange::Graffiti(None));
     }
 
+    #[cfg(test)]
     pub fn set_gas_limit(&self, pubkey: &BlsPubkey, gas_limit: u64) {
         self.apply(pubkey, SettingChange::GasLimit(Some(gas_limit)));
     }
 
+    #[cfg(test)]
     pub fn clear_gas_limit(&self, pubkey: &BlsPubkey) {
         self.apply(pubkey, SettingChange::GasLimit(None));
     }

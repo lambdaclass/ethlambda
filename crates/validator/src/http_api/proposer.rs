@@ -20,6 +20,16 @@
 //! since the duty loop signs under it. The file is written before memory
 //! changes: a failed write is a 500 that changes nothing, so what the operator
 //! sees is what the next restart loads.
+//!
+//! One failure is not a failed write. When the file was replaced and only the
+//! flush of its directory failed, the change is what every reader of the
+//! file sees, so it is applied in memory too, and the answer is still a 500,
+//! saying the change is in effect and may not survive a power loss. Repeating
+//! the request saves the file again, which is what flushes it.
+//!
+//! `definitions_lock` is the keystore routes' lock, so a change made while an
+//! import is decrypting its batch waits for the import. The file work itself
+//! runs on the blocking pool, not on the runtime's workers beside the duties.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -28,10 +38,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ethlambda_types::beacon::primitives::BlsPubkey;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::Error;
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
 use crate::http_api::KeymanagerContext;
+use crate::http_api::keystores::save_definitions;
 use crate::keys::{ValidatorDefinitions, ValidatorStore};
 use crate::proposer_settings::{
     GRAFFITI_BYTES, SettingChange, fee_recipient_from_text, graffiti_from_text, graffiti_to_text,
@@ -129,54 +141,115 @@ pub(crate) fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result
 /// The read lock is released as soon as the check has answered, not kept
 /// across the file work below. It does not need to be: only a delete removes
 /// a key, and a delete holds `definitions_lock` for its whole duration, so
-/// none can land before the change is applied. And it must not be: an import
-/// takes `store`'s write lock after it has released `definitions_lock`, that
-/// write would queue behind a read still held here, and
-/// `tokio::sync::RwLock` is write-preferring, so every signature the duty
-/// loop owes would wait behind it for as long as this file took to read,
-/// write and flush.
+/// none can land before the change is applied. And the duty loop signs under
+/// that lock, so it is not one to hold across a file's read, write and flush
+/// without a need: `tokio::sync::RwLock` is write-preferring, and a writer
+/// queued behind a read held here would stall every signature due for as
+/// long as the file took. Every writer today takes `definitions_lock` first
+/// and so cannot queue here; not holding the read is what keeps that from
+/// being something the duties depend on.
 ///
-/// A held key with no entry in the file can only mean the file was edited
-/// under a running client. That is a 500 naming the file rather than a
-/// memory-only change the operator would believe persisted.
+/// The file work runs on the blocking pool: it is a read, a write, a rename
+/// and two flushes, with no await in any of them, and on a slow disk that is
+/// a runtime worker held from the duties sharing it. The guard on
+/// `definitions_lock` goes into the task with it, so the lock is released
+/// when the file and the settings both hold the change and not when this
+/// request stops being polled: a caller that hung up halfway would otherwise
+/// let an import or a delete in beside a save still being written.
 async fn persist_and_apply(
     context: &KeymanagerContext,
     pubkey: &BlsPubkey,
     change: SettingChange,
 ) -> Result<(), ApiError> {
-    let _definitions_guard = context.definitions_lock.lock().await;
+    let definitions_guard = context.definitions_lock.clone().lock_owned().await;
     // The guard is a temporary of this statement, so it is gone before the
     // file is opened.
     require_held(&*context.store.read().await, pubkey)?;
 
+    let (context, pubkey) = (context.clone(), *pubkey);
+    let written = tokio::task::spawn_blocking(move || {
+        let _definitions_guard = definitions_guard;
+        write_and_apply(&context, &pubkey, change)
+    });
+    written.await.unwrap_or_else(|err| {
+        Err(ApiError::Internal(format!(
+            "the definitions file write did not run to its end: {err}"
+        )))
+    })
+}
+
+/// The file half of [`persist_and_apply`] and the change in memory that
+/// follows it, with `definitions_lock` held by the caller. Synchronous, for
+/// the blocking pool.
+///
+/// A held key with no entry in the file can only mean the file was edited
+/// under a running client. That is a 500 naming the file rather than a
+/// memory-only change the operator would believe persisted.
+fn write_and_apply(
+    context: &KeymanagerContext,
+    pubkey: &BlsPubkey,
+    change: SettingChange,
+) -> Result<(), ApiError> {
     let path = context
         .validators_dir
         .join(crate::keys::definitions::DEFINITIONS_FILE);
     let mut definitions = ValidatorDefinitions::open(&context.validators_dir)
         .map_err(|err| ApiError::Internal(format!("could not read {}: {err}", path.display())))?;
-    let entry = definitions
-        .0
-        .iter_mut()
-        .find(|definition| {
-            parse_pubkey(&definition.voting_public_key)
-                .map(|parsed| parsed == *pubkey)
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            ApiError::Internal(format!(
-                "validator {} is loaded but has no entry in {}; the file was changed under a \
-                 running client, so the change was not made",
-                encode_hex(&pubkey.0),
-                path.display()
-            ))
-        })?;
-    entry.apply(change);
-    definitions
-        .save(&context.validators_dir)
-        .map_err(|err| ApiError::Internal(format!("could not write {}: {err}", path.display())))?;
+    // The entry the next start reads this key's settings from, which is not
+    // always the first one naming it; see `ValidatorDefinitions::position_of`.
+    let Some(position) = definitions.position_of(pubkey) else {
+        return Err(ApiError::Internal(format!(
+            "validator {} is loaded but has no entry in {}; the file was changed under a \
+             running client, so the change was not made",
+            encode_hex(&pubkey.0),
+            path.display()
+        )));
+    };
+    definitions.0[position].apply(change);
 
-    context.settings.apply(pubkey, change);
-    Ok(())
+    // Through `save_definitions`, as every other writer of the file goes, so
+    // `definitions_unflushed` stays true to what the last save left behind.
+    let saved = save_definitions(context, &definitions);
+    settle(context, pubkey, change, saved)
+}
+
+/// Apply `change` in memory when `saved` says the file holds it, and answer
+/// for the save.
+fn settle(
+    context: &KeymanagerContext,
+    pubkey: &BlsPubkey,
+    change: SettingChange,
+    saved: crate::Result<()>,
+) -> Result<(), ApiError> {
+    match saved {
+        Ok(()) => {
+            context.settings.apply(pubkey, change);
+            Ok(())
+        }
+        // The rename landed: the file holds the change, and so does every
+        // reader of it from here on, the next start included. Leaving memory
+        // on the old value would have the two disagree, with the restart
+        // switching to a value no request was ever answered for. So the
+        // change is applied, and the caller is still told what is in doubt.
+        Err(Error::Unflushed { path, source }) => {
+            context.settings.apply(pubkey, change);
+            warn!(
+                pubkey = %encode_hex(&pubkey.0),
+                %path,
+                %source,
+                "Proposer setting written and in effect, but the directory could not be flushed"
+            );
+            Err(ApiError::Internal(format!(
+                "the change is written to {path} and in effect, but the directory could not be \
+                 flushed ({source}), so it may not survive a power loss; repeat the request to \
+                 flush it"
+            )))
+        }
+        // Nothing at the file's path changed, so nothing changes here.
+        Err(err) => Err(ApiError::Internal(format!(
+            "could not write the definitions file, so the change was not made: {err}"
+        ))),
+    }
 }
 
 /// A decimal `u64` with no sign and no leading zero, the specification's
@@ -372,6 +445,8 @@ mod tests {
 
     struct Harness {
         app: axum::Router,
+        /// What the routes run on, for a test that reaches under them.
+        context: KeymanagerContext,
         settings: Arc<ProposerSettings>,
         pubkey: BlsPubkey,
         /// The validators directory, holding the definitions file the routes
@@ -445,7 +520,8 @@ mod tests {
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
         };
         Harness {
-            app: router(context, TOKEN.to_string()),
+            app: router(context.clone(), TOKEN.to_string()),
+            context,
             settings,
             pubkey,
             dir,
@@ -721,12 +797,14 @@ mod tests {
 
         let set = serde_json::json!({ "graffiti": "hello" });
         let path = uri(&harness.pubkey, "graffiti");
-        send(&harness.app, request("POST", &path, Some(set))).await;
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "POST graffiti");
         assert_eq!(harness.entry().graffiti.as_deref(), Some("hello"));
 
         let set = serde_json::json!({ "gas_limit": "30000000" });
         let path = uri(&harness.pubkey, "gas_limit");
-        send(&harness.app, request("POST", &path, Some(set))).await;
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "POST gas_limit");
         assert_eq!(harness.entry().gas_limit, Some(30_000_000));
 
         for setting in ["feerecipient", "graffiti", "gas_limit"] {
@@ -748,10 +826,12 @@ mod tests {
         let own = format!("0x{}", "bb".repeat(ADDRESS_BYTES));
         let set = serde_json::json!({ "ethaddress": own });
         let path = uri(&harness.pubkey, "feerecipient");
-        send(&harness.app, request("POST", &path, Some(set))).await;
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "POST feerecipient");
         let set = serde_json::json!({ "graffiti": "persisted" });
         let path = uri(&harness.pubkey, "graffiti");
-        send(&harness.app, request("POST", &path, Some(set))).await;
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "POST graffiti");
 
         // A fresh `ProposerSettings`, as a restart builds, seeded as startup
         // seeds it.
@@ -770,6 +850,137 @@ mod tests {
             graffiti_from_text("persisted").expect("fits")
         );
         assert_eq!(restarted.gas_limit(&harness.pubkey), DEFAULT_GAS_LIMIT);
+    }
+
+    /// The file was replaced and only its directory's flush failed: the
+    /// change is what the file says, so memory takes it too, and the caller
+    /// is still told it may not survive a power loss. Answering a plain
+    /// failure with memory untouched would leave the two disagreeing, and the
+    /// next restart would switch to a value no request was answered for.
+    #[test]
+    fn a_change_whose_directory_flush_failed_is_applied_and_still_an_error() {
+        let harness = harness(None);
+        let change = SettingChange::Graffiti(Some(graffiti_from_text("hello").expect("fits")));
+        let unflushed = Err(Error::Unflushed {
+            path: "validator_definitions.yml".to_string(),
+            source: std::io::Error::other("the directory would not flush"),
+        });
+
+        let answer = settle(&harness.context, &harness.pubkey, change, unflushed);
+
+        let Err(ApiError::Internal(message)) = answer else {
+            panic!("an unflushed save is still an error, got {answer:?}");
+        };
+        assert!(message.contains("in effect"), "{message}");
+        assert!(message.contains("power loss"), "{message}");
+        assert_eq!(
+            harness.settings.graffiti(&harness.pubkey),
+            graffiti_from_text("hello").expect("fits"),
+            "the file holds the change, so memory must"
+        );
+    }
+
+    /// A save that failed before the rename changed nothing on disk, and
+    /// changes nothing in memory.
+    #[test]
+    fn a_change_whose_save_failed_outright_is_not_applied() {
+        let harness = harness(None);
+        let change = SettingChange::Graffiti(Some(graffiti_from_text("hello").expect("fits")));
+        let failed = Err(Error::Io {
+            path: "validator_definitions.yml".to_string(),
+            source: std::io::Error::other("the disk is full"),
+        });
+
+        let answer = settle(&harness.context, &harness.pubkey, change, failed);
+
+        assert!(matches!(answer, Err(ApiError::Internal(_))), "{answer:?}");
+        assert_eq!(
+            harness.settings.graffiti(&harness.pubkey),
+            default_graffiti()
+        );
+    }
+
+    /// A file may name one key twice: here a disabled entry left from an
+    /// earlier setup, ahead of the enabled one the key was loaded from. The
+    /// next start reads the enabled one, so that is where a change has to
+    /// land. Written to the first entry naming the key, it would be answered
+    /// 202 and gone at the restart.
+    #[tokio::test]
+    async fn a_change_lands_on_the_entry_the_next_start_reads() {
+        let harness = harness(None);
+        let mut definitions = ValidatorDefinitions::open(harness.dir.path()).expect("opens");
+        let mut stale = definitions.0[0].clone();
+        stale.enabled = false;
+        stale.graffiti = Some("stale".to_string());
+        definitions.0.insert(0, stale.clone());
+        definitions.save(harness.dir.path()).expect("saves");
+
+        let set = serde_json::json!({ "graffiti": "hello" });
+        let path = uri(&harness.pubkey, "graffiti");
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let written = ValidatorDefinitions::open(harness.dir.path()).expect("opens");
+        assert_eq!(written.0[0], stale, "the disabled entry is left as it was");
+        assert!(written.0[1].enabled);
+        assert_eq!(written.0[1].graffiti.as_deref(), Some("hello"));
+
+        let restarted = ProposerSettings::new(default_graffiti(), None);
+        written.seed_overrides(&restarted).expect("seeds");
+        assert_eq!(
+            restarted.graffiti(&harness.pubkey),
+            graffiti_from_text("hello").expect("fits"),
+            "the restart runs with what the request set"
+        );
+    }
+
+    /// The three settings are the validator's, whichever way its key signs:
+    /// a key a remote signer holds takes them, on its `web3signer` entry,
+    /// and the file still loads with them there.
+    #[tokio::test]
+    async fn a_remote_keys_settings_persist_on_its_web3signer_entry() {
+        const SIGNER: &str = "https://signer.example:9000";
+        let harness = harness_without_definitions(None);
+        let remote = BlsPubkey([7; 48]);
+        harness
+            .context
+            .store
+            .write()
+            .await
+            .insert_remote(remote, SIGNER)
+            .expect("inserts");
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: encode_hex(&remote.0),
+            signing: crate::keys::SigningDefinition::Web3Signer {
+                url: SIGNER.to_string(),
+            },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
+        }])
+        .save(harness.dir.path())
+        .expect("writes the definitions file");
+
+        let own = format!("0x{}", "bb".repeat(ADDRESS_BYTES));
+        let set = serde_json::json!({ "ethaddress": own });
+        let path = uri(&remote, "feerecipient");
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            harness.settings.fee_recipient(&remote),
+            Some(H160([0xbb; ADDRESS_BYTES]))
+        );
+
+        let written = ValidatorDefinitions::open(harness.dir.path())
+            .expect("a web3signer entry carrying a setting loads");
+        assert!(written.0[0].signing.is_remote());
+        assert_eq!(
+            written.0[0].suggested_fee_recipient.as_deref(),
+            Some(own.as_str())
+        );
+        let reloaded = ValidatorStore::load(harness.dir.path()).expect("loads");
+        assert_eq!(reloaded.remote_url(&remote).as_deref(), Some(SIGNER));
     }
 
     /// A loaded key the file does not describe means the file was changed

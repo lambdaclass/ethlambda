@@ -5,7 +5,7 @@
 //! imported at runtime is still there after a restart, and so are the fee
 //! recipient, graffiti and gas limit it was given.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ethlambda_types::beacon::primitives::BlsPubkey;
@@ -36,8 +36,12 @@ pub struct ValidatorDefinition {
     pub signing: SigningDefinition,
     /// This validator's own fee recipient, `0x`-prefixed hex, in place of
     /// `--suggested-fee-recipient`. The three fields below are Lighthouse's,
-    /// name for name and form for form, so its file reads here and this one
-    /// reads there. Each is absent from the file, not `null`, when unset.
+    /// name for name and form for form, so a file Lighthouse wrote loads
+    /// here with them. Not the other way round as a rule: saving the file
+    /// keeps only the fields this client reads (see [`RawDefinition`]), so
+    /// what Lighthouse alone keeps on an entry, its `description` and its
+    /// `builder_*` settings, is gone from a file this client has rewritten.
+    /// Each is absent from the file, not `null`, when unset.
     pub suggested_fee_recipient: Option<String>,
     /// This validator's own graffiti, as text, in place of `--graffiti`.
     pub graffiti: Option<String>,
@@ -432,25 +436,61 @@ impl ValidatorDefinitions {
         self.0.iter().filter(|definition| definition.enabled)
     }
 
+    /// Where the entry that speaks for `pubkey` is: the first enabled one
+    /// naming it, or the first one naming it when none is enabled.
+    ///
+    /// Nothing refuses a file that names one key twice, and the usual way to
+    /// get one is a disabled entry left from an earlier setup beside the
+    /// enabled entry the key is loaded from. The enabled one is what the
+    /// next start reads the key's settings from ([`Self::seed_overrides`]),
+    /// so it is the one a settings change is written to and a re-import
+    /// replaces: written to whichever came first, a change could land on an
+    /// entry no start ever reads, answered as made and gone at the restart.
+    ///
+    /// Compared as keys, not as text: a hand-written entry may spell its key
+    /// in upper case or without the `0x`.
+    pub fn position_of(&self, pubkey: &BlsPubkey) -> Option<usize> {
+        let names = |definition: &ValidatorDefinition| {
+            parse_pubkey(&definition.voting_public_key).is_ok_and(|parsed| parsed == *pubkey)
+        };
+        self.0
+            .iter()
+            .position(|definition| definition.enabled && names(definition))
+            .or_else(|| self.0.iter().position(names))
+    }
+
     /// Install every enabled entry's overrides into `settings`, returning how
-    /// many entries carried one. What startup does once the keys are loaded.
-    /// A disabled entry keeps its fields in the file for when it is enabled
-    /// again, and is skipped here as its key is skipped by `load`.
+    /// many keys were given one. What startup does before it loads the keys,
+    /// so a malformed value refuses the start before any keystore is
+    /// decrypted. A disabled entry keeps its fields in the file for when it
+    /// is enabled again, and is skipped here as its key is skipped by `load`.
+    ///
+    /// Of several enabled entries naming one key, the first speaks for it,
+    /// as [`Self::position_of`] has it, so what is read here is what a
+    /// settings change wrote.
     pub fn seed_overrides(&self, settings: &ProposerSettings) -> Result<usize> {
+        let mut spoken_for = HashSet::new();
         let mut seeded = 0;
         for definition in self.enabled() {
             let overrides = definition.overrides()?;
-            if overrides.is_empty() {
+            let pubkey = match parse_pubkey(&definition.voting_public_key) {
+                Ok(pubkey) => pubkey,
+                // Names no key, so there is nothing to seed. Loading the
+                // keys is what refuses the entry.
+                Err(_) if overrides.is_empty() => continue,
+                Err(err) => {
+                    return Err(Error::Keystore {
+                        path: format!(
+                            "validator_definitions.yml entry {}",
+                            definition.voting_public_key
+                        ),
+                        reason: format!("the voting_public_key is unreadable: {err}"),
+                    });
+                }
+            };
+            if !spoken_for.insert(pubkey) || overrides.is_empty() {
                 continue;
             }
-            let pubkey =
-                parse_pubkey(&definition.voting_public_key).map_err(|err| Error::Keystore {
-                    path: format!(
-                        "validator_definitions.yml entry {}",
-                        definition.voting_public_key
-                    ),
-                    reason: format!("the voting_public_key is unreadable: {err}"),
-                })?;
             settings.seed(&pubkey, overrides);
             seeded += 1;
         }
@@ -697,6 +737,47 @@ mod tests {
         assert_eq!(
             settings.overrides(&BlsPubkey([0x22; 48])),
             Overrides::default()
+        );
+    }
+
+    /// Where a file names one key twice, the first enabled entry speaks for
+    /// it, to the lookup a settings change and a re-import go through and to
+    /// the seeding a start does alike. A disabled entry speaks only when no
+    /// enabled one does, and a key is found however the file spells it.
+    #[test]
+    fn the_first_enabled_entry_speaks_for_a_key_named_twice() {
+        use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32};
+
+        let key = BlsPubkey([0x11; 48]);
+        let spelled = |text: String, enabled: bool, graffiti: &str| {
+            let mut entry = definition(&text, enabled);
+            entry.graffiti = Some(graffiti.to_string());
+            entry
+        };
+        let lower = format!("0x{}", "11".repeat(48));
+        let definitions = ValidatorDefinitions(vec![
+            spelled(lower.clone(), false, "disabled"),
+            spelled("11".repeat(48).to_uppercase(), true, "first enabled"),
+            spelled(lower.clone(), true, "second enabled"),
+        ]);
+        assert_eq!(definitions.position_of(&key), Some(1));
+
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        assert_eq!(definitions.seed_overrides(&settings).expect("seeds"), 1);
+        assert_eq!(
+            settings.graffiti(&key),
+            graffiti_from_text("first enabled").expect("fits")
+        );
+
+        let only_disabled = ValidatorDefinitions(vec![
+            definition("0xaa", true),
+            spelled(lower, false, "disabled"),
+        ]);
+        assert_eq!(only_disabled.position_of(&key), Some(1));
+        assert_eq!(
+            only_disabled.position_of(&BlsPubkey([0x22; 48])),
+            None,
+            "a key no entry names"
         );
     }
 

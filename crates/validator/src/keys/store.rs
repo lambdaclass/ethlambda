@@ -73,7 +73,16 @@ impl ValidatorStore {
     /// process does, and a key it turns out not to hold fails at its first
     /// signature, where it is logged and counted, rather than at startup.
     pub fn load(validators_dir: &Path) -> Result<Self> {
-        let definitions = ValidatorDefinitions::open(validators_dir)?;
+        Self::from_definitions(validators_dir, &ValidatorDefinitions::open(validators_dir)?)
+    }
+
+    /// [`Self::load`], from a definitions file already read: startup reads
+    /// it once, for the settings its entries carry and then for the keys.
+    /// `validators_dir` is what a relative keystore path is resolved against.
+    pub fn from_definitions(
+        validators_dir: &Path,
+        definitions: &ValidatorDefinitions,
+    ) -> Result<Self> {
         let mut store = Self::new();
 
         let entries = definitions.0.iter().enumerate();

@@ -314,8 +314,12 @@ pub async fn import(
     // write-preferring: a write lock queued here while this loop ran would
     // jump that queue and stall every signature due for as long as the whole
     // batch takes, rather than just for the instant the inserts below
-    // actually need. `definitions_lock` above has no such reader/writer to
-    // starve: only import and delete ever take it.
+    // actually need. `definitions_lock` above has no such reader to starve:
+    // no duty ever takes it, only the keymanager's own requests do (the
+    // imports, the deletes, and the `feerecipient`, `graffiti` and
+    // `gas_limit` routes, which write the same file). Those do wait for this
+    // loop: a settings call made while a full batch is being decrypted is
+    // answered once the import is done, tens of seconds later.
     //
     // The keys a remote signer holds, by the store or by the file, gathered
     // once for the whole request rather than looked up again for each of its
@@ -818,9 +822,12 @@ fn persist_import(
     // case or without the `0x`, and one this lookup missed would be appended
     // beside rather than replaced, leaving its overrides on an entry the
     // settings below no longer describe.
-    let position = definitions.0.iter().position(|existing| {
-        parse_pubkey(&existing.voting_public_key).is_ok_and(|parsed| parsed == *pubkey)
-    });
+    //
+    // And the enabled entry ahead of a disabled one, where the file names
+    // the key twice: it is the one the next start reads the key's settings
+    // from, so it is the one whose overrides this import must carry over
+    // and seed (see `ValidatorDefinitions::position_of`).
+    let position = definitions.position_of(pubkey);
 
     // The overrides the rebuilt entry will carry (see `with_overrides_of`
     // below), parsed before anything is written. Startup parses enabled
@@ -863,6 +870,26 @@ fn persist_import(
                     path: password_path.display().to_string(),
                     source,
                 }
+            })
+        })
+        // Both files' contents have reached the device (`write_private_no_symlink`
+        // flushes them), but a file created just now is only a name in its
+        // directory until the directory is flushed too. The keystore's is the
+        // validators directory, which the definitions save below flushes in
+        // the same step that makes its entry durable. The password's may be
+        // another directory, `--secrets-dir`, and nothing else flushes that
+        // one: left out, a power cut could keep the definitions entry and
+        // lose the password it names, and `ValidatorStore::load` refuses the
+        // whole client for a password it cannot read. So it is flushed here,
+        // ahead of the entry, and an import that cannot flush it fails.
+        .and_then(|()| {
+            let directory = password_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            secure_fs::sync_directory(directory).map_err(|source| Error::Io {
+                path: directory.display().to_string(),
+                source,
             })
         });
     if let Err(err) = written {

@@ -209,7 +209,8 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Flush the directory, so a rename into it is itself durable.
+/// Flush the directory, so a rename into it, or a file created in it, is
+/// itself durable.
 ///
 /// `File::sync_all` is `fsync` everywhere but macOS, where it is
 /// `F_FULLFSYNC`, the only request there that reaches the disk rather than
@@ -221,7 +222,7 @@ fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
 /// while the kernel has already dropped the writeback error with the data,
 /// which would make a flush that did not happen look durable.
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     let directory = std::fs::File::open(directory)?;
     let result = directory.sync_all();
     #[cfg(target_os = "macos")]
@@ -235,6 +236,16 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
         }
     });
     result
+}
+
+/// Refused, as [`write_private_durably`] is off unix and for its reason: an
+/// `Ok` here would vouch for a flush that did not happen.
+#[cfg(not(unix))]
+pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "flushing a directory is only implemented on unix",
+    ))
 }
 
 #[cfg(all(test, unix))]
@@ -254,6 +265,17 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "shh");
+    }
+
+    /// An import flushes the directory its password file was created in
+    /// before the definitions entry naming that file is made durable, and
+    /// fails if it cannot. A platform that refused to flush a directory
+    /// would therefore fail every import, and this is where that would show.
+    #[test]
+    fn sync_directory_flushes_a_directory_a_file_was_created_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_private_no_symlink(&dir.path().join("secret"), "shh").expect("writes");
+        sync_directory(dir.path()).expect("a directory can be flushed");
     }
 
     #[test]
