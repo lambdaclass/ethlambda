@@ -119,6 +119,12 @@ sha2 = { version = "0.10.9", features = ["asm"] }
 # bitfields use, so decoding committee or sync bits does not allocate.
 smallvec = "1.15"
 
+# Keccak-256 (Ethereum's, with Keccak's original padding), the hash of leanXMSS,
+# the post-quantum signature scheme of the Beacon Chain's PQ fork
+# (`ethlambda_crypto::lean_xmss`). Not leanVM's XMSS: that one hashes with
+# BLAKE2s and signs lean consensus messages only.
+sha3 = "0.10.9"
+
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the
 # SSZ codec for the two wire types) and the `rand` that signing draws from, so

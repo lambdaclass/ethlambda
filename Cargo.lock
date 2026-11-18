@@ -2061,6 +2061,7 @@ dependencies = [
  "postcard",
  "rand 0.10.1",
  "rayon",
+ "sha3 0.10.9",
  "thiserror 2.0.18",
  "tracing",
  "zk_alloc",
