@@ -193,6 +193,10 @@ async fn serve(
         tokio::time::sleep(HTTP_DRAIN_TIMEOUT).await;
     };
     tokio::select! {
+        // The server first: when it finishes in the same wake the deadline
+        // fires, its own result stands, an error included, rather than an
+        // `Ok(())` and a warning about responses no longer in flight.
+        biased;
         served = server => served,
         () = drain_deadline => {
             tracing::warn!(
