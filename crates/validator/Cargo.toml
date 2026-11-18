@@ -31,6 +31,10 @@ tracing.workspace = true
 # Declared here rather than relied on through workspace feature unification,
 # so this crate still builds if it is ever compiled on its own.
 tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# `CancellationToken`: the signal that stops the client when the
+# slashing-protection record becomes unusable, and the one that tells the
+# keymanager server to finish its requests in flight.
+tokio-util.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a
@@ -42,6 +46,10 @@ blst = "0.3.16"
 # the `impl Future + Send` bounds at every method is noise this trait does not
 # need.
 async-trait = "0.1"
+# `join_all`, so the calls every beacon node must hear reach them all at once,
+# and a duty's signatures are asked for concurrently: each one is a round trip
+# when a remote signer holds the key.
+futures-util = "0.3"
 
 # EIP-2335 keystore decryption.
 scrypt = { version = "0.11", default-features = false }

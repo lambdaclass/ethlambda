@@ -1976,7 +1976,7 @@ impl DataColumnSidecar {
 }
 
 #[cfg(test)]
-mod json_tests;
+pub(crate) mod json_tests;
 
 #[cfg(test)]
 mod tests {
