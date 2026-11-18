@@ -80,7 +80,9 @@ spamoor_params:
         blob_fee: 20
 # The package defaults are floating tags (`main`, `develop`, `latest`), so a
 # run would change under us. These pin what the tags pointed to on 2026-10-26;
-# bump them deliberately.
+# bump them deliberately. To bump one, read the tag's current digest from the
+# `Digest:` line of `docker buildx imagetools inspect <image>:<tag>`, and update
+# the date here with it.
 mev_params:
   # ethpandaops/mev-boost-relay:main
   mev_relay_image: ethpandaops/mev-boost-relay@sha256:3600f04fcaf0bbb231f4737470f094fdf2314db54b4853197fa369aea90f8b19
