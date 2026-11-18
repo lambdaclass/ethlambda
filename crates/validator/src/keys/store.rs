@@ -73,7 +73,16 @@ impl ValidatorStore {
     /// process does, and a key it turns out not to hold fails at its first
     /// signature, where it is logged and counted, rather than at startup.
     pub fn load(validators_dir: &Path) -> Result<Self> {
-        let definitions = ValidatorDefinitions::open(validators_dir)?;
+        Self::from_definitions(validators_dir, &ValidatorDefinitions::open(validators_dir)?)
+    }
+
+    /// [`Self::load`], from a definitions file already read: startup reads
+    /// it once, for the settings its entries carry and then for the keys.
+    /// `validators_dir` is what a relative keystore path is resolved against.
+    pub fn from_definitions(
+        validators_dir: &Path,
+        definitions: &ValidatorDefinitions,
+    ) -> Result<Self> {
         let mut store = Self::new();
 
         let entries = definitions.0.iter().enumerate();
@@ -443,6 +452,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }]);
         definitions.save(dir.path()).expect("saves definitions");
 
@@ -471,6 +483,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir)
         .expect("saves definitions");
@@ -487,6 +502,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: url.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves definitions");
@@ -509,6 +527,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: "not a url".to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }])
         .save(dir.path())
         .expect("saves definitions");
@@ -529,6 +550,9 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: url.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         };
         ValidatorDefinitions(vec![
             remote(VECTOR_PUBKEY, "http://127.0.0.1:9"),
