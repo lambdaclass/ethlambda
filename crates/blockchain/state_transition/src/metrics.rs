@@ -164,7 +164,7 @@ static LEAN_BEACON_COMMITTEE_KEY_SUMS_WARM_SECONDS: LazyLock<Histogram> = LazyLo
     register_histogram!(
         "lean_beacon_committee_key_sums_warm_seconds",
         "Duration of warming one epoch's committee key sums, off the import path",
-        vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+        vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
     )
     .unwrap()
 });
