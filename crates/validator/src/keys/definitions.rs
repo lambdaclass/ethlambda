@@ -2,9 +2,10 @@
 //!
 //! One YAML-free, JSON-Lines-free plain list, deliberately separate from the
 //! keystores themselves. It is what the keymanager API mutates, so a key
-//! imported at runtime is still there after a restart.
+//! imported at runtime is still there after a restart, and so are the fee
+//! recipient, graffiti and gas limit it was given.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ethlambda_types::beacon::primitives::BlsPubkey;
@@ -13,6 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::beacon_node::dto::parse_pubkey;
 use crate::error::{Error, Result};
+use crate::proposer_settings::{
+    GRAFFITI_BYTES, Overrides, ProposerSettings, SettingChange, fee_recipient_from_text,
+    fee_recipient_to_text, graffiti_from_text, graffiti_to_text,
+};
 use crate::secure_fs;
 
 /// The file's name inside the validators directory.
@@ -29,6 +34,90 @@ pub struct ValidatorDefinition {
     /// Where the key is and how it signs. Kept at the top level of the entry
     /// in the file, beside a `type` naming it; see [`RawDefinition`].
     pub signing: SigningDefinition,
+    /// This validator's own fee recipient, `0x`-prefixed hex, in place of
+    /// `--suggested-fee-recipient`. The three fields below are Lighthouse's,
+    /// name for name and form for form, so a file Lighthouse wrote loads
+    /// here with them. Not the other way round as a rule: saving the file
+    /// keeps only the fields this client reads (see [`RawDefinition`]), so
+    /// what Lighthouse alone keeps on an entry, its `description` and its
+    /// `builder_*` settings, is gone from a file this client has rewritten.
+    /// Each is absent from the file, not `null`, when unset.
+    pub suggested_fee_recipient: Option<String>,
+    /// This validator's own graffiti, as text, in place of `--graffiti`.
+    pub graffiti: Option<String>,
+    /// This validator's own gas limit.
+    pub gas_limit: Option<u64>,
+}
+
+impl ValidatorDefinition {
+    /// The entry's three overrides, parsed. A value the file holds in the
+    /// wrong form is an error naming the entry and the field: a validator
+    /// proposing to an address the operator did not mean is worse than a
+    /// refused start.
+    pub fn overrides(&self) -> Result<Overrides> {
+        let reject = |field: &str, reason: String| Error::Keystore {
+            path: format!("validator_definitions.yml entry {}", self.voting_public_key),
+            reason: format!("{field} {reason}"),
+        };
+        let fee_recipient = self
+            .suggested_fee_recipient
+            .as_deref()
+            .map(|text| {
+                fee_recipient_from_text(text).map_err(|why| reject("suggested_fee_recipient", why))
+            })
+            .transpose()?;
+        let graffiti = self
+            .graffiti
+            .as_deref()
+            .map(|text| {
+                graffiti_from_text(text).ok_or_else(|| {
+                    reject(
+                        "graffiti",
+                        format!(
+                            "is {} bytes encoded as UTF-8; the field holds {GRAFFITI_BYTES}",
+                            text.len()
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
+        // Refused as `--gas-limit` and the keymanager's `POST gas_limit`
+        // refuse it: from gloas this value is signed into the proposer
+        // preferences, which cannot be replaced for their dependent root.
+        if self.gas_limit == Some(0) {
+            return Err(reject(
+                "gas_limit",
+                "is zero, which cannot be a gas limit".to_string(),
+            ));
+        }
+        Ok(Overrides {
+            fee_recipient,
+            graffiti,
+            gas_limit: self.gas_limit,
+        })
+    }
+
+    /// Write one change into the entry, in the form the file carries.
+    pub fn apply(&mut self, change: SettingChange) {
+        match change {
+            SettingChange::FeeRecipient(address) => {
+                self.suggested_fee_recipient = address.as_ref().map(fee_recipient_to_text);
+            }
+            SettingChange::Graffiti(graffiti) => {
+                self.graffiti = graffiti.as_ref().map(graffiti_to_text);
+            }
+            SettingChange::GasLimit(gas_limit) => self.gas_limit = gas_limit,
+        }
+    }
+
+    /// Carry another entry's overrides onto this one, for a re-imported key
+    /// whose entry is rebuilt from the new keystore.
+    pub fn with_overrides_of(mut self, other: &ValidatorDefinition) -> Self {
+        self.suggested_fee_recipient = other.suggested_fee_recipient.clone();
+        self.graffiti = other.graffiti.clone();
+        self.gas_limit = other.gas_limit;
+        self
+    }
 }
 
 /// How one definition's key signs.
@@ -90,6 +179,15 @@ struct RawDefinition {
     voting_keystore_password_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// The validator's own fee recipient, graffiti and gas limit, read and
+    /// written on either kind of entry: they are settings of the validator,
+    /// not of how its key signs. Absent, not `null`, when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    suggested_fee_recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graffiti: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gas_limit: Option<u64>,
     /// Every other field the entry carries, by name: what a web3signer entry
     /// is refused for. Read only, so a rewritten entry holds the fields above
     /// and nothing else.
@@ -175,6 +273,9 @@ impl TryFrom<RawDefinition> for ValidatorDefinition {
             enabled: raw.enabled,
             voting_public_key: raw.voting_public_key,
             signing,
+            suggested_fee_recipient: raw.suggested_fee_recipient,
+            graffiti: raw.graffiti,
+            gas_limit: raw.gas_limit,
         })
     }
 }
@@ -203,6 +304,9 @@ impl From<ValidatorDefinition> for RawDefinition {
             voting_keystore_path,
             voting_keystore_password_path,
             url,
+            suggested_fee_recipient: definition.suggested_fee_recipient,
+            graffiti: definition.graffiti,
+            gas_limit: definition.gas_limit,
             unread: BTreeMap::new(),
         }
     }
@@ -322,6 +426,9 @@ impl ValidatorDefinitions {
                     voting_keystore_password_path: secrets_dir.join(&pubkey),
                 },
                 voting_public_key: pubkey,
+                suggested_fee_recipient: None,
+                graffiti: None,
+                gas_limit: None,
             });
         }
         // Directory order is not stable across filesystems; sorting makes the
@@ -336,6 +443,67 @@ impl ValidatorDefinitions {
 
     pub fn enabled(&self) -> impl Iterator<Item = &ValidatorDefinition> {
         self.0.iter().filter(|definition| definition.enabled)
+    }
+
+    /// Where the entry that speaks for `pubkey` is: the first enabled one
+    /// naming it, or the first one naming it when none is enabled.
+    ///
+    /// Nothing refuses a file that names one key twice, and the usual way to
+    /// get one is a disabled entry left from an earlier setup beside the
+    /// enabled entry the key is loaded from. The enabled one is what the
+    /// next start reads the key's settings from ([`Self::seed_overrides`]),
+    /// so it is the one a settings change is written to and a re-import
+    /// replaces: written to whichever came first, a change could land on an
+    /// entry no start ever reads, answered as made and gone at the restart.
+    ///
+    /// Compared as keys, not as text: a hand-written entry may spell its key
+    /// in upper case or without the `0x`.
+    pub fn position_of(&self, pubkey: &BlsPubkey) -> Option<usize> {
+        let names = |definition: &ValidatorDefinition| {
+            parse_pubkey(&definition.voting_public_key).is_ok_and(|parsed| parsed == *pubkey)
+        };
+        self.0
+            .iter()
+            .position(|definition| definition.enabled && names(definition))
+            .or_else(|| self.0.iter().position(names))
+    }
+
+    /// Install every enabled entry's overrides into `settings`, returning how
+    /// many keys were given one. What startup does before it loads the keys,
+    /// so a malformed value refuses the start before any keystore is
+    /// decrypted. A disabled entry keeps its fields in the file for when it
+    /// is enabled again, and is skipped here as its key is skipped by `load`.
+    ///
+    /// Of several enabled entries naming one key, the first speaks for it,
+    /// as [`Self::position_of`] has it, so what is read here is what a
+    /// settings change wrote.
+    pub fn seed_overrides(&self, settings: &ProposerSettings) -> Result<usize> {
+        let mut spoken_for = HashSet::new();
+        let mut seeded = 0;
+        for definition in self.enabled() {
+            let overrides = definition.overrides()?;
+            let pubkey = match parse_pubkey(&definition.voting_public_key) {
+                Ok(pubkey) => pubkey,
+                // Names no key, so there is nothing to seed. Loading the
+                // keys is what refuses the entry.
+                Err(_) if overrides.is_empty() => continue,
+                Err(err) => {
+                    return Err(Error::Keystore {
+                        path: format!(
+                            "validator_definitions.yml entry {}",
+                            definition.voting_public_key
+                        ),
+                        reason: format!("the voting_public_key is unreadable: {err}"),
+                    });
+                }
+            };
+            if !spoken_for.insert(pubkey) || overrides.is_empty() {
+                continue;
+            }
+            settings.seed(&pubkey, overrides);
+            seeded += 1;
+        }
+        Ok(seeded)
     }
 
     /// Every entry beside the key it names, each `voting_public_key` decoded
@@ -438,6 +606,9 @@ mod tests {
                 voting_keystore_path: PathBuf::from("keystore.json"),
                 voting_keystore_password_path: PathBuf::from("password.txt"),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }
     }
 
@@ -448,7 +619,188 @@ mod tests {
             signing: SigningDefinition::Web3Signer {
                 url: url.to_string(),
             },
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
         }
+    }
+
+    /// An entry with no overrides is written without the three fields: they
+    /// are absent, not `null`, so a file this client writes stays readable by
+    /// a reader that predates them.
+    #[test]
+    fn an_entry_without_overrides_is_written_without_the_fields() {
+        let yaml = serde_yaml_ng::to_string(&ValidatorDefinitions(vec![
+            definition("0xaa", true),
+            remote_definition("0xbb", "https://signer:9000"),
+        ]))
+        .expect("serializes");
+        assert!(!yaml.contains("suggested_fee_recipient"), "{yaml}");
+        assert!(!yaml.contains("graffiti"), "{yaml}");
+        assert!(!yaml.contains("gas_limit"), "{yaml}");
+    }
+
+    /// The overrides are the validator's, whichever way its key signs: they
+    /// round trip on a local entry and on a remote one alike.
+    #[test]
+    fn overrides_round_trip_through_the_file() {
+        use ethlambda_types::beacon::primitives::H160;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let with_overrides = |mut entry: ValidatorDefinition| {
+            entry.apply(SettingChange::FeeRecipient(Some(H160([0xbb; 20]))));
+            entry.apply(SettingChange::Graffiti(Some(
+                graffiti_from_text("hello").expect("fits"),
+            )));
+            entry.apply(SettingChange::GasLimit(Some(30_000_000)));
+            entry
+        };
+        let local = with_overrides(definition("0xaa", true));
+        let remote = with_overrides(remote_definition("0xbb", "https://signer:9000"));
+        ValidatorDefinitions(vec![
+            local.clone(),
+            remote.clone(),
+            definition("0xcc", true),
+        ])
+        .save(dir.path())
+        .expect("saves");
+
+        let read = ValidatorDefinitions::open(dir.path()).expect("opens");
+        assert_eq!(read.0[0], local);
+        assert_eq!(read.0[1], remote);
+        for entry in &read.0[..2] {
+            assert_eq!(
+                entry.overrides().expect("parses"),
+                Overrides {
+                    fee_recipient: Some(H160([0xbb; 20])),
+                    graffiti: Some(graffiti_from_text("hello").expect("fits")),
+                    gas_limit: Some(30_000_000),
+                }
+            );
+        }
+        assert_eq!(read.0[2].overrides().expect("parses"), Overrides::default());
+    }
+
+    /// Lighthouse's own file, fields it writes that this client does not
+    /// included, reads here with the three overrides picked up.
+    #[test]
+    fn a_lighthouse_written_entry_parses_with_its_overrides() {
+        use ethlambda_types::beacon::primitives::H160;
+
+        let yaml = format!(
+            "- enabled: true\n  voting_public_key: 0x{}\n  description: \"\"\n  \
+             graffiti: from lighthouse\n  suggested_fee_recipient: 0x{}\n  gas_limit: 36000000\n  \
+             builder_proposals: false\n  type: local_keystore\n  \
+             voting_keystore_path: /keys/voting-keystore.json\n  \
+             voting_keystore_password_path: /secrets/password\n",
+            "ab".repeat(48),
+            "cd".repeat(20)
+        );
+        let definitions: ValidatorDefinitions = serde_yaml_ng::from_str(&yaml).expect("parses");
+        let overrides = definitions.0[0].overrides().expect("valid");
+        assert_eq!(overrides.fee_recipient, Some(H160([0xcd; 20])));
+        assert_eq!(
+            overrides.graffiti,
+            Some(graffiti_from_text("from lighthouse").expect("fits"))
+        );
+        assert_eq!(overrides.gas_limit, Some(36_000_000));
+    }
+
+    #[test]
+    fn a_malformed_override_is_an_error_naming_the_field() {
+        let mut entry = definition("0xaa", true);
+        entry.suggested_fee_recipient = Some("0x1234".to_string());
+        let err = entry.overrides().expect_err("two bytes is not an address");
+        assert!(
+            err.to_string().contains("suggested_fee_recipient") && err.to_string().contains("0xaa"),
+            "got {err}"
+        );
+
+        let mut entry = definition("0xaa", true);
+        entry.graffiti = Some("a".repeat(GRAFFITI_BYTES + 1));
+        let err = entry.overrides().expect_err("33 bytes does not fit");
+        assert!(err.to_string().contains("graffiti"), "got {err}");
+
+        let mut entry = definition("0xaa", true);
+        entry.gas_limit = Some(0);
+        let err = entry.overrides().expect_err("a zero gas limit is refused");
+        assert!(err.to_string().contains("gas_limit"), "got {err}");
+    }
+
+    /// Startup seeding: enabled entries' overrides land in the settings, a
+    /// disabled entry's do not.
+    #[test]
+    fn seeding_installs_enabled_entries_overrides_only() {
+        use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160};
+
+        let enabled_key = format!("0x{}", "11".repeat(48));
+        let disabled_key = format!("0x{}", "22".repeat(48));
+        let mut enabled = definition(&enabled_key, true);
+        enabled.apply(SettingChange::FeeRecipient(Some(H160([0xbb; 20]))));
+        let mut disabled = definition(&disabled_key, false);
+        disabled.apply(SettingChange::GasLimit(Some(1)));
+        let definitions = ValidatorDefinitions(vec![enabled, disabled, definition("0xcc", true)]);
+
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        let seeded = definitions.seed_overrides(&settings).expect("seeds");
+        assert_eq!(seeded, 1);
+        assert_eq!(
+            settings.fee_recipient(&BlsPubkey([0x11; 48])),
+            Some(H160([0xbb; 20]))
+        );
+        assert_eq!(
+            settings.overrides(&BlsPubkey([0x22; 48])),
+            Overrides::default()
+        );
+    }
+
+    /// Where a file names one key twice, the first enabled entry speaks for
+    /// it, to the lookup a settings change and a re-import go through and to
+    /// the seeding a start does alike. A disabled entry speaks only when no
+    /// enabled one does, and a key is found however the file spells it.
+    #[test]
+    fn the_first_enabled_entry_speaks_for_a_key_named_twice() {
+        use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32};
+
+        let key = BlsPubkey([0x11; 48]);
+        let spelled = |text: String, enabled: bool, graffiti: &str| {
+            let mut entry = definition(&text, enabled);
+            entry.graffiti = Some(graffiti.to_string());
+            entry
+        };
+        let lower = format!("0x{}", "11".repeat(48));
+        let definitions = ValidatorDefinitions(vec![
+            spelled(lower.clone(), false, "disabled"),
+            spelled("11".repeat(48).to_uppercase(), true, "first enabled"),
+            spelled(lower.clone(), true, "second enabled"),
+        ]);
+        assert_eq!(definitions.position_of(&key), Some(1));
+
+        let settings = ProposerSettings::new(Bytes32::ZERO, None);
+        assert_eq!(definitions.seed_overrides(&settings).expect("seeds"), 1);
+        assert_eq!(
+            settings.graffiti(&key),
+            graffiti_from_text("first enabled").expect("fits")
+        );
+
+        let only_disabled = ValidatorDefinitions(vec![
+            definition("0xaa", true),
+            spelled(lower, false, "disabled"),
+        ]);
+        assert_eq!(only_disabled.position_of(&key), Some(1));
+        assert_eq!(
+            only_disabled.position_of(&BlsPubkey([0x22; 48])),
+            None,
+            "a key no entry names"
+        );
+    }
+
+    #[test]
+    fn clearing_an_override_removes_the_field() {
+        let mut entry = definition("0xaa", true);
+        entry.apply(SettingChange::GasLimit(Some(1)));
+        entry.apply(SettingChange::GasLimit(None));
+        assert_eq!(entry, definition("0xaa", true));
     }
 
     /// A file written before remote signers existed has no `url` and no tag,
@@ -576,10 +928,10 @@ mod tests {
 
         let untyped = open_text(
             "- enabled: true\n  voting_public_key: '0xaa'\n  \
-             url: https://signer:9000\n  suggested_fee_recipient: '0x00'\n",
+             url: https://signer:9000\n  client_identity_path: identity.p12\n",
         )
         .expect_err("unimplemented field");
-        assert!(untyped.contains("suggested_fee_recipient"), "{untyped}");
+        assert!(untyped.contains("client_identity_path"), "{untyped}");
     }
 
     /// A disabled remote entry is refused for the same field, deliberately:
@@ -630,10 +982,10 @@ mod tests {
     fn a_field_this_client_does_not_read_is_skipped_on_a_local_entry() {
         let read = open_text(
             "- enabled: true\n  voting_public_key: '0xaa'\n  \
-             graffiti: mine\n  builder_proposals: true\n  description: ''\n  \
+             prefer_builder_proposals: true\n  builder_proposals: true\n  description: ''\n  \
              type: local_keystore\n  voting_keystore_path: keystore.json\n  \
              voting_keystore_password_path: password.txt\n\
-             - enabled: false\n  voting_public_key: '0xbb'\n  gas_limit: 30000000\n  \
+             - enabled: false\n  voting_public_key: '0xbb'\n  builder_boost_factor: 100\n  \
              voting_keystore_path: keystore.json\n  \
              voting_keystore_password_path: password.txt\n",
         )
@@ -651,7 +1003,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(
             dir.path().join(DEFINITIONS_FILE),
-            "- enabled: true\n  voting_public_key: '0xaa'\n  graffiti: mine\n  \
+            "- enabled: true\n  voting_public_key: '0xaa'\n  builder_proposals: true\n  \
              voting_keystore_path: keystore.json\n  \
              voting_keystore_password_path: password.txt\n",
         )
@@ -660,7 +1012,7 @@ mod tests {
         let read = ValidatorDefinitions::open(dir.path()).expect("opens");
         read.save(dir.path()).expect("saves");
         let text = std::fs::read_to_string(dir.path().join(DEFINITIONS_FILE)).expect("reads");
-        assert!(!text.contains("graffiti"), "{text}");
+        assert!(!text.contains("builder_proposals"), "{text}");
         assert_eq!(
             ValidatorDefinitions::open(dir.path()).expect("opens").0,
             read.0
