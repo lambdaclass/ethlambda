@@ -234,9 +234,14 @@ fn warm_committee_sums(
 ) -> eyre::Result<()> {
     let epoch = block.slot() / preset::SLOTS_PER_EPOCH;
     let epochs: Vec<u64> = match previous_epoch {
-        None => epoch.checked_sub(1).into_iter().chain([epoch]).collect(),
-        Some(previous) if epoch > previous => vec![epoch],
-        Some(_) => return Ok(()),
+        Some(previous) if epoch <= previous => return Ok(()),
+        // The epoch right after the last one: its predecessor was warmed when
+        // it began.
+        Some(previous) if epoch == previous + 1 => vec![epoch],
+        // The first block, or the first after a gap in the corpus: the
+        // previous epoch was never warmed here, so warm it too, as the live
+        // worker warms both on every boundary.
+        _ => epoch.checked_sub(1).into_iter().chain([epoch]).collect(),
     };
     let parent_root = block.parent_root();
     let parent_state = store.get_state(&parent_root)?.ok_or_else(|| {
