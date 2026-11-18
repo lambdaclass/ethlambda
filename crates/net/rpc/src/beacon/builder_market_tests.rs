@@ -1206,12 +1206,11 @@ async fn submit_as_the_validator_client(
         parse_pubkey(&duty.pubkey).expect("the duty names a key"),
         "the test registry's key for the proposer"
     );
-    let context = SigningContext {
-        config: world.config.clone(),
-        genesis_validators_root: world.state.genesis_validators_root(),
-    };
+    let keys = tokio::sync::RwLock::new(keys);
+    let context = SigningContext::new(world.config.clone(), world.state.genesis_validators_root());
     let signature = context
         .sign_proposer_preferences(&keys, &pubkey, &message)
+        .await
         .expect("signs");
     let signed = SignedProposerPreferences { message, signature };
 
