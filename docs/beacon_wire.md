@@ -320,6 +320,44 @@ s the swarm task disconnects peers below the graylist. There is no ban list:
 a peer's negative score is kept for `retain_score` (100 epochs) after it
 leaves, so a peer that reconnects comes back graylisted and is dropped again.
 
+The same check also disconnects a peer gossipsub reported as slow (`SlowPeer`:
+its send queue refused a message, or a message expired in it) in each of the
+last `SLOW_PEER_CHECK_LIMIT` checks. This is for a dead gossipsub stream, not
+for slowness in general. The connection handler disables itself for good after
+a few substream negotiations on one connection, successful ones included, and
+then never takes another message off the queue. Gossipsub keeps queueing for
+the peer until the queue is full, and a queued message is only dropped when
+the handler takes it off, so the queue's message copies stay in memory for as
+long as other protocols keep the connection open. On the mainnet follower,
+such queues held about 490 MB. Gossipsub's own penalty for these failures
+(`slow_peer_weight`) left the peer in the `negative` band, never near the
+graylist. Lighthouse penalizes `SlowPeer` reports through its peer manager
+instead.
+
+Two limits keep a slow node of our own from costing it its peers. Gossipsub
+counts a forward that waited too long in a peer's queue as the same failure as
+a full queue, so a saturated uplink or a stalled runtime on our side makes
+every peer look slow at once:
+
+- A report counts only when its priority or its non-priority failures exceed
+  `SLOW_PEER_REPORT_THRESHOLD`. Lighthouse applies the same cut. A dead stream
+  fails every message queued for the peer; a few failures in a heartbeat are
+  more likely late forwards.
+- One check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers,
+  the ones with the most failed messages first. The others keep their streak,
+  so a peer still failing at the next check is disconnected then. Peers held
+  back this way are logged as a warning, since many peers failing together
+  points at our side.
+
+The cap bounds the rate, not the total. A node whose own uplink stays too slow
+for gossip past the streak still loses up to `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`
+peers per check while discovery refills them. That case is deliberately left
+alone: bandwidth that slow is not something the node can solve from its side.
+
+A dead stream on a peer that gets little traffic, such as one gossipsub has
+already pruned from the mesh, may stay under the threshold. Its queue then
+stays pinned until the connection closes, as it did before this check existed.
+
 Around a fork-digest boundary the node holds two digests' topics, and every
 held digest gets the whole parameter set (exits and slashings included),
 scored by its role:
@@ -816,6 +854,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
 | `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_slow_peer_disconnects_total` | Peers disconnected for persistently failing to take gossipsub messages; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
 | `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 
