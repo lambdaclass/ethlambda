@@ -95,11 +95,15 @@
 //! # Signing stays off the async runtime
 //!
 //! The first epoch signs one BLS signature per validator. That runs on the
-//! blocking pool in chunks of [`SIGN_CHUNK`], taking the store's read lock
-//! afresh for each chunk, so neither the runtime's threads nor a queued
-//! keymanager writer wait on thousands of signatures. The cache's own lock is
-//! only ever taken under [`RegistrationService::sending`], so nothing on the
-//! runtime waits on a chunk that holds it.
+//! blocking pool in chunks of [`SIGN_CHUNK`], so the runtime's threads do not
+//! compute thousands of local signatures. The store's read lock is taken per
+//! signature and released before it is produced, so a queued keymanager
+//! writer waits on no signature, remote or local. A remote key's signature is
+//! a request to its signer, which the chunk waits on, bounded by
+//! [`crate::signing::SIGNING_BUDGET`]; one that fails or runs out of budget
+//! costs that key's registration, as a key the keymanager removed does. The
+//! cache's own locks are only ever taken under
+//! [`RegistrationService::sending`], and never held across a signature.
 //!
 //! # The per-slot check is one atomic read
 //!
@@ -126,10 +130,14 @@ use crate::beacon_node::{BeaconNodeApi, REGISTRATION_BATCH};
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::proposer_settings::ProposerSettings;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 
-/// Keys signed per blocking task, and so per hold of the store's read lock.
+/// Keys signed per blocking task. No more than one remote signer is sent at
+/// once ([`crate::keys::web3signer::MAX_CONCURRENT_REQUESTS`]), so a chunk's
+/// requests all go out together and none waits on another for its turn
+/// within the signing budget.
 const SIGN_CHUNK: usize = 64;
+const _: () = assert!(SIGN_CHUNK <= crate::keys::web3signer::MAX_CONCURRENT_REQUESTS);
 
 /// What [`RegistrationService::signed_generation`] holds while something is
 /// still to send. No [`ProposerSettings::generation`] reaches it, so the next
@@ -198,7 +206,7 @@ pub struct RegistrationService<B> {
     known: std::sync::Mutex<Vec<BlsPubkey>>,
     /// The latest signed registration per validator. Taken under
     /// [`Self::sending`] only, so it is never contended: a `std` mutex is
-    /// enough, and a signing chunk holding it keeps no one else waiting.
+    /// enough, and it is never held across a signature.
     /// Written only once a chunk is signed in full, so a key is cached only
     /// when its registration reaches the send.
     signed: std::sync::Mutex<HashMap<BlsPubkey, SignedValidatorRegistrationV1>>,
@@ -252,93 +260,158 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         }
     }
 
+    /// [`Self::signed`], locked. A poisoned lock is recovered: every write is
+    /// one map operation, so the data behind it is never half-changed.
+    fn signed(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<BlsPubkey, SignedValidatorRegistrationV1>> {
+        self.signed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Self::lapsed`], locked, and recovered from poisoning like
+    /// [`Self::signed`].
+    fn lapsed(&self) -> std::sync::MutexGuard<'_, HashSet<BlsPubkey>> {
+        self.lapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The registration for each of `pubkeys` as of `now_secs`, signing only
     /// the ones whose `(fee_recipient, gas_limit)` differs from the cached one.
     ///
+    /// Three steps, so no lock is held across a signature, which for a remote
+    /// key is a round trip: what to reuse and what to sign is decided under
+    /// the cache's locks, the signatures are asked for together through
+    /// [`sign_all`] with the locks released (the store's read guard is taken
+    /// per lookup, inside the signer), and the cache is written last, so a key
+    /// is cached only once its chunk is signed in full.
+    ///
     /// `now_secs` is a parameter so a test can fix the timestamp.
-    fn current(&self, store: &ValidatorStore, pubkeys: &[BlsPubkey], now_secs: u64) -> Current {
-        // A poisoned lock is recovered: every write is one map operation, so
-        // the data behind it is never half-changed.
-        let mut signed = self
-            .signed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut lapsed = self
-            .lapsed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    async fn current(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkeys: &[BlsPubkey],
+        now_secs: u64,
+    ) -> Current {
+        /// Where a validator's registration comes from, in `pubkeys`' order.
+        enum Source {
+            Held(SignedValidatorRegistrationV1),
+            /// An index into `owed`.
+            Owed(usize),
+        }
+
         let mut newly_lapsed = Vec::new();
-        let mut current = Current {
-            all: Vec::with_capacity(pubkeys.len()),
-            changed: Vec::new(),
-            no_fee_recipient: 0,
-            in_failed_chunks: HashSet::new(),
-        };
-        for pubkey in pubkeys {
-            #[cfg(test)]
-            if self.panic_signing.lock().expect("lock").as_ref() == Some(pubkey) {
-                panic!("signing panicked, as the test asked");
-            }
-
-            let Some((fee_recipient, gas_limit)) =
-                self.settings.fee_recipient_and_gas_limit(pubkey)
-            else {
-                current.no_fee_recipient += 1;
-                if signed.contains_key(pubkey) {
-                    newly_lapsed.push(*pubkey);
+        let mut no_fee_recipient = 0;
+        let mut order = Vec::with_capacity(pubkeys.len());
+        // Each message to sign, and whether a registration of its key was
+        // cached before it.
+        let mut owed: Vec<(ValidatorRegistrationV1, bool)> = Vec::new();
+        {
+            let signed = self.signed();
+            let lapsed = self.lapsed();
+            for pubkey in pubkeys {
+                #[cfg(test)]
+                if self.panic_signing.lock().expect("lock").as_ref() == Some(pubkey) {
+                    panic!("signing panicked, as the test asked");
                 }
-                continue;
-            };
 
-            let held = signed.get(pubkey);
-            if let Some(held) = held
-                && !lapsed.contains(pubkey)
-                && held.message.fee_recipient == fee_recipient
-                && held.message.gas_limit == gas_limit
-            {
-                current.all.push(held.clone());
-                continue;
-            }
-
-            let timestamp = newer_than(held, now_secs);
-            if timestamp > now_secs + RELAY_FUTURE_TOLERANCE_SECS {
-                warn!(
-                    pubkey = %encode_hex(&pubkey.0),
-                    timestamp,
-                    now = now_secs,
-                    "A builder registration is signed ahead of the clock, which stepped back; \
-                     the relay refuses its batch until the clock catches up"
-                );
-            }
-            let message = ValidatorRegistrationV1 {
-                fee_recipient,
-                gas_limit,
-                timestamp,
-                pubkey: *pubkey,
-            };
-            // A key the keymanager removed since the epoch refresh is the one
-            // way this fails; the next refresh no longer lists it.
-            let signature = match self.context.sign_validator_registration(store, &message) {
-                Ok(signature) => signature,
-                Err(err) => {
-                    warn!(pubkey = %encode_hex(&pubkey.0), %err, "Could not sign a builder registration; skipping it");
-                    if held.is_some() {
+                let Some((fee_recipient, gas_limit)) =
+                    self.settings.fee_recipient_and_gas_limit(pubkey)
+                else {
+                    no_fee_recipient += 1;
+                    if signed.contains_key(pubkey) {
                         newly_lapsed.push(*pubkey);
                     }
                     continue;
+                };
+
+                let held = signed.get(pubkey);
+                if let Some(held) = held
+                    && !lapsed.contains(pubkey)
+                    && held.message.fee_recipient == fee_recipient
+                    && held.message.gas_limit == gas_limit
+                {
+                    order.push(Source::Held(held.clone()));
+                    continue;
                 }
-            };
-            let registration = SignedValidatorRegistrationV1 { message, signature };
-            current.all.push(registration.clone());
-            current.changed.push(registration);
+
+                let timestamp = newer_than(held, now_secs);
+                if timestamp > now_secs + RELAY_FUTURE_TOLERANCE_SECS {
+                    warn!(
+                        pubkey = %encode_hex(&pubkey.0),
+                        timestamp,
+                        now = now_secs,
+                        "A builder registration is signed ahead of the clock, which stepped back; \
+                         the relay refuses its batch until the clock catches up"
+                    );
+                }
+                let message = ValidatorRegistrationV1 {
+                    fee_recipient,
+                    gas_limit,
+                    timestamp,
+                    pubkey: *pubkey,
+                };
+                order.push(Source::Owed(owed.len()));
+                owed.push((message, held.is_some()));
+            }
         }
+
+        let requests = owed.iter().map(|(message, _)| {
+            let signature = self.context.sign_validator_registration(store, message);
+            (message.pubkey, signature)
+        });
+        let signatures = sign_all(requests).await;
+
+        // A key the keymanager removed since the epoch refresh, a remote
+        // signer that refused or did not answer within the signing budget:
+        // each costs that key's registration, never the chunk's.
+        let mut signed_now: Vec<Option<SignedValidatorRegistrationV1>> = owed
+            .into_iter()
+            .zip(signatures)
+            .map(|((message, was_held), signature)| match signature {
+                Ok(signature) => Some(SignedValidatorRegistrationV1 { message, signature }),
+                Err(err) => {
+                    warn!(
+                        pubkey = %encode_hex(&message.pubkey.0),
+                        %err,
+                        "Could not sign a builder registration; skipping it"
+                    );
+                    if was_held {
+                        newly_lapsed.push(message.pubkey);
+                    }
+                    None
+                }
+            })
+            .collect();
+
+        let mut current = Current {
+            all: Vec::with_capacity(order.len()),
+            changed: Vec::new(),
+            no_fee_recipient,
+            in_failed_chunks: HashSet::new(),
+        };
+        for source in order {
+            match source {
+                Source::Held(registration) => current.all.push(registration),
+                Source::Owed(index) => {
+                    if let Some(registration) = signed_now[index].take() {
+                        current.all.push(registration.clone());
+                        current.changed.push(registration);
+                    }
+                }
+            }
+        }
+
         // Cached only now that the chunk is signed in full: a key cached by a
         // chunk that then panicked would never reach the send, and the next
         // call would find it unchanged and not send it either.
         let changed = current.changed.iter();
-        signed.extend(
+        self.signed().extend(
             changed.map(|registration| (registration.message.pubkey, registration.clone())),
         );
+        let mut lapsed = self.lapsed();
         for registration in &current.changed {
             lapsed.remove(&registration.message.pubkey);
         }
@@ -357,8 +430,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .map_or(0, |elapsed| elapsed.as_secs())
     }
 
-    /// [`Self::current`] over `pubkeys`, off the async runtime, [`SIGN_CHUNK`]
-    /// keys per blocking task with the store's read lock taken per chunk.
+    /// [`Self::current`] over `pubkeys`, [`SIGN_CHUNK`] keys per blocking
+    /// task.
+    ///
+    /// Each chunk runs on the blocking pool and drives its signing there, so
+    /// a local key's signature is computed off the runtime's threads, and a
+    /// chunk that panics costs its own keys only. A remote key's signature is
+    /// a request the chunk waits on, bounded by
+    /// [`crate::signing::SIGNING_BUDGET`]; a chunk is no larger than the
+    /// requests one signer is sent at once, so its keys go out together.
     async fn current_blocking(
         self: &Arc<Self>,
         store: &Arc<RwLock<ValidatorStore>>,
@@ -373,9 +453,11 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         };
         for keys in pubkeys.chunks(SIGN_CHUNK) {
             let (service, store, chunk) = (self.clone(), store.clone(), keys.to_vec());
+            // The runtime the chunk's requests and timers run on: a blocking
+            // thread is outside it, so it enters it to wait on them.
+            let runtime = tokio::runtime::Handle::current();
             let part = tokio::task::spawn_blocking(move || {
-                let store = store.blocking_read();
-                service.current(&store, &chunk, now_secs)
+                runtime.block_on(service.current(&store, &chunk, now_secs))
             })
             .await;
             match part {
@@ -587,10 +669,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     fn context(config: Config) -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config,
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(config, Root::ZERO))
     }
 
     fn service(
@@ -611,31 +690,33 @@ mod tests {
         )
     }
 
-    #[test]
-    fn registrations_are_signed_once_and_reused() {
+    #[tokio::test]
+    async fn registrations_are_signed_once_and_reused() {
         let (store, pubkeys) = store_with_keys(2);
+        let store = RwLock::new(store);
         let (service, _) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
 
-        let first = service.current(&store, &pubkeys, 1_000);
+        let first = service.current(&store, &pubkeys, 1_000).await;
         assert_eq!(first.all.len(), 2);
         assert_eq!(first.changed.len(), 2);
 
-        let second = service.current(&store, &pubkeys, 2_000);
+        let second = service.current(&store, &pubkeys, 2_000).await;
         assert_eq!(second.all, first.all, "same timestamp and signature");
         assert!(second.changed.is_empty());
         assert_eq!(second.all[0].message.timestamp, 1_000);
     }
 
-    #[test]
-    fn a_new_fee_recipient_or_gas_limit_re_signs() {
+    #[tokio::test]
+    async fn a_new_fee_recipient_or_gas_limit_re_signs() {
         let (store, pubkeys) = store_with_keys(3);
+        let store = RwLock::new(store);
         let settings = settings(Some(H160([0xab; 20])));
         let (service, _) = service(Config::mainnet(), settings.clone());
-        let first = service.current(&store, &pubkeys, 1_000);
+        let first = service.current(&store, &pubkeys, 1_000).await;
 
         settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
         settings.set_gas_limit(&pubkeys[1], 30_000_000);
-        let second = service.current(&store, &pubkeys, 2_000);
+        let second = service.current(&store, &pubkeys, 2_000).await;
 
         let changed: Vec<_> = second.changed.iter().map(|r| r.message.pubkey).collect();
         assert_eq!(changed, vec![pubkeys[0], pubkeys[1]]);
@@ -650,49 +731,52 @@ mod tests {
     /// A relay drops a registration that is not newer than the one it holds,
     /// so a change signed within the same second, or after the clock stepped
     /// back, still gets a later timestamp than the registration it replaces.
-    #[test]
-    fn a_re_signed_registration_is_always_newer_than_the_last() {
+    #[tokio::test]
+    async fn a_re_signed_registration_is_always_newer_than_the_last() {
         let (store, pubkeys) = store_with_keys(1);
+        let store = RwLock::new(store);
         let settings = settings(Some(H160([0xab; 20])));
         let (service, _) = service(Config::mainnet(), settings.clone());
-        let first = service.current(&store, &pubkeys, 2_000);
+        let first = service.current(&store, &pubkeys, 2_000).await;
         assert_eq!(first.all[0].message.timestamp, 2_000);
 
         settings.set_gas_limit(&pubkeys[0], 30_000_000);
-        let same_second = service.current(&store, &pubkeys, 2_000);
+        let same_second = service.current(&store, &pubkeys, 2_000).await;
         assert_eq!(same_second.changed[0].message.timestamp, 2_001);
 
         settings.set_gas_limit(&pubkeys[0], 31_000_000);
-        let stepped_back = service.current(&store, &pubkeys, 1_000);
+        let stepped_back = service.current(&store, &pubkeys, 1_000).await;
         assert_eq!(stepped_back.changed[0].message.timestamp, 2_002);
 
         // Once the clock is ahead again, its reading is used.
         settings.set_gas_limit(&pubkeys[0], 32_000_000);
-        let caught_up = service.current(&store, &pubkeys, 5_000);
+        let caught_up = service.current(&store, &pubkeys, 5_000).await;
         assert_eq!(caught_up.changed[0].message.timestamp, 5_000);
     }
 
-    #[test]
-    fn a_validator_without_a_fee_recipient_is_not_registered() {
+    #[tokio::test]
+    async fn a_validator_without_a_fee_recipient_is_not_registered() {
         let (store, pubkeys) = store_with_keys(2);
+        let store = RwLock::new(store);
         let settings = settings(None);
         settings.set_fee_recipient(&pubkeys[1], H160([0xcd; 20]));
         let (service, _) = service(Config::mainnet(), settings);
 
-        let current = service.current(&store, &pubkeys, 1_000);
+        let current = service.current(&store, &pubkeys, 1_000).await;
 
         assert_eq!(current.no_fee_recipient, 1);
         assert_eq!(current.all.len(), 1);
         assert_eq!(current.all[0].message.pubkey, pubkeys[1]);
     }
 
-    #[test]
-    fn a_removed_key_is_skipped_rather_than_failing_the_rest() {
+    #[tokio::test]
+    async fn a_removed_key_is_skipped_rather_than_failing_the_rest() {
         let (mut store, pubkeys) = store_with_keys(2);
         let (service, _) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
         store.remove(&pubkeys[0]);
+        let store = RwLock::new(store);
 
-        let current = service.current(&store, &pubkeys, 1_000);
+        let current = service.current(&store, &pubkeys, 1_000).await;
 
         assert_eq!(current.all.len(), 1);
         assert_eq!(current.all[0].message.pubkey, pubkeys[1]);

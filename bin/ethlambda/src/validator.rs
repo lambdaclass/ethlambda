@@ -10,6 +10,7 @@ use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
+use eyre::WrapErr as _;
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -98,6 +99,15 @@ pub(crate) struct ValidatorOptions {
     /// beyond localhost must front it with TLS.
     #[arg(long, default_value = "false")]
     pub(crate) enable_keymanager: bool,
+
+    /// Base URL of a Web3Signer remote signer (e.g. https://signer:9000),
+    /// the default for remote keys imported through the keymanager API's
+    /// `POST /eth/v1/remotekeys` without a `url` of their own.
+    ///
+    /// Optional: a remote key may name its own signer in that request or in
+    /// `validator_definitions.yml`, and local keystores never need one.
+    #[arg(long)]
+    pub(crate) web3signer_url: Option<String>,
 
     /// Propose builder blocks: register each validator with the beacon node's
     /// builder and accept a blinded block when the builder's bid wins. Requires
@@ -235,6 +245,13 @@ impl ValidatorOptions {
 #[tokio::main]
 pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
+    // The same raise `run_node` makes, and for a like reason: with remote
+    // keys every signing request in flight is a socket (capped per signer,
+    // see `Web3Signer`), next to the beacon nodes', the metrics server's and
+    // the keymanager's. On a default soft limit `connect` starts failing
+    // with `EMFILE` once several signers are busy at once, and every
+    // signature those requests were for fails with it.
+    crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
@@ -248,6 +265,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        web3signer_url: options.web3signer_url,
         gas_limit: options.gas_limit,
         builder,
         builder_min_bid: options.builder_min_bid,
@@ -273,6 +291,7 @@ mod tests {
             suggested_fee_recipient: None,
             gas_limit: DEFAULT_GAS_LIMIT,
             enable_keymanager: false,
+            web3signer_url: None,
             builder_proposals: false,
             builder_boost_factor: 100,
             prefer_builder_proposals: false,

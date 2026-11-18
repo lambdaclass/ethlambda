@@ -275,7 +275,7 @@ async fn the_validator_client_can_exit_a_validator_through_this_node() {
         store
             .insert_secret("test", &secret_key_for(0).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         no_confirmation: true,
@@ -323,7 +323,7 @@ async fn the_validator_client_can_exit_a_validator_through_this_node() {
         store
             .insert_secret("test", &secret_key_for(1).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         epoch: Some(0),
@@ -367,7 +367,7 @@ async fn the_validator_client_follows_this_nodes_shard_committee_period() {
         store
             .insert_secret("test", &secret_key_for(0).to_bytes())
             .expect("valid key");
-        store
+        RwLock::new(store)
     };
     let options = ExitOptions {
         no_confirmation: true,
@@ -1117,10 +1117,7 @@ async fn serve_fulu_pinned_under(
         .spec()
         .await
         .expect("the client reads this node's spec");
-    let context = Arc::new(SigningContext {
-        config: spec,
-        genesis_validators_root: genesis.genesis_validators_root,
-    });
+    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
     (Arc::new(client), state, network, context)
 }
 
@@ -1435,10 +1432,7 @@ mod gloas {
             .spec()
             .await
             .expect("the client reads this node's spec");
-        let context = Arc::new(SigningContext {
-            config: spec,
-            genesis_validators_root: genesis.genesis_validators_root,
-        });
+        let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
         Served {
             client,
             state,
@@ -1960,10 +1954,10 @@ mod builder_flow {
 
         let proposer = get_beacon_proposer_index(&world.state).unwrap();
         let keys = keys_for(&world.state, &[proposer]);
-        let context = SigningContext {
-            config: (*world.store.config()).clone(),
-            genesis_validators_root: world.state.genesis_validators_root(),
-        };
+        let context = SigningContext::new(
+            (*world.store.config()).clone(),
+            world.state.genesis_validators_root(),
+        );
         Harness {
             world,
             client,
@@ -1987,12 +1981,11 @@ mod builder_flow {
                 timestamp: 1,
                 pubkey: self.pubkey(),
             };
-            let signature = {
-                let keys = self.keys.read().await;
-                self.context
-                    .sign_validator_registration(&keys, &message)
-                    .unwrap()
-            };
+            let signature = self
+                .context
+                .sign_validator_registration(&self.keys, &message)
+                .await
+                .unwrap();
             let signed = SignedValidatorRegistrationV1 { message, signature };
             self.client
                 .register_validators(std::slice::from_ref(&signed))
