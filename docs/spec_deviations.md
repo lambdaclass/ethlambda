@@ -589,7 +589,13 @@ counted.
   14,882 transactions of about 700 bytes (a mainnet block's mean size), and
   0.6 s for the worst case, 1,048,576 five-byte transactions (the most the
   list allows). Only a block whose proposer signature verified can ask for
-  that.
+  that, and once its verdict reaches the p2p actor its slot and proposer are
+  marked seen, so the cheap checks IGNORE any other block for them. Blocks
+  already in validation are not covered: a proposer that publishes several
+  signed equivocations at once has each hashed until the first verdict lands,
+  up to the 128 `gossip_validation_permits` at a time (a message arriving with
+  none free is forwarded unhashed under `Overloaded`). The signature check has
+  the same window; only its per-block cost is smaller.
   `lean_beacon_payload_block_hash_mismatch_total{kind}` counts mismatches
   (`block` IGNOREd, `envelope` counted only) and a `warn!` names the slot and
   root.
