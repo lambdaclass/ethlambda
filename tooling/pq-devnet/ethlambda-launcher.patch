@@ -1,0 +1,17 @@
+diff --git a/src/cl/ethlambda/ethlambda_launcher.star b/src/cl/ethlambda/ethlambda_launcher.star
+index 477e74f..158d344 100644
+--- a/src/cl/ethlambda/ethlambda_launcher.star
++++ b/src/cl/ethlambda/ethlambda_launcher.star
+@@ -215,6 +215,12 @@ def get_beacon_config(
+             )
+         )
+ 
++    # A network on the consensus-specs pq fork needs the leanVM prover sidecar
++    # its other clients prove with: `ethlambda-pq` starts one and passes its
++    # socket, as lighthouse-pq-bn does for Lighthouse.
++    if network_params.pq_fork_epoch != constants.FAR_FUTURE_EPOCH:
++        cmd[0] = "ethlambda-pq"
++
+     cmd_str = " && ".join(setup_cmds + ["exec " + " ".join(cmd)])
+ 
+     env_vars = {LOG_LEVEL_ENV_VAR: log_level}

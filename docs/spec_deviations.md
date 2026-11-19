@@ -976,12 +976,35 @@ gossip modules implement, so their deliberate departures carry over:
   (`compute_fork_version(proposal_epoch)`), where gloas's rule accepts any of
   three candidate domains for other clients' sake.
 
-Two more, which the node's not following PQ decides:
+Two more:
 
 - **A rule whose state is not a PQ one ignores the message.** The XMSS keys a
-  rule reads exist only in a PQ state, and the node imports no PQ block, so on
-  a live node every stateful PQ rule ends in an ignore. Rejecting would score
-  down every honest peer on a PQ digest.
+  rule reads exist only in a PQ state, so a message whose block state is
+  another fork's (around the fork boundary) cannot be judged. Rejecting would
+  score down an honest peer.
 - **A message that does not decode as PQ's container is ignored, not
-  rejected**, as on every topic of a fork the node does not follow: the
-  containers are modelled from a moving specification branch.
+  rejected**: the containers are modelled from a moving specification branch.
+
+## PQ attestation proofs are leanVM proofs, which attest no leaf index
+
+The specification's `stark.VerifyAggregates` checks each signature at its
+statement's leaf index, and its reference implementation does (a proof is
+the signatures concatenated). The PQ devnet's clients prove with leanVM
+instead, through a `leanvm-sidecar` (`--pq-prover-socket`,
+`ethlambda_crypto::stark::sidecar`), and a leanVM proof attests only
+`(public key, message)` claims (leanEthereum/leanVM#787). So under the
+sidecar backend a proof shows each key signed the message at *some* leaf,
+not at the statement's. Proving still refuses a signature made at another
+leaf, since it sees the signatures, which is Lighthouse's behavior too. The
+two encodings are not interchangeable: a node verifies only the backend it
+runs, so a network picks one, and the reference stays the default for the
+specification's fixtures.
+
+## The genesis block's body carries the state's bid from gloas on
+
+The specification defines the genesis block only in its test helpers
+(`get_genesis_block`), which from gloas on put the state's
+`latest_execution_payload_bid` in the body's bid; ethpandaops' generator
+builds the genesis header the same way. `genesis_anchor_block` builds that
+body, and falls back to the fully empty body when the state's header names
+that one instead, for a generator built against an older gloas release.
