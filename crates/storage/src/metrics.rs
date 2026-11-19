@@ -90,6 +90,53 @@ impl StateCacheMethod {
     }
 }
 
+static LEAN_STATE_REBUILDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_state_rebuilds_total",
+        "Block states read back from storage after missing the cache and the write buffer, \
+         by whether the read did the rebuild or waited on one already under way for that root",
+        &["role"]
+    )
+    .unwrap()
+});
+
+/// How a `read_state` miss got its state from storage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RebuildRole {
+    /// Read and decoded the state itself.
+    Led,
+    /// Waited on a rebuild of the same root already under way and took the
+    /// state it read.
+    Joined,
+}
+
+impl RebuildRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Led => "led",
+            Self::Joined => "joined",
+        }
+    }
+}
+
+/// Count one storage read of a block state, by `role`.
+pub(crate) fn inc_state_rebuilds(role: RebuildRole) {
+    LEAN_STATE_REBUILDS_TOTAL
+        .with_label_values(&[role.label()])
+        .inc();
+}
+
+/// Register the metrics that should be visible before their first
+/// observation.
+pub fn init() {
+    // Both roles at zero, so `increase()` sees the first burst after a
+    // restart: a burst of rebuilds is rare enough that it can be the only one
+    // in the range a dashboard looks at.
+    for role in [RebuildRole::Led, RebuildRole::Joined] {
+        LEAN_STATE_REBUILDS_TOTAL.with_label_values(&[role.label()]);
+    }
+}
+
 /// Count one state-cache lookup for `key`, made by `method`.
 pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, hit: bool) {
     let kind = match key {
