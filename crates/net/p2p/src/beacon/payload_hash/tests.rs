@@ -333,3 +333,101 @@ fn a_gloas_mismatch_is_counted_but_not_refused() {
     let queued = Outcome::Queue(QueueReason::StateNotCached);
     assert_eq!(envelope_verdict(queued, &changed), queued);
 }
+
+/// Not a check: how long [`verify_block`] takes, copies included, on the real
+/// fulu vector and on fulu blocks filled to the gossip size limit. `#[ignore]`d
+/// because it only prints.
+///
+/// ```text
+/// cargo test -p ethlambda-p2p --profile release-fast --lib \
+///     payload_hash::tests::verify_block_cost -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "benchmark: prints how long verify_block takes"]
+fn verify_block_cost() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use ethlambda_types::beacon::containers::bellatrix::{Transaction, Transactions};
+    use ethlambda_types::beacon::preset;
+
+    use crate::req_resp::MAX_PAYLOAD_SIZE;
+
+    fn time(label: &str, block: &SignedBeaconBlock, runs: u32) {
+        let SignedBeaconBlock::Fulu(inner) = block else {
+            panic!("fulu");
+        };
+        let transactions = inner.message.body.execution_payload.transactions.len();
+        let bytes = block.to_ssz().len();
+        assert!(bytes <= MAX_PAYLOAD_SIZE, "{label}: over the gossip limit");
+        let _ = black_box(verify_block(black_box(block)));
+        let mut fastest = Duration::MAX;
+        let mut total = Duration::ZERO;
+        for _ in 0..runs {
+            let start = Instant::now();
+            let _ = black_box(verify_block(black_box(block)));
+            let elapsed = start.elapsed();
+            fastest = fastest.min(elapsed);
+            total += elapsed;
+        }
+        println!(
+            "verify_block_cost {label}: {transactions} transactions, {bytes} SSZ bytes, \
+             mean {:?}, min {fastest:?} over {runs} runs",
+            total / runs
+        );
+    }
+
+    /// The fulu vector with its transactions replaced by `count` of `len`
+    /// bytes each.
+    fn filled(count: usize, len: usize) -> SignedBeaconBlock {
+        let mut filled = block(ForkName::Fulu, FULU);
+        let transactions: Vec<Transaction> = (0..count)
+            .map(|index| {
+                let mut tx = vec![0x02u8; len];
+                let tail = (index as u32).to_le_bytes();
+                let keep = len.min(tail.len());
+                tx[len - keep..].copy_from_slice(&tail[..keep]);
+                Transaction::try_from(tx).expect("within MAX_BYTES_PER_TRANSACTION")
+            })
+            .collect();
+        fulu_block(&mut filled)
+            .message
+            .body
+            .execution_payload
+            .transactions =
+            Transactions::try_from(transactions).expect("within MAX_TRANSACTIONS_PER_PAYLOAD");
+        filled
+    }
+
+    let real = block(ForkName::Fulu, FULU);
+    time("mainnet vector", &real, 200);
+
+    // What the block takes besides its transactions; each transaction adds
+    // its bytes and a four-byte offset.
+    let empty = filled(0, 0);
+    let room = MAX_PAYLOAD_SIZE - empty.to_ssz().len();
+
+    // As many transactions as the list allows, as small as the room leaves:
+    // the most trie insertions a block at the limit can ask for.
+    let count = preset::MAX_TRANSACTIONS_PER_PAYLOAD;
+    time(
+        "limit, most transactions",
+        &filled(count, room / count - 4),
+        5,
+    );
+
+    // The mainnet vector's mean transaction size.
+    let SignedBeaconBlock::Fulu(inner) = &real else {
+        panic!("fulu");
+    };
+    let real_transactions = &inner.message.body.execution_payload.transactions;
+    let mean = real_transactions.iter().map(|tx| tx.len()).sum::<usize>() / real_transactions.len();
+    time(
+        "limit, mainnet-sized transactions",
+        &filled(room / (mean + 4), mean),
+        10,
+    );
+
+    // One transaction holding the whole room: keccak over ten megabytes.
+    time("limit, one transaction", &filled(1, room - 4), 10);
+}
