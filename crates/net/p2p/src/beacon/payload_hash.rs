@@ -68,9 +68,9 @@ const EMPTY_OMMERS_HASH: [u8; 32] = [
 
 /// The hash the payload claims against the one its fields give.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HashMismatch {
-    pub claimed: [u8; 32],
-    pub computed: [u8; 32],
+pub(crate) struct HashMismatch {
+    pub(crate) claimed: [u8; 32],
+    pub(crate) computed: [u8; 32],
 }
 
 /// What a payload and its surroundings supply to the header, whatever the fork.
@@ -238,7 +238,7 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 /// A block before bellatrix, a bellatrix block from before the merge (its
 /// payload is the empty default), and a gloas block (its payload arrives in a
 /// separate envelope) have nothing to check.
-pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
+pub(crate) fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
     match block {
         SignedBeaconBlock::Bellatrix(block) => {
             let payload = &block.message.body.execution_payload;
@@ -313,7 +313,7 @@ pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
 }
 
 /// A gloas envelope's payload hash against its header.
-pub fn verify_envelope(
+pub(crate) fn verify_envelope(
     envelope: &gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<(), HashMismatch> {
     let message = &envelope.message;
