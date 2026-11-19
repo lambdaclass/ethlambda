@@ -511,6 +511,12 @@ mod tests {
         })
     }
 
+    /// A registry that fills exactly two committees per slot under either
+    /// preset (8192 validators on mainnet, 64 on minimal).
+    fn two_committees_per_slot() -> usize {
+        (2 * preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE) as usize
+    }
+
     fn data_at(state: &BeaconState, slot: Slot) -> AttestationData {
         let epoch = compute_epoch_at_slot(slot);
         let source = if epoch == get_current_epoch(state) {
@@ -538,8 +544,7 @@ mod tests {
     /// not name are left out.
     #[test]
     fn aggregates_of_one_vote_pack_as_one_attestation_in_committee_order() {
-        // Two committees per slot under the mainnet preset.
-        let state = with_validators_at(ForkName::Pq, 2 * 32 * 128);
+        let state = with_validators_at(ForkName::Pq, two_committees_per_slot());
         let committees = CommitteeCache::default();
         let data_slot = state.slot() - preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ;
         let data = data_at(&state, data_slot);
@@ -613,7 +618,7 @@ mod tests {
     /// nothing and is not packed.
     #[test]
     fn an_aggregate_crediting_nobody_new_is_not_packed() {
-        let mut state = with_validators_at(ForkName::Pq, 2 * 32 * 128);
+        let mut state = with_validators_at(ForkName::Pq, two_committees_per_slot());
         let committees = CommitteeCache::default();
         let data_slot = state.slot() - preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ;
         let data = data_at(&state, data_slot);
