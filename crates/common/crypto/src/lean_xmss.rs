@@ -660,7 +660,14 @@ struct BottomTree {
     top_signature: LayerSignature,
 }
 
-/// A secret key: the seed, the top tree, and the bottom tree it last signed in.
+/// How many bottom trees a key keeps built. Two: a validator on the PQ fork
+/// signs its attestations in one bottom tree (leaves `2^15 + epoch`) and its
+/// per-slot messages (proposals, aggregates, payload attestations) in another,
+/// so one cached tree would be rebuilt, about a second and a half of hashing,
+/// on nearly every signature.
+const BOTTOM_TREES_CACHED: usize = 2;
+
+/// A secret key: the seed, the top tree, and the bottom trees it last signed in.
 ///
 /// Holding the top tree is what makes signing cost one bottom tree rather than
 /// both layers: key generation builds `2^16` one-time keys, about a second of
@@ -672,7 +679,8 @@ pub struct SecretKey {
     /// The leaf indices the key's trees hold: every one for a full key.
     leaves: std::ops::RangeInclusive<LeafIndex>,
     top: LayerTree,
-    bottom: Mutex<Option<Arc<BottomTree>>>,
+    /// Most recently used last, at most [`BOTTOM_TREES_CACHED`].
+    bottom: Mutex<Vec<Arc<BottomTree>>>,
 }
 
 impl std::fmt::Debug for SecretKey {
@@ -695,7 +703,7 @@ fn generate(key_seed: &Seed, leaves: std::ops::RangeInclusive<LeafIndex>) -> Sec
         public_param,
         leaves,
         top,
-        bottom: Mutex::new(None),
+        bottom: Mutex::new(Vec::new()),
     }
 }
 
@@ -756,15 +764,16 @@ impl SecretKey {
     /// root: the cached one, or built and cached.
     fn bottom_tree(&self, leaf_index: LeafIndex) -> Result<Arc<BottomTree>, SignError> {
         let index = layer_index(leaf_index, 1);
-        let cached = self
-            .bottom
-            .lock()
-            .expect("the bottom-tree cache is never poisoned")
-            .as_ref()
-            .filter(|bottom| bottom.index == index)
-            .cloned();
-        if let Some(bottom) = cached {
-            return Ok(bottom);
+        {
+            let mut cache = self
+                .bottom
+                .lock()
+                .expect("the bottom-tree cache is never poisoned");
+            if let Some(position) = cache.iter().position(|bottom| bottom.index == index) {
+                let bottom = cache.remove(position);
+                cache.push(Arc::clone(&bottom));
+                return Ok(bottom);
+            }
         }
         let (pp, seed) = (&self.public_param, &self.seed);
         let base = index << LAYER_HEIGHT;
@@ -782,10 +791,14 @@ impl SecretKey {
             },
             tree,
         });
-        *self
+        let mut cache = self
             .bottom
             .lock()
-            .expect("the bottom-tree cache is never poisoned") = Some(Arc::clone(&bottom));
+            .expect("the bottom-tree cache is never poisoned");
+        if cache.len() >= BOTTOM_TREES_CACHED {
+            cache.remove(0);
+        }
+        cache.push(Arc::clone(&bottom));
         Ok(bottom)
     }
 }
@@ -886,6 +899,30 @@ mod tests {
         let expected =
             hex_bytes("d7792e263b94cf0b7a9f70d8374c6d34a600b4247057d4079f810caff711c632");
         assert_eq!(key_gen(&seed).public_key().to_bytes().to_vec(), expected);
+    }
+
+    /// Alternating between two bottom trees keeps both built: after the first
+    /// signature in each, signing costs one one-time key, not a tree.
+    #[test]
+    fn two_bottom_trees_stay_built() {
+        let key = key_gen(&[3; SEED_LEN]);
+        let message: Message = [9; 32];
+        let attestation_leaf: LeafIndex = (1 << 15) + 7;
+        let slot_leaf: LeafIndex = (1 << 30) + (1 << 16) + 8 * 100;
+        let started = std::time::Instant::now();
+        key.sign(&message, attestation_leaf).unwrap();
+        key.sign(&message, slot_leaf).unwrap();
+        let building = started.elapsed();
+        let started = std::time::Instant::now();
+        for offset in 0..4 {
+            key.sign(&message, attestation_leaf + offset).unwrap();
+            key.sign(&message, slot_leaf + offset).unwrap();
+        }
+        let cached = started.elapsed();
+        assert!(
+            cached < building / 4,
+            "{cached:?} signing eight vs {building:?} building two"
+        );
     }
 
     #[test]
