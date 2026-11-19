@@ -74,6 +74,7 @@ use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, deneb, electra};
+use ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB;
 use ethlambda_types::beacon::primitives::KzgProof;
 use ethlambda_types::primitives::H256;
 use tracing::{debug, error, info, warn};
@@ -237,7 +238,7 @@ async fn fetch_and_publish(
 
         let converted = Instant::now();
         let mut blobs = Vec::with_capacity(entries.len());
-        let mut proofs: Vec<KzgProof> = Vec::new();
+        let mut proofs: Vec<KzgProof> = Vec::with_capacity(entries.len() * CELLS_PER_EXT_BLOB);
         for entry in entries {
             match deneb::Blob::try_from(entry.blob) {
                 Ok(blob) => blobs.push(blob),
@@ -272,9 +273,10 @@ async fn fetch_and_publish(
     let columns = sidecars.len();
     let sidecars: Vec<DataColumnSidecar> =
         sidecars.into_iter().map(DataColumnSidecar::Fulu).collect();
-    let _ = p2p
-        .check_data_column_sidecars(sidecars, SidecarOrigin::ExecutionLayer)
-        .inspect_err(|err| error!(%slot, %err, "Failed to hand execution-client columns to P2P"));
+    if let Err(err) = p2p.check_data_column_sidecars(sidecars, SidecarOrigin::ExecutionLayer) {
+        error!(%slot, %err, "Failed to hand execution-client columns to P2P");
+        return;
+    }
 
     info!(
         %slot,
@@ -597,6 +599,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A block imported while the execution client answered (gossip
+    /// completed it first): the answer is a hit, but the re-check before the
+    /// build finds the block's state and nothing is built or handed over.
+    #[tokio::test]
+    async fn a_hit_for_a_block_imported_meanwhile_hands_nothing_over() {
+        let blobs = vec![blob_bytes(8)];
+        let block = block_committing_to(&blobs);
+        let root = block.message_hash_tree_root();
+        let mut store = beacon_store(0, 0);
+        store
+            .insert_signed_block(root, block.clone())
+            .expect("insert");
+        store.insert_state(root, bare_state()).expect("insert");
+        let SignedBeaconBlock::Fulu(inner) = block else {
+            unreachable!("fulu_block builds a fulu block");
+        };
+        let (engine, requests) = mock_engine(answer_for(&blobs)).await;
+        let p2p = Arc::new(crate::tests::RecordingP2P::default());
+
+        fetch_and_publish(engine, p2p.clone(), store, inner, root, CUSTODY.to_vec()).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the engine was asked");
+        assert!(p2p.checks.lock().unwrap().is_empty());
     }
 
     /// A block more than `MAX_ASK_AGE_SLOTS` behind the clock (range sync's)

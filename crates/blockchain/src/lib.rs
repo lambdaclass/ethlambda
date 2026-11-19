@@ -4735,8 +4735,9 @@ mod tests {
             sidecars: Vec<DataColumnSidecar>,
             origin: ethlambda_network_api::SidecarOrigin,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.checks.lock().unwrap().push(sidecars);
+            // Origin first: a test waits on `checks`, then reads the origin.
             self.check_origins.lock().unwrap().push(origin);
+            self.checks.lock().unwrap().push(sidecars);
             Ok(())
         }
     }
