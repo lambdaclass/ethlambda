@@ -26,6 +26,38 @@ use tracing::{error, warn};
 
 use crate::{P2PServer, metrics};
 
+/// What the checks made of one fetched sidecar, as the lookup that asked for
+/// it needs to know: whether its column is now here, and whether the peer that
+/// sent it is to blame if not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnVerdict {
+    /// Passed and went to the chain actor, or was already stored: the column
+    /// is here.
+    Delivered,
+    /// Not judged, through no fault of the sender: parked until its block can
+    /// judge it, dropped for a reason that is not the sender's (an `Ignore`),
+    /// or never checked, because this node had no chain actor to check it for
+    /// or its check panicked.
+    Undecided,
+    /// Refused as invalid: the sender sent something it should not have.
+    Rejected,
+}
+
+impl From<&ChainVerdict> for ColumnVerdict {
+    fn from(verdict: &ChainVerdict) -> Self {
+        match verdict {
+            ChainVerdict::Keep
+            | ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored)) => Self::Delivered,
+            ChainVerdict::Drop(Outcome::Reject(_)) => Self::Rejected,
+            ChainVerdict::AwaitParent | ChainVerdict::Drop(_) => Self::Undecided,
+        }
+    }
+}
+
+/// A completion callback: each sidecar's column index with its
+/// [`ColumnVerdict`].
+pub(crate) type Done = Box<dyn FnOnce(Vec<(u64, ColumnVerdict)>) + Send>;
+
 /// Run the chain checks on `sidecars`, then send the chain actor the ones that
 /// passed as one batch and the ones waiting on a block as another.
 ///
@@ -33,33 +65,62 @@ use crate::{P2PServer, metrics};
 /// goes on handling swarm events while a range batch's KZG proofs are
 /// verified.
 pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSidecar>) {
-    if sidecars.is_empty() {
-        return;
-    }
-    let Some(blockchain) = server.blockchain.clone() else {
-        return;
+    check_and_forward_then(server, sidecars, None);
+}
+
+/// [`check_and_forward`], then `done` with every sidecar's verdict, once the
+/// ones that passed have been handed to the chain actor.
+///
+/// This is how a `DataColumnsByRoot` lookup settles on what passed rather than
+/// on what a peer sent: a sidecar with the right root and index can still
+/// carry bad cells or proofs, and a gloas one carries no signature at all.
+/// `done` runs on every path, with a sidecar that was never judged reported as
+/// [`ColumnVerdict::Undecided`]: a lookup left waiting on a verdict that never
+/// comes would keep its columns covered until the lookup goes stale.
+pub(crate) fn check_and_forward_then(
+    server: &P2PServer,
+    sidecars: Vec<DataColumnSidecar>,
+    done: Option<Done>,
+) {
+    let run_done = |done: Option<Done>, verdicts: Vec<(u64, ColumnVerdict)>| {
+        if let Some(done) = done {
+            done(verdicts);
+        }
+    };
+    let blockchain = match server.blockchain.clone() {
+        Some(blockchain) if !sidecars.is_empty() => blockchain,
+        _ => {
+            run_done(done, undecided(&sidecars));
+            return;
+        }
     };
     let store = server.store.clone();
     let permits = server.column_check_permits.clone();
     tokio::spawn(async move {
         let mut checks = Vec::with_capacity(sidecars.len());
-        for sidecar in sidecars {
+        let mut verdicts = Vec::with_capacity(sidecars.len());
+        let mut sidecars = sidecars.into_iter();
+        while let Some(sidecar) = sidecars.next() {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
             let Ok(permit) = permits.clone().acquire_owned().await else {
-                return;
+                verdicts.push((sidecar.index(), ColumnVerdict::Undecided));
+                verdicts.extend(undecided(sidecars.as_slice()));
+                break;
             };
             let store = store.clone();
-            checks.push(tokio::task::spawn_blocking(move || {
+            let index = sidecar.index();
+            let check = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let verdict = column::chain_checks_for(&store, &sidecar, unix_now_ms());
                 (sidecar, verdict)
-            }));
+            });
+            checks.push((index, check));
         }
 
         let mut keep = Vec::new();
         let mut awaiting_parent = Vec::new();
-        for check in checks {
+        for (index, check) in checks {
             // A panic inside the checks (a `Store` read's `.expect()` on a DB
             // error, say) costs that one sidecar, which is what dropping it
             // would have done anyway. Tokio has already caught it.
@@ -67,9 +128,11 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
                 Ok(checked) => checked,
                 Err(err) => {
                     error!(%err, "A data column check panicked; dropping the sidecar");
+                    verdicts.push((index, ColumnVerdict::Undecided));
                     continue;
                 }
             };
+            verdicts.push((index, ColumnVerdict::from(&verdict)));
             match verdict {
                 ChainVerdict::Keep => keep.push(sidecar),
                 ChainVerdict::AwaitParent => awaiting_parent.push(sidecar),
@@ -89,7 +152,16 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
                     |err| warn!(%err, "Failed to forward data column sidecars awaiting a parent"),
                 );
         }
+        run_done(done, verdicts);
     });
+}
+
+/// Every sidecar of `sidecars` as [`ColumnVerdict::Undecided`].
+fn undecided(sidecars: &[DataColumnSidecar]) -> Vec<(u64, ColumnVerdict)> {
+    sidecars
+        .iter()
+        .map(|sidecar| (sidecar.index(), ColumnVerdict::Undecided))
+        .collect()
 }
 
 /// Count a dropped sidecar under its reason.
@@ -106,7 +178,7 @@ fn count_drop(outcome: Outcome) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use ethlambda_network_api::{
@@ -124,13 +196,13 @@ mod tests {
 
     /// What [`check_and_forward`] sent the chain actor.
     #[derive(Debug, PartialEq)]
-    enum Forwarded {
+    pub(crate) enum Forwarded {
         Checked(Vec<DataColumnSidecar>),
         AwaitingParent(Vec<DataColumnSidecar>),
     }
 
     /// A chain actor stand-in that reports every sidecar batch it receives.
-    struct RecordingChain(mpsc::UnboundedSender<Forwarded>);
+    pub(crate) struct RecordingChain(pub(crate) mpsc::UnboundedSender<Forwarded>);
 
     impl P2PToBlockChain for RecordingChain {
         fn new_block(
@@ -256,5 +328,60 @@ mod tests {
         );
         drop(server);
         assert_eq!(received.recv().await, None);
+    }
+
+    /// The completion callback hears every sidecar's verdict: one already
+    /// stored is here, a malformed one is its sender's fault, and one waiting
+    /// on its parent is neither.
+    #[tokio::test]
+    async fn the_callback_reports_what_the_checks_made_of_each_sidecar() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, _received) = mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(RecordingChain(sender)));
+
+        let stored = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 0));
+        server.store.put_data_column(&stored).expect("stored");
+        let mut malformed = valid_shaped_sidecar(5, 1);
+        malformed.kzg_commitments = Default::default();
+        let orphan = valid_shaped_sidecar(5, 2);
+
+        let (verdicts, mut reported) = mpsc::unbounded_channel();
+        let done: Done = Box::new(move |checked| {
+            let _ = verdicts.send(checked);
+        });
+        let sidecars = vec![
+            stored,
+            DataColumnSidecar::Fulu(malformed),
+            DataColumnSidecar::Fulu(orphan),
+        ];
+        check_and_forward_then(&server, sidecars, Some(done));
+
+        assert_eq!(
+            reported.recv().await,
+            Some(vec![
+                (0, ColumnVerdict::Delivered),
+                (1, ColumnVerdict::Rejected),
+                (2, ColumnVerdict::Undecided),
+            ])
+        );
+    }
+
+    /// With no chain actor to check for, the callback still runs, so a lookup
+    /// waiting on it is not left with its columns on the wire.
+    #[tokio::test]
+    async fn the_callback_runs_when_nothing_can_be_checked() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (verdicts, mut reported) = mpsc::unbounded_channel();
+        let done: Done = Box::new(move |checked| {
+            let _ = verdicts.send(checked);
+        });
+
+        let sidecar = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 3));
+        check_and_forward_then(&server, vec![sidecar], Some(done));
+
+        assert_eq!(
+            reported.recv().await,
+            Some(vec![(3, ColumnVerdict::Undecided)])
+        );
     }
 }

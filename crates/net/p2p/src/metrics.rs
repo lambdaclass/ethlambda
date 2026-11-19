@@ -503,8 +503,11 @@ static LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock
 });
 
 /// Count one `DataColumnsByRoot` lookup this node gave up on. `reason` is
-/// `"no_peers"` (nothing connected to ask) or `"max_retries"` (the retry
-/// ladder ran out).
+/// `"no_peers"` (nothing connected to ask), `"max_retries"` (the retry ladder
+/// ran out on columns some connected peer is known to custody) or
+/// `"no_custodian"` (nobody connected was found holding the missing columns:
+/// none is known to custody them, or every peer asked past the tip answered
+/// without them).
 pub fn inc_data_column_fetch_failure(reason: &str) {
     LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
         .with_label_values(&[reason])
