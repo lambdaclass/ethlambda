@@ -598,8 +598,8 @@ spec.
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
-| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
-| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, one sub-batch of at most 16 of one block's sidecars in the chain checks, which for every sub-batch after a block's first is how long it holds its `column_check_permits` permit (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries,peers_exhausted,no_custodian | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
@@ -613,8 +613,12 @@ gossiped one reported `Queue` or `Ignore(Overloaded)`, and a parked one sent
 back once its parent imported. A gossiped sidecar is judged first by the
 gossip rules and counted in
 `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`; the reasons
-here are that counter's reason labels. The chain actor stores what reaches it
-without checking it again.
+here are that counter's reason labels, except `already_seen`, which here
+counts a sidecar repeating a block and column index already in the same call
+(one peer's answer, say), dropped without being judged. `internal` also counts
+the sidecars a panic inside the checks cost, which are dropped (each one
+whose own checks panicked, or a whole group or KZG sub-batch whose task did).
+The chain actor stores what reaches it without checking it again.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two

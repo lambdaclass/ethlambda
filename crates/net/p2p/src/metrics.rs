@@ -408,10 +408,12 @@ static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyL
 
 /// Every reason `beacon::column_checks` can count a sidecar under: the
 /// `Outcome` reason labels `column::chain_checks` drops with, less
-/// `already_stored`, which is a duplicate rather than a rejection. Seeded at
+/// `already_stored`, which is a duplicate rather than a rejection, plus
+/// `already_seen`, a `(block, index)` repeated within one call. Seeded at
 /// zero by [`init`], so a reason this node never fires is still visible on a
 /// dashboard.
 const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
+    "already_seen",
     "malformed",
     "future_slot",
     "finalized",
@@ -435,12 +437,12 @@ static LEAN_DATA_COLUMNS_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
     .unwrap()
 });
 
-/// Count one sidecar the chain checks dropped. `reason` is one of
-/// [`DATA_COLUMN_REJECT_REASONS`].
-pub fn inc_data_column_rejected(reason: &str) {
+/// Count `count` sidecars the chain checks dropped for one reason. `reason` is
+/// one of [`DATA_COLUMN_REJECT_REASONS`].
+pub fn inc_data_column_rejected(reason: &str, count: u64) {
     LEAN_DATA_COLUMNS_REJECTED_TOTAL
         .with_label_values(&[reason])
-        .inc();
+        .inc_by(count);
 }
 
 /// Register the metrics that should be visible before their first
