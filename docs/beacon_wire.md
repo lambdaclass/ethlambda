@@ -749,9 +749,10 @@ from `metadata/3`, requested once per connection right behind `Status`, and is
 seeded from the ENR `cgc` for a peer this node dialed; a peer that has supplied
 neither is not assumed to custody anything, and both paths send whatever no
 known custodian covers to such a peer rather than to one that has said what it
-keeps. The by-root path asks one at a time; only when none is connected does
-it ask a peer of known custody for those columns, once per lookup, since such
-a peer may hold more than it custodies. At mainnet's
+keeps. The by-root path gives as many of those columns as it can to one such
+peer at a time; only a column none of them can be asked for goes to a peer of
+known custody, once per lookup, since such a peer may hold more than it
+custodies. At mainnet's
 `CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so this is the difference
 between a request that can be answered and one that usually cannot.
 
