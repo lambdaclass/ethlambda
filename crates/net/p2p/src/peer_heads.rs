@@ -102,10 +102,12 @@ struct Suspicion {
 const SUSPICION_WINDOWS: u64 = 4;
 
 /// Range failures in a row after which a peer becomes a suspect for the head
-/// it claims (see [`PeerHeads::suspects`]). A cooldown alone runs out, and
-/// with the head moving on by gossip each return of the claim would start
-/// the stall window over: held as a suspect, the claim stays out until the
-/// head passes it, or for [`SUSPICION_WINDOWS`] stall windows.
+/// it claims, or the higher head it was being synced towards (see
+/// [`PeerHeads::suspects`] and [`note_range_failure`]). A cooldown alone
+/// runs out, and with the head moving on by gossip each return of the claim
+/// would start the stall window over: held as a suspect, the claim stays out
+/// until the head passes that head, or for [`SUSPICION_WINDOWS`] stall
+/// windows.
 const SUSPECT_AFTER_FAILURES: u32 = 3;
 
 /// Refresh intervals after which a `Status` request still out is taken as
@@ -701,20 +703,24 @@ pub(crate) fn note_range_failure(server: &mut P2PServer, peer: &PeerId, end_slot
     }
     let wall_slot = crate::wall_clock_slot(&server.store);
     server.peer_heads.note_range_failure(*peer, wall_slot);
-    // Suspected through the head it claims. With that claim gone (expired
-    // while the request was out), through the one the range session planned
-    // towards; out of the session too (it left on a claim dropped
-    // meanwhile), through the last slot of the request it failed.
+    // Suspected through the highest of the head it claims, the head the range
+    // session planned towards for it, and the last slot of the request it
+    // failed. The peer controls its claim: a `Status` lowering it to a head
+    // just above ours (a root this node does not hold) leaves its place in
+    // the session at the old head, and suspicion through the lowered claim
+    // would clear at the next tick. Each of the three may be missing (a claim
+    // expired or dropped while the request was out, a peer that left the
+    // session); the request's last slot never is.
     let session_head = server
         .range_sync_state
         .as_ref()
         .and_then(|state| state.peer_set.get(peer).copied());
     if server.peer_heads.failure_streak(peer) >= SUSPECT_AFTER_FAILURES {
-        let through = server
-            .peer_heads
-            .claimed_head(peer)
-            .or(session_head)
-            .unwrap_or(end_slot);
+        let claimed_head = server.peer_heads.claimed_head(peer);
+        let through = [claimed_head, session_head]
+            .into_iter()
+            .flatten()
+            .fold(end_slot, u64::max);
         server.peer_heads.suspect(*peer, through, wall_slot);
     }
     publish(server);

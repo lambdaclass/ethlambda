@@ -3782,6 +3782,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_that_lowers_its_claim_is_suspected_through_its_session_head() {
+        // Finding: suspicion ran through the peer's current claim first, which
+        // the peer controls. One that joined the session on a high head, then
+        // sent a `Status` with a head just above ours and a root this node
+        // does not hold, kept its place in the session at the high head (that
+        // `Status` syncs towards nothing, so it is never merged), and its
+        // suspicion, through the lowered claim, cleared at the next tick.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let high = lean_status_at(H256::repeat_byte(0x11), 5_000);
+        on_lean_status_request(&mut server, liar, &high).await;
+        fail_range_request(&mut server, &liar, 64);
+        fail_range_request(&mut server, &liar, 64);
+        // Back in the session on its high head, as once its cooldown runs
+        // out, then a claim lowered to slot 1.
+        server.range_sync_state = Some(RangeSyncState::new(1..5_001, liar, 5_000));
+        let lowered = lean_status_at(H256::repeat_byte(0x22), 1);
+        on_lean_status_request(&mut server, liar, &lowered).await;
+        assert_eq!(server.peer_heads.claimed_head(&liar), Some(1));
+        let state = server.range_sync_state.as_ref().expect("still running");
+        assert_eq!(state.peer_set.get(&liar), Some(&5_000));
+        fail_range_request(&mut server, &liar, 64);
+        assert!(server.peer_heads.is_suspect(&liar));
+        // Through the session's head: a head past the claim and past the
+        // failed request does not clear it, one at the session's head does.
+        let wall = crate::wall_clock_slot(&server.store);
+        peer_heads::clear_suspects(&mut server, 64, wall);
+        assert!(server.peer_heads.is_suspect(&liar));
+        peer_heads::clear_suspects(&mut server, 4_999, wall);
+        assert!(server.peer_heads.is_suspect(&liar));
+        peer_heads::clear_suspects(&mut server, 5_000, wall);
+        assert!(!server.peer_heads.is_suspect(&liar));
+    }
+
+    #[tokio::test]
     async fn a_claim_found_held_at_a_publish_takes_its_peer_out_of_the_session() {
         // Finding: a claim whose head was imported after it was counted was
         // dropped at the next publish, but its peer stayed in the range
