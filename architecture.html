@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-9e00b40f.js";
+            window.path_to_searchindex_js = "searchindex-dc0945f1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -411,8 +411,8 @@ the subnet set that both the swarm and the actor need to agree on.</li>
 swarm, spawn <code>P2PServer</code>, and wire the two together with <code>InitP2P</code> and <code>InitBlockChain</code>.</li>
 <li>Spawn the API and metrics servers.</li>
 </ol>
-<p>Shutdown runs in reverse: the first ctrl+c stops both actors and cancels the servers’
-shutdown token, and three more force the process to exit if a graceful stop hangs.</p>
+<p>Shutdown runs in reverse: the first ctrl+c or SIGTERM stops both actors and cancels the servers’
+shutdown token, and three more, of either kind, force the process to exit if a graceful stop hangs.</p>
 <blockquote>
 <p>Note: booting with <code>HIVE_LEAN_TEST_DRIVER=1</code> short-circuits everything from step 2 on and
 exposes only the Hive test-driver endpoints, so a driver run never touches the node key,
