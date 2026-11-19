@@ -665,10 +665,20 @@ pub enum PayloadValidity {
 }
 
 impl PayloadValidity {
-    /// Whether this is [`PayloadValidity::Invalidated`], the one verdict under
-    /// which [`on_block`] runs the transition with an `invalid()` engine.
-    pub fn is_invalidated(&self) -> bool {
-        matches!(self, Self::Invalidated { .. })
+    /// The execution engine [`on_block`]'s state transition consults for a
+    /// block with this verdict, the one place the verdict reaches the
+    /// transition.
+    ///
+    /// The engine's answer is read the way the specification reads it: an
+    /// `INVALIDATED` verdict makes `verify_and_notify_new_payload` return false,
+    /// and everything else makes it return true. It is also what decides
+    /// whether a [`SpeculativeTransition`], computed with `valid()`, may stand
+    /// in for that transition, so the two cannot disagree.
+    pub fn execution_engine(&self) -> stf::ExecutionEngine {
+        match self {
+            Self::Invalidated { .. } => stf::ExecutionEngine::invalid(),
+            Self::NotRequired | Self::Validated | Self::Optimistic => stf::ExecutionEngine::valid(),
+        }
     }
 }
 
@@ -4841,12 +4851,15 @@ pub fn on_block(
 ///
 /// # Why it is the transition `on_block` would run
 ///
-/// `on_block` reads the verdict in one place, to pick the
-/// [`stf::ExecutionEngine`] the transition consults: `invalid()` for
-/// [`PayloadValidity::Invalidated`], `valid()` for every other verdict
-/// (`NotRequired`, `Validated` and `Optimistic` alike). So a transition run
-/// with `valid()` is byte for byte the one `on_block` runs for every verdict
-/// except `Invalidated`, and for that one the speculation is simply not used.
+/// `on_block` reads the verdict in one place,
+/// [`PayloadValidity::execution_engine`], to pick the [`stf::ExecutionEngine`]
+/// the transition consults: `invalid()` for [`PayloadValidity::Invalidated`],
+/// `valid()` for every other verdict (`NotRequired`, `Validated` and
+/// `Optimistic` alike). So a transition run with `valid()` is byte for byte the
+/// one `on_block` runs for every verdict except `Invalidated`, and for that one
+/// the speculation is simply not used. [`Self::stands_in_for`] asks that same
+/// function rather than naming the verdicts again, so a change to which engine
+/// a verdict selects changes which speculations are used along with it.
 ///
 /// The inputs are the same too. [`transition_block`] takes the store by shared
 /// reference and reads two things off it: the epoch-boundary state the
@@ -4866,17 +4879,36 @@ pub fn on_block(
 pub struct SpeculativeTransition {
     block_root: Root,
     parent_root: Root,
+    /// The engine it was computed with, always `valid()`. Kept so
+    /// [`Self::stands_in_for`] compares it with the one `on_block` would pick
+    /// rather than restating which verdicts that is.
+    engine: stf::ExecutionEngine,
     state: BeaconState,
     outcome: Result<()>,
 }
 
 impl SpeculativeTransition {
     /// Whether this was computed for the block with this root and parent root.
-    ///
-    /// [`on_block_speculative`] makes the same comparison before using one; a
-    /// caller asks it first only to tell a mismatch from a use when counting.
     pub fn is_for(&self, block_root: Root, parent_root: Root) -> bool {
         self.block_root == block_root && self.parent_root == parent_root
+    }
+
+    /// Whether this may stand in for the transition [`on_block`] runs for the
+    /// block with this root and parent root under `payload_validity`: computed
+    /// for that block, and with the engine that verdict makes `on_block`
+    /// consult ([`PayloadValidity::execution_engine`]).
+    ///
+    /// [`on_block_speculative`] decides with this, and a caller counting what
+    /// became of a speculation asks the same question, so the count cannot
+    /// call a speculation used that `on_block` dropped.
+    pub fn stands_in_for(
+        &self,
+        block_root: Root,
+        parent_root: Root,
+        payload_validity: &PayloadValidity,
+    ) -> bool {
+        self.is_for(block_root, parent_root)
+            && self.engine.execution_valid == payload_validity.execution_engine().execution_valid
     }
 
     /// Panics unless `fresh`, the transition `on_block` computed itself, agrees
@@ -4998,6 +5030,7 @@ pub fn speculate_transition(
     check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
         .ok()?;
     let active_balances = store.active_balance_cache();
+    let engine = stf::ExecutionEngine::valid();
     let (state, outcome) = transition_block(
         store,
         &parent_state,
@@ -5005,13 +5038,14 @@ pub fn speculate_transition(
         signed_block,
         true,
         config,
-        &stf::ExecutionEngine::valid(),
+        &engine,
         committees,
         &active_balances,
     );
     Some(SpeculativeTransition {
         block_root,
         parent_root,
+        engine,
         state,
         outcome,
     })
@@ -5021,9 +5055,10 @@ pub fn speculate_transition(
 ///
 /// Every check `on_block` makes runs unchanged and in the same order. The only
 /// difference is the one `transition_block` call: when `speculation` was
-/// computed for this block's own root and parent root, and the verdict is not
-/// `Invalidated` (the one verdict the speculation's `valid()` engine would
-/// disagree with), its result stands in for that call. In every other case it
+/// computed for this block's own root and parent root, with the engine this
+/// verdict makes `on_block` consult ([`SpeculativeTransition::stands_in_for`];
+/// today that is every verdict but `Invalidated`), its result stands in for
+/// that call. In every other case it
 /// is dropped and the transition runs here as it always has, so the
 /// invalidation path in particular is the one `on_block` has today.
 ///
@@ -5162,20 +5197,14 @@ pub fn on_block_speculative(
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 
-    // Check the block is valid and compute the post-state. The engine's answer
-    // is read the way the specification reads it: an `INVALIDATED` verdict makes
-    // `verify_and_notify_new_payload` return false, and everything else makes it
-    // return true. Running the transition even when the verdict is already
-    // `Invalidated` is deliberate. It costs a merkleization on a path that
-    // should never run, and it buys the failure arriving from inside
-    // `process_execution_payload`, which is where the specification puts it and
-    // where a reviewer checks this code against it.
-    let engine = match payload_validity {
-        PayloadValidity::Invalidated { .. } => stf::ExecutionEngine::invalid(),
-        PayloadValidity::NotRequired | PayloadValidity::Validated | PayloadValidity::Optimistic => {
-            stf::ExecutionEngine::valid()
-        }
-    };
+    // Check the block is valid and compute the post-state, with the engine the
+    // verdict selects (see `PayloadValidity::execution_engine`). Running the
+    // transition even when the verdict is already `Invalidated` is deliberate.
+    // It costs a merkleization on a path that should never run, and it buys the
+    // failure arriving from inside `process_execution_payload`, which is where
+    // the specification puts it and where a reviewer checks this code against
+    // it.
+    let engine = payload_validity.execution_engine();
     //
     // An epoch-crossing block starts from the precomputed boundary state when
     // one is cached, and from the parent's own post-state otherwise. Both reach
@@ -5188,9 +5217,8 @@ pub fn on_block_speculative(
     // The store's own cache, so every block of this chain shares one entry per
     // epoch; see `ActiveBalanceCacheExt`.
     let active_balances = store.active_balance_cache();
-    let usable = speculation.filter(|speculation| {
-        speculation.is_for(block_root, parent_root) && !payload_validity.is_invalidated()
-    });
+    let usable = speculation
+        .filter(|speculation| speculation.stands_in_for(block_root, parent_root, payload_validity));
     let fresh_transition = || {
         transition_block(
             store,

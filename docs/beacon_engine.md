@@ -131,7 +131,10 @@ keeps it harmless:
 - It stands in for the transition only when it was computed for this block's
   root and parent root and the verdict is not `INVALIDATED`. For `INVALIDATED`
   it is dropped and `on_block` recomputes with `invalid()`, so the invalidation
-  path is the one described above, unchanged.
+  path is the one described above, unchanged. The decision is
+  `SpeculativeTransition::stands_in_for`, which compares the speculation's
+  engine with `PayloadValidity::execution_engine`, the function `on_block` picks
+  its own engine with, and the actor counts `used` with that same call.
 - A block that ends up held (no verdict, or `SYNCING`/`ACCEPTED` for a block
   that is not an optimistic candidate) drops it. The attempt is counted in
   `lean_engine_speculation_total{outcome}`.

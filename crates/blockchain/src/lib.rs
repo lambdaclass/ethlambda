@@ -1956,13 +1956,15 @@ impl BlockChainServer {
                 // run the transition itself with `invalid()`, exactly as
                 // before. A discarded speculation stays in the `stf` row, so
                 // the transition run twice shows as twice.
+                // `stands_in_for` is the question `on_block_speculative`
+                // itself asks, so `used` is counted exactly when it is used.
                 let speculation = speculation.and_then(|speculation| {
-                    let outcome = if !speculation.is_for(block_root, parent_root) {
-                        SpeculationOutcome::DiscardedMismatch
-                    } else if validity.is_invalidated() {
-                        SpeculationOutcome::DiscardedInvalidated
-                    } else {
+                    let outcome = if speculation.stands_in_for(block_root, parent_root, &validity) {
                         SpeculationOutcome::Used
+                    } else if !speculation.is_for(block_root, parent_root) {
+                        SpeculationOutcome::DiscardedMismatch
+                    } else {
+                        SpeculationOutcome::DiscardedInvalidated
                     };
                     timings.record_speculation(outcome);
                     (outcome == SpeculationOutcome::Used).then_some(speculation)
