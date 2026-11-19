@@ -219,6 +219,16 @@ impl StorageWriteBatch for RocksDBWriteBatch {
         Ok(())
     }
 
+    fn put(&mut self, table: Table, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(cf_name(table))
+            .ok_or_else(|| format!("Column family {} not found", cf_name(table)))?;
+        // The batch copies the bytes, so the caller's buffer is never cloned.
+        self.batch.put_cf(&cf, key, value);
+        Ok(())
+    }
+
     fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error> {
         let cf = self
             .db
