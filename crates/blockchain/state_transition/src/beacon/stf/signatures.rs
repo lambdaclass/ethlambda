@@ -25,16 +25,24 @@
 //!
 //! Deferring a signature lets its operation write before the signature is
 //! known to be good, and lets the operations after it run on that write. That
-//! is confined to votes: an attestation's participation flags and the
-//! inclusion reward it pays the proposer, which are what honest votes for the
-//! same data write; the sync aggregate's rewards and penalties, the last step
-//! of a block, so nothing runs after them; and gloas's payload attestations,
-//! which write nothing. Everything else checks its own set, together with
-//! every set still pending, before it writes, through
-//! [`SignatureBatch::verify_pending`]:
+//! is confined to votes, and to one write nothing reads before its check:
 //!
-//! - the RANDAO reveal, so the mix is never fed an unverified reveal (in
-//!   gloas, the builder's bid, pushed just before it, is checked with it);
+//! - an attestation's participation flags and the inclusion reward it pays
+//!   the proposer, which are what honest votes for the same data write;
+//! - the sync aggregate's rewards and penalties, the last step of a block, so
+//!   nothing runs after them;
+//! - gloas's payload attestations, which write nothing;
+//! - gloas's execution payload bid, which records the builder's payment and
+//!   the bid itself before its signature is checked, but is checked right
+//!   after, with the RANDAO reveal, before any operation runs. That holds
+//!   whenever the reveal is verified, which block import always does; only
+//!   block production skips the reveal, for a block it is building itself,
+//!   and then the bid is checked when the block ends.
+//!
+//! Everything else checks its own set, together with every set still pending,
+//! before it writes, through [`SignatureBatch::verify_pending`]:
+//!
+//! - the RANDAO reveal, so the mix is never fed an unverified reveal;
 //! - proposer and attester slashings, voluntary exits and BLS-to-execution
 //!   changes, the operations that change a validator's record.
 //!
@@ -53,7 +61,8 @@
 //! one a block carries. A forged slashing, exit or credential change is caught
 //! at its own operation, before anything after it runs. Finding the bad set
 //! bisects the failed batch rather than re-checking each set on its own (see
-//! [`SignatureBatch::verify_pending`]), so it costs less than the batch did.
+//! [`SignatureBatch::verify_pending`]): about the batch's cost again, where
+//! the re-check cost a full pairing per set.
 //!
 //! # What a late failure names
 //!
@@ -161,7 +170,7 @@ impl SignatureBatch {
     /// for it this costs nothing.
     ///
     /// A failed batch is bisected to find its first failing set (see
-    /// [`first_failing`]), which costs less than the batch did, rather than
+    /// [`first_failing`]), which costs about what the batch did, rather than
     /// re-checking each set on its own, which costs a whole pairing per set on
     /// top of the batch.
     pub(crate) fn verify_pending(&mut self) -> Result<()> {
@@ -195,10 +204,11 @@ fn check(sets: &[SignatureSet], labels: &[&'static str]) -> Result<()> {
     if let Some(first_bad) = first_failing(sets) {
         return verify(false, labels[first_bad]);
     }
-    // A batch of valid sets always passes, so a set should have failed
-    // above. None did, which is a bug in the batch check: the block is
-    // still rejected rather than accepted, but loudly, since a block every
-    // single check accepts is valid and rejecting it can fork this node off.
+    // A batch of valid sets always passes, so the search should have landed
+    // on a set that fails alone. It did not, which is a bug in the batch
+    // check: the block is still rejected rather than accepted, but loudly,
+    // since a block every single check accepts is valid and rejecting it can
+    // fork this node off.
     error!(
         sets = sets.len(),
         "Signature batch failed but the set it was narrowed to verifies on its own; rejecting the block"
@@ -216,9 +226,10 @@ fn check(sets: &[SignatureSet], labels: &[&'static str]) -> Result<()> {
 /// to hold the first failing set, and keeps that half if it fails or the
 /// other if it passes. Each half checked is half the size of the one before,
 /// so together they hold fewer sets than `sets` does, at one final
-/// exponentiation per step: for the ~130 sets of a full pre-electra block,
-/// fewer than 130 Miller loops and 8 final exponentiations, where checking
-/// every set on its own costs 130 of each.
+/// exponentiation per step: about 8 for the ~130 sets of a full pre-electra
+/// block, where checking every set on its own costs 130 pairings (each its
+/// own final exponentiation, and a Miller loop more than the set costs in a
+/// batch, for its signature).
 fn first_failing(sets: &[SignatureSet]) -> Option<usize> {
     if sets.is_empty() {
         return None;
