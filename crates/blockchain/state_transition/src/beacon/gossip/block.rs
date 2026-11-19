@@ -166,19 +166,8 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     if let Err(err) = precheck_block(block, block_root, Reference::Parent(&parent_state), &config) {
         return Outcome::Reject(err.into());
     }
-    // [IGNORE] (gloas) If the parent block is full, the parent payload is
-    // valid (MAY queue). The specification checks this between the signature
-    // and the slot-order rule, but the slot-order and expected-proposer rules
-    // are both inside `precheck_block` here, so a block that fails either is
-    // rejected even with an unverified parent payload. The parent's fullness
-    // is read once: it decodes the parent block, which the bounded validation
-    // pool should not do twice.
-    //
-    // Queued, not ignored: the envelope is usually moments away (held for its
-    // columns, say), and the chain actor holds such a block until it
-    // verifies. Ignored, the block was dropped and came back only when a
-    // child named it, a slot or more later; a proposal in between built on
-    // the grandparent and was orphaned.
+    // The parent's fullness is read once: it decodes the parent block, which
+    // the bounded validation pool should not do twice.
     let parent_full = if gloas_block.is_some() {
         match fork_choice::is_parent_node_full(store, block) {
             Ok(full) => full,
@@ -190,33 +179,56 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     } else {
         true
     };
-    if gloas_block.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
-    {
-        return Outcome::Queue(QueueReason::ParentPayloadUnverified);
-    }
-    // [REJECT] The finalized checkpoint is an ancestor of the block.
-    if let Err(outcome) = finalized_ancestry(store, parent_root).verdict() {
+    // [REJECT] The finalized checkpoint is an ancestor of the block. Only a
+    // conflict is answered here; a walk that could not finish queues after
+    // the gloas rules below.
+    //
+    // The specification checks the gloas parent-payload rule first. Here it
+    // comes after this rule and the bid's two, as it already did after the
+    // slot-order and expected-proposer rules inside `precheck_block`: none of
+    // them reads the parent's payload, and a block that rule queues takes one
+    // of the few places the chain actor holds per parent
+    // (`MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD`), only to fail on import once the
+    // envelope verifies.
+    let ancestry = finalized_ancestry(store, parent_root);
+    if let Err(outcome @ Outcome::Reject(_)) = ancestry.verdict() {
         return outcome;
     }
-    // A gloas block has no payload to time; earlier forks: [REJECT] the
-    // execution payload's timestamp is the slot's.
     if let Some(gloas_block) = gloas_block {
-        // [REJECT] The bid's parent equals the block's parent.
         let bid = &gloas_block
             .message
             .body
             .signed_execution_payload_bid
             .message;
-        if bid.parent_block_root != gloas_block.message.parent_root {
+        // [REJECT] The bid's parent equals the block's parent.
+        if bid.parent_block_root != parent_root {
             return Outcome::Reject(RejectReason::BidParentMismatch);
         }
-        // [REJECT] If the parent is not full, the bid builds on the parent's
-        // execution head. `process_slots` leaves `latest_block_hash` alone,
-        // so the parent's post-state answers for the advanced one.
-        if !parent_full && latest_block_hash(&parent_state) != Some(bid.parent_block_hash) {
+        if parent_full {
+            // [IGNORE] If the parent block is full, the parent payload is
+            // valid (MAY queue).
+            // Queued, not ignored: the envelope is usually moments away
+            // (held for its columns, say), and the chain actor holds such a
+            // block until it verifies. Ignored, the block was dropped and
+            // came back only when a child named it, a slot or more later; a
+            // proposal in between built on the grandparent and was orphaned.
+            if !fork_choice::is_payload_verified(store, parent_root) {
+                return Outcome::Queue(QueueReason::ParentPayloadUnverified);
+            }
+        } else if latest_block_hash(&parent_state) != Some(bid.parent_block_hash) {
+            // [REJECT] If the parent is not full, the bid builds on the
+            // parent's execution head. `process_slots` leaves
+            // `latest_block_hash` alone, so the parent's post-state answers
+            // for the advanced one.
             return Outcome::Reject(RejectReason::BidNotOnParentHead);
         }
-    } else if let Some(timestamp) = block.execution_payload_timestamp()
+    }
+    if let Err(outcome) = ancestry.verdict() {
+        return outcome;
+    }
+    // [REJECT] (before gloas) The execution payload's timestamp is the
+    // slot's. A gloas block has no payload to time, so has no timestamp here.
+    if let Some(timestamp) = block.execution_payload_timestamp()
         && timestamp != compute_timestamp_at_slot(&parent_state, block.slot(), &config)
     {
         return Outcome::Reject(RejectReason::PayloadTimestamp);
@@ -753,8 +765,18 @@ mod tests {
 
     /// A signed gloas block for slot 33, built on the FULL or the EMPTY
     /// payload of a stored slot-32 parent whose post-state is cached but whose
-    /// envelope this store has never verified.
+    /// envelope this store has never verified. The parent has no `LiveChain`
+    /// row, so the finalized-ancestry walk from it cannot finish.
     fn gloas_child_of_unverified_parent(build_on_full: bool) -> (Store, SignedBeaconBlock) {
+        gloas_child_of_unverified_parent_with(build_on_full, |_| {})
+    }
+
+    /// [`gloas_child_of_unverified_parent`], with `mutate` applied to the
+    /// block before it is signed.
+    fn gloas_child_of_unverified_parent_with(
+        build_on_full: bool,
+        mutate: impl FnOnce(&mut gloas::BeaconBlock),
+    ) -> (Store, SignedBeaconBlock) {
         use crate::beacon::gloas_block_production::test_support as production;
         use crate::beacon::primitives::HashTreeRoot;
 
@@ -771,21 +793,20 @@ mod tests {
         // Signed under the domain `precheck_block` checks: the configured fork
         // version for the block's epoch over the parent's genesis validators
         // root, which the fixture state's own `fork` field need not match.
+        let mut message = produced.block;
+        mutate(&mut message);
         let config = store.config();
         let fork_version =
-            config.fork_version(config.fork_at_epoch(compute_epoch_at_slot(produced.block.slot)));
+            config.fork_version(config.fork_at_epoch(compute_epoch_at_slot(message.slot)));
         let domain = compute_domain(
             DOMAIN_BEACON_PROPOSER,
             fork_version,
             parent_state.genesis_validators_root(),
         );
-        let signing_root = compute_signing_root(produced.block.hash_tree_root(), domain);
-        let signature = sign_for(produced.block.proposer_index as usize, signing_root);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let signature = sign_for(message.proposer_index as usize, signing_root);
         store.cache_state(CacheKey::BlockState(parent_root), Arc::new(parent_state));
-        let block = SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
-            message: produced.block,
-            signature,
-        });
+        let block = SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock { message, signature });
         (store, block)
     }
 
@@ -793,6 +814,9 @@ mod tests {
     /// usually moments away, and the chain actor holds the block until it
     /// verifies. An `Ignore` dropped it, and a proposal before a child named
     /// it again built on the grandparent.
+    ///
+    /// The parent's unfinished finalized-ancestry walk does not preempt the
+    /// rule: it queues too, but only after the gloas rules have run.
     #[test]
     fn a_gloas_block_on_an_unverified_full_parent_is_queued() {
         let (store, block) = gloas_child_of_unverified_parent(true);
@@ -803,15 +827,53 @@ mod tests {
     }
 
     /// The rule reads only a FULL parent: one built on the EMPTY branch needs
-    /// no envelope, and goes on to the checks after it. The next one here is
-    /// the finalized-ancestry walk, which queues since the parent was stored
-    /// without a `LiveChain` row.
+    /// no envelope, and goes on to the checks after it. Its bid builds on the
+    /// parent's execution head, and the finalized-ancestry walk then queues,
+    /// since the parent was stored without a `LiveChain` row.
     #[test]
     fn a_gloas_block_on_an_empty_parent_does_not_wait_for_its_envelope() {
         let (store, block) = gloas_child_of_unverified_parent(false);
         assert_eq!(
             stateful_checks(&store, &block, block.message_hash_tree_root()),
             Outcome::Queue(QueueReason::ParentNotReady)
+        );
+    }
+
+    /// The bid's parent rule does not read the parent's payload, so it runs
+    /// before the rule that queues on it: queued, the block would take one of
+    /// the places the chain actor holds per parent, and fail only on import
+    /// once the envelope verified.
+    #[test]
+    fn a_gloas_block_whose_bid_names_another_parent_is_rejected_before_it_could_queue() {
+        let (store, block) = gloas_child_of_unverified_parent_with(true, |block| {
+            block
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_root = Root::repeat_byte(0xab);
+        });
+        assert_eq!(
+            stateful_checks(&store, &block, block.message_hash_tree_root()),
+            Outcome::Reject(RejectReason::BidParentMismatch)
+        );
+    }
+
+    /// The finalized-ancestry rule, for the same reason: a parent whose chain
+    /// passes the finalized slot at another block is rejected even while its
+    /// payload is unverified.
+    #[test]
+    fn a_gloas_block_off_the_finalized_chain_is_rejected_before_it_could_queue() {
+        let (mut store, block) = gloas_child_of_unverified_parent(true);
+        let parent_root = block.parent_root();
+        let (parent_slot, _) = store.block_entry(&parent_root).expect("stored parent");
+        // The parent descends from a block at the finalized slot that is not
+        // the finalized one (`Root::ZERO`, `store_with_config`'s anchor).
+        let fork_base = Root::repeat_byte(0xa0);
+        store.insert_live_chain_entry(parent_slot, parent_root, fork_base);
+        store.insert_live_chain_entry(0, fork_base, Root::ZERO);
+        assert_eq!(
+            stateful_checks(&store, &block, block.message_hash_tree_root()),
+            Outcome::Reject(RejectReason::FinalizedNotAncestor)
         );
     }
 }
