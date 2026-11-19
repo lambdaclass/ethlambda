@@ -49,6 +49,9 @@ pub mod bls;
 /// module), over Keccak-256. Not the XMSS of [`signature`].
 pub mod lean_xmss;
 mod metrics;
+/// A validator's PQ-fork leanXMSS key and VRF tree, derived from its BLS
+/// signing key as the PQ devnet's genesis tooling derives them.
+pub mod pq_keys;
 pub mod signature;
 /// The Beacon Chain PQ fork's proofs of many leanXMSS signatures (the
 /// specification's `stark` module), in its reference concatenation encoding.
