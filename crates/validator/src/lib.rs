@@ -629,6 +629,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // next, so the duties that are near were subscribed an epoch ago,
             // and the proofs are remembered for the aggregation whenever they
             // land.
+            //
+            // At a PQ slot a duty's aggregator role is the node's
+            // `is_aggregator` rather than a BLS selection proof; `subscribe`
+            // reads either.
             if resubscribe {
                 let (beacon_node, store, context) =
                     (beacon_node.clone(), store.clone(), context.clone());
