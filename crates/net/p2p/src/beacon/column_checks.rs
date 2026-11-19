@@ -32,7 +32,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ethlambda_network_api::P2PToBlockChainRef;
 use ethlambda_state_transition::beacon::gossip::column::{
-    self, ChainPrecheck, ChainVerdict, PendingKzg, SignatureMemo,
+    self, ChainPrechecks, ChainVerdict, PendingKzg,
 };
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_storage::Store;
@@ -95,18 +95,17 @@ fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> Vec<Vec<DataColumnSidecar
 fn judge_group(store: &Store, sidecars: Vec<DataColumnSidecar>, now_ms: u64) -> GroupVerdicts {
     let mut verdicts = GroupVerdicts::default();
     let mut pending: Vec<(DataColumnSidecar, PendingKzg)> = Vec::new();
-    // The block's sidecars share a header, so its signature is verified once.
-    let mut memo = SignatureMemo::default();
+    // The block's sidecars share a header (fulu) or a block (gloas), so the
+    // rules that read only that run once.
+    let mut prechecks = ChainPrechecks::new(store, now_ms);
     for sidecar in sidecars {
         // A panic inside the checks (a `Store` read's `.expect()` on a DB
         // error, say) costs that one sidecar, which is what dropping it
         // would have done anyway.
-        let precheck = catch_unwind(AssertUnwindSafe(|| {
-            column::chain_precheck_for_with(store, &sidecar, now_ms, &mut memo)
-        }));
+        let precheck = catch_unwind(AssertUnwindSafe(|| prechecks.check(&sidecar)));
         match precheck {
-            Ok(ChainPrecheck::Settled(verdict)) => verdicts.record(sidecar, verdict),
-            Ok(ChainPrecheck::Pending(kzg)) => pending.push((sidecar, kzg)),
+            Ok(Ok(kzg)) => pending.push((sidecar, kzg)),
+            Ok(Err(verdict)) => verdicts.record(sidecar, verdict),
             Err(_) => error!("A data column check panicked; dropping the sidecar"),
         }
     }
