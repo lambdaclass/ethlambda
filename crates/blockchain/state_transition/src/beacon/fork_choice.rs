@@ -10147,6 +10147,41 @@ mod tests {
         walk.join().unwrap();
     }
 
+    /// A justified block whose `LiveChain` row is gone, which is what
+    /// invalidating it leaves behind, fails the walk on entry with the
+    /// specification's `block_root in store.blocks` assertion: the error
+    /// `update_head_from_fork_choice` logs before keeping the head it has.
+    ///
+    /// The child is what makes the entry check the only possible source of
+    /// that message. With no child the walk would ask the justified block
+    /// itself, as a leaf, whether it is viable, and `get_voting_source`
+    /// asserts the same words; with one, skipping the entry check would reach
+    /// the child and fail its leaf check on a different assertion instead
+    /// (`block_root in store.block_states`, since this store holds no
+    /// states).
+    #[test]
+    fn the_filter_fails_on_entry_when_the_justified_block_is_gone() {
+        let config = Config::active();
+        let justified_root = Root::repeat_byte(1);
+        let child_root = Root::repeat_byte(2);
+        let mut store = store_anchored_at(justified_root);
+        store
+            .insert_signed_block(justified_root, block(0, Root::ZERO))
+            .unwrap();
+        store
+            .insert_signed_block(child_root, block(1, justified_root))
+            .unwrap();
+        store.delete_live_chain_entries(&[(0, justified_root)]);
+
+        let index = store.block_index();
+        assert!(!index.contains_key(&justified_root));
+        assert_eq!(index[&child_root], (1, justified_root));
+        assert_eq!(
+            failed_assertion(get_filtered_block_tree(&store, &index, &config)),
+            Some("block_root in store.blocks"),
+        );
+    }
+
     /// The payload link derived lazily from the blocks is the specification's
     /// parent payload status.
     ///
