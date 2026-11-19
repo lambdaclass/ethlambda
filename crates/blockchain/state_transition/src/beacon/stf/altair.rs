@@ -81,12 +81,19 @@ use std::collections::HashMap;
 /// attester newly earns and totals the proposer's reward for them, then a
 /// write phase that only ever applies what the first phase already decided.
 ///
+/// `proposer_index` is `get_beacon_proposer_index(state)`, which the
+/// specification reads here to pay the including proposer. The caller
+/// supplies it so a block resolves it once for all its attestations rather
+/// than once each; see the attestation loop in
+/// [`crate::beacon::stf::operations::process_operations`].
+///
 /// Takes no [`crate::beacon::config::Config`]: every quantity this needs is either a
 /// [`crate::beacon::constants`] weight or a [`preset`] value, and the specification
 /// lists none of them under a network's "Configuration" table.
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
@@ -254,7 +261,6 @@ pub fn process_attestation(
     const PROPOSER_REWARD_DENOMINATOR: u64 =
         NON_PROPOSER_WEIGHT * constants::WEIGHT_DENOMINATOR / constants::PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / PROPOSER_REWARD_DENOMINATOR;
-    let proposer_index = get_beacon_proposer_index(state)?;
     increase_balance(state, proposer_index, proposer_reward)?;
 
     Ok(())
@@ -615,6 +621,7 @@ mod tests {
             process_attestation(
                 &mut state,
                 &attestation,
+                proposer_index,
                 &CommitteeCache::default(),
                 &ActiveBalanceCache::default(),
                 s,
@@ -654,6 +661,7 @@ mod tests {
             process_attestation(
                 &mut state,
                 &attestation,
+                proposer_index,
                 &CommitteeCache::default(),
                 &ActiveBalanceCache::default(),
                 s,

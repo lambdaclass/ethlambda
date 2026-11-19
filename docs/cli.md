@@ -249,7 +249,7 @@ not chain-specific, branches once, and shares the shutdown:
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
 | spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
-| ctrl-c, stop and join the actors | shared | shared |
+| ctrl-c or SIGTERM, stop and join the actors | shared | shared |
 
 `ChainSetup` is what the `match` produces: the wire configuration, the ENR
 entries that describe it, the store the req/resp handlers answer from, the

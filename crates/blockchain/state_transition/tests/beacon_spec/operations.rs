@@ -131,7 +131,9 @@ use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
 };
-use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
+use ethlambda_state_transition::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index,
+};
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
 use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
@@ -300,55 +302,72 @@ fn run(
             // than swept into one; see `lean_is_not_a_fixture_fork`.
             ForkName::Lean => lean_is_not_a_fixture_fork("block_header"),
         },
+        // Through fulu, `process_attestation` is handed the proposer its
+        // block's `process_operations` resolves once for every attestation.
+        // A case processes a single attestation outside any block, so each
+        // arm looks it up itself, which is the lookup the specification's
+        // own `process_attestation` makes.
         "attestation" => match case.fork {
             // Phase0 defers every attestation's reward to the epoch boundary.
             ForkName::Phase0 => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                operations::process_attestation(
-                    state,
-                    &attestation,
-                    config,
-                    &committees,
-                    signatures,
-                )
+                get_beacon_proposer_index(state).and_then(|proposer| {
+                    operations::process_attestation(
+                        state,
+                        &attestation,
+                        proposer,
+                        config,
+                        &committees,
+                        signatures,
+                    )
+                })
             }
             // Altair scores an attestation immediately instead, and neither
             // bellatrix's nor capella's specification lists a further change,
             // so altair's own function serves both.
             ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                altair_stf::process_attestation(
-                    state,
-                    &attestation,
-                    &committees,
-                    &active_balances,
-                    signatures,
-                )
+                get_beacon_proposer_index(state).and_then(|proposer| {
+                    altair_stf::process_attestation(
+                        state,
+                        &attestation,
+                        proposer,
+                        &committees,
+                        &active_balances,
+                        signatures,
+                    )
+                })
             }
             // Deneb widens the inclusion window and the timely-target
             // condition (EIP-7045); the container is still phase0's.
             ForkName::Deneb => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                deneb_stf::process_attestation(
-                    state,
-                    &attestation,
-                    &committees,
-                    &active_balances,
-                    signatures,
-                )
+                get_beacon_proposer_index(state).and_then(|proposer| {
+                    deneb_stf::process_attestation(
+                        state,
+                        &attestation,
+                        proposer,
+                        &committees,
+                        &active_balances,
+                        signatures,
+                    )
+                })
             }
             // Electra reshapes the container itself (EIP-7549's
             // `committee_bits`), and fulu's specification makes no further
             // change to either the container or the function.
             ForkName::Electra | ForkName::Fulu => {
                 let attestation: electra::Attestation = case.ssz("attestation");
-                electra_stf::process_attestation(
-                    state,
-                    &attestation,
-                    &committees,
-                    &active_balances,
-                    signatures,
-                )
+                get_beacon_proposer_index(state).and_then(|proposer| {
+                    electra_stf::process_attestation(
+                        state,
+                        &attestation,
+                        proposer,
+                        &committees,
+                        &active_balances,
+                        signatures,
+                    )
+                })
             }
             // Gloas reshapes the container a third time (EIP-7688's unbounded
             // `AttestingIndices`) and modifies the function again (the new

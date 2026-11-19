@@ -127,26 +127,53 @@ pub fn process_operations(
     for attester_slashing in attester_slashings {
         process_attester_slashing(state, attester_slashing, config, signatures)?;
     }
-    for attestation in attestations {
-        // Phase0 defers an attestation's reward to the epoch boundary, so it
-        // needs its own version of this step; altair scores one the moment
-        // it is processed instead, and nothing about that changed through
-        // capella, so every later fork this signature serves shares altair's
-        // version rather than getting one of its own. This is the same
-        // coexisting-by-fork pattern `crate::beacon::helpers::altair` and
-        // `crate::beacon::stf::epoch::rewards` already use for the two
-        // `get_base_reward` implementations: neither is renamed, and the call
-        // site picks between them by fully-qualified path.
-        if altair_attestations {
-            crate::beacon::stf::altair::process_attestation(
-                state,
-                attestation,
-                committees,
-                active_balances,
-                signatures,
-            )?;
-        } else {
-            process_attestation(state, attestation, config, committees, signatures)?;
+    // The proposer every attestation below pays (phase0: records), resolved
+    // once for the list where the specification's `process_attestation` reads
+    // `get_beacon_proposer_index(state)` each time. Before fulu that lookup
+    // scans the whole registry for the active set, and a block carries up to
+    // `MAX_ATTESTATIONS` attestations, so one lookup each was most of the
+    // time a mainnet deneb block took to process.
+    //
+    // The loop cannot change the answer. The proposer is drawn from the slot,
+    // an earlier epoch's RANDAO mix, and each validator's activation epoch,
+    // exit epoch and effective balance; an attestation writes participation
+    // flags (phase0: a pending attestation) and the proposer's balance, none
+    // of which is among them.
+    //
+    // An empty list asks nothing, as it did when the lookup was per
+    // attestation.
+    if !attestations.is_empty() {
+        let proposer_index = get_beacon_proposer_index(state)?;
+        for attestation in attestations {
+            // Phase0 defers an attestation's reward to the epoch boundary, so
+            // it needs its own version of this step; altair scores one the
+            // moment it is processed instead, and nothing about that changed
+            // through capella, so every later fork this signature serves
+            // shares altair's version rather than getting one of its own.
+            // This is the same coexisting-by-fork pattern
+            // `crate::beacon::helpers::altair` and
+            // `crate::beacon::stf::epoch::rewards` already use for the two
+            // `get_base_reward` implementations: neither is renamed, and the
+            // call site picks between them by fully-qualified path.
+            if altair_attestations {
+                crate::beacon::stf::altair::process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                    signatures,
+                )?;
+            } else {
+                process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    config,
+                    committees,
+                    signatures,
+                )?;
+            }
         }
     }
     for deposit in deposits {
@@ -347,12 +374,18 @@ pub fn process_attester_slashing(
 /// block is rejected; callers that need the pre-state intact must clone it
 /// first (see [`crate::beacon::stf`]'s module documentation).
 ///
+/// `proposer_index` is `get_beacon_proposer_index(state)`, which the
+/// specification reads here to record who included the attestation. The
+/// caller supplies it so a block resolves it once for all its attestations
+/// rather than once each; see the attestation loop in [`process_operations`].
+///
 /// Takes `config` only for symmetry with the other operation processors
 /// [`process_operations`] dispatches to uniformly; nothing this function
 /// calls needs a runtime configuration value.
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    proposer_index: ValidatorIndex,
     _config: &Config,
     committees: &CommitteeCache,
     signatures: &mut SignatureBatch,
@@ -408,7 +441,7 @@ pub fn process_attestation(
         data,
         aggregation_bits: attestation.aggregation_bits.clone(),
         inclusion_delay: state.slot() - data.slot,
-        proposer_index: get_beacon_proposer_index(state)?,
+        proposer_index,
     };
 
     if data.target.epoch == current_epoch {
