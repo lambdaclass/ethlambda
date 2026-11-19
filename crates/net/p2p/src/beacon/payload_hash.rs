@@ -29,7 +29,7 @@
 use ethlambda_state_transition::beacon::gossip::{Outcome, RejectReason};
 use ethlambda_state_transition::beacon::stf::{electra, gloas as gloas_stf};
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{SignedBeaconBlock, bellatrix, capella, gloas};
+use ethlambda_types::beacon::containers::{SignedBeaconBlock, bellatrix, capella, deneb, gloas};
 use ethlambda_types::beacon::primitives::Root;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
 use ethrex_common::types::{Withdrawal, compute_withdrawals_root};
@@ -83,7 +83,37 @@ struct Fields<'a> {
     amsterdam: Option<(&'a [u8], u64)>,
 }
 
-impl Fields<'_> {
+impl<'a> Fields<'a> {
+    /// The header fields of deneb's payload container, which electra and fulu
+    /// reuse with the requests list as their only addition.
+    fn deneb(
+        payload: &'a deneb::ExecutionPayload,
+        parent_root: Root,
+        requests: Option<Vec<Vec<u8>>>,
+    ) -> Self {
+        Fields {
+            parent_hash: payload.parent_hash.0,
+            fee_recipient: payload.fee_recipient.0,
+            state_root: payload.state_root.0,
+            receipts_root: payload.receipts_root.0,
+            logs_bloom: payload.logs_bloom.as_ref(),
+            prev_randao: payload.prev_randao.0,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data.as_ref(),
+            base_fee_per_gas: payload.base_fee_per_gas.0,
+            claimed_hash: payload.block_hash.0,
+            transactions: payload.transactions.iter().map(|tx| &tx[..]).collect(),
+            withdrawals: Some(payload.withdrawals.as_ref()),
+            blob_gas: Some((payload.blob_gas_used, payload.excess_blob_gas)),
+            parent_beacon_block_root: Some(parent_root.0),
+            requests,
+            amsterdam: None,
+        }
+    }
+
     /// `keccak256(rlp(header))`.
     fn computed_hash(&self) -> [u8; 32] {
         // The trie roots are over opaque bytes: a transaction is already
@@ -115,9 +145,7 @@ impl Fields<'_> {
         });
         // EIP-7928: the header commits to the keccak of the RLP bytes the
         // payload carries, whatever they decode to.
-        let block_access_list_hash = self
-            .amsterdam
-            .map(|(bal, _)| H256(ethrex_crypto_keccak(bal)));
+        let block_access_list_hash = self.amsterdam.map(|(bal, _)| H256(keccak256(bal)));
         let slot_number = self.amsterdam.map(|(_, slot)| slot);
         let base_fee_per_gas = U256::from_little_endian(&self.base_fee_per_gas);
 
@@ -147,7 +175,7 @@ impl Fields<'_> {
             .encode_optional_field(&block_access_list_hash)
             .encode_optional_field(&slot_number)
             .finish();
-        ethrex_crypto_keccak(&buf)
+        keccak256(&buf)
     }
 
     fn verify(&self) -> Result<(), HashMismatch> {
@@ -163,7 +191,7 @@ impl Fields<'_> {
     }
 }
 
-fn ethrex_crypto_keccak(data: &[u8]) -> [u8; 32] {
+fn keccak256(data: &[u8]) -> [u8; 32] {
     ethrex_common::utils::keccak(data).0
 }
 
@@ -230,50 +258,15 @@ pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
             }
             .verify()
         }
-        // Deneb, and electra and fulu on top of it: one payload container,
-        // with the requests list the only addition.
-        SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => {
-            let parent_root = match block {
-                SignedBeaconBlock::Deneb(block) => block.message.parent_root.0,
-                SignedBeaconBlock::Electra(block) | SignedBeaconBlock::Fulu(block) => {
-                    block.message.parent_root.0
-                }
-                _ => unreachable!("narrowed by the outer match"),
-            };
-            let (payload, requests) = match block {
-                SignedBeaconBlock::Deneb(block) => (&block.message.body.execution_payload, None),
-                SignedBeaconBlock::Electra(block) | SignedBeaconBlock::Fulu(block) => (
-                    &block.message.body.execution_payload,
-                    Some(electra::get_execution_requests_list(
-                        &block.message.body.execution_requests,
-                    )),
-                ),
-                _ => unreachable!("narrowed by the outer match"),
-            };
-            Fields {
-                parent_hash: payload.parent_hash.0,
-                fee_recipient: payload.fee_recipient.0,
-                state_root: payload.state_root.0,
-                receipts_root: payload.receipts_root.0,
-                logs_bloom: payload.logs_bloom.as_ref(),
-                prev_randao: payload.prev_randao.0,
-                block_number: payload.block_number,
-                gas_limit: payload.gas_limit,
-                gas_used: payload.gas_used,
-                timestamp: payload.timestamp,
-                extra_data: payload.extra_data.as_ref(),
-                base_fee_per_gas: payload.base_fee_per_gas.0,
-                claimed_hash: payload.block_hash.0,
-                transactions: payload.transactions.iter().map(|tx| &tx[..]).collect(),
-                withdrawals: Some(payload.withdrawals.as_ref()),
-                blob_gas: Some((payload.blob_gas_used, payload.excess_blob_gas)),
-                parent_beacon_block_root: Some(parent_root),
-                requests,
-                amsterdam: None,
-            }
-            .verify()
+        SignedBeaconBlock::Deneb(block) => {
+            let message = &block.message;
+            Fields::deneb(&message.body.execution_payload, message.parent_root, None).verify()
+        }
+        SignedBeaconBlock::Electra(block) | SignedBeaconBlock::Fulu(block) => {
+            let message = &block.message;
+            let requests = electra::get_execution_requests_list(&message.body.execution_requests);
+            let payload = &message.body.execution_payload;
+            Fields::deneb(payload, message.parent_root, Some(requests)).verify()
         }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
