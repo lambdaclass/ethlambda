@@ -560,11 +560,18 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
-        let received_at = id.received_at;
-        if report(self, id, outcome) {
-            object.forward(self, received_at, outcome);
-        }
+        conclude(self, id, outcome, object);
+    }
+}
+
+/// What the actor does with a blocking task's verdict: settle it against the
+/// seen cache, report it to gossipsub, and hand the object on only when the
+/// outcome allows it ([`disposition`]).
+fn conclude(server: &mut P2PServer, id: GossipId, outcome: Outcome, object: Validated) {
+    let outcome = settle(server, outcome, &object);
+    let received_at = id.received_at;
+    if report(server, id, outcome) {
+        object.forward(server, received_at, outcome);
     }
 }
 
@@ -947,6 +954,43 @@ mod tests {
                 BlockAnnouncement::Silent,
                 BlockAnnouncement::Silent
             ]
+        );
+    }
+
+    /// A block whose payload block hash is not its header's ends in
+    /// `Ignore(PayloadBlockHashMismatch)`, which neither relays it nor hands
+    /// it to the chain actor. `Ignore(Overloaded)` is the one ignore that
+    /// still forwards a block, and only from `spawn_stateful_checks`, when no
+    /// permit was free and no check ran.
+    #[tokio::test]
+    async fn a_block_with_a_mismatched_payload_hash_is_not_imported_from_gossip() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain::default());
+        server.blockchain = Some(chain.clone());
+        let id = |byte: u8| GossipId {
+            message_id: MessageId::new(&[byte]),
+            propagation_source: PeerId::random(),
+            received_at: Instant::now(),
+            kind: "beacon_block",
+        };
+        let block = |slot| Validated::Block {
+            block: Box::new(fulu_block(slot, 1)),
+            block_root: Root::repeat_byte(slot as u8),
+        };
+
+        let mismatch = Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch);
+        assert!(matches!(
+            disposition(mismatch),
+            (MessageAcceptance::Ignore, false)
+        ));
+        conclude(&mut server, id(1), mismatch, block(5));
+        assert!(chain.announcements.lock().unwrap().is_empty());
+
+        // The same path does forward an accepted block.
+        conclude(&mut server, id(2), Outcome::Accept, block(6));
+        assert_eq!(
+            *chain.announcements.lock().unwrap(),
+            [BlockAnnouncement::Announce]
         );
     }
 
