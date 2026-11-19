@@ -393,11 +393,12 @@ whose block is not known yet (`block_unknown`), has no post-state yet
 verifies the signature itself, so the envelope is forwarded rather than dropped).
 `beacon_block` answers `queue` for an unknown parent (`parent_unknown`), a
 parent without a cached post-state (`parent_not_ready`), a slot past the parent
-state's lookahead (`shuffling_unavailable`) and, from gloas, a parent built on
-as FULL whose envelope is not verified yet (`parent_payload_unverified`): the
-chain actor holds that block until the envelope verifies. When the execution
-client has found that parent's payload invalid, nothing will verify it, and the
-block is ignored instead (`parent_payload_invalid`). The aggregate, attestation,
+state's lookahead (`shuffling_unavailable`) and, from gloas, a block built on
+its parent's FULL payload before the parent's envelope is verified
+(`parent_payload_unverified`): the chain actor holds that block until the
+envelope verifies. When the execution client has found that parent's payload
+invalid, nothing will verify it, and the block is ignored instead
+(`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
 topics never answer `queue`, since the vote
 block's post-state is either cached or it is not
