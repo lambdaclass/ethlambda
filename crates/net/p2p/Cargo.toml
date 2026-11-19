@@ -83,3 +83,8 @@ libssz-types.workspace = true
 
 sha2 = "0.10"
 hex.workspace = true
+
+[dev-dependencies]
+# `test-utils` for `helpers::test_state`: a test that needs a stored post-state
+# builds one with it.
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }

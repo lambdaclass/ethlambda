@@ -227,11 +227,16 @@ const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 /// `lean_beacon_gossip_validation_seconds` has data from a follower.
 const GOSSIP_VALIDATION_PERMITS: usize = 128;
 
-/// How many data column sidecars may be in the chain checks at once (see
-/// [`beacon::column_checks`]). A separate pool from
+/// How many blocking threads the chain checks of fetched and parked data
+/// column sidecars, and of fetched execution payload envelopes, may occupy at
+/// once (see [`beacon::column_checks`] and [`beacon::envelope_checks`]). A
+/// permit covers one block's column prechecks and first KZG sub-batch, one
+/// further KZG sub-batch of at most 16 columns, or one envelope: not one
+/// sidecar, as it once did, nor all of a block's proofs. A separate pool from
 /// [`GOSSIP_VALIDATION_PERMITS`], so a range batch's hundreds of sidecars
-/// cannot take every permit and leave gossip reporting `Overloaded`. A sidecar
-/// arriving with none free waits for one. Revisit with data, as for gossip.
+/// cannot take every permit and leave gossip reporting `Overloaded`. Work
+/// arriving with none free waits for one, in arrival order. Revisit with data,
+/// as for gossip.
 const COLUMN_CHECK_PERMITS: usize = 16;
 
 /// How many `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}`
