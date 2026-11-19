@@ -1848,18 +1848,19 @@ mod tests {
     }
 
     /// Prints the time of one batch over `k` columns against `k` separate
-    /// calls. Run with `--ignored --nocapture`.
+    /// calls, the fastest of several runs of each so a loaded machine skews
+    /// it less. Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "benchmark: prints timings"]
     fn bench_kzg_batch_against_separate_calls() {
         use std::time::Instant;
         const BLOBS: usize = 9;
-        let all: Vec<u64> = (0..32).collect();
+        let all: Vec<u64> = (0..preset::NUMBER_OF_COLUMNS as u64).collect();
         let items = real_sidecars(BLOBS, &all);
-        for k in [8usize, 32] {
+        for k in [1usize, 2, 4, 8, 16, 32, 64, 128] {
             let subset = &items[..k];
             let (mut batched, mut separate) = (Vec::new(), Vec::new());
-            for _ in 0..5 {
+            for _ in 0..15 {
                 let start = Instant::now();
                 assert!(
                     verdicts_of(subset)
@@ -1873,9 +1874,8 @@ mod tests {
                 }
                 separate.push(start.elapsed());
             }
-            batched.sort();
-            separate.sort();
-            let (b, s) = (batched[2], separate[2]);
+            let b = batched.into_iter().min().expect("measured");
+            let s = separate.into_iter().min().expect("measured");
             println!(
                 "k={k} blobs={BLOBS}: batch {b:?}, separate {s:?}, ratio {:.2}",
                 s.as_secs_f64() / b.as_secs_f64()
