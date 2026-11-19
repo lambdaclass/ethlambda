@@ -311,4 +311,99 @@ mod tests {
             |list| libssz_merkle::HashTreeRoot::hash_tree_root(&list, &Sha2Hasher),
         );
     }
+
+    /// REVIEW-ONLY: the `fold_roots` loop this PR removed, verbatim.
+    fn removed_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
+        for &zero in zeros {
+            let pairs = layer.len().div_ceil(2);
+            for pair in 0..pairs {
+                let left = layer[2 * pair];
+                let right = layer.get(2 * pair + 1).copied().unwrap_or(zero);
+                layer[pair] = hash_nodes(&Sha2Hasher, &left, &right);
+            }
+            layer.truncate(pairs);
+        }
+        layer[0]
+    }
+
+    /// REVIEW-ONLY: the removed loop's shape, on the PR's `compress256` primitive.
+    fn inplace_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
+        for &zero in zeros {
+            let pairs = layer.len().div_ceil(2);
+            for pair in 0..pairs {
+                let left = layer[2 * pair];
+                let right = layer.get(2 * pair + 1).copied().unwrap_or(zero);
+                layer[pair] = hash_pair(&left, &right);
+            }
+            layer.truncate(pairs);
+        }
+        layer[0]
+    }
+
+    /// REVIEW-ONLY: the fold as the PR writes it.
+    fn pr_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
+        for zero in zeros {
+            hash_layer(&mut layer, zero);
+        }
+        layer[0]
+    }
+
+    /// REVIEW-ONLY: the removed loop against the PR's, on the layer shapes the
+    /// tree actually folds (an inner node's child roots, a leaf's chunks).
+    #[test]
+    #[ignore = "timing benchmark"]
+    fn review_shape_bench() {
+        let shapes = [
+            ("inner node, 1 child, 9 levels", 1usize, 9usize),
+            ("inner node, 8 children, 9 levels", 8, 9),
+            ("inner node, 128 children, 9 levels", 128, 9),
+            ("inner node, 512 children, 9 levels", 512, 9),
+            ("validator leaf, 32 roots, 5 levels", 32, 5),
+            ("validator leaf, 17 roots, 5 levels", 17, 5),
+            ("balance leaf, 128 chunks, 7 levels", 128, 7),
+        ];
+        for (name, len, levels) in shapes {
+            let layer = nodes(len as u64 + 3, len);
+            let zeros = &ZERO_HASHES[..levels];
+            assert_eq!(
+                removed_fold(layer.clone(), zeros),
+                pr_fold(layer.clone(), zeros)
+            );
+            assert_eq!(
+                removed_fold(layer.clone(), zeros),
+                inplace_fold(layer.clone(), zeros)
+            );
+            let iters = 200_000 / len.max(4);
+            let (mut old, mut new, mut inplace) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..15 {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let input = std::hint::black_box(layer.clone());
+                    std::hint::black_box(removed_fold(input, zeros));
+                }
+                old.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let input = std::hint::black_box(layer.clone());
+                    std::hint::black_box(pr_fold(input, zeros));
+                }
+                new.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let input = std::hint::black_box(layer.clone());
+                    std::hint::black_box(inplace_fold(input, zeros));
+                }
+                inplace.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            inplace.sort_by(f64::total_cmp);
+            let (old, new, inplace) = (old[7], new[7], inplace[7]);
+            println!(
+                "{name:<38} removed {old:>7.0} ns  pr {new:>7.0} ns  inplace+compress {inplace:>7.0} ns  removed/pr {:.3}  removed/inplace {:.3}",
+                old / new,
+                old / inplace
+            );
+        }
+    }
 }
