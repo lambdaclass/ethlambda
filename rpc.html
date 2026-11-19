@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7f9a9efe.js";
+            window.path_to_searchindex_js = "searchindex-8fcd8f54.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -401,6 +401,9 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing or on an optimistic head</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID, ENR and listen multiaddrs (see below)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/peers</code></td><td>JSON</td><td>Connected peers, filterable by <code>state</code> and <code>direction</code> (see below)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/peers/{peer_id}</code></td><td>JSON</td><td>One connected peer; <code>400</code> for a malformed id, <code>404</code> if it is not connected</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/peer_count</code></td><td>JSON</td><td>Peers per connection state, as quoted integers</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators/{validator_id}</code></td><td>JSON</td><td>One registry entry, by index or pubkey; <code>404</code> if there is none</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for any epoch from the head’s up to one past the wall clock’s</td></tr>
@@ -1134,6 +1137,31 @@ no IP. <code>metadata</code> is the <code>MetaData</code> the node answers peers
 read at request time, so <code>syncnets</code> and <code>seq_number</code> follow the sync committee
 subnets a validator client asks for. That <code>seq_number</code> versions <code>MetaData</code>
 alone: the p2p specification counts it separately from the ENR’s <code>seq</code>.</p>
+<p><code>/eth/v1/node/peers</code>, <code>/eth/v1/node/peers/{peer_id}</code> and
+<code>/eth/v1/node/peer_count</code> read the p2p layer’s table of connected peers at
+request time. Only <strong>connected</strong> peers are tracked: a peer enters the table when
+its first connection is established and leaves when its last one closes, so
+<code>state</code> is always <code>connected</code>. A <code>state</code> filter naming <code>disconnected</code>,
+<code>connecting</code> or <code>disconnecting</code> is valid and returns an empty list, and
+<code>peer_count</code> reports <code>"0"</code> for those states. A <code>state</code> or <code>direction</code> value
+outside the specification’s enum is a <code>400</code>; the parameters may be repeated or
+comma-separated, values of one parameter are alternatives, and the two
+parameters are AND-combined. Empty values (<code>?state=</code>, a trailing comma) are
+skipped rather than refused, so <code>?state=</code> filters nothing. <code>meta.count</code> is the
+length of the filtered list, and peers are ordered by peer id.</p>
+<p><code>direction</code> is that of the peer’s first connection, and <code>last_seen_p2p_address</code>
+is that connection’s remote address, ending in <code>/p2p/&lt;peer id&gt;</code> (appended, or
+put in place of a trailing <code>/p2p</code> naming another peer). It is set when the peer
+connects and not updated by later connections, and for an inbound peer it is
+the remote’s ephemeral source port rather than an address to dial, as in
+Lighthouse. <code>enr</code> is the record discovery supplied for the peer, kept by peer
+id for every peer the dial loop dials, so a peer that also connected to us
+first still carries it; it is <code>null</code> when discovery never supplied one, as for
+a peer that found us first or a bootnode dialed from <code>--bootnodes</code>. No request
+is made to obtain it. A <code>peer_id</code> must decode the way libp2p’s own parser
+accepts it (base58 of a sha2-256 multihash, or of an inlined key of at most 42
+bytes, with nothing left over), or it is a <code>400</code>; a well-formed one that is not
+connected is a <code>404</code>.</p>
 <h3 id="get-ethv1events"><a class="header" href="#get-ethv1events"><code>GET /eth/v1/events</code></a></h3>
 <p>The Beacon API eventstream: the same Server-Sent Events stream as
 <a href="#get-leanv0events"><code>/lean/v0/events</code></a> (topic on the <code>event:</code> line, payload on
