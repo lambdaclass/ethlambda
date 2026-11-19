@@ -872,6 +872,22 @@ mod tests {
         assert_eq!(signed.to_bytes(), signature);
     }
 
+    /// The key ethpandaops' genesis tooling and Lighthouse give validator 0 of
+    /// ethereum-package's default mnemonic: the seed is
+    /// `sha256("leanxmss-seed" || sk)` of its EIP-2333 signing key
+    /// (`m/12381/3600/0/0/0`), and the public key is the first 32 bytes of
+    /// ethereum-package's `static_files/xmss-keys/e383db4eb96b6f02.bin`.
+    #[test]
+    fn ethereum_package_validator_zero() {
+        let seed: Seed =
+            hex_bytes("6d78e7072bfcbde1a75261f6e16772ea352de90462819cdc53e05f10d4700ad1")
+                .try_into()
+                .unwrap();
+        let expected =
+            hex_bytes("d7792e263b94cf0b7a9f70d8374c6d34a600b4247057d4079f810caff711c632");
+        assert_eq!(key_gen(&seed).public_key().to_bytes().to_vec(), expected);
+    }
+
     #[test]
     fn range_keys_sign_in_range() {
         let message: Message = std::array::from_fn(|i| (i * 3 + 7) as u8);
