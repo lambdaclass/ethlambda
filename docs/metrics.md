@@ -611,7 +611,7 @@ spec.
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
 | `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
 | `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, one sub-batch of at most 16 of one block's sidecars in the chain checks, which for every sub-batch after a block's first is how long it holds its `column_check_permits` permit (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
-| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
+| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries,peers_exhausted,no_custodian | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
@@ -636,10 +636,15 @@ availability gate, and a healthy node returns it to zero within a slot or two
 of a hold: fetch or gossip should complete well inside the retry ladder
 `lean_data_column_fetch_failures_total` counts down. A gauge that sits above
 zero for several slots means either the fetch is failing — check whether
-`lean_data_column_fetch_failures_total`'s `no_peers` or `max_retries` reason
-is climbing — or no reachable peer actually serves the missing columns; short
-of that, only finality passing the held block's slot clears it, which can be
-minutes away.
+`lean_data_column_fetch_failures_total`'s `no_peers`, `max_retries` or
+`peers_exhausted` reason is climbing (the last: every connected peer failed a
+request or sent an invalid sidecar in one lookup) — or no reachable peer
+actually serves the missing columns, which
+the `no_custodian` reason counts: a lookup that ends without finding anyone
+connected holding the missing columns, because none is known to custody them
+or every peer asked after the block's slot answered without them.
+Short of that, only finality passing the held block's slot clears it, which
+can be minutes away.
 
 **Read `lean_sidecars_awaiting_parent` beside it.** A sidecar whose block's
 parent has no post-state yet is parked rather than dropped, and a held block is

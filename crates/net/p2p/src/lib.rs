@@ -106,7 +106,7 @@ use crate::{
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
         fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
-        handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
+        handlers::{ColumnReport, columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
 };
@@ -167,6 +167,12 @@ const BACKOFF_MULTIPLIER: u64 = 2;
 /// backoffs sum to a few seconds, plus each attempt's round trips) and shorter
 /// than a mainnet slot, so a re-drive arriving on the next tick finds either a
 /// live lookup or no entry at all.
+///
+/// Shorter than the request-response timeout (libp2p's default 10 s), so a
+/// replaced lookup's requests can still report back after the new one has
+/// started. Each request carries its lookup's id
+/// ([`PendingRequestKind::Columns`]), so such a report delivers its columns
+/// but settles nothing of the new lookup's.
 const STALE_COLUMN_LOOKUP: Duration = Duration::from_secs(8);
 
 /// How many peers of unknown custody one `DataColumnsByRange` prefetch may
@@ -362,26 +368,80 @@ pub(crate) struct PendingRequest {
 
 /// A block-root fetch's counterpart for a column lookup: the same
 /// attempt/failed-peer bookkeeping [`PendingRequest`] carries, plus what
-/// [`PendingRequest`] never needed to. `columns` is the request body a retry
-/// resends, since (unlike a block-root fetch, whose body is the root already
-/// keying this map) a column request also names which columns.
+/// [`PendingRequest`] never needed to, since (unlike a block-root fetch, whose
+/// body is the root already keying this map) a column request also names
+/// which columns, and one lookup is split across several peers.
 pub(crate) struct PendingColumnRequest {
+    /// The columns still missing: asked and not yet answered, or waiting to be
+    /// asked. A column leaves once a sidecar for it has passed the checks, or
+    /// once the store has it when a retry is about to ask.
     pub(crate) columns: Vec<u64>,
+    /// This lookup's own id, which each of its requests carries
+    /// ([`PendingRequestKind::Columns`]). A request from a lookup this one
+    /// replaced (see [`STALE_COLUMN_LOOKUP`]) can still report back, and must
+    /// not settle this one's requests or spend its attempts.
+    pub(crate) lookup: u64,
+    /// Rounds spent on a request that left out a column it was asked for. A
+    /// request that delivered everything it asked for spends nothing.
     pub(crate) attempts: u32,
+    /// Peers not asked again in this lookup: a request to them failed, or
+    /// they sent a sidecar the checks refused. A peer that answered without a
+    /// column is not here: at the tip it may simply not have it yet.
     pub(crate) failed_peers: HashSet<PeerId>,
-    /// Requests sent for this root and not yet answered or failed.
+    /// `(peer, column)` pairs asked in this lookup that did not deliver. While
+    /// the block is at the tip a retry prefers another peer for that column
+    /// and comes back to this one only when there is none; past the tip it
+    /// does not come back (see `plan_column_requests`).
+    pub(crate) missed: HashSet<(PeerId, u64)>,
+    /// Whether this lookup has asked a peer for columns outside its known
+    /// custody, which it does once at most (see `plan_column_requests`).
+    pub(crate) asked_beyond_custody: bool,
+    /// The columns on the wire, each with the peer asked for it.
     ///
-    /// One attempt now fans out across the peers that custody the columns, so
-    /// a single lookup can have several requests open at once. Without this
-    /// count each of their failures would schedule its own retry, and each
-    /// retry would fan out again: one unanswered lookup against eight
-    /// custodians becomes eight retries, then sixty-four. A retry is scheduled
-    /// only when the last outstanding request of the round reports back, so an
-    /// attempt still costs exactly one retry however wide it was.
-    pub(crate) in_flight: usize,
+    /// One lookup fans out across the peers that custody its columns, so it
+    /// can have several requests open at once, and they ask disjoint sets: a
+    /// column is asked again only once the request that asked for it has
+    /// reported back. That is what lets a request's leftover be asked at once
+    /// without waiting for its siblings, and why their failures cannot
+    /// multiply into one fan-out each: a retry asks only what is not on the
+    /// wire. A request is "on the wire" until its answer has been through the
+    /// checks, so a column being verified is not asked again meanwhile.
+    pub(crate) asked: HashMap<u64, PeerId>,
+    /// A retry is scheduled. Whatever another request leaves out meanwhile
+    /// rides on it rather than spending an attempt of its own.
+    pub(crate) retry_due: bool,
     /// When this lookup last put requests on the wire, for
     /// [`STALE_COLUMN_LOOKUP`] to measure against.
     pub(crate) last_asked: Instant,
+    /// The block's slot, the other half of the store's column key, read once
+    /// when a retry first checks the store.
+    pub(crate) slot: Option<u64>,
+}
+
+impl PendingColumnRequest {
+    pub(crate) fn new(columns: Vec<u64>, lookup: u64) -> Self {
+        Self {
+            columns,
+            lookup,
+            attempts: 1,
+            failed_peers: HashSet::new(),
+            missed: HashSet::new(),
+            asked_beyond_custody: false,
+            asked: HashMap::new(),
+            retry_due: false,
+            last_asked: Instant::now(),
+            slot: None,
+        }
+    }
+
+    /// The columns still missing that no open request asks for.
+    pub(crate) fn unasked(&self) -> Vec<u64> {
+        self.columns
+            .iter()
+            .copied()
+            .filter(|column| !self.asked.contains_key(column))
+            .collect()
+    }
 }
 
 pub(crate) enum PendingRequestKind {
@@ -390,13 +450,19 @@ pub(crate) enum PendingRequestKind {
         start_slot: u64,
         end_slot: u64,
     },
-    /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
-    /// the root and the columns this one request asked its peer for: the
-    /// attempts and failed-peer set live in `pending_column_requests`, keyed
-    /// by the root, but one lookup fans out across peers with a subset each and
-    /// retires its entry on the first answer, so what a later answer may
-    /// contain has to travel with the request itself.
-    Columns(H256, Vec<u64>),
+    /// A `DataColumnsByRoot` request of one lookup for this block's missing
+    /// columns. The lookup's bookkeeping lives in `pending_column_requests`,
+    /// keyed by the root, but one lookup fans out across peers with a subset
+    /// each, and an answer is judged against its own request's subset
+    /// (whether its peer left anything out), so the subset travels with the
+    /// request. So does the lookup's id: a lookup can be replaced while its
+    /// requests are still open, and their reports must not be taken for the
+    /// new one's.
+    Columns {
+        block_root: H256,
+        columns: Vec<u64>,
+        lookup: u64,
+    },
     /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
     /// slots the matching `BlocksByRange` asked for.
     ///
@@ -1396,7 +1462,9 @@ pub struct P2PServer {
     /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
-    /// `handle_column_fetch_failure` is the only place an entry is retired.
+    /// `retire_column_lookup` is the only place an entry is retired, once its
+    /// columns have all arrived, its ladder has run out, or nobody is left to
+    /// ask (`fetch_missing_columns` also drops a stale one to replace it).
     pub(crate) pending_column_requests: HashMap<H256, PendingColumnRequest>,
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
@@ -1601,7 +1669,11 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
-    fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    fn retry_data_column_fetch(&self, block_root: H256, lookup: u64) -> Result<(), ActorError>;
+    /// A `DataColumnsByRoot` answer has been through the chain checks: settle
+    /// its lookup on what passed.
+    #[allow(dead_code)] // sent by the column checks' completion callback
+    fn column_answer_checked(&self, report: ColumnReport) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -1680,21 +1752,16 @@ impl P2PServer {
         msg: p2p_protocol::RetryDataColumnFetch,
         _ctx: &Context<Self>,
     ) {
-        let block_root = msg.block_root;
-        // Same "might have completed during backoff" guard as
-        // `handle_retry_block_fetch`, and the same reason for it: the reissued
-        // request must ask for what is still missing, which
-        // `pending_column_requests` is the only place that remembers.
-        let Some(pending) = self.pending_column_requests.get(&block_root) else {
-            trace!(%block_root, "Data column fetch completed during backoff, skipping retry");
-            return;
-        };
-        let columns = pending.columns.clone();
+        req_resp::handlers::retry_column_lookup(self, msg.block_root, msg.lookup).await;
+    }
 
-        if !fetch_data_columns_from_peer(self, block_root, columns).await {
-            tracing::error!(%block_root, "Failed to retry data column fetch, giving up");
-            self.pending_column_requests.remove(&block_root);
-        }
+    #[send_handler]
+    async fn handle_column_answer_checked(
+        &mut self,
+        msg: p2p_protocol::ColumnAnswerChecked,
+        ctx: &Context<Self>,
+    ) {
+        req_resp::handlers::settle_column_request(self, msg.report, ctx);
     }
 
     #[send_handler]
@@ -1974,14 +2041,12 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
     // in flight with a wider column set than the first ask named, as
     // columns trickle in, and dropping the difference would rest on an
     // unenforced invariant that a re-ask is always a subset of what is
-    // already pending. A column added this way misses the request
-    // already on the wire, which cannot be widened after it was sent;
-    // it rides the next event for this root instead — a retry of this
-    // lookup, which resends whatever `columns` now holds, or, once this
-    // lookup resolves and the entry is gone, a fresh `FetchRequest`
-    // from a caller that rechecks what is still missing.
+    // already pending. The requests already on the wire cannot be widened
+    // after they were sent, so whatever none of them covers is asked for at
+    // once, in a request of its own, unless a retry is already due to ask
+    // for it. A column one of them does cover is left to that request.
     //
-    // "In flight" has to mean it, though: an entry whose round never
+    // "In flight" has to mean it, though: an entry whose requests never
     // reported back would otherwise deduplicate this root against a lookup
     // that will never ask anything again. Past `STALE_COLUMN_LOOKUP` the
     // entry is dropped and this ask starts a lookup of its own.
@@ -1992,6 +2057,9 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
                     trace!(%block_root, column, "Merging a new column into an in-flight data column fetch");
                     pending.columns.push(column);
                 }
+            }
+            if !pending.retry_due {
+                req_resp::handlers::ask_unasked_columns(server, block_root).await;
             }
             return;
         }
@@ -4435,5 +4503,63 @@ mod tests {
             !blocks_by_range.is_connected(&peer),
             "a request/response field still holds the connection the limits refused"
         );
+    }
+
+    /// A beacon server with a custodian of column 1 and a peer that has said
+    /// nothing about its custody.
+    async fn column_server() -> (P2PServer, PeerId, PeerId) {
+        let mut server = test_support::unconnected_beacon_server(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            0,
+        )
+        .await;
+        let holder = random_peer();
+        let silent = random_peer();
+        for peer in [holder, silent] {
+            server
+                .connected_peers
+                .insert(peer, ConnectionDirection::Inbound);
+        }
+        server.peer_custody.insert(holder, vec![1]);
+        (server, holder, silent)
+    }
+
+    #[tokio::test]
+    async fn a_re_ask_that_merges_a_column_asks_for_it_at_once() {
+        // It used to be left for the lookup's next retry, which a hung
+        // request could hold back for its whole timeout.
+        let (mut server, holder, silent) = column_server().await;
+        let root = H256::repeat_byte(0x61);
+
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+        let lookup = server.pending_column_requests[&root].lookup;
+        fetch_missing_columns(&mut server, root, vec![1, 2]).await;
+
+        let pending = &server.pending_column_requests[&root];
+        assert_eq!(pending.lookup, lookup, "merged, not replaced");
+        assert_eq!(pending.asked, HashMap::from([(1, holder), (2, silent)]));
+        assert_eq!(server.outbound_requests.len(), 2, "1 is not asked twice");
+    }
+
+    #[tokio::test]
+    async fn a_re_ask_replaces_a_lookup_that_stopped_asking() {
+        let (mut server, _, _) = column_server().await;
+        let root = H256::repeat_byte(0x62);
+
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+        let pending = server
+            .pending_column_requests
+            .get_mut(&root)
+            .expect("a lookup");
+        let stale = pending.lookup;
+        pending.last_asked = Instant::now()
+            .checked_sub(STALE_COLUMN_LOOKUP + Duration::from_secs(1))
+            .expect("the clock is past the stale window");
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+
+        // A new id, so the stale lookup's requests, still open, settle nothing
+        // of this one's.
+        assert_ne!(server.pending_column_requests[&root].lookup, stale);
+        assert_eq!(server.outbound_requests.len(), 2);
     }
 }
