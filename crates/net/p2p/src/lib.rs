@@ -38,7 +38,8 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    ConnectedPeer, FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    PeerDirection, PeerTableController,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1159,6 +1160,9 @@ pub struct P2P {
     /// The beacon `MetaData` this node answers peers with, for the same
     /// endpoint. `None` on a lean wire, which has no `MetaData`.
     local_metadata: Option<MetaDataController>,
+    /// The peers this node is connected to, for the Beacon API's
+    /// `/eth/v1/node/peers`.
+    peer_table: PeerTableController,
 }
 
 impl P2P {
@@ -1217,6 +1221,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
+        let peer_table = PeerTableController::default();
 
         let server = P2PServer {
             swarm_handle,
@@ -1224,6 +1229,7 @@ impl P2P {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: peer_table.clone(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
@@ -1308,6 +1314,7 @@ impl P2P {
             handle,
             local_enr,
             local_metadata,
+            peer_table,
         })
     }
 
@@ -1327,6 +1334,12 @@ impl P2P {
     /// updated whenever it changes. `None` on a lean wire.
     pub fn local_metadata(&self) -> Option<MetaDataController> {
         self.local_metadata.clone()
+    }
+
+    /// A live view of the peers this node is connected to. Written only by
+    /// the P2P actor.
+    pub fn peer_table(&self) -> PeerTableController {
+        self.peer_table.clone()
     }
 }
 
@@ -1356,6 +1369,9 @@ pub struct P2PServer {
     /// direction is the first connection's, which is the one that decides
     /// whether this peer was our choice or the network's.
     pub(crate) connected_peers: HashMap<PeerId, ConnectionDirection>,
+    /// [`Self::connected_peers`] plus what the Beacon API reports about each
+    /// peer, shared with the RPC layer. This actor is its only writer.
+    pub(crate) peer_table: PeerTableController,
     /// The columns each peer custodies, as computed from its own node id and
     /// its advertised custody group count.
     ///
@@ -1506,6 +1522,44 @@ impl P2PServer {
         }
         metrics::set_peers_by_direction(inbound, outbound);
         self.refresh_custody_column_metrics();
+    }
+
+    /// Record a peer's first connection, in [`Self::connected_peers`] and in
+    /// the table the Beacon API reads. The two are written only here and in
+    /// [`Self::remove_connected_peer`], so they cannot drift apart.
+    ///
+    /// `remote` is the address of the connection that made the peer connected,
+    /// normalized by [`peer_p2p_address`] to end in `/p2p/<peer id>`. For an
+    /// inbound peer that is the remote's ephemeral source port, not a dialable
+    /// address, as in Lighthouse; it is not updated when later connections
+    /// open. The ENR is whatever the dial loop kept from discovery for this
+    /// peer id, whichever side opened the first connection, so it is absent
+    /// only when discovery never supplied one: a peer that found us first, or
+    /// a bootnode dialed from `--bootnodes`.
+    fn add_connected_peer(
+        &mut self,
+        peer_id: PeerId,
+        direction: ConnectionDirection,
+        remote: &Multiaddr,
+    ) {
+        self.connected_peers.insert(peer_id, direction);
+        self.peer_table.insert(ConnectedPeer {
+            peer_id: peer_id.to_string(),
+            direction: direction.into(),
+            last_seen_p2p_address: peer_p2p_address(remote, peer_id).to_string(),
+            enr: self
+                .discovery
+                .as_ref()
+                .and_then(|discovery| discovery.enr_of(&peer_id)),
+        });
+    }
+
+    /// Drop a peer whose last connection closed, from [`Self::connected_peers`]
+    /// and the Beacon API's table together. Returns the direction it was
+    /// counted under, if it was connected.
+    fn remove_connected_peer(&mut self, peer_id: &PeerId) -> Option<ConnectionDirection> {
+        self.peer_table.remove(&peer_id.to_string());
+        self.connected_peers.remove(peer_id)
     }
 
     /// Publish, per column this node samples, how many connected peers are
@@ -1975,7 +2029,7 @@ async fn handle_swarm_event(
             let transport = transport_label(endpoint.get_remote_address());
             metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
-                server.connected_peers.insert(peer_id, direction);
+                server.add_connected_peer(peer_id, direction, endpoint.get_remote_address());
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
@@ -2073,8 +2127,7 @@ async fn handle_swarm_event(
                 // counters drift apart, and those counters are exactly what a
                 // "peers held" figure gets derived from.
                 let direction = server
-                    .connected_peers
-                    .remove(&peer_id)
+                    .remove_connected_peer(&peer_id)
                     .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
                 server.refresh_peer_metrics();
@@ -2562,6 +2615,37 @@ pub enum ConnectionDirection {
     Outbound,
 }
 
+/// `remote` ending in `/p2p/<peer_id>`, the form the Beacon API's
+/// `last_seen_p2p_address` takes.
+///
+/// Only the last component counts: an address can name another peer earlier
+/// on (a relay, in `/p2p/<relay>/p2p-circuit`), so a `/p2p` somewhere in it
+/// does not mean it already names this one. A trailing `/p2p` naming a
+/// different peer is replaced, since the address is reported as this peer's.
+fn peer_p2p_address(remote: &Multiaddr, peer_id: PeerId) -> Multiaddr {
+    let mut address = remote.clone();
+    let tail = address.iter().last();
+    let names_this_peer = matches!(tail, Some(Protocol::P2p(id)) if id == peer_id);
+    let names_another = matches!(tail, Some(Protocol::P2p(_)));
+    if names_this_peer {
+        return address;
+    }
+    if names_another {
+        address.pop();
+    }
+    address.push(Protocol::P2p(peer_id));
+    address
+}
+
+impl From<ConnectionDirection> for PeerDirection {
+    fn from(direction: ConnectionDirection) -> Self {
+        match direction {
+            ConnectionDirection::Inbound => Self::Inbound,
+            ConnectionDirection::Outbound => Self::Outbound,
+        }
+    }
+}
+
 impl ConnectionDirection {
     /// The label this direction carries in metrics and logs.
     ///
@@ -3040,6 +3124,7 @@ pub(crate) mod test_support {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: ethlambda_network_api::PeerTableController::default(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
@@ -3155,6 +3240,74 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    #[test]
+    fn a_peer_address_ends_in_that_peers_own_p2p_component() {
+        let peer = random_peer();
+        let other = random_peer();
+        let suffixed = |base: &str| format!("{base}/p2p/{peer}");
+
+        // A bare transport address gets the peer's id appended.
+        let tcp: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+        assert_eq!(
+            peer_p2p_address(&tcp, peer).to_string(),
+            suffixed("/ip4/10.0.0.1/tcp/9000")
+        );
+
+        // One that already ends in it is left alone.
+        let named: Multiaddr = suffixed("/ip4/10.0.0.1/tcp/9000").parse().unwrap();
+        assert_eq!(peer_p2p_address(&named, peer), named);
+
+        // A relayed address names the relay earlier on; the peer still goes on
+        // the end.
+        let relayed = format!("/ip4/10.0.0.2/tcp/9000/p2p/{other}/p2p-circuit");
+        let relayed_addr: Multiaddr = relayed.parse().unwrap();
+        assert_eq!(
+            peer_p2p_address(&relayed_addr, peer).to_string(),
+            suffixed(&relayed)
+        );
+
+        // A trailing id naming someone else is replaced, not kept.
+        let wrong: Multiaddr = format!("/ip4/10.0.0.1/tcp/9000/p2p/{other}")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            peer_p2p_address(&wrong, peer).to_string(),
+            suffixed("/ip4/10.0.0.1/tcp/9000")
+        );
+    }
+
+    /// `connected_peers` and the Beacon API's peer table are written together,
+    /// on a peer's first connection and when its last one closes, so the table
+    /// never holds a peer that is gone.
+    #[tokio::test]
+    async fn the_peer_table_follows_a_peer_from_first_connection_to_last() {
+        let config = ethlambda_types::beacon::config::Config::mainnet();
+        let mut server = test_support::unconnected_beacon_server(config, 0).await;
+        let peer = random_peer();
+        let remote: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+
+        server.add_connected_peer(peer, ConnectionDirection::Inbound, &remote);
+        let entry = server
+            .peer_table
+            .get(&peer.to_string())
+            .expect("published on the first connection");
+        assert_eq!(entry.direction, PeerDirection::Inbound);
+        assert_eq!(
+            entry.last_seen_p2p_address,
+            format!("/ip4/10.0.0.1/tcp/9000/p2p/{peer}")
+        );
+        assert!(entry.enr.is_none(), "discovery supplied no record");
+        assert_eq!(server.peer_table.len(), server.connected_peers.len());
+
+        assert_eq!(
+            server.remove_connected_peer(&peer),
+            Some(ConnectionDirection::Inbound)
+        );
+        assert!(server.peer_table.get(&peer.to_string()).is_none());
+        assert!(server.connected_peers.is_empty());
+        assert_eq!(server.peer_table.len(), 0);
     }
 
     /// Zero backbone subnets (a lean node, or a beacon node that backbones
