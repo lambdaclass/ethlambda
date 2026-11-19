@@ -106,10 +106,19 @@ and `valid()` for `NOT_REQUIRED`, `VALID` and optimistic alike, and the
 transition reads nothing else off the store except content-keyed caches. What
 keeps it harmless:
 
-- The result is a local value (`SpeculativeTransition`). Nothing reaches the
-  store, a cache that is not content-addressed, or the network until
-  `on_block_speculative` accepts it, and that runs every check `on_block` makes,
-  unchanged and in the same order.
+- The result is a local value (`SpeculativeTransition`). The block, its
+  post-state and its fork choice records reach neither the store nor the network
+  until `on_block_speculative` accepts it, and that runs every check `on_block`
+  makes, unchanged and in the same order. The one write computing it can make is
+  an epoch-crossing block's boundary balances, a cache entry keyed by the
+  checkpoint and built from the parent's state alone, so it is the entry
+  `on_block`'s own transition would write and is right whatever becomes of the
+  block.
+- The argument above rests on the actor handling one message at a time, which
+  no type enforces. Builds with debug assertions (the test suite's
+  `release-fast` among them) therefore run the transition again whenever a
+  speculation is used and panic unless both agree on the outcome and the
+  post-state root.
 - It stands in for the transition only when it was computed for this block's
   root and parent root and the verdict is not `INVALIDATED`. For `INVALIDATED`
   it is dropped and `on_block` recomputes with `invalid()`, so the invalidation
@@ -117,8 +126,15 @@ keeps it harmless:
 - A block that ends up held (no verdict, or `SYNCING`/`ACCEPTED` for a block
   that is not an optimistic candidate) drops it. The attempt is counted in
   `lean_engine_speculation_total{outcome}`.
-- A panicked or cancelled request task is treated as no verdict, like an
-  exhausted retry ladder.
+- A panicked or cancelled request task holds the block too, since there is no
+  verdict, but it is a fault in this node rather than in the execution client:
+  it is logged as an error and is not counted in `lean_engine_no_verdict_total`.
+- The request task is aborted if the import is dropped before the answer is
+  read, so an abandoned import never leaves a request running out its retry
+  ladder.
+- Reading the parent's state for the speculation never panics the actor: a
+  storage error there skips the speculation, and `on_block` meets the same error
+  on its own lookup.
 
 The overlap shows in the import timing tree: the transition that ran during the
 round trip is reported under `stf` (used or discarded), and `engine` reports only

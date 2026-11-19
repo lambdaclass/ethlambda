@@ -107,6 +107,37 @@ pub struct VerifyTimings {
     pub crypto_end: Option<Instant>,
 }
 
+/// What became of the state transition a beacon import computed while the
+/// execution client's verdict was in flight (see
+/// [`ImportTimings::stf_speculative_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculationOutcome {
+    /// Handed to `fork_choice::on_block_speculative` with a verdict that lets it
+    /// stand in for the transition. A block that then fails one of `on_block`'s
+    /// earlier checks still counts, since the work was spent either way.
+    Used,
+    /// The verdict was `INVALIDATED`, so `on_block` runs its own transition
+    /// with an `invalid()` engine.
+    DiscardedInvalidated,
+    /// The block was held without importing: no verdict, or a `SYNCING` or
+    /// `ACCEPTED` answer for a block that is not an optimistic candidate.
+    DiscardedHeld,
+    /// Computed for another root or parent. Not expected from the actor.
+    DiscardedMismatch,
+}
+
+impl SpeculationOutcome {
+    /// The `outcome` label of `lean_engine_speculation_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Used => "used",
+            Self::DiscardedInvalidated => "discarded_invalidated",
+            Self::DiscardedHeld => "discarded_held",
+            Self::DiscardedMismatch => "discarded_mismatch",
+        }
+    }
+}
+
 /// Every boundary one block crosses on its way to a post-state.
 ///
 /// Carried alongside the block itself: through the actor mailbox in
@@ -222,6 +253,11 @@ pub struct ImportTimings {
     /// block with no payload to ask about.
     pub stf_speculative_start: Option<Instant>,
     pub stf_speculative_end: Option<Instant>,
+    /// Beacon: what became of that speculative transition, set by
+    /// [`Self::record_speculation`]. Not a mark, like [`Self::source`]: it
+    /// travels with them so the import's log line can say whether its `stf`
+    /// row holds a transition that was discarded and run again.
+    pub speculation: Option<SpeculationOutcome>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
     /// background writer, which waits while the writer's queue is full. It
@@ -258,6 +294,13 @@ pub struct ImportTimings {
 }
 
 impl ImportTimings {
+    /// Records what became of this pass's speculative transition, here and in
+    /// `lean_engine_speculation_total`, so the two cannot disagree.
+    pub fn record_speculation(&mut self, outcome: SpeculationOutcome) {
+        self.speculation = Some(outcome);
+        metrics::inc_engine_speculation(outcome.label());
+    }
+
     /// The `source` label this block reports under, or `None` for a block
     /// that is not reported at all.
     ///
@@ -602,6 +645,7 @@ impl BlockImportReport {
             slot_offset_ms = self.slot_offset_ms,
             bottleneck = self.bottleneck(),
             da_complete_on_arrival = self.timings.da_complete_on_arrival,
+            speculation = self.timings.speculation.map(SpeculationOutcome::label),
             "Block import timing"
         );
         for line in lines {
