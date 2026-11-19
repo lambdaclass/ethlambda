@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51bd3ad2.js";
+            window.path_to_searchindex_js = "searchindex-ca6bbeb5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -4801,6 +4801,54 @@ carry. Roots are serialized as <code>0x</code>-prefixed hex strings on both.</p>
 </table>
 </div>
 <p>If <code>--api-port</code> and <code>--metrics-port</code> are equal, all routers are merged onto a single port.</p>
+<h3 id="what-the-servers-trust"><a class="header" href="#what-the-servers-trust">What the servers trust</a></h3>
+<p>Neither server authenticates its callers. Anyone who can open a connection to
+<code>--api-port</code> or <code>--metrics-port</code> is treated as this node’s operator and its
+validator client, which is why <code>--http-address</code> defaults to <code>127.0.0.1</code>. Bind
+it anywhere else only behind something that decides who may call, such as a
+firewall rule or an authenticating reverse proxy, and never expose it to the
+internet.</p>
+<p><strong>What the node checks for itself.</strong> Nothing it gossips on a caller’s behalf
+is taken on the caller’s word. A published block’s proposer signature and KZG
+proofs, an envelope’s signature and KZG proofs, attestations, aggregates, sync
+committee messages and contributions, slashings, exits, BLS changes, and
+gloas’s payload attestations, builder bids and signed proposer preferences are
+all checked against the chain, signatures included, before they reach the
+network; a failed check is a <code>400</code>. A caller can only make this node publish
+what passes these checks. They are not every gossip rule, so peers may still
+ignore a message that passed them, such as a duplicate or one outside gossip’s
+timing windows.</p>
+<p><strong>What it takes on the caller’s word.</strong> These carry no signature to check, or
+one the node does not check:</p>
+<ul>
+<li><strong>Where a validator’s execution rewards go.</strong>
+<code>POST /eth/v1/validator/prepare_beacon_proposer</code> sets the fee recipient of
+any validator index, and <code>POST /eth/v1/validator/register_validator</code> sets it
+for the key of any active or pending validator, for the blocks this node
+builds. A builder registration is signed, but the node does not verify the
+signature (neither does Lighthouse). It sets the fee recipient first, then
+forwards the registration to <code>--builder</code>, which does verify it; the fee
+recipient stays set whatever the builder answers, and with no <code>--builder</code> at
+all. The last call wins, so a caller can redirect a validator’s rewards from
+locally built blocks for as long as it keeps calling: the validator client’s
+own call, normally once an epoch, restores the address only until the
+caller’s next one.</li>
+<li><strong>Which subnets the node joins.</strong>
+<code>POST /eth/v1/validator/beacon_committee_subscriptions</code> and
+<code>/eth/v1/validator/sync_committee_subscriptions</code> join gossip subnets on
+request, which costs bandwidth and CPU until the slot or epoch the caller
+named. A sync committee subscription is capped at the end of the next sync
+committee period; an attestation subnet’s is not capped.</li>
+<li><strong>When the node builds a block.</strong> Every
+<code>GET /eth/v3/validator/blocks/{slot}</code> and
+<code>POST /eth/v4/validator/blocks/{slot}</code> request has the execution client
+build a payload.</li>
+<li><strong>On a lean node, who aggregates.</strong> <code>POST /lean/v0/admin/aggregator</code> switches
+the aggregator role on or off.</li>
+<li><strong>On the metrics server, heap profiles.</strong> <code>/debug/pprof/allocs</code> and its
+flamegraph take a jemalloc heap profile on request. A default Linux build
+has profiling on from startup; other platforms answer <code>501</code>.</li>
+</ul>
 <h2 id="api-server-5052"><a class="header" href="#api-server-5052">API Server (<code>:5052</code>)</a></h2>
 <div class="table-wrapper">
 <table>
