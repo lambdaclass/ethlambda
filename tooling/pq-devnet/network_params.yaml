@@ -1,0 +1,21 @@
+# A PQ-at-genesis devnet: Lighthouse (pq) proposes and validates, the ethlambda
+# beacon node follows. See README.md.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    cl_image: ethdreamer/lighthouse:pq
+    vc_image: ethdreamer/lighthouse:pq
+    validator_count: 64
+    supernode: true
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ethlambda:pq-local
+    validator_count: 0
+    cl_log_level: info
+network_params:
+  preset: mainnet
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+additional_services:
+  - dora

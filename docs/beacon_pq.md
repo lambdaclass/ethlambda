@@ -17,10 +17,14 @@ against a quantum adversary. It comes as two feature forks after gloas:
    preregistrations (EIP-8205).
 
 Both are `ForkName`s (`Eip8483`, `Pq`), between `Gloas` and `Lean`, on-disk
-selectors 8 and 9. Neither is scheduled on any network, and the node does not
-follow either (`ForkName::is_followed`): the state transition and fork choice
-implement them, and so does PQ's gossip validation (see [Gossip](#gossip)),
-whose accepted messages are relayed and consumed by nothing.
+selectors 8 and 9. Neither is scheduled on a public network. **The node
+follows PQ** (`ForkName::is_followed`): it imports PQ blocks and envelopes
+from gossip and req/resp, applies PQ aggregates and payload attestations to
+fork choice, and asks its execution client about PQ payloads. It was run
+next to Lighthouse's PQ client on a PQ-at-genesis devnet
+([`tooling/pq-devnet`](../tooling/pq-devnet/README.md)). It does not follow
+EIP-8483 yet: see [What remains](#what-remains). It does not produce PQ blocks
+or run PQ validator duties.
 
 Each builds on the fork before it, like every other fork. EIP-8483 is gloas
 plus its two requests and PQ is EIP-8483 with BLS replaced, so a rule gated
@@ -44,17 +48,19 @@ changes.
 | Layer | Where | Status |
 | --- | --- | --- |
 | leanXMSS sign/verify | `ethlambda_crypto::lean_xmss` | KAT-pinned against consensus-specs and leanVM |
-| Reference STARK | `ethlambda_crypto::stark` | the specification's concatenation encoding |
+| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs through a `leanvm-sidecar` with `--pq-prover-socket` (see [Proofs](#proofs)) |
 | Containers | `ethlambda_types::beacon::containers::{eip8483, pq}` | SSZ round trips, gaps per the spec; the maximal aggregate, attester slashing and bid encode to `pq.yaml`'s size bounds |
 | Fork upgrades | `upgrade::{upgrade_to_eip8483, upgrade_to_pq}` | unit-tested |
 | Block processing | `stf::{eip8483, pq}` | unit-tested with real XMSS keys |
 | Epoch processing | `stf::epoch::pq` | unit-tested |
-| Fork choice | `fork_choice` (`Attestation::Pq`, `AttesterSlashing::Pq`, `on_pq_payload_attestation_message`, no `notify_ptc_messages` for PQ blocks) | compiles, untested; no `on_execution_payload_envelope` for the EIP-8483 or PQ envelope types |
-| Envelope verification | `stf::pq::verify_execution_payload_envelope_signature` | the signature only; gloas's `verify_execution_payload_envelope` takes gloas's envelope type |
+| Fork choice | `fork_choice` (`Attestation::Pq`, `AttesterSlashing::Pq`, `on_pq_payload_attestation_message`, no `notify_ptc_messages` for PQ blocks, `on_execution_payload_envelope` over any fork's envelope) | run on the devnet; no unit tests of its own |
+| Envelopes | `containers::SignedExecutionPayloadEnvelope` (gloas, EIP-8483, PQ), `stf::gloas::verify_execution_payload_envelope` | each fork's signature and requests root; storage, req/resp, gossip, the chain actor and the engine take the fork-tagged envelope |
 | Spec-fixture runners | `tests/beacon_spec` | wired, but no fixtures exist yet |
-| PQ gossip | `gossip::pq`, `ethlambda_p2p::beacon::pq` | every reshaped topic's rules, XMSS signatures and STARK proofs unit-tested with real keys; accepted messages are relayed, consumed by nothing |
+| PQ gossip | `gossip::pq`, `ethlambda_p2p::beacon::pq` | every reshaped topic's rules, XMSS signatures and STARK proofs unit-tested with real keys; an accepted aggregate's vote, a payload attestation and an envelope reach the chain actor, every Lighthouse message on the devnet was accepted |
+| Engine | `beacon_engine::gloas_new_payload_request` | each fork's typed requests list to `engine_newPayloadV5`, `engine_forkchoiceUpdatedV4` for a PQ head |
+| Genesis | `genesis_anchor_block` | the body carries the state's bid from gloas on, as the specification's genesis helper and ethpandaops' generator build it |
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
-| Req/resp, Beacon API, validator client | | refuse both forks |
+| Beacon API, validator client, block production | | refuse PQ's signed containers |
 
 ## Gossip
 
@@ -118,10 +124,32 @@ Full key generation takes about a second and a half in `release-fast` across
 cores, so both full-key tests run in `make test`. `range_key` builds a key real
 over a few leaves only, for tests.
 
-`ethlambda_crypto::stark` is the specification's reference stand-in for a
-recursive STARK: a proof is the signatures concatenated in statement order,
-and verification checks each, plus the exact length. It is capped by
-`MAX_STARK_PROOF_SIZE` (1 MiB), about 436 signatures per block.
+### Proofs
+
+`ethlambda_crypto::stark` proves, merges and verifies the fork's attestation
+proofs through one of two backends, chosen once per process:
+
+- **Reference** (the default): the specification's stand-in for a recursive
+  STARK. A proof is the signatures concatenated in statement order, and
+  verification checks each, plus the exact length. It is capped by
+  `MAX_STARK_PROOF_SIZE` (1 MiB), about 436 signatures per block. The
+  specification's fixtures use it.
+- **Sidecar** (`--pq-prover-socket`, `stark::install_sidecar`): real leanVM
+  proofs, made and checked by a `leanvm-sidecar` process over a Unix socket,
+  through leanVM's own client crate at `283686575c` (`sidecar::LEANVM_REV`),
+  the revision Lighthouse's PQ branch pins. A statement list maps to leanVM
+  claims as Lighthouse maps it: the sorted, deduplicated
+  `(public key, message)` pairs, the empty proof for no claims, and merges
+  folded sixteen children at a time. `bin/ethlambda/pq/ethlambda-pq` starts a
+  sidecar and passes its socket.
+
+The encodings are not interchangeable, so every node of a network must use
+the same backend; the PQ devnet's Lighthouse accepts only the sidecar. A
+leanVM proof does not attest the leaf a signature was made at, so the sidecar
+backend checks that each key signed the message at *some* leaf
+(`docs/spec_deviations.md`). Lighthouse's blocks replay through ethlambda's
+state transition with every proof verified this way, state root for state
+root.
 
 ### Leaves
 
@@ -239,19 +267,16 @@ generated.
 
 - Generate and run the fixtures above, and add the PQ containers to the
   `ssz_static` runner.
-- Consumers for accepted PQ gossip: fork choice's aggregates and payload
-  attestations, the operation and attestation pools, the event stream. Today
-  they are relayed only.
-- EIP-8483's gossip: its blocks and envelopes are their own containers (its
-  attestations, aggregates and slashings already decode and validate as
-  gloas's), and its execution request limits.
+- The operation and attestation pools and the event stream for PQ gossip:
+  only fork choice takes it today.
+- Following EIP-8483 (`ForkName::is_followed` is false for it): its block's
+  cheap gossip rules, its `execution_payload` topic's decode and rules (its
+  envelope is its own container), its fetched envelopes' checks, and its
+  execution request limits. The envelope, engine and storage paths already
+  take its envelope.
 - The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
   `DiscoveryServer` cannot replace the served record at runtime (the same gap
   as its `eth2` entry, see `CLAUDE.md`).
-- Envelopes of the EIP-8483 and PQ shapes: `verify_execution_payload_envelope`
-  and fork choice's `on_execution_payload_envelope` over them, the chain
-  actor's envelope pipeline, and an engine API path for their execution
-  requests.
 - Block production and the validator client (XMSS keys, VRF trees, leaf
   bookkeeping, STARK proof merging).
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ

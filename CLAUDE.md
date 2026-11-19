@@ -299,8 +299,12 @@ actual_slot = finalized_slot + 1 + relative_index
   Keccak-256 (`ethlambda_crypto::lean_xmss`, 32-byte keys, 2404-byte
   signatures, a port of leanVM `4af2cddd`'s Rust implementation pinned by
   consensus-specs' and leanVM's known answers), and proves many signatures at
-  once with the specification's reference STARK (`ethlambda_crypto::stark`, the
-  signatures concatenated). Never pass one scheme's key to the other
+  once through `ethlambda_crypto::stark`: the specification's reference (the
+  signatures concatenated) by default, or real leanVM proofs from a
+  `leanvm-sidecar` process (`--pq-prover-socket`, leanVM `283686575c`, the
+  revision Lighthouse's PQ branch pins), which is what the PQ devnet runs.
+  The two encodings do not verify each other's proofs. Never pass one
+  scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
   (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
   constants in `common/crypto/src/signature.rs`
@@ -871,9 +875,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
   and PQ's gossip rules (`gossip/pq.rs`, `p2p/src/beacon/pq.rs`: a PQ digest's
-  reshaped topics decode by the digest, are judged with XMSS signatures and
-  STARK proofs, and relayed, never consumed), and refused everywhere else
-  (`ForkName::is_followed` is false for both). The
+  reshaped topics decode by the digest and are judged with XMSS signatures
+  and STARK proofs). **The node follows PQ** (`ForkName::is_followed`): PQ
+  blocks and envelopes import from gossip and req/resp, accepted PQ
+  aggregates and payload attestations reach fork choice, and envelopes of
+  every fork travel as the fork-tagged `containers::SignedExecutionPayloadEnvelope`
+  (storage decodes one by its slot's fork, req/resp by the chunk's context
+  bytes, the engine gets each fork's typed requests list). It was run next to
+  Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`).
+  EIP-8483 is not followed yet, and PQ block production, the Beacon API's PQ
+  containers and the validator client's PQ duties are not implemented. The
   gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
   (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
   and the PQ registry holds each XMSS key in its 48-byte request form so the
