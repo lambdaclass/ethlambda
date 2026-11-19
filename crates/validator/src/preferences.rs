@@ -58,8 +58,11 @@
 //! A node keeps the preferences it accepted in memory only, so one that
 //! restarts has lost them, and gossip does not give them back. Every kept
 //! preference whose slot is still ahead is therefore sent again, as signed,
-//! once an epoch, as the duty loop re-sends `prepare_beacon_proposer`, which a
-//! restart loses too. The round runs at the poll of an epoch's second-to-last
+//! once an epoch. `prepare_beacon_proposer`, which a restart loses too, is
+//! re-sent every slot instead (see the duty loop's `Preparations`): that is
+//! one request for every validator, where the kept preferences are one
+//! request each (see "One preference per request" below). The round runs at
+//! the poll of an epoch's second-to-last
 //! slot, or at the next poll after it when that one was skipped behind a slow
 //! node, and re-sends each kept preference whose slot has not started once
 //! the poll's duties are in. Normally that is the epoch's last slot and every

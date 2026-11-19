@@ -323,9 +323,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             "Block pays its execution-layer rewards to an address this client did not ask for; \
              signing it anyway, since refusing would also forfeit the consensus reward and cost \
              the network a slot. Check this beacon node's proposer preparation. A fee recipient \
-             changed through the keymanager API reaches the node at the next epoch boundary; \
-             from gloas, a proposer preference published before the change (by this process \
-             before a restart, say) keeps the old address until the next dependent root."
+             changed through the keymanager API reaches the node after the duties of the slot \
+             it was changed in, and one deleted to no address at all never does; from gloas, \
+             a proposer preference published before the change (by this process before a \
+             restart, say) keeps the old address until the next dependent root."
         );
         crate::metrics::inc_fee_recipient_mismatches();
     }

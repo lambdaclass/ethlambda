@@ -615,6 +615,14 @@ entry and leaves the local key, and its per-validator settings, as they are.
 Its answer is `error` too, naming `/eth/v1/keystores`, and never `deleted`:
 the key is still signing here until that route removes it.
 
+A deleted key's fee recipient is no longer sent to the beacon node, from the
+next slot on. The node keeps the address it was last given for that validator
+until it expires the entry or restarts, so a client the key moved to on the
+same node prepares it with its own address without this one overwriting it.
+An imported key's fee recipient is first sent at the next epoch boundary, when
+its index is resolved, which is also when its proposer duties are first
+fetched.
+
 It also serves `POST /eth/v1/validator/{pubkey}/voluntary_exit`, which signs a
 voluntary exit for a validator this client holds, in a local keystore or in a
 remote signer, and answers with the `SignedVoluntaryExit`, for the exit's
@@ -630,7 +638,7 @@ give one validator its own value in place of the command line's default:
 
 | Setting | Default | Takes effect |
 |---|---|---|
-| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next builder registration carries it too, usually at the next slot (later while the epoch's full registration send is still running) and again every slot until a node accepts it or the epoch's full send carries it, and an ethlambda beacon node takes it from there. A `DELETE` that leaves a validator with no address at all (no `--suggested-fee-recipient` either) sends no registration, so the builder keeps paying the address it was last given. From gloas, the proposer preferences carry it, from the next dependent root on |
+| `feerecipient` | `--suggested-fee-recipient` | Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot's duties. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next builder registration carries it too, usually at the next slot (later while the epoch's full registration send is still running) and again every slot until a node accepts it or the epoch's full send carries it, and an ethlambda beacon node takes it from there. A `DELETE` that leaves a validator with no address at all (no `--suggested-fee-recipient` either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on |
 | `graffiti` | `--graffiti` | The next proposal |
 | `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 

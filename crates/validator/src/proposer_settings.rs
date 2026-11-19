@@ -24,10 +24,12 @@
 //!
 //! Graffiti and gas limit are read when they are used: the next proposal
 //! carries the new value. A fee recipient reaches the beacon node through
-//! `prepare_beacon_proposer`, which the duty loop sends once per epoch, so a
-//! change is registered at the next epoch boundary. A block proposed before
-//! then pays the address the node was last told, which the check before
-//! signing reports as a mismatch.
+//! `prepare_beacon_proposer`, which the duty loop sends again once every
+//! slot's duties are done, so a change is registered within a slot. A block
+//! proposed before then pays the address the node was last told, which the
+//! check before signing reports as a mismatch. A `DELETE` that leaves a
+//! validator no address at all sends nothing for it, so the node keeps the
+//! old one until it expires it or restarts.
 //!
 //! From gloas a node pays the address in the proposer preferences it holds for
 //! the slot instead, and gas limit likewise, and a preference cannot be

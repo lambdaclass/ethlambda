@@ -840,5 +840,6 @@ signature, whichever way the node answered. Three departures:
   and gossip does not replay them, so a node that restarts would otherwise
   self-build without them, and ignore builders' bids, until the next dependent
   root. `prepare_beacon_proposer`, which a restart loses too, is re-sent every
-  slot instead: it is one small request, where a preference is a signature per
-  proposal.
+  slot instead: it is one request for every validator, where the kept
+  preferences are one request each, since a node answers a call carrying
+  several with one status for all of them.
