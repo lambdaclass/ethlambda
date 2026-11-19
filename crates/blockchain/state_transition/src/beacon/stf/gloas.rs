@@ -1428,8 +1428,9 @@ pub fn process_attestation(
         } else {
             previous_participation
         };
-        // `attesting_indices` is sorted ascending, so the reader walks each leaf
-        // once rather than descending the tree for every attester.
+        // `is_valid_indexed_attestation` above refused any `attesting_indices`
+        // that is not strictly ascending, so the reader walks each leaf once
+        // rather than descending the tree for every attester.
         let mut reader = epoch_participation.sorted_reader();
         for index in attesting_indices {
             let current_flags =
@@ -1503,12 +1504,12 @@ pub fn process_attestation(
         let mut participation_mut = state.epoch_participation_mut(current_epoch_target)?;
         let participation_len = participation_mut.len();
         // A blind write of `current_flags | new_flags`, which the read phase
-        // stored, rather than `|=` on the stored value. That is exact: the
-        // attesting indices are distinct (members of disjoint committees, and the
-        // signature set built above refuses a repeated index), so each index is
-        // written once, and nothing writes this list between the read phase and
-        // here, so the stored value is still `current_flags`. It saves the tree
-        // descent `get_mut` makes to copy the old value into the write buffer.
+        // stored, rather than `|=` on the stored value. That is exact:
+        // `is_valid_indexed_attestation` above refused a repeated index, so
+        // each index is written once, and nothing writes this list between the
+        // read phase and here, so the stored value is still `current_flags`. It
+        // saves the tree descent `get_mut` makes to copy the old value into the
+        // write buffer.
         for (index, flags) in flag_updates {
             if !participation_mut.set(index as usize, flags) {
                 return Err(Error::IndexOutOfBounds {
