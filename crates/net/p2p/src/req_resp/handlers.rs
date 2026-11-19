@@ -2007,6 +2007,10 @@ enum Retirement {
     /// or every one asked past the tip answered without it), or the ladder
     /// ran out on columns no connected peer is known to custody.
     NobodyToAsk,
+    /// Nothing is on the wire, and every connected peer has been written off
+    /// in this lookup (a failed request or a refused sidecar), so whether one
+    /// of them holds what is missing was never learned.
+    PeersExhausted,
     /// Nothing is on the wire, and nothing is connected at all.
     NoPeers,
 }
@@ -2042,6 +2046,17 @@ fn retire_column_lookup(server: &mut P2PServer, block_root: H256, why: Retiremen
                 "No connected peer is left to ask for these columns; leaving them to the next re-ask"
             );
             metrics::inc_data_column_fetch_failure("no_custodian");
+        }
+        // The old lookup cleared its written-off peers and asked them all
+        // again; the next re-ask's fresh lookup does that now, a slot later.
+        Retirement::PeersExhausted => {
+            let missing = pending.columns;
+            debug!(
+                %block_root,
+                ?missing,
+                "Every connected peer failed this lookup; leaving its columns to the next re-ask"
+            );
+            metrics::inc_data_column_fetch_failure("peers_exhausted");
         }
         // Counted as `no_peers` where the send found nobody connected.
         Retirement::NoPeers => {
@@ -2091,8 +2106,19 @@ pub(crate) async fn ask_unasked_columns(server: &mut P2PServer, block_root: H256
         .get(&block_root)
         .is_some_and(|pending| !pending.asked.is_empty());
     if !sent && !open {
+        let all_failed = server
+            .pending_column_requests
+            .get(&block_root)
+            .is_some_and(|pending| {
+                server
+                    .connected_peers
+                    .keys()
+                    .all(|peer| pending.failed_peers.contains(peer))
+            });
         let why = if server.connected_peers.is_empty() {
             Retirement::NoPeers
+        } else if all_failed {
+            Retirement::PeersExhausted
         } else {
             Retirement::NobodyToAsk
         };
@@ -4036,6 +4062,23 @@ pub(crate) mod tests {
             server.pending_column_requests[&root].asked,
             HashMap::from([(2, silent)])
         );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_every_peer_failed_ends_as_peers_exhausted() {
+        // Not "nobody holds the columns": nobody was left to say.
+        let custodian = PeerId::random();
+        let mut server = beacon_server_with(&[(custodian, Some(vec![1]))]).await;
+        let root = H256::repeat_byte(0x5A);
+        let mut pending = column_lookup(vec![1], &[]);
+        pending.failed_peers.insert(custodian);
+        server.pending_column_requests.insert(root, pending);
+        let before = metrics::data_column_fetch_failures_total("peers_exhausted");
+
+        ask_unasked_columns(&mut server, root).await;
+
+        assert!(server.pending_column_requests.is_empty());
+        assert!(metrics::data_column_fetch_failures_total("peers_exhausted") > before);
     }
 
     /// An empty fulu block at `slot`.
