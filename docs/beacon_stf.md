@@ -349,6 +349,16 @@ ingest the whole registry; a caller with no store holds an
 asking state, and an index found by a fallback scan is recorded, so a key the
 table cannot confirm costs one scan rather than one per block.
 
+The proposer lookup had the same shape as `get_total_active_balance` before its
+cache. Before fulu, `get_beacon_proposer_index` scans the whole registry to
+build the active-index `Vec`, and the specification's `process_attestation`
+calls it once per attestation to pay (phase0: record) the proposer, up to
+`MAX_ATTESTATIONS` times a block. Each fork's `process_operations` now resolves
+it once before its attestation loop and hands it to `process_attestation`;
+nothing an attestation writes is an input to it. In a `replay-era` run over
+mainnet era 1422 (deneb blocks) that took a block from about 1.7 s to about
+0.3 s. The header, RANDAO and sync-aggregate steps still look it up once each.
+
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
 through `helpers::participation`. One walk of `iter_validators()`, zipped with
 the flat participation slices, produces each validator's flags, its effective
