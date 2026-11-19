@@ -33,6 +33,7 @@ pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod operations;
 pub(crate) mod pool;
+pub(crate) mod pq_aggregation;
 pub(crate) mod pq_proposal;
 pub(crate) mod proposal;
 pub(crate) mod proposer_preferences;

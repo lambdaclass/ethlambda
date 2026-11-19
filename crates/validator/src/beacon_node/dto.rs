@@ -212,6 +212,11 @@ pub struct AttesterDutyDto {
     pub validator_committee_index: u64,
     #[serde(with = "quoted_u64")]
     pub slot: Slot,
+    /// At a PQ slot, whether the node counts the validator on its committee's
+    /// aggregation committee, which is what makes a PQ aggregator; absent
+    /// before PQ, where aggregators select themselves with a BLS proof.
+    #[serde(default)]
+    pub is_aggregator: Option<bool>,
 }
 
 /// One proposer duty, from `GET /eth/v1/validator/duties/proposer/{epoch}`.

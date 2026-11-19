@@ -56,8 +56,14 @@ pub async fn subscribe<B: BeaconNodeApi>(
         duties
             .iter()
             .map(|duty| {
-                let is_aggregator = match selection_for(context, &store, duty) {
-                    Ok(selection) => selection.is_some(),
+                // At a PQ slot the node names the aggregators (the
+                // aggregation committee); there is no selection proof.
+                let pq_aggregator = duty.is_aggregator;
+                let is_aggregator = match pq_aggregator.map_or_else(
+                    || selection_for(context, &store, duty).map(|proof| proof.is_some()),
+                    Ok,
+                ) {
+                    Ok(selected) => selected,
                     Err(err) => {
                         warn!(
                             slot = duty.slot,
@@ -160,6 +166,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 7,
             slot,
+            is_aggregator: None,
         }
     }
 

@@ -475,6 +475,10 @@ pub trait RpcToP2P: Send + Sync {
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
     fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
+    /// [`Self::subscribe_attestation_subnets`] for a PQ slot's committees:
+    /// `(subnet_id, slot)` pairs among PQ's 16 subnets, joined under PQ
+    /// digests only.
+    fn subscribe_pq_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
     /// Gossip one sync committee message on `sync_committee_{id}` for every id
     /// in `subnet_ids` (every subnet its validator has a seat in, computed by
     /// the caller from the head state), and mark it seen. Checked by the caller.

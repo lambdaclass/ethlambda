@@ -309,6 +309,7 @@ pub async fn start_beacon_rpc_server(
             sync_status.clone(),
         ))
     });
+    beacon::pq_aggregation::spawn(store.clone(), shutdown.clone());
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
@@ -535,6 +536,7 @@ pub(crate) mod test_utils {
         pub(crate) operations:
             std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
+        pub(crate) pq_subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
         pub(crate) sidecars:
@@ -621,6 +623,14 @@ pub(crate) mod test_utils {
             subnets: Vec<(u64, u64)>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.subscriptions.lock().unwrap().extend(subnets);
+            Ok(())
+        }
+
+        fn subscribe_pq_attestation_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.pq_subscriptions.lock().unwrap().extend(subnets);
             Ok(())
         }
 

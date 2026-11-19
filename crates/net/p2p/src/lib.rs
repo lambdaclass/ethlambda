@@ -49,7 +49,7 @@ use ethlambda_network_api::{
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
         PublishPayloadAttestationMessage, PublishPqGossip, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
-        SubscribeSyncCommitteeSubnets,
+        SubscribePqAttestationSubnets, SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
@@ -1278,6 +1278,7 @@ impl P2P {
             sync_committee_pool,
             gossip_events,
             aggregator_subnets: HashMap::new(),
+            aggregator_subnets_pq: HashMap::new(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
@@ -1494,6 +1495,11 @@ pub struct P2PServer {
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// [`Self::aggregator_subnets`] for PQ slots: among PQ's 16 subnets, and
+    /// joined under PQ digests only, where the other map is joined under
+    /// every other digest.
+    pub(crate) aggregator_subnets_pq: HashMap<u64, u64>,
 
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
@@ -1890,6 +1896,12 @@ impl Handler<PublishPayloadAttestationMessage> for P2PServer {
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<SubscribePqAttestationSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribePqAttestationSubnets, _ctx: &Context<Self>) {
+        gossipsub::join_pq_aggregator_subnets(self, msg.subnets);
     }
 }
 
@@ -3206,6 +3218,7 @@ pub(crate) mod test_support {
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            aggregator_subnets_pq: HashMap::new(),
             peer_scoring: None,
         }
     }

@@ -745,6 +745,22 @@ pub trait BeaconNodeApi: Send + Sync {
     async fn publish_aggregates(&self, fork: ForkName, aggregates: &SignedAggregates)
     -> Result<()>;
 
+    /// The aggregate the node proved for `committee_index`'s vote on the data
+    /// whose root is `attestation_data_root` at a PQ slot, with its proof: what
+    /// a PQ aggregator wraps and signs. A 404 when it proved none.
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate>;
+
+    /// Publish signed PQ aggregates.
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()>;
+
     /// Tells the node where to pay each validator's execution-layer block
     /// rewards, so it has somewhere to send them when it builds a payload.
     ///

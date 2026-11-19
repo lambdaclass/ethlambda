@@ -90,6 +90,16 @@ pub fn get_leaf_index(signature: &XmssSignature) -> u64 {
 /// The specification's `XMSSAggregateStatement`.
 pub type AggregateStatement = stark::AggregateStatement;
 
+/// The specification's `stark.ProveAggregates`: one proof of every
+/// statement's signatures, `signatures[i]` being those of `statements[i]`'s
+/// keys, in their order.
+pub fn prove_aggregates<S: AsRef<[u8]>>(
+    statements: &[AggregateStatement],
+    signatures: &[Vec<S>],
+) -> std::result::Result<Vec<u8>, stark::ProveError> {
+    stark::prove_aggregates(statements, signatures)
+}
+
 /// The specification's `stark.VerifyAggregates`.
 pub fn verify_aggregates(statements: &[AggregateStatement], proof: &[u8]) -> bool {
     if !xmss_verification_enabled() {

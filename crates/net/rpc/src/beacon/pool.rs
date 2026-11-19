@@ -219,12 +219,16 @@ fn post_pq_attestations(
                 pq_gossip::attestation_stateful_checks(store, &attestation, subnet_id)
             });
         let published = match verdict {
-            Outcome::Accept => p2p
-                .publish_pq_gossip(ethlambda_network_api::PqGossipObject::Attestation {
+            Outcome::Accept => {
+                // This node's own aggregator may be collecting the committee.
+                let now = wall_slot(&config, now_ms);
+                store.pq_signature_pool().insert(now, &attestation);
+                p2p.publish_pq_gossip(ethlambda_network_api::PqGossipObject::Attestation {
                     subnet_id,
                     attestation: Box::new(attestation),
                 })
-                .map_err(|_| "the network actor is not running".to_string()),
+                .map_err(|_| "the network actor is not running".to_string())
+            }
             other => Err(format!("{other:?}")),
         };
         match published {
@@ -452,6 +456,13 @@ async fn post_aggregate_and_proofs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let is_pq = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(ForkName::Pq.as_str());
+    if is_pq {
+        return post_pq_aggregate_and_proofs(&store, &p2p, &headers, &body);
+    }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
@@ -537,6 +548,66 @@ async fn post_aggregate_and_proofs(
     )
 }
 
+/// [`post_aggregate_and_proofs`] at a PQ slot: aggregates proved with
+/// STARKs and signed with leanXMSS, judged by PQ's `beacon_aggregate_and_proof`
+/// rules (the aggregator's signature at the slot's aggregate leaf, its seat
+/// in the aggregation committee, the proof) and gossiped. The network actor
+/// hands each to the chain actor and to block production's pool.
+fn post_pq_aggregate_and_proofs(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::pq as pq_gossip;
+    use ethlambda_types::beacon::containers::pq;
+    let aggregates = match decode_list::<pq::SignedAggregateAndProof>(headers, body) {
+        Ok(aggregates) => aggregates,
+        Err(err) => return err.into_response(),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let capacity = std::num::NonZeroUsize::MIN;
+    let mut failures = Vec::new();
+    for (index, signed) in aggregates.into_iter().enumerate() {
+        let slot = signed.message.aggregate.data.slot;
+        let aggregator = signed.message.aggregator_index;
+        // A fresh seen-cache, as for the other forks' aggregates.
+        let seen = aggregate::SeenAggregates::new(capacity, capacity);
+        let checked = pq_gossip::aggregate_cheap_checks(&seen, store, &signed, now_ms)
+            .and_then(|()| pq_gossip::aggregate_stateful_checks(store, &signed))
+            .map_err(|outcome| format!("{outcome:?}"));
+        let published = checked.and_then(|attesting_indices| {
+            p2p.publish_pq_gossip(ethlambda_network_api::PqGossipObject::Aggregate {
+                aggregate: Box::new(signed),
+                attesting_indices,
+            })
+            .map_err(|_| "the network actor is not running".to_string())
+        });
+        match published {
+            Ok(()) => debug!(%slot, aggregator, "Accepted a PQ aggregate for gossip"),
+            Err(message) => {
+                warn!(%slot, aggregator, reason = %message, "Refused a submitted PQ aggregate");
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
+            }
+        }
+    }
+    batch_response(
+        failures,
+        "some aggregates failed validation and were not published",
+    )
+}
+
+/// The wall clock's slot at `now_ms` (`0` before genesis).
+fn wall_slot(config: &ethlambda_types::beacon::config::Config, now_ms: u64) -> Slot {
+    now_ms.saturating_sub(config.genesis_time.saturating_mul(1000)) / config.slot_duration_ms.max(1)
+}
+
 #[derive(Debug, Deserialize)]
 struct AggregateQuery {
     attestation_data_root: Root,
@@ -558,6 +629,7 @@ async fn get_aggregate_attestation(
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
     Query(query): Query<AggregateQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
@@ -565,6 +637,9 @@ async fn get_aggregate_attestation(
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot));
+    if fork == ForkName::Pq {
+        return get_pq_aggregate(&store, &query, &headers).await;
+    }
     let aggregate = store.attestation_pool().aggregate(
         query.attestation_data_root,
         query.slot,
@@ -590,6 +665,56 @@ async fn get_aggregate_attestation(
         "data": data,
     }));
     crate::shared::content::with_consensus_version(response, fork)
+}
+
+/// [`get_aggregate_attestation`] at a PQ slot: the committee's aggregate
+/// this node proved from the votes it collected for its aggregators (see
+/// [`crate::beacon::pq_aggregation`]), with its proof. A request racing the
+/// proof waits for it until the slot's signatures are sealed and proved, for
+/// at most a few seconds; a 404 when there is none.
+async fn get_pq_aggregate(store: &Store, query: &AggregateQuery, headers: &HeaderMap) -> Response {
+    use ethlambda_types::beacon::containers::pq;
+    use libssz::SszEncode as _;
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let aggregate = loop {
+        let proven = store.pq_signature_pool().proven(
+            query.slot,
+            query.attestation_data_root,
+            query.committee_index,
+        );
+        if let Some(aggregate) = proven {
+            break aggregate;
+        }
+        let collecting = store
+            .pq_signature_pool()
+            .is_subscribed(query.slot, query.committee_index);
+        if !collecting || started.elapsed() >= WAIT {
+            return ApiError::NotFound("no PQ aggregate proved for this committee").into_response();
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    if let Err(err) = require_validated(store, aggregate.attestation.data.beacon_block_root) {
+        return err.into_response();
+    }
+    let answer = pq::ProvenAggregate {
+        aggregate: aggregate.attestation.clone(),
+        proof: aggregate.proof.clone(),
+    };
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    let response = match crate::shared::content::Encoding::from_accept(accept) {
+        crate::shared::content::Encoding::Ssz => {
+            crate::shared::content::ssz_response(answer.to_ssz())
+        }
+        crate::shared::content::Encoding::Json => crate::json_response(serde_json::json!({
+            "version": ForkName::Pq.as_str(),
+            "data": answer,
+        })),
+    };
+    crate::shared::content::with_consensus_version(response, ForkName::Pq)
 }
 
 /// The root of the latest block at or before `epoch`'s first slot on the chain
