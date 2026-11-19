@@ -734,6 +734,23 @@ pub trait BeaconNodeApi: Send + Sync {
     /// before it is signed rather than assumed.
     async fn prepare_beacon_proposer(&self, preparations: &[ProposerPreparationDto]) -> Result<()>;
 
+    /// [`Self::prepare_beacon_proposer`] for a caller that sends it again
+    /// every slot and reports a failure itself. The same request; what
+    /// differs is the logging around it. The fallback logs a refusing node at
+    /// `debug!` and says nothing when none accepts, where the plain call warns
+    /// for each refusal and then that the duty was likely missed: once a slot,
+    /// for as long as a node is down, and on slots with no duty.
+    ///
+    /// The default is the plain call because the logging is the fallback's
+    /// alone: one node (`HttpBeaconNode`) logs nothing about its answer either
+    /// way, so it has nothing to quieten.
+    async fn prepare_beacon_proposer_quietly(
+        &self,
+        preparations: &[ProposerPreparationDto],
+    ) -> Result<()> {
+        self.prepare_beacon_proposer(preparations).await
+    }
+
     /// Tells the node which committees this client's validators care about
     /// this epoch, so it can manage subnet subscriptions on their behalf.
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()>;
