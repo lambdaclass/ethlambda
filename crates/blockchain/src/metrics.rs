@@ -1543,8 +1543,9 @@ pub fn inc_engine_speculation(outcome: &str) {
 ///
 /// For a pre-gloas block the import computes the state transition meanwhile,
 /// so this is not what the import waited: that is
-/// `lean_block_import_phase_seconds`'s `engine` phase, zero whenever the
-/// answer was in before the transition finished. This is the execution
+/// `lean_block_import_phase_seconds`'s `engine` phase, only the request's
+/// construction whenever the answer was in before the transition finished.
+/// This is the execution
 /// client's own processing time. `outcome` is `valid`, `optimistic`,
 /// `invalidated` or `no_verdict`. A `no_verdict` sample is either the whole
 /// retry ladder, when no answer came, or a single attempt, when the execution

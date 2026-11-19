@@ -5008,8 +5008,12 @@ fn check_timely_and_on_the_finalized_chain(
 /// guards are left to the caller, since neither can fire for a block the actor
 /// speculates on: data availability, which `process_block` checks before it
 /// asks the execution client, and gloas's parent-payload check, since a gloas
-/// block carries no payload to ask about. A storage error on any of these
-/// reads is `None` too, for the reason above.
+/// block carries no payload to ask about. An error the store reports for the
+/// known-root, parent-state or `LiveChain` read is `None` too, for the reason
+/// above. The finalized checkpoint and the store's clock are read the way the
+/// import path already reads them before it gets here
+/// (`process_or_pend_block`, `process_block`), so this adds no panic that path
+/// lacks.
 ///
 /// `on_block`'s own checks still run, unchanged and in the same order, when the
 /// speculation is handed to [`on_block_speculative`]; the ones here only decide
@@ -7792,6 +7796,11 @@ mod tests {
         store
             .insert_state(stray_parent, (*parent_state).clone())
             .expect("insert");
+        assert!(
+            store.get_state(&stray_parent).expect("get").is_some(),
+            "the premise: the stray parent's post-state is readable, so only the \
+             finalized-chain check can refuse the block"
+        );
         let SignedBeaconBlock::Phase0(inner) = &mut block else {
             unreachable!("phase0");
         };
