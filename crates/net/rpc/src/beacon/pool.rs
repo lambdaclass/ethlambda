@@ -136,13 +136,21 @@ async fn post_pool_attestations(
                 checked.committee_position,
                 checked.committee_len,
             );
-            let for_event = attestation.clone();
+            // The event needs its own copy, since the attestation moves into
+            // the publish; made only when a client is subscribed, as a batch
+            // can carry a whole validator client's votes.
+            let for_event = events
+                .as_deref()
+                .is_some_and(EventBus::has_subscribers)
+                .then(|| attestation.clone());
             p2p.publish_beacon_attestation(checked.subnet_id, attestation)
                 .map(|()| {
                     // The `(from P2P or API)` half of `single_attestation`.
-                    emit_accepted(events.as_deref(), || {
-                        GossipEvent::SingleAttestation(Box::new(for_event))
-                    })
+                    if let Some(attestation) = for_event {
+                        emit_accepted(events.as_deref(), || {
+                            GossipEvent::SingleAttestation(Box::new(attestation))
+                        });
+                    }
                 })
                 .map_err(|_| "the network actor is not running")
         });
