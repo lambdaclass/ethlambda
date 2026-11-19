@@ -190,11 +190,11 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
     };
     let domain = get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
-    let attester = bls::IndexedPubkey {
+    let attester_key = bls::IndexedPubkey {
         index: attestation.attester_index,
         pubkey: attester.pubkey,
     };
-    if !bls::verify(&attester, signing_root, &attestation.signature) {
+    if !bls::verify(&attester_key, signing_root, &attestation.signature) {
         return Outcome::Reject(RejectReason::BadSignature);
     }
 
