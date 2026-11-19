@@ -398,6 +398,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         store: &RwLock<ValidatorStore>,
         deadline: Option<Instant>,
     ) -> Result<Proposed> {
+        if self
+            .context
+            .config
+            .fork_at_epoch(compute_epoch_at_slot(slot))
+            == ethlambda_types::beacon::fork::ForkName::Pq
+        {
+            return self.propose_pq(slot, duty, deadline).await;
+        }
         // Nothing awaits between signing and the end of `produce_and_sign`,
         // and a completed future is never discarded at the deadline, so a
         // signed block always reaches the publish step below. A deadline
@@ -421,6 +429,106 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         self.publish_full(slot, validator, store, signed, deadline)
             .await
             .map(Proposed::Full)
+    }
+
+    /// A proposal at a PQ slot: the RANDAO reveal is the proposer's VRF proof,
+    /// the beacon node builds a self-built block and its envelope (ethlambda's
+    /// `pq_blocks` endpoint), and both are signed with leanXMSS at the slot's
+    /// proposer and envelope leaves. The slashing protection record guards
+    /// the block's leaf (one block per slot), `crate::pq` the envelope's. An
+    /// envelope failure is logged, not the proposal's: the block is out.
+    async fn propose_pq(
+        &self,
+        slot: Slot,
+        duty: &ProposerDutyDto,
+        deadline: Option<Instant>,
+    ) -> Result<Proposed> {
+        use ethlambda_types::beacon::containers::pq;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        use libssz::SszEncode as _;
+
+        let pubkey = parse_pubkey(&duty.pubkey)?;
+        let validator = duty.validator_index;
+        let checked = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            Ok(protection.check_block(&pubkey, slot))
+        })
+        .await;
+        refuse_unless_safe(slot, validator, "consult", checked)?;
+
+        let pq_error = |err: crate::pq::PqSignError| Error::Signing {
+            pubkey,
+            reason: err.to_string(),
+        };
+        let randao_reveal = crate::pq::vrf_proof(&pubkey, slot).map_err(pq_error)?;
+        let graffiti = self.settings.graffiti(&pubkey);
+        let contents = before(
+            deadline,
+            slot,
+            self.beacon_node
+                .produce_pq_block(slot, &randao_reveal, Some(graffiti)),
+        )
+        .await?;
+        if contents.block.slot != slot || contents.block.proposer_index != validator {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for validator {validator}'s PQ block at slot {slot}, node built one for \
+                 validator {} at slot {}",
+                contents.block.proposer_index, contents.block.slot
+            )));
+        }
+        let block_root = contents.block.hash_tree_root();
+
+        let recorded = crate::slashing_protection::blocking(&self.protection, move |protection| {
+            protection.check_and_record_block(&pubkey, slot)
+        })
+        .await;
+        refuse_unless_safe(slot, validator, "record", recorded)?;
+
+        let signing_root = self.context.block_signing_root(block_root, slot);
+        let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_BEACON_PROPOSER);
+        let signature = crate::pq::sign(&pubkey, leaf, signing_root).map_err(pq_error)?;
+        let signed = pq::SignedBeaconBlock {
+            message: contents.block,
+            signature,
+        };
+        let published = before(
+            deadline,
+            slot,
+            self.beacon_node.publish_block(
+                ethlambda_types::beacon::fork::ForkName::Pq,
+                &signed.to_ssz(),
+            ),
+        )
+        .await?;
+        info!(%slot, validator, "Published a PQ block");
+
+        let envelope = contents.execution_payload_envelope;
+        let domain = self.context.domain(
+            ethlambda_types::beacon::constants::DOMAIN_BEACON_BUILDER,
+            compute_epoch_at_slot(slot),
+        );
+        let envelope_root = ethlambda_types::beacon::signing::compute_signing_root(
+            envelope.hash_tree_root(),
+            domain,
+        );
+        let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE);
+        match crate::pq::sign(&pubkey, leaf, envelope_root) {
+            Ok(signature) => {
+                let signed = pq::SignedExecutionPayloadEnvelope {
+                    message: envelope,
+                    signature,
+                };
+                match self
+                    .beacon_node
+                    .publish_pq_execution_payload_envelope(&signed.to_ssz())
+                    .await
+                {
+                    Ok(()) => info!(%slot, validator, "Published a PQ execution payload envelope"),
+                    Err(err) => warn!(%slot, validator, %err, "Failed to publish the PQ envelope"),
+                }
+            }
+            Err(err) => warn!(%slot, validator, %err, "Failed to sign the PQ envelope"),
+        }
+        Ok(Proposed::Full(published))
     }
 
     /// Everything up to and including the block signature: the slashing

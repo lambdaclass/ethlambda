@@ -2310,6 +2310,7 @@ dependencies = [
  "axum",
  "blst",
  "ctr",
+ "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-types",
  "futures-util",

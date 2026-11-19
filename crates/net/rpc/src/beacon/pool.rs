@@ -96,6 +96,13 @@ async fn post_pool_attestations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let is_pq = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(ForkName::Pq.as_str());
+    if is_pq {
+        return post_pq_attestations(&store, &p2p, &headers, &body);
+    }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
@@ -166,6 +173,79 @@ async fn post_pool_attestations(
         }
     }
 
+    batch_response(
+        failures,
+        "some attestations failed validation and were not published",
+    )
+}
+
+/// The PQ half of `submitPoolAttestationsV2`: PQ's `SingleAttestation`,
+/// signed with leanXMSS, judged by PQ's gossip rules (its signature at the
+/// target epoch's leaf, its committee, its subnet among PQ's 16) and
+/// gossiped on that subnet.
+fn post_pq_attestations(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::{SeenAttestations, pq as pq_gossip};
+    let attestations = match decode_list::<ethlambda_types::beacon::containers::pq::SingleAttestation>(
+        headers, body,
+    ) {
+        Ok(attestations) => attestations,
+        Err(err) => return err.into_response(),
+    };
+    let (_head_root, state) = match head(store) {
+        Ok(found) => found,
+        Err(err) => return err.into_response(),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let config = store.config();
+    // A fresh cache: the node gossips its own validator client's votes once.
+    let seen = SeenAttestations::new(std::num::NonZeroUsize::MIN);
+    let mut failures = Vec::new();
+    for (index, attestation) in attestations.into_iter().enumerate() {
+        let slot = attestation.data.slot;
+        let validator = attestation.attester_index;
+        let committees_per_slot = store
+            .committee_cache()
+            .committees(&state, attestation.data.target.epoch)
+            .committees_per_slot();
+        let subnet_id = compute_subnet_for_attestation(
+            committees_per_slot,
+            slot,
+            attestation.committee_index,
+            &config,
+        );
+        let verdict = pq_gossip::attestation_cheap_checks(&seen, store, &attestation, now_ms)
+            .err()
+            .unwrap_or_else(|| {
+                pq_gossip::attestation_stateful_checks(store, &attestation, subnet_id)
+            });
+        let published = match verdict {
+            Outcome::Accept => p2p
+                .publish_pq_gossip(ethlambda_network_api::PqGossipObject::Attestation {
+                    subnet_id,
+                    attestation: Box::new(attestation),
+                })
+                .map_err(|_| "the network actor is not running".to_string()),
+            other => Err(format!("{other:?}")),
+        };
+        match published {
+            Ok(()) => debug!(%slot, validator, subnet_id, "Accepted a PQ attestation for gossip"),
+            Err(message) => {
+                warn!(%slot, validator, reason = %message, "Refused a submitted PQ attestation");
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
+            }
+        }
+    }
     batch_response(
         failures,
         "some attestations failed validation and were not published",

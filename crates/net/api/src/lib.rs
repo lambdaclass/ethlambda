@@ -10,7 +10,11 @@ use ethlambda_types::{
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
         gloas::{PayloadAttestationMessage, SignedExecutionPayloadBid, SignedProposerPreferences},
-        pq::PayloadAttestationMessage as PqPayloadAttestationMessage,
+        pq::{
+            PayloadAttestationMessage as PqPayloadAttestationMessage,
+            SignedAggregateAndProof as PqSignedAggregateAndProof,
+            SingleAttestation as PqSingleAttestation,
+        },
     },
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
@@ -428,6 +432,24 @@ impl AggregateArrival {
 /// these requests come from a validator client through the HTTP server, not
 /// from the chain actor, and a beacon node's chain actor has nothing to publish
 /// on its own behalf.
+/// A validator client's PQ message for [`RpcToP2P::publish_pq_gossip`].
+#[derive(Debug, Clone)]
+pub enum PqGossipObject {
+    /// For `beacon_attestation_{subnet_id}`, one of PQ's 16 subnets.
+    Attestation {
+        subnet_id: u64,
+        attestation: Box<PqSingleAttestation>,
+    },
+    /// For `beacon_aggregate_and_proof`, with the attesting indices
+    /// validation resolved, which fork choice applies.
+    Aggregate {
+        aggregate: Box<PqSignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
+    },
+    /// For `payload_attestation_message`.
+    PayloadAttestation(Box<PqPayloadAttestationMessage>),
+}
+
 #[protocol]
 pub trait RpcToP2P: Send + Sync {
     /// Gossip one unaggregated attestation on `beacon_attestation_{subnet_id}`.
@@ -455,6 +477,11 @@ pub trait RpcToP2P: Send + Sync {
     ) -> Result<(), ActorError>;
     /// Gossip one operation on its topic, already validated by the caller.
     fn publish_beacon_operation(&self, operation: BeaconOperation) -> Result<(), ActorError>;
+    /// Gossip one of a validator client's PQ messages, already validated by
+    /// the caller with PQ's gossip rules, on its PQ-digest topic, and hand
+    /// what fork choice reads to the chain actor, since gossip never delivers
+    /// a node its own messages.
+    fn publish_pq_gossip(&self, object: PqGossipObject) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.

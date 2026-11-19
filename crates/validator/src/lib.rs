@@ -37,6 +37,7 @@ pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod pq;
 pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
@@ -113,6 +114,7 @@ use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
+use ethlambda_types::beacon::fork::ForkName;
 
 /// Everything the client is configured with at startup.
 #[derive(Debug, Clone)]
@@ -347,6 +349,51 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     }
     let context = Arc::new(context);
 
+    // A network scheduling the PQ fork: derive every validator's leanXMSS key
+    // and VRF tree before any duty runs, since index lookup already needs the
+    // keys. About a second and a half a key, the keys in parallel.
+    let pq_epoch = context
+        .config
+        .fork_epoch(ethlambda_types::beacon::fork::ForkName::Pq);
+    if pq_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+        let secrets: Vec<(BlsPubkey, [u8; 32])> = {
+            let store = store.read().await;
+            store
+                .pubkeys()
+                .into_iter()
+                .filter_map(|pubkey| match store.get(&pubkey)? {
+                    keys::store::SigningMethod::LocalKeystore { secret_key } => {
+                        Some((pubkey, secret_key.to_bytes()))
+                    }
+                    // The PQ keys derive from the BLS secret, which a remote
+                    // signer never hands over: such a validator has no PQ key.
+                    keys::store::SigningMethod::Web3Signer { .. } => None,
+                })
+                .collect()
+        };
+        let count = secrets.len();
+        let current_slot = clock.now().unwrap_or(0);
+        let started = std::time::Instant::now();
+        info!(count, pq_epoch, "Deriving the validators' PQ keys");
+        tokio::task::spawn_blocking(move || {
+            std::thread::scope(|scope| {
+                for (pubkey, secret) in &secrets {
+                    scope.spawn(move || pq::derive_and_register(*pubkey, secret, current_slot));
+                }
+            });
+        })
+        .await
+        .map_err(|err| Error::Io {
+            path: "PQ key derivation".into(),
+            source: std::io::Error::other(err.to_string()),
+        })?;
+        info!(
+            count,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Derived the validators' PQ keys"
+        );
+    }
+
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
         AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
@@ -560,7 +607,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // should not compete with it producing this slot's block. Off the slot
             // loop, since it is single-flight and a slow node must not delay this
             // slot's duties.
-            tokio::spawn(preferences.clone().poll(slot, store.clone()));
+            // PQ preferences are signed with leanXMSS, which this client's
+            // preferences service does not do yet: a PQ proposal self-builds.
+            if clock_fork(&context, slot) != ForkName::Pq {
+                tokio::spawn(preferences.clone().poll(slot, store.clone()));
+            }
 
             // The subscriptions the refresh above left owing, sent from a task
             // of their own and only now, after the block.
@@ -1062,6 +1113,11 @@ async fn aggregate<B: BeaconNodeApi>(
     duties: &[crate::beacon_node::dto::AttesterDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
+    // PQ aggregators are the aggregation committee and prove a STARK; this
+    // client does not aggregate there yet, the network's other aggregators do.
+    if data.target.epoch >= aggregation.pq_fork_epoch() {
+        return;
+    }
     let budget = clock.remaining_in(slot, SystemTime::now());
     let attempt = tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store));
     match attempt.await {
@@ -1524,7 +1580,9 @@ async fn refresh_sync<B: BeaconNodeApi>(
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
-    if context.config.fork_at_epoch(epoch) < ForkName::Altair {
+    // Sync committees start at altair, and PQ removes them.
+    let fork = context.config.fork_at_epoch(epoch);
+    if fork < ForkName::Altair || fork == ForkName::Pq {
         return;
     }
     let period = crate::duties::sync_committee_period(epoch);
@@ -1554,6 +1612,15 @@ async fn refresh_sync<B: BeaconNodeApi>(
             warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
         }
     }
+}
+
+/// The fork of `slot` by the client's own schedule.
+fn clock_fork(context: &SigningContext, slot: u64) -> ForkName {
+    context
+        .config
+        .fork_at_epoch(ethlambda_types::beacon::signing::compute_epoch_at_slot(
+            slot,
+        ))
 }
 
 #[cfg(test)]

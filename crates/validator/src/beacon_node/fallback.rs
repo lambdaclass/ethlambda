@@ -597,6 +597,35 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.try_each("submit_pq_payload_attestations", |node| {
+            node.submit_pq_payload_attestations(messages)
+        })
+        .await
+    }
+
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        self.try_each("produce_pq_block", |node| {
+            node.produce_pq_block(slot, randao_reveal, graffiti)
+        })
+        .await
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()> {
+        self.try_each("publish_pq_execution_payload_envelope", |node| {
+            node.publish_pq_execution_payload_envelope(body)
+        })
+        .await
+    }
+
     async fn submit_attestations(
         &self,
         attestations: &[SingleAttestationDto],

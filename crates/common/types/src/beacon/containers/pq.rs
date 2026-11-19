@@ -1159,3 +1159,13 @@ mod tests {
         );
     }
 }
+
+/// What block production hands a PQ proposer: the unsigned block and the
+/// unsigned envelope revealing its payload, which the proposer signs at their
+/// own leaves. ethlambda's own validator-client exchange: Lighthouse's PQ
+/// branch has an equivalent (`PqBlockAndEnvelope`), the Beacon API none yet.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct BlockContents {
+    pub block: BeaconBlock,
+    pub execution_payload_envelope: ExecutionPayloadEnvelope,
+}

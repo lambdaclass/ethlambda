@@ -63,6 +63,14 @@ pub struct AggregationService<B> {
 }
 
 impl<B: BeaconNodeApi> AggregationService<B> {
+    /// The epoch the PQ fork activates at, from which this service does not
+    /// aggregate (`FAR_FUTURE_EPOCH` when unscheduled).
+    pub fn pq_fork_epoch(&self) -> u64 {
+        self.context
+            .config
+            .fork_epoch(ethlambda_types::beacon::fork::ForkName::Pq)
+    }
+
     pub fn new(beacon_node: Arc<B>, context: Arc<SigningContext>) -> Self {
         Self {
             beacon_node,

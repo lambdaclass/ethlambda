@@ -596,6 +596,13 @@ pub(crate) mod test_utils {
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
+        fn publish_pq_gossip(
+            &self,
+            _object: ethlambda_network_api::PqGossipObject,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
         fn publish_beacon_attestation(
             &self,
             subnet_id: u64,
