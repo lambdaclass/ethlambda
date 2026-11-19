@@ -808,6 +808,9 @@ impl<'a> ParticipationSortedReader<'a> {
     }
 }
 
+/// Equal when the entries are, whatever the list kinds: a bounded and a
+/// progressive list holding the same flags compare equal. Use
+/// [`ParticipationRef::ptr_eq`] to ask whether two are one shared list.
 impl PartialEq for ParticipationRef<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.iter().eq(other.iter())
@@ -1328,26 +1331,31 @@ impl BeaconState {
     /// so across an epoch boundary (the child's previous list is the base's
     /// current one) it finds little to share; the lists are rebuilt wholesale
     /// there anyway.
+    ///
+    /// Gloas is matched first, by name. `altair_validator_lists_mut` answers
+    /// only for altair through fulu, so the second arm sees only bounded
+    /// lists, and a pair straddling the gloas upgrade matches neither.
     fn rebase_participation_on(&mut self, base: &BeaconState) {
-        if let (Ok((previous, current, _)), Ok((base_previous, base_current, _))) = (
-            self.altair_validator_lists_mut(),
-            base.altair_validator_lists(),
-        ) {
-            if let (
-                ParticipationRef::Bounded(base_previous),
-                ParticipationRef::Bounded(base_current),
-            ) = (base_previous, base_current)
-            {
-                previous.rebase_on(base_previous);
-                current.rebase_on(base_current);
-            }
-        } else if let (BeaconState::Gloas(state), BeaconState::Gloas(base)) = (self, base) {
+        if let (BeaconState::Gloas(state), BeaconState::Gloas(base)) = (&mut *self, base) {
             state
                 .previous_epoch_participation
                 .rebase_on(&base.previous_epoch_participation);
             state
                 .current_epoch_participation
                 .rebase_on(&base.current_epoch_participation);
+        } else if let (
+            Ok((previous, current, _)),
+            Ok((
+                ParticipationRef::Bounded(base_previous),
+                ParticipationRef::Bounded(base_current),
+                _,
+            )),
+        ) = (
+            self.altair_validator_lists_mut(),
+            base.altair_validator_lists(),
+        ) {
+            previous.rebase_on(base_previous);
+            current.rebase_on(base_current);
         }
     }
 

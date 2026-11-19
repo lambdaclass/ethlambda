@@ -41,6 +41,12 @@ const PARALLEL_HASH_HEIGHT: usize = 12;
 pub(crate) enum Tree<T> {
     /// A subtree of the given height whose chunks are all zero: its hash is
     /// `ZERO_HASHES[height]`, looked up rather than computed.
+    ///
+    /// Only ever past the end of the data. An in-range element always sits in
+    /// a [`Tree::Leaf`], even when it is zero, and the reads count on that:
+    /// [`Self::get`] and [`Self::leaf_run`] answer `None` at a `Zero`, which
+    /// means "past the end". Collapsing all-zero in-range leaves into a `Zero`
+    /// would make both lose elements.
     Zero(usize),
     /// The elements of one leaf-height subtree, in order.
     Leaf(Leaf<T>),
