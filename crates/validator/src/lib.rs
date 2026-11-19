@@ -1119,6 +1119,8 @@ fn preparations<'a>(
 ///   it would otherwise go out with `--suggested-fee-recipient`, overwriting
 ///   the preparation of a client the key moved to on the same node. The node
 ///   keeps the address it was last given until it expires it or restarts.
+///   Imported again before the next refresh, the key is sent again, with the
+///   defaults a key starts on once its overrides are forgotten.
 /// - **A `DELETE` of a validator's fee recipient that leaves it no address**
 ///   (no `--suggested-fee-recipient` either) sends nothing for it, so the node
 ///   keeps the address it was last given, the same way.
@@ -1135,8 +1137,9 @@ fn preparations<'a>(
 /// either order, reverting a fee recipient changed in between. So a send that
 /// finds the last one still running skips, and the slot after it sends what
 /// is current then (see [`crate::in_flight`]). A node that never answers is
-/// cut off by the HTTP client's request timeout, 8 s, so on a 12 s slot a
-/// hung node can cost the healthy ones every other re-send, never all of
+/// cut off by the HTTP client's request timeout, 8 s, so a hung node costs
+/// the healthy ones only the re-sends that come due while a send waits on it:
+/// at most every other one on 12 s slots, more on shorter ones, never all of
 /// them.
 ///
 /// The epoch refresh's send does not take part. It runs on the duty loop
@@ -1172,8 +1175,9 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
 
     /// The duty loop's gate, once every slot's duties are done, the
     /// refresh's slot included: spawn the re-send of `resolved`'s
-    /// preparations, unless there is nobody to prepare. The task, for a test
-    /// to await; the loop leaves it detached, as it does its other sends.
+    /// preparations, unless there is nobody to prepare. Returns the spawned
+    /// task's handle so a test can await it; the duty loop drops it, as it
+    /// does its other sends' handles.
     fn after_slot(
         self: &Arc<Self>,
         slot: u64,
@@ -1536,6 +1540,10 @@ mod tests {
             .await
             .expect("a skipped re-send does not wait on the node")
             .expect("the skipped re-send ends");
+        assert!(
+            node.preparations().is_empty(),
+            "the slow re-send is still parked at the gate, and the skipped one sent nothing"
+        );
 
         gate.add_permits(1);
         slow.await.expect("the slow re-send ends");
