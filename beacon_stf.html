@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-dc0945f1.js";
+            window.path_to_searchindex_js = "searchindex-9ca8ea15.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -489,6 +489,15 @@ tests) hold a fresh <code>ActiveBalanceCache::default()</code>. Epoch processing
 helpers and fork choice keep calling the uncached one-pass
 <code>get_total_active_balance</code>. In debug builds every hit is cross-checked against a
 fresh computation.</p>
+<p>The proposer lookup had the same shape. Before fulu, <code>get_beacon_proposer_index</code>
+scans the whole registry to build the active-index <code>Vec</code>, and the specification’s
+<code>process_attestation</code> calls it once per attestation to pay (phase0: record) the
+proposer, up to <code>MAX_ATTESTATIONS</code> times a block. Each fork’s
+<code>process_operations</code> now resolves it once before its attestation loop and hands
+it to <code>process_attestation</code>; nothing an attestation writes is an input to it. In
+a <code>replay-era</code> run over mainnet era 1422 (deneb blocks) that took a block from
+about 1.7 s to about 0.3 s. The header, RANDAO and sync-aggregate steps still
+look it up once each.</p>
 <p>Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
 through <code>helpers::participation</code>. One walk of <code>iter_validators()</code>, zipped with
 the flat participation slices, produces each validator’s flags, its effective
