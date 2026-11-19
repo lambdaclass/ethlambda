@@ -8,6 +8,7 @@ mod era;
 mod fd_limit;
 mod keygen;
 mod network;
+mod shutdown;
 mod slashing_protection;
 mod validator;
 mod version;
@@ -43,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use cli::{Network, Options};
 use command::Command;
+use shutdown::ShutdownSignals;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
@@ -1021,40 +1023,30 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 
 /// Wait for ctrl-c or SIGTERM, then stop and join whatever is running.
 ///
-/// A 2nd, 3rd and 4th ctrl-c escalate to `std::process::exit(1)` rather than
-/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`. A
-/// repeated SIGTERM does not: once [`shutdown_signal`] listens for it, it no
-/// longer kills the process, so a supervisor that wants the process gone
-/// sends SIGKILL, as `docker stop` and systemd do after their timeout.
+/// A 2nd, 3rd and 4th signal, ctrl-c or SIGTERM in any mix, escalate to
+/// `std::process::exit(1)` rather than leaving shutdown stuck on an actor that
+/// hangs in `stop()`/`join()` (see [`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// Both signals are listened for before `Node initialized` is logged, so a
+/// signal sent once that line is out is never lost or fatal. One sent earlier,
+/// during startup, still has its default action: see the `shutdown` module.
 ///
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
 async fn wait_for_shutdown(node: RunningNode) {
+    let mut signals = ShutdownSignals::listen();
     info!("Node initialized");
 
     // 1st ctrl+c or SIGTERM: start graceful shutdown
-    let signal = shutdown_signal().await;
+    let signal = signals.recv().await;
 
     info!(
         signal,
         "Shutdown signal received, stopping actors and servers..."
     );
 
-    tokio::spawn(async move {
-        // This can be turned into a loop
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        info!("Forced ungraceful shutdown...");
-        std::process::exit(1);
-    });
+    signals.force_exit_on_repeats();
 
     let blockchain_ref = node.blockchain.actor_ref().clone();
     let p2p_ref = node.p2p.actor_ref().clone();
@@ -1068,28 +1060,6 @@ async fn wait_for_shutdown(node: RunningNode) {
     let _ = node.http.await;
 
     info!("Shutdown complete");
-}
-
-/// Resolve on the first SIGINT (ctrl-c) or SIGTERM, naming which one.
-///
-/// SIGTERM is what `docker stop`, systemd and Kubernetes send, so a container
-/// no longer needs `--stop-signal SIGINT` to shut down gracefully.
-async fn shutdown_signal() -> &'static str {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                return tokio::select! {
-                    _ = tokio::signal::ctrl_c() => "SIGINT",
-                    _ = terminate.recv() => "SIGTERM",
-                };
-            }
-            Err(err) => warn!(%err, "Cannot listen for SIGTERM; only ctrl-c shuts down gracefully"),
-        }
-    }
-    tokio::signal::ctrl_c().await.ok();
-    "SIGINT"
 }
 
 /// The ENRs to start from when `--bootnodes` was not given.
@@ -1186,6 +1156,10 @@ fn init_shadow_cost(shadow: &cli::ShadowOptions) {
 async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
     use tokio::sync::RwLock;
 
+    // Before `Test-driver RPC ready`, so a signal sent once that line is out
+    // is never lost or fatal.
+    let mut signals = ShutdownSignals::listen();
+
     let driver: ethlambda_rpc::test_driver::DriverState =
         Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
 
@@ -1202,11 +1176,12 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 
     info!("Test-driver RPC ready");
 
-    let signal = shutdown_signal().await;
+    let signal = signals.recv().await;
     info!(
         signal,
         "Shutdown signal received, stopping test-driver RPC..."
     );
+    signals.force_exit_on_repeats();
     shutdown_token.cancel();
     let _ = rpc_handle.await;
     info!("Shutdown complete");

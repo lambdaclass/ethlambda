@@ -260,7 +260,7 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
 6. Spawn the API and metrics servers.
 
 Shutdown runs in reverse: the first ctrl+c or SIGTERM stops both actors and cancels the servers'
-shutdown token, and three more force the process to exit if a graceful stop hangs.
+shutdown token, and three more, of either kind, force the process to exit if a graceful stop hangs.
 
 > Note: booting with `HIVE_LEAN_TEST_DRIVER=1` short-circuits everything from step 2 on and
 > exposes only the Hive test-driver endpoints, so a driver run never touches the node key,
