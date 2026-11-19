@@ -80,6 +80,12 @@ pub struct TelemetryConfig {
 /// Import timings are [`Instant`]s, which only subtract from one another, so
 /// each is converted against a pair read at encoding time: the wall clock at
 /// the anchor, minus how long before the anchor the instant was.
+///
+/// The result does not depend on when the anchor is read, so the writer reads
+/// a fresh one per row and a row that waited in the channel is not skewed by
+/// the wait. It assumes the wall clock did not step (an NTP correction, say)
+/// between the instant and the anchor: a row that straddles a step is moved
+/// by it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Anchor {
     instant: Instant,
