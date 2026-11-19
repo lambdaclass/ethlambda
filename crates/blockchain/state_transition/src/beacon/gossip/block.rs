@@ -207,12 +207,25 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
         if parent_full {
             // [IGNORE] If the parent block is full, the parent payload is
             // valid (MAY queue).
+            //
             // Queued, not ignored: the envelope is usually moments away
             // (held for its columns, say), and the chain actor holds such a
             // block until it verifies. Ignored, the block was dropped and
             // came back only when a child named it, a slot or more later; a
             // proposal in between built on the grandparent and was orphaned.
+            //
+            // Unless the execution client found that payload invalid: then
+            // nothing will verify it, and the actor would drop the block
+            // after a trip through its mailbox. Still an IGNORE, not the
+            // REJECT a vote for an invalid payload gets: the specification
+            // ignores a block whose parent payload is unverified, and through
+            // fulu one whose parent "passed validation but its execution
+            // payload is invalid", and a peer that relayed the block on an
+            // optimistically verified envelope did nothing wrong.
             if !fork_choice::is_payload_verified(store, parent_root) {
+                if fork_choice::block_payload_status(store, parent_root).is_invalidated() {
+                    return Outcome::Ignore(IgnoreReason::ParentPayloadInvalid);
+                }
                 return Outcome::Queue(QueueReason::ParentPayloadUnverified);
             }
         } else if latest_block_hash(&parent_state) != Some(bid.parent_block_hash) {
@@ -875,5 +888,29 @@ mod tests {
             stateful_checks(&store, &block, block.message_hash_tree_root()),
             Outcome::Reject(RejectReason::FinalizedNotAncestor)
         );
+    }
+
+    /// A parent payload the execution client found invalid will never be
+    /// verified, so the block is not queued for it: the chain actor would
+    /// only drop it. Ignored, not rejected, as the specification has it for
+    /// a block whose parent's payload is invalid.
+    #[test]
+    fn a_gloas_block_on_an_invalid_parent_payload_is_ignored_not_queued() {
+        use crate::beacon::fork_choice::PayloadStatusEnum;
+
+        for status in [
+            PayloadStatusEnum::Invalid,
+            PayloadStatusEnum::InvalidBlockHash,
+        ] {
+            let (mut store, block) = gloas_child_of_unverified_parent(true);
+            let parent_root = block.parent_root();
+            let (parent_slot, _) = store.block_entry(&parent_root).expect("stored parent");
+            store.insert_beacon_block_payload_status(parent_root, parent_slot, status);
+            assert_eq!(
+                stateful_checks(&store, &block, block.message_hash_tree_root()),
+                Outcome::Ignore(IgnoreReason::ParentPayloadInvalid),
+                "{status:?}"
+            );
+        }
     }
 }

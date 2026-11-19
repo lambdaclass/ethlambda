@@ -184,6 +184,13 @@ pub enum IgnoreReason {
     /// has not been seen and verified. A gloas block in the same position is
     /// queued instead ([`QueueReason::ParentPayloadUnverified`]).
     ParentPayloadUnverified,
+    /// A gloas block builds on its parent's full payload branch, and the
+    /// execution client found that payload invalid. Not queued, since nothing
+    /// will verify it; IGNORE rather than REJECT, as the specification has
+    /// it for a block whose parent passed validation but whose payload did
+    /// not, so a peer that relayed it on an optimistic verdict is not
+    /// penalized.
+    ParentPayloadInvalid,
     /// A gloas vote names the full payload (`data.index == 1`) of a block whose
     /// envelope has not been seen and verified (the specification lets it be
     /// queued until it is).
@@ -237,6 +244,7 @@ impl IgnoreReason {
             Self::SlotStarted => "slot_started",
             Self::ImpossibleDependentRoot => "impossible_dependent_root",
             Self::ParentPayloadUnverified => "parent_payload_unverified",
+            Self::ParentPayloadInvalid => "parent_payload_invalid",
             Self::PayloadEnvelopeUnseen => "payload_envelope_unseen",
             Self::PayloadOptimistic => "payload_optimistic",
             Self::NotCurrentSlot => "not_current_slot",
