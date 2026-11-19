@@ -1722,8 +1722,8 @@ impl BlockChainServer {
         // post-state the store already holds before ever reaching here.
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
-        // Two words, taken before the match moves the block: the `block` event
-        // of a gloas block names its bid's builder and payload hash.
+        // Copied out before `signed_block` is moved below: the `block` event of
+        // a gloas block names its bid's builder and payload hash.
         let bid = crate::beacon_payloads::bid_of(&signed_block)
             .map(|bid| (bid.builder_index, bid.block_hash));
         let is_new = !self

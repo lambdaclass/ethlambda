@@ -762,12 +762,16 @@ impl ChainEvents {
                 &self.bus,
                 &previous,
                 self.view.head,
+                self.view.payload_status,
                 wall_clock_slot,
             );
         } else if previous.payload_status == Some(PayloadStatus::Empty)
             && self.view.payload_status == Some(PayloadStatus::Full)
         {
             // The same head, now with its payload: `head_v2` says so again.
+            // `None` is not an announced `empty`: only the view taken at
+            // startup holds it, before any `head_v2` went out (see
+            // `EventView::payload_status`).
             publish_beacon_payload_arrived(store, &self.bus, self.view.head, wall_clock_slot);
         }
         if self.view.finalized != previous.finalized {
@@ -944,8 +948,13 @@ pub(crate) const HEAD_EVENT_RECENCY_SLOTS: u64 = 32;
 /// its `LiveChain` rows.
 struct EventView {
     head: H256,
-    /// The head node's payload status as recorded for `head` (beacon only;
-    /// `None` on lean, and on beacon until fork choice has recorded one).
+    /// The head node's payload status as recorded for `head` (beacon only).
+    ///
+    /// `None` on lean, and on beacon only in the view taken when the actor
+    /// starts, before fork choice first runs. `fork_choice::get_head`, the one
+    /// runtime writer of the beacon head, records the status with its root
+    /// before it moves the head row, so a view taken after any head move
+    /// holds that head's status.
     payload_status: Option<PayloadStatus>,
     /// Lean only: beacon has no justified-checkpoint topic.
     justified: Checkpoint,
@@ -1114,13 +1123,14 @@ fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
 }
 
 /// Beacon `chain_reorg` (if the new head does not descend from the previous
-/// one) and `head` (if recent enough) for a head move from `previous.head` to
-/// `head`.
+/// one), then `head` and `head_v2` (if recent enough) for a head move from
+/// `previous.head` to `head`, whose recorded status is `payload_status`.
 fn publish_beacon_head_change(
     store: &Store,
     events: &EventBus,
     previous: &EventView,
     head: H256,
+    payload_status: Option<PayloadStatus>,
     wall_clock_slot: u64,
 ) {
     let (Some((old_slot, old_state)), Some((new_slot, new_state))) = (
@@ -1185,10 +1195,10 @@ fn publish_beacon_head_change(
     // `head` is deprecated in the specification's favour of `head_v2`, and
     // clients on either keep working: both go out for every head move.
     events.emit(head_v2_event(
-        store,
         &head_state,
         &new_chain,
         new_state,
+        payload_status,
         epoch_transition,
         execution_optimistic,
     ));
@@ -1228,23 +1238,27 @@ fn publish_beacon_payload_arrived(
         root: head,
         slot,
     };
-    // Same block, same epoch: never a transition.
+    // Same block, same epoch: never a transition. Only ever called for a
+    // head the view now holds as FULL.
     events.emit(head_v2_event(
-        store,
         &head_state,
         &new_chain,
         state_root,
+        Some(PayloadStatus::Full),
         false,
         store.is_beacon_optimistic(head),
     ));
 }
 
 /// The `head_v2` event for `new_chain`'s head, versioned by its state's fork.
+///
+/// `payload_status` is the status the caller's [`EventView`] holds for that
+/// head, so the label and the diff that decided to emit read one value.
 fn head_v2_event(
-    store: &Store,
     head_state: &BeaconState,
     new_chain: &NewChain<'_>,
     state_root: H256,
+    payload_status: Option<PayloadStatus>,
     epoch_transition: bool,
     execution_optimistic: bool,
 ) -> ChainEvent {
@@ -1256,7 +1270,7 @@ fn head_v2_event(
             slot: new_chain.slot,
             block: new_chain.root,
             state: state_root,
-            payload_status: payload_status_label(fork, store.head_payload_status()),
+            payload_status: payload_status_label(fork, payload_status),
             epoch_transition,
             current_epoch_dependent_root: new_chain.dependent_root(epoch.checked_sub(1)),
             next_epoch_dependent_root: new_chain.dependent_root(Some(epoch)),
@@ -1270,8 +1284,10 @@ fn head_v2_event(
 ///
 /// Every head before gloas is `full`: its block carries its payload, so there
 /// is nothing to wait for. From gloas on, only a head node fork choice picked
-/// as FULL is; one not recorded yet (a head move whose status is still
-/// pending) is `empty`, the state the block is in until its envelope arrives.
+/// as FULL is, and anything else is `empty`, the state the block is in until
+/// its envelope arrives. That includes `None`, which no head move passes (see
+/// `EventView::payload_status`); it is read the cautious way rather than
+/// trusted to stay unreachable.
 fn payload_status_label(fork: ForkName, recorded: Option<PayloadStatus>) -> &'static str {
     if fork < ForkName::Gloas || recorded == Some(PayloadStatus::Full) {
         "full"
