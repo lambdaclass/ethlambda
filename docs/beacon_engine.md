@@ -91,6 +91,80 @@ already `INVALIDATED`, which costs one merkleization on a path that should never
 run and buys the failure arriving where a reviewer checks this code against the
 specification.
 
+### The transition runs while the answer is in flight
+
+With an execution client, `process_block` does not wait idle for the answer. It
+builds the request on the actor (copying only the payload, never the block),
+sends it from a spawned task so the HTTP exchange keeps progressing, and runs
+`fork_choice::speculate_transition` on the actor meanwhile: the block's state
+transition against its parent's post-state, with the engine assumed valid. The
+import then costs `max(engine wait, transition)` instead of their sum.
+
+That needs the spawned task to run on another thread while the actor computes,
+and in the node it does: the chain actor runs on `Backend::Thread`, whose thread
+blocks on a multi-thread tokio runtime of its own, and the task runs on that
+runtime's workers. On a current-thread runtime (a `#[tokio::test]` calling
+`process_block` directly) the request only leaves at the `await`, so the two add
+up again: the same result, without the gain.
+
+Why that is the transition `on_block` would run: `on_block` derives the
+`ExecutionEngine` from the verdict in one place, `invalid()` for `INVALIDATED`
+and `valid()` for `NOT_REQUIRED`, `VALID` and optimistic alike, and the
+transition reads nothing else off the store except content-keyed caches. What
+keeps it harmless:
+
+- A block `on_block` would refuse before its own transition gets no
+  speculation: one already imported, one from the future, one at or before the
+  finalized epoch's first slot, or one whose parent is off the finalized chain.
+  `speculate_transition` runs the same guard function `on_block` does
+  (`check_timely_and_on_the_finalized_chain`) before transitioning anything. A
+  block fetched over req/resp carries no gossip-checked signature, and the
+  transition checks the signature only after advancing the parent's state to
+  the block's slot, so without this such a block could make the actor run that
+  advance where `on_block` would have refused it for free.
+- The result is a local value (`SpeculativeTransition`). The block, its
+  post-state and its fork choice records reach neither the store nor the network
+  until `on_block_speculative` accepts it, and that runs every check `on_block`
+  makes, unchanged and in the same order. The one write computing it can make is
+  an epoch-crossing block's boundary balances, a cache entry keyed by the
+  checkpoint and built from the parent's state alone, so it is the entry
+  `on_block`'s own transition would write and is right whatever becomes of the
+  block.
+- The argument above rests on the actor handling one message at a time, which
+  no type enforces. Builds with debug assertions (the test suite's
+  `release-fast` among them) therefore run the transition again whenever a
+  speculation is used and panic unless both agree on the outcome and the
+  post-state root.
+- It stands in for the transition only when it was computed for this block's
+  root and parent root and the verdict is not `INVALIDATED`. For `INVALIDATED`
+  it is dropped and `on_block` recomputes with `invalid()`, so the invalidation
+  path is the one described above, unchanged. The decision is
+  `SpeculativeTransition::stands_in_for`, which compares the speculation's
+  engine with `PayloadValidity::execution_engine`, the function `on_block` picks
+  its own engine with, and the actor counts `used` with that same call.
+- A block that ends up held (no verdict, or `SYNCING`/`ACCEPTED` for a block
+  that is not an optimistic candidate) drops it. The attempt is counted in
+  `lean_engine_speculation_total{outcome}`.
+- A panicked or cancelled request task holds the block too, since there is no
+  verdict, but it is a fault in this node rather than in the execution client:
+  it is logged as an error and is not counted in `lean_engine_no_verdict_total`.
+- The request task is aborted if the import is dropped before the answer is
+  read, so an abandoned import never leaves a request running out its retry
+  ladder.
+- Reading the parent's state for the speculation never panics the actor: a
+  storage error there skips the speculation, and `on_block` meets the same error
+  on its own lookup.
+
+The overlap shows in the import timing tree: the transition that ran during the
+round trip is reported under `stf` (used or discarded), and `engine` reports only
+what the question cost beyond it: building the request (a copy of the
+payload) and the wait that was left once the transition finished, the request's
+construction alone when the answer was already in. Without an execution client,
+and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
+`engine` is zero, and the path is the old one. How long the execution client itself took to answer is
+`lean_engine_new_payload_seconds{outcome}`, timed around every `engine_newPayload*`
+request this module sends (`timed_new_payload`), a gloas envelope's included.
+
 ## The verdicts
 
 `optimistic-sync.md` groups the five wire statuses into three outcomes:

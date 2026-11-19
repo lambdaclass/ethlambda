@@ -5,7 +5,7 @@ mod beacon_state_delta;
 mod committee_cache;
 mod error;
 mod liveness;
-mod metrics;
+pub mod metrics;
 pub mod pools;
 mod proto_array;
 mod state_codec;
