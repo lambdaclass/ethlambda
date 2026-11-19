@@ -60,7 +60,9 @@ it the node advertises `0.0.0.0` and logs a warning. It still dials out and
 follows the chain, but peers cannot reach it until discovery learns the address
 from their replies. The Beacon API binds `127.0.0.1:5052` by default, so
 `--http-address` is only needed to reach it from another host. Stop the node
-with `Ctrl+C` or SIGTERM.
+with `Ctrl+C`. v1.0.0 shuts down gracefully on SIGINT only, so a systemd unit
+running it needs `KillSignal=SIGINT`; later versions handle SIGTERM, systemd's
+default, too.
 
 - `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
   (Haswell or later), and glibc 2.35 or newer.
@@ -149,7 +151,11 @@ docker run -d --name ethrex --network ethereum \
   --authrpc.addr      0.0.0.0 \
   --authrpc.jwtsecret /jwt.hex
 
-docker run -d --name ethlambda-beacon --network ethereum \
+# v1.0.0 shuts down gracefully on SIGINT only (later versions handle SIGTERM too), so
+# `--stop-signal` makes `docker stop` send SIGINT rather than SIGTERM.
+# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
+# unflushed state is lost, so `--stop-timeout` gives it a minute.
+docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
@@ -177,7 +183,11 @@ mkdir -p beacon-data
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
-docker run -d --name ethlambda-beacon \
+# v1.0.0 shuts down gracefully on SIGINT only (later versions handle SIGTERM too), so
+# `--stop-signal` makes `docker stop` send SIGINT rather than SIGTERM.
+# Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
+# unflushed state is lost, so `--stop-timeout` gives it a minute.
+docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
