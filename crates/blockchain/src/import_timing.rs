@@ -113,8 +113,9 @@ pub struct VerifyTimings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculationOutcome {
     /// Handed to `fork_choice::on_block_speculative` with a verdict that lets it
-    /// stand in for the transition. A block that then fails one of `on_block`'s
-    /// earlier checks still counts, since the work was spent either way.
+    /// stand in for the transition. A speculation is only computed for a block
+    /// that passes the checks `on_block` makes before its transition, so this
+    /// is the transition `on_block` took.
     Used,
     /// The verdict was `INVALIDATED`, so `on_block` runs its own transition
     /// with an `invalid()` engine.

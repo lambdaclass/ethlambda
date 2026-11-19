@@ -106,6 +106,15 @@ and `valid()` for `NOT_REQUIRED`, `VALID` and optimistic alike, and the
 transition reads nothing else off the store except content-keyed caches. What
 keeps it harmless:
 
+- A block `on_block` would refuse before its own transition gets no
+  speculation: one already imported, one from the future, one at or before the
+  finalized epoch's first slot, or one whose parent is off the finalized chain.
+  `speculate_transition` runs the same guard function `on_block` does
+  (`check_timely_and_on_the_finalized_chain`) before transitioning anything. A
+  block fetched over req/resp carries no gossip-checked signature, and the
+  transition checks the signature only after advancing the parent's state to
+  the block's slot, so without this such a block could make the actor run that
+  advance where `on_block` would have refused it for free.
 - The result is a local value (`SpeculativeTransition`). The block, its
   post-state and its fork choice records reach neither the store nor the network
   until `on_block_speculative` accepts it, and that runs every check `on_block`

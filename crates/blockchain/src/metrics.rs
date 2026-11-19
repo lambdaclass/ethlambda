@@ -1510,10 +1510,12 @@ pub fn inc_engine_no_verdict() {
 /// Speculative state transitions, by what became of them.
 ///
 /// With an execution client, the chain actor runs a block's state transition
-/// while the `engine_newPayload` round trip is in flight. `outcome` is `used`
-/// (handed to `fork_choice::on_block` with a verdict that lets it stand in for
-/// the transition; a block that then fails one of `on_block`'s earlier checks
-/// still counts, since the work was spent either way), `discarded_invalidated`
+/// while the `engine_newPayload` round trip is in flight, for a block that has
+/// its parent's post-state and passes the checks `on_block` makes before its
+/// own transition (see `fork_choice::speculate_transition`). A block asked
+/// about without one is not counted here. `outcome` is `used` (handed to
+/// `fork_choice::on_block` with a verdict that lets it stand in for the
+/// transition), `discarded_invalidated`
 /// (the verdict was `INVALIDATED`, so `on_block` runs its own), `discarded_held`
 /// (no verdict, or a non-candidate `SYNCING`/`ACCEPTED`, so the block is not
 /// imported) or `discarded_mismatch` (computed for another root or parent;

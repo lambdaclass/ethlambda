@@ -5921,8 +5921,18 @@ mod tests {
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
         // Genesis now, so slot 1 is recent by the wall clock and only an
         // execution parent could make the block a candidate. It has none.
-        let (mut server, block) = server_asking(client, unix_now_ms() / 1000);
+        let genesis_time = unix_now_ms() / 1000;
+        let (mut server, block) = server_asking(client, genesis_time);
         let block_root = block.message_hash_tree_root();
+        // The store's clock at the block's slot, as the arrival handler leaves
+        // it, so the block is not refused as one from the future before the
+        // verdict is read. The wall clock, which decides candidacy, stays put.
+        let config = server.store.config();
+        fork_choice::on_tick(
+            &mut server.store,
+            genesis_time + config.seconds_per_slot,
+            &config,
+        );
         assert!(
             !fork_choice::is_optimistic_candidate_block(
                 &server.store,

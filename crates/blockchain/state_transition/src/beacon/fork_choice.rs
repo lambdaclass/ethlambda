@@ -4905,6 +4905,49 @@ impl SpeculativeTransition {
     }
 }
 
+/// The checks [`on_block`] makes between finding the parent's post-state and
+/// the data-availability check: the block is not from the future, it is later
+/// than the finalized epoch's first slot, and its parent descends from the
+/// finalized checkpoint.
+///
+/// One function for both callers, so [`speculate_transition`] refuses exactly
+/// the blocks `on_block` would refuse here, before either runs a transition.
+/// `index` is the `LiveChain` snapshot `on_block` goes on using after these
+/// checks, which is why it is a parameter.
+fn check_timely_and_on_the_finalized_chain(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    parent_root: Root,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<()> {
+    // Blocks cannot be in the future. If they are, their consideration must
+    // be delayed until they are in the past.
+    verify(
+        get_current_slot(store, config) >= signed_block.slot(),
+        "get_current_slot(store) >= block.slot",
+    )?;
+
+    // Check that block is later than the finalized epoch slot (optimization
+    // to reduce calls to get_ancestor).
+    let finalized_checkpoint = store.beacon_finalized_checkpoint();
+    let finalized_slot = compute_start_slot_at_epoch(finalized_checkpoint.epoch);
+    verify(
+        signed_block.slot() > finalized_slot,
+        "block.slot > finalized_slot",
+    )?;
+    // Check block is a descendant of the finalized block at the checkpoint
+    // finalized slot. A single-call index: see `get_ancestor`'s documentation
+    // for why a per-hop lookup would be the wrong trade, which does not apply
+    // to this one walk.
+    let finalized_checkpoint_block =
+        get_checkpoint_block(index, parent_root, finalized_checkpoint.epoch)?;
+    verify(
+        finalized_checkpoint.root == finalized_checkpoint_block,
+        "store.finalized_checkpoint.root == finalized_checkpoint_block",
+    )
+}
+
 /// Runs `signed_block`'s state transition against its parent's post-state with
 /// the execution engine assumed valid, without importing anything.
 ///
@@ -4922,10 +4965,23 @@ impl SpeculativeTransition {
 /// a storage error must not panic it here, and `on_block` meets the same error
 /// on its own lookup and reports it there.
 ///
-/// None of `on_block`'s own checks run here. They run, unchanged and in the
-/// same order, when the speculation is handed to [`on_block_speculative`], so a
-/// block that fails one of them is rejected exactly as it is today and the
-/// speculation is dropped.
+/// Also `None` for a block `on_block` would refuse before its own transition:
+/// one that already has a post-state, one from the future, one at or before
+/// the finalized epoch's first slot, or one whose parent does not descend from
+/// the finalized checkpoint (see [`check_timely_and_on_the_finalized_chain`],
+/// which both run). A block arriving over req/resp carries no gossip-checked
+/// signature, and the transition checks it only after advancing the parent's
+/// state to the block's slot, so without this a block `on_block` rejects for
+/// free could make the actor run that advance first. Two of `on_block`'s
+/// guards are left to the caller, since neither can fire for a block the actor
+/// speculates on: data availability, which `process_block` checks before it
+/// asks the execution client, and gloas's parent-payload check, since a gloas
+/// block carries no payload to ask about. A storage error on any of these
+/// reads is `None` too, for the reason above.
+///
+/// `on_block`'s own checks still run, unchanged and in the same order, when the
+/// speculation is handed to [`on_block_speculative`]; the ones here only decide
+/// whether a transition is worth computing ahead of them.
 pub fn speculate_transition(
     store: &Store,
     signed_block: &SignedBeaconBlock,
@@ -4934,7 +4990,13 @@ pub fn speculate_transition(
 ) -> Option<SpeculativeTransition> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
+    if !matches!(store.has_state(&block_root), Ok(false)) {
+        return None;
+    }
     let parent_state = store.get_state(&parent_root).ok().flatten()?;
+    let index = store.get_live_chain().ok()?;
+    check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
+        .ok()?;
     let active_balances = store.active_balance_cache();
     let (state, outcome) = transition_block(
         store,
@@ -5042,40 +5104,19 @@ pub fn on_block_speculative(
     };
     let payload_link = rules.payload_link(parent_status);
 
-    // Blocks cannot be in the future. If they are, their consideration must
-    // be delayed until they are in the past.
-    verify(
-        get_current_slot(store, config) >= signed_block.slot(),
-        "get_current_slot(store) >= block.slot",
-    )?;
-
-    // Check that block is later than the finalized epoch slot (optimization
-    // to reduce calls to get_ancestor).
-    let finalized_checkpoint = store.beacon_finalized_checkpoint();
-    let finalized_slot = compute_start_slot_at_epoch(finalized_checkpoint.epoch);
-    verify(
-        signed_block.slot() > finalized_slot,
-        "block.slot > finalized_slot",
-    )?;
-    // Check block is a descendant of the finalized block at the checkpoint
-    // finalized slot. A single-call index: see `get_ancestor`'s documentation
-    // for why a per-hop lookup would be the wrong trade, which does not apply
-    // to this one walk.
-    //
-    // `mut`, and kept alive for the rest of this function: the pre-import
-    // head computation and the proposer-boost shuffling check further down
-    // both want this same pre-insertion snapshot of `LiveChain` (`walk_head`
-    // takes it as a parameter, matching `get_filtered_block_tree`), so it is
-    // built once here rather than three times over. Once `block_root` itself
-    // joins the store below, one `insert` keeps this index in step with it
-    // instead of re-scanning for that alone.
+    // `mut`, and kept alive for the rest of this function: the finalized-chain
+    // check just below, the pre-import head computation and the
+    // proposer-boost shuffling check further down all want this same
+    // pre-insertion snapshot of `LiveChain` (`walk_head` takes it as a
+    // parameter, matching `get_filtered_block_tree`), so it is built once here
+    // rather than three times over. Once `block_root` itself joins the store
+    // below, one `insert` keeps this index in step with it instead of
+    // re-scanning for that alone.
     let mut index = store.block_index();
-    let finalized_checkpoint_block =
-        get_checkpoint_block(&index, parent_root, finalized_checkpoint.epoch)?;
-    verify(
-        finalized_checkpoint.root == finalized_checkpoint_block,
-        "store.finalized_checkpoint.root == finalized_checkpoint_block",
-    )?;
+    // Not from the future, later than the finalized epoch's first slot, and on
+    // the finalized chain. Shared with `speculate_transition`, so a block
+    // refused here never got a transition there either.
+    check_timely_and_on_the_finalized_chain(store, &signed_block, parent_root, config, &index)?;
 
     // [New in Deneb/Electra] Check if blob data is available. [New in Fulu]
     // The same check, over column sidecars instead of blobs. Both run before
@@ -7682,6 +7723,70 @@ mod tests {
         inner.message.parent_root = Root::repeat_byte(0xcd);
         assert!(
             speculate_transition(&store, &block, &config, &CommitteeCache::default()).is_none()
+        );
+    }
+
+    /// A block `on_block` refuses before its own transition never gets one
+    /// computed ahead of it either. Each case would otherwise transition: the
+    /// valid child's parent state is there, and the transition itself reads no
+    /// clock and no finalized checkpoint.
+    #[test]
+    fn no_speculation_for_a_block_on_block_refuses_before_its_transition() {
+        let speculate = |store: &Store, block: &SignedBeaconBlock, config: &Config| {
+            speculate_transition(store, block, config, &CommitteeCache::default())
+        };
+
+        // The premise: the same block with nothing in the way is speculated.
+        let (config, store, block) = store_with_valid_child();
+        assert!(speculate(&store, &block, &config).is_some());
+
+        // From the future: the store's clock one slot short of the block's.
+        let (config, mut store, block) = store_with_valid_child();
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * (block.slot() - 1),
+            ))
+            .expect("set time");
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block from the future"
+        );
+
+        // Off the finalized chain: its parent has a post-state, but is not a
+        // block the store's `LiveChain` index knows, the shape a retained state
+        // of a branch finality abandoned leaves.
+        let (config, mut store, mut block) = store_with_valid_child();
+        let stray_parent = Root::repeat_byte(0xab);
+        let parent_state = store
+            .get_state(&block.parent_root())
+            .expect("get")
+            .expect("the anchor's post-state");
+        store
+            .insert_state(stray_parent, (*parent_state).clone())
+            .expect("insert");
+        let SignedBeaconBlock::Phase0(inner) = &mut block else {
+            unreachable!("phase0");
+        };
+        inner.message.parent_root = stray_parent;
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block whose parent is not on the finalized chain"
+        );
+
+        // Already imported.
+        let (config, mut store, block) = store_with_valid_child();
+        on_block(
+            &mut store,
+            block.clone(),
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::NotRequired,
+            &CommitteeCache::default(),
+        )
+        .expect("the valid child imports");
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block that already has a post-state"
         );
     }
 
