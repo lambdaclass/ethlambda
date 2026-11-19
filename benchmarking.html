@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8fcd8f54.js";
+            window.path_to_searchindex_js = "searchindex-51bd3ad2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -433,12 +433,20 @@ is full. It happens inside <code>fork_choice::on_block</code>, so <code>stf</cod
 is state-transition work and the two phases do not overlap. When blocks import
 faster than the writer persists them, the wait shows up here rather than in
 <code>stf</code>.</p>
+<p>With an execution client the beacon <code>stf</code> row also includes a state
+transition that ran while <code>engine_newPayload</code> was in flight, and <code>engine</code> then
+reports only what the request cost beyond it: building it, and the wait left
+after the transition, which is nothing when the answer was already in. The
+execution client’s own time is <code>lean_engine_new_payload_seconds</code>. A replay has
+no client, so none of this applies to its numbers.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>
-<li><strong>No execution client</strong>, so <code>engine</code> reports a near-zero section with nothing
-to call and <code>fcu</code> never runs. On a live follower paired with one, <code>engine</code> was
-31ms p50, about 0.5% of an import; a replay’s numbers are complete without it.</li>
+<li><strong>No execution client</strong>, so <code>engine</code> reports a zero section with nothing to
+call and <code>fcu</code> never runs. On a live follower paired with one, the
+<code>engine_newPayload</code> round trip was 31ms p50, about 0.5% of an import, before
+the state transition was overlapped with it; a replay’s numbers are complete
+without it.</li>
 <li><strong>An empty custody set</strong>, so <code>columns_wait</code> never runs and no block is ever
 held waiting on data availability. A corpus supplies every block directly;
 there are no columns to wait for.</li>

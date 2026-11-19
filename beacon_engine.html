@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8fcd8f54.js";
+            window.path_to_searchindex_js = "searchindex-51bd3ad2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -264,6 +264,76 @@ specification puts that failure. The transition is run even when the verdict is
 already <code>INVALIDATED</code>, which costs one merkleization on a path that should never
 run and buys the failure arriving where a reviewer checks this code against the
 specification.</p>
+<h3 id="the-transition-runs-while-the-answer-is-in-flight"><a class="header" href="#the-transition-runs-while-the-answer-is-in-flight">The transition runs while the answer is in flight</a></h3>
+<p>With an execution client, <code>process_block</code> does not wait idle for the answer. It
+builds the request on the actor (copying only the payload, never the block),
+sends it from a spawned task so the HTTP exchange keeps progressing, and runs
+<code>fork_choice::speculate_transition</code> on the actor meanwhile: the block’s state
+transition against its parent’s post-state, with the engine assumed valid. The
+import then costs <code>max(engine wait, transition)</code> instead of their sum.</p>
+<p>That needs the spawned task to run on another thread while the actor computes,
+and in the node it does: the chain actor runs on <code>Backend::Thread</code>, whose thread
+blocks on a multi-thread tokio runtime of its own, and the task runs on that
+runtime’s workers. On a current-thread runtime (a <code>#[tokio::test]</code> calling
+<code>process_block</code> directly) the request only leaves at the <code>await</code>, so the two add
+up again: the same result, without the gain.</p>
+<p>Why that is the transition <code>on_block</code> would run: <code>on_block</code> derives the
+<code>ExecutionEngine</code> from the verdict in one place, <code>invalid()</code> for <code>INVALIDATED</code>
+and <code>valid()</code> for <code>NOT_REQUIRED</code>, <code>VALID</code> and optimistic alike, and the
+transition reads nothing else off the store except content-keyed caches. What
+keeps it harmless:</p>
+<ul>
+<li>A block <code>on_block</code> would refuse before its own transition gets no
+speculation: one already imported, one from the future, one at or before the
+finalized epoch’s first slot, or one whose parent is off the finalized chain.
+<code>speculate_transition</code> runs the same guard function <code>on_block</code> does
+(<code>check_timely_and_on_the_finalized_chain</code>) before transitioning anything. A
+block fetched over req/resp carries no gossip-checked signature, and the
+transition checks the signature only after advancing the parent’s state to
+the block’s slot, so without this such a block could make the actor run that
+advance where <code>on_block</code> would have refused it for free.</li>
+<li>The result is a local value (<code>SpeculativeTransition</code>). The block, its
+post-state and its fork choice records reach neither the store nor the network
+until <code>on_block_speculative</code> accepts it, and that runs every check <code>on_block</code>
+makes, unchanged and in the same order. The one write computing it can make is
+an epoch-crossing block’s boundary balances, a cache entry keyed by the
+checkpoint and built from the parent’s state alone, so it is the entry
+<code>on_block</code>’s own transition would write and is right whatever becomes of the
+block.</li>
+<li>The argument above rests on the actor handling one message at a time, which
+no type enforces. Builds with debug assertions (the test suite’s
+<code>release-fast</code> among them) therefore run the transition again whenever a
+speculation is used and panic unless both agree on the outcome and the
+post-state root.</li>
+<li>It stands in for the transition only when it was computed for this block’s
+root and parent root and the verdict is not <code>INVALIDATED</code>. For <code>INVALIDATED</code>
+it is dropped and <code>on_block</code> recomputes with <code>invalid()</code>, so the invalidation
+path is the one described above, unchanged. The decision is
+<code>SpeculativeTransition::stands_in_for</code>, which compares the speculation’s
+engine with <code>PayloadValidity::execution_engine</code>, the function <code>on_block</code> picks
+its own engine with, and the actor counts <code>used</code> with that same call.</li>
+<li>A block that ends up held (no verdict, or <code>SYNCING</code>/<code>ACCEPTED</code> for a block
+that is not an optimistic candidate) drops it. The attempt is counted in
+<code>lean_engine_speculation_total{outcome}</code>.</li>
+<li>A panicked or cancelled request task holds the block too, since there is no
+verdict, but it is a fault in this node rather than in the execution client:
+it is logged as an error and is not counted in <code>lean_engine_no_verdict_total</code>.</li>
+<li>The request task is aborted if the import is dropped before the answer is
+read, so an abandoned import never leaves a request running out its retry
+ladder.</li>
+<li>Reading the parent’s state for the speculation never panics the actor: a
+storage error there skips the speculation, and <code>on_block</code> meets the same error
+on its own lookup.</li>
+</ul>
+<p>The overlap shows in the import timing tree: the transition that ran during the
+round trip is reported under <code>stf</code> (used or discarded), and <code>engine</code> reports only
+what the question cost beyond it: building the request (a copy of the
+payload) and the wait that was left once the transition finished, the request’s
+construction alone when the answer was already in. Without an execution client,
+and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
+<code>engine</code> is zero, and the path is the old one. How long the execution client itself took to answer is
+<code>lean_engine_new_payload_seconds{outcome}</code>, timed around every <code>engine_newPayload*</code>
+request this module sends (<code>timed_new_payload</code>), a gloas envelope’s included.</p>
 <h2 id="the-verdicts"><a class="header" href="#the-verdicts">The verdicts</a></h2>
 <p><code>optimistic-sync.md</code> groups the five wire statuses into three outcomes:</p>
 <div class="table-wrapper">

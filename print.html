@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8fcd8f54.js";
+            window.path_to_searchindex_js = "searchindex-51bd3ad2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -3669,6 +3669,76 @@ specification puts that failure. The transition is run even when the verdict is
 already <code>INVALIDATED</code>, which costs one merkleization on a path that should never
 run and buys the failure arriving where a reviewer checks this code against the
 specification.</p>
+<h3 id="the-transition-runs-while-the-answer-is-in-flight"><a class="header" href="#the-transition-runs-while-the-answer-is-in-flight">The transition runs while the answer is in flight</a></h3>
+<p>With an execution client, <code>process_block</code> does not wait idle for the answer. It
+builds the request on the actor (copying only the payload, never the block),
+sends it from a spawned task so the HTTP exchange keeps progressing, and runs
+<code>fork_choice::speculate_transition</code> on the actor meanwhile: the block’s state
+transition against its parent’s post-state, with the engine assumed valid. The
+import then costs <code>max(engine wait, transition)</code> instead of their sum.</p>
+<p>That needs the spawned task to run on another thread while the actor computes,
+and in the node it does: the chain actor runs on <code>Backend::Thread</code>, whose thread
+blocks on a multi-thread tokio runtime of its own, and the task runs on that
+runtime’s workers. On a current-thread runtime (a <code>#[tokio::test]</code> calling
+<code>process_block</code> directly) the request only leaves at the <code>await</code>, so the two add
+up again: the same result, without the gain.</p>
+<p>Why that is the transition <code>on_block</code> would run: <code>on_block</code> derives the
+<code>ExecutionEngine</code> from the verdict in one place, <code>invalid()</code> for <code>INVALIDATED</code>
+and <code>valid()</code> for <code>NOT_REQUIRED</code>, <code>VALID</code> and optimistic alike, and the
+transition reads nothing else off the store except content-keyed caches. What
+keeps it harmless:</p>
+<ul>
+<li>A block <code>on_block</code> would refuse before its own transition gets no
+speculation: one already imported, one from the future, one at or before the
+finalized epoch’s first slot, or one whose parent is off the finalized chain.
+<code>speculate_transition</code> runs the same guard function <code>on_block</code> does
+(<code>check_timely_and_on_the_finalized_chain</code>) before transitioning anything. A
+block fetched over req/resp carries no gossip-checked signature, and the
+transition checks the signature only after advancing the parent’s state to
+the block’s slot, so without this such a block could make the actor run that
+advance where <code>on_block</code> would have refused it for free.</li>
+<li>The result is a local value (<code>SpeculativeTransition</code>). The block, its
+post-state and its fork choice records reach neither the store nor the network
+until <code>on_block_speculative</code> accepts it, and that runs every check <code>on_block</code>
+makes, unchanged and in the same order. The one write computing it can make is
+an epoch-crossing block’s boundary balances, a cache entry keyed by the
+checkpoint and built from the parent’s state alone, so it is the entry
+<code>on_block</code>’s own transition would write and is right whatever becomes of the
+block.</li>
+<li>The argument above rests on the actor handling one message at a time, which
+no type enforces. Builds with debug assertions (the test suite’s
+<code>release-fast</code> among them) therefore run the transition again whenever a
+speculation is used and panic unless both agree on the outcome and the
+post-state root.</li>
+<li>It stands in for the transition only when it was computed for this block’s
+root and parent root and the verdict is not <code>INVALIDATED</code>. For <code>INVALIDATED</code>
+it is dropped and <code>on_block</code> recomputes with <code>invalid()</code>, so the invalidation
+path is the one described above, unchanged. The decision is
+<code>SpeculativeTransition::stands_in_for</code>, which compares the speculation’s
+engine with <code>PayloadValidity::execution_engine</code>, the function <code>on_block</code> picks
+its own engine with, and the actor counts <code>used</code> with that same call.</li>
+<li>A block that ends up held (no verdict, or <code>SYNCING</code>/<code>ACCEPTED</code> for a block
+that is not an optimistic candidate) drops it. The attempt is counted in
+<code>lean_engine_speculation_total{outcome}</code>.</li>
+<li>A panicked or cancelled request task holds the block too, since there is no
+verdict, but it is a fault in this node rather than in the execution client:
+it is logged as an error and is not counted in <code>lean_engine_no_verdict_total</code>.</li>
+<li>The request task is aborted if the import is dropped before the answer is
+read, so an abandoned import never leaves a request running out its retry
+ladder.</li>
+<li>Reading the parent’s state for the speculation never panics the actor: a
+storage error there skips the speculation, and <code>on_block</code> meets the same error
+on its own lookup.</li>
+</ul>
+<p>The overlap shows in the import timing tree: the transition that ran during the
+round trip is reported under <code>stf</code> (used or discarded), and <code>engine</code> reports only
+what the question cost beyond it: building the request (a copy of the
+payload) and the wait that was left once the transition finished, the request’s
+construction alone when the answer was already in. Without an execution client,
+and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
+<code>engine</code> is zero, and the path is the old one. How long the execution client itself took to answer is
+<code>lean_engine_new_payload_seconds{outcome}</code>, timed around every <code>engine_newPayload*</code>
+request this module sends (<code>timed_new_payload</code>), a gloas envelope’s included.</p>
 <h2 id="the-verdicts"><a class="header" href="#the-verdicts">The verdicts</a></h2>
 <p><code>optimistic-sync.md</code> groups the five wire statuses into three outcomes:</p>
 <div class="table-wrapper">
@@ -6106,7 +6176,7 @@ samples nothing and publishes no series here.</p>
 <p>The bookkeeping an import triggers (chain-event emission, the finality eviction sweep, the gauge refresh including a RocksDB size estimate per table) has no section of its own. It is charged to the section it follows, which is <code>fc_head</code> on lean and <code>block_atts</code> on beacon. Those three were sections once: across 5248 imports on a mainnet follower none of them reached a millisecond, so they were three rows that never moved in every tree and three label values that never said anything. The work is still counted, just where it happens.</p>
 <p><code>decode</code> is a gossip-only section, so <code>queue</code> is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: <code>decode</code> is a gossip population even though the <code>source</code> label allows <code>sync</code>, and a fetched block’s <code>total</code> starts later in its life than a gossiped block’s, having never counted the request round trip at all.</p>
 <p>On the beacon wire, <code>decode</code> for <code>source="gossip"</code> spans more than its name says. <code>BlockArrival::decode_start</code> is still the wire arrival, but <code>handed_off</code> is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check’s own <code>spawn_blocking</code> task, and the verdict’s trip back through the p2p actor’s mailbox. There is no wait for a free validation slot to attribute here either: <code>try_acquire_owned</code> never blocks, and a message arriving with none free is reported <code>Ignore(Overloaded)</code> (and still forwarded to the chain actor) rather than queued. A rising <code>decode</code> on the beacon wire alone therefore does not mean decoding got slower; check <code>lean_beacon_gossip_validation_seconds</code> before assuming so.</p>
-<p><code>engine</code> and <code>fcu</code> are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.</p>
+<p><code>engine</code> and <code>fcu</code> are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. <code>engine</code> is only the part of the <code>engine_newPayload</code> question the import could not hide behind its own state transition: building the request (a copy of the payload), plus whatever of the round trip was left once that transition finished. For a block whose answer arrived first it is the request’s construction alone; how often that is the case depends on the execution client being faster than the transition. The round trip itself is <code>lean_engine_new_payload_seconds</code>. The transition that ran meanwhile is charged to <code>stf</code> whether or not the import used it, and the log line’s <code>speculation</code> field says which (<code>used</code>, <code>discarded_invalidated</code>, <code>discarded_held</code> or <code>discarded_mismatch</code>), so a block whose <code>stf</code> holds two transitions says so.</p>
 <p>The <code>source</code> label has two values, <code>gossip</code> and <code>sync</code> (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its <code>defer</code> section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no <code>decode</code> and an empty <code>queue</code> taken when the import began. Both still appear in the log, which names them <code>deferred</code> and <code>local</code>.</p>
 <p>Series appear as blocks arrive rather than being seeded, since a third of the phases are beacon-only and a lean node can never write to them.</p>
 <div class="table-wrapper">
@@ -6116,6 +6186,8 @@ samples nothing and publishes no series here.</p>
 </thead>
 <tbody>
 <tr><td><code>lean_block_import_phase_seconds</code></td><td>Histogram</td><td>Time one section of a block’s import, or of the arrival carrying it, took</td><td>Per section that ran, on each import, hold or failure</td><td>phase (see below); source=gossip,sync</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32</td></tr>
+<tr><td><code>lean_engine_speculation_total</code></td><td>Counter</td><td>State transitions the chain actor ran while the <code>engine_newPayload</code> round trip was in flight, by what became of them</td><td>Per beacon block asked of an execution client that has its parent’s post-state and passes the checks <code>on_block</code> makes before its transition (not from the future, past the finalized epoch’s start, on the finalized chain); a block refused by one of those is asked about but gets no speculation and is not counted</td><td>outcome=used,discarded_invalidated,discarded_held,discarded_mismatch</td><td></td></tr>
+<tr><td><code>lean_engine_new_payload_seconds</code></td><td>Histogram</td><td>Time the execution client took to answer <code>engine_newPayload*</code>, from the request to the answer, retry ladder included: a pre-gloas block’s payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client’s processing time, not what the import waited (the <code>engine</code> phase)</td><td>Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks</td><td>outcome=valid,optimistic,invalidated,no_verdict (<code>no_verdict</code>: the whole retry ladder with no answer, or one attempt answered with a JSON-RPC error, which is not retried)</td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32</td></tr>
 <tr><td><code>lean_block_import_cascade_blocks</code></td><td>Histogram</td><td>Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts)</td><td>Once per arriving block message</td><td></td><td>1, 2, 3, 5, 8, 16, 32, 64, 128</td></tr>
 </tbody>
 </table>
@@ -6136,10 +6208,10 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>cascade_wait</code></td><td>Between the parent’s import finishing and this block being popped off the cascade queue</td><td>both</td></tr>
 <tr><td><code>da_check</code></td><td>The custody-column availability check itself, not the wait</td><td>beacon</td></tr>
 <tr><td><code>columns_wait</code></td><td>Held because custody columns had not all arrived</td><td>beacon</td></tr>
-<tr><td><code>engine</code></td><td>The <code>engine_newPayload</code> round trip, including its retry ladder</td><td>beacon</td></tr>
+<tr><td><code>engine</code></td><td>What the <code>engine_newPayload</code> question cost beyond the state transition that ran meanwhile: building and sending the request (a copy of the payload), and the wait for the verdict left once that transition finished. Observed as <code>0</code> for every block with no request to send (no execution client, pre-merge, gloas), and as the request’s construction alone for a block whose answer was in before the transition finished. Larger when the execution client was slower than the transition, or gave no answer (the rest of its retry ladder, block held)</td><td>beacon</td></tr>
 <tr><td><code>verify_struct</code></td><td>Participant bounds checks and pubkey resolution</td><td>lean</td></tr>
 <tr><td><code>verify_crypto</code></td><td>The leanVM multi-message aggregate verification</td><td>lean</td></tr>
-<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition and the state root, and excludes <code>writer_wait</code>, which is nested inside it</td><td>both</td></tr>
+<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition and the state root, and excludes <code>writer_wait</code>, which is nested inside it. It includes the transition that ran during the <code>engine_newPayload</code> round trip, also when that one was then discarded and run again (an <code>INVALIDATED</code> verdict) or the block was held</td><td>both</td></tr>
 <tr><td><code>writer_wait</code></td><td>Beacon only: the importer’s blocking hand-off of the post-state to the storage crate’s background writer, which waits while the writer’s queue is full. Subtracted from <code>stf</code>, so <code>stf</code> and <code>writer_wait</code> do not overlap</td><td>beacon</td></tr>
 <tr><td><code>db_write</code></td><td>The block write and handing the post-state off to the storage crate’s background writer; the state’s own encode/diff/commit cost is <code>lean_state_write_seconds</code> instead, not this row</td><td>lean</td></tr>
 <tr><td><code>fc_head</code></td><td><code>update_head</code></td><td>lean</td></tr>
@@ -6434,7 +6506,7 @@ leanMetrics spec.</p>
 <tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lean_beacon_epoch_precompute_lookups_total</code></td><td>Counter</td><td>Epoch-crossing imports, by whether a precomputed boundary state was cached</td><td>On each import whose parent is before the block’s epoch start and whose block is at or after it</td><td>result=hit,miss</td><td></td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_lookups_total</code></td><td>Counter</td><td>Epoch-crossing block transitions, by whether a precomputed boundary state was cached</td><td>On each state transition of a block whose parent is before the block’s epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the <code>engine_newPayload</code> round trip and then discarded for an <code>INVALIDATED</code> verdict, or re-checked in a debug build), and once for a block held after its speculation ran</td><td>result=hit,miss</td><td></td></tr>
 <tr><td><code>lean_beacon_epoch_precompute_seconds</code></td><td>Histogram</td><td>Worker time to advance, flush and hash one state</td><td>When a precompute worker finishes</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8</td></tr>
 <tr><td><code>lean_beacon_epoch_precompute_started_total</code></td><td>Counter</td><td>Workers started, by trigger</td><td>When a worker is spawned</td><td>trigger=head,timer</td><td></td></tr>
 </tbody>
@@ -8493,12 +8565,20 @@ is full. It happens inside <code>fork_choice::on_block</code>, so <code>stf</cod
 is state-transition work and the two phases do not overlap. When blocks import
 faster than the writer persists them, the wait shows up here rather than in
 <code>stf</code>.</p>
+<p>With an execution client the beacon <code>stf</code> row also includes a state
+transition that ran while <code>engine_newPayload</code> was in flight, and <code>engine</code> then
+reports only what the request cost beyond it: building it, and the wait left
+after the transition, which is nothing when the answer was already in. The
+execution client’s own time is <code>lean_engine_new_payload_seconds</code>. A replay has
+no client, so none of this applies to its numbers.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>
-<li><strong>No execution client</strong>, so <code>engine</code> reports a near-zero section with nothing
-to call and <code>fcu</code> never runs. On a live follower paired with one, <code>engine</code> was
-31ms p50, about 0.5% of an import; a replay’s numbers are complete without it.</li>
+<li><strong>No execution client</strong>, so <code>engine</code> reports a zero section with nothing to
+call and <code>fcu</code> never runs. On a live follower paired with one, the
+<code>engine_newPayload</code> round trip was 31ms p50, about 0.5% of an import, before
+the state transition was overlapped with it; a replay’s numbers are complete
+without it.</li>
 <li><strong>An empty custody set</strong>, so <code>columns_wait</code> never runs and no block is ever
 held waiting on data availability. A corpus supplies every block directly;
 there are no columns to wait for.</li>
