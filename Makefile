@@ -105,6 +105,13 @@ test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chai
 # differently and rebuilt most of it, from `libc` up, for tests that run in 5 s.
 # Package-qualified features, since an unqualified one would have to exist in
 # both packages.
+#
+# One invocation also unifies `ethlambda-blockchain`'s dependency and
+# dev-dependency features into the spec suite's build. Today none of them
+# enables a feature of an ethlambda crate (its dev-dependencies add only tokio
+# features). A feature that changes what the state transition or the crypto
+# does (a mock, a skipped verification) must therefore never be enabled from
+# `ethlambda-blockchain`, or the spec suite would run with it and still pass.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
 	$(BEACON_TEST) -p ethlambda-blockchain --features ethlambda-state-transition/beacon-spec-tests,ethlambda-blockchain/beacon-spec-tests
 
