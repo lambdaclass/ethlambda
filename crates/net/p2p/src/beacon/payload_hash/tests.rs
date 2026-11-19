@@ -380,9 +380,12 @@ fn a_gloas_mismatch_is_counted_but_not_refused() {
     let mut changed = envelope();
     changed.message.payload.gas_used += 1;
     assert!(verify_envelope(&changed).is_err());
-    assert_eq!(envelope_verdict(Outcome::Accept, &changed), Outcome::Accept);
-    let queued = Outcome::Queue(QueueReason::StateNotCached);
-    assert_eq!(envelope_verdict(queued, &changed), queued);
+    for source in [EnvelopeSource::Gossip, EnvelopeSource::Fetch] {
+        let accepted = envelope_verdict(Outcome::Accept, &changed, source);
+        assert_eq!(accepted, Outcome::Accept, "{source:?}");
+        let queued = Outcome::Queue(QueueReason::StateNotCached);
+        assert_eq!(envelope_verdict(queued, &changed, source), queued);
+    }
 }
 
 /// Not a check: how long [`verify_block`] takes, copies included, on the real

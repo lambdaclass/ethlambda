@@ -40,7 +40,8 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks, payload_hash};
+use crate::beacon::payload_hash::{self, EnvelopeSource};
+use crate::beacon::{builder_market, column_checks};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -150,7 +151,7 @@ impl Validated {
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
             Self::Envelope(envelope) => {
                 let outcome = gossip::envelope::stateful_checks(store, envelope);
-                payload_hash::envelope_verdict(outcome, envelope)
+                payload_hash::envelope_verdict(outcome, envelope, EnvelopeSource::Gossip)
             }
             Self::ExecutionPayloadBid { bid, market } => {
                 gossip::execution_payload_bid::stateful_checks(store, market, bid)

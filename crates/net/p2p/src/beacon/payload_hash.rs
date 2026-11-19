@@ -56,7 +56,7 @@ use ethrex_common::{Address, Bloom, Bytes, H256, NativeCrypto, U256};
 use ethrex_rlp::encode::RLPEncode;
 use ethrex_rlp::structs::Encoder;
 use ethrex_trie::Trie;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::metrics;
 
@@ -209,6 +209,11 @@ impl<'a> Fields<'a> {
             .encode_optional_field(&self.blob_gas.map(|(_, excess)| excess))
             .encode_optional_field(&self.parent_beacon_block_root.map(H256))
             .encode_optional_field(&requests_hash)
+            // Gloas (Amsterdam): the order of these two, and the fields
+            // themselves, are pinned only by a real Platåberget envelope
+            // (`plataberget_gloas_envelope_slot_593101.ssz`). Re-check both
+            // against the final EIP-7928 and EIP-7843 header before a
+            // mismatch is refused (lambdaclass/ethlambda#818).
             .encode_optional_field(&block_access_list_hash)
             .encode_optional_field(&slot_number)
             .finish();
@@ -365,8 +370,10 @@ pub(crate) fn block_verdict(
     };
     metrics::inc_beacon_payload_block_hash_mismatch("block");
     let slot = block.slot();
+    let proposer = block.proposer_index();
     warn!(
         slot,
+        proposer,
         block_root = %ShortRoot(&block_root.0),
         claimed = %ShortRoot(&mismatch.claimed),
         computed = %ShortRoot(&mismatch.computed),
@@ -386,9 +393,14 @@ pub(crate) fn block_verdict(
 /// node unable to follow the chain; a pre-gloas block refused on gossip still
 /// comes back by root. The counter says whether the encoding agrees with the
 /// chain until the header is final and this can refuse.
+///
+/// A mismatch is logged at `warn` for a gossip envelope and at `debug` for a
+/// fetched one: if the header did move, range sync would otherwise warn once
+/// per envelope of every batch, and the counter already counts them all.
 pub(crate) fn envelope_verdict(
     outcome: Outcome,
     envelope: &gloas::SignedExecutionPayloadEnvelope,
+    source: EnvelopeSource,
 ) -> Outcome {
     if outcome != Outcome::Accept {
         return outcome;
@@ -396,15 +408,36 @@ pub(crate) fn envelope_verdict(
     let _ = verify_envelope(envelope).inspect_err(|mismatch| {
         metrics::inc_beacon_payload_block_hash_mismatch("envelope");
         let slot = envelope.message.payload.slot_number;
-        warn!(
-            slot,
-            block_root = %ShortRoot(&envelope.message.beacon_block_root.0),
-            claimed = %ShortRoot(&mismatch.claimed),
-            computed = %ShortRoot(&mismatch.computed),
-            "An envelope's payload block hash is not its header's; not refused before the Amsterdam header is final"
-        );
+        let block_root = ShortRoot(&envelope.message.beacon_block_root.0);
+        let claimed = ShortRoot(&mismatch.claimed);
+        let computed = ShortRoot(&mismatch.computed);
+        match source {
+            EnvelopeSource::Gossip => warn!(
+                slot,
+                %block_root,
+                %claimed,
+                %computed,
+                "An envelope's payload block hash is not its header's; not refused before the Amsterdam header is final"
+            ),
+            EnvelopeSource::Fetch => debug!(
+                slot,
+                %block_root,
+                %claimed,
+                %computed,
+                "A fetched envelope's payload block hash is not its header's; not refused before the Amsterdam header is final"
+            ),
+        }
     });
     outcome
+}
+
+/// Where an envelope judged by [`envelope_verdict`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvelopeSource {
+    /// The `execution_payload` gossip topic.
+    Gossip,
+    /// An `execution_payload_envelopes_by_{range,root}` answer.
+    Fetch,
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use tracing::{debug, error, warn};
 
 use crate::P2PServer;
-use crate::beacon::payload_hash;
+use crate::beacon::payload_hash::{self, EnvelopeSource};
 
 /// Whether a fetched envelope goes to the chain actor.
 pub(crate) fn forwards(outcome: &Outcome) -> bool {
@@ -55,7 +55,7 @@ fn judge(store: &Store, envelope: &SignedExecutionPayloadEnvelope) -> Outcome {
     // The payload block hash rule the gossip topic runs too, after the
     // builder's signature verified. Counted, never refused, for gloas.
     let outcome = stateful_checks(store, envelope);
-    payload_hash::envelope_verdict(outcome, envelope)
+    payload_hash::envelope_verdict(outcome, envelope, EnvelopeSource::Fetch)
 }
 
 /// Run the gossip rules on `envelopes` and send the chain actor the ones that
