@@ -261,7 +261,9 @@ pub struct ProgressiveSortedReader<'a, T, U> {
 
 impl<'a, T: Value, U: UpdateMap<T>> ProgressiveSortedReader<'a, T, U> {
     /// The element at `index`, or `None` past the end. `index` must not be
-    /// below the previous call's (checked in debug builds).
+    /// below the previous call's (checked in debug builds); the answer would
+    /// still be right, as [`SortedReader::get`]'s is, but a step back costs a
+    /// new search from the first subtree.
     pub fn get(&mut self, index: usize) -> Option<&'a T> {
         debug_assert!(
             index >= self.last,
@@ -269,6 +271,15 @@ impl<'a, T: Value, U: UpdateMap<T>> ProgressiveSortedReader<'a, T, U> {
             self.last
         );
         self.last = index;
+        // Below the subtree last read, or after a read past the end: start
+        // again from the first subtree rather than subtract past a start.
+        if self
+            .subtrees
+            .get(self.current)
+            .is_none_or(|(start, _)| index < *start)
+        {
+            self.current = 0;
+        }
         while let Some((start, reader)) = self.subtrees.get_mut(self.current) {
             if index < *start + reader.len() {
                 return reader.get(index - *start);
