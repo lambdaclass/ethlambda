@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 use crate::beacon::{
     ApiError,
     bids::{describe, require_version, unix_ms},
-    decode_list, emit_accepted,
+    copy_if_listened, decode_list, emit_accepted,
 };
 
 /// The most entries one request may carry: the SSZ list's bound,
@@ -163,12 +163,14 @@ fn submit(
             });
             continue;
         }
-        let for_event = signed.clone();
+        let for_event = copy_if_listened(events, &signed);
         match p2p.publish_proposer_preferences(signed) {
             Ok(()) => {
-                emit_accepted(events, || {
-                    GossipEvent::ProposerPreferences(Box::new(for_event))
-                });
+                if let Some(signed) = for_event {
+                    emit_accepted(events, || {
+                        GossipEvent::ProposerPreferences(Box::new(signed))
+                    });
+                }
                 debug!(%slot, validator, "Accepted proposer preferences for gossip")
             }
             Err(_) => failures.push(Failure {

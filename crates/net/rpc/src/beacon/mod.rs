@@ -162,10 +162,11 @@ impl BodyEncoding {
 /// Report an object the API accepted on the event stream, when the node has an
 /// [`EventBus`](ethlambda_blockchain::EventBus) and anyone listens.
 ///
-/// `event` builds the payload only behind that check, since a bid or an
-/// envelope's fields are cloned into it. The bus is an `Option<Extension<_>>`
-/// on the handlers that call this, so a router built without one (the
-/// handlers' own tests) still serves.
+/// `event` builds the payload only behind that check. A handler whose payload
+/// is the object it then moves into the publish copies it beforehand with
+/// [`copy_if_listened`], which asks the same question. The bus is an
+/// `Option<Extension<_>>` on the handlers that call this, so a router built
+/// without one (the handlers' own tests) still serves.
 pub(crate) fn emit_accepted(
     events: Option<&ethlambda_blockchain::EventBus>,
     event: impl FnOnce() -> ethlambda_network_api::GossipEvent,
@@ -174,6 +175,21 @@ pub(crate) fn emit_accepted(
     if let Some(events) = events.filter(|events| events.has_subscribers()) {
         GossipEventSink::emit(events, event());
     }
+}
+
+/// A copy of `object` for [`emit_accepted`], made only when the node has an
+/// event bus and anyone listens.
+///
+/// The submission handlers move the object into its publish before they know
+/// whether it went out, so the event needs its own copy, and most nodes have
+/// no subscriber to pay a bid's KZG commitments for.
+pub(crate) fn copy_if_listened<T: Clone>(
+    events: Option<&ethlambda_blockchain::EventBus>,
+    object: &T,
+) -> Option<T> {
+    events
+        .is_some_and(|events| events.has_subscribers())
+        .then(|| object.clone())
 }
 
 /// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ

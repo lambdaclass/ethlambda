@@ -12,7 +12,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::beacon::emit_accepted;
 use axum::{
     Extension, Router,
     body::Bytes,
@@ -57,7 +56,7 @@ use tracing::{debug, warn};
 use crate::{
     CustodyColumns,
     beacon::{
-        ApiError, decode_list,
+        ApiError, copy_if_listened, decode_list, emit_accepted,
         validator::{head, require_execution_client, require_validated},
     },
     shared::content::{Encoding, ssz_response, with_consensus_version},
@@ -435,12 +434,14 @@ async fn post_pool_payload_attestations(
             debug!(%slot, validator, "Payload attestation already pooled; not republishing");
             continue;
         }
-        let for_event = message.clone();
+        let for_event = copy_if_listened(events.as_deref(), &message);
         match p2p.publish_payload_attestation_message(message) {
             Ok(()) => {
-                emit_accepted(events.as_deref(), || {
-                    GossipEvent::PayloadAttestationMessage(for_event)
-                });
+                if let Some(message) = for_event {
+                    emit_accepted(events.as_deref(), || {
+                        GossipEvent::PayloadAttestationMessage(message)
+                    });
+                }
                 debug!(%slot, validator, "Accepted payload attestation for gossip")
             }
             Err(_) => failures.push(Failure {
