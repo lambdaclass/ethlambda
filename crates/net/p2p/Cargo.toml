@@ -9,6 +9,11 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Exposes the crate-private gossip codec helpers to `fuzz/` (see
+# `docs/fuzzing.md`). Never enabled by a production build.
+fuzzing = []
+
 [dependencies]
 ethlambda-network-api.workspace = true
 ethlambda-storage.workspace = true
