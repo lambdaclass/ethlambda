@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ca6bbeb5.js";
+            window.path_to_searchindex_js = "searchindex-85125f25.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -861,7 +861,7 @@ spec.</p>
 <tr><td><code>lean_data_columns_stored_total</code></td><td>Counter</td><td>Data column sidecars verified and written to <code>Table::DataColumns</code></td><td>On the chain actor storing a sidecar the p2p layer verified</td><td></td><td></td></tr>
 <tr><td><code>lean_data_columns_rejected_total</code></td><td>Counter</td><td>Sidecars the p2p layer’s chain checks dropped, by reason</td><td>On each drop in <code>beacon::column_checks</code>, except an already stored sidecar</td><td>reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal</td><td></td></tr>
 <tr><td><code>lean_data_column_kzg_verify_seconds</code></td><td>Histogram</td><td>Time spent in one KZG cell-proof batch verification: one sidecar’s cells in gossip validation, one sub-batch of at most 16 of one block’s sidecars in the chain checks, which for every sub-batch after a block’s first is how long it holds its <code>column_check_permits</code> permit (see <a href="beacon_wire.html#data-column-sidecars">Data column sidecars</a>), plus one observation per sidecar if that batch fails and each is re-verified alone</td><td>On each KZG batch verification, in gossip validation or the chain checks</td><td></td><td>0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0</td></tr>
-<tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries</td><td></td></tr>
+<tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries,peers_exhausted,no_custodian</td><td></td></tr>
 <tr><td><code>lean_blocks_held_for_columns</code></td><td>Gauge</td><td>Blocks held out of fork choice pending their custody columns</td><td>On every hold, release, and finality eviction of the held-block set</td><td></td><td></td></tr>
 <tr><td><code>lean_sidecars_awaiting_parent</code></td><td>Gauge</td><td>Sidecars parked until their block’s parent has a post-state</td><td>On every park, replay, and finality eviction of the parked set</td><td></td><td></td></tr>
 <tr><td><code>lean_envelopes_awaiting_block</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until their block is imported</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
@@ -887,10 +887,15 @@ availability gate, and a healthy node returns it to zero within a slot or two
 of a hold: fetch or gossip should complete well inside the retry ladder
 <code>lean_data_column_fetch_failures_total</code> counts down. A gauge that sits above
 zero for several slots means either the fetch is failing — check whether
-<code>lean_data_column_fetch_failures_total</code>’s <code>no_peers</code> or <code>max_retries</code> reason
-is climbing — or no reachable peer actually serves the missing columns; short
-of that, only finality passing the held block’s slot clears it, which can be
-minutes away.</p>
+<code>lean_data_column_fetch_failures_total</code>’s <code>no_peers</code>, <code>max_retries</code> or
+<code>peers_exhausted</code> reason is climbing (the last: every connected peer failed a
+request or sent an invalid sidecar in one lookup) — or no reachable peer
+actually serves the missing columns, which
+the <code>no_custodian</code> reason counts: a lookup that ends without finding anyone
+connected holding the missing columns, because none is known to custody them
+or every peer asked after the block’s slot answered without them.
+Short of that, only finality passing the held block’s slot clears it, which
+can be minutes away.</p>
 <p><strong>Read <code>lean_sidecars_awaiting_parent</code> beside it.</strong> A sidecar whose block’s
 parent has no post-state yet is parked rather than dropped, and a held block is
 precisely a block with no post-state, so the two gauges rise together while the

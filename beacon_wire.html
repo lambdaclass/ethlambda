@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ca6bbeb5.js";
+            window.path_to_searchindex_js = "searchindex-85125f25.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -922,11 +922,19 @@ hits this on every held block, and without it such a follower imported
 roughly one block per slot, waiting out the redrive below for a request
 gossip was never going to answer. Either way, <code>redrive_held_blocks</code> runs on
 every slot tick: for each block still held it sends the same request for
-exactly the columns still missing, with
-<code>MAX_FETCH_RETRIES</code> attempts and backoff doubling from <code>INITIAL_BACKOFF_MS</code>, a
-peer that has already failed this lookup excluded until the whole pool is
-exhausted. A lookup that runs out of peers or
-retries stops asking until the next tick asks again; see
+exactly the columns still missing. One lookup is split across peers, and each
+request settles on its own once its answer has been through the chain checks:
+what passed leaves the lookup, and what the peer left out is asked again at
+once, without waiting for the lookup’s other requests, with
+<code>MAX_FETCH_RETRIES</code> attempts and backoff doubling from <code>INITIAL_BACKOFF_MS</code>.
+Only a request that left something out spends an attempt. A peer whose request
+failed, or that sent a sidecar the checks refused, is not asked again in that
+lookup. A peer that answered without a column is asked for it again only
+while the block is at the tip (it may not have received the column yet), and
+then after every other candidate; past the tip it is not. Before a
+retry asks, the columns the store already holds (gossip often delivers them
+meanwhile) are taken off. A lookup that runs out of retries, or has nobody
+left to ask, stops asking until the next tick asks again; see
 <code>lean_data_column_fetch_failures_total</code> in <a href="./metrics.html">metrics.md</a>. The
 block is released the moment its last missing column arrives, and dropped
 along with any pending descendants once finality passes its slot, whichever
@@ -940,8 +948,12 @@ the spec’s own observation that “due to the deterministic custody functions,
 node knows exactly what a peer should be able to respond to”. The count comes
 from <code>metadata/3</code>, requested once per connection right behind <code>Status</code>, and is
 seeded from the ENR <code>cgc</code> for a peer this node dialed; a peer that has supplied
-neither is not assumed to custody anything, and the by-root path falls back to
-asking one at random for whatever no known custodian covers. At mainnet’s
+neither is not assumed to custody anything, and both paths send whatever no
+known custodian covers to such a peer rather than to one that has said what it
+keeps. The by-root path gives as many of those columns as it can to one such
+peer at a time; only a column none of them can be asked for goes to a peer of
+known custody, once per lookup, since such a peer may hold more than it
+custodies. At mainnet’s
 <code>CUSTODY_REQUIREMENT</code> a peer holds 8 of 128 columns, so this is the difference
 between a request that can be answered and one that usually cannot.</p>
 <p>What this node deliberately does not do with its own slice of the matrix: it
