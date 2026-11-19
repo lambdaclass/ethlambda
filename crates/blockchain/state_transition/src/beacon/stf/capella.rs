@@ -454,6 +454,8 @@ pub fn process_bls_to_execution_change(
         ),
         "bls.Verify(address_change.from_bls_pubkey, signing_root, signed_address_change.signature)",
     )?;
+    // Before the credentials are rewritten on the strength of it.
+    signatures.verify_pending()?;
 
     let mut credentials = [0u8; 32];
     credentials[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;

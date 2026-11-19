@@ -7,46 +7,67 @@
 //! slashings), and checking them in one random-linear-combination
 //! batch costs a fraction of checking them one by one (see
 //! [`ethlambda_crypto::bls::verify_signature_sets`]). So processing *builds*
-//! each set where the specification verifies it, pushes it here, and the block
-//! driver verifies the whole [`SignatureBatch`] once processing ends.
+//! each set where the specification verifies it and pushes it here, and the
+//! [`SignatureBatch`] is verified wherever waiting longer would let an
+//! unverified signature decide what the block writes, and once more when
+//! processing ends.
 //!
 //! # What may be deferred
 //!
-//! A signature may be deferred exactly when its failure rejects the block, since
+//! A signature may be deferred only when its failure rejects the block, since
 //! then the late rejection and the early one end in the same place: the state
 //! the block was applied to is discarded either way. Block import runs the
-//! transition on a clone of the parent's state (`transition_block` in
-//! `fork_choice.rs`) and never reads that clone after an error, so a state
-//! left partly mutated by a block that is rejected a few steps later is never
-//! observed. What must stay immediate is a signature whose failure does *not*
-//! reject the block but changes what happens next: a deposit with a bad
-//! signature is skipped and the block carries on, so that check cannot wait.
+//! transition on a clone of the parent's state, and `transition_block` in
+//! `fork_choice.rs` hands no state back with an error. What must stay
+//! immediate is a signature whose failure does *not* reject the block but
+//! changes what happens next: a deposit with a bad signature is skipped and
+//! the block carries on, so that check cannot wait.
 //!
-//! Deferring lets an operation with a forged signature change the state the
-//! rest of the block runs on (a forged slashing slashes before the sync
-//! aggregate's rewards are paid), but it reaches no state a valid block could
-//! not: what an operation does never depends on its signature, so the same
-//! effects follow from the same operation genuinely signed (a validator that
-//! did equivocate, an exit that was signed). Any panic a later operation hits
-//! there is one a valid block can reach too. Every path that applies outside
-//! input checks signatures (`validate_result` is true on import and in era
-//! replay), and the proposer's signature is checked before the body runs.
+//! Deferring a signature lets its operation write before the signature is
+//! known to be good, and lets the operations after it run on that write. That
+//! is confined to votes: an attestation's participation flags and the
+//! inclusion reward it pays the proposer, which are what honest votes for the
+//! same data write; the sync aggregate's rewards and penalties, the last step
+//! of a block, so nothing runs after them; and gloas's payload attestations,
+//! which write nothing. Everything else checks its own set, together with
+//! every set still pending, before it writes, through
+//! [`SignatureBatch::verify_pending`]:
+//!
+//! - the RANDAO reveal, so the mix is never fed an unverified reveal (in
+//!   gloas, the builder's bid, pushed just before it, is checked with it);
+//! - proposer and attester slashings, voluntary exits and BLS-to-execution
+//!   changes, the operations that change a validator's record.
+//!
+//! So no operation that slashes, exits or redirects a validator writes on a
+//! forged signature, or runs on a state an earlier forged signature wrote to:
+//! a block cannot combine forged slashings, exits and credential changes into
+//! a state no set of honest signers produces. A block of ordinary votes still
+//! checks all of its attestations and its sync aggregate in one batch.
+//!
+//! # What a forged block costs
+//!
+//! Rejecting a block whose body carries a bad signature costs the processing
+//! up to the check that catches it, that batch, and finding the bad set in it.
+//! The processing is bounded as it was with immediate checks, which also ran
+//! every operation before reaching the sync aggregate's signature, the last
+//! one a block carries. A forged slashing, exit or credential change is caught
+//! at its own operation, before anything after it runs. Finding the bad set
+//! bisects the failed batch rather than re-checking each set on its own (see
+//! [`SignatureBatch::verify_pending`]), so it costs less than the batch did.
 //!
 //! # What a late failure names
 //!
 //! Every error is the check's own label (the same `&'static str` the immediate
 //! check would have failed with), so a rejected block's error still says which
 //! signature was bad. A batch that fails does not know which set did, so it
-//! re-checks the sets one at a time in push order and reports the first that
-//! fails, which is also the one the immediate checks would have stopped at.
-//! The order between a bad signature and some *other* check later in the block
-//! can differ from the immediate path: a block with two defects may now be
-//! rejected for the later one, or the signature, depending on which the
-//! driver reaches first. Which defect is named was never part of the
-//! specification, only that the block is invalid.
+//! looks for the first failing set in push order, which is also the one the
+//! immediate checks would have stopped at. The order between a bad signature
+//! and some *other* check later in the block can differ from the immediate
+//! path: a block with two defects may now be rejected for the later one, or
+//! the signature, depending on which the driver reaches first. Which defect is
+//! named was never part of the specification, only that the block is invalid.
 
 use ethlambda_crypto::bls::{SignatureSet, verify_signature_sets};
-use rayon::prelude::*;
 use tracing::error;
 
 use crate::beacon::error::{Result, verify};
@@ -91,13 +112,14 @@ impl SignatureBatch {
     }
 
     /// Runs `f` with a batch that defers every set pushed to it, then verifies
-    /// them all: what a block's driver does, and the only way outside tests
-    /// to defer signatures. An error from `f` is returned as is, since it
-    /// rejects whatever `f` was processing whatever the signatures say.
+    /// what is still pending: what a block's driver does, and the only way
+    /// outside tests to defer signatures. An error from `f` is returned as is,
+    /// since it rejects whatever `f` was processing whatever the signatures
+    /// say.
     pub fn deferred<T>(f: impl FnOnce(&mut SignatureBatch) -> Result<T>) -> Result<T> {
         let mut batch = Self::empty(false);
         let out = f(&mut batch)?;
-        batch.verify()?;
+        batch.verify_pending()?;
         Ok(out)
     }
 
@@ -128,42 +150,97 @@ impl SignatureBatch {
         Ok(())
     }
 
-    /// One batch check. On failure, re-checks the sets one by one and rejects
-    /// with the first failing set's `what` in push order, so the error names
-    /// the check the immediate path would have stopped at.
+    /// Checks every set pushed since the last check, now and in one batch,
+    /// and rejects with the first failing set's `what` in push order: the
+    /// check the immediate path would have stopped at.
     ///
-    /// The re-checks run on rayon's pool, so a failing batch costs the batch
-    /// plus one round of single checks spread over the cores. That stays
-    /// bounded: only a block that is rejected pays it, the block's operation
-    /// limits cap how many sets it pushes, and on import `apply_block` checks
-    /// the proposer's signature (and the header its proposer index) before
-    /// this runs, so making such a block takes the slot proposer's key.
-    pub(crate) fn verify(self) -> Result<()> {
+    /// For an operation about to write something no unverified signature may
+    /// decide (see the module documentation). It pushes its own set, then
+    /// calls this before writing, so its set and every one still pending are
+    /// checked first. A batch that checks at push time has nothing pending, so
+    /// for it this costs nothing.
+    ///
+    /// A failed batch is bisected to find its first failing set (see
+    /// [`first_failing`]), which costs less than the batch did, rather than
+    /// re-checking each set on its own, which costs a whole pairing per set on
+    /// top of the batch.
+    pub(crate) fn verify_pending(&mut self) -> Result<()> {
         debug_assert_eq!(self.sets.len(), self.labels.len(), "one label per set");
-        if verify_signature_sets(&self.sets) {
-            return Ok(());
-        }
-        if let Some(first_bad) = self.sets.par_iter().position_first(|set| !set.verify()) {
-            return verify(false, self.labels[first_bad]);
-        }
-        // A batch of valid sets always passes, so a set should have failed
-        // above. None did, which is a bug in the batch check: the block is
-        // still rejected rather than accepted, but loudly, since a block every
-        // single check accepts is valid and rejecting it can fork this node off.
-        error!(
-            sets = self.sets.len(),
-            "Signature batch failed but every set verifies on its own; rejecting the block"
-        );
-        crate::metrics::inc_signature_batch_disagreements();
-        let last = self.labels.last().copied().unwrap_or("block signatures");
-        verify(false, last)
+        let outcome = check(&self.sets, &self.labels);
+        self.sets.clear();
+        self.labels.clear();
+        outcome
     }
 
-    /// Whether no set has been deferred.
+    /// [`Self::verify_pending`], for a test's batch nothing is pushed to
+    /// afterwards.
+    #[cfg(test)]
+    pub(crate) fn verify(mut self) -> Result<()> {
+        self.verify_pending()
+    }
+
+    /// Whether no set is pending.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.sets.is_empty()
     }
+}
+
+/// [`SignatureBatch::verify_pending`]'s check of `sets`, `labels[i]` naming
+/// `sets[i]`.
+fn check(sets: &[SignatureSet], labels: &[&'static str]) -> Result<()> {
+    if verify_signature_sets(sets) {
+        return Ok(());
+    }
+    if let Some(first_bad) = first_failing(sets) {
+        return verify(false, labels[first_bad]);
+    }
+    // A batch of valid sets always passes, so a set should have failed
+    // above. None did, which is a bug in the batch check: the block is
+    // still rejected rather than accepted, but loudly, since a block every
+    // single check accepts is valid and rejecting it can fork this node off.
+    error!(
+        sets = sets.len(),
+        "Signature batch failed but the set it was narrowed to verifies on its own; rejecting the block"
+    );
+    crate::metrics::inc_signature_batch_disagreements();
+    let last = labels.last().copied().unwrap_or("block signatures");
+    verify(false, last)
+}
+
+/// The position of the first set in `sets` that fails on its own, given that
+/// `sets` failed as one batch. `None` when the set that search lands on
+/// verifies after all, which only a bug in the batch check can cause.
+///
+/// Bisects: each step checks, as one batch, the first half of the range known
+/// to hold the first failing set, and keeps that half if it fails or the
+/// other if it passes. Each half checked is half the size of the one before,
+/// so together they hold fewer sets than `sets` does, at one final
+/// exponentiation per step: for the ~130 sets of a full pre-electra block,
+/// fewer than 130 Miller loops and 8 final exponentiations, where checking
+/// every set on its own costs 130 of each.
+fn first_failing(sets: &[SignatureSet]) -> Option<usize> {
+    if sets.is_empty() {
+        return None;
+    }
+    // Every set before `start` verifies, and `sets[start..end]` holds the
+    // first that does not. `failed` is whether `sets[start..end]` itself was
+    // the last batch checked, and failed.
+    let (mut start, mut end) = (0, sets.len());
+    let mut failed = true;
+    while end - start > 1 {
+        let middle = start + (end - start) / 2;
+        if verify_signature_sets(&sets[start..middle]) {
+            start = middle;
+            failed = false;
+        } else {
+            end = middle;
+            failed = true;
+        }
+    }
+    // A batch of one is that set's own check, so a range of one that failed
+    // as a batch needs no second look.
+    (failed || !sets[start].verify()).then_some(start)
 }
 
 /// [`SignatureBatch::deferred`], under the short name the single-operation
@@ -225,6 +302,41 @@ mod tests {
         batch.push(Some(set(3, false)), "second bad").unwrap();
         let err = batch.verify().unwrap_err();
         assert!(format!("{err:?}").contains("first bad"), "{err:?}");
+    }
+
+    /// The bisection lands on the first bad set wherever it sits and however
+    /// many bad sets follow it, for batch sizes that halve evenly and that do
+    /// not.
+    #[test]
+    fn bisection_finds_the_first_bad_set_at_every_position() {
+        for len in [1u8, 2, 3, 7, 8, 13] {
+            for first_bad in 0..len {
+                for later_bad in [None, Some(len - 1)] {
+                    let sets: Vec<SignatureSet> = (0..len)
+                        .map(|i| set(i, i != first_bad && Some(i) != later_bad))
+                        .collect();
+                    assert_eq!(
+                        first_failing(&sets),
+                        Some(usize::from(first_bad)),
+                        "len {len}, first bad {first_bad}, later bad {later_bad:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verifying_clears_what_was_pending() {
+        let mut batch = SignatureBatch::new();
+        batch.push(Some(set(0, true)), "good").unwrap();
+        batch.verify_pending().unwrap();
+        assert!(batch.is_empty());
+        // A bad set pushed after a check fails the next one, and only it.
+        batch.push(Some(set(1, false)), "bad").unwrap();
+        let err = batch.verify_pending().unwrap_err();
+        assert!(format!("{err:?}").contains("bad"), "{err:?}");
+        assert!(batch.is_empty());
+        assert!(batch.verify().is_ok());
     }
 
     #[test]

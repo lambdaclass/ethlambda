@@ -538,6 +538,8 @@ pub fn process_voluntary_exit(
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     // [Modified in Electra:EIP7251]
     electra_initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
@@ -606,6 +608,8 @@ pub fn process_attester_slashing(
         indexed_attestation_signature_set(state, attestation_2),
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
+    // Before anyone is slashed on the strength of them.
+    signatures.verify_pending()?;
 
     super::operations::slash_attesting_index_intersection(
         state,

@@ -734,6 +734,8 @@ pub fn process_voluntary_exit(
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
     Ok(())
