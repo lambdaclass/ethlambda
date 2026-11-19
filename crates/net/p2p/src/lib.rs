@@ -2324,7 +2324,9 @@ impl P2PServer {
     /// (`Store::judged_head_slot`), or read from the head while it publishes
     /// none (before its first judgment, and while a beacon head names no
     /// stored block yet). On beacon, reading the head decodes the whole head
-    /// block.
+    /// block. The actor publishes it on every judgment, including once a
+    /// wall-clock slot within a long import cascade, so a cascade still
+    /// importing does not read here as a flat head.
     ///
     /// Read by the watermark expiry (both chains) and the beacon `Status`
     /// handlers. Lean's own `Status` handling reads `Store::head_slot` instead,

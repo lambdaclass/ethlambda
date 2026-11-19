@@ -2095,7 +2095,10 @@ impl BlockChainServer {
     /// sole writer of both is starved by the very imports whose progress they
     /// are meant to report. Once per arrival rather than once per block in the
     /// cascade, matching what `Handler<NewBlock>` already does with the store
-    /// clock: a cascade's blocks are all processed at one instant.
+    /// clock: a cascade's blocks are all processed at one instant. A cascade
+    /// that runs into a new wall-clock slot also judges the gate between its
+    /// blocks, publishing the head slot as it goes (see
+    /// [`Self::judge_within_cascade`]).
     ///
     /// Returns what became of `signed_block` itself, for the one caller that
     /// has to know: see [`Self::release_block_if_columns_complete`]. `None`
@@ -2149,6 +2152,10 @@ impl BlockChainServer {
     /// its import unblocks are the cascade's own business and each have their
     /// own tracking already. The count beside it is every block the cascade
     /// imported, which is what the timing tree reports.
+    ///
+    /// Between two blocks, once the wall clock has moved into a slot not
+    /// judged yet, the sync gate is judged ([`Self::judge_within_cascade`]),
+    /// so the published head slot follows a long cascade.
     async fn run_import_cascade(
         &mut self,
         mut queue: VecDeque<(SignedBeaconBlock, ImportTimings)>,
@@ -2165,6 +2172,10 @@ impl BlockChainServer {
             }
             blocks += 1;
             let outcome = self.process_or_pend_block(block, timings, &mut queue).await;
+            // The last block's judgment is `on_block`'s, right after this.
+            if outcome == Some(ImportOutcome::Imported) && !queue.is_empty() {
+                self.judge_within_cascade(self.wall_clock_slot());
+            }
             if is_first {
                 first = outcome;
                 is_first = false;
@@ -2189,6 +2200,38 @@ impl BlockChainServer {
         }
 
         (first, blocks)
+    }
+
+    /// Judge the sync gate between two blocks of a cascade once the wall clock
+    /// has moved into a slot not judged yet, which publishes the head slot
+    /// (`Store::judged_head_slot`) as the cascade moves the head.
+    ///
+    /// A cascade is one message: the tick waits behind it, and `on_block`
+    /// judges once it has drained. P2P reads the published slot to tell range
+    /// blocks that never import (`expire_range_watermark`), so a cascade
+    /// outlasting the stall window (a by-root backfill releasing a long chain
+    /// of pending children) looked like a flat head there however many blocks
+    /// it imported: the watermark was dropped, the range session ended and the
+    /// sender of the lowest batch suspected. Once a slot is what the tick the
+    /// cascade starves would have judged.
+    ///
+    /// Lean moves the head on every import, so this judges it as it stands.
+    /// Beacon records no head on an import, so this runs fork choice first
+    /// ([`Self::update_head_from_fork_choice`], which judges). The
+    /// `forkchoiceUpdated` call and the head events stay at the cascade's end
+    /// ([`Self::recompute_beacon_head`]): the judgment needs only the head,
+    /// and an `INVALID` verdict mid-cascade would invalidate blocks the queue
+    /// was built on.
+    fn judge_within_cascade(&mut self, wall_slot: u64) {
+        if self.sync_status.judged_through() >= wall_slot {
+            return;
+        }
+        match self.store.chain() {
+            Chain::Lean => self.update_sync_status(wall_slot),
+            Chain::Beacon => {
+                self.update_head_from_fork_choice();
+            }
+        }
     }
 
     /// Re-deliver `block` to this actor once its own slot has started.
@@ -5550,6 +5593,79 @@ mod tests {
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Syncing
         );
+    }
+
+    #[tokio::test]
+    async fn a_cascade_publishes_the_head_slot_between_its_blocks() {
+        // Finding: the head slot P2P reads was published once a cascade had
+        // drained, so a cascade outlasting the stall window looked like a flat
+        // head to the range watermark, which dropped the batch above it and
+        // suspected its sender. Two blocks that already have post-states
+        // cascade without a state transition; the fresh tracker has judged no
+        // slot, so the wall clock is past it and the first block's import
+        // judges. `run_import_cascade` alone, so `on_block`'s own judgment
+        // after the cascade cannot be what publishes.
+        let mut store = event_store(GENESIS_TIME);
+        let parent = bare_block(1, G);
+        let parent_root = parent.message_hash_tree_root();
+        let child = bare_block(2, parent_root);
+        let child_root = child.message_hash_tree_root();
+        for (root, block) in [(parent_root, parent.clone()), (child_root, child)] {
+            store.insert_signed_block(root, block).expect("insert");
+            store.insert_state(root, bare_state()).expect("insert");
+        }
+        let mut server = beacon_server(store);
+        server
+            .pending_blocks
+            .insert(parent_root, HashSet::from([child_root]));
+        assert_eq!(server.store.judged_head_slot(), None);
+
+        let queue = VecDeque::from([(parent, ImportTimings::default())]);
+        let mut cascade = CascadeTimings::starting_now();
+        let (outcome, blocks) = server.run_import_cascade(queue, &mut cascade).await;
+        assert_eq!(outcome, Some(ImportOutcome::Imported));
+        assert_eq!(blocks, 2);
+        assert!(server.store.judged_head_slot().is_some());
+    }
+
+    #[test]
+    fn a_cascade_judges_once_a_wall_clock_slot() {
+        // The judgment within a cascade is the starved tick's, so at most one
+        // a slot; on lean it reads the head each import has moved.
+        let backend = Arc::new(InMemoryBackend::default());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let mut server = lean_server(store);
+        server.judge_within_cascade(10);
+        assert_eq!(server.store.judged_head_slot(), Some(0));
+
+        let block = ethlambda_types::block::SignedBlock {
+            message: ethlambda_types::block::Block {
+                slot: 5,
+                proposer_index: 0,
+                parent_root: server.store.head().expect("a head"),
+                state_root: H256::ZERO,
+                body: ethlambda_types::block::BlockBody::default(),
+            },
+            proof: ethlambda_types::block::MultiMessageAggregate::default(),
+        };
+        let root = block.message.hash_tree_root();
+        server
+            .store
+            .insert_signed_block(root, SignedBeaconBlock::Lean(block))
+            .expect("insert");
+        let head = ForkCheckpoints::head_only(root);
+        server.store.update_checkpoints(head).expect("advance head");
+
+        // Within the slot judged: nothing new.
+        server.judge_within_cascade(10);
+        assert_eq!(server.store.judged_head_slot(), Some(0));
+        // Into the next one: the head as the imports left it.
+        server.judge_within_cascade(11);
+        assert_eq!(server.store.judged_head_slot(), Some(5));
     }
 
     #[tokio::test]

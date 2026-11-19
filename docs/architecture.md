@@ -186,7 +186,10 @@ on every tick and again whenever the head can move between ticks (every lean blo
 every beacon head recompute, `INVALID` `forkchoiceUpdated` verdicts included): on a
 catch-up, range sync puts the whole span into the actor's mailbox at once and the tick
 waits behind all of it, so a gate judged only on the tick kept reading synced until the
-catch-up was over. The same status feeds the `lean_node_sync_status` metric and, through a
+catch-up was over. An import cascade that runs into a new wall-clock slot is judged between
+its blocks as well, beacon running fork choice for it, since each judgment also publishes the
+head slot p2p's range watermark reads (`Store::judged_head_slot`) and a long cascade would
+otherwise look like a flat head there. The same status feeds the `lean_node_sync_status` metric and, through a
 shared controller, the `/lean/v0/node/syncing` endpoint.
 `--disable-duty-sync-gate` reduces the gate to observe-only.
 
