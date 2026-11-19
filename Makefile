@@ -24,27 +24,33 @@ lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 #
 # - Every tracked `.rs` file (`git ls-files`), wherever it lives, so a crate
 #   added outside crates/ and bin/ is covered too. If git lists none (not a
-#   checkout, or git refusing the directory) the check fails: `|| true` below
-#   would otherwise read the empty scan as a pass.
+#   checkout, or git refusing the directory) the check fails rather than read
+#   the empty scan as a pass.
 # - Each macro line plus the two after it, which catches the form rustfmt
 #   produces for a long path: `include_str!(` with the path on the next line. A
 #   path assembled further away (`concat!` across many lines) or a file opened
 #   at run time still gets past it; CLAUDE.md ("Docs-only changes skip CI")
-#   states the rule for those.
+#   states the rule for those. A line after the macro that is not its path (a
+#   comment naming `docs/`, say) can match too: a false positive, see below.
+# - Only the source lines are matched (`grep -h`), not the file name grep would
+#   put in front of each, so a `.rs` file that itself lives under a `docs/`
+#   directory is not a hit for its own path. The second scan, run only on a
+#   hit, adds the names and line numbers back for the message, so the list it
+#   prints can also show such a file's lines next to the real hit.
 # - The pattern is unanchored on purpose: `docs/` anywhere in a path, even
 #   `fixtures/docs/x.ssz`, fails. A false positive fails loudly, while a
 #   narrower pattern can miss the real thing, so widen the list rather than
 #   anchoring it. Keep it in step with the action's `inert` list.
-# - The hits are printed with `printf`, not `echo`: both dash's and macOS's `sh`
-#   expand backslash escapes in `echo`, so a `\c` in a hit cut the list short.
+# - A tracked file grep cannot open (deleted, not yet committed) is reported on
+#   stderr and skipped, not a failure: nothing builds it either.
 inert-paths-check: ## 🔎 Fail if a crate compiles in a path the docs-only CI skip treats as unread
 	@pattern='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'; \
 	git ls-files --error-unmatch '*.rs' > /dev/null || { echo "ERROR: git listed no tracked .rs files to scan."; exit 1; }; \
-	hits=$$(git ls-files -z '*.rs' | xargs -0 grep -HnE -A2 'include_(str|bytes)!' | grep -E "$$pattern" || true); \
-	if [ -n "$$hits" ]; then \
+	scan() { git ls-files -z '*.rs' | xargs -0 grep -E -A2 "$$@" -- 'include_(str|bytes)!'; }; \
+	if scan -h | grep -E "$$pattern" > /dev/null; then \
 		echo "ERROR: these compile in a path .github/actions/detect-changes treats as docs-only."; \
 		echo "Take the path off that action's inert list, or stop reading it:"; \
-		printf '%s\n' "$$hits"; \
+		scan -Hn | grep -E "$$pattern"; \
 		exit 1; \
 	fi
 
