@@ -141,9 +141,12 @@ impl PendingStates {
 /// delta into a second buffer of the same size and decodes a fresh registry:
 /// about a second of CPU and several hundred megabytes at its peak. Callers
 /// that miss on the same root at once used to each pay that in full. A late
-/// block's custody columns are checked one sidecar per blocking task, so a
-/// parent state that had left the cache was rebuilt once per column, eight at
-/// a time, and the node's resident memory jumped by gigabytes for it.
+/// block's custody columns arrive on gossip one message at a time, and each
+/// one gossip queued is checked on a blocking task of its own (the column
+/// checks share the parent state's read only among the sidecars of one
+/// delivery), so a parent state that had left the cache was rebuilt once per
+/// column, eight at a time, and the node's resident memory jumped by gigabytes
+/// for it.
 ///
 /// Each root under way has a [`OnceLock`]. The first miss runs the rebuild
 /// inside `get_or_init`; every other miss on that root blocks in
