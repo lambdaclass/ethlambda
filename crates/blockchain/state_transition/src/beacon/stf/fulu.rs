@@ -44,7 +44,8 @@ use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch,
+    get_randao_mix,
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
@@ -246,13 +247,27 @@ pub fn process_operations(
         body.attester_slashings.iter(),
         |slashing| super::electra::process_attester_slashing(state, slashing, config),
     )?;
-    try_for_each_timed(
-        StfPhase::Attestations,
-        body.attestations.iter(),
-        |attestation| {
-            super::electra::process_attestation(state, attestation, committees, active_balances)
-        },
-    )?;
+    // `electra::process_attestation` is handed the proposer rather than looking
+    // it up per attestation (see the same loop in
+    // `super::operations::process_operations`). Under fulu the lookup is a
+    // read of `proposer_lookahead`, so hoisting it saves nothing here; it is
+    // what electra's signature asks for. It is timed with the attestations,
+    // as in the other forks.
+    if !body.attestations.is_empty() {
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in body.attestations.iter() {
+                super::electra::process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                )?;
+            }
+            Ok(())
+        })?;
+    }
     // [Modified in Fulu]
     // Removed `process_deposit`
     try_for_each_timed(
