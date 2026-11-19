@@ -183,8 +183,20 @@ fn process_operations(
     for attester_slashing in attester_slashings {
         super::operations::process_attester_slashing(state, attester_slashing, config, signatures)?;
     }
-    for attestation in attestations {
-        process_attestation(state, attestation, committees, active_balances, signatures)?;
+    // One proposer lookup for the list, not one per attestation: see the same
+    // loop in `super::operations::process_operations`.
+    if !attestations.is_empty() {
+        let proposer_index = get_beacon_proposer_index(state)?;
+        for attestation in attestations {
+            process_attestation(
+                state,
+                attestation,
+                proposer_index,
+                committees,
+                active_balances,
+                signatures,
+            )?;
+        }
     }
     for deposit in deposits {
         super::operations::process_deposit(state, deposit, config)?;
@@ -294,9 +306,14 @@ pub fn process_withdrawals(
 /// state`, and the two cannot interleave in one pass without conflicting
 /// borrows (see altair's `process_attestation` for the borrow-checker
 /// argument in full).
+///
+/// `proposer_index` is the caller's `get_beacon_proposer_index(state)`, as in
+/// altair's version and for the same reason: a block resolves it once for all
+/// its attestations (see [`process_operations`]).
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
@@ -451,7 +468,6 @@ pub fn process_attestation(
     const PROPOSER_REWARD_DENOMINATOR: u64 =
         NON_PROPOSER_WEIGHT * constants::WEIGHT_DENOMINATOR / constants::PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / PROPOSER_REWARD_DENOMINATOR;
-    let proposer_index = get_beacon_proposer_index(state)?;
     increase_balance(state, proposer_index, proposer_reward)?;
 
     Ok(())

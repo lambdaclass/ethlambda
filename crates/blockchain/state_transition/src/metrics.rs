@@ -132,14 +132,18 @@ pub fn time_justified_balances_build() -> TimingGuard {
 static LEAN_BEACON_EPOCH_PRECOMPUTE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_beacon_epoch_precompute_lookups_total",
-        "Epoch-crossing block imports, by whether a precomputed epoch-boundary state was cached",
+        "Epoch-crossing block transitions, by whether a precomputed epoch-boundary state was cached",
         &["result"]
     )
     .unwrap()
 });
 
-/// Count one epoch-crossing import's lookup of a precomputed state: `hit` or
-/// `miss`.
+/// Count one epoch-crossing transition's lookup of a precomputed state: `hit`
+/// or `miss`.
+///
+/// Per transition run, not per import: an import that runs a block's
+/// transition twice (a discarded speculation, see
+/// `fork_choice::precomputed_epoch_state`) looks the state up twice.
 pub fn inc_epoch_precompute_lookups(result: &str) {
     LEAN_BEACON_EPOCH_PRECOMPUTE_LOOKUPS_TOTAL
         .with_label_values(&[result])
