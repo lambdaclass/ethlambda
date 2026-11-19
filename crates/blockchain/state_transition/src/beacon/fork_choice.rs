@@ -664,6 +664,24 @@ pub enum PayloadValidity {
     },
 }
 
+impl PayloadValidity {
+    /// The execution engine [`on_block`]'s state transition consults for a
+    /// block with this verdict, the one place the verdict reaches the
+    /// transition.
+    ///
+    /// The engine's answer is read the way the specification reads it: an
+    /// `INVALIDATED` verdict makes `verify_and_notify_new_payload` return false,
+    /// and everything else makes it return true. It is also what decides
+    /// whether a [`SpeculativeTransition`], computed with `valid()`, may stand
+    /// in for that transition, so the two cannot disagree.
+    pub fn execution_engine(&self) -> stf::ExecutionEngine {
+        match self {
+            Self::Invalidated { .. } => stf::ExecutionEngine::invalid(),
+            Self::NotRequired | Self::Validated | Self::Optimistic => stf::ExecutionEngine::valid(),
+        }
+    }
+}
+
 /// Reads an execution client's status as the verdict [`on_block`] takes.
 ///
 /// One function for both sources of a status: the real client's JSON-RPC answer
@@ -1141,8 +1159,14 @@ fn transition_block(
 /// is before the first slot of the block's epoch, and the block is at or after
 /// that slot. The precompute worker stores it under the key
 /// [`checkpoint_state`] uses for `(block_epoch, parent_root)`, since the two
-/// name the same state. Counts a hit or a miss for every such import and for
-/// no other.
+/// name the same state.
+///
+/// Counts a hit or a miss each time a transition of such a block runs, which is
+/// not always once per import: a speculation the chain actor computed while the
+/// execution client was asked (see [`speculate_transition`]) counts even when it
+/// is discarded, so an `INVALIDATED` epoch-crossing block, whose transition
+/// runs again under `invalid()`, counts twice, and so does a used speculation in
+/// a build with debug assertions, which re-runs the transition to check it.
 fn precomputed_epoch_state(
     store: &Store,
     parent_slot: Slot,
@@ -4119,7 +4143,9 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &fulu::DataColumnSidecar) 
     )
 }
 
-/// The batch check both forks' `verify_data_column_sidecar_kzg_proofs` run.
+/// The batch check both forks' `verify_data_column_sidecar_kzg_proofs` run:
+/// [`verify_column_cells_batch`] over this one column, so a column checked on
+/// its own and one checked beside others go through the same code.
 ///
 /// The one thing that differs between them is where `commitments` comes from:
 /// fulu's sidecar carries them, and gloas's takes them from the bid of the
@@ -4131,15 +4157,64 @@ fn verify_column_cells(
     commitments: &[KzgCommitment],
     proofs: &[KzgProof],
 ) -> Result<bool> {
-    let cell_indices = vec![index; column.len()];
-    let mut cells = Vec::with_capacity(column.len());
-    for cell in column {
-        cells.push(
-            c_kzg::Cell::from_bytes(&cell[..])
-                .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
-        );
+    verify_column_cells_batch(&[ColumnCells {
+        index,
+        column,
+        commitments,
+        proofs,
+    }])
+}
+
+/// One column's worth of input to [`verify_column_cells_batch`]: the cell
+/// position every cell of the column sits at, the cells, and the commitments
+/// and proofs they are checked against.
+pub struct ColumnCells<'a> {
+    pub index: u64,
+    pub column: &'a [fulu::Cell],
+    pub commitments: &'a [KzgCommitment],
+    pub proofs: &'a [KzgProof],
+}
+
+/// [`verify_column_cells`] over several columns at once: one
+/// `verify_cell_kzg_proof_batch` call whose entries are every cell of every
+/// column, in order.
+///
+/// `Ok(true)` means every cell of every column verifies. Anything else (a
+/// cell that fails, or a malformed entry) does not say which column is at
+/// fault, so a caller that must tell them apart verifies the columns one by
+/// one afterwards.
+///
+/// A column whose cells, commitments and proofs differ in length is an `Err`,
+/// as c-kzg makes it for one column on its own. Checked here, column by
+/// column, because once the columns are concatenated only the totals could be
+/// compared: a short column beside a long one would pair a cell of one with a
+/// commitment of the other, and could verify. [`verify_data_column_sidecar`]
+/// and its gloas counterpart already refuse such a sidecar, so this guards a
+/// caller that skipped them.
+pub fn verify_column_cells_batch(columns: &[ColumnCells<'_>]) -> Result<bool> {
+    let total: usize = columns.iter().map(|column| column.column.len()).sum();
+    let mut cell_indices = Vec::with_capacity(total);
+    let mut cells = Vec::with_capacity(total);
+    let mut commitments = Vec::with_capacity(total);
+    let mut proofs = Vec::with_capacity(total);
+    for column in columns {
+        let cell_count = column.column.len();
+        if column.commitments.len() != cell_count || column.proofs.len() != cell_count {
+            return Err(Error::SpecAssert(
+                "len(cells) == len(commitments) == len(proofs)",
+            ));
+        }
+        cell_indices.extend(std::iter::repeat_n(column.index, column.column.len()));
+        for cell in column.column {
+            cells.push(
+                c_kzg::Cell::from_bytes(&cell[..])
+                    .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
+            );
+        }
+        commitments.extend_from_slice(column.commitments);
+        proofs.extend_from_slice(column.proofs);
     }
-    kzg::verify_cell_kzg_proof_batch(commitments, &cell_indices, &cells, proofs)
+    kzg::verify_cell_kzg_proof_batch(&commitments, &cell_indices, &cells, &proofs)
 }
 
 /// `verify_data_column_sidecar` (gloas `p2p-interface.md`, modified): the
@@ -4802,6 +4877,257 @@ pub fn on_block(
     payload_validity: &PayloadValidity,
     committees: &CommitteeCache,
 ) -> Result<()> {
+    on_block_speculative(
+        store,
+        signed_block,
+        config,
+        blob_evidence,
+        payload_validity,
+        committees,
+        None,
+    )
+}
+
+/// The state transition of one block, computed before the execution client's
+/// verdict on its payload is known.
+///
+/// Opaque on purpose: the only thing a holder can do with one is hand it to
+/// [`on_block_speculative`], which decides whether it may stand in for the
+/// transition `on_block` would otherwise run. Until then it is a local value:
+/// the block, its post-state and its fork choice records have not reached the
+/// store, and dropping it costs only the work. Computing it may still write one
+/// content-keyed cache entry, the boundary balances of an epoch-crossing block's
+/// checkpoint (see [`speculate_transition`]), which is the entry `on_block`'s
+/// own transition would write and is correct whether or not the block imports.
+///
+/// # Why it is the transition `on_block` would run
+///
+/// `on_block` reads the verdict in one place,
+/// [`PayloadValidity::execution_engine`], to pick the [`stf::ExecutionEngine`]
+/// the transition consults: `invalid()` for [`PayloadValidity::Invalidated`],
+/// `valid()` for every other verdict (`NotRequired`, `Validated` and
+/// `Optimistic` alike). So a transition run with `valid()` is byte for byte the
+/// one `on_block` runs for every verdict except `Invalidated`, and for that one
+/// the speculation is simply not used. [`Self::stands_in_for`] asks that same
+/// function rather than naming the verdicts again, so a change to which engine
+/// a verdict selects changes which speculations are used along with it.
+///
+/// The inputs are the same too. [`transition_block`] takes the store by shared
+/// reference and reads two things off it: the epoch-boundary state the
+/// precompute worker cached, and, through [`cache_boundary_balances`], the
+/// boundary balance cache it fills. Both are keyed by content (a checkpoint,
+/// that is an epoch and a block root), so what they hold does not depend on
+/// when they are consulted. Everything else is the parent's post-state, the
+/// block, the config and the committee and active-balance caches, which are
+/// content-keyed as well. The chain actor handles one message at a time, so
+/// nothing mutates the store between this computation and `on_block`'s own.
+///
+/// That last sentence is an argument, not something the types enforce, so
+/// builds with debug assertions (the test suite's `release-fast` included)
+/// check it: whenever [`on_block_speculative`] uses a speculation it also runs
+/// the transition itself and panics unless both agree on the outcome and, for
+/// a success, on the post-state root.
+pub struct SpeculativeTransition {
+    block_root: Root,
+    parent_root: Root,
+    /// The engine it was computed with, always `valid()`. Kept so
+    /// [`Self::stands_in_for`] compares it with the one `on_block` would pick
+    /// rather than restating which verdicts that is.
+    engine: stf::ExecutionEngine,
+    state: BeaconState,
+    outcome: Result<()>,
+}
+
+impl SpeculativeTransition {
+    /// Whether this was computed for the block with this root and parent root.
+    pub fn is_for(&self, block_root: Root, parent_root: Root) -> bool {
+        self.block_root == block_root && self.parent_root == parent_root
+    }
+
+    /// Whether this may stand in for the transition [`on_block`] runs for the
+    /// block with this root and parent root under `payload_validity`: computed
+    /// for that block, and with the engine that verdict makes `on_block`
+    /// consult ([`PayloadValidity::execution_engine`]).
+    ///
+    /// [`on_block_speculative`] decides with this, and a caller counting what
+    /// became of a speculation asks the same question, so the count cannot
+    /// call a speculation used that `on_block` dropped.
+    pub fn stands_in_for(
+        &self,
+        block_root: Root,
+        parent_root: Root,
+        payload_validity: &PayloadValidity,
+    ) -> bool {
+        self.is_for(block_root, parent_root)
+            && self.engine.execution_valid == payload_validity.execution_engine().execution_valid
+    }
+
+    /// Panics unless `fresh`, the transition `on_block` computed itself, agrees
+    /// with this speculation: the same outcome and, when it succeeded, the same
+    /// post-state root.
+    ///
+    /// Outcomes are compared through their `Debug` rendering, since the error
+    /// type carries no `PartialEq`, and roots only on success, since a failed
+    /// transition's partial state is never used. Debug builds only: it doubles
+    /// the transition, which is the cost the speculation exists to hide.
+    #[cfg(debug_assertions)]
+    fn assert_agrees_with(&self, fresh: &(BeaconState, Result<()>)) {
+        let (fresh_state, fresh_outcome) = fresh;
+        assert_eq!(
+            format!("{:?}", self.outcome),
+            format!("{fresh_outcome:?}"),
+            "the speculative transition disagrees with on_block's own on the outcome"
+        );
+        if self.outcome.is_ok() {
+            assert_eq!(
+                self.state.hash_tree_root(),
+                fresh_state.hash_tree_root(),
+                "the speculative transition disagrees with on_block's own on the post-state root"
+            );
+        }
+    }
+}
+
+/// The checks [`on_block`] makes between finding the parent's post-state and
+/// the data-availability check: the block is not from the future, it is later
+/// than the finalized epoch's first slot, and its parent descends from the
+/// finalized checkpoint.
+///
+/// One function for both callers, so [`speculate_transition`] refuses exactly
+/// the blocks `on_block` would refuse here, before either runs a transition.
+/// `index` is the `LiveChain` snapshot `on_block` goes on using after these
+/// checks, which is why it is a parameter.
+fn check_timely_and_on_the_finalized_chain(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    parent_root: Root,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<()> {
+    // Blocks cannot be in the future. If they are, their consideration must
+    // be delayed until they are in the past.
+    verify(
+        get_current_slot(store, config) >= signed_block.slot(),
+        "get_current_slot(store) >= block.slot",
+    )?;
+
+    // Check that block is later than the finalized epoch slot (optimization
+    // to reduce calls to get_ancestor).
+    let finalized_checkpoint = store.beacon_finalized_checkpoint();
+    let finalized_slot = compute_start_slot_at_epoch(finalized_checkpoint.epoch);
+    verify(
+        signed_block.slot() > finalized_slot,
+        "block.slot > finalized_slot",
+    )?;
+    // Check block is a descendant of the finalized block at the checkpoint
+    // finalized slot. A single-call index: see `get_ancestor`'s documentation
+    // for why a per-hop lookup would be the wrong trade, which does not apply
+    // to this one walk.
+    let finalized_checkpoint_block =
+        get_checkpoint_block(index, parent_root, finalized_checkpoint.epoch)?;
+    verify(
+        finalized_checkpoint.root == finalized_checkpoint_block,
+        "store.finalized_checkpoint.root == finalized_checkpoint_block",
+    )
+}
+
+/// Runs `signed_block`'s state transition against its parent's post-state with
+/// the execution engine assumed valid, without importing anything.
+///
+/// The store is only read, with one exception: an epoch-crossing block's
+/// transition caches its boundary checkpoint's balances
+/// ([`cache_boundary_balances`]) and counts a precomputed-state lookup, exactly
+/// as `on_block`'s own transition would. The entry is keyed by the checkpoint
+/// and built from the parent's state alone, so it is right whatever becomes of
+/// the block.
+///
+/// `None` when the parent has no post-state, the same condition under which
+/// `on_block` fails with `block.parent_root in store.block_states`; the caller
+/// then gets that failure from `on_block` itself. Also `None` when reading the
+/// parent's state fails: this is optional work on the chain actor's thread, so
+/// a storage error must not panic it here, and `on_block` meets the same error
+/// on its own lookup and reports it there.
+///
+/// Also `None` for a block `on_block` would refuse before its own transition:
+/// one that already has a post-state, one from the future, one at or before
+/// the finalized epoch's first slot, or one whose parent does not descend from
+/// the finalized checkpoint (see [`check_timely_and_on_the_finalized_chain`],
+/// which both run). A block arriving over req/resp carries no gossip-checked
+/// signature, and the transition checks it only after advancing the parent's
+/// state to the block's slot, so without this a block `on_block` rejects for
+/// free could make the actor run that advance first. Two of `on_block`'s
+/// guards are left to the caller, since neither can fire for a block the actor
+/// speculates on: data availability, which `process_block` checks before it
+/// asks the execution client, and gloas's parent-payload check, since a gloas
+/// block carries no payload to ask about. An error the store reports for the
+/// known-root, parent-state or `LiveChain` read is `None` too, for the reason
+/// above. The finalized checkpoint and the store's clock are read the way the
+/// import path already reads them before it gets here
+/// (`process_or_pend_block`, `process_block`), so this adds no panic that path
+/// lacks.
+///
+/// `on_block`'s own checks still run, unchanged and in the same order, when the
+/// speculation is handed to [`on_block_speculative`]; the ones here only decide
+/// whether a transition is worth computing ahead of them.
+pub fn speculate_transition(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Option<SpeculativeTransition> {
+    let block_root = signed_block.message_hash_tree_root();
+    let parent_root = signed_block.parent_root();
+    if !matches!(store.has_state(&block_root), Ok(false)) {
+        return None;
+    }
+    let parent_state = store.get_state(&parent_root).ok().flatten()?;
+    let index = store.get_live_chain().ok()?;
+    check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
+        .ok()?;
+    let active_balances = store.active_balance_cache();
+    let engine = stf::ExecutionEngine::valid();
+    let (state, outcome) = transition_block(
+        store,
+        &parent_state,
+        parent_root,
+        signed_block,
+        true,
+        config,
+        &engine,
+        committees,
+        &active_balances,
+    );
+    Some(SpeculativeTransition {
+        block_root,
+        parent_root,
+        engine,
+        state,
+        outcome,
+    })
+}
+
+/// [`on_block`] with an optional transition computed ahead of time.
+///
+/// Every check `on_block` makes runs unchanged and in the same order. The only
+/// difference is the one `transition_block` call: when `speculation` was
+/// computed for this block's own root and parent root, with the engine this
+/// verdict makes `on_block` consult ([`SpeculativeTransition::stands_in_for`];
+/// today that is every verdict but `Invalidated`), its result stands in for
+/// that call. In every other case it
+/// is dropped and the transition runs here as it always has, so the
+/// invalidation path in particular is the one `on_block` has today.
+///
+/// With debug assertions on, a speculation that is used is also checked
+/// against the transition run here (see [`SpeculativeTransition`]).
+pub fn on_block_speculative(
+    store: &mut Store,
+    signed_block: SignedBeaconBlock,
+    config: &Config,
+    blob_evidence: &DataAvailability,
+    payload_validity: &PayloadValidity,
+    committees: &CommitteeCache,
+    speculation: Option<SpeculativeTransition>,
+) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
 
@@ -4868,40 +5194,19 @@ pub fn on_block(
     };
     let payload_link = rules.payload_link(parent_status);
 
-    // Blocks cannot be in the future. If they are, their consideration must
-    // be delayed until they are in the past.
-    verify(
-        get_current_slot(store, config) >= signed_block.slot(),
-        "get_current_slot(store) >= block.slot",
-    )?;
-
-    // Check that block is later than the finalized epoch slot (optimization
-    // to reduce calls to get_ancestor).
-    let finalized_checkpoint = store.beacon_finalized_checkpoint();
-    let finalized_slot = compute_start_slot_at_epoch(finalized_checkpoint.epoch);
-    verify(
-        signed_block.slot() > finalized_slot,
-        "block.slot > finalized_slot",
-    )?;
-    // Check block is a descendant of the finalized block at the checkpoint
-    // finalized slot. A single-call index: see `get_ancestor`'s documentation
-    // for why a per-hop lookup would be the wrong trade, which does not apply
-    // to this one walk.
-    //
-    // `mut`, and kept alive for the rest of this function: the pre-import
-    // head computation and the proposer-boost shuffling check further down
-    // both want this same pre-insertion snapshot of `LiveChain` (`walk_head`
-    // takes it as a parameter, matching `get_filtered_block_tree`), so it is
-    // built once here rather than three times over. Once `block_root` itself
-    // joins the store below, one `insert` keeps this index in step with it
-    // instead of re-scanning for that alone.
+    // `mut`, and kept alive for the rest of this function: the finalized-chain
+    // check just below, the pre-import head computation and the
+    // proposer-boost shuffling check further down all want this same
+    // pre-insertion snapshot of `LiveChain` (`walk_head` takes it as a
+    // parameter, matching `get_filtered_block_tree`), so it is built once here
+    // rather than three times over. Once `block_root` itself joins the store
+    // below, one `insert` keeps this index in step with it instead of
+    // re-scanning for that alone.
     let mut index = store.block_index();
-    let finalized_checkpoint_block =
-        get_checkpoint_block(&index, parent_root, finalized_checkpoint.epoch)?;
-    verify(
-        finalized_checkpoint.root == finalized_checkpoint_block,
-        "store.finalized_checkpoint.root == finalized_checkpoint_block",
-    )?;
+    // Not from the future, later than the finalized epoch's first slot, and on
+    // the finalized chain. Shared with `speculate_transition`, so a block
+    // refused here never got a transition there either.
+    check_timely_and_on_the_finalized_chain(store, &signed_block, parent_root, config, &index)?;
 
     // [New in Deneb/Electra] Check if blob data is available. [New in Fulu]
     // The same check, over column sidecars instead of blobs. Both run before
@@ -4947,20 +5252,14 @@ pub fn on_block(
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     };
 
-    // Check the block is valid and compute the post-state. The engine's answer
-    // is read the way the specification reads it: an `INVALIDATED` verdict makes
-    // `verify_and_notify_new_payload` return false, and everything else makes it
-    // return true. Running the transition even when the verdict is already
-    // `Invalidated` is deliberate. It costs a merkleization on a path that
-    // should never run, and it buys the failure arriving from inside
-    // `process_execution_payload`, which is where the specification puts it and
-    // where a reviewer checks this code against it.
-    let engine = match payload_validity {
-        PayloadValidity::Invalidated { .. } => stf::ExecutionEngine::invalid(),
-        PayloadValidity::NotRequired | PayloadValidity::Validated | PayloadValidity::Optimistic => {
-            stf::ExecutionEngine::valid()
-        }
-    };
+    // Check the block is valid and compute the post-state, with the engine the
+    // verdict selects (see `PayloadValidity::execution_engine`). Running the
+    // transition even when the verdict is already `Invalidated` is deliberate.
+    // It costs a merkleization on a path that should never run, and it buys the
+    // failure arriving from inside `process_execution_payload`, which is where
+    // the specification puts it and where a reviewer checks this code against
+    // it.
+    let engine = payload_validity.execution_engine();
     //
     // An epoch-crossing block starts from the precomputed boundary state when
     // one is cached, and from the parent's own post-state otherwise. Both reach
@@ -4973,17 +5272,29 @@ pub fn on_block(
     // The store's own cache, so every block of this chain shares one entry per
     // epoch; see `ActiveBalanceCacheExt`.
     let active_balances = store.active_balance_cache();
-    let (mut state, transition) = transition_block(
-        store,
-        &parent_state,
-        parent_root,
-        &signed_block,
-        true,
-        config,
-        &engine,
-        committees,
-        &active_balances,
-    );
+    let usable = speculation
+        .filter(|speculation| speculation.stands_in_for(block_root, parent_root, payload_validity));
+    let fresh_transition = || {
+        transition_block(
+            store,
+            &parent_state,
+            parent_root,
+            &signed_block,
+            true,
+            config,
+            &engine,
+            committees,
+            &active_balances,
+        )
+    };
+    let (mut state, transition) = match usable {
+        Some(speculation) => {
+            #[cfg(debug_assertions)]
+            speculation.assert_agrees_with(&fresh_transition());
+            (speculation.state, speculation.outcome)
+        }
+        None => fresh_transition(),
+    };
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
     // in the canonical chain. That is stated here, on the verdict, rather than
@@ -7135,34 +7446,13 @@ mod tests {
         assert!(store.is_err());
     }
 
-    /// [`on_block`]'s early-return guard must read `Store::has_state`, not
-    /// `Store::has_block`: a block the actor is holding for missing data
-    /// columns is written with
-    /// [`Store::insert_pending_block`](ethlambda_storage::Store::insert_pending_block)
-    /// before it ever imports, which stores the whole signed block in one
-    /// `BlockHeaders` row (so `has_block` answers true) but writes no
-    /// `LiveChain` entry (so [`Store::block_index`](ethlambda_storage::Store::block_index),
-    /// a `LiveChain` scan, does not name it). Guarding on `has_block` instead
-    /// of `has_state` made `on_block` answer `Ok(())` for a held block
-    /// without importing it, so every later delivery naming it as an
-    /// ancestor found it "already known" and gave up without importing
-    /// anything either -- forever, since nothing ever gave the root a
-    /// post-state.
+    /// A store anchored one slot before a genuinely valid child block, with the
+    /// clock at that block's slot, and the block itself.
     ///
-    /// Delivered timely (the first block for its slot, before the
-    /// attestation deadline), so this also proves `on_block`'s pre-import
-    /// `compute_head` call (walking `Store::block_index`, for the new
-    /// proposer-boost dependent-root gate) tolerates a held block sitting
-    /// unindexed in the store: that walk never sees it, being a `LiveChain`
-    /// scan, so it is untouched by the held block's absent post-state.
-    ///
-    /// Builds a genuinely valid child block (correct proposer, RANDAO reveal,
-    /// and state root, all real BLS signatures over
-    /// [`test_state::secret_key_for`]'s key) rather than the zero-signature
-    /// [`block`] helper, since this exercises the real, signature-checking
-    /// [`on_block`], not a fixture harness that can skip verification.
-    #[test]
-    fn on_block_imports_a_block_already_persisted_with_no_post_state() {
+    /// Valid means correct proposer, RANDAO reveal and state root, all real BLS
+    /// signatures over [`test_state::secret_key_for`]'s key, so the real,
+    /// signature-checking [`on_block`] accepts it.
+    fn store_with_valid_child() -> (Config, Store, SignedBeaconBlock) {
         let config = Config::active();
         let (anchor_state, anchor_block) = anchor_pair_with(1);
         let anchor_root = anchor_block.message_hash_tree_root();
@@ -7228,7 +7518,6 @@ mod tests {
                 .to_bytes(),
         );
         let signed_block = draft;
-        let block_root = signed_block.message_hash_tree_root();
 
         // The store holds the child block already, exactly the shape
         // `hold_block_for_columns` leaves it in: one `BlockHeaders` row (so
@@ -7253,6 +7542,39 @@ mod tests {
                 config.seconds_per_slot * target_slot,
             ))
             .expect("set time");
+        (config, store, signed_block)
+    }
+
+    /// [`on_block`]'s early-return guard must read `Store::has_state`, not
+    /// `Store::has_block`: a block the actor is holding for missing data
+    /// columns is written with
+    /// [`Store::insert_pending_block`](ethlambda_storage::Store::insert_pending_block)
+    /// before it ever imports, which stores the whole signed block in one
+    /// `BlockHeaders` row (so `has_block` answers true) but writes no
+    /// `LiveChain` entry (so [`Store::block_index`](ethlambda_storage::Store::block_index),
+    /// a `LiveChain` scan, does not name it). Guarding on `has_block` instead
+    /// of `has_state` made `on_block` answer `Ok(())` for a held block
+    /// without importing it, so every later delivery naming it as an
+    /// ancestor found it "already known" and gave up without importing
+    /// anything either -- forever, since nothing ever gave the root a
+    /// post-state.
+    ///
+    /// Delivered timely (the first block for its slot, before the
+    /// attestation deadline), so this also proves `on_block`'s pre-import
+    /// `compute_head` call (walking `Store::block_index`, for the new
+    /// proposer-boost dependent-root gate) tolerates a held block sitting
+    /// unindexed in the store: that walk never sees it, being a `LiveChain`
+    /// scan, so it is untouched by the held block's absent post-state.
+    ///
+    /// Builds a genuinely valid child block (correct proposer, RANDAO reveal,
+    /// and state root, all real BLS signatures over
+    /// [`test_state::secret_key_for`]'s key) rather than the zero-signature
+    /// [`block`] helper, since this exercises the real, signature-checking
+    /// [`on_block`], not a fixture harness that can skip verification.
+    #[test]
+    fn on_block_imports_a_block_already_persisted_with_no_post_state() {
+        let (config, mut store, signed_block) = store_with_valid_child();
+        let block_root = signed_block.message_hash_tree_root();
         store
             .insert_pending_block(block_root, signed_block.clone())
             .expect("insert");
@@ -7281,6 +7603,278 @@ mod tests {
             store.has_state(&block_root).expect("get"),
             "on_block must not mistake a persisted-but-unimported (held) \
              block for an already-imported one"
+        );
+    }
+
+    /// Imports the valid child with `validity` and `speculation` and reports
+    /// everything an import writes that a later reader could tell apart.
+    fn import_valid_child(
+        validity: &PayloadValidity,
+        speculate: impl FnOnce(&Store, &SignedBeaconBlock, &Config) -> Option<SpeculativeTransition>,
+    ) -> (Result<()>, Store, Root) {
+        let (config, mut store, signed_block) = store_with_valid_child();
+        let block_root = signed_block.message_hash_tree_root();
+        let committees = CommitteeCache::default();
+        let speculation = speculate(&store, &signed_block, &config);
+        let result = on_block_speculative(
+            &mut store,
+            signed_block,
+            &config,
+            &DataAvailability::NotRequired,
+            validity,
+            &committees,
+            speculation,
+        );
+        (result, store, block_root)
+    }
+
+    fn honest_speculation(
+        store: &Store,
+        block: &SignedBeaconBlock,
+        config: &Config,
+    ) -> Option<SpeculativeTransition> {
+        speculate_transition(store, block, config, &CommitteeCache::default())
+    }
+
+    /// What the store holds after an import, as comparable values.
+    fn observed(
+        store: &mut Store,
+        block_root: Root,
+        config: &Config,
+    ) -> (
+        Option<Root>,
+        Option<[bool; constants::NUM_BLOCK_TIMELINESS_DEADLINES]>,
+        Root,
+        Root,
+        Vec<Root>,
+    ) {
+        let post_state_root = store
+            .get_state(&block_root)
+            .expect("get")
+            .map(|state| state.hash_tree_root());
+        let mut roots: Vec<Root> = store.block_index().keys().copied().collect();
+        roots.sort();
+        (
+            post_state_root,
+            store.block_timeliness(&block_root),
+            store.proposer_boost_root(),
+            get_head(store, config).expect("head"),
+            roots,
+        )
+    }
+
+    #[test]
+    fn a_matching_speculation_leaves_the_store_as_importing_without_one() {
+        let config = Config::active();
+        let (plain_result, mut plain, root) =
+            import_valid_child(&PayloadValidity::NotRequired, |_, _, _| None);
+        plain_result.expect("the plain import succeeds");
+        for validity in [
+            PayloadValidity::NotRequired,
+            PayloadValidity::Validated,
+            PayloadValidity::Optimistic,
+        ] {
+            let (result, mut speculated, speculated_root) =
+                import_valid_child(&validity, honest_speculation);
+            result.expect("the speculated import succeeds");
+            assert_eq!(speculated_root, root);
+            assert_eq!(
+                observed(&mut speculated, root, &config),
+                observed(&mut plain, root, &config),
+                "{validity:?}: head, post-state root, timeliness, proposer boost and the \
+                 block index must be identical"
+            );
+        }
+    }
+
+    /// A speculation whose outcome is a marker nothing else produces, so the
+    /// result of the import says whether the speculation or a fresh transition
+    /// supplied it.
+    const POISON: &str = "poisoned speculation";
+
+    fn poisoned(
+        store: &Store,
+        block: &SignedBeaconBlock,
+        config: &Config,
+    ) -> Option<SpeculativeTransition> {
+        let mut speculation = honest_speculation(store, block, config)?;
+        speculation.outcome = Err(Error::SpecAssert(POISON));
+        Some(speculation)
+    }
+
+    /// Without debug assertions the poisoned outcome is the import's result,
+    /// which proves the speculation stood in for the transition. With them
+    /// (every test build, `release-fast` included) `on_block_speculative` also
+    /// runs the transition and refuses to use a speculation that disagrees, so
+    /// the same import is the check that the invariant is enforced.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the speculative transition disagrees with on_block's own on the outcome"
+        )
+    )]
+    fn a_matching_speculation_is_the_transition_on_block_uses() {
+        let (result, store, root) = import_valid_child(&PayloadValidity::Validated, poisoned);
+        assert_eq!(failed_assertion(result), Some(POISON));
+        assert!(
+            !store.has_state(&root).unwrap(),
+            "a failed import writes nothing"
+        );
+    }
+
+    /// The post-state half of the same check: a speculation that succeeded, as
+    /// the real transition does, but holds a different state. Without debug
+    /// assertions that state is what the import stores.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the speculative transition disagrees with on_block's own on the post-state root"
+        )
+    )]
+    fn a_speculation_with_another_post_state_is_caught_in_debug_builds() {
+        let (_, honest_store, root) =
+            import_valid_child(&PayloadValidity::Validated, honest_speculation);
+        let honest_root = honest_store
+            .get_state(&root)
+            .expect("get")
+            .expect("the honest import succeeds")
+            .hash_tree_root();
+        let (result, store, _) =
+            import_valid_child(&PayloadValidity::Validated, |store, block, config| {
+                let mut speculation = honest_speculation(store, block, config)?;
+                speculation
+                    .outcome
+                    .as_ref()
+                    .expect("the transition succeeds");
+                speculation.state.latest_block_header_mut().body_root = Root::repeat_byte(0xab);
+                Some(speculation)
+            });
+        result.expect("the import takes the speculation's outcome");
+        let stored = store
+            .get_state(&root)
+            .expect("get")
+            .expect("imported")
+            .hash_tree_root();
+        assert_ne!(stored, honest_root, "the speculation's state was stored");
+    }
+
+    #[test]
+    fn a_speculation_for_another_root_or_parent_is_ignored() {
+        for tamper in [0u8, 1] {
+            let (result, store, root) =
+                import_valid_child(&PayloadValidity::NotRequired, |store, block, config| {
+                    let mut speculation = poisoned(store, block, config)?;
+                    match tamper {
+                        0 => speculation.block_root = Root::repeat_byte(0xee),
+                        _ => speculation.parent_root = Root::repeat_byte(0xee),
+                    }
+                    Some(speculation)
+                });
+            result.expect("the stale speculation is dropped and the real transition runs");
+            assert!(store.has_state(&root).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_invalidated_verdict_ignores_the_speculation_and_matches_today() {
+        let invalidated = PayloadValidity::Invalidated {
+            latest_valid_hash: None,
+        };
+        let (without, plain_store, root) = import_valid_child(&invalidated, |_, _, _| None);
+        let (with_honest, honest_store, _) = import_valid_child(&invalidated, honest_speculation);
+        let (with_poison, poison_store, _) = import_valid_child(&invalidated, poisoned);
+        let without = format!("{:?}", without.expect_err("an invalidated block fails"));
+        assert_eq!(format!("{:?}", with_honest.expect_err("fails")), without);
+        assert_eq!(
+            format!("{:?}", with_poison.expect_err("fails")),
+            without,
+            "the speculation must not supply the transition under Invalidated"
+        );
+        for store in [&plain_store, &honest_store, &poison_store] {
+            assert!(!store.has_state(&root).unwrap());
+        }
+    }
+
+    #[test]
+    fn no_speculation_without_a_parent_state() {
+        let (config, store, mut block) = store_with_valid_child();
+        let SignedBeaconBlock::Phase0(inner) = &mut block else {
+            unreachable!("phase0");
+        };
+        inner.message.parent_root = Root::repeat_byte(0xcd);
+        assert!(
+            speculate_transition(&store, &block, &config, &CommitteeCache::default()).is_none()
+        );
+    }
+
+    /// A block `on_block` refuses before its own transition never gets one
+    /// computed ahead of it either. Each case would otherwise transition: the
+    /// valid child's parent state is there, and the transition itself reads no
+    /// clock and no finalized checkpoint.
+    #[test]
+    fn no_speculation_for_a_block_on_block_refuses_before_its_transition() {
+        let speculate = |store: &Store, block: &SignedBeaconBlock, config: &Config| {
+            speculate_transition(store, block, config, &CommitteeCache::default())
+        };
+
+        // The premise: the same block with nothing in the way is speculated.
+        let (config, store, block) = store_with_valid_child();
+        assert!(speculate(&store, &block, &config).is_some());
+
+        // From the future: the store's clock one slot short of the block's.
+        let (config, mut store, block) = store_with_valid_child();
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * (block.slot() - 1),
+            ))
+            .expect("set time");
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block from the future"
+        );
+
+        // Off the finalized chain: its parent has a post-state, but is not a
+        // block the store's `LiveChain` index knows, the shape a retained state
+        // of a branch finality abandoned leaves.
+        let (config, mut store, mut block) = store_with_valid_child();
+        let stray_parent = Root::repeat_byte(0xab);
+        let parent_state = store
+            .get_state(&block.parent_root())
+            .expect("get")
+            .expect("the anchor's post-state");
+        store
+            .insert_state(stray_parent, (*parent_state).clone())
+            .expect("insert");
+        assert!(
+            store.get_state(&stray_parent).expect("get").is_some(),
+            "the premise: the stray parent's post-state is readable, so only the \
+             finalized-chain check can refuse the block"
+        );
+        let SignedBeaconBlock::Phase0(inner) = &mut block else {
+            unreachable!("phase0");
+        };
+        inner.message.parent_root = stray_parent;
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block whose parent is not on the finalized chain"
+        );
+
+        // Already imported.
+        let (config, mut store, block) = store_with_valid_child();
+        on_block(
+            &mut store,
+            block.clone(),
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::NotRequired,
+            &CommitteeCache::default(),
+        )
+        .expect("the valid child imports");
+        assert!(
+            speculate(&store, &block, &config).is_none(),
+            "a block that already has a post-state"
         );
     }
 
@@ -10635,5 +11229,53 @@ mod tests {
                 "slot {slot}"
             );
         }
+    }
+
+    /// One real column of a three-blob block, split into two entries whose
+    /// lengths disagree and cancel out: two cells and proofs with one
+    /// commitment, then one cell and proof with two commitments. Concatenated,
+    /// that is the valid column again, so only a per-entry length check can
+    /// refuse it, as c-kzg refuses either entry on its own.
+    #[test]
+    fn a_batch_entry_whose_lengths_disagree_is_refused_even_when_the_totals_match() {
+        let index = 5;
+        let mut cells = Vec::new();
+        let mut commitments = Vec::new();
+        let mut proofs = Vec::new();
+        for seed in 1..=3u8 {
+            // Canonical field elements: the top byte of each is zero.
+            let blob: Vec<u8> = (0..c_kzg::BYTES_PER_BLOB)
+                .map(|i| if i % 32 == 0 { 0 } else { (i as u8) ^ seed })
+                .collect();
+            commitments.push(kzg::blob_to_kzg_commitment(&blob).expect("commitment"));
+            let (blob_cells, blob_proofs) =
+                kzg::compute_cells_and_kzg_proofs(&blob).expect("cells and proofs");
+            let cell: fulu::Cell =
+                libssz_types::SszVector::try_from(blob_cells[index].to_bytes().to_vec())
+                    .expect("exact cell size");
+            cells.push(cell);
+            proofs.push(blob_proofs[index]);
+        }
+        let whole = ColumnCells {
+            index: index as u64,
+            column: &cells,
+            commitments: &commitments,
+            proofs: &proofs,
+        };
+        assert!(matches!(verify_column_cells_batch(&[whole]), Ok(true)));
+
+        let short = ColumnCells {
+            index: index as u64,
+            column: &cells[..2],
+            commitments: &commitments[..1],
+            proofs: &proofs[..2],
+        };
+        let long = ColumnCells {
+            index: index as u64,
+            column: &cells[2..],
+            commitments: &commitments[1..],
+            proofs: &proofs[2..],
+        };
+        assert!(verify_column_cells_batch(&[short, long]).is_err());
     }
 }
