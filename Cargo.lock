@@ -3996,6 +3996,7 @@ name = "ethlambda-rpc"
 version = "1.0.0"
 dependencies = [
  "axum 0.8.9",
+ "bs58",
  "ethlambda-blockchain",
  "ethlambda-engine",
  "ethlambda-fork-choice",
