@@ -178,8 +178,15 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             changes.subscribed.push(topic.to_string());
         }
         // A validator client's aggregator and sync committee subnets come from
-        // BLS duties, which a PQ digest has neither of.
-        if !joined.pq {
+        // BLS duties, which a PQ digest has neither of; its PQ aggregators'
+        // subnets are among PQ's 16 and joined under PQ digests only.
+        if joined.pq {
+            for &subnet_id in server.aggregator_subnets_pq.keys() {
+                let topic = attestation_topic(entry.digest, subnet_id);
+                changes.subscribed.push(topic.to_string());
+                server.swarm_handle.subscribe(topic);
+            }
+        } else {
             for &subnet_id in server.aggregator_subnets.keys() {
                 let topic = attestation_topic(entry.digest, subnet_id);
                 changes.subscribed.push(topic.to_string());
@@ -207,7 +214,13 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             server.swarm_handle.unsubscribe(topic.clone());
             changes.unsubscribed.push(topic.to_string());
         }
-        if !left.pq {
+        if left.pq {
+            for &subnet_id in server.aggregator_subnets_pq.keys() {
+                let topic = attestation_topic(left.fork_digest, subnet_id);
+                changes.unsubscribed.push(topic.to_string());
+                server.swarm_handle.unsubscribe(topic);
+            }
+        } else {
             for &subnet_id in server.aggregator_subnets.keys() {
                 let topic = attestation_topic(left.fork_digest, subnet_id);
                 changes.unsubscribed.push(topic.to_string());

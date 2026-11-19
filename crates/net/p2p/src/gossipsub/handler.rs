@@ -1217,6 +1217,40 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     }
 }
 
+/// [`join_aggregator_subnets`] for a PQ slot's committees: `(subnet_id,
+/// slot)` pairs among PQ's 16 subnets, joined under every held PQ digest. A
+/// subnet of PQ's backbone is joined there already.
+pub fn join_pq_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let mut joined = Vec::new();
+    for (subnet_id, slot) in subnets {
+        if subnet_id >= wire.config.attestation_subnet_count_pq
+            || wire.attestation_subnets_pq.contains(&subnet_id)
+        {
+            continue;
+        }
+        let until = server
+            .aggregator_subnets_pq
+            .entry(subnet_id)
+            .or_insert_with(|| {
+                joined.push(subnet_id);
+                slot
+            });
+        *until = (*until).max(slot);
+    }
+    for &subnet_id in &joined {
+        for held in wire.held_topics().filter(|held| held.pq) {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
+            server.swarm_handle.subscribe(IdentTopic::new(topic));
+        }
+    }
+    if !joined.is_empty() {
+        info!(?joined, "Joined PQ attestation subnets for aggregation");
+    }
+}
+
 /// Gossip one operation on its topic, handed over by the Beacon API after
 /// validation. This node is subscribed to all four operation topics, so it
 /// reaches the mesh rather than relying on fanout.
@@ -1293,6 +1327,19 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
     for subnet_id in &expired {
         server.aggregator_subnets.remove(subnet_id);
         for held in wire.held_topics().filter(|held| !held.pq) {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
+            server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        }
+    }
+    let expired_pq: Vec<u64> = server
+        .aggregator_subnets_pq
+        .iter()
+        .filter(|&(_, &until)| until < now)
+        .map(|(&subnet_id, _)| subnet_id)
+        .collect();
+    for subnet_id in &expired_pq {
+        server.aggregator_subnets_pq.remove(subnet_id);
+        for held in wire.held_topics().filter(|held| held.pq) {
             let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
             server.swarm_handle.unsubscribe(IdentTopic::new(topic));
         }

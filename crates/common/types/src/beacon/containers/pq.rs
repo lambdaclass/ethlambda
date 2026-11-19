@@ -779,6 +779,19 @@ pub struct SignedAggregateAndProof {
     pub signature: XmssSignature,
 }
 
+/// What the Beacon API's `aggregate_attestation` answers at a PQ slot: a
+/// committee's network aggregate and the proof of its attesters'
+/// signatures, which the aggregator wraps in its `AggregateAndProof`. Not a
+/// consensus container; the shape is Lighthouse's PQ branch's `PqAggregate`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, SszEncode, SszDecode,
+)]
+pub struct ProvenAggregate {
+    pub aggregate: Attestation,
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub proof: AttestationProof,
+}
+
 // ---------------------------------------------------------------------------
 // Blocks
 // ---------------------------------------------------------------------------

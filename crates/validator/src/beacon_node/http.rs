@@ -1300,6 +1300,46 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// JSON, because Lighthouse answers an SSZ body here with 415. See the
     /// contract on [`BeaconNodeApi::publish_aggregates`].
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        let path = Self::aggregate_path(slot, attestation_data_root, committee_index);
+        let response: VersionedResponse<ethlambda_types::beacon::containers::pq::ProvenAggregate> =
+            self.get(&path).await?;
+        if !response.version.eq_ignore_ascii_case(ForkName::Pq.as_str()) {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ aggregate, node answered a {} one",
+                response.version
+            )));
+        }
+        let aggregate = response.data;
+        if aggregate.aggregate.data.slot != slot
+            || ethlambda_types::primitives::HashTreeRoot::hash_tree_root(&aggregate.aggregate.data)
+                != attestation_data_root
+        {
+            return Err(Error::InconsistentResponse(
+                "the PQ aggregate is for another vote".into(),
+            ));
+        }
+        Ok(aggregate)
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        // The PQ container serialises as the endpoint's JSON itself.
+        self.post_no_content(
+            "/eth/v2/validator/aggregate_and_proofs",
+            &aggregates,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+    }
+
     async fn publish_aggregates(
         &self,
         fork: ForkName,

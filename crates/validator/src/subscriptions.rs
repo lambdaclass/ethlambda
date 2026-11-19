@@ -83,6 +83,12 @@ pub async fn subscribe<B: BeaconNodeApi>(
     let mut is_aggregator = vec![false; duties.len()];
     let mut keyed = Vec::with_capacity(duties.len());
     for (position, duty) in duties.iter().enumerate() {
+        // At a PQ slot the node names the aggregators (the aggregation
+        // committee); there is no selection proof to sign.
+        if let Some(pq_aggregator) = duty.is_aggregator {
+            is_aggregator[position] = pq_aggregator;
+            continue;
+        }
         match parse_pubkey(&duty.pubkey) {
             Ok(pubkey) => keyed.push((position, duty, pubkey)),
             Err(err) => warn!(
@@ -214,6 +220,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 7,
             slot,
+            is_aggregator: None,
         }
     }
 

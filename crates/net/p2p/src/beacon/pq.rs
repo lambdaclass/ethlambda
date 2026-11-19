@@ -153,6 +153,13 @@ impl PqValidated {
         {
             pool_aggregate(&server.store, signed, attesting_indices);
         }
+        if let Self::Attestation { attestation, .. } = &self
+            && outcome == Outcome::Accept
+            && let Some(wire) = server.wire.beacon()
+        {
+            let now = crate::gossipsub::beacon_wall_slot(wire);
+            server.store.pq_signature_pool().insert(now, attestation);
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -377,7 +384,12 @@ pub(crate) fn publish_pq_gossip(
                 attestation.to_ssz(),
             )
         }
-        PqGossipObject::Aggregate { aggregate, .. } => {
+        PqGossipObject::Aggregate {
+            aggregate,
+            attesting_indices,
+        } => {
+            // Gossip never hands a node its own aggregate back.
+            pool_aggregate(&server.store, aggregate, attesting_indices);
             if let Some(key) = gossip::pq::aggregate_key(aggregate) {
                 let bits = gossip::pq::aggregation_bits(aggregate);
                 server.seen_aggregates.record_parts(&key, &bits);

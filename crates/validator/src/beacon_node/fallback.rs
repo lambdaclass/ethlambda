@@ -597,6 +597,28 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        self.try_each("pq_aggregate", |node| {
+            node.pq_aggregate(slot, attestation_data_root, committee_index)
+        })
+        .await
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        self.try_each("publish_pq_aggregates", |node| {
+            node.publish_pq_aggregates(aggregates)
+        })
+        .await
+    }
+
     async fn submit_pq_payload_attestations(
         &self,
         messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],

@@ -1157,6 +1157,25 @@ impl BeaconNodeApi for MockBeaconNode {
         Ok(Some(data))
     }
 
+    async fn pq_aggregate(
+        &self,
+        _slot: Slot,
+        _attestation_data_root: Root,
+        _committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        self.guard("pq_aggregate")?;
+        Err(Error::InconsistentResponse(
+            "the mock proves no PQ aggregates".into(),
+        ))
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        _aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        self.guard("publish_pq_aggregates")
+    }
+
     async fn submit_pq_payload_attestations(
         &self,
         messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],

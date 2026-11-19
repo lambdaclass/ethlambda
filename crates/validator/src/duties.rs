@@ -441,6 +441,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 7,
             slot,
+            is_aggregator: None,
         }
     }
 

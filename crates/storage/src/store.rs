@@ -12,7 +12,7 @@ use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWri
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
-use crate::pools::{AttestationPool, OperationPool, PqAggregatePool};
+use crate::pools::{AttestationPool, OperationPool, PqAggregatePool, PqSignaturePool};
 use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
 use crate::pubkey_index_cache::PubkeyIndexCache;
 use crate::target_balance_cache::TargetBalanceCache;
@@ -1279,6 +1279,8 @@ pub struct Store {
     operation_pool: Arc<Mutex<OperationPool>>,
     /// PQ network aggregates. See [`Store::pq_aggregate_pool`].
     pq_aggregate_pool: Arc<Mutex<PqAggregatePool>>,
+    /// PQ aggregators' signatures. See [`Store::pq_signature_pool`].
+    pq_signature_pool: Arc<Mutex<PqSignaturePool>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -1998,6 +2000,7 @@ impl Store {
             attestation_pool: Default::default(),
             operation_pool: Default::default(),
             pq_aggregate_pool: Default::default(),
+            pq_signature_pool: Default::default(),
             state_cache,
             pending_states,
             state_rebuilds,
@@ -2040,6 +2043,15 @@ impl Store {
         self.pq_aggregate_pool
             .lock()
             .expect("PQ aggregate pool lock poisoned")
+    }
+
+    /// The signatures this node's PQ aggregators prove aggregates from, and
+    /// what it proved. Same sharing and locking rules as
+    /// [`Store::attestation_pool`].
+    pub fn pq_signature_pool(&self) -> MutexGuard<'_, PqSignaturePool> {
+        self.pq_signature_pool
+            .lock()
+            .expect("PQ signature pool lock poisoned")
     }
 
     // ============ Metadata Helpers ============

@@ -1113,14 +1113,15 @@ async fn aggregate<B: BeaconNodeApi>(
     duties: &[crate::beacon_node::dto::AttesterDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    // PQ aggregators are the aggregation committee and prove a STARK; this
-    // client does not aggregate there yet, the network's other aggregators do.
-    if data.target.epoch >= aggregation.pq_fork_epoch() {
-        return;
-    }
     let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store));
-    match attempt.await {
+    // PQ aggregators are the aggregation committee and publish what the node
+    // proved; see `AggregationService::aggregate_pq`.
+    let outcome = if data.target.epoch >= aggregation.pq_fork_epoch() {
+        tokio::time::timeout(budget, aggregation.aggregate_pq(slot, data, duties)).await
+    } else {
+        tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store)).await
+    };
+    match outcome {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
             error!(%slot, %err, "Failed to publish this slot's aggregates");
