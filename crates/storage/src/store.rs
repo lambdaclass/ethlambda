@@ -12,6 +12,7 @@ use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
 use crate::pools::{AttestationPool, OperationPool};
+use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -29,8 +30,8 @@ use ethlambda_types::{
         },
         fork::ForkName,
         fork_choice::{
-            BlockPayloadLink, JustifiedBalances, LatestMessage, PayloadStatus, PayloadStatusEnum,
-            PayloadStatusV1, PowBlock,
+            BlockPayloadLink, ForkChoiceNode, JustifiedBalances, LatestMessage, PayloadStatus,
+            PayloadStatusEnum, PayloadStatusV1, PowBlock,
         },
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
@@ -846,6 +847,12 @@ pub(crate) struct BeaconScratch {
     /// snapshot balances in index order, not hash order. `None` is a validator
     /// that has not voted (or an index below the highest one seen).
     pub(crate) latest_messages: Vec<Option<LatestMessage>>,
+    /// The head walk's weights, kept current as `latest_messages` and
+    /// `equivocating_indices` change (see [`crate::proto_array`]). Beside them
+    /// under the one lock, so a vote and its weight change are one step.
+    /// Scratch like its inputs: a restart starts it stale, and the first head
+    /// computation rebuilds it from the latest messages it has by then.
+    pub(crate) proto_array: ProtoArray,
     /// Epoch-boundary balances, flattened for the vote loop
     /// and keyed by their own checkpoint. A derived cache: a miss is rebuilt
     /// from `checkpoint_states`, so nothing needs to persist it.
@@ -2461,6 +2468,12 @@ impl Store {
             .delete_batch(Table::LiveChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
+        // The cached fork-choice weights drop the same blocks by rebuilding.
+        self.beacon
+            .lock()
+            .unwrap()
+            .proto_array
+            .mark_stale(RebuildReason::Prune);
         Ok(count)
     }
 
@@ -2487,10 +2500,11 @@ impl Store {
     /// the blocks either side of them at the same slots must survive.
     ///
     /// Dropping the row is the whole of "remove this block from fork choice":
-    /// [`block_index`](Self::block_index) is the only source
+    /// [`block_index`](Self::block_index) is the only block source
     /// `filter_block_tree`, `compute_node_weights` and `walk_head` read, so a
     /// root with no row contributes no weight to any ancestor and can never be
-    /// walked to.
+    /// walked to. The cached fork-choice weights are marked stale here, so the
+    /// next head computation rebuilds them from the index without the rows.
     ///
     /// The block and its state stay in their own tables. Nothing reads them
     /// once the index row is gone, and keeping them means an operator can still
@@ -2508,6 +2522,14 @@ impl Store {
             .delete_batch(Table::LiveChain, keys)
             .expect("delete live chain entries");
         batch.commit().expect("commit");
+        // A removed block's votes must stop counting for its ancestors. The
+        // cached fork-choice weights drop them by rebuilding, which also
+        // forgets the node indices the removal invalidates.
+        self.beacon
+            .lock()
+            .unwrap()
+            .proto_array
+            .mark_stale(RebuildReason::Removal);
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
@@ -3952,13 +3974,12 @@ impl Store {
             .contains(&index)
     }
 
-    /// Marks `index` as equivocating.
+    /// Marks `index` as equivocating, and takes its vote out of the cached
+    /// fork-choice weights: an equivocator's vote counts for neither side.
     pub fn insert_equivocating_index(&mut self, index: u64) {
-        self.beacon
-            .lock()
-            .unwrap()
-            .equivocating_indices
-            .insert(index);
+        let mut beacon = self.beacon.lock().unwrap();
+        beacon.equivocating_indices.insert(index);
+        beacon.proto_array.remove_vote(index);
     }
 
     /// Gloas: whether `root`'s execution payload envelope has been locally
@@ -4335,18 +4356,29 @@ impl Store {
     /// input: a wild index would allocate a table to match. The assertion is
     /// the tripwire for that in debug builds and fixtures.
     ///
-    /// A caller recording a batch should call
-    /// [`Store::reserve_latest_messages`] first.
+    /// A batch of one for the cached fork-choice weights; an equivocator's
+    /// message is recorded but counts nowhere. The production path records a
+    /// whole attestation at once through [`Store::record_latest_messages`],
+    /// which reserves the table for its batch itself; a caller recording a
+    /// batch through this one should call [`Store::reserve_latest_messages`]
+    /// first.
     pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
         let slot = latest_message_slot(index);
-        let mut beacon = self.beacon.lock().unwrap();
-        let messages = &mut beacon.latest_messages;
-        if messages.len() <= slot {
-            reserve_latest_message_slot(messages, slot);
+        let mut guard = self.beacon.lock().unwrap();
+        let beacon = &mut *guard;
+        if beacon.latest_messages.len() <= slot {
+            reserve_latest_message_slot(&mut beacon.latest_messages, slot);
             // Capacity now exceeds `slot`, so this cannot reallocate.
-            messages.resize(slot + 1, None);
+            beacon.latest_messages.resize(slot + 1, None);
         }
-        messages[slot] = Some(message);
+        beacon.latest_messages[slot] = Some(message);
+        let equivocating =
+            !beacon.equivocating_indices.is_empty() && beacon.equivocating_indices.contains(&index);
+        if equivocating {
+            beacon.proto_array.remove_vote(index);
+        } else {
+            beacon.proto_array.apply_votes(&[index], &message);
+        }
     }
 
     /// Makes room in the vote table for every index up to `highest`, so the
@@ -4356,19 +4388,169 @@ impl Store {
     /// An aggregate lists its attesters in ascending index order. Grown one
     /// index at a time, the table would be copied whenever an index passed the
     /// headroom: hundreds of copies of a table sized to the registry, for a
-    /// single aggregate that spans it.
+    /// single aggregate that spans it. [`Store::record_latest_messages`], the
+    /// production path, makes the same reservation for its own batch.
     ///
     /// The same precondition as [`Store::set_latest_message`]: `highest` must
     /// come from a validated attestation, since this allocates a table up to it
-    /// at once. Its one caller, fork choice's `update_latest_messages`, runs
-    /// only on attestations whose committees were already resolved against
-    /// the registry. Today it is also the only production caller recording
-    /// votes at all; the table is rebuilt from fresh attestations through it
-    /// after a restart.
+    /// at once.
     pub fn reserve_latest_messages(&mut self, highest: u64) {
         let slot = latest_message_slot(highest);
         let mut beacon = self.beacon.lock().unwrap();
         reserve_latest_message_slot(&mut beacon.latest_messages, slot);
+    }
+
+    /// Records `message` as the latest message of every validator in
+    /// `indices` that is not a known equivocator and whose current latest
+    /// message `should_replace` answers `true` for (a validator with none is
+    /// always recorded), and moves their weight in the cached fork-choice
+    /// weights: one vote batch, under one lock.
+    ///
+    /// `should_replace` is the fork's ordering of messages, which this crate
+    /// cannot name: target epoch before gloas, slot from gloas on.
+    ///
+    /// The indices must come from a validated attestation, for the reason
+    /// [`Store::set_latest_message`] gives. Its one production caller, fork
+    /// choice's `update_latest_messages`, runs only on attestations whose
+    /// committees were already resolved against the registry, and it is the
+    /// only production path recording votes at all; the table is rebuilt from
+    /// fresh attestations through it after a restart.
+    pub fn record_latest_messages(
+        &mut self,
+        indices: &[u64],
+        message: LatestMessage,
+        should_replace: impl Fn(&LatestMessage) -> bool,
+    ) {
+        let mut guard = self.beacon.lock().unwrap();
+        let beacon = &mut *guard;
+        // One reservation for the whole batch. The table grows exactly (plus
+        // a fixed headroom) rather than by doubling, and an indexed
+        // attestation's indices are sorted, so growing it per index would copy
+        // it every time an ascending index passed the headroom. Equivocators
+        // skipped below count towards the highest index on purpose: they are
+        // in the registry, so the table reaches them anyway, and leaving them
+        // out would cost a pass over the equivocation set for at most one
+        // headroom of capacity. `max` rather than `last`, so an unsorted list
+        // still reserves enough.
+        if let Some(&highest) = indices.iter().max() {
+            let highest_slot = latest_message_slot(highest);
+            reserve_latest_message_slot(&mut beacon.latest_messages, highest_slot);
+        }
+        let mut recorded = Vec::with_capacity(indices.len());
+        // Most of the time nobody has equivocated, so skip the set probe per
+        // attester, as `for_each_non_equivocating_latest_message` does.
+        let any_equivocators = !beacon.equivocating_indices.is_empty();
+        for &index in indices {
+            let slot = latest_message_slot(index);
+            if any_equivocators && beacon.equivocating_indices.contains(&index) {
+                continue;
+            }
+            if beacon.latest_messages.len() <= slot {
+                // Capacity covers the batch's highest index, so this cannot
+                // reallocate.
+                beacon.latest_messages.resize(slot + 1, None);
+            }
+            let entry = &mut beacon.latest_messages[slot];
+            if entry.as_ref().is_none_or(&should_replace) {
+                *entry = Some(message);
+                recorded.push(index);
+            }
+        }
+        beacon.proto_array.apply_votes(&recorded, &message);
+    }
+
+    /// Adds a block to the cached fork-choice weights, for `on_block` to call
+    /// just before it stores the block itself. In that order, a head
+    /// computation on another thread never reads a block index row whose node
+    /// is missing, which would cost it a full rebuild.
+    ///
+    /// A block stored any other way still counts: the next head computation
+    /// finds its row without a node and rebuilds.
+    pub fn insert_fork_choice_node(
+        &self,
+        root: H256,
+        slot: u64,
+        parent_root: H256,
+        link: BlockPayloadLink,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .proto_array
+            .insert_node(root, slot, parent_root, link);
+    }
+
+    /// The head walk's node weights from the cached fork-choice weights:
+    /// every node at or above `bound` that `index` holds, before the proposer
+    /// boost, with zero weights left out. The same map
+    /// `fork_choice::compute_node_weights` builds from its tally, which is what
+    /// this replaces on the head computation's path.
+    ///
+    /// Rebuilds the cache first when it is stale or does not follow these
+    /// inputs (another balances snapshot, the other rule set, a block in
+    /// `index` it has no node for), and refreshes its subtree totals when a
+    /// vote moved since the last read. Payload links are read from this
+    /// store's records: under the gloas rules the caller records those of the
+    /// blocks at or above `bound` first.
+    ///
+    /// Holds the scratch lock throughout, calling nothing that takes it again.
+    pub fn proto_array_weights(
+        &self,
+        index: &HashMap<H256, (u64, H256)>,
+        balances: &Arc<JustifiedBalances>,
+        bound: u64,
+        rules: WeightRules,
+    ) -> Result<HashMap<ForkChoiceNode, u64>, ProtoArrayError> {
+        let mut guard = self.beacon.lock().unwrap();
+        let BeaconScratch {
+            proto_array,
+            payload_links,
+            latest_messages,
+            equivocating_indices,
+            ..
+        } = &mut *guard;
+        proto_array.fill_missing_links(payload_links);
+        if let Some(reason) = proto_array.rebuild_reason(index, balances, rules) {
+            crate::metrics::inc_proto_array_rebuilds(reason.label());
+            let _timing = crate::metrics::time_proto_array_rebuild();
+            // Rebuilt from a scan made now, under the lock, not from the
+            // caller's `index`: a caller on another thread scanned before
+            // locking, and a removal committed in between (whose stale mark
+            // comes after its commit) would otherwise be rebuilt back in and
+            // its mark cleared. The chain actor's own `index` is this scan,
+            // since nothing else writes the table. The caller's `index` still
+            // filters what is read out below.
+            let live_chain = self.get_live_chain().expect("live chain scan");
+            proto_array.rebuild(
+                &live_chain,
+                |root| payload_links.get(root).map(|&(_, link)| link),
+                latest_messages,
+                equivocating_indices,
+                Arc::clone(balances),
+                rules,
+            );
+        }
+        proto_array.refresh();
+        proto_array.weights(index, bound)
+    }
+
+    /// Test support: whether the cached fork-choice weights, as votes, blocks
+    /// and equivocations have moved them since their last rebuild, equal a
+    /// rebuild from the same inputs, node by node and vote by vote. `Err`
+    /// describes the first difference, or says the cache is stale (nothing
+    /// incremental to compare). `index` is the block index the cache follows.
+    #[doc(hidden)]
+    pub fn proto_array_diff_against_rebuild(
+        &self,
+        index: &HashMap<H256, (u64, H256)>,
+    ) -> Result<(), String> {
+        let beacon = self.beacon.lock().unwrap();
+        beacon.proto_array.diff_against_rebuild(
+            index,
+            |root| beacon.payload_links.get(root).map(|&(_, link)| link),
+            &beacon.latest_messages,
+            &beacon.equivocating_indices,
+        )
     }
 
     /// Gloas: the payload timeliness committee's per-member votes on whether
