@@ -458,16 +458,24 @@ ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
 | `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
-| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a fetched sidecar or envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
+| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a block's fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
 | `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
 
 `kind` on the queue and run histograms is the gossip topic kind above for gossip
 validation. `column_check` and `envelope_check` are the tasks of
 `check_and_forward` (fetched and replayed columns) and of the envelope checks:
 their queue delay is measured from `spawn_blocking`, after the permit wait, which
-has its own histogram, so the two add up. The in-use gauge counts a task from its
+has its own histogram, so the two add up. `column_check` covers both stages of a
+block's columns (see [Data column sidecars](beacon_wire.md#data-column-sidecars)):
+its prechecks, which wait for the group's permit, and each KZG sub-batch. The
+first sub-batch runs on the permit the prechecks held, so it has no permit wait of
+its own; each further one waits for its own. The run histogram therefore mixes
+the two stages, and the prechecks' share of a permit hold is not measured on its
+own. The in-use gauge counts a task from its
 permit being taken, so one waiting in the blocking pool counts too; it is a count
-of admitted work, not of busy threads. Only
+of admitted work, not of busy threads. A block's columns hold one permit from
+their prechecks through their first sub-batch, so between the two the gauge counts
+a permit no thread is using. Only
 `lean_beacon_validation_queue_seconds` isolates time spent waiting for a thread.
 
 `lean_beacon_epoch_precompute_running` is set when the worker's closure starts
@@ -656,8 +664,8 @@ spec.
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
-| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
-| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, one sub-batch of at most 16 of one block's sidecars in the chain checks, which for every sub-batch after a block's first is how long it holds its `column_check_permits` permit (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
@@ -671,8 +679,12 @@ gossiped one reported `Queue` or `Ignore(Overloaded)`, and a parked one sent
 back once its parent imported. A gossiped sidecar is judged first by the
 gossip rules and counted in
 `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`; the reasons
-here are that counter's reason labels. The chain actor stores what reaches it
-without checking it again.
+here are that counter's reason labels, except `already_seen`, which here
+counts a sidecar repeating a block and column index already in the same call
+(one peer's answer, say), dropped without being judged. `internal` also counts
+the sidecars a panic inside the checks cost, which are dropped (each one
+whose own checks panicked, or a whole group or KZG sub-batch whose task did).
+The chain actor stores what reaches it without checking it again.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two

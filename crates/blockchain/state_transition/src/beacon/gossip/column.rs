@@ -10,6 +10,8 @@
 //! actor stores whatever reaches it without checking it
 //! again, so these are the only checks such a sidecar gets.
 
+use std::collections::HashMap;
+
 use ethlambda_storage::CacheKey;
 
 use super::{
@@ -21,9 +23,9 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::DataColumnSidecar as AnyDataColumnSidecar;
-use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
+use crate::beacon::containers::{SignedBeaconBlock, SignedBeaconBlockHeader};
 use crate::beacon::das;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
@@ -34,7 +36,7 @@ use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::precheck;
 use crate::beacon::preset;
 use crate::beacon::primitives::HashTreeRoot as _;
-use crate::beacon::primitives::{Root, Slot, ValidatorIndex};
+use crate::beacon::primitives::{BlsSignature, KzgCommitment, Root, Slot, ValidatorIndex};
 use crate::beacon::stf;
 use crate::metrics;
 
@@ -81,10 +83,14 @@ pub fn cheap_checks(
 
 /// The rules that need the parent's post-state. Runs on a blocking thread,
 /// and reads states only from the cache, as [`super::block::stateful_checks`]
-/// does. The rules themselves are [`judge_against_parent`]'s, a permit held
-/// while they run.
+/// does.
+///
+/// The header's rules first ([`judge_header_against_parent`]), then the
+/// inclusion proof and the KZG proofs, and the lookahead last: every
+/// REJECT-worthy rule is settled before the one rule that may only queue.
 pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
-    let header = &sidecar.signed_block_header.message;
+    let signed_header = &sidecar.signed_block_header;
+    let header = &signed_header.message;
     let parent_known = store.has_block(&header.parent_root);
     let parent_state = if parent_known {
         store.cached_state(CacheKey::BlockState(header.parent_root))
@@ -101,9 +107,31 @@ pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
         } else {
             QueueReason::ParentUnknown
         };
-        return queue_unless_forged(store, sidecar, reason);
+        return queue_unless_forged(store, signed_header, reason);
     };
-    judge_against_parent(store, sidecar, &parent_state, PastLookahead::Queue)
+    if let Err(outcome) =
+        judge_header_against_parent(store, signed_header, &parent_state, PastLookahead::Queue)
+    {
+        return outcome;
+    }
+    // [REJECT] The commitments are the ones the block committed to.
+    if !fork_choice::verify_data_column_sidecar_inclusion_proof(sidecar) {
+        return Outcome::Reject(RejectReason::InclusionProof);
+    }
+    // [REJECT] Every cell matches its commitment and proof.
+    let kzg = {
+        let _timing = metrics::time_data_column_kzg_verify();
+        fork_choice::verify_data_column_sidecar_kzg_proofs(sidecar)
+    };
+    if !matches!(kzg, Ok(true)) {
+        return Outcome::Reject(RejectReason::Kzg);
+    }
+    // [IGNORE] The sidecar's slot is outside the parent state's proposer
+    // lookahead window (MAY queue).
+    if let Err(outcome) = lookahead_covers(&parent_state, header.slot) {
+        return outcome;
+    }
+    Outcome::Accept
 }
 
 /// What the chain may do with a sidecar [`chain_checks`] judged.
@@ -136,45 +164,14 @@ pub enum ChainVerdict {
 ///   than queued. Nothing would ever come along to answer it later.
 ///
 /// Runs off both actors. It costs a KZG batch and a BLS verification per
-/// sidecar, and those used to run on the chain actor's single thread.
+/// sidecar, and those used to run on the chain actor's single thread. The p2p
+/// layer judges the sidecars of one block together, through
+/// [`ChainPrechecks`] and [`kzg_verdicts`], which give each sidecar the
+/// verdict this gives it alone.
 pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> ChainVerdict {
-    let config = store.config();
-    // [REJECT] The sidecar is structurally valid. First, so a peer answering
-    // a fetch with garbage cannot make this pay for a state read or a KZG
-    // batch.
-    if !fork_choice::verify_data_column_sidecar(sidecar, &config) {
-        return ChainVerdict::Drop(Outcome::Reject(RejectReason::Malformed));
-    }
-    let header = &sidecar.signed_block_header.message;
-    // [IGNORE] Not from a future slot. Also what bounds `advanced_proposer`'s
-    // `process_slots` below: a header naming a slot far ahead would otherwise
-    // make it advance one slot at a time towards that slot.
-    if is_future_slot(&config, header.slot, now_ms) {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::FutureSlot));
-    }
-    // [IGNORE] From a slot greater than the latest finalized slot.
-    if header.slot <= finalized_start_slot(store) {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized));
-    }
-    // [IGNORE] Already stored. Common during a range sync, whose consecutive
-    // batches ask for overlapping spans of columns, and everything after this
-    // is the expensive part.
-    if store.has_data_column(header.slot, &header.hash_tree_root(), sidecar.index) {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
-    }
-    let Ok(Some(parent_state)) = store.get_state(&header.parent_root) else {
-        // Parked rather than dropped: the specification's "MAY be queued"
-        // for a sidecar whose parent has not been seen. The head-state
-        // signature check keeps a forged header from taking a
-        // `PendingDataColumns` row while it waits.
-        return match queue_unless_forged(store, sidecar, QueueReason::ParentUnknown) {
-            Outcome::Queue(_) => ChainVerdict::AwaitParent,
-            outcome => ChainVerdict::Drop(outcome),
-        };
-    };
-    match judge_against_parent(store, sidecar, &parent_state, PastLookahead::Advance) {
-        Outcome::Accept => ChainVerdict::Keep,
-        outcome => ChainVerdict::Drop(outcome),
+    match ChainPrechecks::new(store, now_ms).check_fulu(sidecar) {
+        Ok(pending) => kzg_verdict_ref(&ColumnRef::Fulu(sidecar), &pending),
+        Err(verdict) => verdict,
     }
 }
 
@@ -184,9 +181,9 @@ pub fn chain_checks_for(
     sidecar: &AnyDataColumnSidecar,
     now_ms: u64,
 ) -> ChainVerdict {
-    match sidecar {
-        AnyDataColumnSidecar::Fulu(sidecar) => chain_checks(store, sidecar, now_ms),
-        AnyDataColumnSidecar::Gloas(sidecar) => chain_checks_gloas(store, sidecar, now_ms),
+    match ChainPrechecks::new(store, now_ms).check(sidecar) {
+        Ok(pending) => kzg_verdict(sidecar, &pending),
+        Err(verdict) => verdict,
     }
 }
 
@@ -204,78 +201,358 @@ pub fn chain_checks_gloas(
     sidecar: &gloas::DataColumnSidecar,
     now_ms: u64,
 ) -> ChainVerdict {
-    let config = store.config();
-    // [IGNORE] Not from a future slot. Also what bounds how far ahead a
-    // parked row can name.
-    if is_future_slot(&config, sidecar.slot, now_ms) {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::FutureSlot));
-    }
-    // [IGNORE] From a slot greater than the latest finalized slot, unless it
-    // is a column of the finalized block itself. Not a gloas rule: gloas has
-    // no finalized bound on sidecars, and this one stays only to bound what a
-    // parked row can name. The finalized block is exempt because its envelope
-    // can still be waiting on these columns: a checkpoint-synced anchor is the
-    // finalized block, and no child building on its payload imports until its
-    // sampled columns arrive. Matched by root rather than by slot, since an
-    // anchor state advanced past empty slots finalizes a block from before its
-    // epoch's start slot. A column naming that root is never parked: the block
-    // and its post-state are both stored, so it is judged at once.
-    let finalized = store.beacon_finalized_checkpoint();
-    if sidecar.slot <= compute_start_slot_at_epoch(finalized.epoch)
-        && sidecar.beacon_block_root != finalized.root
-    {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized));
-    }
-    // [IGNORE] Already stored, as in [`chain_checks`].
-    if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
-        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
-    }
-    match stateful_checks_gloas(store, sidecar) {
-        Outcome::Accept => ChainVerdict::Keep,
-        Outcome::Queue(QueueReason::BlockUnknown | QueueReason::BlockNotReady) => {
-            ChainVerdict::AwaitParent
-        }
-        outcome => ChainVerdict::Drop(outcome),
+    match ChainPrechecks::new(store, now_ms).check_gloas(sidecar) {
+        Ok(pending) => kzg_verdict_ref(&ColumnRef::Gloas(sidecar), &pending),
+        Err(verdict) => verdict,
     }
 }
 
-/// What [`judge_against_parent`] does when the parent state's proposer
+/// The chain checks up to, and not including, the KZG proofs, for the sidecars
+/// of one block: every rule that does not read the cells, in the order
+/// [`chain_checks`] and [`chain_checks_gloas`] run them.
+///
+/// The rules that read nothing of a sidecar but what every sidecar of its
+/// block carries run once per block rather than once per sidecar. For fulu
+/// that is everything judged against the signed header ([`judge_header`]):
+/// finding the parent's post-state, or the head-state signature check before
+/// parking, then `NotAfterParent`, the signature, the expected proposer (a
+/// `process_slots` on a state clone past the lookahead) and finalized
+/// ancestry. For gloas it is finding and decoding the block the sidecar names
+/// ([`gloas_block`]). An answer is worked out the first time a sidecar gets as
+/// far as needing it, so a group whose sidecars all stop earlier (all already
+/// stored, say) pays for none of it, and is remembered under everything it
+/// read of the sidecar: the signed header's root *and* signature, so a forged
+/// signature over a block's header is judged on its own, or the block root.
+/// Everything else (the structure, the clock, finality, `AlreadyStored`, the
+/// inclusion proof, the slot match and shape against the bid's commitments)
+/// runs for every sidecar, in its place.
+///
+/// `Err` is the verdict whatever the proofs say. `Ok` means every rule before
+/// the proofs passed, and the proofs are the last rule on this path, so the
+/// sidecar is [`ChainVerdict::Keep`] exactly when they verify: hand it to
+/// [`kzg_verdict`], or to [`kzg_verdicts`] with the other sidecars of the same
+/// block.
+///
+/// Meant to live as long as one group's checks. Each answer it remembers is the
+/// store as it stood when that answer was first worked out, not when a later
+/// sidecar asks: a parent whose post-state lands partway through a group
+/// leaves the rest of the group parked on the answer given before it. That
+/// costs a round trip, not the sidecars: the chain actor's
+/// `park_data_columns` sends back at once any sidecar whose block can be
+/// judged by the time it arrives.
+pub struct ChainPrechecks<'a> {
+    store: &'a Store,
+    now_ms: u64,
+    /// [`judge_header`]'s answers, by the signed header's root and signature.
+    headers: HashMap<(Root, BlsSignature), Result<(), ChainVerdict>>,
+    /// [`gloas_block`]'s answers, by block root.
+    blocks: HashMap<Root, Result<GloasBlock, Outcome>>,
+}
+
+impl<'a> ChainPrechecks<'a> {
+    /// Checks against `store`, with `now_ms` as the clock for every sidecar.
+    pub fn new(store: &'a Store, now_ms: u64) -> Self {
+        Self {
+            store,
+            now_ms,
+            headers: HashMap::new(),
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// The verdict, when a rule before the KZG proofs settles it, or what the
+    /// proofs are checked against.
+    pub fn check(&mut self, sidecar: &AnyDataColumnSidecar) -> Result<PendingKzg, ChainVerdict> {
+        match sidecar {
+            AnyDataColumnSidecar::Fulu(sidecar) => self.check_fulu(sidecar),
+            AnyDataColumnSidecar::Gloas(sidecar) => self.check_gloas(sidecar),
+        }
+    }
+
+    /// [`Self::check`] for a fulu sidecar.
+    fn check_fulu(&mut self, sidecar: &DataColumnSidecar) -> Result<PendingKzg, ChainVerdict> {
+        let store = self.store;
+        let config = store.config();
+        // [REJECT] The sidecar is structurally valid. First, so a peer
+        // answering a fetch with garbage cannot make this pay for a state read
+        // or a KZG batch.
+        if !fork_choice::verify_data_column_sidecar(sidecar, &config) {
+            return Err(ChainVerdict::Drop(Outcome::Reject(RejectReason::Malformed)));
+        }
+        let signed_header = &sidecar.signed_block_header;
+        let header = &signed_header.message;
+        // [IGNORE] Not from a future slot. Also what bounds
+        // `advanced_proposer`'s `process_slots` in `judge_header`: a header
+        // naming a slot far ahead would otherwise make it advance one slot at
+        // a time towards that slot.
+        if is_future_slot(&config, header.slot, self.now_ms) {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::FutureSlot,
+            )));
+        }
+        // [IGNORE] From a slot greater than the latest finalized slot.
+        if header.slot <= finalized_start_slot(store) {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized)));
+        }
+        // [IGNORE] Already stored. Common during a range sync, whose
+        // consecutive batches ask for overlapping spans of columns, and
+        // everything after this is the expensive part.
+        let header_root = header.hash_tree_root();
+        if store.has_data_column(header.slot, &header_root, sidecar.index) {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::AlreadyStored,
+            )));
+        }
+        // Everything the signed header and the parent's post-state decide,
+        // once per signed header. Inserted only once `judge_header` returns,
+        // so a panic inside it leaves nothing behind for the next sidecar to
+        // read.
+        let key = (header_root, signed_header.signature);
+        let shared = *self
+            .headers
+            .entry(key)
+            .or_insert_with(|| judge_header(store, signed_header));
+        shared?;
+        // [REJECT] The commitments are the ones the block committed to. Per
+        // sidecar: the commitments and the branch proving them are the
+        // sidecar's own, not the header's.
+        if !fork_choice::verify_data_column_sidecar_inclusion_proof(sidecar) {
+            return Err(ChainVerdict::Drop(Outcome::Reject(
+                RejectReason::InclusionProof,
+            )));
+        }
+        Ok(PendingKzg {
+            commitments: sidecar.kzg_commitments.to_vec(),
+        })
+    }
+
+    /// [`Self::check`] for a gloas sidecar. The commitments its proofs are
+    /// checked against come out of the block's bid, so they travel in the
+    /// [`PendingKzg`].
+    fn check_gloas(
+        &mut self,
+        sidecar: &gloas::DataColumnSidecar,
+    ) -> Result<PendingKzg, ChainVerdict> {
+        let store = self.store;
+        let config = store.config();
+        // [IGNORE] Not from a future slot. Also what bounds how far ahead a
+        // parked row can name.
+        if is_future_slot(&config, sidecar.slot, self.now_ms) {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::FutureSlot,
+            )));
+        }
+        // [IGNORE] From a slot greater than the latest finalized slot, unless
+        // it is a column of the finalized block itself. Not a gloas rule:
+        // gloas has no finalized bound on sidecars, and this one stays only to
+        // bound what a parked row can name. The finalized block is exempt
+        // because its envelope can still be waiting on these columns: a
+        // checkpoint-synced anchor is the finalized block, and no child
+        // building on its payload imports until its sampled columns arrive.
+        // Matched by root rather than by slot, since an anchor state advanced
+        // past empty slots finalizes a block from before its epoch's start
+        // slot. A column naming that root is never parked: the block and its
+        // post-state are both stored, so it is judged at once.
+        let finalized = store.beacon_finalized_checkpoint();
+        if sidecar.slot <= compute_start_slot_at_epoch(finalized.epoch)
+            && sidecar.beacon_block_root != finalized.root
+        {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized)));
+        }
+        // [IGNORE] Already stored, as in [`chain_checks`].
+        if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
+            return Err(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::AlreadyStored,
+            )));
+        }
+        // The block the sidecar names, looked up and decoded once per block.
+        let block = self
+            .blocks
+            .entry(sidecar.beacon_block_root)
+            .or_insert_with(|| gloas_block(store, &sidecar.beacon_block_root));
+        match gloas_before_kzg(sidecar, block) {
+            Ok(commitments) => Ok(PendingKzg {
+                commitments: commitments.to_vec(),
+            }),
+            Err(Outcome::Queue(QueueReason::BlockUnknown | QueueReason::BlockNotReady)) => {
+                Err(ChainVerdict::AwaitParent)
+            }
+            Err(outcome) => Err(ChainVerdict::Drop(outcome)),
+        }
+    }
+}
+
+/// The fulu chain rules that read nothing of a sidecar but its signed header,
+/// in [`chain_checks`]'s order: what [`ChainPrechecks`] runs once per signed
+/// header.
+///
+/// `Err(AwaitParent)` when the parent has no post-state and the head state
+/// does not show the signature forged; any other `Err` drops the sidecar.
+fn judge_header(
+    store: &Store,
+    signed_header: &SignedBeaconBlockHeader,
+) -> Result<(), ChainVerdict> {
+    let header = &signed_header.message;
+    let Ok(Some(parent_state)) = store.get_state(&header.parent_root) else {
+        // Parked rather than dropped: the specification's "MAY be queued"
+        // for a sidecar whose parent has not been seen. The head-state
+        // signature check keeps a forged header from taking a
+        // `PendingDataColumns` row while it waits.
+        return Err(
+            match queue_unless_forged(store, signed_header, QueueReason::ParentUnknown) {
+                Outcome::Queue(_) => ChainVerdict::AwaitParent,
+                outcome => ChainVerdict::Drop(outcome),
+            },
+        );
+    };
+    judge_header_against_parent(store, signed_header, &parent_state, PastLookahead::Advance)
+        .map_err(ChainVerdict::Drop)
+}
+
+/// What the KZG proofs of a sidecar that passed [`ChainPrechecks`] are
+/// checked against.
+///
+/// Fulu's sidecar carries its commitments, so this is a copy of them (a few
+/// dozen bytes each, nothing next to the cells). Gloas's come from the bid of
+/// the block the sidecar names, which only the precheck's store read could
+/// supply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingKzg {
+    commitments: Vec<KzgCommitment>,
+}
+
+/// A sidecar of either fork, borrowed: lets [`chain_checks`] and
+/// [`chain_checks_gloas`] verify the proofs the way [`kzg_verdict`] does
+/// without wrapping (and so cloning) a sidecar into [`AnyDataColumnSidecar`].
+enum ColumnRef<'a> {
+    Fulu(&'a DataColumnSidecar),
+    Gloas(&'a gloas::DataColumnSidecar),
+}
+
+impl<'a> From<&'a AnyDataColumnSidecar> for ColumnRef<'a> {
+    fn from(sidecar: &'a AnyDataColumnSidecar) -> Self {
+        match sidecar {
+            AnyDataColumnSidecar::Fulu(sidecar) => Self::Fulu(sidecar),
+            AnyDataColumnSidecar::Gloas(sidecar) => Self::Gloas(sidecar),
+        }
+    }
+}
+
+impl<'a> ColumnRef<'a> {
+    /// The cells and proofs of the column, as [`fork_choice::ColumnCells`]
+    /// against `commitments`.
+    fn cells(&self, commitments: &'a [KzgCommitment]) -> fork_choice::ColumnCells<'a> {
+        match self {
+            Self::Fulu(sidecar) => fork_choice::ColumnCells {
+                index: sidecar.index,
+                column: &sidecar.column,
+                commitments,
+                proofs: &sidecar.kzg_proofs,
+            },
+            Self::Gloas(sidecar) => fork_choice::ColumnCells {
+                index: sidecar.index,
+                column: &sidecar.column,
+                commitments,
+                proofs: &sidecar.kzg_proofs,
+            },
+        }
+    }
+}
+
+/// Verify one pending sidecar's KZG proofs on their own.
+pub fn kzg_verdict(sidecar: &AnyDataColumnSidecar, pending: &PendingKzg) -> ChainVerdict {
+    kzg_verdict_ref(&sidecar.into(), pending)
+}
+
+fn kzg_verdict_ref(sidecar: &ColumnRef<'_>, pending: &PendingKzg) -> ChainVerdict {
+    let kzg = {
+        let _timing = metrics::time_data_column_kzg_verify();
+        fork_choice::verify_column_cells_batch(&[sidecar.cells(&pending.commitments)])
+    };
+    // [REJECT] Every cell matches its commitment and proof.
+    if matches!(kzg, Ok(true)) {
+        ChainVerdict::Keep
+    } else {
+        ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg))
+    }
+}
+
+/// The KZG verdicts of several pending sidecars, one per entry and in order,
+/// from one `verify_cell_kzg_proof_batch` call over all their cells.
+///
+/// Every entry is [`ChainVerdict::Keep`] when the batch verifies. When it does
+/// not, the batch cannot say which sidecar is at fault, so each is verified
+/// again on its own: the verdicts are then exactly [`kzg_verdict`]'s, and a
+/// forged column costs the rest of its batch one extra pass rather than their
+/// acceptance. Intended for the sidecars of one block, which is where the
+/// cost is shared: the batch pays its fixed work once instead of once per
+/// sidecar. How many go in one call is the caller's to bound, since the
+/// cells are copied into it and a failed batch is re-run one by one.
+pub fn kzg_verdicts(items: &[(&AnyDataColumnSidecar, &PendingKzg)]) -> Vec<ChainVerdict> {
+    match items {
+        // Nothing to verify, and nothing to time: an empty call must not add
+        // an observation to the KZG histogram.
+        [] => return Vec::new(),
+        [(sidecar, pending)] => return vec![kzg_verdict(sidecar, pending)],
+        _ => {}
+    }
+    let refs: Vec<ColumnRef<'_>> = items.iter().map(|(sidecar, _)| (*sidecar).into()).collect();
+    let columns: Vec<fork_choice::ColumnCells<'_>> = refs
+        .iter()
+        .zip(items)
+        .map(|(sidecar, (_, pending))| sidecar.cells(&pending.commitments))
+        .collect();
+    let batch = {
+        let _timing = metrics::time_data_column_kzg_verify();
+        fork_choice::verify_column_cells_batch(&columns)
+    };
+    if matches!(batch, Ok(true)) {
+        return vec![ChainVerdict::Keep; items.len()];
+    }
+    refs.iter()
+        .zip(items)
+        .map(|(sidecar, (_, pending))| kzg_verdict_ref(sidecar, pending))
+        .collect()
+}
+
+/// What [`judge_header_against_parent`] does when the parent state's proposer
 /// lookahead has no answer for the sidecar's slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PastLookahead {
-    /// Queue it, as gossip does: advancing a state clone takes longer than a
-    /// gossip verdict can wait.
+    /// Skip the proposer rule, as gossip does: [`stateful_checks`] queues the
+    /// sidecar after its last REJECT rule instead ([`lookahead_covers`]), since
+    /// advancing a state clone takes longer than a gossip verdict can wait.
     Queue,
-    /// Advance a clone of the parent state to the slot and ask it, as
-    /// [`chain_checks`] does.
+    /// Advance a clone of the parent state to the slot and ask it, as the
+    /// chain checks do.
     Advance,
 }
 
-/// The rules that read the parent's post-state, shared by [`stateful_checks`]
-/// and [`chain_checks`].
+/// The rules that read the parent's post-state and nothing of the sidecar but
+/// its signed header, shared by [`stateful_checks`] and [`judge_header`]: in
+/// order, `NotAfterParent`, the signature, the expected proposer and the
+/// finalized ancestry.
 ///
-/// Signature first, lookahead last, mirroring
-/// [`super::block::stateful_checks`]'s own order: a forged header naming a
-/// real parent is caught by [`header_signature_is_valid`] before this pays
-/// for the finalized-ancestry walk (a full `LiveChain` scan) or the KZG
-/// proof.
-fn judge_against_parent(
+/// Signature first, mirroring [`super::block::stateful_checks`]'s own order: a
+/// forged header naming a real parent is caught by
+/// [`header_signature_is_valid`] before this pays for the finalized-ancestry
+/// walk (a full `LiveChain` scan), and before its caller pays for the
+/// inclusion proof or the KZG proofs.
+fn judge_header_against_parent(
     store: &Store,
-    sidecar: &DataColumnSidecar,
+    signed_header: &SignedBeaconBlockHeader,
     parent_state: &BeaconState,
     past_lookahead: PastLookahead,
-) -> Outcome {
+) -> Result<(), Outcome> {
     let config = store.config();
-    let header = &sidecar.signed_block_header.message;
+    let header = &signed_header.message;
     // [REJECT] The sidecar is from a higher slot than its parent.
     if header.slot <= parent_state.slot() {
-        return Outcome::Reject(RejectReason::NotAfterParent);
+        return Err(Outcome::Reject(RejectReason::NotAfterParent));
     }
     // [REJECT] Signed by a validator the parent's state knows, over this
     // header.
-    if let Err(outcome) = header_signature_is_valid(sidecar, parent_state, &config) {
-        return outcome;
-    }
+    header_signature_is_valid(signed_header, parent_state, &config)?;
     // [REJECT] Proposed by the proposer the parent's state fixes for the
     // slot. Read from its lookahead when that covers the slot; past it, only
     // the chain path pays to find out.
@@ -287,38 +564,16 @@ fn judge_against_parent(
         (None, PastLookahead::Queue) => None,
         (None, PastLookahead::Advance) => {
             let Some(expected) = advanced_proposer(parent_state, header.slot, &config) else {
-                return Outcome::Ignore(IgnoreReason::Internal);
+                return Err(Outcome::Ignore(IgnoreReason::Internal));
             };
             Some(expected)
         }
     };
     if expected.is_some_and(|expected| header.proposer_index != expected) {
-        return Outcome::Reject(RejectReason::WrongProposer);
+        return Err(Outcome::Reject(RejectReason::WrongProposer));
     }
     // [REJECT] The finalized checkpoint is an ancestor of the sidecar's block.
-    if let Err(outcome) = finalized_ancestry(store, header.parent_root).verdict() {
-        return outcome;
-    }
-    // [REJECT] The commitments are the ones the block committed to.
-    if !fork_choice::verify_data_column_sidecar_inclusion_proof(sidecar) {
-        return Outcome::Reject(RejectReason::InclusionProof);
-    }
-    // [REJECT] Every cell matches its commitment and proof.
-    let kzg = {
-        let _timing = metrics::time_data_column_kzg_verify();
-        fork_choice::verify_data_column_sidecar_kzg_proofs(sidecar)
-    };
-    if !matches!(kzg, Ok(true)) {
-        return Outcome::Reject(RejectReason::Kzg);
-    }
-    // [IGNORE] The sidecar's slot is outside the parent state's proposer
-    // lookahead window (MAY queue).
-    if past_lookahead == PastLookahead::Queue
-        && let Err(outcome) = lookahead_covers(parent_state, header.slot)
-    {
-        return outcome;
-    }
-    Outcome::Accept
+    finalized_ancestry(store, header.parent_root).verdict()
 }
 
 /// The proposer `parent_state`, advanced to `slot`, names for it: the answer
@@ -328,8 +583,9 @@ fn judge_against_parent(
 /// Advances a clone, so the caller's copy (the store's cached `Arc`) is left
 /// exactly as it was. Costs a `process_slots` over every slot between the
 /// parent and `slot`, including a full state merkleization per empty slot
-/// crossed, which is why only [`chain_checks`] calls this, and only for a
-/// slot the lookahead does not cover.
+/// crossed, which is why only the chain checks call this, once per signed
+/// header ([`ChainPrechecks`]), and only for a slot the lookahead does not
+/// cover.
 fn advanced_proposer(
     parent_state: &BeaconState,
     slot: Slot,
@@ -349,7 +605,11 @@ fn advanced_proposer(
 /// the *expected* one for the slot. A column queued here is written to the
 /// chain actor's `PendingDataColumns`, so without this check a forged one
 /// would sit there rather than being refused up front.
-fn queue_unless_forged(store: &Store, sidecar: &DataColumnSidecar, reason: QueueReason) -> Outcome {
+fn queue_unless_forged(
+    store: &Store,
+    signed_header: &SignedBeaconBlockHeader,
+    reason: QueueReason,
+) -> Outcome {
     let head_state = store
         .head()
         .ok()
@@ -357,7 +617,7 @@ fn queue_unless_forged(store: &Store, sidecar: &DataColumnSidecar, reason: Queue
     let Some(head_state) = head_state else {
         return Outcome::Queue(reason);
     };
-    match header_signature_is_valid(sidecar, &head_state, &store.config()) {
+    match header_signature_is_valid(signed_header, &head_state, &store.config()) {
         Err(Outcome::Reject(RejectReason::BadSignature)) => {
             Outcome::Reject(RejectReason::BadSignature)
         }
@@ -425,38 +685,11 @@ pub fn cheap_checks_gloas(
 /// is queued too where the specification rejects it, the same deviation
 /// fulu's parent rule makes until a bad-block cache exists.
 pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) -> Outcome {
-    let block = match judgeable_block_gloas(store, &sidecar.beacon_block_root) {
-        Ok(block) => block,
+    let block = gloas_block(store, &sidecar.beacon_block_root);
+    let kzg_commitments = match gloas_before_kzg(sidecar, &block) {
+        Ok(commitments) => commitments,
         Err(outcome) => return outcome,
     };
-    // [REJECT] The sidecar's slot matches the slot of the block.
-    if sidecar.slot != block.slot() {
-        return Outcome::Reject(RejectReason::SlotMismatch);
-    }
-    let kzg_commitments = match &block {
-        SignedBeaconBlock::Gloas(block) => {
-            &block
-                .message
-                .body
-                .signed_execution_payload_bid
-                .message
-                .blob_kzg_commitments
-        }
-        // A block of any other fork has no bid to read commitments from, so
-        // no sidecar of this shape can be valid for it.
-        SignedBeaconBlock::Phase0(_)
-        | SignedBeaconBlock::Altair(_)
-        | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_)
-        | SignedBeaconBlock::Deneb(_)
-        | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
-        SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::stateful_checks_gloas"),
-    };
-    // [REJECT] The sidecar passes structural validation.
-    if !fork_choice::gloas_verify_data_column_sidecar(sidecar, kzg_commitments) {
-        return Outcome::Reject(RejectReason::Malformed);
-    }
     // [REJECT] The sidecar's column data passes KZG verification.
     let kzg = {
         let _timing = metrics::time_data_column_kzg_verify();
@@ -466,6 +699,67 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
         return Outcome::Reject(RejectReason::Kzg);
     }
     Outcome::Accept
+}
+
+/// What a gloas sidecar's rules read of the block it names: its slot, and the
+/// commitments of its bid, or the verdict for a block that has no bid.
+#[derive(Debug, Clone)]
+struct GloasBlock {
+    slot: Slot,
+    commitments: Result<Vec<KzgCommitment>, Outcome>,
+}
+
+/// The block `root` names, as far as its sidecars' rules need it, or the
+/// verdict [`judgeable_block_gloas`] gives for why it cannot be judged against
+/// yet. Decodes the block, so [`ChainPrechecks`] asks it once per block.
+fn gloas_block(store: &Store, root: &Root) -> Result<GloasBlock, Outcome> {
+    let block = judgeable_block_gloas(store, root)?;
+    let commitments = match &block {
+        SignedBeaconBlock::Gloas(block) => Ok(block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments
+            .to_vec()),
+        // A block of any other fork has no bid to read commitments from, so
+        // no sidecar of this shape can be valid for it.
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => Err(Outcome::Reject(RejectReason::BlockNotGloas)),
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::gloas_block"),
+    };
+    Ok(GloasBlock {
+        slot: block.slot(),
+        commitments,
+    })
+}
+
+/// Every rule [`stateful_checks_gloas`] runs before the KZG proofs, in the
+/// same order, against `block` as [`gloas_block`] found it. `Ok` carries the
+/// commitments the proofs are checked against (the block's bid's), and means
+/// "accepted unless the proofs fail"; an `Err` is the verdict whatever the
+/// proofs say. The commitments are borrowed from `block`, so gossip checks
+/// against them without a copy and only a [`PendingKzg`] takes one.
+fn gloas_before_kzg<'a>(
+    sidecar: &gloas::DataColumnSidecar,
+    block: &'a Result<GloasBlock, Outcome>,
+) -> Result<&'a [KzgCommitment], Outcome> {
+    let block = block.as_ref().map_err(|outcome| *outcome)?;
+    // [REJECT] The sidecar's slot matches the slot of the block.
+    if sidecar.slot != block.slot {
+        return Err(Outcome::Reject(RejectReason::SlotMismatch));
+    }
+    let kzg_commitments = block.commitments.as_ref().map_err(|outcome| *outcome)?;
+    // [REJECT] The sidecar passes structural validation.
+    if !fork_choice::gloas_verify_data_column_sidecar(sidecar, kzg_commitments) {
+        return Err(Outcome::Reject(RejectReason::Malformed));
+    }
+    Ok(kzg_commitments)
 }
 
 /// The block a gloas sidecar is judged against, or the verdict that says why
@@ -554,24 +848,24 @@ fn lookahead_covers(parent_state: &BeaconState, slot: Slot) -> Result<(), Outcom
     Ok(())
 }
 
-/// Whether `sidecar`'s header carries `state`'s key for its `proposer_index`.
+/// Whether `signed_header` carries `state`'s key for its `proposer_index`.
 ///
-/// Checked in [`stateful_checks`] before the proposer-identity check and
-/// every later rule, so a forged header is caught before the finalized-
-/// ancestry walk or the KZG proof. Also what [`queue_unless_forged`] judges a
-/// column on before its parent's own state is even available, against the
-/// head state instead of the parent's. Neither caller can answer the
+/// Checked in [`judge_header_against_parent`] before the proposer-identity
+/// check and every later rule, so a forged header is caught before the
+/// finalized-ancestry walk or the KZG proof. Also what [`queue_unless_forged`]
+/// judges a column on before its parent's own state is even available, against
+/// the head state instead of the parent's. Neither caller can answer the
 /// *expected*-proposer question the state `state` is judged against here (the
 /// head state may predate the proposer's own deposit; the parent's state
 /// knows the proposer but not always the slot's shuffling), so this checks
 /// only what the signature alone can tell them: an unknown proposer or a bad
 /// signature, never `WrongProposer`.
 fn header_signature_is_valid(
-    sidecar: &DataColumnSidecar,
+    signed_header: &SignedBeaconBlockHeader,
     state: &BeaconState,
     config: &Config,
 ) -> Result<(), Outcome> {
-    let header = &sidecar.signed_block_header.message;
+    let header = &signed_header.message;
     let Ok(proposer) = state.validator(header.proposer_index) else {
         return Err(Outcome::Reject(RejectReason::UnknownProposer));
     };
@@ -585,11 +879,7 @@ fn header_signature_is_valid(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(header.hash_tree_root(), domain);
-    if !bls::verify(
-        &proposer.pubkey,
-        signing_root,
-        &sidecar.signed_block_header.signature,
-    ) {
+    if !bls::verify(&proposer.pubkey, signing_root, &signed_header.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -1109,6 +1399,90 @@ mod tests {
         );
     }
 
+    /// The sidecars of one block share a header, so a group's checks judge it
+    /// once; a sidecar carrying a different signature over the same header is
+    /// its own entry and fails on its own, with the verdict it has when
+    /// checked alone.
+    #[test]
+    fn a_groups_shared_header_is_judged_once() {
+        let parent = fulu_parent(3);
+        let parent_root = Root::repeat_byte(0x99);
+        let store = store_with_parent(&parent, parent_root);
+        let config = store.config();
+        let slot = parent.slot() + 1;
+        let now = slot_start_ms(&store, slot);
+        // Signed by the validator it names, which is not the slot's proposer:
+        // the signature passes and `WrongProposer` follows.
+        let good = signed_child(&parent, parent_root, slot, 5, 5, &config);
+        let mut forged = signed_child(&parent, parent_root, slot, 5, 6, &config);
+        forged.index = 3;
+        let columns: Vec<DataColumnSidecar> = (0..3)
+            .map(|index| DataColumnSidecar {
+                index,
+                ..good.clone()
+            })
+            .collect();
+
+        let mut prechecks = ChainPrechecks::new(&store, now);
+        for sidecar in &columns {
+            assert_eq!(
+                prechecks.check_fulu(sidecar),
+                Err(ChainVerdict::Drop(Outcome::Reject(
+                    RejectReason::WrongProposer
+                )))
+            );
+        }
+        assert_eq!(prechecks.headers.len(), 1);
+
+        assert_eq!(
+            prechecks.check_fulu(&forged),
+            Err(ChainVerdict::Drop(Outcome::Reject(
+                RejectReason::BadSignature
+            )))
+        );
+        assert_eq!(prechecks.headers.len(), 2);
+        // The forged one's answer is what it is alone, and does not leak onto
+        // the sidecars that carry the good signature.
+        assert_eq!(
+            chain_checks(&store, &forged, now),
+            ChainVerdict::Drop(Outcome::Reject(RejectReason::BadSignature))
+        );
+        assert_eq!(
+            prechecks.check_fulu(&columns[0]),
+            Err(ChainVerdict::Drop(Outcome::Reject(
+                RejectReason::WrongProposer
+            )))
+        );
+        assert_eq!(prechecks.headers.len(), 2);
+    }
+
+    /// A group whose sidecars all stop before the header's rules (here, all
+    /// already stored) never reads the parent's state or judges the header:
+    /// the shared answer is worked out only when a sidecar needs it.
+    #[test]
+    fn a_group_that_stops_early_never_judges_its_header() {
+        let parent = fulu_parent(3);
+        let parent_root = Root::repeat_byte(0x99);
+        let store = store_with_parent(&parent, parent_root);
+        let config = store.config();
+        let slot = parent.slot() + 1;
+        let now = slot_start_ms(&store, slot);
+        let card = signed_child(&parent, parent_root, slot, 3, 3, &config);
+        let header = &card.signed_block_header.message;
+        store
+            .put_data_column_sidecar(slot, &header.hash_tree_root(), card.index, Vec::new())
+            .expect("store the column");
+
+        let mut prechecks = ChainPrechecks::new(&store, now);
+        assert_eq!(
+            prechecks.check_fulu(&card),
+            Err(ChainVerdict::Drop(Outcome::Ignore(
+                IgnoreReason::AlreadyStored
+            )))
+        );
+        assert!(prechecks.headers.is_empty());
+    }
+
     /// Where gossip queues, `chain_checks` drops: the parent already has a
     /// post-state, so no import will ever let the walk finish, and parking the
     /// sidecar would only wait for an import that has already happened.
@@ -1371,5 +1745,424 @@ mod tests {
             .try_into()
             .expect("within the list bound");
         assert!(!is_parkable_gloas(&config, &custody, &crowded));
+    }
+
+    // -- KZG batching ------------------------------------------------------
+
+    /// A blob of `4096` canonical field elements derived from `seed`: the top
+    /// byte of each 32-byte element is zero, which keeps it below the modulus.
+    fn blob(seed: u8) -> Vec<u8> {
+        (0..c_kzg::BYTES_PER_BLOB)
+            .map(|i| {
+                if i % 32 == 0 {
+                    0
+                } else {
+                    (i as u8).wrapping_mul(31).wrapping_add(seed)
+                }
+            })
+            .collect()
+    }
+
+    /// One column of real KZG material: its index, its cell of every blob, and
+    /// the proof of each.
+    type RealColumn = (u64, Vec<fulu::Cell>, Vec<KzgProof>);
+
+    /// `blobs` blobs' worth of real commitments, and the cells and proofs of
+    /// every column in `columns`. Every column carries one cell per blob, as on
+    /// the wire.
+    fn real_columns(blobs: usize, columns: &[u64]) -> (Vec<KzgCommitment>, Vec<RealColumn>) {
+        let mut commitments = Vec::new();
+        let mut cells = Vec::new();
+        let mut proofs = Vec::new();
+        for seed in 0..blobs {
+            let blob = blob(seed as u8);
+            commitments.push(crate::beacon::kzg::blob_to_kzg_commitment(&blob).expect("commit"));
+            let (blob_cells, blob_proofs) =
+                crate::beacon::kzg::compute_cells_and_kzg_proofs(&blob).expect("cells");
+            cells.push(blob_cells);
+            proofs.push(blob_proofs);
+        }
+        let columns = columns
+            .iter()
+            .map(|&index| {
+                let column: Vec<fulu::Cell> = cells
+                    .iter()
+                    .map(|blob_cells| {
+                        libssz_types::SszVector::try_from(
+                            blob_cells[index as usize].to_bytes().to_vec(),
+                        )
+                        .expect("exact cell size")
+                    })
+                    .collect();
+                let column_proofs: Vec<KzgProof> = proofs
+                    .iter()
+                    .map(|blob_proofs| blob_proofs[index as usize])
+                    .collect();
+                (index, column, column_proofs)
+            })
+            .collect();
+        (commitments, columns)
+    }
+
+    /// [`real_columns`] as the fulu sidecars of those columns, each with its
+    /// [`PendingKzg`] built by hand: for the tests of [`kzg_verdicts`] alone.
+    fn real_sidecars(blobs: usize, columns: &[u64]) -> Vec<(AnyDataColumnSidecar, PendingKzg)> {
+        let (commitments, columns) = real_columns(blobs, columns);
+        columns
+            .into_iter()
+            .map(|(index, column, column_proofs)| {
+                let mut sidecar = sidecar(5, 0, index);
+                sidecar.column = column.try_into().expect("within the per-block limit");
+                sidecar.kzg_proofs = column_proofs
+                    .try_into()
+                    .expect("within the per-block limit");
+                sidecar.kzg_commitments = commitments
+                    .clone()
+                    .try_into()
+                    .expect("within the per-block limit");
+                let pending = PendingKzg {
+                    commitments: commitments.clone(),
+                };
+                (AnyDataColumnSidecar::Fulu(sidecar), pending)
+            })
+            .collect()
+    }
+
+    fn verdicts_of(items: &[(AnyDataColumnSidecar, PendingKzg)]) -> Vec<ChainVerdict> {
+        let refs: Vec<_> = items.iter().map(|(s, p)| (s, p)).collect();
+        kzg_verdicts(&refs)
+    }
+
+    #[test]
+    fn a_batch_of_valid_columns_keeps_every_one() {
+        let items = real_sidecars(2, &[0, 7, 64]);
+        assert_eq!(verdicts_of(&items), vec![ChainVerdict::Keep; 3]);
+    }
+
+    /// The verdict the specification's own per-sidecar check gives, the one
+    /// gossip runs and the chain checks ran before they batched: what a batch's
+    /// verdicts must equal.
+    fn spec_kzg_verdict(sidecar: &AnyDataColumnSidecar, pending: &PendingKzg) -> ChainVerdict {
+        let kzg = match sidecar {
+            AnyDataColumnSidecar::Fulu(sidecar) => {
+                fork_choice::verify_data_column_sidecar_kzg_proofs(sidecar)
+            }
+            AnyDataColumnSidecar::Gloas(sidecar) => {
+                fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(
+                    sidecar,
+                    &pending.commitments,
+                )
+            }
+        };
+        if matches!(kzg, Ok(true)) {
+            ChainVerdict::Keep
+        } else {
+            ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg))
+        }
+    }
+
+    /// One forged cell fails the whole batch; the fallback must then give the
+    /// verdicts the specification's per-sidecar check gives: the forged column
+    /// dropped as a KZG rejection, its neighbours kept.
+    #[test]
+    fn one_bad_column_in_a_batch_drops_only_that_column() {
+        let mut items = real_sidecars(2, &[0, 7, 64]);
+        let AnyDataColumnSidecar::Fulu(forged) = &mut items[1].0 else {
+            unreachable!("real_sidecars builds fulu sidecars");
+        };
+        let mut cell = forged.column[0].to_vec();
+        cell[0] ^= 1;
+        forged.column[0] = libssz_types::SszVector::try_from(cell).expect("exact cell size");
+
+        let batched = verdicts_of(&items);
+        assert_eq!(
+            batched,
+            vec![
+                ChainVerdict::Keep,
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg)),
+                ChainVerdict::Keep,
+            ]
+        );
+        let one_by_one: Vec<_> = items
+            .iter()
+            .map(|(sidecar, pending)| spec_kzg_verdict(sidecar, pending))
+            .collect();
+        assert_eq!(batched, one_by_one);
+    }
+
+    /// Proofs swapped between two columns: each proof is a valid proof, for
+    /// the other column's cell, so only a check of the pairing catches it.
+    #[test]
+    fn proofs_swapped_between_columns_are_both_rejected() {
+        let mut items = real_sidecars(1, &[3, 4]);
+        let (first, second) = items.split_at_mut(1);
+        let (AnyDataColumnSidecar::Fulu(a), AnyDataColumnSidecar::Fulu(b)) =
+            (&mut first[0].0, &mut second[0].0)
+        else {
+            unreachable!("real_sidecars builds fulu sidecars");
+        };
+        std::mem::swap(&mut a.kzg_proofs, &mut b.kzg_proofs);
+        assert_eq!(
+            verdicts_of(&items),
+            vec![ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg)); 2]
+        );
+    }
+
+    /// The sidecars of a real fulu block with `blobs` blobs, at every column in
+    /// `columns`: a child of `parent` (stored under `parent_root`) at the next
+    /// slot, proposed and signed by `proposer`, so that every chain rule, the
+    /// inclusion proof and the KZG proofs included, can pass.
+    fn real_block_sidecars(
+        parent: &BeaconState,
+        parent_root: Root,
+        proposer: ValidatorIndex,
+        blobs: usize,
+        columns: &[u64],
+        config: &Config,
+    ) -> Vec<DataColumnSidecar> {
+        let blobs: Vec<crate::beacon::containers::deneb::Blob> = (0..blobs)
+            .map(|seed| libssz_types::SszVector::try_from(blob(seed as u8)).expect("blob size"))
+            .collect();
+        let commitments: Vec<KzgCommitment> = blobs
+            .iter()
+            .map(|blob| crate::beacon::kzg::blob_to_kzg_commitment(&blob[..]).expect("commit"))
+            .collect();
+        let cell_proofs: Vec<KzgProof> = blobs
+            .iter()
+            .flat_map(|blob| {
+                crate::beacon::kzg::compute_cells_and_kzg_proofs(&blob[..])
+                    .expect("cells")
+                    .1
+                    .to_vec()
+            })
+            .collect();
+        let mut body = electra::BeaconBlockBody::empty();
+        body.blob_kzg_commitments = commitments.try_into().expect("within the block limit");
+        let block = electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot: parent.slot() + 1,
+                proposer_index: proposer,
+                parent_root,
+                state_root: Root::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        };
+        let sidecars = crate::beacon::data_columns::verified_sidecars(&block, &blobs, &cell_proofs)
+            .expect("the block's own columns");
+        columns
+            .iter()
+            .map(|&index| signed(sidecars[index as usize].clone(), parent, config, proposer))
+            .collect()
+    }
+
+    /// The verdicts a group gets the way the p2p layer judges it: every
+    /// sidecar through one [`ChainPrechecks`], then the pending ones through
+    /// one [`kzg_verdicts`] batch, put back in order.
+    fn group_verdicts(
+        prechecks: &mut ChainPrechecks<'_>,
+        group: &[AnyDataColumnSidecar],
+    ) -> Vec<ChainVerdict> {
+        let prechecked: Vec<_> = group
+            .iter()
+            .map(|sidecar| prechecks.check(sidecar))
+            .collect();
+        let pending: Vec<_> = group
+            .iter()
+            .zip(&prechecked)
+            .filter_map(|(sidecar, precheck)| Some((sidecar, precheck.as_ref().ok()?)))
+            .collect();
+        let mut batch = kzg_verdicts(&pending).into_iter();
+        prechecked
+            .iter()
+            .map(|precheck| match precheck {
+                Ok(_) => batch.next().expect("one verdict per pending sidecar"),
+                Err(verdict) => *verdict,
+            })
+            .collect()
+    }
+
+    /// A fulu group mixing every way a sidecar of one block can end gets,
+    /// judged together, exactly the verdicts [`chain_checks_for`] gives each
+    /// sidecar alone, the good ones kept through the batch, and judges the
+    /// header once per signature it carries.
+    #[test]
+    fn a_fulu_group_gets_the_verdicts_each_sidecar_gets_alone() {
+        let proposer: ValidatorIndex = 3;
+        let parent = fulu_parent(proposer);
+        let parent_root = Root::repeat_byte(0xcc);
+        let mut store = store_with_parent(&parent, parent_root);
+        // The parent's own parent is the finalized root (`Root::ZERO`, at
+        // slot 0), so the finalized-ancestry walk passes.
+        store.insert_live_chain_entry(parent.slot(), parent_root, Root::ZERO);
+        store.insert_live_chain_entry(0, Root::ZERO, Root::ZERO);
+        let config = store.config();
+        let now = slot_start_ms(&store, parent.slot() + 1);
+        let all: Vec<u64> = (0..8).collect();
+        let mut group = real_block_sidecars(&parent, parent_root, proposer, 2, &all, &config);
+
+        // 2: no commitments.
+        group[2].kzg_commitments = Default::default();
+        // 3: already stored.
+        let header = &group[3].signed_block_header.message;
+        store
+            .put_data_column_sidecar(header.slot, &header.hash_tree_root(), 3, Vec::new())
+            .expect("store the column");
+        // 4: the block's header under another validator's signature.
+        group[4] = signed(group[4].clone(), &parent, &config, 6);
+        // 5: a branch that does not prove the commitments.
+        let mut branch = group[5].kzg_commitments_inclusion_proof.to_vec();
+        branch[0] = Root::repeat_byte(0xee);
+        group[5].kzg_commitments_inclusion_proof = branch.try_into().expect("exact depth");
+        // 6: a cell its proof does not open to.
+        let mut cell = group[6].column[0].to_vec();
+        cell[31] ^= 1;
+        group[6].column[0] = libssz_types::SszVector::try_from(cell).expect("exact cell size");
+        let group: Vec<AnyDataColumnSidecar> =
+            group.into_iter().map(AnyDataColumnSidecar::Fulu).collect();
+
+        let mut prechecks = ChainPrechecks::new(&store, now);
+        let together = group_verdicts(&mut prechecks, &group);
+        let alone: Vec<ChainVerdict> = group
+            .iter()
+            .map(|sidecar| chain_checks_for(&store, sidecar, now))
+            .collect();
+        assert_eq!(together, alone);
+        assert_eq!(
+            together,
+            vec![
+                ChainVerdict::Keep,
+                ChainVerdict::Keep,
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::Malformed)),
+                ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored)),
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::BadSignature)),
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::InclusionProof)),
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg)),
+                ChainVerdict::Keep,
+            ]
+        );
+        // The block's own signature, and the other validator's.
+        assert_eq!(prechecks.headers.len(), 2);
+    }
+
+    /// A gloas group: the block it names is looked up and decoded once, each
+    /// sidecar is shaped against that block's bid, and one batch keeps the
+    /// columns that verify and drops the forged one, as the specification's
+    /// per-sidecar check and [`chain_checks_for`] each do.
+    #[test]
+    fn a_gloas_group_reads_its_block_once_and_keeps_what_verifies() {
+        let mut store = store(0);
+        let slot = 5;
+        let root = Root::repeat_byte(0x5a);
+        let (commitments, columns) = real_columns(2, &[0, 1, 2]);
+        let mut block = gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments = commitments.into();
+        store
+            .insert_pending_block(root, SignedBeaconBlock::Gloas(block))
+            .expect("insert the block");
+        store
+            .insert_state(root, fulu_parent(3))
+            .expect("insert a post-state");
+        let mut group: Vec<gloas::DataColumnSidecar> = columns
+            .into_iter()
+            .map(|(index, column, proofs)| gloas::DataColumnSidecar {
+                index,
+                slot,
+                beacon_block_root: root,
+                column: column.into(),
+                kzg_proofs: proofs.into(),
+            })
+            .collect();
+        let mut cell = group[1].column[0].to_vec();
+        cell[31] ^= 1;
+        group[1].column[0] = libssz_types::SszVector::try_from(cell).expect("exact cell size");
+        let group: Vec<AnyDataColumnSidecar> =
+            group.into_iter().map(AnyDataColumnSidecar::Gloas).collect();
+        let now = slot_start_ms(&store, slot);
+
+        let mut prechecks = ChainPrechecks::new(&store, now);
+        let pending: Vec<(&AnyDataColumnSidecar, PendingKzg)> = group
+            .iter()
+            .map(|sidecar| {
+                let pending = prechecks
+                    .check(sidecar)
+                    .expect("every rule before the proofs passes");
+                (sidecar, pending)
+            })
+            .collect();
+        assert_eq!(prechecks.blocks.len(), 1);
+        let items: Vec<_> = pending
+            .iter()
+            .map(|(sidecar, pending)| (*sidecar, pending))
+            .collect();
+        let together = kzg_verdicts(&items);
+        assert_eq!(
+            together,
+            vec![
+                ChainVerdict::Keep,
+                ChainVerdict::Drop(Outcome::Reject(RejectReason::Kzg)),
+                ChainVerdict::Keep,
+            ]
+        );
+        let spec: Vec<_> = pending
+            .iter()
+            .map(|(sidecar, pending)| spec_kzg_verdict(sidecar, pending))
+            .collect();
+        assert_eq!(together, spec);
+        let alone: Vec<_> = group
+            .iter()
+            .map(|sidecar| chain_checks_for(&store, sidecar, now))
+            .collect();
+        assert_eq!(together, alone);
+    }
+
+    /// Prints the time of one batch over `k` columns against `k` separate
+    /// calls, the fastest of several runs of each so a loaded machine skews
+    /// it less. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark: prints timings"]
+    fn bench_kzg_batch_against_separate_calls() {
+        use std::time::Instant;
+        const BLOBS: usize = 9;
+        let all: Vec<u64> = (0..preset::NUMBER_OF_COLUMNS as u64).collect();
+        let items = real_sidecars(BLOBS, &all);
+        for k in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let subset = &items[..k];
+            let (mut batched, mut separate) = (Vec::new(), Vec::new());
+            for _ in 0..15 {
+                let start = Instant::now();
+                assert!(
+                    verdicts_of(subset)
+                        .iter()
+                        .all(|verdict| *verdict == ChainVerdict::Keep)
+                );
+                batched.push(start.elapsed());
+                let start = Instant::now();
+                for (sidecar, pending) in subset {
+                    assert_eq!(kzg_verdict(sidecar, pending), ChainVerdict::Keep);
+                }
+                separate.push(start.elapsed());
+            }
+            let b = batched.into_iter().min().expect("measured");
+            let s = separate.into_iter().min().expect("measured");
+            println!(
+                "k={k} blobs={BLOBS}: batch {b:?}, separate {s:?}, ratio {:.2}",
+                s.as_secs_f64() / b.as_secs_f64()
+            );
+        }
     }
 }
