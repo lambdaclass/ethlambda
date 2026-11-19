@@ -207,12 +207,16 @@ impl NewPayloadRequest<'_> {
     }
 }
 
-/// [`ask`] for a request already built with [`new_payload_request`], which is
-/// how the actor sends it from a task while it computes the transition.
+/// Asks the execution client about a block's payload, with a request already
+/// built by [`new_payload_request`], which is how the actor sends it from a
+/// task while it computes the transition.
 ///
-/// The answer is read exactly as [`ask`] reads it: `Err` means no answer after
-/// the client's whole retry ladder, and there is no `Ok(None)` because a
-/// request existing means there was something to ask.
+/// `Err` means no verdict: no answer after the client's whole retry ladder, or
+/// a JSON-RPC error answer ([`EngineError::Rpc`]), which is not retried.
+/// `optimistic-sync.md` then requires the caller not to import the block and
+/// not to touch fork choice. There is no "nothing to ask" reading: a request
+/// existing means there was something to ask, and a block with none (pre-merge,
+/// gloas) is [`PayloadValidity::NotRequired`] without a call.
 pub async fn ask_request(
     client: &EngineClient,
     request: OwnedNewPayloadRequest,
@@ -247,7 +251,9 @@ async fn timed_new_payload(
 }
 
 /// The `outcome` an answer is counted under: its verdict, or `no_verdict`
-/// when the retry ladder ran out without one.
+/// when there is none. That is either the retry ladder running out without an
+/// answer, or a JSON-RPC error answer ([`EngineError::Rpc`]), which ends the
+/// call at its first attempt since asking again would get the same refusal.
 ///
 /// `not_required` is listed for completeness: a status from the execution
 /// client always reads as one of the other three verdicts.
@@ -261,51 +267,15 @@ pub fn outcome_label(verdict: Option<&PayloadValidity>) -> &'static str {
     }
 }
 
-/// Asks the execution client about `block`'s payload.
-///
-/// `Ok(None)` means there was nothing to ask, which is not a failure:
-/// [`PayloadValidity::NotRequired`] is the right verdict and the block imports.
-/// `Err` means no answer was obtained after the client's whole retry ladder, and
-/// `optimistic-sync.md` requires the caller not to import the block and not to
-/// touch fork choice.
-pub async fn ask(
-    client: &EngineClient,
-    block: &SignedBeaconBlock,
-) -> Result<Option<PayloadValidity>, EngineError> {
-    let Some(request) = new_payload_request(block) else {
-        return Ok(None);
-    };
-    let call = client.new_payload(
-        request.execution_payload,
-        &request.versioned_hashes,
-        request.parent_beacon_block_root,
-        &request.execution_requests,
-    );
-    let status = timed_new_payload(call).await?;
-    Ok(Some(verdict(&status)))
-}
-
 /// Asks the execution client about the payload `envelope` reveals for `block`,
-/// with `engine_newPayloadV5`.
+/// with `engine_newPayloadV5`, and hands back its raw answer.
 ///
-/// Never `Ok(None)`: unlike [`ask`] there is no "nothing to ask" reading, and a
-/// block/envelope pair that does not match is an
-/// [`EngineError::EnvelopeMismatch`], which the caller must treat as a refusal
-/// to import.
-pub async fn ask_envelope(
-    client: &EngineClient,
-    block: &SignedBeaconBlock,
-    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Result<PayloadValidity, EngineError> {
-    ask_envelope_status(client, block, envelope)
-        .await
-        .map(|status| verdict(&status))
-}
-
-/// [`ask_envelope`] with the engine's raw answer, for a caller that must tell
+/// Raw rather than read through [`verdict`], since the caller must tell
 /// `INVALID_BLOCK_HASH` (the envelope's contents do not hash to its claimed
 /// block hash, so only that envelope is bad) from `INVALID` (the payload the
-/// hash names is bad).
+/// hash names is bad). Never "nothing to ask": a block/envelope pair that does
+/// not match is an [`EngineError::EnvelopeMismatch`], which the caller must
+/// treat as a refusal to import.
 pub async fn ask_envelope_status(
     client: &EngineClient,
     block: &SignedBeaconBlock,

@@ -181,7 +181,7 @@ pub struct ImportTimings {
     /// work.
     ///
     /// The request is sent from a task of its own while the state transition
-    /// runs (see [`Self::stf_spec_start`]), so this pair starts where that
+    /// runs (see [`Self::stf_speculative_start`]), so this pair starts where that
     /// transition ended and ends when the answer arrived. Both are the same
     /// instant, a recorded zero, when there was no request to send (no
     /// execution client, or a block with no payload in it: pre-merge or
@@ -220,8 +220,8 @@ pub struct ImportTimings {
     /// instead of counting the overlap twice. `None` whenever no request was
     /// sent, which is every import without an execution client and every
     /// block with no payload to ask about.
-    pub stf_spec_start: Option<Instant>,
-    pub stf_spec_end: Option<Instant>,
+    pub stf_speculative_start: Option<Instant>,
+    pub stf_speculative_end: Option<Instant>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
     /// background writer, which waits while the writer's queue is full. It
@@ -404,9 +404,9 @@ impl ImportTimings {
         }
         // Also when the import stopped before running its own transition (a
         // held block), so the speculation it paid for is not lost.
-        if let Some(spec) = span(self.stf_spec_start, self.stf_spec_end) {
+        if let Some(spec) = span(self.stf_speculative_start, self.stf_speculative_end) {
             stf.elapsed = Some(stf.elapsed.unwrap_or_default() + spec);
-            stf.end = stf.end.or(self.stf_spec_end);
+            stf.end = stf.end.or(self.stf_speculative_end);
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -936,7 +936,7 @@ mod tests {
         // engine row keeps the 30 ms that was left and stf gains the 70 ms.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_spec_start, timings.stf_spec_end) = pair(base, 0, 70);
+        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 0, 70);
         (timings.engine_start, timings.engine_end) = pair(base, 70, 30);
         (timings.stf_start, timings.stf_end) = pair(base, 100, 20);
 
@@ -966,7 +966,7 @@ mod tests {
         // the block was held without a transition of its own.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_spec_start, timings.stf_spec_end) = pair(base, 0, 70);
+        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 0, 70);
         (timings.engine_start, timings.engine_end) = pair(base, 70, 300);
 
         assert_eq!(

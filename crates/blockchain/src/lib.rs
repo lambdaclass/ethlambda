@@ -1845,8 +1845,8 @@ impl BlockChainServer {
                                 // import ends up using it: it is
                                 // state-transition work either way.
                                 if computed.is_some() {
-                                    timings.stf_spec_start = Some(spec_start);
-                                    timings.stf_spec_end = Some(spec_end);
+                                    timings.stf_speculative_start = Some(spec_start);
+                                    timings.stf_speculative_end = Some(spec_end);
                                 }
                                 speculation = computed;
                                 // A panicked or cancelled task is no
@@ -1929,10 +1929,7 @@ impl BlockChainServer {
                         if !spec.is_for(block_root, parent_root) {
                             metrics::inc_engine_speculation("discarded_mismatch");
                             None
-                        } else if matches!(
-                            validity,
-                            fork_choice::PayloadValidity::Invalidated { .. }
-                        ) {
+                        } else if validity.is_invalidated() {
                             metrics::inc_engine_speculation("discarded_invalidated");
                             None
                         } else {
@@ -5741,8 +5738,8 @@ mod tests {
     ///
     /// Driven through the real engine client against a closed port, since an
     /// unreachable execution client is exactly the production shape of this:
-    /// `beacon_engine::ask` spends its retry ladder and `process_block`
-    /// answers `Held` with nothing recorded.
+    /// `beacon_engine::ask_request` spends its retry ladder and
+    /// `process_block` answers `Held` with nothing recorded.
     #[tokio::test]
     async fn a_release_that_gets_no_engine_verdict_puts_the_block_back_on_hold() {
         let store = beacon_store(GENESIS_TIME, 0);

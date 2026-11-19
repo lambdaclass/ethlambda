@@ -664,6 +664,14 @@ pub enum PayloadValidity {
     },
 }
 
+impl PayloadValidity {
+    /// Whether this is [`PayloadValidity::Invalidated`], the one verdict under
+    /// which [`on_block`] runs the transition with an `invalid()` engine.
+    pub fn is_invalidated(&self) -> bool {
+        matches!(self, Self::Invalidated { .. })
+    }
+}
+
 /// Reads an execution client's status as the verdict [`on_block`] takes.
 ///
 /// One function for both sources of a status: the real client's JSON-RPC answer
@@ -1141,8 +1149,14 @@ fn transition_block(
 /// is before the first slot of the block's epoch, and the block is at or after
 /// that slot. The precompute worker stores it under the key
 /// [`checkpoint_state`] uses for `(block_epoch, parent_root)`, since the two
-/// name the same state. Counts a hit or a miss for every such import and for
-/// no other.
+/// name the same state.
+///
+/// Counts a hit or a miss each time a transition of such a block runs, which is
+/// not always once per import: a speculation the chain actor computed while the
+/// execution client was asked (see [`speculate_transition`]) counts even when it
+/// is discarded, so an `INVALIDATED` epoch-crossing block, whose transition
+/// runs again under `invalid()`, counts twice, and so does a used speculation in
+/// a build with debug assertions, which re-runs the transition to check it.
 fn precomputed_epoch_state(
     store: &Store,
     parent_slot: Slot,
@@ -5087,8 +5101,7 @@ pub fn on_block_speculative(
     // epoch; see `ActiveBalanceCacheExt`.
     let active_balances = store.active_balance_cache();
     let usable = speculation.filter(|speculation| {
-        speculation.is_for(block_root, parent_root)
-            && !matches!(payload_validity, PayloadValidity::Invalidated { .. })
+        speculation.is_for(block_root, parent_root) && !payload_validity.is_invalidated()
     });
     let (mut state, transition) = match usable {
         Some(speculation) => (speculation.state, speculation.outcome),

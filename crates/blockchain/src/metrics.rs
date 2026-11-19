@@ -1544,8 +1544,9 @@ pub fn inc_engine_speculation(outcome: &str) {
 /// `lean_block_import_phase_seconds`'s `engine` phase, zero whenever the
 /// answer was in before the transition finished. This is the execution
 /// client's own processing time. `outcome` is `valid`, `optimistic`,
-/// `invalidated` or `no_verdict` (no answer after the whole ladder, so the
-/// time is the ladder's).
+/// `invalidated` or `no_verdict`. A `no_verdict` sample is either the whole
+/// retry ladder, when no answer came, or a single attempt, when the execution
+/// client answered with a JSON-RPC error, which is not retried.
 pub fn observe_engine_new_payload(outcome: &str, duration: Duration) {
     static LEAN_ENGINE_NEW_PAYLOAD_SECONDS: std::sync::LazyLock<HistogramVec> =
         std::sync::LazyLock::new(|| {
