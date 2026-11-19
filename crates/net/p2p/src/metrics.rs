@@ -437,12 +437,12 @@ static LEAN_DATA_COLUMNS_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
     .unwrap()
 });
 
-/// Count one sidecar the chain checks dropped. `reason` is one of
-/// [`DATA_COLUMN_REJECT_REASONS`].
-pub fn inc_data_column_rejected(reason: &str) {
+/// Count `count` sidecars the chain checks dropped for one reason. `reason` is
+/// one of [`DATA_COLUMN_REJECT_REASONS`].
+pub fn inc_data_column_rejected(reason: &str, count: u64) {
     LEAN_DATA_COLUMNS_REJECTED_TOTAL
         .with_label_values(&[reason])
-        .inc();
+        .inc_by(count);
 }
 
 /// Register the metrics that should be visible before their first

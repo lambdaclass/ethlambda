@@ -232,10 +232,11 @@ const GOSSIP_VALIDATION_PERMITS: usize = 128;
 /// once (see [`beacon::column_checks`] and [`beacon::envelope_checks`]). A
 /// permit covers one block's column prechecks and first KZG sub-batch, one
 /// further KZG sub-batch of at most 16 columns, or one envelope: not one
-/// sidecar, as it once did, nor all of a block's proofs. A separate pool from [`GOSSIP_VALIDATION_PERMITS`], so a range batch's
-/// hundreds of sidecars cannot take every permit and leave gossip reporting
-/// `Overloaded`. Work arriving with none free waits for one, in arrival order.
-/// Revisit with data, as for gossip.
+/// sidecar, as it once did, nor all of a block's proofs. A separate pool from
+/// [`GOSSIP_VALIDATION_PERMITS`], so a range batch's hundreds of sidecars
+/// cannot take every permit and leave gossip reporting `Overloaded`. Work
+/// arriving with none free waits for one, in arrival order. Revisit with data,
+/// as for gossip.
 const COLUMN_CHECK_PERMITS: usize = 16;
 
 /// How many `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}`

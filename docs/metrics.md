@@ -615,8 +615,10 @@ gossip rules and counted in
 `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`; the reasons
 here are that counter's reason labels, except `already_seen`, which here
 counts a sidecar repeating a block and column index already in the same call
-(one peer's answer, say), dropped without being judged. The chain actor stores
-what reaches it without checking it again.
+(one peer's answer, say), dropped without being judged. `internal` also counts
+the sidecars a panic inside the checks cost, which are dropped (each one
+whose own checks panicked, or a whole group or KZG sub-batch whose task did).
+The chain actor stores what reaches it without checking it again.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two

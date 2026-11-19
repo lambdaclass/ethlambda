@@ -122,9 +122,12 @@ impl GroupVerdicts {
 /// else would catch a repeat within one call: the answer filters match on
 /// block and index, not on repeats of them, and `AlreadyStored` cannot fire
 /// before the group is done. The first copy is the one kept, as the chain
-/// actor's own parking keeps the first (`queue_sidecar_awaiting_parent`): an
-/// honest answer never repeats a column, and judging copies in turn until one
-/// passes is the cost this bounds.
+/// actor's own parking keeps the first (`queue_sidecar_awaiting_parent`), and
+/// the repeats are not judged even when the first copy fails its checks and a
+/// later one would pass: an honest answer never repeats a column, and judging
+/// copies in turn until one passes is the cost this bounds. Every caller hands
+/// over one source's sidecars (one peer's answer, one gossip message, the
+/// parked set of one block, this node's own), so a repeat is that source's.
 fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> (Vec<Vec<DataColumnSidecar>>, usize) {
     let mut positions: HashMap<Root, usize> = HashMap::new();
     let mut seen: HashSet<(Root, u64)> = HashSet::new();
@@ -181,14 +184,18 @@ fn precheck_group(
     let mut prechecks = ChainPrechecks::new(store, now_ms);
     for sidecar in sidecars {
         // A panic inside the checks (a `Store` read's `.expect()` on a DB
-        // error, say) costs that one sidecar, which is what dropping it
-        // would have done anyway. `ChainPrechecks` keeps an answer only once
-        // it is complete, so the next sidecar works it out again.
+        // error, say) costs that one sidecar, dropped and counted as
+        // `internal`. `ChainPrechecks` keeps an answer only once it is
+        // complete, so the next sidecar works it out again.
         let precheck = catch_unwind(AssertUnwindSafe(|| prechecks.check(&sidecar)));
         match precheck {
             Ok(Ok(kzg)) => pending.push((sidecar, kzg)),
             Ok(Err(verdict)) => settled.record(sidecar, verdict),
-            Err(_) => error!("A data column check panicked; dropping the sidecar"),
+            Err(_) => {
+                error!("A data column check panicked; dropping the sidecar");
+                let internal = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal));
+                settled.record(sidecar, internal);
+            }
         }
     }
     (settled, pending)
@@ -216,15 +223,18 @@ async fn check_group(
     group: Vec<DataColumnSidecar>,
     permit: OwnedSemaphorePermit,
 ) {
+    let group_size = group.len();
     let prechecked =
         tokio::task::spawn_blocking(move || precheck_group(&store, group, unix_now_ms())).await;
     let (settled, pending) = match prechecked {
         Ok(prechecked) => prechecked,
         // Tokio has already caught the panic. A sidecar's own checks catch
         // theirs, so this one came from outside them, and the whole group is
-        // lost: none of it is forwarded or counted.
+        // lost: none of it is forwarded, and all of it is counted as
+        // `internal`.
         Err(err) => {
-            error!(%err, "A data column precheck panicked; dropping the group");
+            error!(%err, lost = group_size, "A data column precheck panicked; dropping the group");
+            count_drops(Outcome::Ignore(IgnoreReason::Internal), group_size);
             return;
         }
     };
@@ -234,33 +244,48 @@ async fn check_group(
 
     let mut own_permit = Some(permit);
     let mut batches = Vec::new();
-    for batch in sub_batches(pending) {
+    let mut remaining = sub_batches(pending).into_iter();
+    while let Some(batch) = remaining.next() {
         // The group's own permit carries the first sub-batch. Each further one
         // waits for a permit of its own, and the group holds none while it
-        // waits, the first having moved into its batch. The semaphore is never
-        // closed, so the wait only ends once a permit is free.
+        // waits, the first having moved into its batch.
         let permit = match own_permit.take() {
             Some(permit) => permit,
-            None => {
-                let Ok(permit) = permits.clone().acquire_owned().await else {
+            None => match permits.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                // The semaphore is never closed, so this does not happen
+                // today. Should it ever, the sidecars not yet sent to a batch
+                // are lost, and say so rather than vanish.
+                Err(_) => {
+                    let lost =
+                        batch.len() + remaining.by_ref().map(|rest| rest.len()).sum::<usize>();
+                    error!(
+                        lost,
+                        "The column check permits are closed; dropping a block's unverified sidecars"
+                    );
+                    count_drops(Outcome::Ignore(IgnoreReason::Internal), lost);
                     break;
-                };
-                permit
-            }
+                }
+            },
         };
-        batches.push(tokio::task::spawn_blocking(move || {
+        let size = batch.len();
+        let verified = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             verify_batch(batch)
-        }));
+        });
+        batches.push((size, verified));
     }
     let mut verdicts = GroupVerdicts::default();
-    for batch in batches {
+    for (size, batch) in batches {
         match batch.await {
             Ok(batch) => verdicts.merge(batch),
             // Tokio has already caught the panic. That sub-batch's sidecars
-            // are lost, neither forwarded nor counted; the group's other
-            // sub-batches and everything settled above are not.
-            Err(err) => error!(%err, "A data column KZG batch panicked; dropping its sidecars"),
+            // are lost, not forwarded and counted as `internal`; the group's
+            // other sub-batches and everything settled above are not.
+            Err(err) => {
+                error!(%err, lost = size, "A data column KZG batch panicked; dropping its sidecars");
+                count_drops(Outcome::Ignore(IgnoreReason::Internal), size);
+            }
         }
     }
     forward(&blockchain, verdicts);
@@ -310,9 +335,7 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
                 repeats,
                 "Dropping data column sidecars that repeat a block and index of the same call"
             );
-            for _ in 0..repeats {
-                count_drop(Outcome::Ignore(IgnoreReason::AlreadySeen));
-            }
+            count_drops(Outcome::Ignore(IgnoreReason::AlreadySeen), repeats);
         }
         for group in groups {
             // The semaphore is never closed, so this only returns once a
@@ -332,18 +355,25 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
 }
 
 /// Count a dropped sidecar under its reason.
+fn count_drop(outcome: Outcome) {
+    count_drops(outcome, 1);
+}
+
+/// Count `count` sidecars dropped for the same reason, in one increment.
 ///
 /// An already stored one is not counted: consecutive range batches ask for
 /// overlapping spans of columns, so re-deliveries are routine, and they are
 /// duplicates rather than rejections. A repeat within one call is counted
-/// (`already_seen`): an honest peer never sends one.
-fn count_drop(outcome: Outcome) {
-    if outcome == Outcome::Ignore(IgnoreReason::AlreadyStored) {
+/// (`already_seen`): an honest peer never sends one. So is every sidecar a
+/// panic in the checks, or a closed permit pool, cost (`internal`).
+fn count_drops(outcome: Outcome, count: usize) {
+    if count == 0 || outcome == Outcome::Ignore(IgnoreReason::AlreadyStored) {
         return;
     }
     let (_, reason) = outcome.labels();
-    metrics::inc_data_column_rejected(reason);
+    metrics::inc_data_column_rejected(reason, count as u64);
 }
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
