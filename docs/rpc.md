@@ -331,8 +331,22 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
+| `POST` | `/eth/v1/validator/pq_blocks/{slot}` | SSZ | An unsigned PQ block and the envelope of its self-built payload, `pq::BlockContents`, given the proposer's VRF proof (ethlambda's own; see [PQ](#pq)) |
 | `POST` | `/eth/v1/validator/register_validator` | *(status only)* | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
+
+### PQ
+
+At a PQ slot (`docs/beacon_pq.md`) the endpoints a validator client needs
+take PQ's containers under `Eth-Consensus-Version: pq`: attestations, payload
+attestations and aggregates in the pool endpoints, blocks and envelopes in
+the publish endpoints. The Beacon API has no PQ block production yet, so
+ethlambda's validator client asks `POST /eth/v1/validator/pq_blocks/{slot}`
+with `{"randao_reveal": [<VRF leaf and branch, hex roots>], "graffiti"?}`.
+Attester duties at a PQ epoch add `is_aggregator`, the validator's seat in
+its committee's aggregation committee, and `GET aggregate_attestation` at a
+PQ slot answers `{"aggregate", "proof"}`, the aggregate this node proved for
+its aggregators' committee (Lighthouse's PQ branch's `PqAggregate`), or 404.
 
 ### Validator endpoints
 
