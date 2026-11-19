@@ -4128,7 +4128,9 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &fulu::DataColumnSidecar) 
     )
 }
 
-/// The batch check both forks' `verify_data_column_sidecar_kzg_proofs` run.
+/// The batch check both forks' `verify_data_column_sidecar_kzg_proofs` run:
+/// [`verify_column_cells_batch`] over this one column, so a column checked on
+/// its own and one checked beside others go through the same code.
 ///
 /// The one thing that differs between them is where `commitments` comes from:
 /// fulu's sidecar carries them, and gloas's takes them from the bid of the
@@ -4140,15 +4142,64 @@ fn verify_column_cells(
     commitments: &[KzgCommitment],
     proofs: &[KzgProof],
 ) -> Result<bool> {
-    let cell_indices = vec![index; column.len()];
-    let mut cells = Vec::with_capacity(column.len());
-    for cell in column {
-        cells.push(
-            c_kzg::Cell::from_bytes(&cell[..])
-                .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
-        );
+    verify_column_cells_batch(&[ColumnCells {
+        index,
+        column,
+        commitments,
+        proofs,
+    }])
+}
+
+/// One column's worth of input to [`verify_column_cells_batch`]: the cell
+/// position every cell of the column sits at, the cells, and the commitments
+/// and proofs they are checked against.
+pub struct ColumnCells<'a> {
+    pub index: u64,
+    pub column: &'a [fulu::Cell],
+    pub commitments: &'a [KzgCommitment],
+    pub proofs: &'a [KzgProof],
+}
+
+/// [`verify_column_cells`] over several columns at once: one
+/// `verify_cell_kzg_proof_batch` call whose entries are every cell of every
+/// column, in order.
+///
+/// `Ok(true)` means every cell of every column verifies. Anything else (a
+/// cell that fails, or a malformed entry) does not say which column is at
+/// fault, so a caller that must tell them apart verifies the columns one by
+/// one afterwards.
+///
+/// A column whose cells, commitments and proofs differ in length is an `Err`,
+/// as c-kzg makes it for one column on its own. Checked here, column by
+/// column, because once the columns are concatenated only the totals could be
+/// compared: a short column beside a long one would pair a cell of one with a
+/// commitment of the other, and could verify. [`verify_data_column_sidecar`]
+/// and its gloas counterpart already refuse such a sidecar, so this guards a
+/// caller that skipped them.
+pub fn verify_column_cells_batch(columns: &[ColumnCells<'_>]) -> Result<bool> {
+    let total: usize = columns.iter().map(|column| column.column.len()).sum();
+    let mut cell_indices = Vec::with_capacity(total);
+    let mut cells = Vec::with_capacity(total);
+    let mut commitments = Vec::with_capacity(total);
+    let mut proofs = Vec::with_capacity(total);
+    for column in columns {
+        let cell_count = column.column.len();
+        if column.commitments.len() != cell_count || column.proofs.len() != cell_count {
+            return Err(Error::SpecAssert(
+                "len(cells) == len(commitments) == len(proofs)",
+            ));
+        }
+        cell_indices.extend(std::iter::repeat_n(column.index, column.column.len()));
+        for cell in column.column {
+            cells.push(
+                c_kzg::Cell::from_bytes(&cell[..])
+                    .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
+            );
+        }
+        commitments.extend_from_slice(column.commitments);
+        proofs.extend_from_slice(column.proofs);
     }
-    kzg::verify_cell_kzg_proof_batch(commitments, &cell_indices, &cells, proofs)
+    kzg::verify_cell_kzg_proof_batch(&commitments, &cell_indices, &cells, &proofs)
 }
 
 /// `verify_data_column_sidecar` (gloas `p2p-interface.md`, modified): the
@@ -10748,5 +10799,53 @@ mod tests {
                 "slot {slot}"
             );
         }
+    }
+
+    /// One real column of a three-blob block, split into two entries whose
+    /// lengths disagree and cancel out: two cells and proofs with one
+    /// commitment, then one cell and proof with two commitments. Concatenated,
+    /// that is the valid column again, so only a per-entry length check can
+    /// refuse it, as c-kzg refuses either entry on its own.
+    #[test]
+    fn a_batch_entry_whose_lengths_disagree_is_refused_even_when_the_totals_match() {
+        let index = 5;
+        let mut cells = Vec::new();
+        let mut commitments = Vec::new();
+        let mut proofs = Vec::new();
+        for seed in 1..=3u8 {
+            // Canonical field elements: the top byte of each is zero.
+            let blob: Vec<u8> = (0..c_kzg::BYTES_PER_BLOB)
+                .map(|i| if i % 32 == 0 { 0 } else { (i as u8) ^ seed })
+                .collect();
+            commitments.push(kzg::blob_to_kzg_commitment(&blob).expect("commitment"));
+            let (blob_cells, blob_proofs) =
+                kzg::compute_cells_and_kzg_proofs(&blob).expect("cells and proofs");
+            let cell: fulu::Cell =
+                libssz_types::SszVector::try_from(blob_cells[index].to_bytes().to_vec())
+                    .expect("exact cell size");
+            cells.push(cell);
+            proofs.push(blob_proofs[index]);
+        }
+        let whole = ColumnCells {
+            index: index as u64,
+            column: &cells,
+            commitments: &commitments,
+            proofs: &proofs,
+        };
+        assert!(matches!(verify_column_cells_batch(&[whole]), Ok(true)));
+
+        let short = ColumnCells {
+            index: index as u64,
+            column: &cells[..2],
+            commitments: &commitments[..1],
+            proofs: &proofs[..2],
+        };
+        let long = ColumnCells {
+            index: index as u64,
+            column: &cells[2..],
+            commitments: &commitments[1..],
+            proofs: &proofs[2..],
+        };
+        assert!(verify_column_cells_batch(&[short, long]).is_err());
     }
 }
