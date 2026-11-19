@@ -2373,6 +2373,32 @@ async fn fetch_initial_beacon_state(
 /// `latest_execution_payload_bid` in the body's bid, so the first block's
 /// `parent_block_hash` check has a genesis payload to build on.
 fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
+    let with_bid = genesis_block_with(state, true);
+    // A generator built against an older gloas release commits to the fully
+    // empty body instead. Whichever body the header names is the genesis
+    // block; with neither, `get_forkchoice_store` refuses the bid form.
+    if state.fork_name() >= ForkName::Gloas
+        && with_bid.body_root() != state.latest_block_header().body_root
+    {
+        let empty = genesis_block_with(state, false);
+        if empty.body_root() == state.latest_block_header().body_root {
+            return empty;
+        }
+    }
+    with_bid
+}
+
+/// [`genesis_anchor_block`]'s block, its body's bid the state's own when
+/// `bid` (the gloas-family genesis the specification builds) and empty
+/// otherwise. Pre-gloas forks have no bid, so `bid` changes nothing for them.
+fn genesis_block_with(state: &BeaconState, bid: bool) -> SignedBeaconBlock {
+    let body_bid = |state: &BeaconState| {
+        if bid {
+            genesis_bid(state)
+        } else {
+            Default::default()
+        }
+    };
     let header = state.latest_block_header();
     let slot = header.slot;
     let proposer_index = header.proposer_index;
@@ -2461,7 +2487,7 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 state_root,
                 body: gloas::BeaconBlockBody {
                     signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
-                        message: genesis_bid(state),
+                        message: body_bid(state),
                         ..Default::default()
                     },
                     ..gloas::BeaconBlockBody::empty()
@@ -2477,7 +2503,7 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 state_root,
                 body: eip8483::BeaconBlockBody {
                     signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
-                        message: genesis_bid(state),
+                        message: body_bid(state),
                         ..Default::default()
                     },
                     ..eip8483::BeaconBlockBody::empty()
@@ -2493,7 +2519,7 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 state_root,
                 body: pq::BeaconBlockBody {
                     signed_execution_payload_bid: pq::SignedExecutionPayloadBid {
-                        message: genesis_bid(state),
+                        message: body_bid(state),
                         ..Default::default()
                     },
                     ..pq::BeaconBlockBody::empty()
@@ -2772,12 +2798,16 @@ mod tests {
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
-    /// Every beacon fork is followed, the consensus-specs feature forks after
-    /// gloas (EIP-8483, PQ) included, so no anchor is refused for its fork.
+    /// Every beacon fork is followed but EIP-8483, so only its anchor is
+    /// refused for its fork.
     #[test]
     fn startup_accepts_an_anchor_at_every_followed_fork() {
         for fork in ForkName::ALL {
-            assert!(refuse_unfollowable_fork(fork).is_ok(), "{fork} is refused");
+            assert_eq!(
+                refuse_unfollowable_fork(fork).is_ok(),
+                fork != ForkName::Eip8483,
+                "{fork}"
+            );
         }
     }
 
@@ -3647,6 +3677,34 @@ validators:
     /// Chains all the way through gloas: `upgrade_state` handles every fork
     /// from altair to gloas, so this loop exercises `genesis_anchor_block`'s
     /// gloas arm the same way it does every earlier fork's.
+    /// A gloas genesis whose header names the fully empty body (a generator
+    /// built against an older gloas release) still anchors: the empty body
+    /// is tried when the bid form does not match.
+    #[test]
+    fn a_gloas_genesis_with_an_empty_body_still_anchors() {
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in ForkName::ALL
+            .into_iter()
+            .skip(1)
+            .take_while(|f| *f <= ForkName::Gloas)
+        {
+            config = config.with_fork_epoch(fork, 0);
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        // An upgraded state's bid is not the default one, so the two bodies differ.
+        assert_ne!(genesis_bid(&state), Default::default());
+        state.latest_block_header_mut().body_root =
+            gloas::BeaconBlockBody::empty().hash_tree_root();
+        let block = genesis_anchor_block(&state);
+        assert_eq!(
+            block.body_root(),
+            gloas::BeaconBlockBody::empty().hash_tree_root()
+        );
+    }
+
     #[test]
     fn a_genesis_anchor_block_hashes_to_the_states_own_header_at_every_fork() {
         let config = Config::mainnet();

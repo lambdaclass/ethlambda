@@ -156,13 +156,16 @@ impl ForkName {
             | ForkName::Electra
             | ForkName::Fulu
             | ForkName::Gloas
-            // The feature forks after gloas: their blocks and envelopes are
-            // gossiped, requested and imported like gloas's, their execution
-            // requests go to the engine as gloas's do, and PQ's attestation
-            // proofs need the prover backend the network runs
-            // (`ethlambda_crypto::stark`).
-            | ForkName::Eip8483
+            // PQ: its blocks and envelopes are gossiped, requested and
+            // imported like gloas's, its execution requests go to the engine
+            // as gloas's do, and its attestation proofs need the prover
+            // backend the network runs (`ethlambda_crypto::stark`). Run
+            // against Lighthouse on a PQ-at-genesis devnet.
             | ForkName::Pq => true,
+            // Not yet: its block's cheap gossip rules, its envelope topic's
+            // decode and rules, and its fetched envelopes' checks still take
+            // gloas's shapes. Nothing schedules it: the PQ devnet starts on PQ.
+            ForkName::Eip8483 => false,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -368,9 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_is_followed() {
+    fn every_beacon_fork_but_eip8483_is_followed() {
         for fork in ForkName::ALL {
-            assert!(fork.is_followed(), "{fork:?}");
+            assert_eq!(fork.is_followed(), fork != ForkName::Eip8483, "{fork:?}");
         }
     }
 
