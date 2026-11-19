@@ -2802,11 +2802,15 @@ async fn handle_data_column_sidecars_range_response(
         return;
     }
 
-    // One batch through the checks, which forward what passes as one
-    // message. A range answer is the largest batch this node ever takes
-    // delivery of, and it arrives precisely when the chain actor is busiest
-    // draining a backlog, so a message per sidecar would put that many
-    // mailbox hops between the answer and the imports waiting on it.
+    // The whole answer through the checks in one call, which forward per
+    // block: the sidecars that pass as one message and the ones waiting on a
+    // block as another, so at most two per block, not one per sidecar. A range
+    // answer is the largest batch this node ever takes delivery of, and it
+    // arrives precisely when the chain actor is busiest draining a backlog, so
+    // a message per sidecar would put that many mailbox hops between the
+    // answer and the imports waiting on it; a message per block lets the
+    // actor count a block's columns toward availability as soon as that block
+    // is checked, rather than after the slowest block of the span.
     column_checks::check_and_forward(server, in_range);
 }
 
@@ -3123,6 +3127,7 @@ pub(crate) mod tests {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: ethlambda_network_api::PeerTableController::default(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
