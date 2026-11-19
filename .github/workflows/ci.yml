@@ -125,6 +125,9 @@ jobs:
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     needs: detect-changes
     if: ${{ !cancelled() && needs.detect-changes.outputs.run_tests != 'false' }}
+    # Its tests start and stop an embedded ethrex; a hung shutdown should fail
+    # the job rather than hold the runner for GitHub's six-hour default.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6.1.0
 
