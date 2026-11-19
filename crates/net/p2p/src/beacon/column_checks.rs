@@ -31,13 +31,14 @@ use crate::{P2PServer, metrics};
 /// sent it is to blame if not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnVerdict {
-    /// Passed and went to the chain actor, or was already stored: the column
-    /// is here.
+    /// Passed and was handed to the chain actor, or was already stored: the
+    /// column is here.
     Delivered,
     /// Not judged, through no fault of the sender: parked until its block can
     /// judge it, dropped for a reason that is not the sender's (an `Ignore`),
-    /// or never checked, because this node had no chain actor to check it for
-    /// or its check panicked.
+    /// or never checked or never handed over, because this node had no chain
+    /// actor to check it for or reach, its check panicked, or its task ended
+    /// first.
     Undecided,
     /// Refused as invalid: the sender sent something it should not have.
     Rejected,
@@ -55,8 +56,61 @@ impl From<&ChainVerdict> for ColumnVerdict {
 }
 
 /// A completion callback: each sidecar's column index with its
-/// [`ColumnVerdict`].
+/// [`ColumnVerdict`], in no particular order.
 pub(crate) type Done = Box<dyn FnOnce(Vec<(u64, ColumnVerdict)>) + Send>;
+
+/// The verdicts of one batch, handed to its [`Done`] when dropped: those
+/// recorded, and every other sidecar of the batch as
+/// [`ColumnVerdict::Undecided`].
+///
+/// Reported on drop rather than by a call at the end of the checks, so every
+/// way out reports, a panic or a task ended early included: a lookup that
+/// never hears back keeps its columns on the wire until it goes stale.
+struct Verdicts {
+    done: Option<Done>,
+    /// Column indices of the batch with no verdict recorded yet.
+    unjudged: Vec<u64>,
+    recorded: Vec<(u64, ColumnVerdict)>,
+}
+
+impl Verdicts {
+    fn new(done: Option<Done>, sidecars: &[DataColumnSidecar]) -> Self {
+        let unjudged = sidecars.iter().map(DataColumnSidecar::index).collect();
+        Self {
+            done,
+            unjudged,
+            recorded: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, index: u64, verdict: ColumnVerdict) {
+        if let Some(position) = self.unjudged.iter().position(|&left| left == index) {
+            self.unjudged.swap_remove(position);
+        }
+        self.recorded.push((index, verdict));
+    }
+
+    /// Take back `indices`' delivery: the chain actor never got them.
+    fn not_delivered(&mut self, indices: &[u64]) {
+        for (index, verdict) in &mut self.recorded {
+            if *verdict == ColumnVerdict::Delivered && indices.contains(index) {
+                *verdict = ColumnVerdict::Undecided;
+            }
+        }
+    }
+}
+
+impl Drop for Verdicts {
+    fn drop(&mut self) {
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        let mut verdicts = std::mem::take(&mut self.recorded);
+        let unjudged = self.unjudged.drain(..);
+        verdicts.extend(unjudged.map(|index| (index, ColumnVerdict::Undecided)));
+        done(verdicts);
+    }
+}
 
 /// Run the chain checks on `sidecars`, then send the chain actor the ones that
 /// passed as one batch and the ones waiting on a block as another.
@@ -74,53 +128,41 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
 /// This is how a `DataColumnsByRoot` lookup settles on what passed rather than
 /// on what a peer sent: a sidecar with the right root and index can still
 /// carry bad cells or proofs, and a gloas one carries no signature at all.
-/// `done` runs on every path, with a sidecar that was never judged reported as
-/// [`ColumnVerdict::Undecided`]: a lookup left waiting on a verdict that never
-/// comes would keep its columns covered until the lookup goes stale.
+/// `done` runs on every path ([`Verdicts`] reports when dropped), with a
+/// sidecar that was never judged, or that passed but could not be handed to
+/// the chain actor, reported as [`ColumnVerdict::Undecided`].
 pub(crate) fn check_and_forward_then(
     server: &P2PServer,
     sidecars: Vec<DataColumnSidecar>,
     done: Option<Done>,
 ) {
-    let run_done = |done: Option<Done>, verdicts: Vec<(u64, ColumnVerdict)>| {
-        if let Some(done) = done {
-            done(verdicts);
-        }
-    };
-    let blockchain = match server.blockchain.clone() {
-        Some(blockchain) if !sidecars.is_empty() => blockchain,
-        _ => {
-            run_done(done, undecided(&sidecars));
-            return;
-        }
+    let mut verdicts = Verdicts::new(done, &sidecars);
+    let Some(blockchain) = server.blockchain.clone().filter(|_| !sidecars.is_empty()) else {
+        return;
     };
     let store = server.store.clone();
     let permits = server.column_check_permits.clone();
     tokio::spawn(async move {
         let mut checks = Vec::with_capacity(sidecars.len());
-        let mut verdicts = Vec::with_capacity(sidecars.len());
-        let mut sidecars = sidecars.into_iter();
-        while let Some(sidecar) = sidecars.next() {
+        for sidecar in sidecars {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
             let Ok(permit) = permits.clone().acquire_owned().await else {
-                verdicts.push((sidecar.index(), ColumnVerdict::Undecided));
-                verdicts.extend(undecided(sidecars.as_slice()));
                 break;
             };
             let store = store.clone();
-            let index = sidecar.index();
             let check = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let verdict = column::chain_checks_for(&store, &sidecar, unix_now_ms());
                 (sidecar, verdict)
             });
-            checks.push((index, check));
+            checks.push(check);
         }
 
         let mut keep = Vec::new();
+        let mut kept = Vec::new();
         let mut awaiting_parent = Vec::new();
-        for (index, check) in checks {
+        for check in checks {
             // A panic inside the checks (a `Store` read's `.expect()` on a DB
             // error, say) costs that one sidecar, which is what dropping it
             // would have done anyway. Tokio has already caught it.
@@ -128,13 +170,15 @@ pub(crate) fn check_and_forward_then(
                 Ok(checked) => checked,
                 Err(err) => {
                     error!(%err, "A data column check panicked; dropping the sidecar");
-                    verdicts.push((index, ColumnVerdict::Undecided));
                     continue;
                 }
             };
-            verdicts.push((index, ColumnVerdict::from(&verdict)));
+            verdicts.record(sidecar.index(), ColumnVerdict::from(&verdict));
             match verdict {
-                ChainVerdict::Keep => keep.push(sidecar),
+                ChainVerdict::Keep => {
+                    kept.push(sidecar.index());
+                    keep.push(sidecar);
+                }
                 ChainVerdict::AwaitParent => awaiting_parent.push(sidecar),
                 ChainVerdict::Drop(outcome) => count_drop(outcome),
             }
@@ -143,7 +187,10 @@ pub(crate) fn check_and_forward_then(
         if !keep.is_empty() {
             let _ = blockchain
                 .new_data_column_sidecars(keep)
-                .inspect_err(|err| warn!(%err, "Failed to forward checked data column sidecars"));
+                .inspect_err(|err| {
+                    warn!(%err, "Failed to forward checked data column sidecars");
+                    verdicts.not_delivered(&kept);
+                });
         }
         if !awaiting_parent.is_empty() {
             let _ = blockchain
@@ -152,16 +199,8 @@ pub(crate) fn check_and_forward_then(
                     |err| warn!(%err, "Failed to forward data column sidecars awaiting a parent"),
                 );
         }
-        run_done(done, verdicts);
+        // `verdicts` reports as it drops here.
     });
-}
-
-/// Every sidecar of `sidecars` as [`ColumnVerdict::Undecided`].
-fn undecided(sidecars: &[DataColumnSidecar]) -> Vec<(u64, ColumnVerdict)> {
-    sidecars
-        .iter()
-        .map(|sidecar| (sidecar.index(), ColumnVerdict::Undecided))
-        .collect()
 }
 
 /// Count a dropped sidecar under its reason.
@@ -382,6 +421,65 @@ pub(crate) mod tests {
         assert_eq!(
             reported.recv().await,
             Some(vec![(3, ColumnVerdict::Undecided)])
+        );
+    }
+
+    /// Verdicts reported through `done`, for the guard tests below.
+    fn reporting() -> (
+        Option<Done>,
+        mpsc::UnboundedReceiver<Vec<(u64, ColumnVerdict)>>,
+    ) {
+        let (sender, received) = mpsc::unbounded_channel();
+        let done: Done = Box::new(move |verdicts| {
+            let _ = sender.send(verdicts);
+        });
+        (Some(done), received)
+    }
+
+    /// A task that ends before judging every sidecar (a panic outside the
+    /// blocking checks, or a runtime shutting down) still settles the lookup,
+    /// with what it did not judge as undecided.
+    #[test]
+    fn verdicts_dropped_early_report_the_rest_as_undecided() {
+        let (done, mut reported) = reporting();
+        let batch = [
+            DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 3)),
+            DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 4)),
+        ];
+        let mut verdicts = Verdicts::new(done, &batch);
+        verdicts.record(3, ColumnVerdict::Delivered);
+        drop(verdicts);
+
+        assert_eq!(
+            reported.try_recv().ok(),
+            Some(vec![
+                (3, ColumnVerdict::Delivered),
+                (4, ColumnVerdict::Undecided)
+            ])
+        );
+    }
+
+    /// A sidecar that passed but never reached the chain actor (its mailbox
+    /// closed) is not delivered: the lookup asks for it again.
+    #[test]
+    fn a_kept_sidecar_the_chain_never_got_is_not_delivered() {
+        let (done, mut reported) = reporting();
+        let batch = [
+            DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 5)),
+            DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 6)),
+        ];
+        let mut verdicts = Verdicts::new(done, &batch);
+        verdicts.record(5, ColumnVerdict::Delivered);
+        verdicts.record(6, ColumnVerdict::Delivered);
+        verdicts.not_delivered(&[5]);
+        drop(verdicts);
+
+        assert_eq!(
+            reported.try_recv().ok(),
+            Some(vec![
+                (5, ColumnVerdict::Undecided),
+                (6, ColumnVerdict::Delivered)
+            ])
         );
     }
 }
