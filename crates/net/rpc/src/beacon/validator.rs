@@ -333,8 +333,8 @@ async fn post_committee_subscriptions(
 /// Each validator's execution-layer fee recipient, as its validator client
 /// last named it. Read by block production, which puts the proposer's into
 /// the payload attributes. In memory only: a validator client repeats the
-/// call, ethlambda's and Lighthouse's every slot and some others only every
-/// epoch, so a restarted node relearns the map within a slot or an epoch.
+/// call (ethlambda's and Lighthouse's every slot), so a restarted node
+/// relearns the map from its next one.
 pub(crate) type FeeRecipients = Arc<std::sync::Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>;
 
 /// One entry of `prepare_beacon_proposer`.
