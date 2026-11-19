@@ -711,15 +711,17 @@ The sub-batch size trades wall-clock against CPU. Measured locally at 9 blobs
 (`bench_kzg_batch_against_separate_calls`), one column's proofs take 3.2 ms, a
 batch of 8 columns 7.9 ms, of 16 12.6 ms, and of 128 73 ms, each on one
 thread. Computed from those, assuming free permits and cores: a node's 8
-sampled columns are one batch, 7.9 ms of wall-clock where separate checks 16
-wide would take 3.2 ms, for a third of the CPU; a supernode's 128 are 8
-sub-batches, about 13 ms of wall-clock against 73 ms as one batch and 26 ms as
-separate checks, for 101 ms of CPU against 73 ms and 414 ms. A permit is held
-for one group's prechecks and first sub-batch, or for one further sub-batch,
-so a block's proofs never hold one permit from first column to last; the
-prechecks' share of a hold runs the group's sidecars in turn and is not
-measured. The envelope checks that share the pool wait in arrival order
-behind only what was queued before them.
+sampled columns are one batch, taking 7.9 ms of wall-clock and 7.9 ms of CPU,
+where eight separate checks running side by side would take 3.2 ms of
+wall-clock but 25.8 ms of CPU between them, so the batch is slower to finish
+for a third of the CPU. A supernode's 128 are 8 sub-batches, about 13 ms of
+wall-clock against 73 ms as one batch and 26 ms as separate checks, for 101 ms
+of CPU against 73 ms and 414 ms. A permit is held for one group's prechecks
+and first sub-batch, or for one further sub-batch, so a block's proofs never
+hold one permit from first column to last; the prechecks' share of a hold
+runs the group's sidecars in turn and is not measured. The envelope checks
+that share the pool wait in arrival order behind only what was queued before
+them.
 
 *Asking* happens on two paths, bulk and per block.
 
