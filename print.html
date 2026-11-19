@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e7776a9c.js";
+            window.path_to_searchindex_js = "searchindex-fb49b9c6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -3771,9 +3771,11 @@ suite proves it: its one case, <code>from_syncing_to_invalid</code>, has a <code
 take the head from a <code>VALID</code> one on attestation weight, and then requires the
 head to fall back when the <code>SYNCING</code> branch turns out to be invalid.</p>
 <p>An invalidated block leaves fork choice by having its <code>LiveChain</code> index row
-deleted. That is sufficient because <code>Store::block_index()</code> is the only source
-<code>filter_block_tree</code>, <code>compute_node_weights</code> and <code>walk_head</code> read: a root with no
-row contributes no weight to any ancestor and can never be walked to. The block
+deleted. That is sufficient because <code>Store::block_index()</code> is the only block
+source <code>filter_block_tree</code>, <code>compute_node_weights</code> and <code>walk_head</code> read: a root
+with no row contributes no weight to any ancestor and can never be walked to.
+The deletion also marks the store’s cached fork-choice weights stale, so the next
+head computation rebuilds them without the removed blocks. The block
 and its state stay in their own tables, so an operator can still inspect what
 was rejected.</p>
 <p>That an <code>INVALIDATED</code> block is never imported is enforced on the verdict itself,
@@ -6329,9 +6331,22 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>lean_state_write_seconds</code></td><td>Histogram</td><td>Time the background writer spends encoding, diffing and committing one state</td><td>Per state written</td><td></td></tr>
 <tr><td><code>lean_state_cache_lookups_total</code></td><td>Counter</td><td>State cache lookups, by the <code>Store</code> method that made them, the kind of state asked for, and whether the cache held it</td><td>On every <code>get_state</code> (and the writer’s own parent read), <code>has_state</code> and <code>cached_state</code> call</td><td>method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss</td></tr>
 <tr><td><code>lean_state_rebuilds_total</code></td><td>Counter</td><td>Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root</td><td>On every <code>get_state</code> miss (and the writer’s own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero</td><td>role=led,joined</td></tr>
+<tr><td><code>lean_beacon_proto_array_rebuilds_total</code></td><td>Counter</td><td>Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale</td><td>On a head computation that found the cache stale or not following its inputs</td><td>reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow</td></tr>
+<tr><td><code>lean_beacon_proto_array_rebuild_seconds</code></td><td>Histogram</td><td>Time to rebuild the cached beacon fork-choice weights from every latest message</td><td>Per rebuild</td><td></td></tr>
 </tbody>
 </table>
 </div>
+<p><strong><code>lean_beacon_proto_array_rebuilds_total</code> should move about once per epoch.</strong>
+The beacon head computation reads vote weights the store keeps current as votes
+arrive, and rebuilds them from every latest message only when its inputs move
+under it: <code>balances</code> when the justified checkpoint moves, <code>prune</code> when finality
+prunes the block index (the two usually land together, and one rebuild covers
+both), <code>unbuilt</code> once per process. <code>removal</code> follows a payload invalidation or the
+restart head repair, <code>rules</code> the gloas fork boundary. <code>coverage</code> means a block
+reached the index without <code>Store::insert_fork_choice_node</code>: <code>on_block</code> always
+inserts one, so outside tests and bootstrap a steady rate of it is worth a look
+(an API read racing a block import can cost one now and then). <code>underflow</code> is a
+bug: the cache repaired itself, and a warning in the log names the validator.</p>
 <p><strong>On a beacon follower, watch <code>lean_table_bytes{table="data_columns"}</code>.</strong> Every
 other table’s series either stays flat or is bounded by pruning; <code>data_columns</code>
 backs <code>Table::DataColumns</code>, the one table with no pruning rule (see
@@ -9408,8 +9423,9 @@ named in the header comment of <code>fork_choice.rs</code>’s gloas section.</l
 because a live node holds gaps a fixture tree never has. Each is marked
 “Implementation choice, not spec text” at its definition. The head the node
 runs is <code>walk_head</code> (through <code>get_head_node</code>) over the weights of
-<code>compute_node_weights</code>; the spec-literal references carry the same tolerances so
-that the tests compare like with like.</p>
+<code>cached_node_weights</code>, the store’s cached vote weights, which the tests hold
+equal to <code>compute_node_weights</code>; the spec-literal references carry the same
+tolerances so that the tests compare like with like.</p>
 <ul>
 <li><strong>Pruned votes</strong> (<code>compute_node_weights</code>; in the references,
 <code>get_attestation_score</code>, and through it <code>is_head_weak</code> and

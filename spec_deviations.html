@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e7776a9c.js";
+            window.path_to_searchindex_js = "searchindex-fb49b9c6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -665,8 +665,9 @@ named in the header comment of <code>fork_choice.rs</code>’s gloas section.</l
 because a live node holds gaps a fixture tree never has. Each is marked
 “Implementation choice, not spec text” at its definition. The head the node
 runs is <code>walk_head</code> (through <code>get_head_node</code>) over the weights of
-<code>compute_node_weights</code>; the spec-literal references carry the same tolerances so
-that the tests compare like with like.</p>
+<code>cached_node_weights</code>, the store’s cached vote weights, which the tests hold
+equal to <code>compute_node_weights</code>; the spec-literal references carry the same
+tolerances so that the tests compare like with like.</p>
 <ul>
 <li><strong>Pruned votes</strong> (<code>compute_node_weights</code>; in the references,
 <code>get_attestation_score</code>, and through it <code>is_head_weak</code> and

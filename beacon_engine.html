@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e7776a9c.js";
+            window.path_to_searchindex_js = "searchindex-fb49b9c6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -354,9 +354,11 @@ suite proves it: its one case, <code>from_syncing_to_invalid</code>, has a <code
 take the head from a <code>VALID</code> one on attestation weight, and then requires the
 head to fall back when the <code>SYNCING</code> branch turns out to be invalid.</p>
 <p>An invalidated block leaves fork choice by having its <code>LiveChain</code> index row
-deleted. That is sufficient because <code>Store::block_index()</code> is the only source
-<code>filter_block_tree</code>, <code>compute_node_weights</code> and <code>walk_head</code> read: a root with no
-row contributes no weight to any ancestor and can never be walked to. The block
+deleted. That is sufficient because <code>Store::block_index()</code> is the only block
+source <code>filter_block_tree</code>, <code>compute_node_weights</code> and <code>walk_head</code> read: a root
+with no row contributes no weight to any ancestor and can never be walked to.
+The deletion also marks the store’s cached fork-choice weights stale, so the next
+head computation rebuilds them without the removed blocks. The block
 and its state stay in their own tables, so an operator can still inspect what
 was rejected.</p>
 <p>That an <code>INVALIDATED</code> block is never imported is enforced on the verdict itself,
