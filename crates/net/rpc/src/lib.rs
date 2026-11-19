@@ -629,12 +629,14 @@ pub(crate) mod test_utils {
 
         fn publish_execution_payload_envelope(
             &self,
-            envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
+            envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
             sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            let envelope = envelope
+                .as_gloas()
+                .expect("the rpc tests publish gloas envelopes")
+                .clone();
+            self.envelopes.lock().unwrap().push((envelope, sidecars));
             Ok(())
         }
 

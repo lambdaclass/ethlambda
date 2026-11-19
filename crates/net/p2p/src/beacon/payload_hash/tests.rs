@@ -68,7 +68,7 @@ fn every_real_payload_matches_its_hash() {
         let block = block(fork, bytes);
         assert_eq!(verify_block(&block), Ok(()), "{fork:?}");
     }
-    assert_eq!(verify_envelope(&envelope()), Ok(()), "gloas");
+    assert_eq!(verify_gloas_envelope(&envelope()), Ok(()), "gloas");
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn a_changed_gloas_field_is_refused() {
             }
             _ => message.payload.base_fee_per_gas.0[31] ^= 1,
         }
-        assert_refused(verify_envelope(&changed), what);
+        assert_refused(verify_gloas_envelope(&changed), what);
     }
 }
 
@@ -227,7 +227,7 @@ fn a_pre_merge_bellatrix_payload_has_nothing_to_check() {
 fn a_mismatch_is_a_reject_with_its_own_reason() {
     let mut changed = envelope();
     changed.message.payload.gas_used += 1;
-    let outcome = reject_envelope_on_mismatch(&changed).expect_err("a changed envelope");
+    let outcome = reject_gloas_envelope_on_mismatch(&changed).expect_err("a changed envelope");
     assert_eq!(outcome.labels(), ("reject", "payload_block_hash_mismatch"));
-    assert!(reject_envelope_on_mismatch(&envelope()).is_ok());
+    assert!(reject_gloas_envelope_on_mismatch(&envelope()).is_ok());
 }

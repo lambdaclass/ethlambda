@@ -1,0 +1,64 @@
+#!/bin/bash
+# Runs `ethlambda` with a leanVM prover sidecar beside it, for a network that
+# schedules the PQ fork: `ethlambda-pq beacon <flags>` starts `leanvm-sidecar`
+# on a private socket, waits for it to listen, then starts
+# `ethlambda <flags> --pq-prover-socket <socket>`. Either exiting stops the
+# other. The sidecar must be built from the leanVM revision ethlambda pins
+# (`ethlambda_crypto::stark::sidecar::LEANVM_REV`). `LEANVM_THREADS` caps its
+# threads (0, the default, is one per core).
+set -eu
+
+socket_dir=$(mktemp -d "${TMPDIR:-/tmp}/leanvm.XXXXXXXX")
+socket_path="$socket_dir/prover.sock"
+prover_pid=
+node_pid=
+
+cleanup() {
+    if [[ -n "$node_pid" ]]; then
+        kill "$node_pid" 2>/dev/null || true
+        wait "$node_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$prover_pid" ]]; then
+        kill "$prover_pid" 2>/dev/null || true
+        wait "$prover_pid" 2>/dev/null || true
+    fi
+    rm -f -- "$socket_path" "$socket_path.lock"
+    rmdir -- "$socket_dir" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+leanvm-sidecar --socket "$socket_path" --threads "${LEANVM_THREADS:-0}" &
+prover_pid=$!
+ready_deadline=$((SECONDS + 120))
+until [[ -S "$socket_path" ]]; do
+    if ! kill -0 "$prover_pid" 2>/dev/null; then
+        echo 'leanvm-sidecar exited before creating its socket' >&2
+        exit 1
+    fi
+    if (( SECONDS >= ready_deadline )); then
+        echo 'leanvm-sidecar did not create its socket within 120 seconds' >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+ethlambda "$@" --pq-prover-socket "$socket_path" &
+node_pid=$!
+
+while kill -0 "$prover_pid" 2>/dev/null && kill -0 "$node_pid" 2>/dev/null; do
+    sleep 0.2
+done
+
+if kill -0 "$prover_pid" 2>/dev/null; then
+    status=0
+    wait "$node_pid" || status=$?
+    node_pid=
+    exit "$status"
+fi
+
+prover_pid=
+echo 'leanvm-sidecar exited while ethlambda was running' >&2
+exit 1

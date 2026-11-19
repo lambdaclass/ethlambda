@@ -683,8 +683,11 @@ fn prepare(
             .ok_or(ApiError::ServiceUnavailable(
                 "the parent's payload envelope is not held to build on",
             ))?
+            .as_gloas()
+            .ok_or(ApiError::Internal("a gloas head with a non-gloas envelope"))?
             .message
             .execution_requests
+            .clone()
     } else {
         ExecutionRequests::default()
     };
@@ -1209,7 +1212,7 @@ async fn post_envelope_emitting(
         block_root,
     };
     if p2p
-        .publish_execution_payload_envelope(Box::new(signed), sidecars)
+        .publish_execution_payload_envelope(Box::new(signed.into()), sidecars)
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();

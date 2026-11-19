@@ -28,7 +28,7 @@ use ethlambda_types::{
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
-            gloas,
+            SignedExecutionPayloadEnvelope, StorableEnvelope,
         },
         fork::ForkName,
         fork_choice::{
@@ -4075,12 +4075,8 @@ impl Store {
     /// `slot` is the slot of the block the envelope fulfills, which the
     /// caller has already read while verifying the envelope against it; the
     /// envelope carries none and the row is keyed by it.
-    pub fn insert_verified_payload(
-        &mut self,
-        slot: u64,
-        envelope: &gloas::SignedExecutionPayloadEnvelope,
-    ) {
-        let root = envelope.message.beacon_block_root;
+    pub fn insert_verified_payload(&mut self, slot: u64, envelope: &impl StorableEnvelope) {
+        let root = envelope.beacon_block_root();
         debug_assert_eq!(
             beacon_block_slot(self.backend.as_ref(), &root),
             Some(slot),
@@ -4131,11 +4127,24 @@ impl Store {
             .collect()
     }
 
+    /// The fork of an envelope stored at `slot`: the fork of the block it
+    /// reveals the payload of. Gloas's when the configuration schedules no
+    /// fork with envelopes there, which only a store fed gloas envelopes under
+    /// another schedule (a test) holds.
+    fn envelope_fork(&self, slot: u64) -> ForkName {
+        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        if fork.has_payload_envelopes() {
+            fork
+        } else {
+            ForkName::Gloas
+        }
+    }
+
     /// Gloas: the verified envelope stored for `root`, if any.
     pub fn get_execution_payload_envelope(
         &self,
         root: &H256,
-    ) -> Result<Option<gloas::SignedExecutionPayloadEnvelope>, Error> {
+    ) -> Result<Option<SignedExecutionPayloadEnvelope>, Error> {
         let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) else {
             return Ok(None);
         };
@@ -4147,7 +4156,7 @@ impl Store {
             )
             .expect("get");
         Ok(bytes.map(|bytes| {
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+            SignedExecutionPayloadEnvelope::from_ssz(self.envelope_fork(slot), &bytes)
                 .expect("a stored envelope decodes")
         }))
     }
@@ -4173,7 +4182,7 @@ impl Store {
         &self,
         start_slot: u64,
         end_slot: u64,
-    ) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, Error> {
+    ) -> Result<Vec<SignedExecutionPayloadEnvelope>, Error> {
         if self.chain != Chain::Beacon {
             Self::lean_only("canonical_execution_payload_envelopes");
         }
@@ -4227,8 +4236,9 @@ impl Store {
             let Some(bytes) = envelope_row(slot, &root) else {
                 continue;
             };
-            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
-                .expect("a stored envelope decodes");
+            let envelope =
+                SignedExecutionPayloadEnvelope::from_ssz(self.envelope_fork(slot), &bytes)
+                    .expect("a stored envelope decodes");
             let builds_on_it = match window.get(index + 1) {
                 // No successor: this is the head, whose envelope is part of
                 // the chain only on the FULL node.
@@ -4239,9 +4249,7 @@ impl Store {
                         .expect("get")
                         .map(|bytes| decode_beacon_block_value(&bytes));
                     match next {
-                        Some(next) => {
-                            builds_on_payload(&next, &envelope.message.payload.block_hash)
-                        }
+                        Some(next) => builds_on_payload(&next, &envelope.payload().block_hash),
                         None => false,
                     }
                 }
@@ -5602,6 +5610,7 @@ mod tests {
     use crate::committee_cache::{Lookup, ShufflingKey};
     use ethlambda_types::beacon::committees::EpochCommittees;
     use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
+    use ethlambda_types::beacon::containers::gloas;
     // Only the tests name a status variant: the store itself stores and hands
     // back whole `PayloadStatusV1` values without ever reading the tag.
     use ethlambda_types::beacon::fork_choice::PayloadStatusEnum;
@@ -9323,7 +9332,7 @@ mod tests {
             reopened
                 .get_execution_payload_envelope(&root)
                 .expect("read"),
-            Some(envelope)
+            Some(envelope.into())
         );
     }
 

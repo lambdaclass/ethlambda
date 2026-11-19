@@ -944,7 +944,7 @@ mod gloas_block_production_tests {
         };
         stf::gloas::verify_execution_payload_envelope(
             &post,
-            &signed_envelope,
+            &signed_envelope.clone().into(),
             &config(),
             &ExecutionEngine::valid(),
         )

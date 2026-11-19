@@ -36,7 +36,7 @@ use std::io;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
@@ -359,7 +359,7 @@ where
 {
     for envelope in envelopes {
         let encoded = envelope.to_ssz();
-        let slot = envelope.message.payload.slot_number;
+        let slot = envelope.payload().slot_number;
         if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
             warn!(
                 slot,
@@ -411,16 +411,17 @@ where
     read_chunked_response(io, protocol_label, limits, |context, payload| {
         let fork = <[u8; 4]>::try_from(context)
             .ok()
-            .and_then(|digest| schedule.fork_for_digest(digest));
-        if !fork.is_some_and(carries_envelopes) {
-            return Err(invalid(format!(
-                "execution payload envelope chunk context {} is not a gloas-or-later fork digest",
-                hex::encode(context),
-            )));
-        }
-        let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
+            .and_then(|digest| schedule.fork_for_digest(digest))
+            .filter(|fork| carries_envelopes(*fork))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "execution payload envelope chunk context {} is not a gloas-or-later fork digest",
+                    hex::encode(context),
+                ))
+            })?;
+        let envelope = SignedExecutionPayloadEnvelope::from_ssz(fork, payload)
             .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
-        let slot = envelope.message.payload.slot_number;
+        let slot = envelope.payload().slot_number;
         let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
         if context != expected {
             warn!(

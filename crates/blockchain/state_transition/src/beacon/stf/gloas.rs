@@ -51,7 +51,7 @@ use crate::beacon::bls::{self, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
-use crate::beacon::containers::{BeaconState, capella, gloas};
+use crate::beacon::containers::{BeaconState, SignedExecutionPayloadEnvelope, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
@@ -667,7 +667,43 @@ pub fn verify_execution_payload_envelope_signature(
     state: &BeaconState,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<bool> {
-    let builder_index = signed_envelope.message.builder_index;
+    verify_bls_envelope_signature(
+        state,
+        signed_envelope.message.builder_index,
+        signed_envelope.message.hash_tree_root(),
+        &signed_envelope.signature,
+    )
+}
+
+/// The envelope signature check of whichever fork `signed_envelope` is:
+/// gloas's and EIP-8483's BLS one over their own message roots, PQ's
+/// leanXMSS one.
+pub fn verify_any_execution_payload_envelope_signature(
+    state: &BeaconState,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
+) -> Result<bool> {
+    match signed_envelope {
+        SignedExecutionPayloadEnvelope::Gloas(envelope) => {
+            verify_execution_payload_envelope_signature(state, envelope)
+        }
+        SignedExecutionPayloadEnvelope::Eip8483(envelope) => verify_bls_envelope_signature(
+            state,
+            envelope.message.builder_index,
+            envelope.message.hash_tree_root(),
+            &envelope.signature,
+        ),
+        SignedExecutionPayloadEnvelope::Pq(envelope) => {
+            super::pq::verify_execution_payload_envelope_signature(state, envelope)
+        }
+    }
+}
+
+fn verify_bls_envelope_signature(
+    state: &BeaconState,
+    builder_index: gloas::BuilderIndex,
+    message_root: Root,
+    signature: &crate::beacon::primitives::BlsSignature,
+) -> Result<bool> {
     let pubkey = if builder_index == constants::BUILDER_INDEX_SELF_BUILD {
         let validator_index = state.latest_block_header().proposer_index;
         state.validator(validator_index)?.pubkey
@@ -684,12 +720,8 @@ pub fn verify_execution_payload_envelope_signature(
     };
 
     let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
-    let signing_root = compute_signing_root(signed_envelope.message.hash_tree_root(), domain);
-    Ok(bls::verify(
-        &pubkey,
-        signing_root,
-        &signed_envelope.signature,
-    ))
+    let signing_root = compute_signing_root(message_root, domain);
+    Ok(bls::verify(&pubkey, signing_root, signature))
 }
 
 /// `verify_execution_payload_envelope` (gloas `fork-choice.md`).
@@ -707,18 +739,21 @@ pub fn verify_execution_payload_envelope_signature(
 /// [`ExecutionEngine`]'s own doc for why the versioned hashes below are
 /// computed but never themselves checked against anything beyond the
 /// engine's own opaque verdict.
+///
+/// Takes any fork's envelope: EIP-8483's and PQ's are gloas's with their own
+/// execution requests (which only the bid's `execution_requests_root` check
+/// reads) and, for PQ, a leanXMSS signature.
 pub fn verify_execution_payload_envelope(
     state: &BeaconState,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
     config: &Config,
     engine: &ExecutionEngine,
 ) -> Result<()> {
-    let envelope = &signed_envelope.message;
-    let payload = &envelope.payload;
+    let payload = signed_envelope.payload();
 
     // Verify signature.
     verify(
-        verify_execution_payload_envelope_signature(state, signed_envelope)?,
+        verify_any_execution_payload_envelope_signature(state, signed_envelope)?,
         "verify_execution_payload_envelope: verify_execution_payload_envelope_signature(state, signed_envelope)",
     )?;
 
@@ -742,11 +777,11 @@ pub fn verify_execution_payload_envelope(
     let mut header = state.latest_block_header().clone();
     header.state_root = state.compute_state_root();
     verify(
-        envelope.beacon_block_root == header.hash_tree_root(),
+        signed_envelope.beacon_block_root() == header.hash_tree_root(),
         "verify_execution_payload_envelope: envelope.beacon_block_root == hash_tree_root(header)",
     )?;
     verify(
-        envelope.parent_beacon_block_root == state.latest_block_header().parent_root,
+        signed_envelope.parent_beacon_block_root() == state.latest_block_header().parent_root,
         "verify_execution_payload_envelope: envelope.parent_beacon_block_root == state.latest_block_header.parent_root",
     )?;
 
@@ -754,7 +789,7 @@ pub fn verify_execution_payload_envelope(
     let inner = gloas_state_ref(state, "verify_execution_payload_envelope")?;
     let bid = &inner.latest_execution_payload_bid;
     verify(
-        envelope.builder_index == bid.builder_index,
+        signed_envelope.builder_index() == bid.builder_index,
         "verify_execution_payload_envelope: envelope.builder_index == bid.builder_index",
     )?;
     verify(
@@ -770,7 +805,7 @@ pub fn verify_execution_payload_envelope(
         "verify_execution_payload_envelope: payload.block_hash == bid.block_hash",
     )?;
     verify(
-        envelope.execution_requests.hash_tree_root() == bid.execution_requests_root,
+        signed_envelope.execution_requests_root() == bid.execution_requests_root,
         "verify_execution_payload_envelope: hash_tree_root(envelope.execution_requests) == bid.execution_requests_root",
     )?;
 
@@ -2463,7 +2498,7 @@ mod tests {
             matches!(
                 verify_execution_payload_envelope(
                     &state,
-                    &signed,
+                    &signed.clone().into(),
                     &config,
                     &ExecutionEngine::invalid()
                 ),
@@ -2476,8 +2511,13 @@ mod tests {
             ),
             "every check but the engine's should have already passed"
         );
-        verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid())
-            .expect("a consistent envelope passes every check, including a valid engine's");
+        verify_execution_payload_envelope(
+            &state,
+            &signed.clone().into(),
+            &config,
+            &ExecutionEngine::valid(),
+        )
+        .expect("a consistent envelope passes every check, including a valid engine's");
     }
 
     #[test]
@@ -2500,8 +2540,13 @@ mod tests {
         let cached_root = state.compute_state_root();
         state.latest_block_header_mut().state_root = cached_root;
 
-        verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid())
-            .expect("a stored state's cached header.state_root must still match the envelope");
+        verify_execution_payload_envelope(
+            &state,
+            &signed.clone().into(),
+            &config,
+            &ExecutionEngine::valid(),
+        )
+        .expect("a stored state's cached header.state_root must still match the envelope");
     }
 
     #[test]
@@ -2515,8 +2560,12 @@ mod tests {
         // the signature.
         let signed = sign_envelope(&state, &secret, message);
 
-        let result =
-            verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid());
+        let result = verify_execution_payload_envelope(
+            &state,
+            &signed.clone().into(),
+            &config,
+            &ExecutionEngine::valid(),
+        );
         assert!(
             matches!(
                 result,
@@ -2540,8 +2589,12 @@ mod tests {
             consistent_envelope_message(|bid| bid.builder_index = 0, |_| {});
         let signed = sign_envelope(&state, &secret, message);
 
-        let result =
-            verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid());
+        let result = verify_execution_payload_envelope(
+            &state,
+            &signed.clone().into(),
+            &config,
+            &ExecutionEngine::valid(),
+        );
         assert!(
             matches!(
                 result,

@@ -4,21 +4,25 @@
 //! `ethlambda_state_transition::beacon::gossip::pq`'s, and the bid and
 //! preference rules gloas's own through their fork traits.
 //!
-//! An accepted message is relayed, recorded in the seen caches the other
+//! An accepted message is relayed and recorded in the seen caches the other
 //! forks' messages share (and its bid or preferences in the PQ builder
-//! market), and goes no further: the node does not follow PQ
-//! (`ForkName::is_followed`), so nothing past gossip consumes a PQ object.
-//! Blocks and data column sidecars take the shared path, which ignores a
-//! fork the node does not follow.
+//! market). The chain actor then takes what fork choice reads: an aggregate's
+//! vote and attesting indices, a payload attestation message, and an envelope
+//! (queued ones too, as for gloas). Blocks and data column sidecars take the
+//! shared path.
 
 use std::time::Instant;
 
+use std::time::Instant as StdInstant;
+
+use ethlambda_network_api::{AggregateArrival, BlockArrival};
 use ethlambda_state_transition::beacon::builder_market::SharedPqBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::containers::pq;
+use ethlambda_types::beacon::containers::{SignedExecutionPayloadEnvelope, pq};
+use ethlambda_types::beacon::primitives::ValidatorIndex;
 use ethlambda_types::time::unix_now_ms;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::beacon::builder_market::wall_slot;
 use crate::beacon::decode::{self as beacon_decode, PqGossip};
@@ -30,7 +34,11 @@ use crate::{P2PServer, metrics};
 /// [`Validated`] variant for every PQ topic, so the shared variants, which
 /// the chain actor, the pools and the event stream read, carry no PQ shape.
 pub(crate) enum PqValidated {
-    Aggregate(Box<pq::SignedAggregateAndProof>),
+    Aggregate {
+        signed: Box<pq::SignedAggregateAndProof>,
+        /// Filled in by [`Self::stateful_checks`] on `Accept`.
+        attesting_indices: Vec<ValidatorIndex>,
+    },
     Attestation {
         attestation: Box<pq::SingleAttestation>,
         subnet_id: u64,
@@ -48,10 +56,16 @@ pub(crate) enum PqValidated {
 }
 
 impl PqValidated {
-    pub(crate) fn stateful_checks(&self, store: &Store) -> Outcome {
+    pub(crate) fn stateful_checks(&mut self, store: &Store) -> Outcome {
         match self {
-            Self::Aggregate(signed) => match gossip::pq::aggregate_stateful_checks(store, signed) {
-                Ok(_attesting_indices) => Outcome::Accept,
+            Self::Aggregate {
+                signed,
+                attesting_indices,
+            } => match gossip::pq::aggregate_stateful_checks(store, signed) {
+                Ok(indices) => {
+                    *attesting_indices = indices;
+                    Outcome::Accept
+                }
                 Err(outcome) => outcome,
             },
             Self::Attestation {
@@ -82,7 +96,7 @@ impl PqValidated {
     /// another verdict recorded one first.
     pub(crate) fn record_seen(&self, server: &mut P2PServer) -> bool {
         match self {
-            Self::Aggregate(signed) => {
+            Self::Aggregate { signed, .. } => {
                 let Some(key) = gossip::pq::aggregate_key(signed) else {
                     return false;
                 };
@@ -124,12 +138,60 @@ impl PqValidated {
         }
     }
 
+    /// Hand the parts fork choice reads to the chain actor, given the gossip
+    /// `outcome`: an aggregate's vote and a payload attestation only when
+    /// accepted, an envelope also when queued (the actor holds one whose block
+    /// it has not imported). Subnet attestations, slashings, bids and
+    /// preferences stop at relay, as gloas's do.
+    pub(crate) fn forward(self, server: &P2PServer, received_at: StdInstant, outcome: Outcome) {
+        let Some(blockchain) = &server.blockchain else {
+            return;
+        };
+        match self {
+            Self::Aggregate {
+                signed,
+                attesting_indices,
+            } if outcome == Outcome::Accept => {
+                let arrival = AggregateArrival {
+                    decode_start: received_at,
+                    handed_off: StdInstant::now(),
+                };
+                let data = signed.message.aggregate.data;
+                let _ = blockchain
+                    .new_pq_aggregate(data, attesting_indices, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a PQ aggregate"));
+            }
+            Self::PayloadAttestation(message) if outcome == Outcome::Accept => {
+                let arrival = BlockArrival {
+                    decode_start: Some(received_at),
+                    handed_off: StdInstant::now(),
+                    deferred_from: None,
+                };
+                let _ = blockchain
+                    .new_pq_payload_attestation_message(message, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a PQ payload attestation"));
+            }
+            Self::Envelope(envelope) if matches!(outcome, Outcome::Accept | Outcome::Queue(_)) => {
+                let arrival = BlockArrival {
+                    decode_start: Some(received_at),
+                    handed_off: StdInstant::now(),
+                    deferred_from: None,
+                };
+                let envelope = Box::new(SignedExecutionPayloadEnvelope::Pq(envelope));
+                let _ = blockchain
+                    .new_execution_payload_envelope(envelope, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a PQ envelope"));
+            }
+            _ => {}
+        }
+    }
+
     /// The permit pool its stateful checks draw from, as the matching gloas
     /// object's does.
     pub(crate) fn pool(&self) -> &'static str {
         match self {
             Self::Envelope(_) => "gossip",
-            Self::Aggregate(_)
+            Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::PayloadAttestation(_)
             | Self::ProposerSlashing(_)
@@ -218,7 +280,10 @@ pub(crate) fn triage(
         return Some(Dispatch::Report(outcome));
     }
     let object = match decoded {
-        PqGossip::Aggregate(signed) => PqValidated::Aggregate(signed),
+        PqGossip::Aggregate(signed) => PqValidated::Aggregate {
+            signed,
+            attesting_indices: Vec::new(),
+        },
         PqGossip::Attestation(attestation) => {
             let subnet_id = beacon_topics::attestation_subnet(kind)
                 .expect("decode_pq_gossip decodes an attestation only off a subnet topic");
@@ -334,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn a_pq_slashing_against_a_non_pq_head_is_ignored() {
         let server = unconnected_beacon_server(config(), 0).await;
-        let object = PqValidated::ProposerSlashing(Box::default());
+        let mut object = PqValidated::ProposerSlashing(Box::default());
         assert_eq!(
             object.stateful_checks(&server.store),
             Outcome::Ignore(IgnoreReason::StateUnavailable)

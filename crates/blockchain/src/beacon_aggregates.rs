@@ -36,7 +36,7 @@ use std::collections::{HashMap, VecDeque};
 use ethlambda_state_transition::beacon::aggregate::{
     MAX_AGGREGATES_PER_SLOT, is_non_strict_superset,
 };
-use ethlambda_types::beacon::containers::SignedAggregateAndProof;
+use ethlambda_types::beacon::containers::{AttestationData, SignedAggregateAndProof};
 use ethlambda_types::beacon::primitives::{
     CommitteeIndex, Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex,
 };
@@ -100,9 +100,45 @@ pub(crate) struct AggregateGossip {
     seen_bits: HashMap<Epoch, HashMap<(Root, CommitteeIndex), Vec<bool>>>,
     /// Aggregates waiting for their own slot to pass.
     deferred: VecDeque<Deferred>,
+    /// PQ aggregates waiting for their own slot to pass, as the vote and the
+    /// attesting indices gossip validation resolved. Kept apart from
+    /// [`Self::deferred`] because the coverage gate reads a BLS-fork
+    /// aggregate; p2p's seen cache already drops a PQ aggregate whose bits
+    /// add nothing.
+    pq_deferred: VecDeque<(AttestationData, Vec<ValidatorIndex>)>,
 }
 
 impl AggregateGossip {
+    /// Holds a PQ aggregate until its slot has passed. The oldest is dropped
+    /// once the queue holds [`MAX_DEFERRED`].
+    pub(crate) fn defer_pq(
+        &mut self,
+        data: AttestationData,
+        attesting_indices: Vec<ValidatorIndex>,
+    ) {
+        if self.pq_deferred.len() >= MAX_DEFERRED {
+            self.pq_deferred.pop_front();
+        }
+        self.pq_deferred.push_back((data, attesting_indices));
+    }
+
+    /// The PQ aggregates whose slot is before `current_slot`, removed from the
+    /// queue.
+    pub(crate) fn take_ready_pq(
+        &mut self,
+        current_slot: Slot,
+    ) -> Vec<(AttestationData, Vec<ValidatorIndex>)> {
+        let mut ready = Vec::new();
+        self.pq_deferred.retain(|entry| {
+            let is_ready = current_slot >= entry.0.slot.saturating_add(1);
+            if is_ready {
+                ready.push(entry.clone());
+            }
+            !is_ready
+        });
+        ready
+    }
+
     /// Whether this aggregate adds nothing that has not already been applied.
     ///
     /// Read before [`fork_choice::apply_verified_aggregate`] and written only

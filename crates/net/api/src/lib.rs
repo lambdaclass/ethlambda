@@ -4,13 +4,12 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
-        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        AttestationData, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        SignedExecutionPayloadEnvelope,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
-        gloas::{
-            PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-            SignedProposerPreferences,
-        },
+        gloas::{PayloadAttestationMessage, SignedExecutionPayloadBid, SignedProposerPreferences},
+        pq::PayloadAttestationMessage as PqPayloadAttestationMessage,
     },
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
@@ -349,6 +348,24 @@ pub trait P2PToBlockChain: Send + Sync {
     fn new_payload_attestation_message(
         &self,
         message: PayloadAttestationMessage,
+        arrival: BlockArrival,
+    ) -> Result<(), ActorError>;
+    /// A PQ aggregate that passed gossip validation (its aggregator's XMSS
+    /// signature and its STARK proof included), as the vote it carries and
+    /// the attesting indices validation resolved: what fork choice applies.
+    /// Not the aggregate itself, whose proof and leanXMSS signature nothing
+    /// past gossip reads.
+    fn new_pq_aggregate(
+        &self,
+        data: AttestationData,
+        attesting_indices: Vec<ValidatorIndex>,
+        arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+    /// A PQ payload attestation message that passed gossip validation, for
+    /// fork choice. Not queued, like gloas's.
+    fn new_pq_payload_attestation_message(
+        &self,
+        message: Box<PqPayloadAttestationMessage>,
         arrival: BlockArrival,
     ) -> Result<(), ActorError>;
 }

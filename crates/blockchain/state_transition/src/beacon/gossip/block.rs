@@ -28,13 +28,10 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    // The feature forks after gloas (EIP-8483, PQ) stop here: the node does
-    // not follow them, and a block that passed would be handed to the chain
-    // actor, which cannot import past them.
     if !block.fork_name().is_followed() {
         return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
     }
-    // PQ's rules, ready for when it is followed.
+    // PQ's rules: gloas's with its own operation and request limits.
     if let SignedBeaconBlock::Pq(pq_block) = block {
         return super::pq::block_cheap_checks(seen, store, pq_block, now_ms);
     }
@@ -154,7 +151,9 @@ fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
 /// rebuild the state from diffs, which is far too slow for a verdict that
 /// gossipsub waits on. A miss queues the block instead.
 pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Root) -> Outcome {
-    let gloas_block = as_gloas(block, "block::stateful_checks");
+    // Gloas and the feature forks built on it (EIP-8483, PQ) share the
+    // payload-envelope rules: they read only the bid and the parent.
+    let bid = payload_bid(block);
     let config = store.config();
     let parent_root = block.parent_root();
     let parent_known = store.has_block(&parent_root);
@@ -187,7 +186,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     // even with an unverified parent payload. The parent's fullness is read
     // once: it decodes the parent block, which the bounded validation pool
     // should not do twice.
-    let parent_full = if gloas_block.is_some() {
+    let parent_full = if bid.is_some() {
         match fork_choice::is_parent_node_full(store, block) {
             Ok(full) => full,
             Err(err) => {
@@ -198,8 +197,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     } else {
         true
     };
-    if gloas_block.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
-    {
+    if bid.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root) {
         return Outcome::Ignore(IgnoreReason::ParentPayloadUnverified);
     }
     // [REJECT] The finalized checkpoint is an ancestor of the block.
@@ -208,14 +206,9 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     }
     // A gloas block has no payload to time; earlier forks: [REJECT] the
     // execution payload's timestamp is the slot's.
-    if let Some(gloas_block) = gloas_block {
+    if let Some(bid) = bid {
         // [REJECT] The bid's parent equals the block's parent.
-        let bid = &gloas_block
-            .message
-            .body
-            .signed_execution_payload_bid
-            .message;
-        if bid.parent_block_root != gloas_block.message.parent_root {
+        if bid.parent_block_root != block.parent_root() {
             return Outcome::Reject(RejectReason::BidParentMismatch);
         }
         // [REJECT] If the parent is not full, the bid builds on the parent's
@@ -237,6 +230,30 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
         return Outcome::Queue(QueueReason::ShufflingUnavailable);
     }
     Outcome::Accept
+}
+
+/// The execution payload bid of a block of gloas or a feature fork built on
+/// it, or `None` for an earlier fork.
+fn payload_bid(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPayloadBid> {
+    match block {
+        SignedBeaconBlock::Gloas(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Eip8483(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Pq(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => None,
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("block::payload_bid"),
+    }
 }
 
 /// `state.latest_block_hash`, for a gloas state. `None` for an earlier fork,

@@ -1020,7 +1020,7 @@ mod tests {
                 &stream_protocol,
                 &mut buffer,
                 Response::success(ResponsePayload::ExecutionPayloadEnvelopes(
-                    envelopes.clone(),
+                    envelopes.iter().cloned().map(Into::into).collect(),
                 )),
             )
             .await

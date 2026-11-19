@@ -27,9 +27,13 @@
 //! which holds `base_fee_per_gas` as a `u64` where the payload has 256 bits.
 
 use ethlambda_state_transition::beacon::gossip::{Outcome, RejectReason};
-use ethlambda_state_transition::beacon::stf::{electra, gloas as gloas_stf};
+use ethlambda_state_transition::beacon::stf::{
+    eip8483 as eip8483_stf, electra, gloas as gloas_stf, pq as pq_stf,
+};
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{SignedBeaconBlock, capella, gloas};
+use ethlambda_types::beacon::containers::{
+    SignedBeaconBlock, SignedExecutionPayloadEnvelope, capella, gloas,
+};
 use ethlambda_types::beacon::primitives::Root;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
 use ethrex_common::types::{Withdrawal, compute_withdrawals_root};
@@ -282,12 +286,44 @@ pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
     }
 }
 
-/// A gloas envelope's payload hash against its header.
-pub fn verify_envelope(
+/// An envelope's payload hash against its header, at any fork with
+/// envelopes: the header's `requests_hash` covers the fork's own typed
+/// requests.
+pub fn verify_envelope(envelope: &SignedExecutionPayloadEnvelope) -> Result<(), HashMismatch> {
+    let requests = match envelope {
+        SignedExecutionPayloadEnvelope::Gloas(inner) => {
+            gloas_stf::get_execution_requests_list(&inner.message.execution_requests)
+        }
+        SignedExecutionPayloadEnvelope::Eip8483(inner) => {
+            eip8483_stf::get_execution_requests_list(&inner.message.execution_requests)
+        }
+        SignedExecutionPayloadEnvelope::Pq(inner) => {
+            pq_stf::get_execution_requests_list(&inner.message.execution_requests)
+        }
+    };
+    verify_envelope_parts(
+        envelope.payload(),
+        envelope.parent_beacon_block_root(),
+        requests,
+    )
+}
+
+/// [`verify_envelope`] for a gloas envelope, without wrapping it.
+pub fn verify_gloas_envelope(
     envelope: &gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<(), HashMismatch> {
-    let message = &envelope.message;
-    let payload = &message.payload;
+    verify_envelope_parts(
+        &envelope.message.payload,
+        envelope.message.parent_beacon_block_root,
+        gloas_stf::get_execution_requests_list(&envelope.message.execution_requests),
+    )
+}
+
+fn verify_envelope_parts(
+    payload: &gloas::ExecutionPayload,
+    parent_beacon_block_root: Root,
+    requests: Vec<Vec<u8>>,
+) -> Result<(), HashMismatch> {
     Fields {
         parent_hash: payload.parent_hash.0,
         fee_recipient: payload.fee_recipient.0,
@@ -305,10 +341,8 @@ pub fn verify_envelope(
         transactions: payload.transactions.iter().map(|tx| &tx[..]).collect(),
         withdrawals: Some(payload.withdrawals.as_ref()),
         blob_gas: Some((payload.blob_gas_used, payload.excess_blob_gas)),
-        parent_beacon_block_root: Some(message.parent_beacon_block_root.0),
-        requests: Some(gloas_stf::get_execution_requests_list(
-            &message.execution_requests,
-        )),
+        parent_beacon_block_root: Some(parent_beacon_block_root.0),
+        requests: Some(requests),
         amsterdam: Some((payload.block_access_list.as_ref(), payload.slot_number)),
     }
     .verify()
@@ -320,7 +354,7 @@ pub fn verify_envelope(
 pub(crate) fn seal_envelope(
     mut envelope: gloas::SignedExecutionPayloadEnvelope,
 ) -> gloas::SignedExecutionPayloadEnvelope {
-    if let Err(mismatch) = verify_envelope(&envelope) {
+    if let Err(mismatch) = verify_gloas_envelope(&envelope) {
         envelope.message.payload.block_hash = mismatch.computed.into();
     }
     envelope
@@ -338,9 +372,23 @@ pub(crate) fn reject_block_on_mismatch(
 /// [`verify_envelope`] as a verdict, shared by the gossip topic and the
 /// fetched-envelope checks.
 pub(crate) fn reject_envelope_on_mismatch(
-    envelope: &gloas::SignedExecutionPayloadEnvelope,
+    envelope: &SignedExecutionPayloadEnvelope,
 ) -> Result<(), Outcome> {
     verify_envelope(envelope).map_err(|mismatch| {
+        refuse(
+            "envelope",
+            envelope.payload().slot_number,
+            envelope.beacon_block_root(),
+            mismatch,
+        )
+    })
+}
+
+/// [`reject_envelope_on_mismatch`] for a gloas envelope, without wrapping it.
+pub(crate) fn reject_gloas_envelope_on_mismatch(
+    envelope: &gloas::SignedExecutionPayloadEnvelope,
+) -> Result<(), Outcome> {
+    verify_gloas_envelope(envelope).map_err(|mismatch| {
         refuse(
             "envelope",
             envelope.message.payload.slot_number,

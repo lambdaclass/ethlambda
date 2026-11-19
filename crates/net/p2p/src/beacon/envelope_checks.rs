@@ -24,12 +24,12 @@
 use std::num::NonZeroUsize;
 
 use ethlambda_network_api::BlockArrival;
-use ethlambda_state_transition::beacon::gossip::Outcome;
 use ethlambda_state_transition::beacon::gossip::envelope::{
     SeenEnvelopes, cheap_checks, stateful_checks,
 };
+use ethlambda_state_transition::beacon::gossip::{self, Outcome};
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope;
 use tracing::{debug, error, warn};
 
 use crate::beacon::payload_hash;
@@ -49,14 +49,27 @@ fn judge(store: &Store, envelope: &SignedExecutionPayloadEnvelope) -> Outcome {
     // A fresh, empty cache: a fetched envelope is not a gossip duplicate of
     // anything, so the cache's one rule never fires.
     let seen = SeenEnvelopes::new(NonZeroUsize::MIN);
-    if let Err(outcome) = cheap_checks(&seen, store, envelope) {
-        return outcome;
-    }
     // The same stricter-than-the-specification rule the gossip topic runs.
     if let Err(outcome) = payload_hash::reject_envelope_on_mismatch(envelope) {
         return outcome;
     }
-    stateful_checks(store, envelope)
+    match envelope {
+        SignedExecutionPayloadEnvelope::Gloas(inner) => {
+            if let Err(outcome) = cheap_checks(&seen, store, inner) {
+                return outcome;
+            }
+            stateful_checks(store, inner)
+        }
+        SignedExecutionPayloadEnvelope::Pq(inner) => {
+            if let Err(outcome) = gossip::pq::envelope_cheap_checks(&seen, store, inner) {
+                return outcome;
+            }
+            gossip::pq::envelope_stateful_checks(store, inner)
+        }
+        // No gossip rules of its own: the chain actor verifies every envelope
+        // against its block's post-state.
+        SignedExecutionPayloadEnvelope::Eip8483(_) => Outcome::Accept,
+    }
 }
 
 /// Run the gossip rules on `envelopes` and send the chain actor the ones that
@@ -137,7 +150,7 @@ pub(crate) fn check_and_forward_then(
                 }
             };
             if !forwards(&outcome) {
-                let block_root = envelope.message.beacon_block_root;
+                let block_root = envelope.beacon_block_root();
                 let (_, reason) = outcome.labels();
                 debug!(
                     block_root = %ethlambda_types::ShortRoot(&block_root.0),
@@ -227,13 +240,28 @@ pub(crate) mod tests {
         }
         fn new_execution_payload_envelope(
             &self,
-            envelope: Box<SignedExecutionPayloadEnvelope>,
+            envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
             _: BlockArrival,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Seen::Envelope(
-                envelope.message.beacon_block_root,
-                envelope.message.payload.slot_number,
+                envelope.beacon_block_root(),
+                envelope.payload().slot_number,
             ));
+            Ok(())
+        }
+        fn new_pq_aggregate(
+            &self,
+            _data: ethlambda_types::beacon::containers::AttestationData,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_pq_payload_attestation_message(
+            &self,
+            _message: Box<ethlambda_types::beacon::containers::pq::PayloadAttestationMessage>,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
             Ok(())
         }
         fn new_payload_attestation_message(
@@ -248,10 +276,12 @@ pub(crate) mod tests {
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {
         // Sealed: the fetched-envelope rules refuse a block hash that is not
         // the payload's header's.
-        payload_hash::seal_envelope(crate::beacon::encoding::test_support::envelope(
-            H256::repeat_byte(byte),
-            slot,
-            H256::ZERO,
+        SignedExecutionPayloadEnvelope::Gloas(payload_hash::seal_envelope(
+            crate::beacon::encoding::test_support::envelope(
+                H256::repeat_byte(byte),
+                slot,
+                H256::ZERO,
+            ),
         ))
     }
 

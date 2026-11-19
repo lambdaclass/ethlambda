@@ -386,6 +386,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         );
         ethlambda_crypto::init_leanvm(lean.prover_arena);
     }
+    // The PQ fork's attestation proofs: leanVM proofs from a sidecar when one
+    // is named, the specification's reference encoding otherwise. Before
+    // anything can verify a proof, since the first one used stays installed.
+    if let Network::Mainnet { mainnet, .. } = &network
+        && let Some(socket) = &mainnet.pq_prover_socket
+    {
+        ethlambda_crypto::stark::install_sidecar(
+            ethlambda_crypto::stark::sidecar::SidecarConfig::new(socket.clone()),
+        )
+        .wrap_err("cannot use the leanVM prover sidecar")?;
+    }
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -960,7 +971,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
-    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
+    let mut anchor_envelope_fetch: Option<(Vec<String>, H256, ForkName)> = None;
     let blockchain = match setup.chain {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
@@ -974,7 +985,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             check_custody_set(&custody_columns)?;
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
                 .filter(|_| !anchor_envelope_urls.is_empty())
-                .map(|root| (anchor_envelope_urls, root));
+                .map(|(root, fork)| (anchor_envelope_urls, root, fork));
             BlockChain::spawn_beacon(
                 setup.store,
                 sync_status,
@@ -1010,10 +1021,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // delay the node. The envelope goes through the same chain-actor entry a
     // gossiped one does, so the bid check, the column check and the
     // verification all apply to it.
-    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+    if let Some((urls, anchor_root, anchor_fork)) = anchor_envelope_fetch {
         let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
         tokio::spawn(async move {
-            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
+            if let Some(envelope) =
+                checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root, anchor_fork).await
             {
                 let _ = chain
                     .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
@@ -1093,7 +1105,7 @@ fn hostname() -> String {
 /// gloas block has the block and state but not the payload its children may
 /// build on; asking the checkpoint source for it saves waiting for a FULL
 /// child to make the by-root request fetch it.
-fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
+fn missing_anchor_envelope_root(store: &Store) -> Option<(H256, ForkName)> {
     let root = store.latest_finalized().ok()?.root;
     let block = store.get_signed_block(&root).ok()??;
     // Gloas or any later fork (lean sorts last, and is not a beacon fork).
@@ -1102,7 +1114,7 @@ fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
         return None;
     }
     let held = store.get_execution_payload_envelope(&root).ok()?.is_some();
-    (!held).then_some(root)
+    (!held).then_some((root, fork))
 }
 
 /// Reject a beacon node with no custody set before it spawns.
@@ -2354,6 +2366,12 @@ async fn fetch_initial_beacon_state(
 /// rebuilding it here and letting `get_forkchoice_store` check the header
 /// hash is what proves this reconstruction matches what the state actually
 /// describes, rather than assuming it.
+///
+/// From gloas on the genesis body is not quite empty: the specification's
+/// genesis (`create_genesis_state` and `get_genesis_block` in its test
+/// helpers, which ethpandaops' generator follows) puts the state's
+/// `latest_execution_payload_bid` in the body's bid, so the first block's
+/// `parent_block_hash` check has a genesis payload to build on.
 fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
     let header = state.latest_block_header();
     let slot = header.slot;
@@ -2441,7 +2459,13 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 proposer_index,
                 parent_root,
                 state_root,
-                body: gloas::BeaconBlockBody::empty(),
+                body: gloas::BeaconBlockBody {
+                    signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                        message: genesis_bid(state),
+                        ..Default::default()
+                    },
+                    ..gloas::BeaconBlockBody::empty()
+                },
             },
             signature: Default::default(),
         }),
@@ -2451,7 +2475,13 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 proposer_index,
                 parent_root,
                 state_root,
-                body: eip8483::BeaconBlockBody::empty(),
+                body: eip8483::BeaconBlockBody {
+                    signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                        message: genesis_bid(state),
+                        ..Default::default()
+                    },
+                    ..eip8483::BeaconBlockBody::empty()
+                },
             },
             signature: Default::default(),
         }),
@@ -2461,7 +2491,13 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 proposer_index,
                 parent_root,
                 state_root,
-                body: pq::BeaconBlockBody::empty(),
+                body: pq::BeaconBlockBody {
+                    signed_execution_payload_bid: pq::SignedExecutionPayloadBid {
+                        message: genesis_bid(state),
+                        ..Default::default()
+                    },
+                    ..pq::BeaconBlockBody::empty()
+                },
             },
             signature: Default::default(),
         })),
@@ -2473,6 +2509,14 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
             unreachable!("a beacon network's genesis state is never ForkName::Lean")
         }
     }
+}
+
+/// The bid a gloas-family genesis block carries: the state's own.
+fn genesis_bid(state: &BeaconState) -> gloas::ExecutionPayloadBid {
+    state
+        .gloas_family()
+        .map(|inner| inner.latest_execution_payload_bid.clone())
+        .unwrap_or_default()
 }
 
 /// Reject an `--aggregate-subnet-ids` value that names no subnet.
@@ -2728,19 +2772,12 @@ mod tests {
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
-    /// Gloas is followed: the envelopes and payload attestations a gloas chain
-    /// needs are delivered, so no fork through gloas is refused as an anchor.
-    /// The consensus-specs feature forks after it (EIP-8483, PQ) are refused:
-    /// only the state transition and fork choice implement them.
+    /// Every beacon fork is followed, the consensus-specs feature forks after
+    /// gloas (EIP-8483, PQ) included, so no anchor is refused for its fork.
     #[test]
     fn startup_accepts_an_anchor_at_every_followed_fork() {
         for fork in ForkName::ALL {
-            let followed = fork <= ForkName::Gloas;
-            assert_eq!(
-                refuse_unfollowable_fork(fork).is_ok(),
-                followed,
-                "{fork} followed: {followed}"
-            );
+            assert!(refuse_unfollowable_fork(fork).is_ok(), "{fork} is refused");
         }
     }
 
@@ -3300,10 +3337,17 @@ validators:
             state = upgrade_state(&state, fork, &config).unwrap();
         }
         assert_eq!(state.fork_name(), ForkName::Gloas);
-        // A real gloas genesis commits to gloas's empty body; the upgrade
-        // chain above leaves phase0's in the header.
-        state.latest_block_header_mut().body_root =
-            gloas::BeaconBlockBody::empty().hash_tree_root();
+        // A real gloas genesis commits to the specification's genesis body
+        // (empty but for the state's own bid); the upgrade chain above leaves
+        // phase0's in the header.
+        state.latest_block_header_mut().body_root = gloas::BeaconBlockBody {
+            signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                message: genesis_bid(&state),
+                ..Default::default()
+            },
+            ..gloas::BeaconBlockBody::empty()
+        }
+        .hash_tree_root();
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), config_text).unwrap();
@@ -3625,9 +3669,32 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
-                ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
-                ForkName::Eip8483 => eip8483::BeaconBlockBody::empty().hash_tree_root(),
-                ForkName::Pq => pq::BeaconBlockBody::empty().hash_tree_root(),
+                // From gloas on, the specification's genesis body carries the
+                // state's own bid (`get_genesis_block` in its test helpers).
+                ForkName::Gloas => gloas::BeaconBlockBody {
+                    signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                        message: genesis_bid(&state),
+                        ..Default::default()
+                    },
+                    ..gloas::BeaconBlockBody::empty()
+                }
+                .hash_tree_root(),
+                ForkName::Eip8483 => eip8483::BeaconBlockBody {
+                    signed_execution_payload_bid: gloas::SignedExecutionPayloadBid {
+                        message: genesis_bid(&state),
+                        ..Default::default()
+                    },
+                    ..eip8483::BeaconBlockBody::empty()
+                }
+                .hash_tree_root(),
+                ForkName::Pq => pq::BeaconBlockBody {
+                    signed_execution_payload_bid: pq::SignedExecutionPayloadBid {
+                        message: genesis_bid(&state),
+                        ..Default::default()
+                    },
+                    ..pq::BeaconBlockBody::empty()
+                }
+                .hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;
@@ -3910,7 +3977,10 @@ mod anchor_envelope_root_tests {
     #[test]
     fn a_gloas_anchor_without_its_envelope_is_asked_about() {
         let (store, root, _) = anchored_at(gloas_block(64));
-        assert_eq!(missing_anchor_envelope_root(&store), Some(root));
+        assert_eq!(
+            missing_anchor_envelope_root(&store),
+            Some((root, ForkName::Gloas))
+        );
     }
 
     #[test]

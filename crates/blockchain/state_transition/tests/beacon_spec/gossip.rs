@@ -327,7 +327,11 @@ fn deliver_payload(
     let Some(name) = &entry.payload else {
         return Ok(());
     };
-    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&case.ssz_bytes(name))
+    let envelope =
+        ethlambda_state_transition::beacon::containers::SignedExecutionPayloadEnvelope::from_ssz(
+            case.fork,
+            &case.ssz_bytes(name),
+        )
         .map_err(|err| format!("decoding {name}: {err:?}"))?;
     if trusted {
         fork_choice::accept_execution_payload_envelope(store, &envelope);

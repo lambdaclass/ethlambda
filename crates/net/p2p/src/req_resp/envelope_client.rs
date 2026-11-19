@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope;
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
 use spawned_concurrency::tasks::{Context, send_after};
@@ -159,7 +159,7 @@ fn retain_requested_envelopes(
     let received = envelopes.len();
     let kept: Vec<_> = envelopes
         .into_iter()
-        .filter(|envelope| envelope.message.beacon_block_root == block_root)
+        .filter(|envelope| envelope.beacon_block_root() == block_root)
         .collect();
     let dropped = received - kept.len();
     (kept, dropped)
@@ -323,9 +323,9 @@ fn retain_envelopes_in_range(
     let received = envelopes.len();
     let mut kept: Vec<_> = envelopes
         .into_iter()
-        .filter(|envelope| (start_slot..=end_slot).contains(&envelope.message.payload.slot_number))
+        .filter(|envelope| (start_slot..=end_slot).contains(&envelope.payload().slot_number))
         .collect();
-    kept.sort_by_key(|envelope| envelope.message.payload.slot_number);
+    kept.sort_by_key(|envelope| envelope.payload().slot_number);
     let dropped = received - kept.len();
     (kept, dropped)
 }
@@ -386,10 +386,8 @@ mod tests {
     fn envelope_for(slot: u64, block_root: H256) -> SignedExecutionPayloadEnvelope {
         // Sealed: the fetched-envelope rules refuse a block hash that is not
         // the payload's header's.
-        crate::beacon::payload_hash::seal_envelope(crate::beacon::encoding::test_support::envelope(
-            block_root,
-            slot,
-            H256::ZERO,
+        SignedExecutionPayloadEnvelope::Gloas(crate::beacon::payload_hash::seal_envelope(
+            crate::beacon::encoding::test_support::envelope(block_root, slot, H256::ZERO),
         ))
     }
 
@@ -433,7 +431,7 @@ mod tests {
 
         let slots: Vec<u64> = kept
             .iter()
-            .map(|envelope| envelope.message.payload.slot_number)
+            .map(|envelope| envelope.payload().slot_number)
             .collect();
         assert_eq!(slots, vec![10, 11]);
         assert_eq!(dropped, 2);

@@ -2589,6 +2589,186 @@ impl DataColumnSidecar {
     }
 }
 
+/// A signed execution payload envelope (EIP-7732) of any fork that reveals
+/// payloads in one: gloas's, EIP-8483's (gloas's with wider execution
+/// requests) and PQ's (EIP-8483's requests replaced, signed with leanXMSS).
+///
+/// The three share every message field but the requests, and the payload is
+/// gloas's in all of them, so the accessors below answer for any; the bytes,
+/// the signature and the requests stay the fork's own. Like a data column
+/// sidecar's, the fork comes from context: a topic's digest, a chunk's context
+/// bytes, or the slot of the block the envelope names.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum SignedExecutionPayloadEnvelope {
+    Gloas(gloas::SignedExecutionPayloadEnvelope),
+    Eip8483(eip8483::SignedExecutionPayloadEnvelope),
+    /// Boxed for its inline 2404-byte signature.
+    Pq(Box<pq::SignedExecutionPayloadEnvelope>),
+}
+
+macro_rules! dispatch_envelope {
+    ($envelope:expr, |$inner:ident| $body:expr) => {
+        match $envelope {
+            SignedExecutionPayloadEnvelope::Gloas($inner) => $body,
+            SignedExecutionPayloadEnvelope::Eip8483($inner) => $body,
+            SignedExecutionPayloadEnvelope::Pq($inner) => $body,
+        }
+    };
+}
+
+impl SignedExecutionPayloadEnvelope {
+    /// The fork whose container this is.
+    pub fn fork(&self) -> ForkName {
+        match self {
+            Self::Gloas(_) => ForkName::Gloas,
+            Self::Eip8483(_) => ForkName::Eip8483,
+            Self::Pq(_) => ForkName::Pq,
+        }
+    }
+
+    /// Decodes an envelope of a known fork. A fork without envelopes answers
+    /// with an error, since the fork comes off the wire.
+    pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
+        match fork {
+            ForkName::Gloas => Ok(Self::Gloas(
+                gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes)?,
+            )),
+            ForkName::Eip8483 => Ok(Self::Eip8483(
+                eip8483::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes)?,
+            )),
+            ForkName::Pq => Ok(Self::Pq(Box::new(
+                pq::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes)?,
+            ))),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Lean => Err(Error::UnsupportedForFork {
+                function: "SignedExecutionPayloadEnvelope",
+                fork,
+            }),
+        }
+    }
+
+    pub fn to_ssz(&self) -> Vec<u8> {
+        match self {
+            Self::Gloas(inner) => libssz::SszEncode::to_ssz(inner),
+            Self::Eip8483(inner) => libssz::SszEncode::to_ssz(inner),
+            Self::Pq(inner) => libssz::SszEncode::to_ssz(inner.as_ref()),
+        }
+    }
+
+    /// The root of the block whose payload this reveals.
+    pub fn beacon_block_root(&self) -> Root {
+        dispatch_envelope!(self, |inner| inner.message.beacon_block_root)
+    }
+
+    pub fn parent_beacon_block_root(&self) -> Root {
+        dispatch_envelope!(self, |inner| inner.message.parent_beacon_block_root)
+    }
+
+    pub fn builder_index(&self) -> gloas::BuilderIndex {
+        dispatch_envelope!(self, |inner| inner.message.builder_index)
+    }
+
+    /// The execution payload, gloas's at every fork that has envelopes.
+    pub fn payload(&self) -> &gloas::ExecutionPayload {
+        dispatch_envelope!(self, |inner| &inner.message.payload)
+    }
+
+    /// The hash tree root of the unsigned message, which the signature is
+    /// over.
+    pub fn message_root(&self) -> Root {
+        dispatch_envelope!(self, |inner| inner.message.hash_tree_root())
+    }
+
+    /// The hash tree root of the whole signed envelope, which tells two
+    /// envelopes for one block apart.
+    pub fn signed_root(&self) -> Root {
+        dispatch_envelope!(self, |inner| inner.hash_tree_root())
+    }
+
+    /// The hash tree root of the fork's own execution requests, which the
+    /// bid commits to.
+    pub fn execution_requests_root(&self) -> Root {
+        dispatch_envelope!(self, |inner| inner
+            .message
+            .execution_requests
+            .hash_tree_root())
+    }
+
+    /// The deposit requests, which every fork's requests carry first.
+    pub fn deposit_count(&self) -> usize {
+        dispatch_envelope!(self, |inner| inner
+            .message
+            .execution_requests
+            .deposits
+            .len())
+    }
+
+    /// The gloas envelope this is, if it is one.
+    pub fn as_gloas(&self) -> Option<&gloas::SignedExecutionPayloadEnvelope> {
+        match self {
+            Self::Gloas(inner) => Some(inner),
+            Self::Eip8483(_) | Self::Pq(_) => None,
+        }
+    }
+}
+
+/// What storing an envelope reads: the block it reveals the payload of and
+/// its bytes. Implemented by the fork-tagged enum and by a bare gloas
+/// envelope, so a caller holding either stores it without converting.
+pub trait StorableEnvelope {
+    fn beacon_block_root(&self) -> Root;
+    fn to_ssz(&self) -> Vec<u8>;
+}
+
+impl StorableEnvelope for SignedExecutionPayloadEnvelope {
+    fn beacon_block_root(&self) -> Root {
+        SignedExecutionPayloadEnvelope::beacon_block_root(self)
+    }
+    fn to_ssz(&self) -> Vec<u8> {
+        SignedExecutionPayloadEnvelope::to_ssz(self)
+    }
+}
+
+impl StorableEnvelope for gloas::SignedExecutionPayloadEnvelope {
+    fn beacon_block_root(&self) -> Root {
+        self.message.beacon_block_root
+    }
+    fn to_ssz(&self) -> Vec<u8> {
+        libssz::SszEncode::to_ssz(self)
+    }
+}
+
+impl PartialEq<gloas::SignedExecutionPayloadEnvelope> for SignedExecutionPayloadEnvelope {
+    fn eq(&self, other: &gloas::SignedExecutionPayloadEnvelope) -> bool {
+        self.as_gloas() == Some(other)
+    }
+}
+
+impl From<gloas::SignedExecutionPayloadEnvelope> for SignedExecutionPayloadEnvelope {
+    fn from(envelope: gloas::SignedExecutionPayloadEnvelope) -> Self {
+        Self::Gloas(envelope)
+    }
+}
+
+impl From<eip8483::SignedExecutionPayloadEnvelope> for SignedExecutionPayloadEnvelope {
+    fn from(envelope: eip8483::SignedExecutionPayloadEnvelope) -> Self {
+        Self::Eip8483(envelope)
+    }
+}
+
+impl From<pq::SignedExecutionPayloadEnvelope> for SignedExecutionPayloadEnvelope {
+    fn from(envelope: pq::SignedExecutionPayloadEnvelope) -> Self {
+        Self::Pq(Box::new(envelope))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod json_tests;
 

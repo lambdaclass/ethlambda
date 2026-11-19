@@ -619,7 +619,12 @@ fn apply_execution_step(
     }
 
     if let Some(name) = &step.execution_payload {
-        let signed_envelope: gloas::SignedExecutionPayloadEnvelope = decode(case, name)?;
+        // The case's own fork's envelope: gloas's, EIP-8483's or PQ's.
+        let signed_envelope = ethlambda_state_transition::beacon::containers::SignedExecutionPayloadEnvelope::from_ssz(
+            case.fork,
+            &case.ssz_bytes(name),
+        )
+        .map_err(|err| format!("decoding {name}: {err:?}"))?;
         // The format names no sampled columns for this step, so the evidence
         // is the empty retrieval, which reads as available.
         return expect_outcome(

@@ -391,6 +391,17 @@ pub(crate) struct MainnetOptions {
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
 
+    /// The Unix socket of a `leanvm-sidecar` (built from leanVM
+    /// `283686575c4e81790591d2c6e3ed21c69c0e3bbe`), which makes and checks
+    /// the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ
+    /// devnet's clients use.
+    ///
+    /// Without it the node uses the specification's reference encoding (a
+    /// proof is the signatures concatenated), which only another node on the
+    /// reference accepts. Only a network scheduling the PQ fork reads either.
+    #[arg(long)]
+    pub(crate) pq_prover_socket: Option<PathBuf>,
+
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
     /// is built locally, and `register_validator` answers 500 so a validator
