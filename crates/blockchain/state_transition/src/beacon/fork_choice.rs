@@ -1053,11 +1053,14 @@ pub fn advance_to_epoch_start(
 /// the precomputed epoch-boundary state when the block crosses into an epoch
 /// and one is cached.
 ///
-/// Returns the copy with the transition's outcome, since a failed transition
-/// still leaves the caller a state to inspect. Both starting points reach the
-/// same post-state: the precomputed one is what `process_slots` would produce
-/// from the parent. Either way the copy is independent, so a failing block
-/// cannot corrupt a cached entry.
+/// Returns the post-state, or the error and no state: a failed transition
+/// leaves its copy partly applied (the operations before the failing check,
+/// and the attestations and sync aggregate whose signatures were deferred to
+/// the end of the block; see `stf::signatures`), and dropping it here is what
+/// keeps any caller from reading one. Both starting points reach the same
+/// post-state: the precomputed one is what `process_slots` would produce from
+/// the parent. Either way the copy is independent, so a failing block cannot
+/// corrupt a cached entry.
 ///
 /// This is also where the epoch-boundary balances of a crossing block are
 /// built (see [`cache_boundary_balances`]): a block with empty slots between
@@ -1080,7 +1083,7 @@ fn transition_block(
     engine: &stf::ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
-) -> (BeaconState, Result<()>) {
+) -> Result<BeaconState> {
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -1098,7 +1101,7 @@ fn transition_block(
     else {
         let mut state = parent_state.clone();
         if !crosses_with_empty_slots {
-            let outcome = stf::state_transition(
+            stf::state_transition(
                 &mut state,
                 signed_block,
                 validate_result,
@@ -1106,40 +1109,14 @@ fn transition_block(
                 engine,
                 committees,
                 active_balances,
-            );
-            return (state, outcome);
+            )?;
+            return Ok(state);
         }
         // The same `process_slots` steps `state_transition` would run, split
         // at the epoch start so the boundary state can be read in between.
-        let outcome = stf::process_slots(&mut state, epoch_start, config)
-            .inspect(|()| cache_boundary_balances(store, boundary, &state))
-            .and_then(|()| stf::process_slots(&mut state, block_slot, config))
-            .and_then(|()| {
-                stf::apply_block(
-                    &mut state,
-                    signed_block,
-                    validate_result,
-                    config,
-                    engine,
-                    committees,
-                    active_balances,
-                )
-            });
-        return (state, outcome);
-    };
-
-    if crosses_with_empty_slots {
-        cache_boundary_balances(store, boundary, &precomputed);
-    }
-    let mut state = (*precomputed).clone();
-    // Only the slots skipped past the boundary are left to advance; none when
-    // the block sits on the boundary itself.
-    let outcome = if state.slot() < block_slot {
-        stf::process_slots(&mut state, block_slot, config)
-    } else {
-        Ok(())
-    }
-    .and_then(|()| {
+        stf::process_slots(&mut state, epoch_start, config)?;
+        cache_boundary_balances(store, boundary, &state);
+        stf::process_slots(&mut state, block_slot, config)?;
         stf::apply_block(
             &mut state,
             signed_block,
@@ -1148,9 +1125,29 @@ fn transition_block(
             engine,
             committees,
             active_balances,
-        )
-    });
-    (state, outcome)
+        )?;
+        return Ok(state);
+    };
+
+    if crosses_with_empty_slots {
+        cache_boundary_balances(store, boundary, &precomputed);
+    }
+    let mut state = (*precomputed).clone();
+    // Only the slots skipped past the boundary are left to advance; none when
+    // the block sits on the boundary itself.
+    if state.slot() < block_slot {
+        stf::process_slots(&mut state, block_slot, config)?;
+    }
+    stf::apply_block(
+        &mut state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        committees,
+        active_balances,
+    )?;
+    Ok(state)
 }
 
 /// The precomputed epoch-boundary state an import can resume from, if any.
@@ -4934,8 +4931,8 @@ pub struct SpeculativeTransition {
     /// [`Self::stands_in_for`] compares it with the one `on_block` would pick
     /// rather than restating which verdicts that is.
     engine: stf::ExecutionEngine,
-    state: BeaconState,
-    outcome: Result<()>,
+    /// What [`transition_block`] returned: the post-state, or the error alone.
+    transition: Result<BeaconState>,
 }
 
 impl SpeculativeTransition {
@@ -4968,20 +4965,20 @@ impl SpeculativeTransition {
     ///
     /// Outcomes are compared through their `Debug` rendering, since the error
     /// type carries no `PartialEq`, and roots only on success, since a failed
-    /// transition's partial state is never used. Debug builds only: it doubles
-    /// the transition, which is the cost the speculation exists to hide.
+    /// transition has no state. Debug builds only: it doubles the transition,
+    /// which is the cost the speculation exists to hide.
     #[cfg(debug_assertions)]
-    fn assert_agrees_with(&self, fresh: &(BeaconState, Result<()>)) {
-        let (fresh_state, fresh_outcome) = fresh;
+    fn assert_agrees_with(&self, fresh: &Result<BeaconState>) {
+        let outcome = |transition: &Result<BeaconState>| format!("{:?}", transition.as_ref().err());
         assert_eq!(
-            format!("{:?}", self.outcome),
-            format!("{fresh_outcome:?}"),
+            outcome(&self.transition),
+            outcome(fresh),
             "the speculative transition disagrees with on_block's own on the outcome"
         );
-        if self.outcome.is_ok() {
+        if let (Ok(speculated), Ok(fresh)) = (&self.transition, fresh) {
             assert_eq!(
-                self.state.hash_tree_root(),
-                fresh_state.hash_tree_root(),
+                speculated.hash_tree_root(),
+                fresh.hash_tree_root(),
                 "the speculative transition disagrees with on_block's own on the post-state root"
             );
         }
@@ -5086,7 +5083,7 @@ pub fn speculate_transition(
         .ok()?;
     let active_balances = store.active_balance_cache();
     let engine = stf::ExecutionEngine::valid();
-    let (state, outcome) = transition_block(
+    let transition = transition_block(
         store,
         &parent_state,
         parent_root,
@@ -5101,8 +5098,7 @@ pub fn speculate_transition(
         block_root,
         parent_root,
         engine,
-        state,
-        outcome,
+        transition,
     })
 }
 
@@ -5287,11 +5283,11 @@ pub fn on_block_speculative(
             &active_balances,
         )
     };
-    let (mut state, transition) = match usable {
+    let transition = match usable {
         Some(speculation) => {
             #[cfg(debug_assertions)]
             speculation.assert_agrees_with(&fresh_transition());
-            (speculation.state, speculation.outcome)
+            speculation.transition
         }
         None => fresh_transition(),
     };
@@ -5336,7 +5332,7 @@ pub fn on_block_speculative(
         )));
     }
 
-    transition?;
+    let mut state = transition?;
 
     // A block at its epoch's first slot is its own epoch-boundary block: its
     // post-state is the checkpoint state. Cached at import so the tick that
@@ -6631,7 +6627,7 @@ mod tests {
         let (signed, _) = block_on(&parent, first_slot);
 
         let mut store = empty_store();
-        let (mut post, outcome) = transition_block(
+        let mut post = transition_block(
             &store,
             &parent,
             parent_root,
@@ -6641,8 +6637,8 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
-        );
-        outcome.expect("applies");
+        )
+        .expect("applies");
         post.apply_pending_mutations();
         assert!(
             store
@@ -7698,7 +7694,7 @@ mod tests {
         config: &Config,
     ) -> Option<SpeculativeTransition> {
         let mut speculation = honest_speculation(store, block, config)?;
-        speculation.outcome = Err(Error::SpecAssert(POISON));
+        speculation.transition = Err(Error::SpecAssert(POISON));
         Some(speculation)
     }
 
@@ -7745,10 +7741,11 @@ mod tests {
             import_valid_child(&PayloadValidity::Validated, |store, block, config| {
                 let mut speculation = honest_speculation(store, block, config)?;
                 speculation
-                    .outcome
-                    .as_ref()
-                    .expect("the transition succeeds");
-                speculation.state.latest_block_header_mut().body_root = Root::repeat_byte(0xab);
+                    .transition
+                    .as_mut()
+                    .expect("the transition succeeds")
+                    .latest_block_header_mut()
+                    .body_root = Root::repeat_byte(0xab);
                 Some(speculation)
             });
         result.expect("the import takes the speculation's outcome");
@@ -11071,7 +11068,7 @@ mod tests {
         parent_root: Root,
         block: &SignedBeaconBlock,
     ) -> Root {
-        let (mut state, outcome) = transition_block(
+        let mut state = transition_block(
             store,
             parent,
             parent_root,
@@ -11081,8 +11078,8 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
-        );
-        outcome.expect("the block applies");
+        )
+        .expect("the block applies");
         state.apply_pending_mutations();
         state.hash_tree_root()
     }
