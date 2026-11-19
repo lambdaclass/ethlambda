@@ -614,7 +614,7 @@ spec.
 `lean_engine_get_blobs_total` and its siblings cover the execution-client path
 (`docs/beacon_engine.md`, "Blobs from the execution client"). A high `miss`
 share means the execution client's blob pool lacks the blobs, which is normal
-for old blocks and for a syncing execution client; `already_seen` in
+for a syncing execution client; `already_seen` in
 `lean_data_columns_from_execution_layer_total` counts columns gossip delivered
 first.
 

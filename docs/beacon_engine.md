@@ -252,10 +252,18 @@ The code is `crates/blockchain/src/beacon_blobs.rs`.
 
 **When it fires.** On the first data-availability hold of a block
 (`hold_block_for_columns`), when all of these hold: the block is fulu, it
-commits to at least one blob, `--execution-endpoint` is set, and the block
-passes `precheck_block` against its parent's post-state (expected proposer and
-proposer signature). Any slot and any source (gossip or sync) qualifies. A
+commits to at least one blob, `--execution-endpoint` is set, the block is at
+most `MAX_ASK_AGE_SLOTS` (4) slots behind the store's clock, and it passes
+`precheck_block` against its parent's post-state (expected proposer and
+proposer signature). Any source qualifies (gossip, or a by-root answer). A
 redelivery of a held root does not ask again.
+
+The age bound is what keeps range sync out. Every block it delivers is older
+than the slot it arrives in, and a catch-up holds them by the batch, so asking
+for each would be an unbounded fan-out of prechecks on the chain actor, engine
+calls and cell computations. Such a block's columns are asked of peers as soon
+as it is held, so it does not wait for a redrive either way. How often the
+execution client would still hold an older block's blobs is not measured.
 
 The precheck is there because the built columns carry the block's own signed
 header and skip every check on their way out (see the hand-over below). Range
@@ -294,7 +302,7 @@ columns, and forwards one batch to the chain actor. The chain actor stores the
 columns and releases the held block through the usual completeness check.
 
 ```
-hold (first time) -> engine_getBlobsV2        1 s, one attempt
+hold (1st, recent) -> engine_getBlobsV2       1 s, one attempt
                        |-- null / error  -> count; gossip and peer asks carry on
                        '-- every blob    -> build missing custody columns
                                             (block imported meanwhile? stop)
@@ -306,11 +314,13 @@ hold (first time) -> engine_getBlobsV2        1 s, one attempt
    chain actor: store columns -> release the held block
 ```
 
-**Trust.** The proofs are taken as the execution client gives them. One that
-returns wrong proofs makes this node store and publish columns its peers'
-gossip validation rejects, which costs this node peer score. Debug builds
-re-run the chain checks on everything `new_data_column_sidecars` delivers and
-would catch it.
+**Trust.** The blobs and proofs are taken as the execution client gives them;
+nothing checks a blob against the block's commitment either. One that returns
+wrong blobs or proofs makes this node store and publish columns its peers'
+gossip validation rejects, which costs this node peer score, and release the
+held block as if its data were available. Debug builds re-run the chain checks
+on everything `new_data_column_sidecars` delivers and would catch it; release
+builds do not.
 
 **Not done.**
 
@@ -329,7 +339,7 @@ would catch it.
 | `lean_data_columns_from_execution_layer_total{result}` | What p2p did with each column: `published`, `no_digest`, `already_seen`, `not_custody` |
 
 A high `miss` rate means the execution client's pool does not have the blobs.
-That is normal for old blocks and while the execution client is syncing.
+That is normal while the execution client is syncing.
 
 ## `forkchoiceUpdated`
 

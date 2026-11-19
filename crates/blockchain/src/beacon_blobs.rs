@@ -10,7 +10,7 @@
 //! # Flow
 //!
 //! ```text
-//! hold (first time) -> spawn_fetch
+//! hold (first time, recent block) -> spawn_fetch
 //!   task:          engine_getBlobsV2(versioned hashes)      1 s ceiling
 //!     null / error -> count, give up (gossip and peer asks carry on)
 //!     every blob   -> spawn_blocking:
@@ -30,12 +30,18 @@
 //!   SHOULD query `engine_getBlobsV2` as soon as they receive a valid
 //!   `beacon_block` or `data_column_sidecar` from gossip, convert a complete
 //!   answer to data columns and import them as if received on gossip. This
-//!   node asks on the first data-availability hold of a block, whether the
-//!   block came from gossip or from sync, once its proposer signature verifies
-//!   against its parent's state (see [`signed_by_its_proposer`]); it does not
-//!   yet ask when a sidecar arrives. Hence the hand-over to p2p rather than a
-//!   direct store write: publishing on subscribed subnets and updating the
+//!   node asks on the first data-availability hold of a block at most
+//!   [`MAX_ASK_AGE_SLOTS`] behind the clock, whether the block came from
+//!   gossip or a by-root answer, once its proposer signature verifies against
+//!   its parent's state (see [`signed_by_its_proposer`]); it does not yet ask
+//!   when a sidecar arrives. Hence the hand-over to p2p rather than a direct
+//!   store write: publishing on subscribed subnets and updating the
 //!   anti-equivocation cache are MUSTs, and p2p owns both.
+//! - **Recent blocks only.** The specification's trigger is gossip, so the
+//!   tip. Range sync holds older blocks by the batch, and asking for each
+//!   would be an unbounded fan-out of prechecks on the chain actor, engine
+//!   calls and cell computations, for blocks whose columns peers are already
+//!   being asked for (see [`MAX_ASK_AGE_SLOTS`]).
 //! - **One attempt.** The call races gossip delivery of the same columns, the
 //!   specification's own timeout for the method is 1 s, and a retry after the
 //!   engine ladder's backoff would land after that race is decided. A miss
@@ -73,6 +79,27 @@ use ethlambda_types::primitives::H256;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics;
+
+/// How many slots behind the store's clock a held block may be and still have
+/// the execution client asked for its blobs.
+///
+/// Wide enough for what the specification's trigger covers (a block gossip
+/// delivered in its own slot or late) and for a by-root answer filling in a
+/// parent missed a slot or two back. Range sync is what it cuts off: every
+/// block that delivers is older than the slot it arrives in, a catch-up holds
+/// them by the batch, and asking for each would cost a parent-state read and
+/// a BLS verification on the chain actor ([`signed_by_its_proposer`]), an
+/// engine round trip, and on a hit a cell computation, all unbounded. Such a
+/// block's columns are asked of peers at once (`hold_block_for_columns`), so
+/// it does not wait for a redrive either way. How often the execution client
+/// would still hold an older block's blobs is not measured.
+pub(crate) const MAX_ASK_AGE_SLOTS: u64 = 4;
+
+/// Whether a held block at `slot` is recent enough, at `current_slot`, to ask
+/// the execution client about (see [`MAX_ASK_AGE_SLOTS`]).
+pub(crate) fn recent_enough_to_ask(slot: u64, current_slot: u64) -> bool {
+    slot.saturating_add(MAX_ASK_AGE_SLOTS) >= current_slot
+}
 
 /// Whether a held block may have its columns built from the execution
 /// client's blobs: its proposer signature, and the rest of
@@ -570,6 +597,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A block more than `MAX_ASK_AGE_SLOTS` behind the clock (range sync's)
+    /// is not asked about; one exactly that far behind still is.
+    #[tokio::test]
+    async fn only_a_recent_block_is_asked_about() {
+        let at_the_edge = block_committing_to(&[blob_bytes(9)]);
+        let too_old = block_committing_to(&[blob_bytes(10)]);
+        let (engine, requests) = mock_engine("null".to_string()).await;
+        let (mut server, _p2p) = beacon_server_recording(store_with_keyed_parent());
+        server.engine = Some(engine);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let edge = at_the_edge.slot() + MAX_ASK_AGE_SLOTS;
+        server.hold_block_for_columns(too_old, edge + 1, ImportTimings::default());
+        server.hold_block_for_columns(at_the_edge, edge, ImportTimings::default());
+        for _ in 0..40 {
+            if requests.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "only the block at the edge of the window was asked about"
+        );
     }
 
     /// An altered copy of a block (its body changed after signing, the

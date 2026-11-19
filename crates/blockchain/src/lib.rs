@@ -3145,12 +3145,14 @@ impl BlockChainServer {
     /// slot.
     ///
     /// The execution client is asked for the block's blobs once, on the first
-    /// hold of a fulu block that commits to any and whose proposer signature
-    /// verifies against its parent's state (see [`beacon_blobs`]). That
-    /// does not depend on the peer-ask timing above: it is a local call that
-    /// races nobody, and a hit hands the custody columns back through the same
-    /// path gossip uses, so it is as useful for a block at the tip as for an
-    /// old one.
+    /// hold of a fulu block that commits to any, is at most
+    /// [`beacon_blobs::MAX_ASK_AGE_SLOTS`] behind `current_slot`, and whose
+    /// proposer signature verifies against its parent's state (see
+    /// [`beacon_blobs`]). Unlike the peer ask, that one is made at the tip:
+    /// it asks no peer, so it burns no lookup attempt, and a hit hands the
+    /// custody columns back through the same path gossip uses, so it just
+    /// races gossip to complete the block. A block further behind (range
+    /// sync's) is not asked about; its peer ask starts at once below.
     fn hold_block_for_columns(
         &mut self,
         block: SignedBeaconBlock,
@@ -3180,12 +3182,15 @@ impl BlockChainServer {
 
         // Before the block is moved into the store. Only the first hold asks:
         // a redelivery of a held root must not re-query the execution client.
-        // Only a block whose proposer signature verifies does, since the
-        // columns built from its blobs carry its header unchecked.
+        // Only a recent block does, checked before the signature so range
+        // sync pays for neither. Only a block whose proposer signature
+        // verifies does, since the columns built from its blobs carry its
+        // header unchecked.
         if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
             (&self.engine, &self.p2p, &block)
             && !inner.message.body.blob_kzg_commitments.is_empty()
             && !self.blocks_awaiting_columns.contains_key(&block_root)
+            && beacon_blobs::recent_enough_to_ask(slot, current_slot)
             && beacon_blobs::signed_by_its_proposer(&self.store, &block, block_root)
         {
             beacon_blobs::spawn_fetch(
