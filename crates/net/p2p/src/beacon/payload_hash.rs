@@ -79,6 +79,9 @@ struct Fields<'a> {
     fee_recipient: [u8; 20],
     state_root: [u8; 32],
     receipts_root: [u8; 32],
+    /// Always 256 bytes: every fork's `logs_bloom` is a fixed-length
+    /// `ByteVector[256]`, which is what lets `Bloom::from_slice` (it panics on
+    /// any other length) take it.
     logs_bloom: &'a [u8],
     prev_randao: [u8; 32],
     block_number: u64,

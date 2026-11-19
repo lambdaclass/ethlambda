@@ -6,8 +6,8 @@
 //! |-----------|-------------|-----------------------|----------------------------------------|
 //! | bellatrix | Sepolia     | block, slot 500000    |                                        |
 //! | capella   | Sepolia     | block, slot 1900000   | withdrawals                            |
-//! | deneb     | Hoodi       | block, slot 2003      |                                        |
-//! | electra   | Hoodi       | block, slot 70001     |                                        |
+//! | deneb     | Hoodi       | block, slot 2003      | no transactions                        |
+//! | electra   | Hoodi       | block, slot 70001     | no requests                            |
 //! | fulu      | mainnet     | block, slot 15684701  | 238 transactions, 3 requests (2 types) |
 //! | gloas     | Plataberget | envelope, slot 593101 |                                        |
 //!
@@ -142,7 +142,40 @@ fn the_vectors_exercise_what_each_fork_adds() {
         "fulu's vector must carry requests of two types"
     );
 
+    // The empty cases on real blocks: deneb's has no transactions, so its
+    // hash covers the empty transactions trie, and electra's has no requests,
+    // so its hash covers the requests hash of an empty list.
+    let SignedBeaconBlock::Deneb(deneb) = block(ForkName::Deneb, DENEB) else {
+        panic!("deneb");
+    };
+    assert!(deneb.message.body.execution_payload.transactions.is_empty());
+    let SignedBeaconBlock::Electra(electra_block) = block(ForkName::Electra, ELECTRA) else {
+        panic!("electra");
+    };
+    let requests = ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list(
+        &electra_block.message.body.execution_requests,
+    );
+    assert!(
+        requests.is_empty(),
+        "electra's vector must carry no requests"
+    );
+
     assert!(!envelope().message.payload.transactions.is_empty());
+}
+
+/// No vector has an empty withdrawals list (every one from capella on carries
+/// 16), so the empty withdrawals root is pinned against the execution layer's
+/// empty trie root, `keccak256(rlp(""))`, instead.
+#[test]
+fn an_empty_withdrawals_list_has_the_empty_trie_root() {
+    let empty_trie_root =
+        hex::decode("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+            .expect("hex");
+    assert_eq!(keccak256(&[0x80]).to_vec(), empty_trie_root);
+    assert_eq!(
+        compute_withdrawals_root(&[], &NativeCrypto).0.to_vec(),
+        empty_trie_root
+    );
 }
 
 #[test]
