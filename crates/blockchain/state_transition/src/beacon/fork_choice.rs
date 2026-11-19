@@ -1914,23 +1914,30 @@ pub fn get_voting_source(
 /// Walks `block_root`'s subtree, adding every block on a viable branch to
 /// `blocks`, and reporting whether `block_root` itself sits on one.
 ///
-/// *Note*: external callers must pass `store.justified_checkpoint.root` for
-/// `block_root`; only the recursive calls below pass anything else.
+/// *Note*: callers must pass `store.justified_checkpoint.root` for
+/// `block_root`, as [`get_filtered_block_tree`], the only one, does. The
+/// specification passes other roots only from its own recursive calls, which
+/// the walk below replaces.
 ///
-/// Recursive, following the specification directly rather than an explicit
-/// stack: the subtree walked here is the unfinalized suffix since the
-/// justified checkpoint, which stays shallow in ordinary operation.
+/// The specification recurses once per child. This visits the same blocks in
+/// the same order, failing at the same block, but keeps its own stack of the
+/// path from `block_root` to the block in hand. That path is as long as the
+/// chain below the justified checkpoint: short while the chain justifies, but
+/// a block longer every slot for as long as it does not, and the chain actor
+/// runs this on a thread with the default-sized stack. Recursing, the walk
+/// overflowed that stack once a stall had left a few thousand blocks below the
+/// justified one, and a stack overflow aborts the whole process.
 ///
-/// Takes `index`, [`Store::block_index`] built once by
-/// [`get_filtered_block_tree`] and threaded through every recursive call,
-/// rather than re-scanning the store's blocks at each node, and `children_of`,
-/// the parent-to-children map [`get_filtered_block_tree`] builds from `index`
-/// in one pass. The specification finds a block's children by scanning every
-/// block in the store; doing that here at every node visited made the walk
-/// quadratic in the live window, which is what a finality stall or a range
-/// catch-up grows. `blocks`' value is `index`'s own `(slot, parent_root)`
-/// shape rather than a whole [`SignedBeaconBlock`], since [`get_head`], the
-/// only reader of this function's output, never needs more than that.
+/// Takes `index`, the [`Store::block_index`] its caller already holds, read
+/// throughout the walk rather than re-scanning the store's blocks at each
+/// node, and `children_of`, the parent-to-children map
+/// [`get_filtered_block_tree`] builds from `index` in one pass. The
+/// specification finds a block's children by scanning every block in the
+/// store; doing that here at every node visited made the walk quadratic in
+/// the live window, which is what a finality stall or a range catch-up
+/// grows. `blocks`' value is `index`'s own `(slot, parent_root)` shape rather
+/// than a whole [`SignedBeaconBlock`], since [`get_head`], the only reader of
+/// this function's output, never needs more than that.
 pub fn filter_block_tree(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1939,31 +1946,76 @@ pub fn filter_block_tree(
     blocks: &mut HashMap<Root, (Slot, Root)>,
     config: &Config,
 ) -> Result<bool> {
-    let entry = *index
-        .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
-
-    let children = children_of
-        .get(&block_root)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-
-    // If any children branches contain expected finalized/justified
-    // checkpoints, add to filtered block-tree and signal viability to parent.
-    if !children.is_empty() {
-        let mut any_viable = false;
-        for &child in children {
-            if filter_block_tree(store, index, children_of, child, blocks, config)? {
-                any_viable = true;
-            }
-        }
-        if any_viable {
-            blocks.insert(block_root, entry);
-            return Ok(true);
-        }
-        return Ok(false);
+    /// A block on the path from `block_root` to the block in hand: which of
+    /// its children is next, and whether any visited so far is viable.
+    struct Frame<'a> {
+        root: Root,
+        entry: (Slot, Root),
+        children: &'a [Root],
+        next_child: usize,
+        any_viable: bool,
     }
 
+    /// Enters `root`, where the specification's recursive call would: its
+    /// `block_root in store.blocks` assertion included, which is what fails
+    /// the walk when the justified block's row is gone.
+    fn enter<'a>(
+        index: &HashMap<Root, (Slot, Root)>,
+        children_of: &'a HashMap<Root, Vec<Root>>,
+        root: Root,
+    ) -> Result<Frame<'a>> {
+        let entry = *index
+            .get(&root)
+            .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
+        let children = children_of.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+        Ok(Frame {
+            root,
+            entry,
+            children,
+            next_child: 0,
+            any_viable: false,
+        })
+    }
+
+    let mut path = vec![enter(index, children_of, block_root)?];
+    loop {
+        let top = path
+            .last_mut()
+            .expect("the walk returns once the path is empty");
+        // A block with children is viable if any child branch contains the
+        // expected finalized/justified checkpoints; a leaf, if its own do.
+        let viable = if top.children.is_empty() {
+            is_viable_leaf(store, index, top.root, config)?
+        } else if let Some(&child) = top.children.get(top.next_child) {
+            top.next_child += 1;
+            path.push(enter(index, children_of, child)?);
+            continue;
+        } else {
+            top.any_viable
+        };
+
+        // Add it to the filtered block-tree if viable, and signal viability
+        // to its parent.
+        let done = path.pop().expect("`top` was on the path");
+        if viable {
+            blocks.insert(done.root, done.entry);
+        }
+        match path.last_mut() {
+            Some(parent) => parent.any_viable |= viable,
+            None => return Ok(viable),
+        }
+    }
+}
+
+/// Whether the leaf `block_root` is viable: its voting source is the store's
+/// justified checkpoint or recent enough, and it descends from the store's
+/// finalized checkpoint. The leaf case of [`filter_block_tree`].
+fn is_viable_leaf(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    block_root: Root,
+    config: &Config,
+) -> Result<bool> {
     let current_epoch = get_current_store_epoch(store, config);
     let voting_source = get_voting_source(store, index, block_root, config)?;
 
@@ -1981,14 +2033,7 @@ pub fn filter_block_tree(
     let correct_finalized = finalized_checkpoint.epoch == constants::GENESIS_EPOCH
         || finalized_checkpoint.root == finalized_checkpoint_block;
 
-    // If expected finalized/justified, add to viable block-tree and signal
-    // viability to parent.
-    if correct_justified && correct_finalized {
-        blocks.insert(block_root, entry);
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(correct_justified && correct_finalized)
 }
 
 /// The filtered block tree: every block, from the justified checkpoint down,
@@ -3384,10 +3429,12 @@ pub fn is_parent_node_full(store: &Store, block: &SignedBeaconBlock) -> Result<b
 /// `get_checkpoint_block`, which is this walk from a `Pending` node keeping
 /// only `.root`, has no gloas function here: it answers what the pre-gloas,
 /// index-only [`get_checkpoint_block`] does on any chain both could answer.
-/// [`filter_block_tree`] (the only caller of [`get_checkpoint_block`] in this
-/// file; [`get_voting_source`] never calls it) therefore keeps calling the
-/// pre-gloas version, which is what lets [`get_filtered_block_tree`] serve
-/// [`gloas_get_head`] with no per-block fetch.
+/// Every caller of [`get_checkpoint_block`] in this file
+/// ([`filter_block_tree`]'s leaf check, `validate_on_attestation_indexed` and
+/// [`on_block`]; [`get_voting_source`] never calls it) therefore keeps calling
+/// the pre-gloas version, and the leaf check doing so is what lets
+/// [`get_filtered_block_tree`] serve [`gloas_get_head`] with no per-block
+/// fetch.
 pub fn gloas_get_ancestor(
     store: &Store,
     node: ForkChoiceNode,
@@ -6880,7 +6927,7 @@ mod tests {
     /// finalized checkpoint names epoch 1, whose start slot nobody built a
     /// block for, so the finalized block itself sits at the slot before. Once
     /// finalization advances (a real `update_checkpoints` call, which prunes
-    /// `LiveChain` as a side effect), `filter_block_tree`'s own
+    /// `LiveChain` as a side effect), the leaf check's (`is_viable_leaf`)
     /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
     /// rather than fail: `on_block` and `get_head` both call it on every
     /// leaf, and either one erroring here is `get_head` freezing on a live
@@ -10589,12 +10636,15 @@ mod tests {
         );
     }
 
-    /// The specification's `filter_block_tree` finds a block's children by
-    /// scanning every block in the store. The node's version looks them up in
-    /// a parent-to-children map built once per call, so this keeps the scan
-    /// as the reference and checks the two agree on every random tree, at
-    /// current slots where the filter keeps everything and where it drops a
-    /// branch.
+    /// The specification's `filter_block_tree`, recursing once per child and
+    /// finding a block's children by scanning every block in the store. The
+    /// node's version walks an explicit stack and looks the children up in a
+    /// parent-to-children map built once per call, so this keeps the
+    /// recursive scan as the reference and checks the two agree on every
+    /// random tree, at current slots where the filter keeps everything and
+    /// where it drops a branch. A leaf's viability is the same question
+    /// either way, so the reference asks [`is_viable_leaf`] for it and shares
+    /// nothing else with the walk.
     fn filter_block_tree_by_scan(
         store: &Store,
         index: &HashMap<Root, (Slot, Root)>,
@@ -10602,28 +10652,29 @@ mod tests {
         blocks: &mut HashMap<Root, (Slot, Root)>,
         config: &Config,
     ) -> Result<bool> {
+        let entry = *index
+            .get(&block_root)
+            .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
         let children: Vec<Root> = index
             .iter()
             .filter(|&(_, &(_, parent_root))| parent_root == block_root)
             .map(|(&root, _)| root)
             .collect();
-        if children.is_empty() {
-            // A leaf's viability is the same question either way, so the
-            // reference asks the node's own code for it: an empty child map
-            // makes `filter_block_tree` take its leaf branch.
-            let no_children = HashMap::new();
-            return filter_block_tree(store, index, &no_children, block_root, blocks, config);
-        }
-        let mut any_viable = false;
-        for child in children {
-            if filter_block_tree_by_scan(store, index, child, blocks, config)? {
-                any_viable = true;
+        let viable = if children.is_empty() {
+            is_viable_leaf(store, index, block_root, config)?
+        } else {
+            let mut any_viable = false;
+            for child in children {
+                if filter_block_tree_by_scan(store, index, child, blocks, config)? {
+                    any_viable = true;
+                }
             }
+            any_viable
+        };
+        if viable {
+            blocks.insert(block_root, entry);
         }
-        if any_viable {
-            blocks.insert(block_root, index[&block_root]);
-        }
-        Ok(any_viable)
+        Ok(viable)
     }
 
     #[test]
@@ -10667,6 +10718,114 @@ mod tests {
         assert!(
             branches_filtered_out > 0,
             "the filter never dropped a branch, so the comparison covered only full trees"
+        );
+    }
+
+    /// The head walk over a chain as deep as a long finality stall leaves
+    /// below the justified block, on a thread with the stack
+    /// `std::thread::spawn` gives by default, which is what the chain actor's
+    /// thread runs on.
+    ///
+    /// A filter that recursed once per block overflowed that stack long before
+    /// this depth. A stack overflow aborts the whole test binary rather than
+    /// failing this test alone, so a run that loses every test at once points
+    /// here.
+    #[test]
+    fn the_head_walk_does_not_overflow_a_default_stack_on_a_stall_deep_chain() {
+        const DEPTH: u64 = 20_000;
+        // `std::thread`'s documented default, unless `RUST_MIN_STACK` says
+        // otherwise. Set explicitly so the environment cannot hide a
+        // regression.
+        const DEFAULT_THREAD_STACK: usize = 2 * 1024 * 1024;
+
+        let walk = std::thread::Builder::new()
+            .name("deep-chain-head-walk".into())
+            .stack_size(DEFAULT_THREAD_STACK)
+            .spawn(|| {
+                let config = Config::active();
+                let mut rng = TestRng(DEPTH);
+                let anchor_root = rng.root();
+                let mut store = store_anchored_at(anchor_root);
+                store
+                    .insert_signed_block(anchor_root, fulu_block(0, Root::ZERO))
+                    .unwrap();
+                let anchor_state = test_state::with_validators_at(ForkName::Fulu, TREE_VALIDATORS);
+                store.insert_state(anchor_root, anchor_state).unwrap();
+                store.set_unrealized_justification(anchor_root, 0, Checkpoint::default());
+
+                // One chain, nothing justified or finalized past the anchor:
+                // the justified block is the anchor, so the filter walks the
+                // whole chain.
+                let mut tip = anchor_root;
+                for slot in 1..=DEPTH {
+                    let root = rng.root();
+                    store
+                        .insert_signed_block(root, fulu_block(slot, tip))
+                        .unwrap();
+                    store.set_unrealized_justification(root, slot, Checkpoint::default());
+                    tip = root;
+                }
+                for validator_index in 0..TREE_VALIDATORS as u64 {
+                    let vote = LatestMessage {
+                        epoch: 0,
+                        slot: DEPTH,
+                        root: tip,
+                        payload_present: false,
+                    };
+                    store.set_latest_message(validator_index, vote);
+                }
+                // Past every block's epoch, so the leaf reads its stored
+                // unrealized justification rather than a state.
+                let current_slot = DEPTH + 2 * preset::SLOTS_PER_EPOCH;
+                store
+                    .set_time_ms(current_slot * config.slot_duration_ms)
+                    .unwrap();
+
+                let index = store.block_index();
+                let filtered = get_filtered_block_tree(&store, &index, &config).unwrap();
+                assert_eq!(
+                    filtered.len(),
+                    index.len(),
+                    "with nothing justified past the anchor, every block is viable"
+                );
+                assert_eq!(get_head_node(&store, &config).unwrap().root, tip);
+            })
+            .unwrap();
+        walk.join().unwrap();
+    }
+
+    /// A justified block whose `LiveChain` row is gone, which is what
+    /// invalidating it leaves behind, fails the walk on entry with the
+    /// specification's `block_root in store.blocks` assertion: the error
+    /// `update_head_from_fork_choice` logs before keeping the head it has.
+    ///
+    /// The child is what makes the entry check the only possible source of
+    /// that message. With no child the walk would ask the justified block
+    /// itself, as a leaf, whether it is viable, and `get_voting_source`
+    /// asserts the same words; with one, skipping the entry check would reach
+    /// the child and fail its leaf check on a different assertion instead
+    /// (`block_root in store.block_states`, since this store holds no
+    /// states).
+    #[test]
+    fn the_filter_fails_on_entry_when_the_justified_block_is_gone() {
+        let config = Config::active();
+        let justified_root = Root::repeat_byte(1);
+        let child_root = Root::repeat_byte(2);
+        let mut store = store_anchored_at(justified_root);
+        store
+            .insert_signed_block(justified_root, block(0, Root::ZERO))
+            .unwrap();
+        store
+            .insert_signed_block(child_root, block(1, justified_root))
+            .unwrap();
+        store.delete_live_chain_entries(&[(0, justified_root)]);
+
+        let index = store.block_index();
+        assert!(!index.contains_key(&justified_root));
+        assert_eq!(index[&child_root], (1, justified_root));
+        assert_eq!(
+            failed_assertion(get_filtered_block_tree(&store, &index, &config)),
+            Some("block_root in store.blocks"),
         );
     }
 
