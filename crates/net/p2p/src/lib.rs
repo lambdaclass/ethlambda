@@ -2287,7 +2287,7 @@ pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<Pee
 
 /// [`Clone`] so one parse of the bootnode file can serve both `build_swarm` and
 /// discovery: every field is plain data, and cloning beats reading the file twice.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
     /// The libp2p QUIC port, when the ENR advertises one or the bootnode is a
@@ -4343,10 +4343,7 @@ mod tests {
 
     /// The reason `parse_bootnode` refuses `entry`, panicking if it accepts it.
     fn bootnode_refusal(entry: &str) -> String {
-        match parse_bootnode(entry) {
-            Ok(bootnode) => panic!("{entry:?} was accepted as a bootnode at {}", bootnode.ip),
-            Err(reason) => reason,
-        }
+        parse_bootnode(entry).expect_err("the entry must be refused")
     }
 
     #[test]
@@ -4427,6 +4424,33 @@ mod tests {
         let bootnode = parse_bootnode(&entry).unwrap();
 
         assert_eq!(PeerId::from_public_key(&bootnode.public_key), peer_id);
+    }
+
+    /// `beacon` adds its `--bootnodes` entries to the network's ENR list and
+    /// leaves duplicates to this merge, so a multiaddr typed for a peer the
+    /// network also lists must land in that peer's one dial: the two parse paths
+    /// have to key the peer alike.
+    #[test]
+    fn a_multiaddr_and_an_enr_for_one_peer_merge_into_one_dial() {
+        // Reused from `parse_enrs_extracts_ip_port_and_public_key`: localhost,
+        // `quic` 9001, no `tcp`.
+        let enr = parse_bootnode("enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys").unwrap();
+        let peer_id = enr.peer_id();
+        let typed = parse_bootnode(&format!("/ip4/203.0.113.7/tcp/9000/p2p/{peer_id}")).unwrap();
+        assert_eq!(typed.peer_id(), peer_id);
+
+        let (merged, undialable) = merge_bootnode_dial_addrs(vec![typed, enr], random_peer());
+
+        assert_eq!(undialable, 0);
+        assert_eq!(merged.len(), 1, "the two entries name one peer");
+        let addrs = merged
+            .get(&peer_id)
+            .expect("the peer is keyed by its peer id");
+        let expected: HashSet<Multiaddr> = HashSet::from([
+            tcp_multiaddr(IpAddr::from(Ipv4Addr::new(203, 0, 113, 7)), 9000, peer_id),
+            quic_multiaddr(IpAddr::from(Ipv4Addr::LOCALHOST), 9001, peer_id),
+        ]);
+        assert_eq!(addrs.iter().cloned().collect::<HashSet<_>>(), expected);
     }
 
     #[test]
