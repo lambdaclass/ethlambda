@@ -4705,6 +4705,18 @@ pub fn update_latest_messages(
     let beacon_block_root = data.beacon_block_root;
     let payload_present = rules == ForkRules::Gloas && data.index == 1;
 
+    // One reservation for the whole batch. `set_latest_message` grows the
+    // table exactly (plus a fixed headroom) rather than by doubling, and an
+    // indexed attestation's indices are sorted, so without this the table
+    // would be copied every time an ascending index passed the headroom.
+    // Equivocators skipped below count towards the highest index on purpose:
+    // they are in the registry, so the table reaches them anyway, and leaving
+    // them out would cost a pass over the equivocation set for at most one
+    // headroom of capacity. `max` rather than `last`, so an unsorted list
+    // still reserves enough.
+    if let Some(&highest) = attesting_indices.iter().max() {
+        store.reserve_latest_messages(highest);
+    }
     for &index in attesting_indices {
         if store.is_equivocating(index) {
             continue;
