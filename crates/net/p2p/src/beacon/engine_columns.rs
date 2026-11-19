@@ -18,7 +18,9 @@
 //! Recording comes before publishing on purpose. A copy of the same column that
 //! gossip delivers afterwards then finds its key taken and is ignored rather
 //! than re-forwarded, and a column gossip already accepted is not published a
-//! second time.
+//! second time. Gossip records a column only once its verdict is `Accept`
+//! (`verdict::Validated::record_seen`), so a copy still being validated when
+//! these are recorded is ignored too, as any second valid copy is.
 
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::ShortRoot;
@@ -131,8 +133,12 @@ mod tests {
     use std::sync::Arc;
 
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::fork::ForkName;
 
     use super::*;
+    use crate::beacon::decode::decode_data_column_sidecar;
+    use crate::gossipsub::decompress_message;
+    use crate::swarm_adapter::{SwarmCommand, SwarmHandle};
     use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
 
     const SLOT: u64 = 5;
@@ -176,6 +182,40 @@ mod tests {
         assert_eq!(forwarded_indices(&chain), [vec![1, 2]]);
         assert!(server.seen_columns.contains(SLOT, PROPOSER, 1));
         assert!(server.seen_columns.contains(SLOT, PROPOSER, 2));
+    }
+
+    /// What goes on the wire is what gossip validation decodes: the fulu
+    /// container, snappy-compressed, on the column's own subnet topic under
+    /// the digest held for its slot. Only a newly recorded custody column
+    /// goes out.
+    #[tokio::test]
+    async fn a_new_custody_column_is_published_as_gossip_decodes_it() {
+        let (mut server, _chain) = server_custodying(&[1, 2]).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        assert!(server.seen_columns.record(SLOT, PROPOSER, 2));
+        let crate::Wire::Beacon(beacon) = &server.wire else {
+            unreachable!("unconnected_beacon_server builds a beacon wire");
+        };
+        let digest = beacon.digest_for_slot(SLOT);
+
+        publish_and_forward(&mut server, vec![sidecar(1), sidecar(2), sidecar(9)]);
+
+        let mut published = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let SwarmCommand::Publish { topic, data } = command {
+                published.push((topic, data));
+            }
+        }
+        assert_eq!(published.len(), 1, "only column 1 is new and custodied");
+        let (topic, data) = &published[0];
+        let subnet = das::compute_subnet_for_data_column_sidecar(1);
+        let expected = IdentTopic::new(beacon_topics::data_column_topic_name(digest, subnet));
+        assert_eq!(topic.hash(), expected.hash());
+        let bytes = decompress_message(data).expect("snappy-compressed");
+        let decoded = decode_data_column_sidecar(ForkName::Fulu, &bytes)
+            .expect("the fulu container gossip decodes");
+        assert_eq!(decoded, sidecar(1));
     }
 
     #[tokio::test]
