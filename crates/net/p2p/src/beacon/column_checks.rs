@@ -13,8 +13,9 @@
 //!   wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
 //!   sidecar's parent, a gloas sidecar's own block.
 //!
-//! The sidecars are grouped by the block they belong to, and each group is
-//! checked on one blocking thread, bounded by
+//! The sidecars are grouped by the block they belong to, each `(block, index)`
+//! once ([`group_by_block`]), and each group is checked on one blocking
+//! thread, bounded by
 //! [`P2PServer::column_check_permits`]. Unlike a gossip verdict, nothing here
 //! has a deadline, so a group with no free permit waits for one rather than
 //! being dropped.
@@ -27,7 +28,7 @@
 //! forwarded as soon as it finishes, so the chain actor can count a block's
 //! columns toward availability without waiting for the rest of a range batch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use ethlambda_network_api::P2PToBlockChainRef;
@@ -37,9 +38,9 @@ use ethlambda_state_transition::beacon::gossip::column::{
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
-use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Root};
+use ethlambda_types::beacon::primitives::Root;
 use ethlambda_types::time::unix_now_ms;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{P2PServer, metrics};
 
@@ -62,27 +63,38 @@ impl GroupVerdicts {
     }
 }
 
-/// The block a sidecar belongs to: a fulu sidecar's signed header's root, a
-/// gloas sidecar's `beacon_block_root`.
-fn block_of(sidecar: &DataColumnSidecar) -> Root {
-    match sidecar {
-        DataColumnSidecar::Fulu(sidecar) => sidecar.signed_block_header.message.hash_tree_root(),
-        DataColumnSidecar::Gloas(sidecar) => sidecar.beacon_block_root,
-    }
-}
-
-/// Group `sidecars` by block, in the order each block first appears.
-fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> Vec<Vec<DataColumnSidecar>> {
+/// Group `sidecars` by block, in the order each block first appears, keeping
+/// only the first sidecar of each `(block, index)`. Returns the groups and how
+/// many repeats were left out.
+///
+/// The repeats are what bound a group: a block has `NUMBER_OF_COLUMNS`
+/// columns, and the checks refuse an index past that before the KZG stage, so
+/// no group sends more than `NUMBER_OF_COLUMNS` sidecars to it, however many
+/// copies a peer's answer carries (a range answer may hold 16,384). Nothing
+/// else would catch a repeat within one call: the answer filters match on
+/// block and index, not on repeats of them, and `AlreadyStored` cannot fire
+/// before the group is done. The first copy is the one kept, as the chain
+/// actor's own parking keeps the first (`queue_sidecar_awaiting_parent`): an
+/// honest answer never repeats a column, and judging copies in turn until one
+/// passes is the cost this bounds.
+fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> (Vec<Vec<DataColumnSidecar>>, usize) {
     let mut positions: HashMap<Root, usize> = HashMap::new();
+    let mut seen: HashSet<(Root, u64)> = HashSet::new();
     let mut groups: Vec<Vec<DataColumnSidecar>> = Vec::new();
+    let mut repeats = 0;
     for sidecar in sidecars {
-        let position = *positions.entry(block_of(&sidecar)).or_insert_with(|| {
+        let block = sidecar.block_root();
+        if !seen.insert((block, sidecar.index())) {
+            repeats += 1;
+            continue;
+        }
+        let position = *positions.entry(block).or_insert_with(|| {
             groups.push(Vec::new());
             groups.len() - 1
         });
         groups[position].push(sidecar);
     }
-    groups
+    (groups, repeats)
 }
 
 /// Judge every sidecar of one block: each one's checks that do not read the
@@ -160,7 +172,17 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
     let store = server.store.clone();
     let permits = server.column_check_permits.clone();
     tokio::spawn(async move {
-        for group in group_by_block(sidecars) {
+        let (groups, repeats) = group_by_block(sidecars);
+        if repeats > 0 {
+            debug!(
+                repeats,
+                "Dropping data column sidecars that repeat a block and index of the same call"
+            );
+            for _ in 0..repeats {
+                count_drop(Outcome::Ignore(IgnoreReason::AlreadySeen));
+            }
+        }
+        for group in groups {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
             let Ok(permit) = permits.clone().acquire_owned().await else {
@@ -190,7 +212,8 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
 ///
 /// An already stored one is not counted: consecutive range batches ask for
 /// overlapping spans of columns, so re-deliveries are routine, and they are
-/// duplicates rather than rejections.
+/// duplicates rather than rejections. A repeat within one call is counted
+/// (`already_seen`): an honest peer never sends one.
 fn count_drop(outcome: Outcome) {
     if outcome == Outcome::Ignore(IgnoreReason::AlreadyStored) {
         return;
@@ -398,26 +421,59 @@ mod tests {
         let a0 = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 0));
         let b0 = DataColumnSidecar::Fulu(valid_shaped_sidecar(6, 0));
         let a1 = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 1));
-        let gloas_of = |byte| {
+        let gloas_of = |byte, index| {
             DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+                index,
                 beacon_block_root: Root::repeat_byte(byte),
                 ..Default::default()
             })
         };
-        let (g1, g2, g1_again) = (gloas_of(1), gloas_of(2), gloas_of(1));
+        let (g1, g2, g1_next) = (gloas_of(1, 0), gloas_of(2, 0), gloas_of(1, 1));
 
-        let groups = group_by_block(vec![
+        let (groups, repeats) = group_by_block(vec![
             a0.clone(),
             b0.clone(),
             a1.clone(),
             g1.clone(),
             g2.clone(),
-            g1_again.clone(),
+            g1_next.clone(),
         ]);
 
         assert_eq!(
             groups,
-            vec![vec![a0, a1], vec![b0], vec![g1, g1_again], vec![g2]]
+            vec![vec![a0, a1], vec![b0], vec![g1, g1_next], vec![g2]]
         );
+        assert_eq!(repeats, 0);
+    }
+
+    /// A `(block, index)` an answer carries more than once is judged once,
+    /// on its first copy, however many copies follow: what keeps a group, and
+    /// so the KZG stage, at one sidecar per column.
+    #[test]
+    fn a_repeated_block_and_index_is_kept_once() {
+        let first = valid_shaped_sidecar(5, 0);
+        let mut other_cells = first.clone();
+        other_cells.column[0] = vec![1u8; ethlambda_types::beacon::preset::BYTES_PER_CELL]
+            .try_into()
+            .expect("exact cell size");
+        let next = valid_shaped_sidecar(5, 1);
+        let mut sidecars = vec![DataColumnSidecar::Fulu(first.clone())];
+        sidecars.extend(std::iter::repeat_n(
+            DataColumnSidecar::Fulu(other_cells),
+            1000,
+        ));
+        sidecars.push(DataColumnSidecar::Fulu(next.clone()));
+        sidecars.push(DataColumnSidecar::Fulu(first.clone()));
+
+        let (groups, repeats) = group_by_block(sidecars);
+
+        assert_eq!(
+            groups,
+            vec![vec![
+                DataColumnSidecar::Fulu(first),
+                DataColumnSidecar::Fulu(next)
+            ]]
+        );
+        assert_eq!(repeats, 1001);
     }
 }

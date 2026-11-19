@@ -408,10 +408,12 @@ static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyL
 
 /// Every reason `beacon::column_checks` can count a sidecar under: the
 /// `Outcome` reason labels `column::chain_checks` drops with, less
-/// `already_stored`, which is a duplicate rather than a rejection. Seeded at
+/// `already_stored`, which is a duplicate rather than a rejection, plus
+/// `already_seen`, a `(block, index)` repeated within one call. Seeded at
 /// zero by [`init`], so a reason this node never fires is still visible on a
 /// dashboard.
 const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
+    "already_seen",
     "malformed",
     "future_slot",
     "finalized",
