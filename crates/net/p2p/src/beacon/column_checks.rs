@@ -146,22 +146,21 @@ fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> (Vec<Vec<DataColumnSideca
 }
 
 /// Split `items` into the fewest sub-batches of at most [`KZG_BATCH_COLUMNS`],
-/// in order and as near equal in size as that allows.
+/// in order, no two differing in size by more than one.
 fn sub_batches<T>(items: Vec<T>) -> Vec<Vec<T>> {
-    if items.is_empty() {
+    let count = items.len().div_ceil(KZG_BATCH_COLUMNS);
+    if count == 0 {
         return Vec::new();
     }
-    let count = items.len().div_ceil(KZG_BATCH_COLUMNS);
-    let size = items.len().div_ceil(count);
+    // The first `longer` sub-batches take one item more than the rest.
+    let (base, longer) = (items.len() / count, items.len() % count);
     let mut items = items.into_iter();
-    let mut batches = Vec::with_capacity(count);
-    loop {
-        let batch: Vec<T> = items.by_ref().take(size).collect();
-        if batch.is_empty() {
-            return batches;
-        }
-        batches.push(batch);
-    }
+    (0..count)
+        .map(|batch| {
+            let size = base + usize::from(batch < longer);
+            items.by_ref().take(size).collect()
+        })
+        .collect()
 }
 
 /// The first stage: every rule of one block's sidecars that does not read the
@@ -601,7 +600,8 @@ mod tests {
     }
 
     /// Sub-batches hold at most [`KZG_BATCH_COLUMNS`] each, as few as that
-    /// allows, near-equal and in order.
+    /// allows, no two differing by more than one, and in order. 100 columns
+    /// are seven sub-batches of 15 and 14, not six of 15 and a short one of 10.
     #[test]
     fn sub_batches_are_bounded_near_equal_and_in_order() {
         let sizes = |count: usize| -> Vec<usize> {
@@ -616,6 +616,7 @@ mod tests {
         assert_eq!(sizes(KZG_BATCH_COLUMNS), vec![KZG_BATCH_COLUMNS]);
         assert_eq!(sizes(KZG_BATCH_COLUMNS + 1), vec![9, 8]);
         assert_eq!(sizes(128), vec![16; 8]);
+        assert_eq!(sizes(100), vec![15, 15, 14, 14, 14, 14, 14]);
         let flattened: Vec<usize> = sub_batches((0..100).collect()).concat();
         assert_eq!(flattened, (0..100).collect::<Vec<_>>());
     }
