@@ -11,6 +11,7 @@
 //! | fulu      | mainnet     | block, slot 15576000 |
 //! | gloas     | Plataberget | envelope, slot 593101 |
 
+use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::fork::ForkName;
 use libssz::SszDecode as _;
@@ -39,6 +40,24 @@ fn bellatrix_payload(block: &mut SignedBeaconBlock) -> &mut bellatrix::Execution
         panic!("bellatrix");
     };
     &mut inner.message.body.execution_payload
+}
+
+fn fulu_block(block: &mut SignedBeaconBlock) -> &mut electra::SignedBeaconBlock {
+    let SignedBeaconBlock::Fulu(inner) = block else {
+        panic!("fulu");
+    };
+    inner
+}
+
+/// The real fulu block with one header field changed.
+fn changed_fulu_block() -> SignedBeaconBlock {
+    let mut changed = block(ForkName::Fulu, FULU);
+    fulu_block(&mut changed)
+        .message
+        .body
+        .execution_payload
+        .gas_used += 1;
+    changed
 }
 
 /// An all-zero request: only its presence matters to the requests hash.
@@ -234,10 +253,40 @@ fn a_payload_with_zero_hashes_but_other_fields_is_checked() {
 }
 
 #[test]
-fn a_mismatch_is_a_reject_with_its_own_reason() {
+fn a_block_mismatch_is_ignored_once_its_checks_accept() {
+    let changed = changed_fulu_block();
+    let root = Root::ZERO;
+    let outcome = block_verdict(Outcome::Accept, &changed, root);
+    // IGNORE, never REJECT: other clients relay such a block.
+    assert_eq!(outcome.labels(), ("ignore", "payload_block_hash_mismatch"));
+    assert_eq!(
+        block_verdict(Outcome::Accept, &block(ForkName::Fulu, FULU), root),
+        Outcome::Accept
+    );
+}
+
+/// Anything but `Accept` passes through unhashed: a queued block may not have
+/// had its signature checked yet, and a rejected one is refused already.
+#[test]
+fn a_block_that_was_not_accepted_keeps_its_verdict() {
+    let changed = changed_fulu_block();
+    for outcome in [
+        Outcome::Queue(QueueReason::ParentUnknown),
+        Outcome::Ignore(IgnoreReason::Overloaded),
+        Outcome::Reject(RejectReason::BadSignature),
+    ] {
+        assert_eq!(block_verdict(outcome, &changed, Root::ZERO), outcome);
+    }
+}
+
+/// Gloas only counts a mismatch until the Amsterdam header is final: an
+/// encoding this build gets wrong must not refuse every payload.
+#[test]
+fn a_gloas_mismatch_is_counted_but_not_refused() {
     let mut changed = envelope();
     changed.message.payload.gas_used += 1;
-    let outcome = reject_envelope_on_mismatch(&changed).expect_err("a changed envelope");
-    assert_eq!(outcome.labels(), ("reject", "payload_block_hash_mismatch"));
-    assert!(reject_envelope_on_mismatch(&envelope()).is_ok());
+    assert!(verify_envelope(&changed).is_err());
+    assert_eq!(envelope_verdict(Outcome::Accept, &changed), Outcome::Accept);
+    let queued = Outcome::Queue(QueueReason::StateNotCached);
+    assert_eq!(envelope_verdict(queued, &changed), queued);
 }

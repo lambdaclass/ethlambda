@@ -52,11 +52,10 @@ fn judge(store: &Store, envelope: &SignedExecutionPayloadEnvelope) -> Outcome {
     if let Err(outcome) = cheap_checks(&seen, store, envelope) {
         return outcome;
     }
-    // The same stricter-than-the-specification rule the gossip topic runs.
-    if let Err(outcome) = payload_hash::reject_envelope_on_mismatch(envelope) {
-        return outcome;
-    }
-    stateful_checks(store, envelope)
+    // The payload block hash rule the gossip topic runs too, after the
+    // builder's signature verified. Counted, never refused, for gloas.
+    let outcome = stateful_checks(store, envelope);
+    payload_hash::envelope_verdict(outcome, envelope)
 }
 
 /// Run the gossip rules on `envelopes` and send the chain actor the ones that
@@ -240,13 +239,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {
-        // Sealed: the fetched-envelope rules refuse a block hash that is not
-        // the payload's header's.
-        payload_hash::seal_envelope(crate::beacon::encoding::test_support::envelope(
-            H256::repeat_byte(byte),
-            slot,
-            H256::ZERO,
-        ))
+        crate::beacon::encoding::test_support::envelope(H256::repeat_byte(byte), slot, H256::ZERO)
     }
 
     #[test]

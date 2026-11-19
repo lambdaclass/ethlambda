@@ -478,14 +478,14 @@ static LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL: LazyLock<IntCounterVec> = 
     || {
         register_int_counter_vec!(
             "lean_beacon_payload_block_hash_mismatch_total",
-            "Execution payloads refused because their block hash is not the hash of the header rebuilt from their fields, by kind (block, envelope)",
+            "Signed execution payloads whose block hash is not the hash of the header rebuilt from their fields, by kind (block: a gossip block, IGNOREd; envelope: counted, not refused)",
             &["kind"]
         )
         .unwrap()
     },
 );
 
-/// Count one payload refused for a block hash that is not its header's.
+/// Count one signed payload whose block hash is not its header's.
 pub fn inc_beacon_payload_block_hash_mismatch(kind: &str) {
     LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL
         .with_label_values(&[kind])

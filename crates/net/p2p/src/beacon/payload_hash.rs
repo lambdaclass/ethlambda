@@ -4,12 +4,31 @@
 //! A payload carries its `block_hash` next to the fields that hash is taken
 //! over, so a node can recompute it without an execution client: the header is
 //! the payload's fields plus the transactions, withdrawals and requests tries,
-//! RLP-encoded and keccak-hashed. The Engine API answers a mismatch with
-//! `INVALID` and a null `latestValidHash` (execution-apis `shanghai.md`), which
-//! is indistinguishable from a payload that executed badly and whose last valid
-//! ancestor is unknown. Catching the structural case here keeps such a payload
-//! from ever reaching fork choice. It is a rule stricter than the consensus
-//! specification's gossip rules; see `docs/spec_deviations.md`.
+//! RLP-encoded and keccak-hashed.
+//!
+//! The consensus specification has no such gossip rule, and the Engine API
+//! already requires the execution client to validate `blockHash` on every
+//! `engine_newPayload`, even while syncing (execution-apis `paris.md`). While
+//! an import waits for that answer, this finds nothing the execution client
+//! would not. What it buys is a gossip block refused before it is imported:
+//! once a pre-gloas payload is applied to fork choice before the execution
+//! client answers (lambdaclass/ethlambda#773), a block caught here is one that
+//! never has to be reverted. See `docs/spec_deviations.md`.
+//!
+//! Where it runs, and what it answers:
+//!
+//! - A pre-gloas `beacon_block` from gossip, once its stateful checks answered
+//!   `Accept` ([`block_verdict`]). That is the one outcome that says the
+//!   proposer's signature verified, so no unsigned message makes this node
+//!   build a transaction trie. A mismatch is `IGNORE`, not `REJECT`: other
+//!   clients have no such rule and forward the block, and a `REJECT` would
+//!   score every honest peer that relayed it.
+//! - A gloas envelope, from gossip or fetched, once its checks answered
+//!   `Accept` ([`envelope_verdict`]): counted and logged, never refused, until
+//!   the Amsterdam header is final.
+//! - Nothing else. A block fetched by range or root, and a gossip block
+//!   forwarded under `Queue` or `Ignore(Overloaded)`, reach the chain actor
+//!   unhashed; the execution client still checks them.
 //!
 //! The header's shape per fork:
 //!
@@ -26,7 +45,7 @@
 //! The header is encoded here rather than through ethrex's `BlockHeader`,
 //! which holds `base_fee_per_gas` as a `u64` where the payload has 256 bits.
 
-use ethlambda_state_transition::beacon::gossip::{Outcome, RejectReason};
+use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::stf::{electra, gloas as gloas_stf};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{SignedBeaconBlock, bellatrix, capella, deneb, gloas};
@@ -307,53 +326,67 @@ pub fn verify_envelope(
     .verify()
 }
 
-/// `envelope` with its payload's `block_hash` set to the header's, for tests
-/// that build a structurally valid envelope out of arbitrary fields.
-#[cfg(test)]
-pub(crate) fn seal_envelope(
-    mut envelope: gloas::SignedExecutionPayloadEnvelope,
-) -> gloas::SignedExecutionPayloadEnvelope {
-    if let Err(mismatch) = verify_envelope(&envelope) {
-        envelope.message.payload.block_hash = mismatch.computed.into();
-    }
-    envelope
-}
-
-/// [`verify_block`] as a gossip verdict: `Err(Reject)` on a mismatch, counted
-/// and logged.
-pub(crate) fn reject_block_on_mismatch(
+/// A gossip block's verdict, given the `outcome` its stateful checks answered.
+///
+/// Only an `Accept` is hashed: it is the one outcome that says the proposer's
+/// signature verified, so only a proposer can make this node build the trie
+/// or reach the `warn!`. A mismatch turns it into
+/// `Ignore(PayloadBlockHashMismatch)`, which keeps the block from being
+/// imported or relayed without scoring the peers that relayed it. Any other
+/// outcome passes through unhashed.
+pub(crate) fn block_verdict(
+    outcome: Outcome,
     block: &SignedBeaconBlock,
     block_root: Root,
-) -> Result<(), Outcome> {
-    verify_block(block).map_err(|mismatch| refuse("block", block.slot(), block_root, mismatch))
-}
-
-/// [`verify_envelope`] as a verdict, shared by the gossip topic and the
-/// fetched-envelope checks.
-pub(crate) fn reject_envelope_on_mismatch(
-    envelope: &gloas::SignedExecutionPayloadEnvelope,
-) -> Result<(), Outcome> {
-    verify_envelope(envelope).map_err(|mismatch| {
-        refuse(
-            "envelope",
-            envelope.message.payload.slot_number,
-            envelope.message.beacon_block_root,
-            mismatch,
-        )
-    })
-}
-
-fn refuse(kind: &str, slot: u64, root: Root, mismatch: HashMismatch) -> Outcome {
-    metrics::inc_beacon_payload_block_hash_mismatch(kind);
+) -> Outcome {
+    if outcome != Outcome::Accept {
+        return outcome;
+    }
+    let Err(mismatch) = verify_block(block) else {
+        return outcome;
+    };
+    metrics::inc_beacon_payload_block_hash_mismatch("block");
+    let slot = block.slot();
     warn!(
-        kind,
         slot,
-        root = %ShortRoot(&root.0),
+        block_root = %ShortRoot(&block_root.0),
         claimed = %ShortRoot(&mismatch.claimed),
         computed = %ShortRoot(&mismatch.computed),
-        "Refusing an execution payload whose block hash is not its header's"
+        "Ignoring a gossip block whose payload block hash is not its header's"
     );
-    Outcome::Reject(RejectReason::PayloadBlockHashMismatch)
+    Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch)
+}
+
+/// A gloas envelope's verdict, given the `outcome` its checks answered: always
+/// `outcome`, with an `Accept` whose payload hash is not its header's counted
+/// and logged.
+///
+/// Not refused, unlike a pre-gloas block. The Amsterdam header (EIP-7928's
+/// block access list hash, EIP-7843's slot number) is still moving between
+/// devnets, and an envelope is judged here on gossip and on fetch alike, so a
+/// header this build encodes wrongly would refuse every payload and leave the
+/// node unable to follow the chain; a pre-gloas block refused on gossip still
+/// comes back by root. The counter says whether the encoding agrees with the
+/// chain until the header is final and this can refuse.
+pub(crate) fn envelope_verdict(
+    outcome: Outcome,
+    envelope: &gloas::SignedExecutionPayloadEnvelope,
+) -> Outcome {
+    if outcome != Outcome::Accept {
+        return outcome;
+    }
+    let _ = verify_envelope(envelope).inspect_err(|mismatch| {
+        metrics::inc_beacon_payload_block_hash_mismatch("envelope");
+        let slot = envelope.message.payload.slot_number;
+        warn!(
+            slot,
+            block_root = %ShortRoot(&envelope.message.beacon_block_root.0),
+            claimed = %ShortRoot(&mismatch.claimed),
+            computed = %ShortRoot(&mismatch.computed),
+            "An envelope's payload block hash is not its header's; not refused before the Amsterdam header is final"
+        );
+    });
+    outcome
 }
 
 #[cfg(test)]
