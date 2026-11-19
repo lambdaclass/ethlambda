@@ -835,9 +835,18 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   every fork travel as the fork-tagged `containers::SignedExecutionPayloadEnvelope`
   (storage decodes one by its slot's fork, req/resp by the chunk's context
   bytes, the engine gets each fork's typed requests list). It was run next to
-  Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`).
-  EIP-8483 is not followed yet, and PQ block production, the Beacon API's PQ
-  containers and the validator client's PQ duties are not implemented. The
+  Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`),
+  with its own validators: the validator client derives each validator's
+  leanXMSS key and VRF tree from its BLS key (`ethlambda_crypto::pq_keys`) and
+  attests, aggregates, casts PTC votes and proposes, each signature at its
+  leaf. The beacon node builds PQ blocks through `POST
+  /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
+  `pq_block_production.rs`), packing attestations from the validated
+  aggregates in `Store::pq_aggregate_pool` with their proofs merged on the
+  sidecar under a deadline (one unmerged attestation when it misses), and
+  proves its aggregators' committees ahead (`rpc/src/beacon/pq_aggregation.rs`,
+  `Store::pq_signature_pool`). EIP-8483 is not followed yet, and PQ blocks
+  carry no blobs. The
   gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
   (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
   and the PQ registry holds each XMSS key in its 48-byte request form so the

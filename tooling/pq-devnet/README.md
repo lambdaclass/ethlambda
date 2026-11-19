@@ -2,8 +2,11 @@
 
 A local kurtosis devnet on the consensus-specs `pq` fork (pinned at
 `a4d16c5b`), active from genesis, with ethlambda next to Lighthouse's PQ
-client. See [`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda
-implements of the fork.
+client. `network_params.yaml` runs an ethlambda beacon node that only
+follows; `network_params_validators.yaml` gives it 16 of the 64 validators
+behind ethlambda's own validator client. See
+[`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda implements
+of the fork.
 
 ## What runs
 
@@ -51,6 +54,11 @@ startup, about two minutes for 64 on an 11-core machine, so the first slots
 are missed. Lighthouse needs a supernode or 128 validators for PeerDAS, which
 the params give it.
 
+With `network_params_validators.yaml`, ethlambda's validator client derives
+its 16 keys in under a minute. Lighthouse keeps 48 (75%), enough to finalize
+alone, so a fault on ethlambda's side shows as missed duties rather than a
+stalled chain.
+
 ## Known limits
 
 - **Lighthouse does not serve PQ envelopes over req/resp.** Its `pq` branch
@@ -77,3 +85,9 @@ the params give it.
 - ethlambda's execution client answers `VALID` for every envelope
   (`Execution payload envelope verified ... status=Valid`).
 - Finality matches Lighthouse's.
+- With ethlambda validators: every block ethlambda's validator client
+  publishes (`Published a PQ block`) is canonical on Lighthouse, the ones
+  after the first few carry attestations (`Packed PQ attestations`), and
+  Lighthouse's `gossipsub_rejected_messages_per_topic_total` stays empty for
+  ethlambda's attestations, PTC votes, blocks, envelopes and aggregates
+  (`Proved a PQ aggregate`, `Published PQ aggregates`).

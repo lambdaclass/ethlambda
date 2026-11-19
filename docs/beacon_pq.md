@@ -22,9 +22,11 @@ follows PQ** (`ForkName::is_followed`): it imports PQ blocks and envelopes
 from gossip and req/resp, applies PQ aggregates and payload attestations to
 fork choice, and asks its execution client about PQ payloads. It was run
 next to Lighthouse's PQ client on a PQ-at-genesis devnet
-([`tooling/pq-devnet`](../tooling/pq-devnet/README.md)). It does not follow
-EIP-8483 yet: see [What remains](#what-remains). It does not produce PQ blocks
-or run PQ validator duties.
+([`tooling/pq-devnet`](../tooling/pq-devnet/README.md)). Its validator
+client runs every PQ duty (attest, aggregate, the PTC vote, propose and
+reveal the payload), and the beacon node builds PQ blocks with their
+attestations' proofs merged: see [Validator duties](#validator-duties). It
+does not follow EIP-8483 yet: see [What remains](#what-remains).
 
 Each builds on the fork before it, like every other fork. EIP-8483 is gloas
 plus its two requests and PQ is EIP-8483 with BLS replaced, so a rule gated
@@ -60,7 +62,10 @@ changes.
 | Engine | `beacon_engine::gloas_new_payload_request` | each fork's typed requests list to `engine_newPayloadV5`, `engine_forkchoiceUpdatedV4` for a PQ head |
 | Genesis | `genesis_anchor_block` | the body carries the state's bid from gloas on, as the specification's genesis helper and ethpandaops' generator build it |
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
-| Beacon API, validator client, block production | | refuse PQ's signed containers |
+| Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; no blobs. Every block it built on the devnet was canonical on Lighthouse |
+| Validator client | `ethlambda_validator::pq` and the duty services | keys derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on the devnet |
+| Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
+| Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
 ## Gossip
 
@@ -234,6 +239,52 @@ bit at its own slot (`get_latest_block_slot`) rather than the parent's. Gloas's
 PQ, and take the delay from the state's fork
 (`helpers::pq::min_attestation_inclusion_delay`).
 
+## Validator duties
+
+The validator client keeps its BLS keystores and derives each validator's PQ
+material from the BLS signing key at startup, the way ethereum-package's
+genesis generator and Lighthouse's PQ branch do: the leanXMSS key from
+`sha256("leanxmss-seed" || sk)` and the VRF tree from `sha256("vrf-seed" ||
+sk)` (`ethlambda_crypto::pq_keys`). The registry names a validator by its
+key's 48-byte request form, which the client looks its validators up by and
+maps back to the BLS key it holds, so a validator whose derived key is not
+the registered one resolves to no index and gets no duties. Key generation
+builds two bottom trees per key, which takes under a minute for 16
+validators.
+
+Each duty signs at the leaf the fork assigns it (see [Leaves](#leaves)): the
+attestation at its target epoch's, the others at the slot's own offset. The
+client refuses to sign two different roots at one leaf. That record is in
+memory; across a restart, slashing protection still guards attestations and
+proposals, the two that slashing punishes.
+
+- **Attesting**: a `SingleAttestation` signed at the target epoch's leaf,
+  published on one of PQ's 16 subnets.
+- **The PTC vote**: as gloas's, signed at the slot's PTC leaf.
+- **Proposing**: the client sends its VRF proof for the slot (the RANDAO
+  reveal) to `POST /eth/v1/validator/pq_blocks/{slot}`, signs the block and
+  the envelope revealing its self-built payload at their leaves, and publishes
+  both. The beacon node builds the block while the execution client builds
+  the payload, and meanwhile packs attestations: it picks, from the
+  aggregates it validated, what `process_attestation` accepts at the slot and
+  credits someone new, as `compute_on_chain_aggregate` shapes them, and merges
+  their proofs in `process_stark`'s order on the sidecar. A merge must end
+  three quarters of the way to the attestation deadline (Lighthouse's bound).
+  One child needs no merge; when more do not finish in time, the block packs
+  the most valuable single-committee attestation alone, whose proof is the
+  block's as it is. On the devnet's VM a two-child merge takes about four
+  seconds, for Lighthouse too, so blocks there carry one attestation each.
+- **Aggregating**: a PQ aggregator is a member of its committee's
+  aggregation committee, which the attester duties report as
+  `is_aggregator`. Proving takes seconds, so the node proves ahead, as
+  Lighthouse's PQ branch does: the client's committee subscriptions join the
+  committee's subnet and register it, the node keeps the validated votes'
+  signatures for registered committees, and halfway between the attestation
+  and aggregate deadlines seals the slot and proves each committee before the
+  aggregate deadline. `GET aggregate_attestation` then answers the proved
+  aggregate and its proof, and the client signs the `AggregateAndProof` at the
+  slot's aggregate leaf.
+
 ## Spec fixtures
 
 No consensus-specs release ships fixtures for either fork. The pyspec on the
@@ -267,8 +318,9 @@ generated.
 
 - Generate and run the fixtures above, and add the PQ containers to the
   `ssz_static` runner.
-- The operation and attestation pools and the event stream for PQ gossip:
-  only fork choice takes it today.
+- The operation pool and the event stream for PQ gossip: slashings are
+  relayed but never packed into a block, and accepted PQ messages raise no
+  events. Attestations are pooled (see [Validator duties](#validator-duties)).
 - Following EIP-8483 (`ForkName::is_followed` is false for it): its block's
   cheap gossip rules, its `execution_payload` topic's decode and rules (its
   envelope is its own container), its fetched envelopes' checks, and its
@@ -277,8 +329,14 @@ generated.
 - The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
   `DiscoveryServer` cannot replace the served record at runtime (the same gap
   as its `eth2` entry, see `CLAUDE.md`).
-- Block production and the validator client (XMSS keys, VRF trees, leaf
-  bookkeeping, STARK proof merging).
+- Blobs in PQ block production: a payload with blobs is refused, since the
+  envelope's column sidecars are not built for PQ yet.
+- Merging ahead of a proposal: the aggregates a slot-`N` block may pack are
+  all known a slot earlier, so a node could merge during slot `N - 1` for a
+  proposer it serves, where today a slow merge costs every attestation but
+  one.
+- A persistent leaf record for the aggregate, PTC and envelope leaves, which
+  slashing protection does not cover.
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ
   key's request form: still correct (every candidate is verified, and a miss
   scans), but every PQ lookup scans.

@@ -1,0 +1,28 @@
+# A PQ-at-genesis devnet where ethlambda validates too: Lighthouse (pq) with 48
+# validators (75%, enough to finalize alone), an ethlambda beacon node and
+# validator client with 16. See README.md.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    cl_image: ethdreamer/lighthouse:pq
+    vc_image: ethdreamer/lighthouse:pq
+    validator_count: 48
+    supernode: true
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ethlambda:pq-local
+    # The sidecar proves aggregates and merges block proofs; two threads keep
+    # it next to Lighthouse's in Docker Desktop's default 8 GB VM.
+    cl_extra_env_vars:
+      LEANVM_THREADS: "2"
+    vc_type: ethlambda
+    vc_image: ethlambda:pq-local
+    vc_extra_params: ["--init-slashing-protection"]
+    validator_count: 16
+network_params:
+  preset: mainnet
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+additional_services:
+  - dora
