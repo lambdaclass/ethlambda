@@ -13,23 +13,48 @@
 //!   wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
 //!   sidecar's parent, a gloas sidecar's own block.
 //!
-//! The sidecars are grouped by the block they belong to, each `(block, index)`
-//! once ([`group_by_block`]), and each group is checked on one blocking
-//! thread, bounded by
-//! [`P2PServer::column_check_permits`]. Unlike a gossip verdict, nothing here
-//! has a deadline, so a group with no free permit waits for one rather than
-//! being dropped.
+//! The sidecars of one call are grouped by the block they belong to, each
+//! `(block, index)` once ([`group_by_block`]), and each group is checked in
+//! two stages on blocking threads, bounded by
+//! [`P2PServer::column_check_permits`]:
 //!
-//! A group takes one permit, not one per sidecar, because the KZG proofs of
-//! all its sidecars are verified in one batch: the batch is one unit of work
-//! on one thread, so a permit per sidecar would count permits the group does
-//! not use at the same time. The pool still bounds the blocking threads this
-//! module occupies, at one per block in flight. A group's verdicts are
-//! forwarded as soon as it finishes, so the chain actor can count a block's
-//! columns toward availability without waiting for the rest of a range batch.
+//! 1. Every rule before the KZG proofs, sidecar by sidecar on one thread,
+//!    through one [`ChainPrechecks`], so the rules that read only what the
+//!    block's sidecars share (the signed header's, or the gloas block lookup)
+//!    run once for the group. The sidecars this settles, parked or dropped,
+//!    are forwarded as soon as it finishes.
+//! 2. The KZG proofs of the sidecars still standing, in sub-batches of at most
+//!    [`KZG_BATCH_COLUMNS`] columns, each one `verify_cell_kzg_proof_batch`
+//!    call on a thread of its own. The first runs on the permit the group's
+//!    prechecks held; each further one waits for a permit of its own, so a
+//!    block with many columns spreads over the free permits rather than
+//!    queueing on one thread. Once every sub-batch is back, the sidecars kept
+//!    go to the chain actor as one batch, so it can count a block's columns
+//!    toward availability without waiting for the rest of a range answer.
+//!
+//! A permit is held for one group's prechecks and first sub-batch, or for
+//! one further sub-batch. The proofs' share of a hold is bounded by
+//! [`KZG_BATCH_COLUMNS`], not by how many columns the block has. The
+//! prechecks' share is not bounded that way: they take the group's sidecars in
+//! turn, one header judgment (a state read, and past the lookahead a state
+//! advance) plus a check per sidecar, and how long that holds a permit on a
+//! live node is unmeasured. Nothing awaits a permit while it holds one, so
+//! groups and sub-batches cannot deadlock the pool between them. The pool is
+//! shared with the envelope checks (`envelope_checks.rs`, one permit per
+//! envelope), and tokio serves waiting requests in arrival order, so an
+//! envelope waits behind only the requests queued before it.
+//!
+//! Unlike a gossip verdict, nothing here has a deadline, so a group or
+//! sub-batch with no free permit waits for one rather than being dropped.
+//! Each call runs on one task, which takes a permit per group in turn, and
+//! each group on a task of its own until its last sub-batch is back. A group
+//! task waiting for a sub-batch permit holds none, so the group tasks alive at
+//! once are bounded by the groups of the calls in flight, whose sidecars are
+//! in memory already, rather than by the pool.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use ethlambda_network_api::P2PToBlockChainRef;
 use ethlambda_state_transition::beacon::gossip::column::{
@@ -40,12 +65,29 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::primitives::Root;
 use ethlambda_types::time::unix_now_ms;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
 use crate::{P2PServer, metrics};
 
-/// What one block's sidecars came to: the ones to store, the ones to park, and
-/// the reason for each one dropped.
+/// The most columns one KZG batch verifies. A block's columns past this are
+/// split into near-equal sub-batches, each on a permit of its own.
+///
+/// One batch costs about 3 ms plus 0.55 ms per column (9 blobs,
+/// `bench_kzg_batch_against_separate_calls`: one column 3.2 ms, 8 columns
+/// 7.9 ms, 16 columns 12.6 ms, 128 columns 73 ms, on one core). Computed from
+/// those, at 16: the 8 columns a node samples are one batch, a third of the CPU
+/// of eight separate checks; a supernode's 128 are 8 batches, about 13 ms of
+/// wall-clock with 8 permits free where one batch takes 73 ms; and a failed
+/// batch's one-by-one re-check covers 16 columns at most.
+const KZG_BATCH_COLUMNS: usize = 16;
+
+/// A sidecar every rule before the KZG proofs passed, with what its proofs
+/// are checked against.
+type Pending = (DataColumnSidecar, PendingKzg);
+
+/// What some of one block's sidecars came to: the ones to store, the ones to
+/// park, and the reason for each one dropped.
 #[derive(Default)]
 struct GroupVerdicts {
     keep: Vec<DataColumnSidecar>,
@@ -60,6 +102,12 @@ impl GroupVerdicts {
             ChainVerdict::AwaitParent => self.awaiting_parent.push(sidecar),
             ChainVerdict::Drop(outcome) => self.dropped.push(outcome),
         }
+    }
+
+    fn merge(&mut self, other: GroupVerdicts) {
+        self.keep.extend(other.keep);
+        self.awaiting_parent.extend(other.awaiting_parent);
+        self.dropped.extend(other.dropped);
     }
 }
 
@@ -97,46 +145,130 @@ fn group_by_block(sidecars: Vec<DataColumnSidecar>) -> (Vec<Vec<DataColumnSideca
     (groups, repeats)
 }
 
-/// Judge every sidecar of one block: each one's checks that do not read the
-/// cells, then the KZG proofs of the ones still standing, in one batch.
+/// Split `items` into the fewest sub-batches of at most [`KZG_BATCH_COLUMNS`],
+/// in order and as near equal in size as that allows.
+fn sub_batches<T>(items: Vec<T>) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let count = items.len().div_ceil(KZG_BATCH_COLUMNS);
+    let size = items.len().div_ceil(count);
+    let mut items = items.into_iter();
+    let mut batches = Vec::with_capacity(count);
+    loop {
+        let batch: Vec<T> = items.by_ref().take(size).collect();
+        if batch.is_empty() {
+            return batches;
+        }
+        batches.push(batch);
+    }
+}
+
+/// The first stage: every rule of one block's sidecars that does not read the
+/// cells. Returns what those rules settled and the sidecars whose KZG proofs
+/// decide.
 ///
 /// Each sidecar gets the verdict [`column::chain_checks_for`] would give it:
 /// the proofs are the last rule on the chain path, so running the other rules
-/// first and the proofs together changes nothing but how the proofs are paid
-/// for, and a failed batch is re-run sidecar by sidecar.
-fn judge_group(store: &Store, sidecars: Vec<DataColumnSidecar>, now_ms: u64) -> GroupVerdicts {
-    let mut verdicts = GroupVerdicts::default();
-    let mut pending: Vec<(DataColumnSidecar, PendingKzg)> = Vec::new();
-    // The block's sidecars share a header (fulu) or a block (gloas), so the
-    // rules that read only that run once.
+/// first and the proofs afterwards, batched, changes nothing but how the
+/// proofs are paid for.
+fn precheck_group(
+    store: &Store,
+    sidecars: Vec<DataColumnSidecar>,
+    now_ms: u64,
+) -> (GroupVerdicts, Vec<Pending>) {
+    let mut settled = GroupVerdicts::default();
+    let mut pending = Vec::new();
     let mut prechecks = ChainPrechecks::new(store, now_ms);
     for sidecar in sidecars {
         // A panic inside the checks (a `Store` read's `.expect()` on a DB
         // error, say) costs that one sidecar, which is what dropping it
-        // would have done anyway.
+        // would have done anyway. `ChainPrechecks` keeps an answer only once
+        // it is complete, so the next sidecar works it out again.
         let precheck = catch_unwind(AssertUnwindSafe(|| prechecks.check(&sidecar)));
         match precheck {
             Ok(Ok(kzg)) => pending.push((sidecar, kzg)),
-            Ok(Err(verdict)) => verdicts.record(sidecar, verdict),
+            Ok(Err(verdict)) => settled.record(sidecar, verdict),
             Err(_) => error!("A data column check panicked; dropping the sidecar"),
         }
     }
-    if pending.is_empty() {
-        return verdicts;
-    }
-    let items: Vec<_> = pending
-        .iter()
-        .map(|(sidecar, kzg)| (sidecar, kzg))
-        .collect();
+    (settled, pending)
+}
+
+/// The second stage, for one sub-batch: its sidecars' KZG proofs in one
+/// batch, each re-verified alone if the batch fails ([`column::kzg_verdicts`]).
+fn verify_batch(batch: Vec<Pending>) -> GroupVerdicts {
+    let items: Vec<_> = batch.iter().map(|(sidecar, kzg)| (sidecar, kzg)).collect();
     let kzg_verdicts = column::kzg_verdicts(&items);
-    for ((sidecar, _), verdict) in pending.into_iter().zip(kzg_verdicts) {
+    let mut verdicts = GroupVerdicts::default();
+    for ((sidecar, _), verdict) in batch.into_iter().zip(kzg_verdicts) {
         verdicts.record(sidecar, verdict);
     }
     verdicts
 }
 
-/// Send the chain actor one group's results: the sidecars to store as one
-/// batch, and the ones waiting on a block as another.
+/// Check one block's sidecars, `permit` already taken for them, and forward
+/// what they come to: the parked and the dropped once the prechecks are done,
+/// the kept once every sub-batch is.
+async fn check_group(
+    store: Store,
+    blockchain: P2PToBlockChainRef,
+    permits: Arc<Semaphore>,
+    group: Vec<DataColumnSidecar>,
+    permit: OwnedSemaphorePermit,
+) {
+    let prechecked =
+        tokio::task::spawn_blocking(move || precheck_group(&store, group, unix_now_ms())).await;
+    let (settled, pending) = match prechecked {
+        Ok(prechecked) => prechecked,
+        // Tokio has already caught the panic. A sidecar's own checks catch
+        // theirs, so this one came from outside them, and the whole group is
+        // lost: none of it is forwarded or counted.
+        Err(err) => {
+            error!(%err, "A data column precheck panicked; dropping the group");
+            return;
+        }
+    };
+    // Nothing the proofs say changes these, so they go now: a panic in a KZG
+    // batch below cannot cost them.
+    forward(&blockchain, settled);
+
+    let mut own_permit = Some(permit);
+    let mut batches = Vec::new();
+    for batch in sub_batches(pending) {
+        // The group's own permit carries the first sub-batch. Each further one
+        // waits for a permit of its own, and the group holds none while it
+        // waits, the first having moved into its batch. The semaphore is never
+        // closed, so the wait only ends once a permit is free.
+        let permit = match own_permit.take() {
+            Some(permit) => permit,
+            None => {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    break;
+                };
+                permit
+            }
+        };
+        batches.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verify_batch(batch)
+        }));
+    }
+    let mut verdicts = GroupVerdicts::default();
+    for batch in batches {
+        match batch.await {
+            Ok(batch) => verdicts.merge(batch),
+            // Tokio has already caught the panic. That sub-batch's sidecars
+            // are lost, neither forwarded nor counted; the group's other
+            // sub-batches and everything settled above are not.
+            Err(err) => error!(%err, "A data column KZG batch panicked; dropping its sidecars"),
+        }
+    }
+    forward(&blockchain, verdicts);
+}
+
+/// Send the chain actor some of one block's verdicts: the sidecars to store as
+/// one batch, and the ones waiting on a block as another, and count the drops.
 fn forward(blockchain: &P2PToBlockChainRef, verdicts: GroupVerdicts) {
     for outcome in verdicts.dropped {
         count_drop(outcome);
@@ -155,8 +287,9 @@ fn forward(blockchain: &P2PToBlockChainRef, verdicts: GroupVerdicts) {
     }
 }
 
-/// Run the chain checks on `sidecars`, then send the chain actor the ones that
-/// passed as one batch per block and the ones waiting on a block as another.
+/// Run the chain checks on `sidecars`, then send the chain actor, per block,
+/// the ones waiting on a block as one batch and the ones that passed as
+/// another.
 ///
 /// Returns at once: the checks run on tasks of their own, so the p2p actor
 /// goes on handling swarm events while a range batch's KZG proofs are
@@ -188,22 +321,13 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
             let Ok(permit) = permits.clone().acquire_owned().await else {
                 return;
             };
-            let store = store.clone();
-            let blockchain = blockchain.clone();
-            tokio::spawn(async move {
-                let checked = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    judge_group(&store, group, unix_now_ms())
-                })
-                .await;
-                match checked {
-                    Ok(verdicts) => forward(&blockchain, verdicts),
-                    // Tokio has already caught the panic; what the group
-                    // held is lost, which is what dropping it would have
-                    // done anyway.
-                    Err(err) => error!(%err, "A data column check panicked; dropping the group"),
-                }
-            });
+            tokio::spawn(check_group(
+                store.clone(),
+                blockchain.clone(),
+                permits.clone(),
+                group,
+                permit,
+            ));
         }
     });
 }
@@ -221,7 +345,6 @@ fn count_drop(outcome: Outcome) {
     let (_, reason) = outcome.labels();
     metrics::inc_data_column_rejected(reason);
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -475,5 +598,142 @@ mod tests {
             ]]
         );
         assert_eq!(repeats, 1001);
+    }
+
+    /// Sub-batches hold at most [`KZG_BATCH_COLUMNS`] each, as few as that
+    /// allows, near-equal and in order.
+    #[test]
+    fn sub_batches_are_bounded_near_equal_and_in_order() {
+        let sizes = |count: usize| -> Vec<usize> {
+            sub_batches((0..count).collect::<Vec<_>>())
+                .iter()
+                .map(Vec::len)
+                .collect()
+        };
+        assert_eq!(sizes(0), Vec::<usize>::new());
+        assert_eq!(sizes(1), vec![1]);
+        assert_eq!(sizes(8), vec![8]);
+        assert_eq!(sizes(KZG_BATCH_COLUMNS), vec![KZG_BATCH_COLUMNS]);
+        assert_eq!(sizes(KZG_BATCH_COLUMNS + 1), vec![9, 8]);
+        assert_eq!(sizes(128), vec![16; 8]);
+        let flattened: Vec<usize> = sub_batches((0..100).collect()).concat();
+        assert_eq!(flattened, (0..100).collect::<Vec<_>>());
+    }
+
+    /// A blob of canonical field elements derived from `seed`: the top byte of
+    /// each 32-byte element is zero, which keeps it below the modulus.
+    fn blob(seed: u8) -> Vec<u8> {
+        (0..ethlambda_types::beacon::preset::BYTES_PER_BLOB)
+            .map(|i| {
+                if i % 32 == 0 {
+                    0
+                } else {
+                    (i as u8).wrapping_mul(31).wrapping_add(seed)
+                }
+            })
+            .collect()
+    }
+
+    /// A gloas block at `slot` whose bid commits to two real blobs, stored
+    /// under `root` with a post-state, and its sidecars at every column in
+    /// `columns`, carrying the real cells and proofs: sidecars every chain
+    /// rule passes.
+    fn stored_gloas_block_and_sidecars(
+        store: &mut Store,
+        slot: u64,
+        root: Root,
+        columns: &[u64],
+    ) -> Vec<gloas::DataColumnSidecar> {
+        use ethlambda_state_transition::beacon::kzg;
+        let blobs = [blob(1), blob(2)];
+        let commitments: Vec<_> = blobs
+            .iter()
+            .map(|blob| kzg::blob_to_kzg_commitment(blob).expect("commit"))
+            .collect();
+        let cells_and_proofs: Vec<_> = blobs
+            .iter()
+            .map(|blob| kzg::compute_cells_and_kzg_proofs(blob).expect("cells"))
+            .collect();
+        let mut block = gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments = commitments.into();
+        store
+            .insert_pending_block(root, SignedBeaconBlock::Gloas(block))
+            .expect("insert the block");
+        let state = ethlambda_state_transition::beacon::helpers::test_state::with_validators_at(
+            ethlambda_types::beacon::fork::ForkName::Gloas,
+            1,
+        );
+        store
+            .insert_state(root, state)
+            .expect("insert a post-state");
+        columns
+            .iter()
+            .map(|&index| {
+                let column: Vec<ethlambda_types::beacon::containers::fulu::Cell> = cells_and_proofs
+                    .iter()
+                    .map(|(cells, _)| {
+                        cells[index as usize]
+                            .to_bytes()
+                            .to_vec()
+                            .try_into()
+                            .expect("exact cell size")
+                    })
+                    .collect();
+                let proofs: Vec<_> = cells_and_proofs
+                    .iter()
+                    .map(|(_, proofs)| proofs[index as usize])
+                    .collect();
+                gloas::DataColumnSidecar {
+                    index,
+                    slot,
+                    beacon_block_root: root,
+                    column: column.into(),
+                    kzg_proofs: proofs.into(),
+                }
+            })
+            .collect()
+    }
+
+    /// A block with more columns than one KZG batch takes is verified in
+    /// sub-batches on permits of their own, and what passes comes back to
+    /// the chain actor as one batch, in order: here every column but the one
+    /// forged in the second sub-batch, which goes nowhere.
+    #[tokio::test]
+    async fn a_blocks_columns_that_verify_are_forwarded_together_across_sub_batches() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, mut received) = mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(RecordingChain(sender)));
+
+        let all: Vec<u64> = (0..KZG_BATCH_COLUMNS as u64 + 2).collect();
+        let mut sidecars =
+            stored_gloas_block_and_sidecars(&mut server.store, 5, Root::repeat_byte(0x5a), &all);
+        let forged = KZG_BATCH_COLUMNS - 1;
+        let mut cell = sidecars[forged].column[0].to_vec();
+        cell[31] ^= 1;
+        sidecars[forged].column[0] = cell.try_into().expect("exact cell size");
+        let sidecars: Vec<DataColumnSidecar> =
+            sidecars.into_iter().map(DataColumnSidecar::Gloas).collect();
+        let mut expected = sidecars.clone();
+        expected.remove(forged);
+
+        check_and_forward(&server, sidecars);
+
+        assert_eq!(received.recv().await, Some(Forwarded::Checked(expected)));
+        drop(server);
+        assert_eq!(received.recv().await, None);
     }
 }
