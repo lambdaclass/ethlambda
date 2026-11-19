@@ -95,8 +95,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, Domain, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot,
-    ValidatorIndex,
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -105,7 +104,6 @@ use super::accessors::{
 };
 use super::math::{bytes_to_uint64, integer_squareroot};
 use super::misc::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch};
-use super::predicates::are_indices_sorted_and_unique;
 use super::shuffling::compute_shuffled_index;
 
 // ---------------------------------------------------------------------------
@@ -118,8 +116,8 @@ use super::shuffling::compute_shuffled_index;
 /// Modified from [`super::electra::is_valid_indexed_attestation`] (EIP-7688):
 /// [`gloas::IndexedAttestation::attesting_indices`] is now the unbounded
 /// [`gloas::AttestingIndices`], so the length that used to be enforced by the
-/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked here
-/// explicitly instead.
+/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked
+/// explicitly instead, in [`super::attestation::attesters_signature_set`].
 pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
@@ -129,62 +127,19 @@ pub fn is_valid_indexed_attestation(
 
 /// The signature check [`is_valid_indexed_attestation`] makes, resolved but
 /// not yet run, so a block can verify every attestation's signature in one
-/// batch.
-///
-/// Every structural check [`is_valid_indexed_attestation`] makes (the
-/// attester set's shape and range) happens here, at once: `None` means the
-/// attestation is invalid without needing a pairing. Only the pairing is left
-/// to the caller.
+/// batch. See [`super::attestation::attesters_signature_set`], which holds the
+/// checks every fork shares, the length bound included.
 pub fn indexed_attestation_signature_set(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
 ) -> Option<SignatureSet> {
-    let domain = get_domain(
+    super::attestation::attesters_signature_set(
         state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
-    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
-}
-
-/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
-///
-/// For gossip, which checks against a state that may not have reached the
-/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
-pub fn is_valid_indexed_attestation_with_domain(
-    state: &BeaconState,
-    indexed_attestation: &gloas::IndexedAttestation,
-    domain: Domain,
-) -> bool {
-    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
-        .is_some_and(|set| set.verify())
-}
-
-/// [`indexed_attestation_signature_set`] under a signing domain the caller
-/// chose.
-pub fn indexed_attestation_signature_set_with_domain(
-    state: &BeaconState,
-    indexed_attestation: &gloas::IndexedAttestation,
-    domain: Domain,
-) -> Option<SignatureSet> {
-    let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
-    if indices.is_empty()
-        || indices.len() > preset::MAX_VALIDATORS_PER_SLOT
-        || !are_indices_sorted_and_unique(indices)
-    {
-        return None;
-    }
-
-    let mut pubkeys = Vec::with_capacity(indices.len());
-    for index in indices {
-        match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return None,
-        }
-    }
-
-    let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    SignatureSet::fast_aggregate(&pubkeys, signing_root, &indexed_attestation.signature)
+        &indexed_attestation.attesting_indices,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------

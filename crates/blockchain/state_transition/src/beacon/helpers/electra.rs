@@ -134,17 +134,15 @@ use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei,
-    HashTreeRoot as _, Slot, ValidatorIndex,
+    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Epoch, Gwei, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch, get_domain,
-    get_seed, get_total_active_balance,
+    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch, get_seed,
+    get_total_active_balance,
 };
 use super::math::bytes_to_uint64;
-use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
-use super::predicates::are_indices_sorted_and_unique;
+use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot};
 use super::shuffling::compute_shuffled_index;
 
 // ---------------------------------------------------------------------------
@@ -271,11 +269,12 @@ pub fn compute_proposer_index(
 /// Whether an indexed attestation names a valid attester set and carries
 /// their aggregate signature.
 ///
-/// Logic identical to [`crate::beacon::helpers::attestation::is_valid_indexed_attestation`];
-/// this exists as its own copy only because [`electra::IndexedAttestation`]
-/// is a different concrete type from phase0's `IndexedAttestation`, bounded
-/// by `MAX_VALIDATORS_PER_SLOT` rather than `MAX_VALIDATORS_PER_COMMITTEE`
-/// (EIP-7549: one electra attestation can span every committee in a slot).
+/// Logic identical to [`crate::beacon::helpers::attestation::is_valid_indexed_attestation`]:
+/// both run [`super::attestation::attesters_signature_set`]. This one exists
+/// only because [`electra::IndexedAttestation`] is a different concrete type
+/// from phase0's `IndexedAttestation`, bounded by `MAX_VALIDATORS_PER_SLOT`
+/// rather than `MAX_VALIDATORS_PER_COMMITTEE` (EIP-7549: one electra
+/// attestation can span every committee in a slot).
 pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &electra::IndexedAttestation,
@@ -285,59 +284,19 @@ pub fn is_valid_indexed_attestation(
 
 /// The signature check [`is_valid_indexed_attestation`] makes, resolved but
 /// not yet run, so a block can verify every attestation's signature in one
-/// batch.
-///
-/// Every structural check [`is_valid_indexed_attestation`] makes (the
-/// attester set's shape and range) happens here, at once: `None` means the
-/// attestation is invalid without needing a pairing. Only the pairing is left
-/// to the caller.
+/// batch. See [`super::attestation::attesters_signature_set`], which holds the
+/// checks every fork shares.
 pub fn indexed_attestation_signature_set(
     state: &BeaconState,
     indexed_attestation: &electra::IndexedAttestation,
 ) -> Option<SignatureSet> {
-    let domain = get_domain(
+    super::attestation::attesters_signature_set(
         state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
-    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
-}
-
-/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
-///
-/// For gossip, which checks against a state that may not have reached the
-/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
-pub fn is_valid_indexed_attestation_with_domain(
-    state: &BeaconState,
-    indexed_attestation: &electra::IndexedAttestation,
-    domain: Domain,
-) -> bool {
-    indexed_attestation_signature_set_with_domain(state, indexed_attestation, domain)
-        .is_some_and(|set| set.verify())
-}
-
-/// [`indexed_attestation_signature_set`] under a signing domain the caller
-/// chose.
-pub fn indexed_attestation_signature_set_with_domain(
-    state: &BeaconState,
-    indexed_attestation: &electra::IndexedAttestation,
-    domain: Domain,
-) -> Option<SignatureSet> {
-    let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
-    if indices.is_empty() || !are_indices_sorted_and_unique(indices) {
-        return None;
-    }
-
-    let mut pubkeys = Vec::with_capacity(indices.len());
-    for index in indices {
-        match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return None,
-        }
-    }
-
-    let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    SignatureSet::fast_aggregate(&pubkeys, signing_root, &indexed_attestation.signature)
+        &indexed_attestation.attesting_indices,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
