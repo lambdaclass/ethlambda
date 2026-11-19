@@ -139,7 +139,8 @@ impl<'a> Fields<'a> {
     /// `keccak256(rlp(header))`.
     fn computed_hash(&self) -> [u8; 32] {
         // The trie roots are over opaque bytes: a transaction is already
-        // `type || rlp(tx)` on the wire, so it is never decoded.
+        // `type || rlp(tx)` on the wire, so it is never decoded. It is
+        // copied, since ethrex's trie takes owned values.
         let transactions = self
             .transactions
             .iter()
@@ -170,6 +171,20 @@ impl<'a> Fields<'a> {
         let block_access_list_hash = self.amsterdam.map(|(bal, _)| H256(keccak256(bal)));
         let slot_number = self.amsterdam.map(|(_, slot)| slot);
         let base_fee_per_gas = U256::from_little_endian(&self.base_fee_per_gas);
+        // An absent optional field writes nothing, so a later fork's field
+        // after an absent earlier one would land in the earlier one's place.
+        // Forks only ever add to the header's tail.
+        let tail = [
+            withdrawals_root.is_some(),
+            self.blob_gas.is_some(),
+            self.parent_beacon_block_root.is_some(),
+            requests_hash.is_some(),
+            self.amsterdam.is_some(),
+        ];
+        debug_assert!(
+            tail.windows(2).all(|pair| pair[0] || !pair[1]),
+            "a header field is present after an absent earlier one: {tail:?}"
+        );
 
         let mut buf = Vec::with_capacity(700);
         Encoder::new(&mut buf)

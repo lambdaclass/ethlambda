@@ -178,6 +178,24 @@ fn an_empty_withdrawals_list_has_the_empty_trie_root() {
     );
 }
 
+/// An absent optional header field writes nothing, so a present one after it
+/// would shift into its place: `computed_hash` asserts the fields a fork adds
+/// only ever extend the header's tail.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a header field is present after an absent earlier one")]
+fn a_header_field_after_an_absent_one_is_caught() {
+    let block = block(ForkName::Electra, ELECTRA);
+    let SignedBeaconBlock::Electra(inner) = &block else {
+        panic!("electra");
+    };
+    let message = &inner.message;
+    let payload = &message.body.execution_payload;
+    let mut fields = Fields::deneb(payload, message.parent_root, Some(Vec::new()));
+    fields.blob_gas = None;
+    let _ = fields.computed_hash();
+}
+
 #[test]
 fn a_changed_bellatrix_field_is_refused() {
     let mut changed = block(ForkName::Bellatrix, BELLATRIX);
