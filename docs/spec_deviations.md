@@ -855,7 +855,11 @@ signature, whichever way the node answered. Three departures:
 - **Why:** Lighthouse (v8.3.3, and `unstable`) still declares the parameter
   required and answers a query without it with a `400`, so omitting it would
   miss every gloas attestation against a Lighthouse beacon node. The value
-  changes nothing: Lighthouse's handler always uses committee 0, ethlambda's
-  own beacon node ignores the parameter, and the answer's `index` is the
-  payload signal whatever was asked. ethlambda's beacon node still answers a
-  query that omits it, as spec-following validator clients send.
+  changes nothing: Lighthouse's handler produces the data for committee 0
+  whatever the query names, ethlambda's own beacon node ignores the
+  parameter, and the answer's `index` is the payload signal whatever was
+  asked. ethlambda's beacon node still answers a query that omits it, as
+  spec-following validator clients send.
+- **Until:** Lighthouse's `ValidatorAttestationDataQuery` makes
+  `committee_index` optional. The gloas query can then omit it again, as the
+  Beacon API asks.

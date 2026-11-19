@@ -510,8 +510,10 @@ impl HttpBeaconNode {
     /// Lighthouse (v8.3.3, and `unstable`) still declares the parameter
     /// required and answers a query without it with a 400, which would cost
     /// every gloas attestation against a Lighthouse node. Sending it is safe:
-    /// Lighthouse and ethlambda's own beacon node both ignore the value, and
-    /// the answer's `index` is the payload signal whatever was asked.
+    /// Lighthouse's handler produces the data for committee 0 whatever the
+    /// query names, ethlambda's own beacon node ignores the parameter, and the
+    /// answer's `index` is the payload signal whatever was asked. Omit it at
+    /// gloas once Lighthouse accepts a query without it.
     fn attestation_data_path(slot: Slot) -> String {
         format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
     }
