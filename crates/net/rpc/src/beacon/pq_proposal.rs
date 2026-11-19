@@ -12,6 +12,17 @@
 //! parent's requests are PQ's, the bid carries the empty `XMSSSignature()`,
 //! and the block carries no sync aggregate or payload attestations. No
 //! builder bids are considered.
+//!
+//! The attestations come from the pool of validated network aggregates, and
+//! their proofs are merged into the block's one `proof` while the execution
+//! client builds the payload. A merge runs on the proving sidecar and costs
+//! seconds when there is more than one child, so it is bounded by a deadline
+//! three quarters of the way to the slot's attestation deadline (Lighthouse's
+//! PQ branch uses the same one). A merge that misses it, fails, or yields a
+//! block `process_stark` refuses is dropped, and the block goes out without
+//! attestations rather than not at all.
+
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Extension, Json, Router,
@@ -23,21 +34,25 @@ use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_engine::EngineClient;
 use ethlambda_state_transition::beacon::{
     block_production::advance_to_slot,
-    fork_choice::{ForkChoiceNode, get_head_node, should_build_on_full},
+    fork_choice::{ForkChoiceNode, get_attestation_due_ms, get_head_node, should_build_on_full},
     helpers::{accessors::get_beacon_proposer_index, pq::is_valid_vrf_proof},
     pq_block_production::{
         PqBlockInputs, assemble_pq_block, parse_pq_execution_requests, pq_payload_inputs,
+        select_pq_attestations,
     },
 };
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
-    containers::{SignedBeaconBlock, SignedExecutionPayloadEnvelope, pq},
+    config::Config,
+    containers::{BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope, pq},
     fork::ForkName,
+    preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
     primitives::{Bytes32, ExecutionAddress, Root, Slot},
     signing::compute_epoch_at_slot,
 };
 use libssz::SszEncode as _;
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::CustodyColumns as NodeCustodyColumns;
@@ -179,7 +194,11 @@ async fn produce(
         .get(&proposer)
         .copied()
         .unwrap_or(ExecutionAddress::ZERO);
-    let built = build_payload(store, engine, fee_recipient, custody, &inputs).await?;
+    let (built, (attestations, proof)) = tokio::join!(
+        build_payload(store, engine, fee_recipient, custody, &inputs),
+        pack_attestations(store, &state, &config),
+    );
+    let built = built?;
     if !built.blobs_bundle.blobs.is_empty() {
         // The envelope's column sidecars are not built for PQ yet: a payload
         // with blobs would reveal data no node could sample.
@@ -190,28 +209,125 @@ async fn produce(
     }
     let execution_requests = parse_pq_execution_requests(&built.execution_requests)
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
-    let produced = assemble_pq_block(
-        &state,
-        PqBlockInputs {
-            randao_reveal,
-            graffiti,
-            attestations: Vec::new(),
-            proof: Vec::new(),
-            parent_execution_requests: parent_requests,
-            execution_payload: built.execution_payload,
-            blob_kzg_commitments: built.blobs_bundle.commitments,
-            execution_requests,
-        },
-        &config,
-        Default::default(),
-    )
-    .map_err(|err| {
-        warn!(%slot, %err, "The PQ block failed to build");
-        ApiError::Internal("the block failed to build")
-    })?;
-    info!(%slot, proposer, build_on_full, "Produced a PQ block");
+    let inputs = PqBlockInputs {
+        randao_reveal,
+        graffiti,
+        attestations,
+        proof,
+        parent_execution_requests: parent_requests,
+        execution_payload: built.execution_payload,
+        blob_kzg_commitments: built.blobs_bundle.commitments,
+        execution_requests,
+    };
+    // `process_block` runs `process_stark` on the merged proof: one that does
+    // not prove the packed attestations fails here, and the block is built
+    // again without them.
+    let fallback = (!inputs.attestations.is_empty()).then(|| PqBlockInputs {
+        attestations: Vec::new(),
+        proof: Vec::new(),
+        ..inputs.clone()
+    });
+    let produced = match assemble_pq_block(&state, inputs, &config, Default::default()) {
+        Ok(produced) => produced,
+        Err(err) => {
+            let Some(fallback) = fallback else {
+                warn!(%slot, %err, "The PQ block failed to build");
+                return Err(ApiError::Internal("the block failed to build"));
+            };
+            warn!(%slot, %err, "The PQ block failed to build with its attestations; building it without");
+            assemble_pq_block(&state, fallback, &config, Default::default()).map_err(|err| {
+                warn!(%slot, %err, "The PQ block failed to build");
+                ApiError::Internal("the block failed to build")
+            })?
+        }
+    };
+    let attestations = produced.block.body.attestations.len();
+    info!(%slot, proposer, build_on_full, attestations, "Produced a PQ block");
     Ok(pq::BlockContents {
         block: produced.block,
         execution_payload_envelope: produced.envelope,
     })
+}
+
+/// One merge at a time: the sidecar proves one request after another, so a
+/// second merge started while one runs would only push both past their
+/// deadlines. A merge that missed its deadline keeps the permit until it
+/// ends.
+static MERGE_PERMIT: Semaphore = Semaphore::const_new(1);
+
+/// The attestations a PQ block at `state`'s slot packs and the merged proof
+/// of their aggregates, or none when there are none, the merge misses its
+/// deadline, or it fails.
+async fn pack_attestations(
+    store: &Store,
+    state: &BeaconState,
+    config: &Config,
+) -> (Vec<pq::Attestation>, Vec<u8>) {
+    let slot = state.slot();
+    let latest = slot.saturating_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ);
+    let candidates = store.pq_aggregate_pool().candidates(latest);
+    if candidates.is_empty() {
+        return Default::default();
+    }
+    let Some(remaining) = merge_budget(config, slot) else {
+        warn!(%slot, "No time left to merge the PQ attestation proofs");
+        return Default::default();
+    };
+    let Ok(permit) = MERGE_PERMIT.try_acquire() else {
+        warn!(%slot, "A PQ proof merge is still running; packing no attestations");
+        return Default::default();
+    };
+    let (store, state) = (store.clone(), state.clone());
+    let job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let started = Instant::now();
+        let packed = select_pq_attestations(&state, candidates, &store.committee_cache())
+            .map_err(|err| err.to_string())?;
+        let proof = packed.merge().map_err(|err| err.to_string())?;
+        Ok::<_, String>((packed, proof, started.elapsed()))
+    });
+    match tokio::time::timeout(remaining, job).await {
+        Ok(Ok(Ok((packed, proof, took)))) => {
+            info!(
+                %slot,
+                attestations = packed.attestations.len(),
+                children = packed.children.len(),
+                proof_bytes = proof.len(),
+                took_ms = took.as_millis() as u64,
+                "Packed PQ attestations"
+            );
+            (packed.attestations, proof)
+        }
+        Ok(Ok(Err(err))) => {
+            warn!(%slot, %err, "Packing the PQ attestations failed");
+            Default::default()
+        }
+        Ok(Err(err)) => {
+            warn!(%slot, %err, "The PQ attestation packing task failed");
+            Default::default()
+        }
+        Err(_) => {
+            warn!(%slot, budget_ms = remaining.as_millis() as u64, "Merging the PQ attestation proofs missed its deadline");
+            Default::default()
+        }
+    }
+}
+
+/// How long a merge for a block at `slot` may take: until three quarters of
+/// the slot's attestation deadline, so the block still reaches the attesters
+/// in time. `None` once that point has passed.
+fn merge_budget(config: &Config, slot: Slot) -> Option<Duration> {
+    let due_ms = get_attestation_due_ms(compute_epoch_at_slot(slot), config);
+    let deadline_ms = config
+        .genesis_time
+        .saturating_mul(1000)
+        .saturating_add(slot.saturating_mul(config.slot_duration_ms))
+        .saturating_add(due_ms.saturating_mul(3) / 4);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    deadline_ms
+        .checked_sub(now_ms)
+        .filter(|&left| left > 0)
+        .map(Duration::from_millis)
 }

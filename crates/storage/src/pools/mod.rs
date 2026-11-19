@@ -3,6 +3,8 @@
 
 mod attestation;
 mod operation;
+mod pq_aggregate;
 
 pub use attestation::{AttestationPool, single_committee};
 pub use operation::OperationPool;
+pub use pq_aggregate::{PooledPqAggregate, PqAggregatePool};
