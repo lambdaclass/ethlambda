@@ -75,8 +75,15 @@ validator client enters as `gossip`, with `received` at the hand-off and no
 | `column_recv`, `column_validated` | A data column arrived, and passed validation. Written only for a column that passed (or, for `column_recv`, was judged to wait for its block), as Silver does, so rejected columns and re-delivered stored ones write nothing. At least once per block, column and stage: a column delivered again while it waits, or two copies passing at once in separate deliveries, write again, so take the earliest. A copy repeated within one delivery (one peer's answer, say) is dropped unchecked and writes nothing. A column that waited writes `column_validated` with source `recheck`, so join the two on block root and column index, not on source. By-root and by-range answers stamp every column with the moment the whole answer reached the handler. A gossip-accepted column's `column_validated` comes after the verdict's trip back through the p2p actor; a checked one's when its check finished, which is when the KZG sub-batch it was verified in (at most 16 of its block's columns) finished, not when its block's last one did |
 | `cascade_*`, `prune_*`, `get_head_*`, `fcu_*` | Once per arrival, filed under the arriving block, when that block was imported in that cascade |
 
-ethlambda waits for the execution client before the state transition, so
-`el_sent` to `stf_done` covers both; `stf_start` separates them.
+With an execution client, ethlambda computes the block's state transition
+while `engine_newPayload` is in flight, and keeps it only for a verdict that
+agrees with it. `el_sent` to `stf_done` still covers both, but `stf_start` no
+longer separates them. When the overlapped transition is kept, it ran inside
+`el_sent`..`el_verdict`, and `stf_start`..`stf_done` is only the rest of
+`on_block` after the verdict. When it is discarded (an `Invalid` verdict),
+`stf_start`..`stf_done` runs the transition again. The overlapped transition
+writes no row of its own: the import's log line and
+`lean_block_import_phase_seconds{phase="stf"}` count it.
 
 `source` and `verdict` are ethlambda's own values on every row, not Silver's
 (`Gossip`, `Rpc`, `Syncing`, ...); a query shared with Silver's rows must
