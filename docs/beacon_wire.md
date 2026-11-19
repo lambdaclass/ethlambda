@@ -687,6 +687,53 @@ NUMBER_OF_COLUMNS`) bounds what one request may ask for; an answer over that
 is truncated, not refused, matching how the block protocols treat a peer
 built to an older, wider ceiling.
 
+*Checking* what arrives over req/resp, and what gossip left unjudged, is
+`beacon/column_checks.rs`. The sidecars of one call are grouped by block (a
+fulu sidecar's signed header root, a gloas sidecar's `beacon_block_root`),
+keeping the first sidecar of each block and column index: an honest answer
+never repeats one, a faulty one's repeats are dropped unjudged and counted as
+`already_seen`, and that bounds what one block can send to the KZG proofs at
+`NUMBER_OF_COLUMNS` sidecars. Each group is then checked in two stages, on
+`column_check_permits` permits.
+
+First, every rule before the KZG proofs, sidecar by sidecar on one thread, in
+the order `chain_checks` has always run them (`ChainPrechecks`). The rules that
+read only what the block's sidecars share run once for the group, when the
+first sidecar gets that far: for fulu, everything judged against the signed
+header (the parent's post-state, or the head-state signature check before
+parking, then `NotAfterParent`, the signature, the proposer and the finalized
+ancestry), remembered under the header's root and signature, so a forged
+signature is judged on its own; for gloas, the lookup and decode of the block
+the sidecar names. The sidecars this settles, parked or dropped, are forwarded
+at once.
+
+Second, the proofs of every sidecar still standing, in near-equal sub-batches
+of at most 16 columns (`KZG_BATCH_COLUMNS`), each one
+`verify_cell_kzg_proof_batch` call (`kzg_verdicts`) on a permit of its own, the
+first on the group's. The proofs are the last rule on this path, so each
+sidecar's verdict is the one it would have had alone. A batch that fails says
+nothing about which sidecar is at fault, so each of its sidecars is verified
+again by itself and only the ones that fail are rejected. A block's kept
+sidecars go to the chain actor as one batch once its last sub-batch is back,
+not when the whole call is. Gossip keeps one message, one verdict, and is not
+batched.
+
+The sub-batch size trades wall-clock against CPU. Measured locally at 9 blobs
+(`bench_kzg_batch_against_separate_calls`), one column's proofs take 3.2 ms, a
+batch of 8 columns 7.9 ms, of 16 12.6 ms, and of 128 73 ms, each on one
+thread. Computed from those, assuming free permits and cores: a node's 8
+sampled columns are one batch, taking 7.9 ms of wall-clock and 7.9 ms of CPU,
+where eight separate checks running side by side would take 3.2 ms of
+wall-clock but 25.8 ms of CPU between them, so the batch is slower to finish
+for a third of the CPU. A supernode's 128 are 8 sub-batches, about 13 ms of
+wall-clock against 73 ms as one batch and 26 ms as separate checks, for 101 ms
+of CPU against 73 ms and 414 ms. A permit is held for one group's prechecks
+and first sub-batch, or for one further sub-batch, so a block's proofs never
+hold one permit from first column to last; the prechecks' share of a hold
+runs the group's sidecars in turn and is not measured. The envelope checks
+that share the pool wait in arrival order behind only what was queued before
+them.
+
 *Asking* happens on two paths, bulk and per block.
 
 The bulk one rides with range sync: every `BeaconBlocksByRange` batch sends a
