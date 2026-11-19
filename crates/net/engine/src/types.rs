@@ -16,7 +16,6 @@ use ethlambda_types::beacon::primitives::{ExecutionBlockHash, KzgProof, Uint256}
 use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::building::{parse_data, parse_fixed};
 use crate::error::EngineError;
 
 /// `PayloadStatusV1.status`.
@@ -198,6 +197,21 @@ pub fn data(bytes: &[u8]) -> String {
     HexPrefixed(bytes).to_string()
 }
 
+/// Decodes a `DATA` of any length.
+pub(crate) fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
+    let digits = text
+        .strip_prefix("0x")
+        .ok_or_else(|| EngineError::Decode("DATA must be 0x-prefixed".to_string()))?;
+    hex::decode(digits).map_err(|err| EngineError::Decode(format!("DATA is not hex: {err}")))
+}
+
+/// Decodes a `DATA` of exactly `N` bytes.
+pub(crate) fn parse_fixed<const N: usize>(text: &str) -> Result<[u8; N], EngineError> {
+    parse_data(text)?.try_into().map_err(|bytes: Vec<u8>| {
+        EngineError::Decode(format!("expected {N} bytes, got {}", bytes.len()))
+    })
+}
+
 /// The `custodyColumns` parameter of `engine_forkchoiceUpdatedV4`: a bitarray
 /// of `CELLS_PER_EXT_BLOB` bits marking the columns the consensus client
 /// custodies.
@@ -270,7 +284,7 @@ pub struct BlobAndProofV2 {
     /// The blob, `BYTES_PER_BLOB` bytes.
     pub blob: Vec<u8>,
     /// The blob's cell proofs, exactly `CELLS_PER_EXT_BLOB` of them.
-    pub proofs: Vec<ethlambda_types::beacon::primitives::KzgProof>,
+    pub proofs: Vec<KzgProof>,
 }
 
 #[derive(Deserialize)]
