@@ -367,8 +367,13 @@ impl PubkeyCache {
         // messages) is copied into its empty slot, so later lookups by index
         // hit the table. The map keeps its entry: byte-path callers cannot see
         // the table and would have to validate again. Set-once, first writer
-        // wins; a slot holding other bytes is left alone.
+        // wins, and only a successful set counts an entry, so racing promoters
+        // count it once. A slot already holding bytes holds other bytes (these
+        // would have answered above): it is left alone without a failed set,
+        // which a cross-fork index collision would otherwise repeat on every
+        // lookup.
         if let Some(index) = key.index()
+            && !self.slot(index).is_some_and(|slot| slot.get().is_some())
             && let Some(slot) = self.slot_or_allocate(index)
             && slot.set((*pubkey, point)).is_ok()
         {
@@ -1045,6 +1050,11 @@ mod tests {
         BlsSignature(secret.sign(message.as_slice(), DST, &[]).to_bytes())
     }
 
+    // The tests below that warm the global `VALIDATED_PUBKEYS` at fixed
+    // indices keep to ranges no other test uses: 3_000_001 here, 3_100_000..
+    // and 3_200_000.. further down, and the last index under the bound. Tests
+    // run in parallel against the one cache, so a new such test takes a fresh
+    // range rather than reusing one.
     #[test]
     fn a_different_key_at_a_warmed_index_falls_back_and_verifies() {
         let index = 3_000_001;
