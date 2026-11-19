@@ -5,8 +5,9 @@ mod beacon_state_delta;
 mod committee_cache;
 mod error;
 mod liveness;
-mod metrics;
+pub mod metrics;
 pub mod pools;
+mod proto_array;
 mod state_codec;
 mod state_diff;
 mod state_writer;
@@ -21,6 +22,7 @@ pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 /// callers can match on it (e.g. to distinguish [`Error::DbVersionMismatch`]).
 pub use error::Error;
 pub use liveness::ObservedLiveness;
+pub use proto_array::{ProtoArrayError, WeightRules};
 // `CacheKey` lives in `state_writer` (beside the `StateCache` it keys), not
 // `store`; re-exported here so the public path (`ethlambda_storage::CacheKey`)
 // is unaffected by which module owns it.
