@@ -544,12 +544,24 @@ impl Message for GossipVerdict {
 /// validation on separate blocking threads at once, and only the first
 /// `Accept` to reach the actor stands, which is the specification's "first
 /// valid". Any other outcome passes through unrecorded, since only an Accept
-/// is a candidate for the seen cache in the first place.
+/// is a candidate for the seen cache in the first place, with one exception.
+///
+/// A block IGNOREd for its payload block hash passed every rule the
+/// specification has, signature included, so it is the specification's "first
+/// block with a valid signature" for its slot and proposer, and is recorded
+/// too. Otherwise a proposer could send any number of signed blocks for one
+/// slot, each verified and hashed in full, where the cheap checks would IGNORE
+/// every one after the first.
 fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outcome {
-    if outcome == Outcome::Accept && !object.record_seen(server) {
-        Outcome::Ignore(IgnoreReason::AlreadySeen)
-    } else {
-        outcome
+    match outcome {
+        Outcome::Accept if !object.record_seen(server) => {
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        }
+        Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch) => {
+            object.record_seen(server);
+            outcome
+        }
+        _ => outcome,
     }
 }
 
@@ -954,6 +966,36 @@ mod tests {
                 BlockAnnouncement::Silent,
                 BlockAnnouncement::Silent
             ]
+        );
+    }
+
+    /// A block IGNOREd for its payload hash had a valid signature, so its slot
+    /// and proposer are marked seen: another block for them is IGNOREd by the
+    /// cheap checks, before any signature or hash work, and a later `Accept`
+    /// for them is `AlreadySeen`.
+    #[tokio::test]
+    async fn a_payload_hash_mismatch_marks_its_slot_and_proposer_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let block = |root: u8| Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(root),
+        };
+        let mismatch = Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch);
+
+        assert_eq!(settle(&mut server, mismatch, &block(1)), mismatch);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis() as u64;
+        let second = fulu_block(5, 1);
+        assert_eq!(
+            gossip::block::cheap_checks(&server.seen_blocks, &server.store, &second, now_ms),
+            Err(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &block(2)),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
         );
     }
 
