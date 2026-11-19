@@ -320,7 +320,7 @@ pub fn gloas_data_column_sidecars(
             let mut kzg_proofs = Vec::with_capacity(blobs.len());
             for (blob, cells) in per_blob_cells.iter().enumerate() {
                 let cell = ethlambda_types::beacon::containers::fulu::Cell::try_from(
-                    cells[column_index].to_bytes().to_vec(),
+                    cells[column_index].to_vec(),
                 )
                 .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?;
                 column.push(cell);

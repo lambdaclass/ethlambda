@@ -11,6 +11,10 @@ version.workspace = true
 
 [dependencies]
 blst = "0.3.16"
+# Point decoding, subgroup checks and pairing products, eight lanes at a time on
+# AVX-512 IFMA CPUs and through blst elsewhere; see `bls`'s module documentation
+# for which operations still go to blst directly.
+silver_crypto_simd.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 rand.workspace = true

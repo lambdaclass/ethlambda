@@ -31,8 +31,8 @@ use super::{PubkeySource, SignatureSet, sum_validated_projective, validated_pubk
 /// Not a [`BlsPubkey`] on purpose: compressing a point costs a field inversion,
 /// and the only consumer is a pairing check in this process, so the point stays
 /// as it is. The sum may be the identity (every key subtracted away), which is
-/// representable here and refused by [`Self::verify`], exactly as `blst`
-/// refuses an infinite key at pairing time.
+/// representable here and refused by [`Self::verify`] before any pairing, as
+/// an identity key summed from scratch is.
 #[derive(Clone, Copy)]
 pub struct AggregatePubkey(AggregatePublicKey);
 
@@ -76,7 +76,7 @@ impl AggregatePubkey {
     /// [`super::fast_aggregate_verify`] validates it: nothing upstream
     /// guarantees a subgroup-correct point. The key needs no check, since a sum
     /// of validated points is in the subgroup; the identity is the one value
-    /// that is not a valid key, and `blst` rejects it at pairing time.
+    /// that is not a valid key, and the pairing check refuses it.
     pub fn verify(&self, message: Root, signature: &BlsSignature) -> bool {
         SignatureSet::from_aggregate(*self, message, signature).is_some_and(|set| set.verify())
     }

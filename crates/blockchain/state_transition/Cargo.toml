@@ -83,6 +83,10 @@ rayon.workspace = true
 # version and feature set ethrex uses, plus the embedded mainnet trusted setup.
 c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
 
+# `beacon::kzg`'s cell extension and cell-proof batch check, on AVX-512 IFMA
+# where the CPU has it; everything else there stays on c-kzg.
+silver_crypto_simd.workspace = true
+
 # Reduction modulo the BLS field order, for the two Fiat-Shamir challenge
 # functions that c-kzg does not export.
 num-bigint = "0.4.6"

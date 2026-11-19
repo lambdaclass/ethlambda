@@ -57,9 +57,8 @@
 //! to the match would be dead weight, not a safety net, since no arm could
 //! ever need it.
 
-use c_kzg::Cell;
 use ethlambda_state_transition::beacon::ForkName;
-use ethlambda_state_transition::beacon::kzg;
+use ethlambda_state_transition::beacon::kzg::{self, Cell};
 use ethlambda_state_transition::beacon::primitives::{Bytes32, H256, KzgCommitment, KzgProof};
 use libtest_mimic::Trial;
 use serde_yaml_ng::Value;
@@ -108,13 +107,9 @@ fn hex_proof(value: &Value) -> Option<KzgProof> {
     hex_array(value).map(KzgProof)
 }
 
-/// Decodes one cell of an extended blob.
-///
-/// Unlike the fixed arrays above, [`Cell::from_bytes`] does its own length
-/// check rather than this runner doing it through `try_into`, since `Cell` is
-/// `c-kzg`'s type, not this crate's; `None` on a length mismatch either way.
+/// Decodes one cell of an extended blob, a fixed array like the fields above.
 fn hex_cell(value: &Value) -> Option<Cell> {
-    Cell::from_bytes(&hex_bytes(value)).ok()
+    hex_array(value)
 }
 
 /// Parses a YAML list of plain integers (`cell_indices`, `commitment_indices`),
