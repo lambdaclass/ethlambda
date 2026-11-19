@@ -313,7 +313,8 @@ pub async fn set_fee_recipient(
     info!(
         pubkey = %encode_hex(&pubkey.0),
         fee_recipient = %encode_hex(&address.0),
-        "Fee recipient set; sent to the beacon node once this slot's duties are done"
+        "Fee recipient set; sent to the beacon node once this slot's duties are done, or the \
+         next slot's while a slow node holds the last send"
     );
     Ok(StatusCode::ACCEPTED)
 }

@@ -25,7 +25,9 @@
 //! Graffiti and gas limit are read when they are used: the next proposal
 //! carries the new value. A fee recipient reaches the beacon node through
 //! `prepare_beacon_proposer`, which the duty loop sends again once every
-//! slot's duties are done, so a change is registered within a slot. A block
+//! slot's duties are done, so a change is registered after the duties of the
+//! slot it is made in (the next slot's while a slow node holds the last
+//! send). A block
 //! proposed before then pays the address the node was last told, which the
 //! check before signing reports as a mismatch. A `DELETE` that leaves a
 //! validator no address at all sends nothing for it, so the node keeps the

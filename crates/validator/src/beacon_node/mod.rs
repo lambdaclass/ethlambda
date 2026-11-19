@@ -740,6 +740,10 @@ pub trait BeaconNodeApi: Send + Sync {
     /// `debug!` and says nothing when none accepts, where the plain call warns
     /// for each refusal and then that the duty was likely missed: once a slot,
     /// for as long as a node is down, and on slots with no duty.
+    ///
+    /// The default is the plain call because the logging is the fallback's
+    /// alone: one node (`HttpBeaconNode`) logs nothing about its answer either
+    /// way, so it has nothing to quieten.
     async fn prepare_beacon_proposer_quietly(
         &self,
         preparations: &[ProposerPreparationDto],

@@ -129,6 +129,9 @@ pub struct MockBeaconNode {
     /// as the test holds it back.
     pub preparation_gate: Option<Arc<Semaphore>>,
     /// Notified when `prepare_beacon_proposer` is called, before the gate.
+    /// Every call stores a permit (`notify_one`), so a test that awaits it
+    /// must not make an earlier call it does not mean to wait for: that call's
+    /// permit would answer the wait.
     pub preparation_entered: Arc<Notify>,
     /// Every blinded block published, as (fork, body).
     pub published_blinded: Mutex<Vec<(ForkName, Vec<u8>)>>,

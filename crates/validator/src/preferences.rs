@@ -61,11 +61,12 @@
 //! once an epoch. `prepare_beacon_proposer`, which a restart loses too, is
 //! re-sent every slot instead (see the duty loop's `Preparations`): that is
 //! one request for every validator, where the kept preferences are one
-//! request each (see "One preference per request" below). The round runs at
-//! the poll of an epoch's second-to-last
-//! slot, or at the next poll after it when that one was skipped behind a slow
-//! node, and re-sends each kept preference whose slot has not started once
-//! the poll's duties are in. Normally that is the epoch's last slot and every
+//! request each (see "One preference per request" below).
+//!
+//! The round runs at the poll of an epoch's second-to-last slot, or at the
+//! next poll after it when that one was skipped behind a slow node, and
+//! re-sends each kept preference whose slot has not started once the poll's
+//! duties are in. Normally that is the epoch's last slot and every
 //! slot of the next one, so a node restarted mid-epoch lacks the preferences
 //! of the slots before the round and holds every later one. One restarted
 //! after the round lacks the next epoch's too, all but its last slot's, which
