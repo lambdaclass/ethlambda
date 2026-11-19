@@ -982,7 +982,7 @@ reached its first decoded block 16 seconds after start and its first aggregate
 at 24 seconds, then took a block every slot. `bytes` on mainnet is typically
 100 KB to 310 KB for a block and about 500 for an aggregate, and `attesters`
 sits in the low hundreds. Peer lifecycle lines (`Peer connected`, `Beacon
-handshake complete`) are at `trace`: at mainnet peer counts they are what
+Status answered`) are at `trace`: at mainnet peer counts they are what
 drowned the log, so raise the level to see them.
 
 What each failure looks like:
@@ -991,7 +991,7 @@ What each failure looks like:
 | --- | --- |
 | `Peer said goodbye reason=129` right after a connection | nothing local: 129 is lighthouse's `TooManyPeers` |
 | `fork_digest` is not what a live crawl reports | the blob-schedule branch, or the schedule itself |
-| connections but no `Beacon handshake complete` | the `Status` encoding, or answering the wrong version |
+| connections but no `Beacon Status answered` | the `Status` encoding, or answering the wrong version |
 | `Status answered from another fork digest` | the digest |
 | `Beacon gossip decode failed` for `beacon_block` | the fork selection or the slot offset |
 | the same for `beacon_aggregate_and_proof` alone | the electra boundary in `decode_gossip`; the block path is fine |
