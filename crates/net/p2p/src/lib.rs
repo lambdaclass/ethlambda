@@ -2290,21 +2290,24 @@ pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<Pee
 #[derive(Clone)]
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
-    /// The libp2p QUIC port, when the ENR advertises one.
+    /// The libp2p QUIC port, when the ENR advertises one or the bootnode is a
+    /// `/udp/<port>/quic-v1` multiaddr.
     ///
     /// `None` for a record that does not advertise one. See
     /// [`Bootnode::tcp_port`] for the other transport that can still make such
     /// a record dialable: every beacon-chain bootnode published today is
     /// exactly that case, `tcp` and `udp` but no `quic`.
     pub(crate) quic_port: Option<u16>,
-    /// The libp2p TCP port, when the ENR advertises one.
+    /// The libp2p TCP port, when the ENR advertises one or the bootnode is a
+    /// `/tcp/<port>` multiaddr.
     ///
     /// `None` for the ENRs lean-quickstart generates today, which carry only
     /// `ip`/`quic`/`secp256k1`. Every published mainnet beacon-chain bootnode
     /// carries this instead of `quic`, which is what makes them statically
     /// dialable now that the swarm speaks both transports.
     pub(crate) tcp_port: Option<u16>,
-    /// The discv5 UDP port, when the ENR advertises one.
+    /// The discv5 UDP port, when the ENR advertises one or the bootnode is a
+    /// bare `/udp/<port>` multiaddr.
     ///
     /// `None` for the ENRs lean-quickstart generates today, which carry only
     /// `ip`/`quic`/`secp256k1`. Such a bootnode is still dialed statically over
@@ -2314,12 +2317,17 @@ pub struct Bootnode {
 }
 
 impl Bootnode {
-    /// This bootnode as a discv5 seed, or `None` when its ENR advertises no
-    /// `udp` port and it therefore cannot be reached by discovery.
+    /// The peer id this bootnode is dialed and merged under.
+    pub fn peer_id(&self) -> PeerId {
+        PeerId::from_public_key(&self.public_key)
+    }
+
+    /// This bootnode as a discv5 seed, or `None` when it has no `udp` port (or
+    /// a key discv5 cannot use) and therefore cannot be reached by discovery.
     ///
-    /// `tcp_port` carries this bootnode's real advertised TCP port when it has
-    /// one, now that ethlambda dials TCP too; it is `0` only when the ENR
-    /// advertises none, which ethrex reads as "no TCP listener".
+    /// `tcp_port` carries this bootnode's real TCP port when it has one, now
+    /// that ethlambda dials TCP too; it is `0` only when the bootnode has none,
+    /// which ethrex reads as "no TCP listener".
     pub(crate) fn as_discovery_node(&self) -> Option<ethrex_p2p::types::Node> {
         let udp_port = self.udp_port?;
         // libp2p and ethrex hold the same key in different representations:
@@ -2362,14 +2370,13 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 .ok()
         })
         .collect();
-    // Each rejection above already warned, but a file where *every* entry is
-    // unusable boots a node with an empty bootnode list, which otherwise looks
-    // identical to having configured none at all.
+    // Each rejection above already warned, but a list where *every* entry is
+    // unusable contributes nothing, which otherwise looks identical to having
+    // configured none at all. Worded for the list, not the node: `beacon` adds
+    // its own `--bootnodes` entries to this one, so an empty result here need
+    // not leave the node with no bootnodes.
     if bootnodes.is_empty() && configured > 0 {
-        warn!(
-            configured,
-            "No bootnode ENR could be used; the node starts with no bootnodes"
-        );
+        warn!(configured, "No bootnode ENR in this list could be used");
     }
     bootnodes
 }
@@ -2416,6 +2423,164 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
         udp_port,
         public_key: public_key.into(),
     })
+}
+
+/// Read one `--bootnodes` entry: an ENR, with or without its `enr:` prefix, or
+/// a libp2p multiaddr, the two forms Lighthouse's `--boot-nodes` takes. ENRs
+/// are URL-safe base64 and never contain `/`, so a leading `/` is what tells
+/// the two apart.
+///
+/// A multiaddr names one transport, so it sets one port: `/tcp/<port>` is a
+/// TCP dial target, `/udp/<port>/quic-v1` a QUIC one, and a bare `/udp/<port>`
+/// a discv5 contact, which is how Lighthouse reads a UDP multiaddr. Lighthouse
+/// asks that contact for its ENR before using it; here the key in the peer id
+/// is all discv5 needs, so it is seeded directly, with no round trip.
+///
+/// Two departures from Lighthouse, both deliberate:
+/// - `/p2p/<peer id>` is required. Lighthouse dials a TCP multiaddr without one
+///   anonymously, but a bootnode here is keyed by its peer id (merging its dial
+///   addresses, skipping our own entry, redialing it) and seeds discv5 with the
+///   key the id embeds, so an anonymous entry has no place to go.
+/// - QUIC multiaddrs are dialed. Lighthouse's multiaddr bootnodes dial TCP only;
+///   this node prefers QUIC wherever a peer offers it.
+///
+/// `/dns*` is refused: a [`Bootnode`] holds an address, and the swarm has no
+/// DNS transport to resolve a name with. Unlike [`parse_enrs`], a bad entry is
+/// an error rather than a warning, since an operator typed it on the command
+/// line.
+pub fn parse_bootnode(entry: &str) -> Result<Bootnode, String> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err("empty bootnode entry".to_string());
+    }
+    if entry.starts_with('/') {
+        return parse_bootnode_multiaddr(entry);
+    }
+    if entry.starts_with("enr:") {
+        return parse_enr(entry).map_err(|reason| format!("invalid ENR: {reason}"));
+    }
+    // Without the prefix the entry could equally be a mistyped address (say
+    // `1.2.3.4:9000`), so say both readings failed rather than report a bare
+    // RLP error for an entry that was never meant as an ENR.
+    parse_enr(&format!("enr:{entry}")).map_err(|reason| {
+        format!("neither a multiaddr (those start with /) nor a valid ENR: {reason}")
+    })
+}
+
+/// The multiaddr half of [`parse_bootnode`], walked component by component so
+/// that anything after the one transport and the peer id is refused rather
+/// than ignored.
+fn parse_bootnode_multiaddr(entry: &str) -> Result<Bootnode, String> {
+    const EXPECTED_TRANSPORT: &str = "expected /tcp/<port>, /udp/<port>/quic-v1 or /udp/<port>";
+
+    enum Transport {
+        Quic,
+        Tcp,
+        Discv5,
+    }
+
+    let addr: Multiaddr = entry
+        .parse()
+        .map_err(|err| format!("invalid multiaddr: {err}"))?;
+    let mut components = addr.iter().peekable();
+
+    let ip = match components.next() {
+        Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
+        Some(Protocol::Ip6(ip)) => IpAddr::V6(ip),
+        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)) => {
+            return Err("DNS multiaddrs are not supported, use /ip4 or /ip6".to_string());
+        }
+        Some(other) => {
+            return Err(format!(
+                "multiaddr must start with /ip4 or /ip6, not {other}"
+            ));
+        }
+        None => return Err("empty multiaddr".to_string()),
+    };
+
+    let (transport, port) = match components.next() {
+        Some(Protocol::Tcp(port)) => (Transport::Tcp, port),
+        Some(Protocol::Udp(port)) => match components.peek() {
+            Some(Protocol::QuicV1) => {
+                components.next();
+                (Transport::Quic, port)
+            }
+            Some(Protocol::Quic) => {
+                return Err("draft-29 QUIC (/quic) is not spoken, use /quic-v1".to_string());
+            }
+            _ => (Transport::Discv5, port),
+        },
+        Some(Protocol::P2p(_)) | None => {
+            return Err(format!(
+                "multiaddr names no transport; {EXPECTED_TRANSPORT}"
+            ));
+        }
+        Some(other) => {
+            return Err(format!(
+                "unsupported transport {other}; {EXPECTED_TRANSPORT}"
+            ));
+        }
+    };
+    let port = dialable_port(port).ok_or_else(|| "port 0 is not dialable".to_string())?;
+
+    let peer_id = match components.next() {
+        Some(Protocol::P2p(peer_id)) => peer_id,
+        Some(other) => {
+            return Err(format!(
+                "unsupported {other} after the transport; expected /p2p/<peer id>"
+            ));
+        }
+        None => {
+            return Err(
+                "missing /p2p/<peer id>: a bootnode is keyed by its peer id and \
+                 seeds discv5 with the public key in it, so an address without one is refused"
+                    .to_string(),
+            );
+        }
+    };
+    if let Some(extra) = components.next() {
+        return Err(format!("unexpected {extra} after /p2p/<peer id>"));
+    }
+
+    let mut bootnode = Bootnode {
+        ip,
+        quic_port: None,
+        tcp_port: None,
+        udp_port: None,
+        public_key: embedded_public_key(&peer_id)?,
+    };
+    match transport {
+        Transport::Quic => bootnode.quic_port = Some(port),
+        Transport::Tcp => bootnode.tcp_port = Some(port),
+        Transport::Discv5 => bootnode.udp_port = Some(port),
+    }
+
+    // A bare UDP address is only a discv5 contact, and discv5 takes secp256k1
+    // keys alone: with any other key nothing could use the entry, and
+    // `parse_enr` likewise drops a record nothing can use.
+    if bootnode.udp_port.is_some() && bootnode.as_discovery_node().is_none() {
+        return Err(
+            "a /udp/<port> bootnode is a discv5 contact and needs a secp256k1 peer id".to_string(),
+        );
+    }
+    Ok(bootnode)
+}
+
+/// The public key a peer id carries inline.
+///
+/// libp2p inlines a key of up to 42 encoded bytes (secp256k1, ed25519) under
+/// the identity multihash and hashes a longer one (RSA) with sha256, which
+/// keeps no key to read back.
+fn embedded_public_key(peer_id: &PeerId) -> Result<PublicKey, String> {
+    const IDENTITY_MULTIHASH_CODE: u64 = 0;
+    let multihash: &libp2p::multihash::Multihash<64> = peer_id.as_ref();
+    if multihash.code() != IDENTITY_MULTIHASH_CODE {
+        return Err(
+            "peer id does not embed its public key (it is a hash, as for an RSA key)".to_string(),
+        );
+    }
+    PublicKey::try_decode_protobuf(multihash.digest())
+        .map_err(|err| format!("peer id embeds no decodable public key: {err}"))
 }
 
 // --- Utility functions ---
@@ -2475,7 +2640,7 @@ fn merge_bootnode_dial_addrs(
     let mut merged: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut undialable = 0usize;
     for bootnode in bootnodes {
-        let peer_id = PeerId::from_public_key(&bootnode.public_key);
+        let peer_id = bootnode.peer_id();
         if peer_id == local_peer_id {
             continue;
         }
@@ -4169,6 +4334,210 @@ mod tests {
         assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, Some(9001));
+    }
+
+    /// A secp256k1 peer id, the kind every lean and beacon node runs with.
+    fn secp256k1_peer_id() -> PeerId {
+        PeerId::from_public_key(&Keypair::generate_secp256k1().public())
+    }
+
+    /// The reason `parse_bootnode` refuses `entry`, panicking if it accepts it.
+    fn bootnode_refusal(entry: &str) -> String {
+        match parse_bootnode(entry) {
+            Ok(bootnode) => panic!("{entry:?} was accepted as a bootnode at {}", bootnode.ip),
+            Err(reason) => reason,
+        }
+    }
+
+    #[test]
+    fn parse_bootnode_reads_an_enr_with_or_without_its_prefix() {
+        // Reused from `parse_enrs_extracts_ip_port_and_public_key`.
+        let enr = "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
+
+        let prefixed = parse_bootnode(enr).unwrap();
+        assert_eq!(prefixed.ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(prefixed.quic_port, Some(9001));
+
+        let bare = parse_bootnode(enr.strip_prefix("enr:").unwrap()).unwrap();
+        assert_eq!(bare.ip, prefixed.ip);
+        assert_eq!(bare.quic_port, prefixed.quic_port);
+        assert_eq!(bare.tcp_port, prefixed.tcp_port);
+        assert_eq!(bare.udp_port, prefixed.udp_port);
+        assert_eq!(bare.public_key, prefixed.public_key);
+    }
+
+    #[test]
+    fn parse_bootnode_reads_a_tcp_multiaddr_as_a_tcp_dial_target() {
+        let peer_id = secp256k1_peer_id();
+        // Surrounding whitespace, as a comma-separated list leaves it, is trimmed.
+        let entry = format!("  /ip4/1.2.3.4/tcp/9000/p2p/{peer_id} ");
+
+        let bootnode = parse_bootnode(&entry).unwrap();
+
+        assert_eq!(bootnode.ip, IpAddr::from(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(bootnode.tcp_port, Some(9000));
+        assert_eq!(bootnode.quic_port, None);
+        assert_eq!(bootnode.udp_port, None);
+    }
+
+    #[test]
+    fn parse_bootnode_reads_a_quic_v1_multiaddr_as_a_quic_dial_target() {
+        let peer_id = secp256k1_peer_id();
+        let entry = format!("/ip4/1.2.3.4/udp/9001/quic-v1/p2p/{peer_id}");
+
+        let bootnode = parse_bootnode(&entry).unwrap();
+
+        assert_eq!(bootnode.quic_port, Some(9001));
+        assert_eq!(bootnode.tcp_port, None);
+        assert_eq!(bootnode.udp_port, None);
+    }
+
+    #[test]
+    fn parse_bootnode_reads_a_bare_udp_multiaddr_as_a_discv5_seed() {
+        let peer_id = secp256k1_peer_id();
+        let entry = format!("/ip4/1.2.3.4/udp/9000/p2p/{peer_id}");
+
+        let bootnode = parse_bootnode(&entry).unwrap();
+
+        assert_eq!(bootnode.udp_port, Some(9000));
+        assert_eq!(bootnode.quic_port, None);
+        assert_eq!(bootnode.tcp_port, None);
+        let node = bootnode
+            .as_discovery_node()
+            .expect("a secp256k1 UDP bootnode must seed discv5");
+        assert_eq!(node.udp_port, 9000);
+    }
+
+    #[test]
+    fn parse_bootnode_reads_an_ip6_multiaddr() {
+        let peer_id = secp256k1_peer_id();
+        let entry = format!("/ip6/2001:db8::1/tcp/9000/p2p/{peer_id}");
+
+        let bootnode = parse_bootnode(&entry).unwrap();
+
+        assert_eq!(bootnode.ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(bootnode.tcp_port, Some(9000));
+    }
+
+    #[test]
+    fn parse_bootnode_takes_the_public_key_from_the_peer_id() {
+        let peer_id = secp256k1_peer_id();
+        let entry = format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}");
+
+        let bootnode = parse_bootnode(&entry).unwrap();
+
+        assert_eq!(PeerId::from_public_key(&bootnode.public_key), peer_id);
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_a_multiaddr_without_a_peer_id() {
+        for entry in [
+            "/ip4/1.2.3.4/tcp/9000",
+            "/ip4/1.2.3.4/udp/9001/quic-v1",
+            "/ip4/1.2.3.4/udp/9000",
+        ] {
+            let reason = bootnode_refusal(entry);
+            assert!(reason.contains("missing /p2p"), "{entry}: {reason}");
+        }
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_a_dns_multiaddr() {
+        let peer_id = secp256k1_peer_id();
+        let reason = bootnode_refusal(&format!("/dns4/boot.example.com/tcp/9000/p2p/{peer_id}"));
+        assert!(reason.contains("DNS"), "{reason}");
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_draft_quic() {
+        let peer_id = secp256k1_peer_id();
+        let reason = bootnode_refusal(&format!("/ip4/1.2.3.4/udp/9001/quic/p2p/{peer_id}"));
+        assert!(reason.contains("quic-v1"), "{reason}");
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_port_zero() {
+        let peer_id = secp256k1_peer_id();
+        for entry in [
+            format!("/ip4/1.2.3.4/tcp/0/p2p/{peer_id}"),
+            format!("/ip4/1.2.3.4/udp/0/quic-v1/p2p/{peer_id}"),
+            format!("/ip4/1.2.3.4/udp/0/p2p/{peer_id}"),
+        ] {
+            let reason = bootnode_refusal(&entry);
+            assert!(reason.contains("port 0"), "{entry}: {reason}");
+        }
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_transports_it_does_not_speak() {
+        let peer_id = secp256k1_peer_id();
+        for (entry, expected) in [
+            (
+                format!("/ip4/1.2.3.4/tcp/9000/ws/p2p/{peer_id}"),
+                "unsupported /ws",
+            ),
+            (
+                format!("/ip4/1.2.3.4/tcp/9000/wss/p2p/{peer_id}"),
+                "unsupported /wss",
+            ),
+            (
+                format!("/ip4/1.2.3.4/udp/9001/quic-v1/webtransport/p2p/{peer_id}"),
+                "unsupported /webtransport",
+            ),
+            (
+                format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}/p2p-circuit"),
+                "unexpected /p2p-circuit",
+            ),
+            (
+                format!("/ip4/1.2.3.4/tcp/9000/tcp/9001/p2p/{peer_id}"),
+                "unsupported /tcp",
+            ),
+            (format!("/ip4/1.2.3.4/p2p/{peer_id}"), "names no transport"),
+            (
+                format!("/ip4/1.2.3.4/sctp/9000/p2p/{peer_id}"),
+                "unsupported transport",
+            ),
+        ] {
+            let reason = bootnode_refusal(&entry);
+            assert!(reason.contains(expected), "{entry}: {reason}");
+        }
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_garbage_an_empty_entry_and_a_malformed_enr() {
+        assert!(bootnode_refusal("").contains("empty"));
+        assert!(bootnode_refusal("   ").contains("empty"));
+        assert!(bootnode_refusal("1.2.3.4:9000").contains("neither a multiaddr"));
+        assert!(bootnode_refusal("enr:not valid base64!!!").contains("invalid ENR"));
+        assert!(bootnode_refusal("/not/a/multiaddr").contains("invalid multiaddr"));
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_a_peer_id_that_hashes_its_key() {
+        // An RSA key is too long to inline, so its peer id is a sha256 digest
+        // and there is no key to read back. Any digest stands in for one here.
+        const SHA2_256_MULTIHASH_CODE: u64 = 0x12;
+        let digest =
+            libp2p::multihash::Multihash::<64>::wrap(SHA2_256_MULTIHASH_CODE, &[7; 32]).unwrap();
+        let peer_id = PeerId::from_multihash(digest).unwrap();
+
+        let reason = bootnode_refusal(&format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}"));
+
+        assert!(reason.contains("does not embed its public key"), "{reason}");
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_a_bare_udp_multiaddr_with_a_key_discv5_cannot_use() {
+        let peer_id = PeerId::from_public_key(&Keypair::generate_ed25519().public());
+
+        // Dialable transports take any key libp2p can authenticate.
+        let tcp = parse_bootnode(&format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}")).unwrap();
+        assert_eq!(tcp.tcp_port, Some(9000));
+
+        // A discv5 contact cannot: discv5 speaks secp256k1 only, so nothing
+        // could use this entry at all.
+        let reason = bootnode_refusal(&format!("/ip4/1.2.3.4/udp/9000/p2p/{peer_id}"));
+        assert!(reason.contains("secp256k1"), "{reason}");
     }
 
     /// A connection the limits refuse must leave no trace in any

@@ -7,11 +7,15 @@ use std::path::PathBuf;
 
 /// Flags every sub-command takes, with the same meaning on each.
 ///
-/// `--node-key`, `--bootnodes` and `--checkpoint-sync-url` used to be declared
-/// once per sub-command because each was required on one and optional on the
-/// other, and a flattened struct has one requiredness. They are optional on
-/// both now, which is what lets one declaration serve both: each sub-command
-/// decides what an absent value means, and says so on the field below.
+/// `--node-key` and `--checkpoint-sync-url` used to be declared once per
+/// sub-command because each was required on one and optional on the other, and
+/// a flattened struct has one requiredness. They are optional on both now,
+/// which is what lets one declaration serve both: each sub-command decides what
+/// an absent value means, and says so on the field below.
+///
+/// `--bootnodes` is not here: it names a file on `node` and is a list on
+/// `beacon`, so each chain declares its own ([`LeanOptions::bootnodes`],
+/// [`MainnetOptions::bootnodes`]).
 ///
 /// The `--discovery.*` tuning flags are here too, in one [`DiscoveryConfig`],
 /// and mean the same thing on both whenever discv5 runs: on
@@ -52,16 +56,6 @@ pub(crate) struct CommonOptions {
     /// and ENR stay the same across restarts until the directory is wiped.
     #[arg(long)]
     pub(crate) node_key: Option<PathBuf>,
-    /// Path to a bootnode list: ENRs, one per YAML entry.
-    ///
-    /// Optional on both sub-commands, but an absent file means different
-    /// things. `beacon` falls back to whatever `--network` resolved to: a
-    /// built-in network's own ENR list, or a loaded directory's own
-    /// `bootstrap_nodes.yaml`/`.txt` (empty if the directory has neither).
-    /// `node` has no built-in list for a lean network, so it starts with no
-    /// bootnodes and reaches peers only through discv5, if that is enabled.
-    #[arg(long)]
-    pub(crate) bootnodes: Option<PathBuf>,
     /// Base URL(s) of the peer API servers to take a checkpoint from, e.g.
     /// `http://peer:5052`.
     ///
@@ -308,6 +302,30 @@ pub(crate) struct MainnetOptions {
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
 
+    /// Extra bootnodes: ENRs (with or without `enr:`) and
+    /// `/ip4|ip6/<ip>/<transport>/p2p/<peer-id>` multiaddrs, comma-separated;
+    /// the flag may be repeated.
+    ///
+    /// Added to the resolved network's own bootnode list, never replacing it,
+    /// as Lighthouse's `--boot-nodes` is. Unlike Lighthouse, a multiaddr must
+    /// end in `/p2p/<peer-id>` and DNS multiaddrs are refused. Unlike an entry
+    /// in the network's list, a bad one here is a startup error, and a file
+    /// path is no longer accepted. See `docs/cli.md#bootnodes-on-beacon`.
+    //
+    // `allow_hyphen_values` because an ENR written without its `enr:` prefix
+    // can start with `-`, which clap would otherwise read as a flag. Each
+    // occurrence takes one value, so a list never swallows the flag after it,
+    // but a `--bootnodes` given no value (an unset variable in a launch
+    // script) takes the next flag as its value; `beacon_bootnodes` refuses
+    // such an entry by name.
+    #[arg(
+        long,
+        value_name = "ENR/MULTIADDR LIST",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
+    pub(crate) bootnodes: Vec<String>,
+
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
     /// is built locally, and `register_validator` answers 500 so a validator
@@ -380,6 +398,13 @@ pub(crate) struct LeanOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     pub(crate) node_id: String,
+    /// Path to a bootnode list: ENRs, one per YAML entry.
+    ///
+    /// Optional. A lean network has no built-in list, so without it the node
+    /// starts with no bootnodes and reaches peers only through discv5, if
+    /// that is enabled, or by being dialed.
+    #[arg(long)]
+    pub(crate) bootnodes: Option<PathBuf>,
     /// Whether this node acts as a committee aggregator.
     ///
     /// Seeds the initial value of the live aggregator flag shared by the
@@ -886,8 +911,8 @@ mod tests {
             ["https://checkpointz.example"]
         );
         assert_eq!(options.common.node_key, Some(PathBuf::from("node.key")));
-        // No flag given, so the built-in mainnet ENR list applies.
-        assert_eq!(options.common.bootnodes, None);
+        // No flag given, so the built-in mainnet ENR list applies alone.
+        assert!(options.mainnet.bootnodes.is_empty());
     }
 
     /// Drop `flag` and the value after it from an argv.
@@ -901,22 +926,74 @@ mod tests {
         args
     }
 
-    /// The three flags that moved into [`CommonOptions`] are optional on both
-    /// sub-commands, so clap accepts an argv carrying none of them. What an
-    /// absent value *means* is each sub-command's own decision, made at
-    /// startup in `main`; the two tests after this one pin the answers that
-    /// are not simply "carry on with nothing".
+    /// The flags that moved into [`CommonOptions`] are optional on both
+    /// sub-commands, and so is each chain's own `--bootnodes`, so clap accepts
+    /// an argv carrying none of them. What an absent value *means* is each
+    /// sub-command's own decision, made at startup in `main`; the two tests
+    /// after this one pin the answers that are not simply "carry on with
+    /// nothing".
     #[test]
     fn the_shared_flags_are_optional_on_both_sub_commands() {
         let node = parse_node(without(&without(&base_args(), "--node-key"), "--bootnodes"));
         assert_eq!(node.common.node_key, None);
-        assert_eq!(node.common.bootnodes, None);
+        assert_eq!(node.lean.bootnodes, None);
         assert!(node.common.checkpoint_sync_url.is_empty());
 
         let beacon = parse_beacon(vec!["ethlambda", "beacon"]);
         assert_eq!(beacon.common.node_key, None);
-        assert_eq!(beacon.common.bootnodes, None);
+        assert!(beacon.mainnet.bootnodes.is_empty());
         assert!(beacon.common.checkpoint_sync_url.is_empty());
+    }
+
+    /// Commas split one occurrence and repeated occurrences add up, in order.
+    /// The trailing `--network` is the point: `allow_hyphen_values` must not
+    /// let a list swallow the flag after it.
+    #[test]
+    fn beacon_bootnodes_combines_commas_and_repeats_in_order() {
+        let mut args = beacon_args();
+        args.extend([
+            "--bootnodes",
+            "enr:a,/ip4/1.2.3.4/tcp/9000/p2p/b",
+            "--bootnodes",
+            "enr:c",
+            "--network",
+            "sepolia",
+        ]);
+        let beacon = parse_beacon(args);
+        assert_eq!(
+            beacon.mainnet.bootnodes,
+            ["enr:a", "/ip4/1.2.3.4/tcp/9000/p2p/b", "enr:c"]
+        );
+        assert_eq!(beacon.mainnet.network, "sepolia");
+    }
+
+    /// An ENR written without its `enr:` prefix can start with `-`, which clap
+    /// would read as a flag without `allow_hyphen_values`.
+    #[test]
+    fn beacon_bootnodes_accepts_a_prefixless_enr_starting_with_a_hyphen() {
+        let enr = "-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", enr]);
+        assert_eq!(parse_beacon(args).mainnet.bootnodes, [enr]);
+    }
+
+    /// An empty value and a trailing comma parse; the empty entries they leave
+    /// are skipped at startup (`main::beacon_bootnodes`), not refused here.
+    #[test]
+    fn beacon_bootnodes_parses_an_empty_value_and_a_trailing_comma() {
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", ""]);
+        assert!(
+            parse_beacon(args)
+                .mainnet
+                .bootnodes
+                .iter()
+                .all(String::is_empty)
+        );
+
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", "enr:a,"]);
+        assert_eq!(parse_beacon(args).mainnet.bootnodes, ["enr:a", ""]);
     }
 
     #[test]

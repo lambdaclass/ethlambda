@@ -926,7 +926,9 @@ sync committee messages, blocks with their columns, operations), plus relayed
 validated gossip.
 
 `seeds=17` proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. `topics=17` proves the subscription set: the 7
+ENR was skipped with a warning. That holds for a run without `--bootnodes`,
+whose entries are counted on top (in `seeds` only when they carry a discv5
+port). `topics=17` proves the subscription set: the 7
 global topics, the 8 column subnets this run's (randomly generated) node id
 selected, and the 2 attestation subnets the same id selected; `columns=8` and
 `attestation_subnets=[…]` confirm the two families directly.

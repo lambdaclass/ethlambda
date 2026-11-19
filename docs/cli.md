@@ -62,21 +62,24 @@ one `CommonOptions` struct flattened into each.
 | `--api-port` | `5052` | API server port. `beacon` binds it too, off its own anchored store rather than an empty one; the lean-shaped `/lean/v0` routes still don't answer for it (see [`beacon` flags](#beacon-flags) below) |
 | `--metrics-port` | `5054` | Metrics and debug server port. Equal to `--api-port` merges the routers onto one listener |
 | `--node-key` | `<data-dir>/node.key` | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, the key stored in `--data-dir` as `node.key` is used, generated and stored there (mode `0600`) on the directory's first start, so the PeerId and ENR stay the same across restarts until the directory is wiped |
-| `--bootnodes` | see below | Bootnode ENR list: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated) |
 | `--checkpoint-sync-url` | see below | API base URLs, tried in order until one answers. Supplies `node`'s starting state on the lean API, and `beacon`'s anchor on a standard Beacon API; required on a fresh `beacon` data directory only for a built-in network, since a loaded network anchors at its own `genesis.ssz` instead. See [`checkpoint_sync.md`](checkpoint_sync.md) |
 | `--discovery.port` | `9000` | discv5 UDP port; must differ from `--gossipsub-port`. See [Peer discovery](./discovery.md) |
 | `--discovery.advertise-ip` | bind address | IP published in the ENR |
 | `--discovery.target-peers` | `200` | Connected-peer count above which discovery stops dialing |
 
-Three of those have no clap default, because the two chains answer them
+Two of those have no clap default, because the two chains answer them
 differently. A single `default_value` can only say one thing, so the flag
 carries none and each chain resolves an absent value itself:
 
 | Flag | Absent on `node` | Absent on `beacon` |
 |---|---|---|
 | `--node-key` | `<data-dir>/node.key`, generated on the directory's first start | same |
-| `--bootnodes` | no bootnodes: peers only via discv5 (with `--discovery.enable`) or by being dialed, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
 | `--checkpoint-sync-url` | start from a resumable DB, else from genesis | start from a resumable DB, else anchor at the resolved network's own genesis (loaded network only), else abort |
+
+`--bootnodes` is taken by both too, but not with one meaning, so it is listed
+under each sub-command instead: on `node` it names a file of ENRs, and on
+`beacon` it is a list of ENRs and multiaddrs added to the network's own
+bootnodes.
 
 Whether discv5 runs is not a common flag. `beacon` always runs it, since
 published mainnet bootnode ENRs carry no `quic` entry and so are not statically
@@ -100,6 +103,7 @@ On top of the common flags above.
 | `--hash-sig-keys-dir` | required | Directory of per-validator XMSS keys |
 | `--node-id` | required | The key in `annotated_validators.yaml` naming this node, e.g. `ethlambda_0` |
 | `--is-aggregator` | `false` | Seed the runtime aggregator flag |
+| `--bootnodes` | none, warned about | Path to a bootnode ENR file: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated). An unusable entry is skipped with a warning. Without the flag the node starts with no bootnodes, since a lean network has no built-in list, and reaches peers only via discv5 (with `--discovery.enable`) or by being dialed |
 | `--discovery.enable` | `false` | Run discv5 peer discovery; off, the node peers from `--bootnodes` alone. See [Peer discovery](./discovery.md) |
 | `--aggregate-subnet-ids` | this node's subnets | Subnets to aggregate on; requires `--is-aggregator` |
 | `--attestation-committee-count` | from `validator-config.yaml`, else `1` | Committees per slot |
@@ -151,12 +155,13 @@ Engine API endpoint always requires authentication. See
 [the execution layer pairing](./beacon_engine.md) for what each verdict does and
 for the limitations that go with the retry ladder.
 
-`beacon` takes one more flag of its own, and two common flags also mean
+`beacon` takes two more flags of its own, and two common flags also mean
 something specific here.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
+| `--bootnodes` | none: the network's own list alone | Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network's own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See [Bootnodes on `beacon`](#bootnodes-on-beacon) |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,
@@ -174,8 +179,10 @@ wrong chain.
 
 `beacon` therefore takes no genesis config, validator registry, or bootnode file
 of its own the way `node` does: those are read off the resolved network instead
-of being separate operator input. A `config.yaml` (a directory's, or a built-in
-network's embedded one) is read permissively: absent keys fall back to mainnet's values,
+of being separate operator input, and `beacon`'s `--bootnodes` only adds entries
+to the network's list (see [Bootnodes on `beacon`](#bootnodes-on-beacon)). A
+`config.yaml` (a directory's, or a built-in network's embedded one) is read
+permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
@@ -218,6 +225,53 @@ site serves both chains, but it picks the router by the store's chain, so a
 `beacon` run serves the Beacon API under `/eth/v1` and `/eth/v2` and answers a
 `/lean/v0/...` path with a 404. See [`rpc.md`](./rpc.md).
 
+### Bootnodes on `beacon`
+
+`beacon`'s `--bootnodes` is a list, not a file, modeled on Lighthouse's
+`--boot-nodes`. Entries are comma-separated and the flag may be repeated, all
+of its values combined; each entry is trimmed, and an empty one is ignored. An
+entry is either an ENR, written with or without its `enr:` prefix, or a
+multiaddr, which starts with `/`:
+
+```sh
+ethlambda beacon --network hoodi --checkpoint-sync-url <URL> \
+  --bootnodes enr:-Iq4Q…,/ip4/203.0.113.7/tcp/9000/p2p/16Uiu2HAm… \
+  --bootnodes /ip4/203.0.113.8/udp/9000/p2p/16Uiu2HAk…
+```
+
+A multiaddr is `/ip4/<ip>` or `/ip6/<ip>`, then one transport, then
+`/p2p/<peer-id>`. The transport decides what the entry is used for:
+
+| Transport | The peer is |
+|---|---|
+| `tcp/<port>` | dialed over TCP |
+| `udp/<port>/quic-v1` | dialed over QUIC |
+| `udp/<port>` | not dialed directly: the port is the peer's discv5 port, so the entry seeds discovery, which is how Lighthouse reads a UDP multiaddr too |
+
+QUIC is `quic-v1` only; the older draft `/quic` is refused. The
+`/p2p/<peer-id>` is required, and DNS multiaddrs (`/dns`, `/dns4`, `/dns6`,
+`/dnsaddr`) are refused, so write the address as `/ip4` or `/ip6`. Those two are
+departures from Lighthouse; [Peer discovery](./discovery.md#multiaddrs) lists
+them with the rest.
+
+The entries are added to the resolved network's own list (a built-in network's
+embedded one, or a loaded directory's `bootstrap_nodes.yaml`/`.txt`), never put
+in its place, which is Lighthouse's behavior too. Giving the flag used to
+replace that list; now the network's bootnodes are always used, and the flag
+only adds to them.
+
+Every entry is checked at startup. One that does not parse, or that is
+unusable (an ENR with no `quic`, `tcp` or `udp` port, a port of `0`, and so
+on), is a startup error naming the entry: an operator who typed it meant to
+reach that peer, and skipping it would leave the node running on a list it was
+not given. The network's own list keeps the old rule, a bad entry there being
+skipped with a warning, as `node` skips one in its file.
+
+**A file path is no longer accepted.** Startup fails on one, with a hint that
+`--bootnodes` now takes a list. A launch script that passed `beacon` a bootnode
+file must pass its entries joined with commas instead, or, for a network loaded
+from a directory, list them in that directory's `bootstrap_nodes.yaml`.
+
 ## What `ethlambda beacon` does today
 
 It follows the resolved network as a non-validating follower. It anchors a
@@ -241,7 +295,7 @@ not chain-specific, branches once, and shares the shutdown:
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
 | resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's) and check `PRESET_BASE` against the compiled preset and the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
-| read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
+| read `--bootnodes` | a file of ENRs; absent means no bootnodes, warned about | a comma-separated list of ENRs and multiaddrs, added to the resolved network's own list; a bad entry is a startup error (see [Bootnodes on `beacon`](#bootnodes-on-beacon)) |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
 | resolve `--node-key`, else load `<data-dir>/node.key`, generating it on first start (after the open, so RocksDB's lock covers the write) | shared | shared |
