@@ -817,7 +817,10 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (data availability moves from the block to the envelope), then goes to
   `on_execution_payload_envelope`; a block whose parent is FULL with an
   unverified payload is held until that envelope verifies. All queues are
-  capped, aged out and swept at finality, a missing parent envelope is re-asked
+  capped and swept at finality, and an envelope for a block not seen yet also
+  ages out after two slots; a block held for its parent's payload has no age
+  limit, so a payload never revealed holds it, and its parent envelope is
+  re-asked, until finality. A missing parent envelope is re-asked
   once a slot (`FetchRequest.needs_envelope`, asked at once when the block is
   held, whatever its source, since `BlockSource::Sync` also covers by-root
   answers), an envelope for a block that is stored but not imported is checked
