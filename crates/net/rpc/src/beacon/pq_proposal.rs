@@ -11,7 +11,8 @@
 //! The build is gloas's self-build (`gloas_proposal`) with PQ's shapes: the
 //! parent's requests are PQ's, the bid carries the empty `XMSSSignature()`,
 //! and the block carries no sync aggregate or payload attestations. No
-//! builder bids are considered.
+//! builder bids are considered. The graffiti gets both clients' version codes
+//! appended, as every other block this node builds does.
 //!
 //! The attestations come from the pool of validated network aggregates, and
 //! their proofs are merged into the block's one `proof` while the execution
@@ -32,7 +33,7 @@ use axum::{
     routing::post,
 };
 use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
-use ethlambda_engine::EngineClient;
+use ethlambda_engine::{EngineClient, types::ClientVersionV1};
 use ethlambda_state_transition::beacon::{
     block_production::advance_to_slot,
     fork_choice::{ForkChoiceNode, get_attestation_due_ms, get_head_node, should_build_on_full},
@@ -60,6 +61,7 @@ use crate::CustodyColumns as NodeCustodyColumns;
 use crate::beacon::{
     ApiError,
     gloas_proposal::build_payload,
+    graffiti::{self, OwnVersion},
     proposal::refuse_future_slot,
     validator::{FeeRecipients, head},
 };
@@ -80,12 +82,14 @@ struct ProducePqBlock {
     graffiti: Option<Bytes32>,
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn post_produce_pq_block(
     Path(slot): Path<String>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(custody): Extension<NodeCustodyColumns>,
+    Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
     Json(request): Json<ProducePqBlock>,
 ) -> Response {
@@ -116,6 +120,7 @@ async fn post_produce_pq_block(
         &engine,
         &fee_recipients,
         &custody,
+        &own_version,
         slot,
         randao_reveal,
         request.graffiti.unwrap_or(Bytes32::ZERO),
@@ -127,11 +132,13 @@ async fn post_produce_pq_block(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
+    own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: pq::VrfProof,
     graffiti: Bytes32,
@@ -195,10 +202,14 @@ async fn produce(
         .get(&proposer)
         .copied()
         .unwrap_or(ExecutionAddress::ZERO);
-    let (built, (attestations, proof)) = tokio::join!(
+    // The execution client's version, for the graffiti, is asked alongside
+    // the build, as gloas's production does.
+    let (built, (attestations, proof), el_version) = tokio::join!(
         build_payload(store, engine, fee_recipient, custody, &inputs),
         pack_attestations(store, &state, &config),
+        graffiti::execution_client_version(engine, own_version),
     );
+    let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let built = built?;
     if !built.blobs_bundle.blobs.is_empty() {
         // The envelope's column sidecars are not built for PQ yet: a payload
@@ -243,7 +254,8 @@ async fn produce(
         }
     };
     let attestations = produced.block.body.attestations.len();
-    info!(%slot, proposer, build_on_full, attestations, "Produced a PQ block");
+    let graffiti = graffiti::display(&produced.block.body.graffiti);
+    info!(%slot, proposer, build_on_full, attestations, %graffiti, "Produced a PQ block");
     Ok(pq::BlockContents {
         block: produced.block,
         execution_payload_envelope: produced.envelope,

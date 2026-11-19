@@ -291,8 +291,9 @@ take PQ's containers under `Eth-Consensus-Version: pq`: attestations, payload
 attestations and aggregates in the pool endpoints, blocks and envelopes in
 the publish endpoints. The Beacon API has no PQ block production yet, so
 ethlambda's validator client asks `POST /eth/v1/validator/pq_blocks/{slot}`
-with `{"randao_reveal": [<VRF leaf and branch, hex roots>], "graffiti"?}`.
-Attester duties at a PQ epoch add `is_aggregator`, the validator's seat in
+with `{"randao_reveal": [<VRF leaf and branch, hex roots>], "graffiti"?}`;
+the block's graffiti gets both clients' codes appended, as `produceBlockV3`'s
+does (see its **Graffiti** note below). Attester duties at a PQ epoch add `is_aggregator`, the validator's seat in
 its committee's aggregation committee, and `GET aggregate_attestation` at a
 PQ slot answers `{"aggregate", "proof"}`, the aggregate this node proved for
 its aggregators' committee (Lighthouse's PQ branch's `PqAggregate`), or 404.
