@@ -39,6 +39,7 @@ use ethlambda_state_transition::beacon::{
         checkpoint_state, compute_shuffling_dependent_slot, get_current_store_epoch, get_head_node,
     },
     gossip::attestation::compute_subnet_for_attestation,
+    gossip::pq::compute_subnet_for_attestation as pq_compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
 };
@@ -315,7 +316,14 @@ async fn post_committee_subscriptions(
         .iter()
         .filter(|entry| entry.is_aggregator)
         .map(|entry| {
-            let subnet_id = compute_subnet_for_attestation(
+            // A PQ slot's committees travel on PQ's 16 subnets.
+            let subnet_for =
+                if config.fork_at_epoch(compute_epoch_at_slot(entry.slot)) >= ForkName::Pq {
+                    pq_compute_subnet_for_attestation
+                } else {
+                    compute_subnet_for_attestation
+                };
+            let subnet_id = subnet_for(
                 entry.committees_at_slot,
                 entry.slot,
                 entry.committee_index,

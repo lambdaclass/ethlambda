@@ -207,7 +207,7 @@ fn post_pq_attestations(
             .committee_cache()
             .committees(&state, attestation.data.target.epoch)
             .committees_per_slot();
-        let subnet_id = compute_subnet_for_attestation(
+        let subnet_id = pq_gossip::compute_subnet_for_attestation(
             committees_per_slot,
             slot,
             attestation.committee_index,
