@@ -412,7 +412,9 @@ the chain actor writes, so no request waits on the actor.
   next slot's block is asked for. Entries more than an epoch old are dropped
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
-  memory (a validator client repeats the call every epoch).
+  memory, so a restart forgets it and the node builds its own payloads for the
+  zero address until the next call. ethlambda's validator client repeats the
+  call every slot, as Lighthouse's does.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
