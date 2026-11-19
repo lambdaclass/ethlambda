@@ -29,7 +29,7 @@
 use ethlambda_state_transition::beacon::gossip::{Outcome, RejectReason};
 use ethlambda_state_transition::beacon::stf::{electra, gloas as gloas_stf};
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{SignedBeaconBlock, capella, gloas};
+use ethlambda_types::beacon::containers::{SignedBeaconBlock, bellatrix, capella, gloas};
 use ethlambda_types::beacon::primitives::Root;
 use ethrex_common::types::requests::{EncodedRequests, compute_requests_hash};
 use ethrex_common::types::{Withdrawal, compute_withdrawals_root};
@@ -177,7 +177,9 @@ pub fn verify_block(block: &SignedBeaconBlock) -> Result<(), HashMismatch> {
     match block {
         SignedBeaconBlock::Bellatrix(block) => {
             let payload = &block.message.body.execution_payload;
-            if payload.block_hash.0 == [0; 32] && payload.parent_hash.0 == [0; 32] {
+            // The specification's `is_execution_enabled` asks the same of a
+            // pre-merge block: its payload is the whole default container.
+            if *payload == bellatrix::ExecutionPayload::default() {
                 return Ok(());
             }
             Fields {

@@ -34,9 +34,7 @@ fn envelope() -> gloas::SignedExecutionPayloadEnvelope {
     gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(GLOAS).expect("a real envelope decodes")
 }
 
-fn bellatrix_payload(
-    block: &mut SignedBeaconBlock,
-) -> &mut ethlambda_types::beacon::containers::bellatrix::ExecutionPayload {
+fn bellatrix_payload(block: &mut SignedBeaconBlock) -> &mut bellatrix::ExecutionPayload {
     let SignedBeaconBlock::Bellatrix(inner) = block else {
         panic!("bellatrix");
     };
@@ -93,8 +91,8 @@ fn the_vectors_exercise_what_each_fork_adds() {
     };
     // Past the merge: a pre-merge block carries the empty default payload.
     assert_ne!(
-        bellatrix.message.body.execution_payload.block_hash.0,
-        [0; 32]
+        bellatrix.message.body.execution_payload,
+        bellatrix::ExecutionPayload::default()
     );
     assert!(!fulu.message.body.execution_payload.transactions.is_empty());
     assert!(!envelope().message.payload.transactions.is_empty());
@@ -217,10 +215,22 @@ fn a_changed_gloas_field_is_refused() {
 fn a_pre_merge_bellatrix_payload_has_nothing_to_check() {
     // Before the merge a block carries the empty default payload.
     let mut empty = block(ForkName::Bellatrix, BELLATRIX);
-    let payload = bellatrix_payload(&mut empty);
+    *bellatrix_payload(&mut empty) = bellatrix::ExecutionPayload::default();
+    assert_eq!(verify_block(&empty), Ok(()));
+}
+
+/// The pre-merge skip is the whole default payload, as the specification's
+/// `is_execution_enabled` has it, not two zero hashes.
+#[test]
+fn a_payload_with_zero_hashes_but_other_fields_is_checked() {
+    let mut zero_hashes = block(ForkName::Bellatrix, BELLATRIX);
+    let payload = bellatrix_payload(&mut zero_hashes);
     payload.block_hash = Default::default();
     payload.parent_hash = Default::default();
-    assert_eq!(verify_block(&empty), Ok(()));
+    assert_refused(
+        verify_block(&zero_hashes),
+        "zero hashes over a real payload",
+    );
 }
 
 #[test]
