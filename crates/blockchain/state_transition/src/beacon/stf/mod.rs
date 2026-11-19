@@ -183,7 +183,9 @@ pub fn apply_block(
     // pairing to reject instead of a whole body's processing. Gossip checked it
     // already (`precheck_block`), but a block fetched by request arrives here
     // unchecked. `process_block` batches the body's own signatures and checks
-    // them before returning, so before the state root below is computed.
+    // them before returning, so before the state root below is computed (and
+    // the ones that slash, exit, redirect or feed the RANDAO mix before they
+    // write; see `signatures`).
     if validate_result {
         verify(
             verify_block_signature(state, signed_block),
