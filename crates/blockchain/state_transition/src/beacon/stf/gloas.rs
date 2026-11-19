@@ -1324,6 +1324,8 @@ pub fn process_attester_slashing(
         indexed_attestation_signature_set(state, attestation_2),
         "process_attester_slashing: is_valid_indexed_attestation(state, attestation_2)",
     )?;
+    // Before anyone is slashed on the strength of them.
+    signatures.verify_pending()?;
 
     crate::beacon::stf::operations::slash_attesting_index_intersection(
         state,

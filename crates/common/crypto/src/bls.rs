@@ -106,7 +106,7 @@ use ethlambda_types::beacon::primitives::{
 };
 
 mod batch;
-pub use batch::{SignatureSet, verify_signature_sets};
+pub use batch::{EthFastAggregate, SignatureSet, verify_signature_sets};
 
 /// The ciphersuite the specification pins BLS signatures to: the IETF BLS
 /// draft's proof-of-possession scheme over BLS12-381's G2, using SHA-256 in
@@ -339,15 +339,11 @@ pub const G2_POINT_AT_INFINITY: [u8; BLS_SIGNATURE_SIZE] = g2_point_at_infinity(
 /// here rather than panicking or returning an error: an unparseable or
 /// invalid-point key is treated exactly like a valid key over the wrong
 /// signature, since the specification never distinguishes the two.
+///
+/// [`SignatureSet::single`] and its [`SignatureSet::verify`], so this and a
+/// block's batched check of the same signature are one definition.
 pub fn verify(pubkey: &BlsPubkey, message: Root, signature: &BlsSignature) -> bool {
-    let Some(pubkey) = validated_pubkey(pubkey) else {
-        return false;
-    };
-    let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
-        return false;
-    };
-    let result = signature.verify(false, message.as_slice(), DST, &[], &pubkey, false);
-    result == BLST_ERROR::BLST_SUCCESS
+    SignatureSet::single(pubkey, message, signature).is_some_and(|set| set.verify())
 }
 
 /// The specification's `bls.Aggregate(signatures) -> BLSSignature`.
@@ -413,31 +409,15 @@ pub fn aggregate_verify(
 /// Electra block's attestations, where a single aggregate can carry
 /// thousands of signers behind one shared message; keys go through
 /// [`PubkeyCache`], see the module documentation for why that is safe.
+///
+/// [`SignatureSet::fast_aggregate`] and its [`SignatureSet::verify`], so this
+/// and a block's batched check of the same aggregate are one definition.
 pub fn fast_aggregate_verify(
     pubkeys: &[BlsPubkey],
     message: Root,
     signature: &BlsSignature,
 ) -> bool {
-    if pubkeys.is_empty() {
-        return false;
-    }
-    let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
-        return false;
-    };
-    let Some(points) = validated_pubkeys(pubkeys) else {
-        return false;
-    };
-    // `points` is non-empty because of the early return on an empty `pubkeys`
-    // at the top, not because of `validated_pubkeys` (which maps an empty
-    // input to an empty `Some`), so the `None` arm is unreachable. The
-    // signature was validated above, which is why the group check stays off
-    // here.
-    let Some(aggregated) = sum_validated_points(&points) else {
-        return false;
-    };
-    let result =
-        signature.fast_aggregate_verify_pre_aggregated(false, message.as_slice(), DST, &aggregated);
-    result == BLST_ERROR::BLST_SUCCESS
+    SignatureSet::fast_aggregate(pubkeys, message, signature).is_some_and(|set| set.verify())
 }
 
 /// `specs/altair/bls.md`'s `eth_aggregate_pubkeys(pubkeys) -> BLSPubkey`.
@@ -472,15 +452,15 @@ pub fn eth_aggregate_pubkeys(pubkeys: &[BlsPubkey]) -> Result<BlsPubkey> {
 /// the identity element by convention rather than "no signature was
 /// provided"; [`fast_aggregate_verify`] itself has no such case, since the
 /// underlying IETF ciphersuite it wraps was never given one.
+///
+/// [`SignatureSet::eth_fast_aggregate`] with its pairing run now, which is
+/// where that rule is written down once.
 pub fn eth_fast_aggregate_verify(
     pubkeys: &[BlsPubkey],
     message: Root,
     signature: &BlsSignature,
 ) -> bool {
-    if pubkeys.is_empty() {
-        return signature.as_ref() == G2_POINT_AT_INFINITY;
-    }
-    fast_aggregate_verify(pubkeys, message, signature)
+    SignatureSet::eth_fast_aggregate(pubkeys, message, signature).verify()
 }
 
 /// The specification's `bls.KeyValidate(pubkey) -> bool`.
