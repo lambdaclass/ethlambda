@@ -1029,8 +1029,9 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    // The subscriptions carry BLS selection proofs, which PQ has none of.
-    if changed && context.config.fork_at_epoch(epoch) != ForkName::Pq {
+    // At a PQ slot a duty's aggregator role is the node's `is_aggregator`
+    // rather than a BLS selection proof; `subscribe` reads either.
+    if changed {
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
