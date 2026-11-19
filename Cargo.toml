@@ -125,6 +125,18 @@ smallvec = "1.15"
 # BLAKE2s and signs lean consensus messages only.
 sha3 = "0.10.9"
 
+# The client of leanVM's `leanvm-sidecar` (`crates/sidecar` without its
+# `server` feature, which builds no prover) and its claim encoding: the PQ
+# fork's attestation proofs as the PQ devnet makes them, real leanVM STARKs
+# over leanXMSS signatures rather than the specification's concatenation
+# (`ethlambda_crypto::stark`). Pinned to the revision Lighthouse's PQ branch
+# and its `leanvm-sidecar` use: nothing on the wire detects a mismatch, a proof
+# from another revision just fails to verify. Not the `leanvm` revision below,
+# which lean consensus proves with.
+leanvm_sidecar = { package = "sidecar", git = "https://github.com/leanEthereum/leanVM.git", rev = "283686575c4e81790591d2c6e3ed21c69c0e3bbe" }
+leanvm_claims = { package = "claims", git = "https://github.com/leanEthereum/leanVM.git", rev = "283686575c4e81790591d2c6e3ed21c69c0e3bbe" }
+leanvm_lean_xmss = { package = "lean_xmss", git = "https://github.com/leanEthereum/leanVM.git", rev = "283686575c4e81790591d2c6e3ed21c69c0e3bbe" }
+
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the
 # SSZ codec for the two wire types) and the `rand` that signing draws from, so

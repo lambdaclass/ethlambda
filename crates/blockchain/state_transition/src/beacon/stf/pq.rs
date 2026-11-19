@@ -1157,14 +1157,15 @@ mod tests {
             proof: proof.try_into().expect("far below MAX_STARK_PROOF_SIZE"),
             ..pq::BeaconBlockBody::empty()
         };
-        let proof = ethlambda_crypto::stark::merge_proofs(&signatures);
+        // The reference encoding: the signatures, in statement order.
+        let proof = signatures.concat();
         assert!(process_stark(&state, &body_with(proof.clone()), &committees).is_ok());
 
-        let short = ethlambda_crypto::stark::merge_proofs(&signatures[1..]);
+        let short = signatures[1..].concat();
         assert!(process_stark(&state, &body_with(short), &committees).is_err());
         let mut reversed = signatures.clone();
         reversed.reverse();
-        let reversed = ethlambda_crypto::stark::merge_proofs(&reversed);
+        let reversed = reversed.concat();
         assert!(process_stark(&state, &body_with(reversed), &committees).is_err());
     }
 
