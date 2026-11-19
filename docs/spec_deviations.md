@@ -567,7 +567,11 @@ counted.
   execution client would not. It exists for the early fork-choice import being
   worked on in lambdaclass/ethlambda#773, which applies a payload before the
   execution client answers and reverts it on `INVALID`: a gossip block caught
-  here saves that path a revert.
+  here saves that path a revert. Until that lands there is no revert to save:
+  what the rule changes is that such a block is neither relayed (an `Accept`
+  verdict comes before the execution client is asked) nor handed to the chain
+  actor from gossip, whose import would have failed on the execution client's
+  answer anyway.
 - **Not covered:** a block fetched by `beacon_blocks_by_range/root`, and a
   gossip block answered `Queue` or forwarded under `Ignore(Overloaded)`, reach
   the chain actor unhashed. The execution client still checks them. That
