@@ -594,11 +594,15 @@ counted.
   already in validation are not covered: a proposer that publishes several
   signed equivocations at once has each hashed until the first verdict lands,
   up to the 128 `gossip_validation_permits` at a time (a message arriving with
-  none free is forwarded unhashed under `Overloaded`). The signature check has
-  the same window; only its per-block cost is smaller.
+  none free is forwarded unhashed under `Overloaded`). That pool is shared with
+  data columns and envelopes only: the attestation, sync committee and builder
+  topics have pools of their own. The signature check has the same window;
+  only its per-block cost is smaller.
   `lean_beacon_payload_block_hash_mismatch_total{kind}` counts mismatches
-  (`block` IGNOREd, `envelope` counted only) and a `warn!` names the slot and
-  root.
+  (`block` IGNOREd, `envelope` counted only). A `warn!` names the slot,
+  proposer and root of a block, and the slot and root of a gossip envelope; a
+  fetched envelope's mismatch is logged at `debug`, so a sync does not log one
+  per envelope.
 - **Equivalence:** a stricter filter, never a looser one, as long as this
   header encoding is the execution layer's: every block it ignores then
   carries a payload the execution client would call `INVALID`. The real-chain
