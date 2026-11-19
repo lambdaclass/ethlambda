@@ -179,7 +179,9 @@ use tracing::{debug, error, warn};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::Validator;
-use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
+use crate::beacon::containers::{
+    AttestationData, BeaconState, Checkpoint, SignedBeaconBlock, SignedExecutionPayloadEnvelope,
+};
 use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0, pq};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
@@ -6265,7 +6267,7 @@ fn apply_ptc_vote(
 /// verified is checked again and recorded again, which is idempotent.
 pub fn on_execution_payload_envelope(
     store: &mut Store,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
     config: &Config,
     sidecars: &[gloas::DataColumnSidecar],
     engine: &stf::ExecutionEngine,
@@ -6293,7 +6295,7 @@ pub fn on_execution_payload_envelope(
 /// the fixture runner hands [`on_execution_payload_envelope`].
 pub fn check_execution_payload_envelope(
     store: &Store,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
     config: &Config,
     sidecars: &[gloas::DataColumnSidecar],
     engine: &stf::ExecutionEngine,
@@ -6312,7 +6314,7 @@ pub fn check_execution_payload_envelope(
 /// taken on trust, so the KZG batch is not repeated on every envelope.
 pub fn check_execution_payload_envelope_columns_verified(
     store: &Store,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
     config: &Config,
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
@@ -6323,13 +6325,12 @@ pub fn check_execution_payload_envelope_columns_verified(
 /// vouched for every sampled column, which skips only the availability step.
 fn check_envelope(
     store: &Store,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
     config: &Config,
     sidecars: Option<&[gloas::DataColumnSidecar]>,
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
-    let envelope = &signed_envelope.message;
-    let block_root = envelope.beacon_block_root;
+    let block_root = signed_envelope.beacon_block_root();
 
     // The corresponding beacon block root needs to be known.
     let state = store
@@ -6370,9 +6371,9 @@ fn check_envelope(
 /// a block the store does not hold is the only case this refuses.
 pub fn accept_execution_payload_envelope(
     store: &mut Store,
-    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    signed_envelope: &SignedExecutionPayloadEnvelope,
 ) {
-    let block_root = signed_envelope.message.beacon_block_root;
+    let block_root = signed_envelope.beacon_block_root();
     let Some((slot, _parent)) = store.block_entry(&block_root) else {
         return;
     };

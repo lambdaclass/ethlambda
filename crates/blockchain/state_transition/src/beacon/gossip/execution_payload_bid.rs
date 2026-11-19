@@ -373,9 +373,12 @@ fn parent_payload_exits<B: SignedBid, P: SignedPreferences>(
     {
         return Some(builder_exits);
     }
+    // A gloas bid's parent payload is a gloas envelope: the later forks'
+    // bids are judged against their own markets.
     let envelope = store
         .get_execution_payload_envelope(&bid.parent_block_root)
         .ok()??;
+    let envelope = envelope.as_gloas()?;
     Some(
         envelope
             .message

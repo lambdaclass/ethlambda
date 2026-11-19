@@ -1161,7 +1161,7 @@ async fn post_envelope_emitting(
         block_root,
     };
     if p2p
-        .publish_execution_payload_envelope(Box::new(signed), sidecars)
+        .publish_execution_payload_envelope(Box::new(signed.into()), sidecars)
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();

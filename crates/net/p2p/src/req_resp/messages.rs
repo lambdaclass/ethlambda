@@ -1,8 +1,8 @@
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope;
 use ethlambda_types::beacon::containers::fulu::DataColumnsByRootIdentifier;
-use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use ethlambda_types::beacon::primitives::Root;
 use libssz_types::SszList;
 

@@ -157,13 +157,14 @@ impl ForkName {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => true,
-            // The state transition and fork choice implement both, but the
-            // live follower does not: nothing gossips, requests or produces
-            // their blocks yet, and the EIP-8483 and PQ execution requests have
-            // no engine API path. A chain reaching either is refused
-            // (`refuse_unfollowable_fork`) rather than followed half way.
-            ForkName::Eip8483 | ForkName::Pq => false,
+            | ForkName::Gloas
+            // The feature forks after gloas: their blocks and envelopes are
+            // gossiped, requested and imported like gloas's, their execution
+            // requests go to the engine as gloas's do, and PQ's attestation
+            // proofs need the prover backend the network runs
+            // (`ethlambda_crypto::stark`).
+            | ForkName::Eip8483
+            | ForkName::Pq => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -369,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_gloas_is_followed() {
+    fn every_beacon_fork_is_followed() {
         for fork in ForkName::ALL {
-            assert_eq!(fork.is_followed(), fork <= ForkName::Gloas, "{fork:?}");
+            assert!(fork.is_followed(), "{fork:?}");
         }
     }
 

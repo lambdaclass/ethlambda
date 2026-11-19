@@ -782,9 +782,22 @@ pub(crate) mod tests {
         }
         fn new_execution_payload_envelope(
             &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
+            _envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_pq_aggregate(
+            &self,
+            _data: ethlambda_types::beacon::containers::AttestationData,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_pq_payload_attestation_message(
+            &self,
+            _message: Box<ethlambda_types::beacon::containers::pq::PayloadAttestationMessage>,
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
             Ok(())

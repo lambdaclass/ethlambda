@@ -280,9 +280,10 @@ impl Validated {
     /// validators it names as live for its target epoch; see
     /// [`record_liveness`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
-        // Relayed on `Accept` by gossipsub itself, and nothing more: no pool,
-        // event or chain actor takes a PQ object.
-        if let Self::Pq(_) = self {
+        // Relayed on `Accept` by gossipsub itself; the chain actor takes what
+        // fork choice reads (see `PqValidated::forward`).
+        if let Self::Pq(object) = self {
+            object.forward(server, received_at, outcome);
             return;
         }
         if outcome == Outcome::Accept {
@@ -408,6 +409,11 @@ impl Validated {
                     handed_off: Instant::now(),
                     deferred_from: None,
                 };
+                let envelope = Box::new(
+                    ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope::Gloas(
+                        *envelope,
+                    ),
+                );
                 let _ = blockchain
                     .new_execution_payload_envelope(envelope, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip envelope"));
@@ -1337,10 +1343,25 @@ mod tests {
         }
         fn new_execution_payload_envelope(
             &self,
-            _envelope: Box<SignedExecutionPayloadEnvelope>,
+            _envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Sent::Envelope);
+            Ok(())
+        }
+        fn new_pq_aggregate(
+            &self,
+            _data: ethlambda_types::beacon::containers::AttestationData,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_pq_payload_attestation_message(
+            &self,
+            _message: Box<ethlambda_types::beacon::containers::pq::PayloadAttestationMessage>,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
             Ok(())
         }
         fn new_payload_attestation_message(
@@ -1729,7 +1750,12 @@ mod tests {
         let hash = signed.message.payload.block_hash;
         assert!(server.builder_market.known_payload(hash).is_none());
 
-        crate::gossipsub::publish_execution_payload_envelope(&mut server, signed, Vec::new()).await;
+        crate::gossipsub::publish_execution_payload_envelope(
+            &mut server,
+            signed.into(),
+            Vec::new(),
+        )
+        .await;
 
         assert!(server.builder_market.known_payload(hash).is_some());
     }

@@ -3,7 +3,7 @@
 //! answering peers out of `Table::ExecutionPayloadEnvelopes`.
 
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope;
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
 use libp2p::request_response::ResponseChannel;
@@ -84,7 +84,7 @@ fn envelopes_by_range(
     store: &Store,
     start_slot: u64,
     count: u64,
-) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, &'static str> {
+) -> Result<Vec<SignedExecutionPayloadEnvelope>, &'static str> {
     if start_slot < store.anchor_slot() {
         return Err("requested range starts before this node's earliest available slot");
     }
@@ -146,7 +146,7 @@ pub(super) async fn handle_execution_payload_envelopes_by_root_request(
 
 /// The held envelopes among `roots`, in the order asked, looking at no more
 /// than `MAX_REQUEST_PAYLOADS` of them.
-fn envelopes_by_root(store: &Store, roots: &[H256]) -> Vec<gloas::SignedExecutionPayloadEnvelope> {
+fn envelopes_by_root(store: &Store, roots: &[H256]) -> Vec<SignedExecutionPayloadEnvelope> {
     roots
         .iter()
         .take(MAX_REQUEST_PAYLOADS as usize)
@@ -173,6 +173,7 @@ mod tests {
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::SignedBeaconBlock;
+    use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::beacon::fork_choice::PayloadStatus;
     use ethlambda_types::checkpoint::Checkpoint;
     use std::sync::Arc;
@@ -345,12 +346,7 @@ mod tests {
         let served = envelopes_by_range(&store, 1, total).expect("in window");
 
         assert_eq!(served.len() as u64, MAX_REQUEST_PAYLOADS);
-        let last_slot = served
-            .last()
-            .expect("non-empty")
-            .message
-            .payload
-            .slot_number;
+        let last_slot = served.last().expect("non-empty").payload().slot_number;
         assert_eq!(last_slot, MAX_REQUEST_PAYLOADS);
         // A count past the cap is cut to it, not refused.
         let wide = envelopes_by_range(&store, 1, u64::MAX).expect("in window");

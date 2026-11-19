@@ -328,8 +328,13 @@ fn prepare_gloas_proposal_on(
             .get_execution_payload_envelope(&head_root)
             .map_err(|_| ProposalError::Internal("store read failed"))?
             .ok_or(ProposalError::ParentEnvelopeMissing)?
+            .as_gloas()
+            .ok_or(ProposalError::Internal(
+                "a gloas head with a non-gloas envelope",
+            ))?
             .message
             .execution_requests
+            .clone()
     } else {
         ExecutionRequests::default()
     };

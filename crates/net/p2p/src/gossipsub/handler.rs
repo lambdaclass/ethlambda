@@ -1036,16 +1036,23 @@ pub async fn publish_beacon_block(
 /// peers.
 pub async fn publish_execution_payload_envelope(
     server: &mut P2PServer,
-    envelope: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+    envelope: ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope,
     sidecars: Vec<DataColumnSidecar>,
 ) {
-    let slot = envelope.message.payload.slot_number;
-    let block_root = envelope.message.beacon_block_root;
+    use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope as Envelope;
+    let slot = envelope.payload().slot_number;
+    let block_root = envelope.beacon_block_root();
     // Gossip never echoes a node's own message, so its own envelope is a
     // known payload for bid validation only because it is recorded here.
-    server
-        .builder_market
-        .record_execution_payload(&envelope.message);
+    match &envelope {
+        Envelope::Gloas(inner) => server
+            .builder_market
+            .record_execution_payload(&inner.message),
+        Envelope::Pq(inner) => server
+            .pq_builder_market
+            .record_pq_execution_payload(&inner.message),
+        Envelope::Eip8483(_) => {}
+    }
     let Some(beacon) = server.wire.beacon() else {
         error!(
             slot,
@@ -1069,7 +1076,7 @@ pub async fn publish_execution_payload_envelope(
         .publish(topic, compress_message(&envelope.to_ssz()));
     info!(
         slot,
-        builder_index = envelope.message.builder_index,
+        builder_index = envelope.builder_index(),
         block_root = %ShortRoot(&block_root.0),
         "Published execution payload envelope to gossipsub"
     );

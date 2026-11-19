@@ -25,11 +25,10 @@ use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
-use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list;
-use ethlambda_state_transition::beacon::stf::gloas;
+use ethlambda_state_transition::beacon::stf::{eip8483, gloas, pq};
 
 /// Everything `engine_newPayloadV4` takes, derived from one block.
 pub struct NewPayloadRequest<'a> {
@@ -70,11 +69,15 @@ pub struct GloasNewPayloadRequest<'a> {
 /// `engine_newPayloadV4`, and no fork after gloas exists yet to need a V6.
 pub fn gloas_new_payload_request<'a>(
     block: &SignedBeaconBlock,
-    envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
+    envelope: &'a containers::SignedExecutionPayloadEnvelope,
 ) -> Result<GloasNewPayloadRequest<'a>, EngineError> {
     let mismatch = |reason: &str| Err(EngineError::EnvelopeMismatch(reason.to_string()));
-    let inner = match block {
-        SignedBeaconBlock::Gloas(inner) => inner,
+    let bid = match block {
+        SignedBeaconBlock::Gloas(inner) => &inner.message.body.signed_execution_payload_bid.message,
+        SignedBeaconBlock::Eip8483(inner) => {
+            &inner.message.body.signed_execution_payload_bid.message
+        }
+        SignedBeaconBlock::Pq(inner) => &inner.message.body.signed_execution_payload_bid.message,
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)
@@ -82,18 +85,16 @@ pub fn gloas_new_payload_request<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_)
-        // EIP-8483's and PQ's envelopes are their own shapes, and their
-        // execution requests have no engine API method yet.
-        | SignedBeaconBlock::Eip8483(_)
-        | SignedBeaconBlock::Pq(_)
-        | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
+        | SignedBeaconBlock::Lean(_) => return mismatch("the block has no payload envelope"),
     };
+    if envelope.fork() != block.fork_name() {
+        return mismatch("the envelope is not of the block's fork");
+    }
 
-    if envelope.message.beacon_block_root != inner.message.hash_tree_root() {
+    if envelope.beacon_block_root() != block.message_hash_tree_root() {
         return mismatch("the envelope's beacon_block_root is not the block's root");
     }
-    let bid = &inner.message.body.signed_execution_payload_bid.message;
-    if bid.block_hash != envelope.message.payload.block_hash {
+    if bid.block_hash != envelope.payload().block_hash {
         return mismatch("the bid's block_hash is not the payload's block_hash");
     }
 
@@ -103,13 +104,25 @@ pub fn gloas_new_payload_request<'a>(
         .map(kzg_commitment_to_versioned_hash)
         .collect();
 
+    // Each fork's own requests list, with its own request types: the engine
+    // hashes whatever typed requests it is handed.
+    let execution_requests = match envelope {
+        containers::SignedExecutionPayloadEnvelope::Gloas(inner) => {
+            gloas::get_execution_requests_list(&inner.message.execution_requests)
+        }
+        containers::SignedExecutionPayloadEnvelope::Eip8483(inner) => {
+            eip8483::get_execution_requests_list(&inner.message.execution_requests)
+        }
+        containers::SignedExecutionPayloadEnvelope::Pq(inner) => {
+            pq::get_execution_requests_list(&inner.message.execution_requests)
+        }
+    };
+
     Ok(GloasNewPayloadRequest {
-        execution_payload: &envelope.message.payload,
+        execution_payload: envelope.payload(),
         versioned_hashes,
-        parent_beacon_block_root: envelope.message.parent_beacon_block_root,
-        execution_requests: gloas::get_execution_requests_list(
-            &envelope.message.execution_requests,
-        ),
+        parent_beacon_block_root: envelope.parent_beacon_block_root(),
+        execution_requests,
     })
 }
 
@@ -285,7 +298,7 @@ pub fn outcome_label(verdict: Option<&PayloadValidity>) -> &'static str {
 pub async fn ask_envelope_status(
     client: &EngineClient,
     block: &SignedBeaconBlock,
-    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
+    envelope: &containers::SignedExecutionPayloadEnvelope,
 ) -> Result<PayloadStatusV1, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
     let call = client.new_payload_v5(
@@ -305,6 +318,7 @@ mod tests {
     };
 
     use super::*;
+    use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 
     /// An otherwise-zero electra signed block with `parent_root` set.
     ///
@@ -486,6 +500,7 @@ mod tests {
             .builder_exits
             .push(Default::default());
 
+        let envelope = envelope.into();
         let request = gloas_new_payload_request(&block, &envelope)
             .unwrap_or_else(|err| panic!("a matching pair has a request: {err}"));
 
@@ -510,7 +525,7 @@ mod tests {
         let envelope = gloas_envelope(Root::ZERO, Root::ZERO);
 
         assert!(matches!(
-            gloas_new_payload_request(&block, &envelope),
+            gloas_new_payload_request(&block, &envelope.into()),
             Err(EngineError::EnvelopeMismatch(_))
         ));
     }
@@ -521,7 +536,7 @@ mod tests {
         let envelope = gloas_envelope(Root::repeat_byte(0xee), Root::ZERO);
 
         assert!(matches!(
-            gloas_new_payload_request(&block, &envelope),
+            gloas_new_payload_request(&block, &envelope.into()),
             Err(EngineError::EnvelopeMismatch(_))
         ));
     }
@@ -535,7 +550,7 @@ mod tests {
         envelope.message.payload.block_hash = ExecutionBlockHash::repeat_byte(0xab);
 
         assert!(matches!(
-            gloas_new_payload_request(&block, &envelope),
+            gloas_new_payload_request(&block, &envelope.into()),
             Err(EngineError::EnvelopeMismatch(_))
         ));
     }
