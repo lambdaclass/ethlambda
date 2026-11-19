@@ -1157,7 +1157,7 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
     use tokio::sync::RwLock;
 
     // Before `Test-driver RPC ready`, so a signal sent once that line is out
-    // is never lost or fatal.
+    // is never lost or fatal; `tests/shutdown.rs` relies on it.
     let mut signals = ShutdownSignals::listen();
 
     let driver: ethlambda_rpc::test_driver::DriverState =
