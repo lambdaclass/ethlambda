@@ -502,7 +502,7 @@ leanMetrics spec.
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCacheExt::committees` call: the state transition's, fork choice's and p2p's gossip validation's attestation processing | result=hit,miss,unkeyable |
-| `lean_beacon_signature_batch_disagreements_total` | Counter | Signature batches that failed while every set in them verified on its own: a bug in the batch check. The block is rejected anyway, so any non-zero value means valid blocks may be refused | When a block's deferred signature batch fails and no single set does | |
+| `lean_beacon_signature_batch_disagreements_total` | Counter | Signature batches that failed although the set the search for the failing one narrowed to verifies on its own: a bug in the batch check. The block is rejected anyway, so any non-zero value means valid blocks may be refused | When a block's deferred signature batch fails and the set its bisection lands on passes alone | |
 
 **Read the miss rate against the epoch rate, not the hit rate.** A follower on
 one chain misses about once per epoch, when the first block of a new epoch asks

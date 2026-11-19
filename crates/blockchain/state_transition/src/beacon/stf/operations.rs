@@ -192,8 +192,10 @@ pub fn process_operations(
 
 /// Checks a proposer slashing's evidence without slashing anyone: the two
 /// headers agree on slot and proposer, differ from each other, name a
-/// still-slashable proposer. Both signatures are pushed to `signatures`, which
-/// the block's driver checks once processing ends.
+/// still-slashable proposer, and both signatures check out. The signatures go
+/// through `signatures` and are verified, with every set still pending, before
+/// this returns, since the caller slashes on the strength of them (see
+/// [`SignatureBatch::verify_pending`]).
 ///
 /// Shared between phase0's own [`process_proposer_slashing`] below and
 /// `crate::beacon::stf::gloas::process_proposer_slashing`: gloas's own
@@ -252,6 +254,7 @@ pub(crate) fn verify_proposer_slashing(
             "bls.Verify(proposer.pubkey, signing_root, signed_header.signature)",
         )?;
     }
+    signatures.verify_pending()?;
 
     Ok((proposer_index, current_epoch))
 }
@@ -351,6 +354,8 @@ pub fn process_attester_slashing(
         indexed_attestation_signature_set(state, attestation_2),
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
+    // Before anyone is slashed on the strength of them.
+    signatures.verify_pending()?;
 
     slash_attesting_index_intersection(
         state,
@@ -718,6 +723,8 @@ pub fn process_voluntary_exit(
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
     Ok(())

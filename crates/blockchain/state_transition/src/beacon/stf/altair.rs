@@ -26,7 +26,7 @@
 //! two are the same number applied with opposite sign, not two independently
 //! derived quantities that happen to match.
 
-use crate::beacon::bls::{self, SignatureSet};
+use crate::beacon::bls::{EthFastAggregate, SignatureSet};
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
@@ -285,10 +285,11 @@ pub fn process_attestation(
 /// in this module needs one) and its own aggregation already batches every
 /// point in a single pass, so this collapses the three cases into one direct
 /// aggregation of the participating members' pubkeys.
-/// [`bls::eth_fast_aggregate_verify`]'s own convention for an empty list
-/// (accept only when the signature is the point at infinity) covers the case
-/// nobody participated exactly the way the specification's own "less than
-/// half" branch does when zero bits are set.
+/// [`crate::beacon::bls::eth_fast_aggregate_verify`]'s own convention for an empty list
+/// (accept only when the signature is the point at infinity), written once in
+/// [`SignatureSet::eth_fast_aggregate`] and read here through it, covers the
+/// case nobody participated exactly the way the specification's own "less
+/// than half" branch does when zero bits are set.
 ///
 /// Every reward and penalty here is the same `participant_reward`, applied
 /// with opposite sign: [`crate::beacon::constants::SYNC_REWARD_WEIGHT`] and
@@ -340,24 +341,18 @@ pub fn process_sync_aggregate(
         Some(compute_epoch_at_slot(previous_slot)),
     );
     let signing_root = compute_signing_root(get_block_root_at_slot(state, previous_slot)?, domain);
-    // `eth_fast_aggregate_verify`'s one carve-out: with no participants the
-    // signature must be the point at infinity, and there is nothing to
-    // pair, so that case is decided here and defers nothing.
+    // `eth_fast_aggregate_verify`, the same constructor block production's
+    // check of a pooled aggregate goes through. No participants is decided
+    // there and then, with nothing to pair; otherwise the pairing is deferred.
     let eth_fast_aggregate_verify = "eth_fast_aggregate_verify(participant_pubkeys, signing_root, sync_aggregate.sync_committee_signature)";
-    if participant_pubkeys.is_empty() {
-        verify(
-            sync_aggregate.sync_committee_signature.as_ref() == bls::G2_POINT_AT_INFINITY,
-            eth_fast_aggregate_verify,
-        )?;
-    } else {
-        signatures.push(
-            SignatureSet::fast_aggregate(
-                &participant_pubkeys,
-                signing_root,
-                &sync_aggregate.sync_committee_signature,
-            ),
-            eth_fast_aggregate_verify,
-        )?;
+    match SignatureSet::eth_fast_aggregate(
+        &participant_pubkeys,
+        signing_root,
+        &sync_aggregate.sync_committee_signature,
+    ) {
+        EthFastAggregate::Valid => {}
+        EthFastAggregate::Invalid => verify(false, eth_fast_aggregate_verify)?,
+        EthFastAggregate::Pairing(set) => signatures.push(Some(set), eth_fast_aggregate_verify)?,
     }
 
     // Resolve every committee seat's validator index up front; see this
@@ -444,6 +439,7 @@ mod tests {
     use blst::min_pk::SecretKey;
 
     use super::*;
+    use crate::beacon::bls;
     use crate::beacon::containers::altair::SyncCommittee;
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
     use crate::beacon::helpers::accessors::{get_beacon_committee, get_total_active_balance};

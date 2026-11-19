@@ -454,6 +454,8 @@ pub fn process_bls_to_execution_change(
         ),
         "bls.Verify(address_change.from_bls_pubkey, signing_root, signed_address_change.signature)",
     )?;
+    // Before the credentials are rewritten on the strength of it.
+    signatures.verify_pending()?;
 
     let mut credentials = [0u8; 32];
     credentials[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
@@ -816,6 +818,79 @@ mod tests {
                 process_bls_to_execution_change(&mut state, &signed_change, &config, s)
             })
             .is_err()
+        );
+    }
+
+    /// A credential change rewrites a validator's record, so its signature and
+    /// every one still pending are checked before it writes, even through a
+    /// batch that defers: a forged change is refused by the operation itself,
+    /// and so is a genuine one while a forged set from earlier in the block is
+    /// pending. Either way the credentials are left as they were.
+    #[test]
+    fn a_credential_change_checks_its_signature_and_every_pending_one_before_it_writes() {
+        let config = Config::mainnet();
+        let mut state = capella_state_with_validators(1);
+        let secret_key = SecretKey::key_gen(&[6u8; 32], &[]).expect("32 bytes of key material");
+        let from_pubkey = BlsPubkey(secret_key.sk_to_pk().to_bytes());
+        let hashed = hash(&from_pubkey.0);
+        {
+            let validator = state.validator_mut(0).unwrap();
+            validator.withdrawal_credentials.0[0] = constants::BLS_WITHDRAWAL_PREFIX;
+            validator.withdrawal_credentials.0[1..].copy_from_slice(&hashed.0[1..]);
+        }
+        let credentials_before = state.validator(0).unwrap().withdrawal_credentials;
+
+        let message = capella::BLSToExecutionChange {
+            validator_index: 0,
+            from_bls_pubkey: from_pubkey,
+            to_execution_address: ExecutionAddress::repeat_byte(0xcd),
+        };
+        let domain = compute_domain(
+            constants::DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            config.genesis_fork_version,
+            state.genesis_validators_root(),
+        );
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let sign = |root: Root| BlsSignature(secret_key.sign(root.as_slice(), DST, &[]).to_bytes());
+        let genuine = capella::SignedBLSToExecutionChange {
+            message: message.clone(),
+            signature: sign(signing_root),
+        };
+        let forged = capella::SignedBLSToExecutionChange {
+            message,
+            signature: sign(Root::repeat_byte(1)),
+        };
+
+        let mut signatures = SignatureBatch::new();
+        let err = process_bls_to_execution_change(&mut state, &forged, &config, &mut signatures)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("bls.Verify(address_change.from_bls_pubkey"),
+            "{err:?}"
+        );
+        assert_eq!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
+        );
+
+        let mut signatures = SignatureBatch::new();
+        let earlier = SignatureSet::single(&from_pubkey, Root::repeat_byte(2), &sign(Root::ZERO));
+        signatures.push(earlier, "an earlier operation").unwrap();
+        let err = process_bls_to_execution_change(&mut state, &genuine, &config, &mut signatures)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("an earlier operation"),
+            "{err:?}"
+        );
+        assert_eq!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
+        );
+
+        checked(|s| process_bls_to_execution_change(&mut state, &genuine, &config, s)).unwrap();
+        assert_ne!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
         );
     }
 

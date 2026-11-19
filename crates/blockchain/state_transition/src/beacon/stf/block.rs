@@ -45,12 +45,15 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 /// `signed_block`'s slot.
 ///
 /// Means what it always did, that the block is valid: it builds the
-/// [`SignatureBatch`] the drivers push into and checks it before returning
-/// `Ok`, so a caller needs no knowledge of it.
+/// [`SignatureBatch`] the drivers push into and checks all of it before
+/// returning `Ok`, so a caller needs no knowledge of it.
 ///
-/// An `Err` leaves `state` partly mutated, as it always could: an operation
-/// whose signature is deferred has already written when a bad signature is
-/// found at the end. Every caller discards the state after an error.
+/// An `Err` leaves `state` partly mutated: a check that fails midway leaves
+/// the operations before it applied, and a bad signature on an attestation or
+/// the sync aggregate, which is found only at the end, leaves that operation
+/// applied too (see [`super::signatures`] for which writes may precede their
+/// signature's check). Every caller discards the state after an error; block
+/// import's `transition_block` returns none with one.
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -75,7 +78,8 @@ pub fn process_block(
 }
 
 /// [`process_block`]'s dispatch: every signature the block's processing needs
-/// is pushed into `signatures`, which [`process_block`] then verifies.
+/// is pushed into `signatures`, which [`process_block`] then verifies (what the
+/// processing has not already checked on its way).
 ///
 /// An `Err` here, or from the batch after it, leaves `state` partly mutated;
 /// see [`process_block`]. A new caller must discard the state after an error.
@@ -333,9 +337,13 @@ pub enum RandaoVerification {
     Skip,
 }
 
-/// Defers the check of the proposer's RANDAO reveal (unless `verification`
-/// skips it) to `signatures`, and mixes the reveal into the current epoch's
-/// randao mix.
+/// Verifies the proposer's RANDAO reveal (unless `verification` skips it), then
+/// mixes the reveal into the current epoch's randao mix.
+///
+/// In the specification's order: the reveal is checked before the mix takes
+/// it, so nothing that reads the mix ever sees an unverified reveal. The check
+/// goes through `signatures` with everything already pending (in gloas, the
+/// builder's bid processed just before this), one batch for both.
 ///
 /// The reveal signs the epoch rather than the slot, so the same signature would
 /// verify for every slot of the epoch: the mix it feeds is per-epoch, not
@@ -365,6 +373,7 @@ pub fn process_randao(
             ),
             "RANDAO reveal signature",
         )?;
+        signatures.verify_pending()?;
     }
 
     let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
@@ -489,13 +498,78 @@ mod tests {
         crate::beacon::helpers::test_state::sign_for(proposer as usize, signed)
     }
 
+    /// The reveal the proposer of `state`'s slot really makes.
+    fn valid_reveal(state: &BeaconState) -> BlsSignature {
+        let epoch = get_current_epoch(state);
+        let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
+        reveal_over(state, compute_signing_root(epoch.hash_tree_root(), domain))
+    }
+
+    /// The spec's order: the reveal is verified, and only then mixed in. A bad
+    /// one is refused by `process_randao` itself, with the mix untouched, even
+    /// though the batch it goes through defers.
     #[test]
-    fn a_bad_randao_reveal_is_deferred_and_rejected_by_the_batch() {
+    fn a_bad_randao_reveal_is_rejected_before_it_is_mixed_in() {
         let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let epoch = get_current_epoch(&state);
+        let mix_before = get_randao_mix(&state, epoch);
         let reveal = reveal_over(&state, Root::repeat_byte(7));
         let mut signatures = SignatureBatch::new();
 
-        // Nothing is checked while processing; the batch is what rejects.
+        let err = process_randao(
+            &mut state,
+            &reveal,
+            RandaoVerification::Verify,
+            &mut signatures,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("RANDAO reveal signature"),
+            "{err:?}"
+        );
+        assert_eq!(get_randao_mix(&state, epoch), mix_before);
+    }
+
+    /// What gloas's bid is to the reveal: a set pushed before it is checked
+    /// with it, before the mix, and a bad one rejects under its own label.
+    #[test]
+    fn a_bad_set_pending_before_the_reveal_is_rejected_with_it() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let epoch = get_current_epoch(&state);
+        let mix_before = get_randao_mix(&state, epoch);
+        let reveal = valid_reveal(&state);
+        let forged = SignatureSet::single(
+            &state.validator(0).unwrap().pubkey,
+            Root::repeat_byte(1),
+            &crate::beacon::helpers::test_state::sign_for(0, Root::repeat_byte(2)),
+        );
+        let mut signatures = SignatureBatch::new();
+        signatures
+            .push(forged, "the set before the reveal")
+            .unwrap();
+
+        let err = process_randao(
+            &mut state,
+            &reveal,
+            RandaoVerification::Verify,
+            &mut signatures,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("the set before the reveal"),
+            "{err:?}"
+        );
+        assert_eq!(get_randao_mix(&state, epoch), mix_before);
+    }
+
+    #[test]
+    fn a_valid_randao_reveal_is_verified_and_mixed_in() {
+        let mut state = crate::beacon::helpers::test_state::with_validators(8);
+        let epoch = get_current_epoch(&state);
+        let reveal = valid_reveal(&state);
+        let expected = xor(get_randao_mix(&state, epoch), hash(&reveal.0));
+        let mut signatures = SignatureBatch::new();
+
         process_randao(
             &mut state,
             &reveal,
@@ -503,22 +577,11 @@ mod tests {
             &mut signatures,
         )
         .unwrap();
-        let err = signatures.verify().unwrap_err();
         assert!(
-            format!("{err:?}").contains("RANDAO reveal signature"),
-            "{err:?}"
+            signatures.is_empty(),
+            "the reveal was checked, not deferred"
         );
-    }
-
-    #[test]
-    fn a_valid_randao_reveal_passes_the_batch() {
-        let mut state = crate::beacon::helpers::test_state::with_validators(8);
-        let epoch = get_current_epoch(&state);
-        let domain = get_domain(&state, constants::DOMAIN_RANDAO, None);
-        let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
-        let reveal = reveal_over(&state, signing_root);
-
-        checked(|s| process_randao(&mut state, &reveal, RandaoVerification::Verify, s)).unwrap();
+        assert_eq!(get_randao_mix(&state, epoch), expected);
     }
 
     #[test]

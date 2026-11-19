@@ -22,17 +22,22 @@
 //! The weights must be unpredictable to whoever chose the signatures: with
 //! independent uniform 64-bit weights, a forged batch passes with probability
 //! about 2^-64, which is the soundness level every consensus client accepts.
-//! They are drawn from `rand`'s thread-local CSPRNG, which is seeded from the
-//! operating system's entropy and reseeded periodically, and a weight of zero
-//! is redrawn, since it would drop its set from the equation altogether.
+//! They are drawn from `rand::rng()`, a thread-local ChaCha12 generator seeded
+//! from the operating system (`SysRng`), and soundness rests on that
+//! unpredictability alone: rand 0.10.1, the version locked here, also reseeds
+//! it from the operating system after every 64 KiB of output, but nothing
+//! here depends on that. A weight of zero is redrawn, since it would drop its
+//! set from the equation altogether.
 //!
 //! # What a batch answers
 //!
 //! Only whether every set holds. When it fails it cannot say which set did;
-//! callers that need to name one check the sets individually afterwards
-//! ([`SignatureSet::verify`]), which is also the answer a standalone
-//! [`super::verify`] or [`super::fast_aggregate_verify`] gives for the same
-//! inputs.
+//! callers that need to name one check smaller batches or single sets
+//! afterwards ([`SignatureSet::verify`]). A single set's check is the
+//! standalone one: [`super::verify`], [`super::fast_aggregate_verify`] and
+//! [`super::eth_fast_aggregate_verify`] are built on [`SignatureSet`], so a
+//! signature gossip accepts and one a block's batch accepts are decided by
+//! the same code.
 
 use blst::BLST_ERROR;
 use blst::blst_scalar;
@@ -41,7 +46,9 @@ use rand::RngExt;
 
 use ethlambda_types::beacon::primitives::{BlsSignature, Root};
 
-use super::{AggregatePubkey, DST, PubkeySource, validated_pubkey, validated_pubkeys};
+use super::{
+    AggregatePubkey, DST, G2_POINT_AT_INFINITY, PubkeySource, validated_pubkey, validated_pubkeys,
+};
 
 /// How many bits of each random weight the batch check uses.
 const RAND_BITS: usize = 64;
@@ -134,8 +141,36 @@ impl SignatureSet {
         })
     }
 
+    /// `eth_fast_aggregate_verify`'s inputs (`specs/altair/bls.md`): what
+    /// [`Self::fast_aggregate`] builds, except that no participants at all is
+    /// valid exactly when the signature is [`G2_POINT_AT_INFINITY`], and needs
+    /// no pairing.
+    ///
+    /// The one definition of that rule: [`super::eth_fast_aggregate_verify`]
+    /// is [`EthFastAggregate::verify`] over this, and a block's sync
+    /// aggregate goes through it, so block production's own check of an
+    /// aggregate and the state transition's cannot disagree.
+    pub fn eth_fast_aggregate<K: PubkeySource>(
+        pubkeys: &[K],
+        message: Root,
+        signature: &BlsSignature,
+    ) -> EthFastAggregate {
+        if pubkeys.is_empty() {
+            return if signature.as_ref() == G2_POINT_AT_INFINITY {
+                EthFastAggregate::Valid
+            } else {
+                EthFastAggregate::Invalid
+            };
+        }
+        match Self::fast_aggregate(pubkeys, message, signature) {
+            Some(set) => EthFastAggregate::Pairing(set),
+            None => EthFastAggregate::Invalid,
+        }
+    }
+
     /// The pairing check on its own: the same answer [`super::verify`] or
-    /// [`super::fast_aggregate_verify`] gives for these inputs.
+    /// [`super::fast_aggregate_verify`] gives for these inputs, since both are
+    /// this check.
     pub fn verify(&self) -> bool {
         let result = if self.aggregated {
             self.signature.fast_aggregate_verify_pre_aggregated(
@@ -156,21 +191,33 @@ impl SignatureSet {
         };
         result == BLST_ERROR::BLST_SUCCESS
     }
+}
 
-    /// Whether the key is the identity, which no signature can validly be
-    /// made under. Only a sum of keys can be: a single registry key is
-    /// rejected by `key_validate` if it is.
-    ///
-    /// blst rejects the same input itself (`BLST_PK_IS_INFINITY`, from the
-    /// pairing aggregation both the single and the batch check go through),
-    /// so this makes the existing rule explicit and changes no behavior.
-    ///
-    /// Read off the affine point, with no serialization: blst stores the
-    /// identity as the all-zero point, which is `PublicKey::default()`, and its
-    /// `PartialEq` compares those bytes (the same test as its
-    /// `blst_p1_affine_is_inf`, without the `unsafe` call).
-    fn key_is_identity(&self) -> bool {
-        self.aggregated && self.pubkey == PublicKey::default()
+/// What [`SignatureSet::eth_fast_aggregate`] makes of its inputs: a check
+/// already decided without a pairing, or the set whose pairing decides it.
+// `Pairing` is the usual answer and is moved straight on into a batch or
+// checked; boxing it would allocate per check to shrink a value that never
+// stays around.
+#[allow(clippy::large_enum_variant)]
+pub enum EthFastAggregate {
+    /// No participants, and the signature is the point at infinity.
+    Valid,
+    /// No participants with any other signature, or a key or the signature
+    /// that does not validate.
+    Invalid,
+    /// The participants' check, decided by its pairing.
+    Pairing(SignatureSet),
+}
+
+impl EthFastAggregate {
+    /// The answer with the pairing, if any, run now:
+    /// `eth_fast_aggregate_verify`'s.
+    pub fn verify(&self) -> bool {
+        match self {
+            Self::Valid => true,
+            Self::Invalid => false,
+            Self::Pairing(set) => set.verify(),
+        }
     }
 }
 
@@ -193,17 +240,18 @@ fn random_weight(rng: &mut impl RngExt) -> blst_scalar {
 ///
 /// See the module documentation for why the weights are random. A single set
 /// skips them and is verified directly, since one equation needs no
-/// combining. A set whose key is the identity fails the batch, as it fails
-/// [`SignatureSet::verify`]. blst rejects that input itself, so the explicit
-/// check only states the rule where a reader of the batch looks for it.
+/// combining.
+///
+/// A set whose key is the identity (keys that sum to it, such as `[P, -P]`)
+/// fails here as it fails [`SignatureSet::verify`], with nothing in this crate
+/// checking for it: blst refuses an infinite public key wherever it adds a
+/// key to a pairing (`BLST_PK_IS_INFINITY` in `blst/src/aggregate.c`), which
+/// both this batch and the single check go through.
 pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     match sets {
         [] => return true,
         [only] => return only.verify(),
         _ => {}
-    }
-    if sets.iter().any(SignatureSet::key_is_identity) {
-        return false;
     }
     let mut rng = rand::rng();
     let weights: Vec<blst_scalar> = sets.iter().map(|_| random_weight(&mut rng)).collect();
@@ -454,7 +502,10 @@ mod tests {
         let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
         for signature in [infinity, sign(&key, msg)] {
             let set = SignatureSet::fast_aggregate(&pair, msg, &signature).unwrap();
-            assert!(set.key_is_identity());
+            assert!(
+                set.pubkey == PublicKey::default(),
+                "the keys sum to the identity"
+            );
             assert!(!set.verify());
             assert_eq!(
                 set.verify(),
@@ -469,10 +520,59 @@ mod tests {
         // `P + P - P` is `P`, so `P`'s own signature verifies.
         let three = [pubkey, pubkey, negated(pubkey)];
         let set = SignatureSet::fast_aggregate(&three, msg, &sign(&key, msg)).unwrap();
-        assert!(!set.key_is_identity());
+        assert!(set.pubkey != PublicKey::default());
         let mut sets = valid_sets(3);
         sets.push(set);
         assert!(verify_signature_sets(&sets));
+    }
+
+    /// `eth_fast_aggregate_verify`'s carve-out: no participants is valid with
+    /// the point at infinity and nothing else, and needs no pairing either way.
+    #[test]
+    fn no_participants_is_decided_without_a_pairing() {
+        let msg = message(50);
+        let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        let real = sign(&secret_key(50), msg);
+        assert!(matches!(
+            SignatureSet::eth_fast_aggregate::<BlsPubkey>(&[], msg, &infinity),
+            EthFastAggregate::Valid
+        ));
+        for signature in [real, BlsSignature([0; 96])] {
+            assert!(matches!(
+                SignatureSet::eth_fast_aggregate::<BlsPubkey>(&[], msg, &signature),
+                EthFastAggregate::Invalid
+            ));
+        }
+    }
+
+    /// With participants, the answer is `fast_aggregate`'s set and its
+    /// pairing, and `eth_fast_aggregate_verify` is that answer.
+    #[test]
+    fn participants_are_checked_by_their_pairing() {
+        let keys: Vec<SecretKey> = (60..63).map(secret_key).collect();
+        let pubkeys: Vec<BlsPubkey> = keys.iter().map(pubkey_of).collect();
+        let msg = message(60);
+        let signatures: Vec<BlsSignature> = keys.iter().map(|key| sign(key, msg)).collect();
+        let good = bls::aggregate(&signatures).unwrap();
+        let short = bls::aggregate(&signatures[1..]).unwrap();
+
+        let check = SignatureSet::eth_fast_aggregate(&pubkeys, msg, &good);
+        assert!(matches!(check, EthFastAggregate::Pairing(_)) && check.verify());
+        let check = SignatureSet::eth_fast_aggregate(&pubkeys, msg, &short);
+        assert!(matches!(check, EthFastAggregate::Pairing(_)) && !check.verify());
+        let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
+        assert!(!SignatureSet::eth_fast_aggregate(&pubkeys, msg, &infinity).verify());
+        let garbage = BlsPubkey([0xff; 48]);
+        assert!(matches!(
+            SignatureSet::eth_fast_aggregate(&[pubkeys[0], garbage], msg, &good),
+            EthFastAggregate::Invalid
+        ));
+        for signature in [good, short, infinity] {
+            assert_eq!(
+                SignatureSet::eth_fast_aggregate(&pubkeys, msg, &signature).verify(),
+                bls::eth_fast_aggregate_verify(&pubkeys, msg, &signature)
+            );
+        }
     }
 
     #[test]
