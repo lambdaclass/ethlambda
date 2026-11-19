@@ -33,14 +33,15 @@ firewall rule or an authenticating reverse proxy, and never expose it to the
 internet.
 
 **What the node checks for itself.** Nothing it gossips on a caller's behalf
-is taken on the caller's word. A published block's proposer signature, an
-envelope's signature and data columns, attestations, aggregates, sync committee
-messages and contributions, slashings, exits, BLS changes, payload attestations,
-builder bids and proposer preferences are all checked against the chain,
-signatures included, before they reach the network; a failure is a `400`. A
-caller can only make this node publish what passes these checks. They are not
-every gossip rule, so peers may still ignore a message that passed them, such
-as a duplicate or one outside gossip's timing windows.
+is taken on the caller's word. A published block's proposer signature and KZG
+proofs, an envelope's signature and KZG proofs, attestations, aggregates, sync
+committee messages and contributions, slashings, exits, BLS changes, and
+gloas's payload attestations, builder bids and signed proposer preferences are
+all checked against the chain, signatures included, before they reach the
+network; a failed check is a `400`. A caller can only make this node publish
+what passes these checks. They are not every gossip rule, so peers may still
+ignore a message that passed them, such as a duplicate or one outside gossip's
+timing windows.
 
 **What it takes on the caller's word.** These carry no signature to check, or
 one the node does not check:
@@ -63,12 +64,15 @@ one the node does not check:
   request, which costs bandwidth and CPU until the slot or epoch the caller
   named. A sync committee subscription is capped at the end of the next sync
   committee period; an attestation subnet's is not capped.
-- **When the node builds a block.** Every block production request has the
-  execution client build a payload.
+- **When the node builds a block.** Every
+  `GET /eth/v3/validator/blocks/{slot}` and
+  `POST /eth/v4/validator/blocks/{slot}` request has the execution client
+  build a payload.
 - **On a lean node, who aggregates.** `POST /lean/v0/admin/aggregator` switches
   the aggregator role on or off.
 - **On the metrics server, heap profiles.** `/debug/pprof/allocs` and its
-  flamegraph take a jemalloc heap profile, where profiling is enabled.
+  flamegraph take a jemalloc heap profile on request. A default Linux build
+  has profiling on from startup; other platforms answer `501`.
 
 ## API Server (`:5052`)
 
