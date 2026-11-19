@@ -649,6 +649,15 @@ impl HeadWatch {
     /// the slots between are empty on that chain, and the short batch is held
     /// only to its last block.
     ///
+    /// The link is the upper batch's sender's word: it chooses the parent its
+    /// first block names. A match only ever credits the peer below, so a liar
+    /// gains nothing by faking one. A mismatch leaves the peer below held to
+    /// its requested end, so a liar above an honest short batch can still push
+    /// a drop's blame down onto it by naming a parent it never delivered.
+    /// Holding both senders on a mismatch would close that, but blames an
+    /// honest upper peer whenever the batch below is the bad one, which is
+    /// the case the lowest-batch rule exists for.
+    ///
     /// `first` is the batch's lowest block, with its parent's root;
     /// `short_tail` its highest block handed over, with its own root, when
     /// that sits below `end` (`None` otherwise).

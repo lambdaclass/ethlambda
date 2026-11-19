@@ -98,7 +98,11 @@ head trails the wall clock **and** its peers report a head ahead of it.
   import stalls for a window (an execution client down), the honest peers
   that delivered the lowest batch stop counting too, and the node reads as synced on its stale head
   until the head passes what they handed over, or for 4 stall windows at
-  most. These bounds hold per peer identity: a fresh identity starts with
+  most. The same happens to an honest peer whose batch ends short (its last
+  slots were missed) when the peer serving the batch above lies: the short
+  batch is held only to its last block when the next batch's first block
+  names that block as its parent, and the upper sender chooses that parent
+  (`HeadWatch::note_delivery`). These bounds hold per peer identity: a fresh identity starts with
   none of the history (claims, cooldowns, suspicion) its predecessor
   earned, so an adversary with many identities is bounded by how many it
   can connect, as for any client. The window is sized above what can legitimately hold a
