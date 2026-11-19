@@ -1150,7 +1150,7 @@ impl BlockChainServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -2149,8 +2149,9 @@ mod tests {
 
     /// What the mock execution client answers and has been asked.
     #[derive(Default)]
-    struct MockState {
-        /// The `payloadStatus` object `engine_newPayloadV5` answers with.
+    pub(crate) struct MockState {
+        /// The `payloadStatus` object every `engine_newPayload*` answers with:
+        /// a gloas envelope's V5 and a pre-gloas block's V4 alike.
         new_payload: String,
         /// The `payloadStatus` object `engine_forkchoiceUpdated*` answers with.
         forkchoice: String,
@@ -2158,14 +2159,17 @@ mod tests {
         requests: Vec<String>,
     }
 
-    fn status_json(status: &str, latest_valid_hash: Option<H256>) -> String {
+    pub(crate) fn status_json(status: &str, latest_valid_hash: Option<H256>) -> String {
         let hash = latest_valid_hash.map_or("null".to_string(), |hash| format!("\"{hash:?}\""));
         format!(r#"{{"status":"{status}","latestValidHash":{hash},"validationError":null}}"#)
     }
 
     /// A hand-rolled JSON-RPC server answering by method name, like
     /// `ethlambda-engine`'s wire smoke tests but for many requests.
-    async fn mock_engine(
+    ///
+    /// Shared with the block import tests in `lib.rs`, which ask V4 about a
+    /// fulu block's payload, so every `engine_newPayload*` gets `new_payload`.
+    pub(crate) async fn mock_engine(
         new_payload: String,
         forkchoice: String,
     ) -> (EngineClient, Arc<std::sync::Mutex<MockState>>) {
@@ -2222,13 +2226,13 @@ mod tests {
                         let result = {
                             let mut state = shared.lock().unwrap();
                             state.requests.push(body.clone());
-                            if body.contains("engine_newPayloadV5") {
+                            if body.contains("engine_newPayload") {
                                 state.new_payload.clone()
                             } else {
                                 state.forkchoice.clone()
                             }
                         };
-                        let result = if body.contains("engine_newPayloadV5") {
+                        let result = if body.contains("engine_newPayload") {
                             result
                         } else {
                             format!(r#"{{"payloadStatus":{result},"payloadId":null}}"#)
@@ -2254,7 +2258,7 @@ mod tests {
         (client, state)
     }
 
-    fn methods(state: &Arc<std::sync::Mutex<MockState>>) -> Vec<String> {
+    pub(crate) fn methods(state: &Arc<std::sync::Mutex<MockState>>) -> Vec<String> {
         state
             .lock()
             .unwrap()
