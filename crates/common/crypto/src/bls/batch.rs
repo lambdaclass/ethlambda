@@ -22,9 +22,12 @@
 //! The weights must be unpredictable to whoever chose the signatures: with
 //! independent uniform 64-bit weights, a forged batch passes with probability
 //! about 2^-64, which is the soundness level every consensus client accepts.
-//! They are drawn from `rand`'s thread-local CSPRNG, which is seeded from the
-//! operating system's entropy and reseeded periodically, and a weight of zero
-//! is redrawn, since it would drop its set from the equation altogether.
+//! They are drawn from `rand::rng()`, a thread-local ChaCha12 generator seeded
+//! from the operating system (`SysRng`), and soundness rests on that
+//! unpredictability alone: rand 0.10.1, the version locked here, also reseeds
+//! it from the operating system after every 64 KiB of output, but nothing
+//! here depends on that. A weight of zero is redrawn, since it would drop its
+//! set from the equation altogether.
 //!
 //! # What a batch answers
 //!
@@ -131,22 +134,6 @@ impl SignatureSet {
         };
         result == BLST_ERROR::BLST_SUCCESS
     }
-
-    /// Whether the key is the identity, which no signature can validly be
-    /// made under. Only a sum of keys can be: a single registry key is
-    /// rejected by `key_validate` if it is.
-    ///
-    /// blst rejects the same input itself (`BLST_PK_IS_INFINITY`, from the
-    /// pairing aggregation both the single and the batch check go through),
-    /// so this makes the existing rule explicit and changes no behavior.
-    ///
-    /// Read off the affine point, with no serialization: blst stores the
-    /// identity as the all-zero point, which is `PublicKey::default()`, and its
-    /// `PartialEq` compares those bytes (the same test as its
-    /// `blst_p1_affine_is_inf`, without the `unsafe` call).
-    fn key_is_identity(&self) -> bool {
-        self.aggregated && self.pubkey == PublicKey::default()
-    }
 }
 
 /// A random weight in `1..2^64`, as the little-endian scalar `blst` expects.
@@ -168,17 +155,18 @@ fn random_weight(rng: &mut impl RngExt) -> blst_scalar {
 ///
 /// See the module documentation for why the weights are random. A single set
 /// skips them and is verified directly, since one equation needs no
-/// combining. A set whose key is the identity fails the batch, as it fails
-/// [`SignatureSet::verify`]. blst rejects that input itself, so the explicit
-/// check only states the rule where a reader of the batch looks for it.
+/// combining.
+///
+/// A set whose key is the identity (keys that sum to it, such as `[P, -P]`)
+/// fails here as it fails [`SignatureSet::verify`], with nothing in this crate
+/// checking for it: blst refuses an infinite public key wherever it adds a
+/// key to a pairing (`BLST_PK_IS_INFINITY` in `blst/src/aggregate.c`), which
+/// both this batch and the single check go through.
 pub fn verify_signature_sets(sets: &[SignatureSet]) -> bool {
     match sets {
         [] => return true,
         [only] => return only.verify(),
         _ => {}
-    }
-    if sets.iter().any(SignatureSet::key_is_identity) {
-        return false;
     }
     let mut rng = rand::rng();
     let weights: Vec<blst_scalar> = sets.iter().map(|_| random_weight(&mut rng)).collect();
@@ -428,7 +416,10 @@ mod tests {
         let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
         for signature in [infinity, sign(&key, msg)] {
             let set = SignatureSet::fast_aggregate(&pair, msg, &signature).unwrap();
-            assert!(set.key_is_identity());
+            assert!(
+                set.pubkey == PublicKey::default(),
+                "the keys sum to the identity"
+            );
             assert!(!set.verify());
             assert_eq!(
                 set.verify(),
@@ -443,7 +434,7 @@ mod tests {
         // `P + P - P` is `P`, so `P`'s own signature verifies.
         let three = [pubkey, pubkey, negated(pubkey)];
         let set = SignatureSet::fast_aggregate(&three, msg, &sign(&key, msg)).unwrap();
-        assert!(!set.key_is_identity());
+        assert!(set.pubkey != PublicKey::default());
         let mut sets = valid_sets(3);
         sets.push(set);
         assert!(verify_signature_sets(&sets));
