@@ -19,6 +19,8 @@
 //! Gloas is the exception: its payload is revealed in an envelope, so its
 //! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
+use std::time::Instant;
+
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
@@ -178,13 +180,66 @@ pub fn verdict(status: &PayloadStatusV1) -> PayloadValidity {
     })
 }
 
-/// Asks the execution client about `block`'s payload.
+/// [`NewPayloadRequest`] with its own copy of the payload, so it can move into
+/// a spawned task.
+///
+/// The chain actor sends the question from a task of its own and runs the
+/// block's state transition meanwhile (see `process_block`), and a task cannot
+/// borrow the block the actor goes on using. Only the payload is copied: the
+/// rest of the request is already owned, and the block itself, which also
+/// carries the attestations and the other operations, is never cloned.
+pub struct OwnedNewPayloadRequest {
+    execution_payload: containers::deneb::ExecutionPayload,
+    versioned_hashes: Vec<Bytes32>,
+    parent_beacon_block_root: Root,
+    execution_requests: Vec<Vec<u8>>,
+}
+
+impl NewPayloadRequest<'_> {
+    /// Copies the borrowed payload so the request outlives the block.
+    pub fn into_owned(self) -> OwnedNewPayloadRequest {
+        OwnedNewPayloadRequest {
+            execution_payload: self.execution_payload.clone(),
+            versioned_hashes: self.versioned_hashes,
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            execution_requests: self.execution_requests,
+        }
+    }
+}
+
+/// Asks the execution client about a block's payload, with a request already
+/// built by [`new_payload_request`], which is how the actor sends it from a
+/// task while it computes the transition.
+///
+/// `Err` means no verdict: no answer after the client's whole retry ladder, or
+/// a JSON-RPC error answer ([`EngineError::Rpc`]), which is not retried.
+/// `optimistic-sync.md` then requires the caller not to import the block and
+/// not to touch fork choice. There is no "nothing to ask" reading: a request
+/// existing means there was something to ask, and a block with none (pre-merge,
+/// gloas) is [`PayloadValidity::NotRequired`] without a call.
+pub async fn ask_request(
+    client: &EngineClient,
+    request: OwnedNewPayloadRequest,
+) -> Result<PayloadValidity, EngineError> {
+    let call = client.new_payload(
+        &request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
+    Ok(verdict(&status))
+}
+
+/// Asks the execution client about `block`'s payload, borrowing the block.
+///
+/// For a task that already owns the block it asks about: the answered-later
+/// path in `beacon_new_payload`, whose request task holds the block in its
+/// `PayloadQuestion`, so no payload copy is needed there.
 ///
 /// `Ok(None)` means there was nothing to ask, which is not a failure:
-/// [`PayloadValidity::NotRequired`] is the right verdict and the block imports.
-/// `Err` means no answer was obtained after the client's whole retry ladder, and
-/// `optimistic-sync.md` requires the caller not to import the block and not to
-/// touch fork choice.
+/// [`PayloadValidity::NotRequired`] is the right verdict. `Err` means no
+/// verdict, as for [`ask_request`].
 pub async fn ask(
     client: &EngineClient,
     block: &SignedBeaconBlock,
@@ -192,52 +247,74 @@ pub async fn ask(
     let Some(request) = new_payload_request(block) else {
         return Ok(None);
     };
-    let status = client
-        .new_payload(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await?;
+    let call = client.new_payload(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
     Ok(Some(verdict(&status)))
 }
 
-/// Asks the execution client about the payload `envelope` reveals for `block`,
-/// with `engine_newPayloadV5`.
+/// Awaits `call`, one `engine_newPayload*` request, and observes the time from
+/// sending it to its answer as `lean_engine_new_payload_seconds`, under the
+/// [`outcome_label`] of the verdict the answer reads as.
 ///
-/// Never `Ok(None)`: unlike [`ask`] there is no "nothing to ask" reading, and a
-/// block/envelope pair that does not match is an
-/// [`EngineError::EnvelopeMismatch`], which the caller must treat as a refusal
-/// to import.
-pub async fn ask_envelope(
-    client: &EngineClient,
-    block: &SignedBeaconBlock,
-    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Result<PayloadValidity, EngineError> {
-    ask_envelope_status(client, block, envelope)
-        .await
-        .map(|status| verdict(&status))
+/// Every request this module sends goes through here, a block's payload and an
+/// envelope's alike, so the metric is the execution client's time for every
+/// payload it was asked about. A request refused before it is sent (an
+/// envelope that does not match its block) never reaches it.
+async fn timed_new_payload(
+    call: impl Future<Output = Result<PayloadStatusV1, EngineError>>,
+) -> Result<PayloadStatusV1, EngineError> {
+    let sent = Instant::now();
+    let status = call.await;
+    let validity = status.as_ref().ok().map(verdict);
+    let outcome = outcome_label(validity.as_ref());
+    crate::metrics::observe_engine_new_payload(outcome, sent.elapsed());
+    status
 }
 
-/// [`ask_envelope`] with the engine's raw answer, for a caller that must tell
+/// The `outcome` an answer is counted under: its verdict, or `no_verdict`
+/// when there is none. That is either the retry ladder running out without an
+/// answer, or a JSON-RPC error answer ([`EngineError::Rpc`]), which ends the
+/// call at its first attempt since asking again would get the same refusal.
+///
+/// `not_required` is listed for completeness: a status from the execution
+/// client always reads as one of the other three verdicts.
+pub fn outcome_label(verdict: Option<&PayloadValidity>) -> &'static str {
+    match verdict {
+        Some(PayloadValidity::Validated) => "valid",
+        Some(PayloadValidity::Optimistic) => "optimistic",
+        Some(PayloadValidity::Invalidated { .. }) => "invalidated",
+        Some(PayloadValidity::NotRequired) => "not_required",
+        None => "no_verdict",
+    }
+}
+
+/// Asks the execution client about the payload `envelope` reveals for `block`,
+/// with `engine_newPayloadV5`, and hands back its raw answer.
+///
+/// Raw rather than read through [`verdict`], since the caller must tell
 /// `INVALID_BLOCK_HASH` (the envelope's contents do not hash to its claimed
 /// block hash, so only that envelope is bad) from `INVALID` (the payload the
-/// hash names is bad).
+/// hash names is bad). Never "nothing to ask": a block/envelope pair that does
+/// not match is an [`EngineError::EnvelopeMismatch`], which the caller must
+/// treat as a refusal to import.
 pub async fn ask_envelope_status(
     client: &EngineClient,
     block: &SignedBeaconBlock,
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<PayloadStatusV1, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    client
-        .new_payload_v5(
-            request.execution_payload,
-            &request.versioned_hashes,
-            request.parent_beacon_block_root,
-            &request.execution_requests,
-        )
-        .await
+    let call = client.new_payload_v5(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    timed_new_payload(call).await
 }
 
 #[cfg(test)]
