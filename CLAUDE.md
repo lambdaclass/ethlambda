@@ -84,22 +84,6 @@ Fork choice head update
 (Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
 `extract_latest_new_attestations`/`extract_latest_known_attestations`.)
 
-### Asynchronous `engine_newPayload` (beacon)
-`crates/blockchain/src/beacon_new_payload.rs`. On the running actor a pre-gloas
-block (optimistic candidate) imports as optimistic and a gloas envelope applies
-as `NOT_VALIDATED` before the EL answers; `engine_newPayload` goes out first from
-a tokio task that reports back with a `NewPayloadAnswered` message, applied as
-`optimistic-sync.md` applies a verdict. Sent parent-before-child, at most
-`MAX_NEW_PAYLOADS_IN_FLIGHT` in flight; `forkchoiceUpdated` names the newest
-payload on the head's chain whose request is not queued or in flight (so catch-up
-still feeds the EL a head); at most `MAX_PAYLOADS_AWAITING_VERDICT` wait (past
-that the import is held). No answer:
-kept optimistic, re-asked once a slot (a documented deviation). Without a
-mailbox (offline replay) and for non-candidates the import still waits inline,
-running the block's state transition while the request is out
-(`speculate_transition`, `docs/beacon_engine.md`).
-The actor records its own `ActorRef` in a `#[started]` hook for this.
-
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
 2. **process_block()**: Validate header → process attestations → update justifications/finality
@@ -438,10 +422,14 @@ where a bad value is reported.
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
-it must still precede key loading), `--node-key` resolution, resolving
-`--network` into a `NetworkSource` (mainnet only; must precede the next step,
-since a loaded network's own bootnode list is part of its fallback), reading
-`--bootnodes`, and building the aggregator, sync-status and event handles.
+it must still precede key loading), resolving `--network` into a
+`NetworkSource` (mainnet only; must precede the next step, since a loaded
+network's own bootnode list is part of its fallback), reading `--bootnodes`,
+building the aggregator, sync-status and event handles, opening `--data-dir`'s
+RocksDB backend, and `--node-key` resolution. That last one comes after the
+open because, without `--node-key`, the identity is `<data-dir>/node.key`,
+generated and stored on the directory's first start, and RocksDB's lock is
+what keeps two processes on one directory from racing to write it.
 
 It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainSetup`: the wire configuration, the ENR entries that describe it, the
@@ -605,6 +593,17 @@ default** on its two SSZ endpoints and bare integers in JSON, because
 `checkpoint_sync.rs` and other clients' lean sync read those bytes and may send no
 `Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
 
+With `--builder`, the beacon surface also runs the **fulu builder flow
+(MEV-Boost)**. `register_validator` forwards registrations to the builder
+(`beacon/registrations.rs`, client in `beacon/builder_client/`).
+`produceBlockV3` asks for the builder's bid alongside the local build and
+serves a blinded block when the bid passes its checks and wins on value
+(`beacon/builder_flow/`: bid checks, circuit breaker, boost-factor choice).
+`blinded_blocks` hands the signed block back for the builder to publish, with
+no local fallback, since a second block for the slot would be an equivocation. Gloas
+has no blinded blocks; its builder market is separate (the **Gloas** bullet
+under Beacon Chain STF).
+
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Block telemetry (`crates/common/telemetry`)
@@ -698,6 +697,12 @@ existing once per chain.
     validator: helpers that build the active-index `Vec` and then read each
     index back were the largest cost left in the import profile
     (`docs/beacon_stf.md`, "Registry and balances").
+- **`beacon::builder` holds builder-specs containers** (`ValidatorRegistrationV1`,
+  `BuilderBid`, `BlindedBeaconBlock`), not consensus ones: the MEV-Boost relay
+  flow's wire types. `BlindedBeaconBlock`'s root equals the full block's, which
+  is what lets a validator sign a block whose payload it never sees. Electra and
+  fulu shapes only. Tests decode builder-specs' own examples, vendored under
+  `crates/common/types/tests/fixtures/builder_specs/`.
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
@@ -848,13 +853,10 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the duties. `attestation_data.index` at a gloas slot comes from
   `Store::head_payload_status`.
   With `--execution-endpoint`, an envelope that passes the consensus checks is
-  applied at once (payload `NOT_VALIDATED`) and judged by `engine_newPayloadV5`
-  without waiting, like a pre-gloas block (see `beacon_new_payload` below):
-  INVALID with a null `latestValidHash` is a hash mismatch (the only answer
-  Engine API V2+ gives one) that takes the envelope back out and refuses only
-  that copy; INVALID with one condemns the payload via the execution-chain
-  walk; no answer keeps it applied and re-asks once a slot. Blocks built on a
-  FULL payload wait for its answer, not just its envelope. A gloas head sends
+  judged by `engine_newPayloadV5` (INVALID with a null `latestValidHash` is a
+  hash mismatch that refuses only that envelope; INVALID with one condemns the
+  payload via the execution-chain walk; an engine error keeps the envelope and
+  retries once a slot, probing with the oldest), and a gloas head sends
   `engine_forkchoiceUpdatedV4` with the custody columns (head hash by the head
   node's FULL or EMPTY status, finalized from the finalized block's and safe
   from the Fast Confirmation Rule's confirmed block's `bid.parent_block_hash`).
@@ -878,11 +880,21 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   and a block at slot N packs only `(N-1, parent_root)`, replaced by the empty
   aggregate when `verified_sync_aggregate` fails (see `docs/spec_deviations.md`).
   `SlotClock` picks the
-  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
-  keeps EIP-3076 minimal-watermark slashing protection in
+  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. With
+  `--builder-proposals`, pre-gloas slots register validators with the node's builder
+  and may sign a blinded block, published to the producing node only. From the
+  epoch before gloas it signs proposer preferences every slot for its proposals in
+  the current and next epoch (`PreferencesService`, v2 duties, signed at the
+  proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
+  client do), unconditionally, re-sending each kept one once an epoch (a node
+  holds them in memory only), and `produceBlockV4` carries the boost factor and
+  `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
+  carry, which the node's own gloas payload is built toward.
+  It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
-  durable before every block and attestation signature; PTC votes have an
-  in-memory `(validator, slot)` dedup only, and envelopes are unguarded.
+  durable before every block (blinded ones included) and attestation signature;
+  PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
+  unguarded.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
@@ -919,6 +931,15 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
+- **`assemble_blinded_block` does not use a blinded STF.** It runs `process_block`
+  on a stand-in payload built from the builder's header, then patches the two
+  post-state fields that depend on the payload itself
+  (`latest_execution_payload_header`, `latest_block_header.body_root`). It
+  also checks the header's `withdrawals_root` itself: the stand-in carries the
+  expected withdrawals, so the STF's own withdrawals check passes trivially. Fulu
+  only, since it is the last fork with blinded blocks. Read the function's doc
+  before touching fulu's `process_block`;
+  `blinded_and_full_blocks_reach_the_same_state_root` fails on any drift.
 
 ## Configuration Files
 

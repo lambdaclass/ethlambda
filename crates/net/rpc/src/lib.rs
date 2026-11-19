@@ -31,6 +31,9 @@ mod shared;
 mod spec;
 pub mod test_driver;
 
+pub use beacon::builder_client::{BuilderClient, BuilderError, VersionedBid};
+pub use beacon::builder_flow::breaker::FallbackThresholds;
+
 pub(crate) use base::json_response;
 
 #[derive(Debug, Clone)]
@@ -277,6 +280,12 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
+    /// The builder `--builder` names, for the builder flow's endpoints.
+    /// `None` when the node runs without one.
+    pub builder: Option<BuilderClient>,
+    /// When block production skips the builder for a local block
+    /// (`--builder-fallback-*`). Unused without a builder.
+    pub builder_fallback: FallbackThresholds,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -293,6 +302,13 @@ pub async fn start_beacon_rpc_server(
     peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let builder = handles.builder.map(|client| {
+        Arc::new(beacon::builder_flow::Builder::new(
+            client,
+            handles.builder_fallback,
+            sync_status.clone(),
+        ))
+    });
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
@@ -307,6 +323,12 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
+    // Layered only when `--builder` is set, so every handler reads it as an
+    // `Option<Extension<_>>` and a node without one keeps the local path.
+    let api_router = match builder {
+        Some(builder) => api_router.layer(Extension(builder)),
+        None => api_router,
+    };
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -789,6 +811,19 @@ pub(crate) mod test_utils {
         Some(client.expect("building a client opens no connection"))
     }
 
+    /// A block root of its own for every `slot`, never the zero hash: `slot + 1`
+    /// in the last eight bytes, big-endian.
+    ///
+    /// For filling a state's `block_roots` so a root read from the wrong slot
+    /// shows up. `H256::repeat_byte(slot as u8 + 1)` cannot do that: the window
+    /// is `SLOTS_PER_HISTORICAL_ROOT` long, more slots than a byte counts, so it
+    /// overflows at slot 255 (a panic in debug, repeating roots in release).
+    pub(crate) fn slot_root(slot: u64) -> H256 {
+        let mut root = [0; 32];
+        root[24..].copy_from_slice(&(slot + 1).to_be_bytes());
+        H256(root)
+    }
+
     /// A beacon store whose anchor, and so head, is `state`, under a block at
     /// the state's slot. Returns the store and that block's root.
     ///
@@ -844,6 +879,20 @@ pub(crate) mod test_utils {
             .update_checkpoints(ForkCheckpoints::head_only(root))
             .expect("make the anchor the head");
         (store, root)
+    }
+
+    /// Finalizes `root` at `slot`'s epoch, leaving the head at `head`.
+    ///
+    /// For a store that keeps its anchor state under a second root, the one a
+    /// block built on it names as its parent: a real anchor's finalized
+    /// checkpoint names that root, and the publish endpoints refuse a parent
+    /// at the finalized slot that is not the finalized block.
+    pub(crate) fn finalize_at(store: &mut Store, head: H256, root: H256, slot: u64) {
+        let finalized = Checkpoint { root, slot };
+        let checkpoints = ForkCheckpoints::new(head, None, Some(finalized));
+        store
+            .update_checkpoints(checkpoints)
+            .expect("finalize the anchor's second root");
     }
 
     /// A beacon store whose head is `block` (a block at `state`'s slot) with

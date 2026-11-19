@@ -1,10 +1,10 @@
 //! `GET`, `POST` and `DELETE /eth/v1/validator/{pubkey}/feerecipient`,
 //! `/graffiti` and `/gas_limit`.
 //!
-//! Each overrides one validator's setting in [`ProposerSettings`], which holds
-//! them in memory only: a restart puts every validator back on the command
-//! line's defaults. See [`crate::proposer_settings`] for why, and for when a
-//! change takes effect.
+//! Each overrides one validator's setting in [`ProposerSettings`], and first
+//! writes it onto that validator's entry in `validator_definitions.yml`, so a
+//! restart runs with it. See [`crate::proposer_settings`] for when a change
+//! takes effect.
 //!
 //! `GET` answers the validator's own value, or the process-wide default when it
 //! has none, as the specification asks. `DELETE` drops the validator's own
@@ -12,27 +12,31 @@
 //! one to drop.
 //!
 //! Every route answers 404 for a key this client does not hold. The check and
-//! the change happen under one read of the validator store, so a keystore
-//! delete, which takes that store's write lock and then forgets the key's
-//! settings, cannot land between them and leave an override behind for a key
-//! that is gone.
+//! the change happen under one hold of `definitions_lock`, which a keystore
+//! delete also holds from before it removes the key until after it has
+//! forgotten the key's settings, so a delete cannot land between them and
+//! leave an override behind for a key that is gone. The validator store's own
+//! lock is read for the check alone and released before the file is touched,
+//! since the duty loop signs under it. The file is written before memory
+//! changes: a failed write is a 500 that changes nothing, so what the operator
+//! sees is what the next restart loads.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress, H160};
+use ethlambda_types::beacon::primitives::BlsPubkey;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::beacon_node::dto::{encode_hex, parse_pubkey};
+use crate::error::Error;
 use crate::http_api::KeymanagerContext;
-use crate::keys::ValidatorStore;
-use crate::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text, graffiti_to_text};
-
-/// An execution address is exactly this wide.
-const ADDRESS_BYTES: usize = 20;
+use crate::keys::{ValidatorDefinitions, ValidatorStore};
+use crate::proposer_settings::{
+    GRAFFITI_BYTES, SettingChange, fee_recipient_from_text, graffiti_from_text, graffiti_to_text,
+};
 
 /// The keymanager API's error body, `{"message": ...}`.
 #[derive(Debug)]
@@ -101,12 +105,12 @@ pub struct SetGasLimitRequest {
 }
 
 /// The key in the path, or a 400 when it is not one.
-fn parse_path_key(text: &str) -> Result<BlsPubkey, ApiError> {
+pub(crate) fn parse_path_key(text: &str) -> Result<BlsPubkey, ApiError> {
     parse_pubkey(text).map_err(|err| ApiError::BadRequest(err.to_string()))
 }
 
 /// A 404 unless the store holds `pubkey`.
-fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiError> {
+pub(crate) fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiError> {
     if store.contains(pubkey) {
         Ok(())
     } else {
@@ -117,37 +121,89 @@ fn require_held(store: &ValidatorStore, pubkey: &BlsPubkey) -> Result<(), ApiErr
     }
 }
 
-/// `0x` and forty hex digits, the specification's `EthAddress` pattern.
-fn parse_address(text: &str) -> Result<ExecutionAddress, ApiError> {
-    let Some(digits) = text.strip_prefix("0x") else {
-        return Err(ApiError::BadRequest(
-            "ethaddress must be 0x-prefixed hex".to_string(),
-        ));
-    };
-    let bytes = hex::decode(digits)
-        .map_err(|err| ApiError::BadRequest(format!("ethaddress is not hex: {err}")))?;
-    let bytes: [u8; ADDRESS_BYTES] = bytes.try_into().map_err(|got: Vec<u8>| {
-        ApiError::BadRequest(format!(
-            "ethaddress is {} bytes, expected {ADDRESS_BYTES}",
-            got.len()
-        ))
-    })?;
-    Ok(H160(bytes))
+/// Persist `change` on `pubkey`'s definitions entry, then apply it in memory.
+///
+/// Locks in the order the keystore routes take them: `definitions_lock`
+/// first, which serialises this open-mutate-save cycle against a concurrent
+/// import or delete, then `store`'s read lock for the held check.
+///
+/// The read lock is released as soon as the check has answered, not kept
+/// across the file work below. It does not need to be: only a delete removes
+/// a key, and a delete holds `definitions_lock` for its whole duration, so
+/// none can land before the change is applied.
+///
+/// A held key with no entry in the file can only mean the file was edited
+/// under a running client. That is a 500 naming the file rather than a
+/// memory-only change the operator would believe persisted.
+async fn persist_and_apply(
+    context: &KeymanagerContext,
+    pubkey: &BlsPubkey,
+    change: SettingChange,
+) -> Result<(), ApiError> {
+    let _definitions_guard = context.definitions_lock.lock().await;
+    // The guard is a temporary of this statement, so it is gone before the
+    // file is opened.
+    require_held(&*context.store.read().await, pubkey)?;
+
+    let path = context
+        .validators_dir
+        .join(crate::keys::definitions::DEFINITIONS_FILE);
+    let mut definitions = ValidatorDefinitions::open(&context.validators_dir)
+        .map_err(|err| ApiError::Internal(format!("could not read {}: {err}", path.display())))?;
+    let entry = definitions
+        .0
+        .iter_mut()
+        .find(|definition| {
+            parse_pubkey(&definition.voting_public_key)
+                .map(|parsed| parsed == *pubkey)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "validator {} is loaded but has no entry in {}; the file was changed under a \
+                 running client, so the change was not made",
+                encode_hex(&pubkey.0),
+                path.display()
+            ))
+        })?;
+    entry.apply(change);
+    match crate::http_api::keystores::save_definitions(context, &definitions) {
+        Ok(()) => {}
+        // The rename is the commit: the file holds the change and every
+        // reader sees it, only its survival of a power loss is in doubt. A
+        // 500 here would tell the operator nothing changed while the next
+        // start loads the change, so memory follows the file.
+        Err(Error::Unflushed { path, source }) => warn!(
+            %path,
+            %source,
+            "Validator definitions written, but the directory could not be flushed"
+        ),
+        Err(err) => {
+            return Err(ApiError::Internal(format!(
+                "could not write {}: {err}",
+                path.display()
+            )));
+        }
+    }
+
+    context.settings.apply(pubkey, change);
+    Ok(())
 }
 
 /// A decimal `u64` with no sign and no leading zero, the specification's
 /// `Uint64` pattern. Stricter than `str::parse`, which takes a leading `+`.
-fn parse_uint64(text: &str) -> Result<u64, ApiError> {
+/// `field` names the value in the 400.
+pub(crate) fn parse_uint64(field: &str, text: &str) -> Result<u64, ApiError> {
     let well_formed = !text.is_empty()
         && text.bytes().all(|byte| byte.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
     if !well_formed {
         return Err(ApiError::BadRequest(format!(
-            "gas_limit {text:?} is not a decimal unsigned integer"
+            "{field} {text:?} is not a decimal unsigned integer"
         )));
     }
     text.parse()
-        .map_err(|_| ApiError::BadRequest(format!("gas_limit {text} does not fit in 64 bits")))
+        .map_err(|_| ApiError::BadRequest(format!("{field} {text} does not fit in 64 bits")))
 }
 
 pub async fn get_fee_recipient(
@@ -182,19 +238,15 @@ pub async fn set_fee_recipient(
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
     let Json(request) = body?;
-    let address = parse_address(&request.ethaddress)?;
-    // The specification forbids it outright: it would read as an address
-    // chosen on purpose, and pays nobody.
-    if address == H160([0; ADDRESS_BYTES]) {
-        return Err(ApiError::BadRequest(
-            "the zero address cannot be set as a fee recipient".to_string(),
-        ));
-    }
+    let address = fee_recipient_from_text(&request.ethaddress)
+        .map_err(|why| ApiError::BadRequest(format!("ethaddress {why}")))?;
 
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.set_fee_recipient(&pubkey, address);
-    drop(store);
+    persist_and_apply(
+        &context,
+        &pubkey,
+        SettingChange::FeeRecipient(Some(address)),
+    )
+    .await?;
 
     info!(
         pubkey = %encode_hex(&pubkey.0),
@@ -209,10 +261,7 @@ pub async fn delete_fee_recipient(
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.clear_fee_recipient(&pubkey);
-    drop(store);
+    persist_and_apply(&context, &pubkey, SettingChange::FeeRecipient(None)).await?;
 
     info!(pubkey = %encode_hex(&pubkey.0), "Fee recipient reset to the default");
     Ok(StatusCode::NO_CONTENT)
@@ -247,10 +296,7 @@ pub async fn set_graffiti(
         )));
     };
 
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.set_graffiti(&pubkey, graffiti);
-    drop(store);
+    persist_and_apply(&context, &pubkey, SettingChange::Graffiti(Some(graffiti))).await?;
 
     info!(pubkey = %encode_hex(&pubkey.0), graffiti = ?request.graffiti, "Graffiti set");
     Ok(StatusCode::ACCEPTED)
@@ -261,10 +307,7 @@ pub async fn delete_graffiti(
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.clear_graffiti(&pubkey);
-    drop(store);
+    persist_and_apply(&context, &pubkey, SettingChange::Graffiti(None)).await?;
 
     info!(pubkey = %encode_hex(&pubkey.0), "Graffiti reset to the default");
     Ok(StatusCode::NO_CONTENT)
@@ -292,12 +335,17 @@ pub async fn set_gas_limit(
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
     let Json(request) = body?;
-    let gas_limit = parse_uint64(&request.gas_limit)?;
+    let gas_limit = parse_uint64("gas_limit", &request.gas_limit)?;
+    // Refused as `--gas-limit` refuses it. From gloas this value is signed
+    // into the proposer preferences, which cannot be replaced for their
+    // dependent root, and the node builds this client's payload toward it.
+    if gas_limit == 0 {
+        return Err(ApiError::BadRequest(
+            "a gas limit of zero cannot be set".to_string(),
+        ));
+    }
 
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.set_gas_limit(&pubkey, gas_limit);
-    drop(store);
+    persist_and_apply(&context, &pubkey, SettingChange::GasLimit(Some(gas_limit))).await?;
 
     info!(pubkey = %encode_hex(&pubkey.0), gas_limit, "Gas limit set");
     Ok(StatusCode::ACCEPTED)
@@ -308,10 +356,7 @@ pub async fn delete_gas_limit(
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
-    let store = context.store.read().await;
-    require_held(&store, &pubkey)?;
-    context.settings.clear_gas_limit(&pubkey);
-    drop(store);
+    persist_and_apply(&context, &pubkey, SettingChange::GasLimit(None)).await?;
 
     info!(pubkey = %encode_hex(&pubkey.0), "Gas limit reset to the default");
     Ok(StatusCode::NO_CONTENT)
@@ -323,14 +368,16 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
-    use ethlambda_types::beacon::primitives::Bytes32;
+    use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
     use http_body_util::BodyExt as _;
     use tokio::sync::RwLock;
     use tower::ServiceExt as _;
 
     use super::*;
     use crate::http_api::router;
-    use crate::proposer_settings::{DEFAULT_GAS_LIMIT, ProposerSettings};
+    use crate::http_api::tests::exit_route_context;
+    use crate::keys::ValidatorDefinition;
+    use crate::proposer_settings::{ADDRESS_BYTES, DEFAULT_GAS_LIMIT, ProposerSettings};
 
     const TOKEN: &str = "test-token";
 
@@ -338,9 +385,21 @@ mod tests {
         app: axum::Router,
         settings: Arc<ProposerSettings>,
         pubkey: BlsPubkey,
-        /// Kept alive for the test that deletes a keystore, which writes the
-        /// definitions file.
-        _dir: tempfile::TempDir,
+        /// The validators directory, holding the definitions file the routes
+        /// write through.
+        dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        /// The key's entry as the file holds it now.
+        fn entry(&self) -> ValidatorDefinition {
+            ValidatorDefinitions::open(self.dir.path())
+                .expect("opens")
+                .0
+                .into_iter()
+                .find(|entry| entry.voting_public_key == encode_hex(&self.pubkey.0))
+                .expect("the key's entry")
+        }
     }
 
     fn secret() -> [u8; 32] {
@@ -355,18 +414,41 @@ mod tests {
     }
 
     /// A router over a store holding one key, with a default graffiti of
-    /// `default` and, when `fee_recipient` is `Some`, a default address.
+    /// `default` and, when `fee_recipient` is `Some`, a default address. The
+    /// definitions file names the key, as it would for any loaded key.
     fn harness(fee_recipient: Option<ExecutionAddress>) -> Harness {
+        let harness = harness_without_definitions(fee_recipient);
+        ValidatorDefinitions(vec![ValidatorDefinition {
+            enabled: true,
+            voting_public_key: encode_hex(&harness.pubkey.0),
+            voting_keystore_path: harness.dir.path().join("voting-keystore.json"),
+            voting_keystore_password_path: harness.dir.path().join("password"),
+            suggested_fee_recipient: None,
+            graffiti: None,
+            gas_limit: None,
+        }])
+        .save(harness.dir.path())
+        .expect("writes the definitions file");
+        harness
+    }
+
+    /// [`harness`] with no definitions file at all: a key in memory the file
+    /// does not describe.
+    fn harness_without_definitions(fee_recipient: Option<ExecutionAddress>) -> Harness {
         let mut store = ValidatorStore::new();
         let pubkey = store.insert_secret("test", &secret()).expect("inserts");
         let settings = Arc::new(ProposerSettings::new(default_graffiti(), fee_recipient));
         let dir = tempfile::tempdir().expect("temp dir");
+        let (beacon_node, signing, clock) = exit_route_context();
         let context = KeymanagerContext {
             store: Arc::new(RwLock::new(store)),
             settings: settings.clone(),
             validators_dir: dir.path().to_path_buf(),
             secrets_dir: dir.path().to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),
+            beacon_node,
+            signing,
+            clock,
             definitions_unflushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protection: crate::slashing_protection::SlashingProtection::in_memory(),
         };
@@ -374,7 +456,7 @@ mod tests {
             app: router(context, TOKEN.to_string()),
             settings,
             pubkey,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -571,6 +653,22 @@ mod tests {
         );
     }
 
+    /// `"0"` is a well-formed `Uint64`, but refused as `--gas-limit` refuses
+    /// it, and an override already set is left as it was.
+    #[tokio::test]
+    async fn a_zero_gas_limit_is_refused() {
+        let harness = harness(None);
+        let path = uri(&harness.pubkey, "gas_limit");
+        let set = serde_json::json!({ "gas_limit": "30000000" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let zero = serde_json::json!({ "gas_limit": "0" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(zero))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(harness.settings.gas_limit(&harness.pubkey), 30_000_000);
+    }
+
     #[tokio::test]
     async fn a_key_this_client_does_not_hold_is_not_found() {
         let harness = harness(Some(default_address()));
@@ -611,6 +709,129 @@ mod tests {
         let (status, body) = send(&harness.app, request("POST", &path, Some(set))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["message"].is_string(), "got {body}");
+    }
+
+    /// Every change lands on the key's entry in the definitions file before
+    /// it is answered, and a delete takes the field out again.
+    #[tokio::test]
+    async fn a_change_is_written_to_the_definitions_file_and_a_delete_removes_it() {
+        let harness = harness(Some(default_address()));
+        let own = format!("0x{}", "bb".repeat(ADDRESS_BYTES));
+
+        let set = serde_json::json!({ "ethaddress": own });
+        let path = uri(&harness.pubkey, "feerecipient");
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            harness.entry().suggested_fee_recipient.as_deref(),
+            Some(own.as_str())
+        );
+
+        let set = serde_json::json!({ "graffiti": "hello" });
+        let path = uri(&harness.pubkey, "graffiti");
+        send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(harness.entry().graffiti.as_deref(), Some("hello"));
+
+        let set = serde_json::json!({ "gas_limit": "30000000" });
+        let path = uri(&harness.pubkey, "gas_limit");
+        send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(harness.entry().gas_limit, Some(30_000_000));
+
+        for setting in ["feerecipient", "graffiti", "gas_limit"] {
+            let request = request("DELETE", &uri(&harness.pubkey, setting), None);
+            let (status, _) = send(&harness.app, request).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "DELETE {setting}");
+        }
+        let entry = harness.entry();
+        assert_eq!(entry.suggested_fee_recipient, None);
+        assert_eq!(entry.graffiti, None);
+        assert_eq!(entry.gas_limit, None);
+    }
+
+    /// What a restart does with the file: the overrides a previous run
+    /// persisted are the ones the next run proposes with.
+    #[tokio::test]
+    async fn persisted_overrides_survive_a_restart() {
+        let harness = harness(Some(default_address()));
+        let own = format!("0x{}", "bb".repeat(ADDRESS_BYTES));
+        let set = serde_json::json!({ "ethaddress": own });
+        let path = uri(&harness.pubkey, "feerecipient");
+        send(&harness.app, request("POST", &path, Some(set))).await;
+        let set = serde_json::json!({ "graffiti": "persisted" });
+        let path = uri(&harness.pubkey, "graffiti");
+        send(&harness.app, request("POST", &path, Some(set))).await;
+
+        // A fresh `ProposerSettings`, as a restart builds, seeded as startup
+        // seeds it.
+        let restarted = ProposerSettings::new(default_graffiti(), Some(default_address()));
+        let seeded = ValidatorDefinitions::open(harness.dir.path())
+            .expect("opens")
+            .seed_overrides(&restarted)
+            .expect("seeds");
+        assert_eq!(seeded, 1);
+        assert_eq!(
+            restarted.fee_recipient(&harness.pubkey),
+            Some(H160([0xbb; ADDRESS_BYTES]))
+        );
+        assert_eq!(
+            restarted.graffiti(&harness.pubkey),
+            graffiti_from_text("persisted").expect("fits")
+        );
+        assert_eq!(restarted.gas_limit(&harness.pubkey), DEFAULT_GAS_LIMIT);
+    }
+
+    /// A loaded key the file does not describe means the file was changed
+    /// under the client. The change is refused rather than kept in memory
+    /// alone, where the operator would believe it persisted.
+    #[tokio::test]
+    async fn a_key_missing_from_the_definitions_file_is_a_500_and_memory_is_unchanged() {
+        let harness = harness_without_definitions(None);
+        let set = serde_json::json!({ "graffiti": "hello" });
+        let path = uri(&harness.pubkey, "graffiti");
+        let (status, body) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("validator_definitions.yml")),
+            "got {body}"
+        );
+        assert_eq!(
+            harness.settings.graffiti(&harness.pubkey),
+            default_graffiti(),
+            "a change that was not persisted must not take effect"
+        );
+        let (status, _) = send(&harness.app, request("DELETE", &path, None)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A file that cannot be written is a 500 that changes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_that_cannot_be_written_is_a_500_and_memory_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let harness = harness(None);
+        // Saving writes a sibling temporary file, which a read-only directory
+        // refuses. Root is exempt from permission bits, so the test is moot
+        // there rather than wrong.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        std::fs::set_permissions(harness.dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+
+        let set = serde_json::json!({ "graffiti": "hello" });
+        let path = uri(&harness.pubkey, "graffiti");
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        std::fs::set_permissions(harness.dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back, so the directory can be removed");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            harness.settings.graffiti(&harness.pubkey),
+            default_graffiti()
+        );
+        assert_eq!(harness.entry().graffiti, None, "the file is unchanged too");
     }
 
     /// A deleted key's overrides go with it, so the same key imported again

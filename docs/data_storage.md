@@ -702,7 +702,28 @@ Reads go through `get_state`, which tries three levels:
 ```
 
 If the diff chain is broken or the target's header is missing, `get_state`
-returns `None` rather than a partial state.
+returns `None` rather than a partial state. If a read fails, or a state on
+the way does not decode (a snapshot, a delta that does not apply to its base,
+a lean snapshot or diff), it returns an error rather than panicking:
+`Error::StateRebuild` wrapping `Error::Storage` or `Error::CorruptState`. A
+`BlockHeaders` row that does not decode still panics, in the slot lookup that
+reads it before any state row. Each caller decides what an error costs: p2p's
+column checks drop the one sidecar and log it, while fork choice and the state
+writer still panic on it.
+
+Concurrent misses on one root rebuild it once (`StateRebuilds` in
+`crates/storage/src/state_writer.rs`, a `OnceLock` per root under way). The
+first caller rebuilds. Every other caller that misses on that root while the
+rebuild is under way waits for it and gets the same result, so p2p's
+per-sidecar column checks, the chain actor and the RPC asking for one evicted
+parent state cost one snapshot read and one decode, not one each. A failed
+rebuild's error is shared the same way, so a failing root is read once rather
+than once per caller, and every caller waiting on it fails: a late block's
+eight custody columns are all dropped when their parent's state does not read
+back. The first caller out removes the rebuild's entry; a miss arriving
+before that takes the settled result, and any later miss reads storage
+again. A rebuild that panics hands the waiting callers nothing, and one of
+them rebuilds for the rest.
 
 ## Write Paths: What a Block Import Persists
 
@@ -930,6 +951,15 @@ current slot: ~30 minutes at lean's four-second slots, ~90 minutes at beacon's
 twelve-second ones. A staler DB, or one whose anchor checkpoint state is
 missing, falls through to checkpoint sync, which writes a fresh anchor on top
 of the existing data.
+
+One file in `--data-dir` is not RocksDB's: `node.key`, the node's secp256k1
+libp2p and discv5 identity. When `--node-key` is absent, `run_node` reads it on
+every start and generates it on the first (hex, mode `0600`). It never goes
+through the `StorageBackend`, is written only after the DB is open so RocksDB's
+lock covers it, and is lost with the directory when the directory is wiped,
+together with the custody columns that identity selected. A `node.key` that
+fails to load stops startup rather than being replaced; deleting it is how to
+ask for a new identity.
 
 ## Key Files
 
