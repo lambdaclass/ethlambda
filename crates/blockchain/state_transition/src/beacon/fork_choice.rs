@@ -4832,8 +4832,12 @@ pub fn on_block(
 ///
 /// Opaque on purpose: the only thing a holder can do with one is hand it to
 /// [`on_block_speculative`], which decides whether it may stand in for the
-/// transition `on_block` would otherwise run. Until then it is a local value;
-/// nothing here has reached the store, and dropping it costs only the work.
+/// transition `on_block` would otherwise run. Until then it is a local value:
+/// the block, its post-state and its fork choice records have not reached the
+/// store, and dropping it costs only the work. Computing it may still write one
+/// content-keyed cache entry, the boundary balances of an epoch-crossing block's
+/// checkpoint (see [`speculate_transition`]), which is the entry `on_block`'s
+/// own transition would write and is correct whether or not the block imports.
 ///
 /// # Why it is the transition `on_block` would run
 ///
@@ -4853,6 +4857,12 @@ pub fn on_block(
 /// block, the config and the committee and active-balance caches, which are
 /// content-keyed as well. The chain actor handles one message at a time, so
 /// nothing mutates the store between this computation and `on_block`'s own.
+///
+/// That last sentence is an argument, not something the types enforce, so
+/// builds with debug assertions (the test suite's `release-fast` included)
+/// check it: whenever [`on_block_speculative`] uses a speculation it also runs
+/// the transition itself and panics unless both agree on the outcome and, for
+/// a success, on the post-state root.
 pub struct SpeculativeTransition {
     block_root: Root,
     parent_root: Root,
@@ -4868,15 +4878,49 @@ impl SpeculativeTransition {
     pub fn is_for(&self, block_root: Root, parent_root: Root) -> bool {
         self.block_root == block_root && self.parent_root == parent_root
     }
+
+    /// Panics unless `fresh`, the transition `on_block` computed itself, agrees
+    /// with this speculation: the same outcome and, when it succeeded, the same
+    /// post-state root.
+    ///
+    /// Outcomes are compared through their `Debug` rendering, since the error
+    /// type carries no `PartialEq`, and roots only on success, since a failed
+    /// transition's partial state is never used. Debug builds only: it doubles
+    /// the transition, which is the cost the speculation exists to hide.
+    #[cfg(debug_assertions)]
+    fn assert_agrees_with(&self, fresh: &(BeaconState, Result<()>)) {
+        let (fresh_state, fresh_outcome) = fresh;
+        assert_eq!(
+            format!("{:?}", self.outcome),
+            format!("{fresh_outcome:?}"),
+            "the speculative transition disagrees with on_block's own on the outcome"
+        );
+        if self.outcome.is_ok() {
+            assert_eq!(
+                self.state.hash_tree_root(),
+                fresh_state.hash_tree_root(),
+                "the speculative transition disagrees with on_block's own on the post-state root"
+            );
+        }
+    }
 }
 
 /// Runs `signed_block`'s state transition against its parent's post-state with
-/// the execution engine assumed valid, without touching the store.
+/// the execution engine assumed valid, without importing anything.
+///
+/// The store is only read, with one exception: an epoch-crossing block's
+/// transition caches its boundary checkpoint's balances
+/// ([`cache_boundary_balances`]) and counts a precomputed-state lookup, exactly
+/// as `on_block`'s own transition would. The entry is keyed by the checkpoint
+/// and built from the parent's state alone, so it is right whatever becomes of
+/// the block.
 ///
 /// `None` when the parent has no post-state, the same condition under which
 /// `on_block` fails with `block.parent_root in store.block_states`; the caller
-/// then gets that failure from `on_block` itself. The parent state is looked up
-/// exactly as `on_block` looks it up.
+/// then gets that failure from `on_block` itself. Also `None` when reading the
+/// parent's state fails: this is optional work on the chain actor's thread, so
+/// a storage error must not panic it here, and `on_block` meets the same error
+/// on its own lookup and reports it there.
 ///
 /// None of `on_block`'s own checks run here. They run, unchanged and in the
 /// same order, when the speculation is handed to [`on_block_speculative`], so a
@@ -4890,7 +4934,7 @@ pub fn speculate_transition(
 ) -> Option<SpeculativeTransition> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
-    let parent_state = store.get_state(&parent_root).expect("get")?;
+    let parent_state = store.get_state(&parent_root).ok().flatten()?;
     let active_balances = store.active_balance_cache();
     let (state, outcome) = transition_block(
         store,
@@ -4920,6 +4964,9 @@ pub fn speculate_transition(
 /// disagree with), its result stands in for that call. In every other case it
 /// is dropped and the transition runs here as it always has, so the
 /// invalidation path in particular is the one `on_block` has today.
+///
+/// With debug assertions on, a speculation that is used is also checked
+/// against the transition run here (see [`SpeculativeTransition`]).
 pub fn on_block_speculative(
     store: &mut Store,
     signed_block: SignedBeaconBlock,
@@ -5103,9 +5150,8 @@ pub fn on_block_speculative(
     let usable = speculation.filter(|speculation| {
         speculation.is_for(block_root, parent_root) && !payload_validity.is_invalidated()
     });
-    let (mut state, transition) = match usable {
-        Some(speculation) => (speculation.state, speculation.outcome),
-        None => transition_block(
+    let fresh_transition = || {
+        transition_block(
             store,
             &parent_state,
             parent_root,
@@ -5115,7 +5161,15 @@ pub fn on_block_speculative(
             &engine,
             committees,
             &active_balances,
-        ),
+        )
+    };
+    let (mut state, transition) = match usable {
+        Some(speculation) => {
+            #[cfg(debug_assertions)]
+            speculation.assert_agrees_with(&fresh_transition());
+            (speculation.state, speculation.outcome)
+        }
+        None => fresh_transition(),
     };
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
@@ -7524,7 +7578,18 @@ mod tests {
         Some(speculation)
     }
 
+    /// Without debug assertions the poisoned outcome is the import's result,
+    /// which proves the speculation stood in for the transition. With them
+    /// (every test build, `release-fast` included) `on_block_speculative` also
+    /// runs the transition and refuses to use a speculation that disagrees, so
+    /// the same import is the check that the invariant is enforced.
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the speculative transition disagrees with on_block's own on the outcome"
+        )
+    )]
     fn a_matching_speculation_is_the_transition_on_block_uses() {
         let (result, store, root) = import_valid_child(&PayloadValidity::Validated, poisoned);
         assert_eq!(failed_assertion(result), Some(POISON));
@@ -7532,6 +7597,43 @@ mod tests {
             !store.has_state(&root).unwrap(),
             "a failed import writes nothing"
         );
+    }
+
+    /// The post-state half of the same check: a speculation that succeeded, as
+    /// the real transition does, but holds a different state. Without debug
+    /// assertions that state is what the import stores.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(
+            expected = "the speculative transition disagrees with on_block's own on the post-state root"
+        )
+    )]
+    fn a_speculation_with_another_post_state_is_caught_in_debug_builds() {
+        let (_, honest_store, root) =
+            import_valid_child(&PayloadValidity::Validated, honest_speculation);
+        let honest_root = honest_store
+            .get_state(&root)
+            .expect("get")
+            .expect("the honest import succeeds")
+            .hash_tree_root();
+        let (result, store, _) =
+            import_valid_child(&PayloadValidity::Validated, |store, block, config| {
+                let mut speculation = honest_speculation(store, block, config)?;
+                speculation
+                    .outcome
+                    .as_ref()
+                    .expect("the transition succeeds");
+                speculation.state.latest_block_header_mut().body_root = Root::repeat_byte(0xab);
+                Some(speculation)
+            });
+        result.expect("the import takes the speculation's outcome");
+        let stored = store
+            .get_state(&root)
+            .expect("get")
+            .expect("imported")
+            .hash_tree_root();
+        assert_ne!(stored, honest_root, "the speculation's state was stored");
     }
 
     #[test]
