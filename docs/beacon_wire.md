@@ -212,12 +212,17 @@ an unbounded progressive bitlist, so one longer than electra's type bound is
 REJECTed first, reading its length without expanding it, since expanding is
 what the seen-set check does before any other.
 
-One rule on `beacon_block` (bellatrix to fulu) and `execution_payload` is
-stricter than the specification: the payload's `block_hash` must equal the hash
-of the execution header rebuilt from the payload's own fields, or the message is
-REJECTed (`beacon/payload_hash.rs`; the reason is `payload_block_hash_mismatch`,
-and `lean_beacon_payload_block_hash_mismatch_total{kind}` counts it). It runs
-after the cheap rules and before the stateful half. See
+One rule on `beacon_block` (bellatrix to fulu) is stricter than the
+specification: the payload's `block_hash` must equal the hash of the execution
+header rebuilt from the payload's own fields, or the block is IGNOREd
+(`beacon/payload_hash.rs`; the reason is `payload_block_hash_mismatch`, and
+`lean_beacon_payload_block_hash_mismatch_total{kind}` counts it). It runs at the
+end of the stateful half, on a block the topic's rules accepted, so only a block
+whose proposer signature verified is hashed. IGNORE rather than REJECT, since
+other clients have no such rule and relay the block. A block answered `Queue`
+or forwarded under `Overloaded` is not hashed. `execution_payload` envelopes
+are hashed the same way once accepted, but a mismatch is only counted and
+logged until the Amsterdam header is final. See
 [spec_deviations.md](./spec_deviations.md#a-payloads-block-hash-must-be-its-headers).
 
 Three deliberate departures from the gloas gossip rules, each for want of state
@@ -649,8 +654,8 @@ not imported only briefly and in small numbers, so a batch's envelopes must
 arrive before the next batch's blocks do. Everything fetched goes through the
 same rules as an `execution_payload` gossip message
 (`beacon/envelope_checks.rs`) before the actor sees it; a `Queue` verdict is
-forwarded too. That includes the payload block hash rule above, which the
-specification does not have.
+forwarded too. An accepted one also has its payload block hash checked, as
+above, which counts a mismatch without refusing the envelope.
 
 ### Data column sidecars
 
@@ -853,7 +858,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
-| `lean_beacon_payload_block_hash_mismatch_total{kind}` | Payloads refused because `block_hash` is not the hash of the header rebuilt from their fields, by `block` / `envelope` |
+| `lean_beacon_payload_block_hash_mismatch_total{kind}` | Signed payloads whose `block_hash` is not the hash of the header rebuilt from their fields: `block` (a gossip block, IGNOREd) / `envelope` (counted, not refused) |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |

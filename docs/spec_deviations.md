@@ -528,34 +528,66 @@ that the tests compare like with like.
 
 ## A payload's block hash must be its header's
 
-`beacon_block` (bellatrix to fulu) and `execution_payload` gossip, and every
-envelope fetched by root or range, are REJECTed when the payload's `block_hash`
-is not `keccak256(rlp(header))` for the execution block header rebuilt from the
-payload's own fields.
+A `beacon_block` gossip message (bellatrix to fulu) whose payload `block_hash`
+is not `keccak256(rlp(header))`, for the execution block header rebuilt from the
+payload's own fields, is IGNOREd once the topic's own rules have accepted it.
+Gloas envelopes, from gossip or fetched, are checked the same way but only
+counted.
 
 - **The specification:** has no such rule. A hash that does not match is the
   execution client's to find, when the chain actor hands it the payload.
 - **ethlambda:** rebuilds the header in `ethlambda-p2p`
-  (`beacon/payload_hash.rs`) and refuses the message before the stateful rules
-  run. The header takes the payload's fields, the transactions and withdrawals
-  tries, the parent beacon block root (the block's `parent_root`; the
-  envelope's own field in gloas), the EIP-7685 requests hash (the Engine API's
-  request list, `get_execution_requests_list`), and in gloas the keccak of the
-  block access list bytes (EIP-7928) and the slot number (EIP-7843). It is run
-  per fork against real chain data: see the vector table in the module's tests.
-  A bellatrix payload that is the empty default (before the merge) is skipped.
-- **Why:** since `engine_newPayloadV2` the Engine API answers a block-hash
-  mismatch with `INVALID` and a null `latestValidHash`, the same answer as for
-  a payload that executed badly and whose last valid ancestor is unknown.
-  Applying payloads to fork choice before the execution client answers is only
-  safe if the structural case cannot get that far.
-- **Cost and counter:** one trie over the transactions per accepted-looking
-  message, after the cheap rules that drop most of them.
-  `lean_beacon_payload_block_hash_mismatch_total{kind}` counts refusals and a
-  `warn!` names the slot and root.
-- **Equivalence:** a stricter filter, never a looser one: every payload it
-  refuses is one the execution client would call `INVALID`. Blocks fetched by
-  `beacon_blocks_by_range/root` are not checked here.
+  (`beacon/payload_hash.rs`) at the end of the stateful half, and only for a
+  message those rules answered `Accept`, so the proposer's (or the builder's)
+  signature has verified: an unsigned message never makes the node build a
+  transaction trie. The header takes the payload's fields, the transactions
+  and withdrawals tries, the parent beacon block root (the block's
+  `parent_root`; the envelope's own field in gloas), the EIP-7685 requests hash
+  (the Engine API's request list, `get_execution_requests_list`), and in gloas
+  the keccak of the block access list bytes (EIP-7928) and the slot number
+  (EIP-7843). It is run per fork against real chain data, including a mainnet
+  block with more than 128 transactions and requests of two types: see the
+  vector table in the module's tests. A bellatrix payload that is the whole empty
+  default (before the merge, the specification's `is_execution_enabled`) is
+  skipped.
+- **IGNORE, not REJECT:** other clients have no such rule and relay a validly
+  signed block whatever its `block_hash`, so a REJECT would count an invalid
+  delivery against every honest peer that forwarded one, and a proposer
+  publishing such blocks could drive those peers toward the graylist,
+  isolating only this node. IGNORE keeps the block from being imported or
+  relayed from gossip without scoring anyone.
+- **Gloas is counted, not refused:** the Amsterdam header (the block access
+  list hash, the slot number) may still change between devnets, and envelopes
+  are judged on gossip and on fetch alike, so an encoding this build gets wrong
+  would refuse every payload and leave the node unable to follow the chain.
+  Refusing waits until the header is final.
+- **Why:** the Engine API already requires the execution client to validate
+  `blockHash` on every `engine_newPayload`, even while syncing (execution-apis
+  `paris.md`), so while an import waits for that answer this finds nothing the
+  execution client would not. It exists for the early fork-choice import being
+  worked on in lambdaclass/ethlambda#773, which applies a payload before the
+  execution client answers and reverts it on `INVALID`: a gossip block caught
+  here saves that path a revert.
+- **Not covered:** a block fetched by `beacon_blocks_by_range/root`, and a
+  gossip block answered `Queue` or forwarded under `Ignore(Overloaded)`, reach
+  the chain actor unhashed. The execution client still checks them.
+- **Cost and counter:** one transactions trie plus the RLP and keccak of the
+  header, on the blocking validation thread and inside its permit
+  (`gossip_validation_permits` on gossip, `column_check_permits` for a fetched
+  envelope). Measured with the `#[ignore]`d
+  `payload_hash::tests::verify_block_cost` (`release-fast`, Apple M3 Pro, load
+  average about 20 on 11 cores; reruns under a load near 100 were up to five
+  times slower): about 0.24 ms on the mainnet vector (238 transactions,
+  114 kB). At the 10 MiB gossip limit: 11 ms for one transaction, 19 ms for
+  14,882 transactions of about 700 bytes (a mainnet block's mean size), and
+  0.6 s for the worst case, 1,048,576 five-byte transactions (the most the
+  list allows). Only a block whose proposer signature verified can ask for
+  that.
+  `lean_beacon_payload_block_hash_mismatch_total{kind}` counts mismatches
+  (`block` IGNOREd, `envelope` counted only) and a `warn!` names the slot and
+  root.
+- **Equivalence:** a stricter filter, never a looser one: every block it
+  ignores carries a payload the execution client would call `INVALID`.
 
 ## The envelope check reads the cached state root
 

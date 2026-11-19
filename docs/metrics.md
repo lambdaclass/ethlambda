@@ -426,7 +426,10 @@ and `subcommittee_index` (contribution only) on the reject side; they reuse
 `not_current_slot`, `already_seen`, `covered_bits`, `no_participants`,
 `not_aggregator`, `not_in_committee`, `unknown_validator`, `selection_proof`,
 `aggregator_signature`, `aggregate_signature`, `wrong_subnet` and
-`bad_signature`. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+`bad_signature`. `beacon_block` adds `payload_block_hash_mismatch` on the ignore
+side, a rule the specification does not have (see
+[spec_deviations.md](./spec_deviations.md#a-payloads-block-hash-must-be-its-headers)).
+`already_seen`, `overloaded` and `unsupported_fork` are shared with the
 other topics: `unsupported_fork` is an ignore reason for a message of a fork this
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
