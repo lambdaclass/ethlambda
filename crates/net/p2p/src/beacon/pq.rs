@@ -18,7 +18,8 @@ use std::time::Instant as StdInstant;
 use ethlambda_network_api::{AggregateArrival, BlockArrival};
 use ethlambda_state_transition::beacon::builder_market::SharedPqBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
-use ethlambda_storage::Store;
+use ethlambda_state_transition::beacon::helpers::pq::get_committee_indices;
+use ethlambda_storage::{Store, pools::PooledPqAggregate};
 use ethlambda_types::beacon::containers::{SignedExecutionPayloadEnvelope, pq};
 use ethlambda_types::beacon::primitives::ValidatorIndex;
 use ethlambda_types::time::unix_now_ms;
@@ -144,6 +145,14 @@ impl PqValidated {
     /// it has not imported). Subnet attestations, slashings, bids and
     /// preferences stop at relay, as gloas's do.
     pub(crate) fn forward(self, server: &P2PServer, received_at: StdInstant, outcome: Outcome) {
+        if let Self::Aggregate {
+            signed,
+            attesting_indices,
+        } = &self
+            && outcome == Outcome::Accept
+        {
+            pool_aggregate(&server.store, signed, attesting_indices);
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -199,6 +208,27 @@ impl PqValidated {
             Self::ExecutionPayloadBid { .. } | Self::ProposerPreferences(_) => "builder",
         }
     }
+}
+
+/// Hold an accepted aggregate for block production, which merges the proofs
+/// of the ones it packs (PQ `validator.md`, "Proof").
+fn pool_aggregate(
+    store: &Store,
+    signed: &pq::SignedAggregateAndProof,
+    attesting_indices: &[ValidatorIndex],
+) {
+    let aggregate = &signed.message.aggregate;
+    let committees = get_committee_indices(&aggregate.committee_bits);
+    // Gossip validation accepts single-committee aggregates only.
+    let [committee_index] = committees[..] else {
+        return;
+    };
+    store.pq_aggregate_pool().insert(PooledPqAggregate {
+        attestation: aggregate.clone(),
+        committee_index,
+        attesting_indices: attesting_indices.to_vec(),
+        proof: signed.message.proof.clone(),
+    });
 }
 
 /// Decode a message from a PQ digest's topic `kind` and run its cheap rules,
