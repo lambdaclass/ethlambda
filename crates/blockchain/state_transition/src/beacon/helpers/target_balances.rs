@@ -61,7 +61,8 @@ use super::participation::ParticipationTotals;
 /// unslashed TIMELY_TARGET balance.
 ///
 /// Written by `process_attestation` through a shared reference (hence the
-/// atomics, relaxed since one thread writes), so it can ride in
+/// atomics: relaxed, since only the sums matter, and each addition one atomic
+/// update, so a second writer could not lose one), so it can ride in
 /// [`BlockProcessingOptions`](crate::beacon::stf::block::BlockProcessingOptions),
 /// which is `Copy`, and keep that type `Send` for the async block producers.
 #[derive(Debug, Default)]
@@ -101,10 +102,11 @@ impl TargetBalanceDelta {
         } else {
             &self.previous
         };
-        let total = side
-            .load(Ordering::Relaxed)
-            .saturating_add(effective_balance);
-        side.store(total, Ordering::Relaxed);
+        // Saturating like the registry scan's own sums; neither can reach
+        // `u64::MAX` Gwei, which is orders of magnitude above the whole supply.
+        let add = |total: Gwei| Some(total.saturating_add(effective_balance));
+        side.fetch_update(Ordering::Relaxed, Ordering::Relaxed, add)
+            .expect("the update always returns Some");
     }
 
     /// The balance added to the previous epoch's total.
