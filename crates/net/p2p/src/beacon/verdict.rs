@@ -549,19 +549,19 @@ impl Message for GossipVerdict {
 /// A block IGNOREd for its payload block hash passed every rule the
 /// specification has, signature included, so it is the specification's "first
 /// block with a valid signature" for its slot and proposer, and is recorded
-/// too. Otherwise a proposer could send any number of signed blocks for one
-/// slot, each verified and hashed in full, where the cheap checks would IGNORE
-/// every one after the first.
+/// too, as `AlreadySeen` when another one got there first. Otherwise a
+/// proposer could send any number of signed blocks for one slot, each
+/// verified and hashed in full, where the cheap checks would IGNORE every one
+/// after the first.
 fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outcome {
-    match outcome {
-        Outcome::Accept if !object.record_seen(server) => {
-            Outcome::Ignore(IgnoreReason::AlreadySeen)
-        }
-        Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch) => {
-            object.record_seen(server);
-            outcome
-        }
-        _ => outcome,
+    let seen_candidate = matches!(
+        outcome,
+        Outcome::Accept | Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch)
+    );
+    if seen_candidate && !object.record_seen(server) {
+        Outcome::Ignore(IgnoreReason::AlreadySeen)
+    } else {
+        outcome
     }
 }
 
@@ -972,7 +972,8 @@ mod tests {
     /// A block IGNOREd for its payload hash had a valid signature, so its slot
     /// and proposer are marked seen: another block for them is IGNOREd by the
     /// cheap checks, before any signature or hash work, and a later `Accept`
-    /// for them is `AlreadySeen`.
+    /// for them is `AlreadySeen`. So is a later mismatch, which was checked
+    /// concurrently and lost the race to the first.
     #[tokio::test]
     async fn a_payload_hash_mismatch_marks_its_slot_and_proposer_seen() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -995,6 +996,10 @@ mod tests {
         );
         assert_eq!(
             settle(&mut server, Outcome::Accept, &block(2)),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        assert_eq!(
+            settle(&mut server, mismatch, &block(3)),
             Outcome::Ignore(IgnoreReason::AlreadySeen)
         );
     }
