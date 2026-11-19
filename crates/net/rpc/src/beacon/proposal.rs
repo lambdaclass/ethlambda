@@ -162,15 +162,16 @@ async fn post_block(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
+    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas | ForkName::Pq)) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas or pq")
+            .into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if fork == Some(ForkName::Gloas) {
-        return post_gloas_block(&store, &p2p, &published, encoding, &body).await;
+    if let Some(fork @ (ForkName::Gloas | ForkName::Pq)) = fork {
+        return post_gloas_block(&store, &p2p, &published, fork, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
@@ -289,22 +290,39 @@ async fn post_block(
 /// slot's, and the proposer's signature verifies against the parent's state
 /// advanced to the slot. The advance and the signature are CPU-bound and run
 /// off the runtime.
+///
+/// A PQ block (`fork` is PQ) takes the same path: it carries no payload or
+/// blobs either, and its proposer's leanXMSS signature is checked at its
+/// slot's proposer leaf.
 async fn post_gloas_block(
     store: &Store,
     p2p: &RpcToP2PRef,
     published: &PublishedProposals,
+    fork: ForkName,
     encoding: BodyEncoding,
     body: &[u8],
 ) -> Response {
-    let Some(signed) = encoding.decode::<containers::gloas::SignedBeaconBlock>(body) else {
-        return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock").into_response();
+    let block = if fork == ForkName::Pq {
+        let Some(signed) = encoding.decode::<containers::pq::SignedBeaconBlock>(body) else {
+            return ApiError::BadRequest("the body is not a pq SignedBeaconBlock").into_response();
+        };
+        containers::SignedBeaconBlock::Pq(Box::new(signed))
+    } else {
+        let Some(signed) = encoding.decode::<containers::gloas::SignedBeaconBlock>(body) else {
+            return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock")
+                .into_response();
+        };
+        containers::SignedBeaconBlock::Gloas(signed)
     };
-    let block = containers::SignedBeaconBlock::Gloas(signed);
     let config = store.config();
-    if let Err(err) = require_gloas_slot(
+    let slot_fork = config.fork_at_epoch(compute_epoch_at_slot(block.slot()));
+    if slot_fork != fork {
+        return ApiError::BadRequest("the block's fork is not its slot's").into_response();
+    }
+    if let Err(err) = require_gloas_family_slot(
         &config,
         block.slot(),
-        "blocks are accepted for gloas slots only",
+        "blocks are accepted for gloas and pq slots only",
     )
     .and_then(|()| refuse_future_slot(&config, block.slot()))
     .and_then(|()| refuse_finalized_slot(store, block.slot()))
@@ -366,6 +384,18 @@ async fn post_gloas_block(
         return ApiError::Internal("the network actor is not running").into_response();
     }
     StatusCode::OK.into_response()
+}
+
+/// Refuses a slot the schedule places at neither gloas nor PQ.
+fn require_gloas_family_slot(
+    config: &Config,
+    slot: Slot,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
+        ForkName::Pq => Ok(()),
+        _ => require_gloas_slot(config, slot, message),
+    }
 }
 
 /// Refuses a slot the schedule does not place at gloas.

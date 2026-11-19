@@ -678,8 +678,17 @@ impl BeaconNodeApi for HttpBeaconNode {
         struct Body {
             ids: Vec<String>,
         }
+        // Each key in both forms the registry may name it by: its BLS key, and
+        // on the PQ fork its XMSS key's request form (`crate::pq`). The answer
+        // names whichever the head state holds, which `parse_pubkey` maps back.
         let body = Body {
-            ids: pubkeys.iter().map(|key| encode_hex(&key.0)).collect(),
+            ids: pubkeys
+                .iter()
+                .flat_map(|key| {
+                    std::iter::once(encode_hex(&key.0))
+                        .chain(crate::pq::request_key(key).map(|request| encode_hex(&request)))
+                })
+                .collect(),
         };
         let response: DataResponse<Vec<ValidatorEntryDto>> = self
             .post("/eth/v1/beacon/states/head/validators", &body, None)
@@ -1066,6 +1075,116 @@ impl BeaconNodeApi for HttpBeaconNode {
         }
         let body = read_error_body(response).await;
         Self::handle_pool_submission(status, body, messages.len())
+    }
+
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/pool/payload_attestations", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Pq.as_str())
+            .json(messages)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(messages.len());
+        }
+        let body = read_error_body(response).await;
+        Self::handle_pool_submission(status, body, messages.len())
+    }
+
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        #[derive(Serialize)]
+        struct Body {
+            randao_reveal: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            graffiti: Option<String>,
+        }
+        let body = Body {
+            randao_reveal: randao_reveal
+                .iter()
+                .map(|node| encode_hex(&node.0))
+                .collect(),
+            graffiti: graffiti.map(|graffiti| encode_hex(&graffiti.0)),
+        };
+        let url = format!("{}/eth/v1/validator/pq_blocks/{slot}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = error_body(response).await;
+            return Err(Error::BeaconNodeStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let bytes = response.bytes().await.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let contents =
+            <ethlambda_types::beacon::containers::pq::BlockContents as libssz::SszDecode>::from_ssz_bytes(&bytes)
+                .map_err(|err| Error::Decode(format!("pq block contents: {err:?}")))?;
+        let block_root =
+            ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&contents.block);
+        if contents.block.slot != slot
+            || contents.execution_payload_envelope.beacon_block_root != block_root
+        {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ block at slot {slot}, node answered one at slot {} or an envelope for another block",
+                contents.block.slot
+            )));
+        }
+        Ok(contents)
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()> {
+        let (url, sent) = self
+            .post_ssz_body(
+                "/eth/v1/beacon/execution_payload_envelopes",
+                ForkName::Pq,
+                body,
+            )
+            .await;
+        let response = sent.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = error_body(response).await;
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body,
+        })
     }
 
     /// Distinct from `post_no_content`: this endpoint's 400s are not always

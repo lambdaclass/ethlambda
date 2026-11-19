@@ -147,6 +147,8 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             .as_str();
 
         let data_dto = AttestationDataOutDto::from(&data);
+        let is_pq = self.context.config.fork_at_epoch(data.target.epoch)
+            == ethlambda_types::beacon::fork::ForkName::Pq;
 
         let candidates: Vec<(&AttesterDutyDto, BlsPubkey)> = duties
             .iter()
@@ -245,7 +247,22 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 }
 
                 // One validator failing must not cost the others their attestation.
-                let signature = match self.context.sign_attestation(&store, &pubkey, &data) {
+                // From PQ a leanXMSS signature at the target epoch's leaf, over
+                // the same signing root: the slashing protection record above
+                // already guards that leaf (one per target epoch).
+                let signature = if is_pq {
+                    let root = self.context.attestation_signing_root(&data);
+                    let leaf = crate::pq::attestation_leaf(data.target.epoch);
+                    crate::pq::sign(&pubkey, leaf, root)
+                        .map(|signature| encode_hex(&signature.0))
+                        .map_err(|err| err.to_string())
+                } else {
+                    self.context
+                        .sign_attestation(&store, &pubkey, &data)
+                        .map(|signature| encode_hex(&signature.0))
+                        .map_err(|err| err.to_string())
+                };
+                let signature = match signature {
                     Ok(signature) => signature,
                     Err(err) => {
                         error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
@@ -258,7 +275,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                     committee_index: duty.committee_index,
                     attester_index: duty.validator_index,
                     data: data_dto.clone(),
-                    signature: encode_hex(&signature.0),
+                    signature,
                 });
             }
         }

@@ -762,7 +762,8 @@ async fn build_local(
     prepared: &Prepared,
     slot: Slot,
 ) -> Result<LocalBuild, ApiError> {
-    let built = build_payload(store, engine, fee_recipients, custody, prepared).await?;
+    let fee_recipient = fee_recipient_for(fee_recipients, prepared);
+    let built = build_payload(store, engine, fee_recipient, custody, &prepared.inputs).await?;
     let bundle = &built.blobs_bundle;
     if bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len()
@@ -821,15 +822,13 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
 /// execution client starts with a valid payload and improves it, so an early
 /// `getPayload` always answers, and the validator client asks at the start of
 /// the slot, when the block is due.
-async fn build_payload(
+pub(crate) async fn build_payload(
     store: &Store,
     engine: &EngineClient,
-    fee_recipients: &FeeRecipients,
+    fee_recipient: ExecutionAddress,
     custody: &NodeCustodyColumns,
-    prepared: &Prepared,
+    inputs: &GloasPayloadInputs,
 ) -> Result<BuiltGloasPayload, ApiError> {
-    let inputs = &prepared.inputs;
-    let fee_recipient = fee_recipient_for(fee_recipients, prepared);
     let forkchoice = ForkchoiceStateV1 {
         head_block_hash: inputs.head_block_hash,
         safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
@@ -1081,8 +1080,11 @@ async fn post_envelope_emitting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
+    if consensus_version(headers) == Some(ForkName::Pq) {
+        return post_pq_envelope(store, p2p, events, headers, body, block_wait).await;
+    }
     if consensus_version(headers) != Some(ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or pq").into_response();
     }
     let encoding = match BodyEncoding::from_headers(headers) {
         Ok(encoding) => encoding,
@@ -1213,6 +1215,78 @@ async fn post_envelope_emitting(
     };
     if p2p
         .publish_execution_payload_envelope(Box::new(signed.into()), sidecars)
+        .is_err()
+    {
+        return ApiError::Internal("the network actor is not running").into_response();
+    }
+    emit_accepted(events, || accepted);
+    StatusCode::OK.into_response()
+}
+
+/// The PQ half of `publishExecutionPayloadEnvelope`: PQ's container, signed
+/// with leanXMSS at the slot's envelope leaf. PQ block production builds no
+/// blobs yet, so none are taken and no columns are gossiped.
+async fn post_pq_envelope(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    events: Option<&EventBus>,
+    headers: &HeaderMap,
+    body: &[u8],
+    block_wait: Duration,
+) -> Response {
+    let encoding = match BodyEncoding::from_headers(headers) {
+        Ok(encoding) => encoding,
+        Err(err) => return err.into_response(),
+    };
+    let Some(signed) = encoding.decode::<containers::pq::SignedExecutionPayloadEnvelope>(body)
+    else {
+        return ApiError::BadRequest("the body is not a pq SignedExecutionPayloadEnvelope")
+            .into_response();
+    };
+    let block_root = signed.message.beacon_block_root;
+    let Some((block, post_state)) = wait_for_block(store, block_root, block_wait).await else {
+        return ApiError::BadRequest("unknown block: the envelope's block is not held")
+            .into_response();
+    };
+    let containers::SignedBeaconBlock::Pq(block) = block else {
+        return ApiError::BadRequest("the envelope's block is not a pq block").into_response();
+    };
+    let block_slot = block.message.slot;
+    let bid = &block.message.body.signed_execution_payload_bid.message;
+    if signed.message.builder_index != bid.builder_index
+        || signed.message.payload.block_hash != bid.block_hash
+    {
+        return ApiError::BadRequest("the envelope does not fulfill the block's bid")
+            .into_response();
+    }
+    if !bid.blob_kzg_commitments.is_empty() {
+        return ApiError::BadRequest("pq envelopes with blobs are not published yet")
+            .into_response();
+    }
+    let envelope_for_check = signed.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        ethlambda_state_transition::beacon::stf::pq::verify_execution_payload_envelope_signature(
+            &post_state,
+            &envelope_for_check,
+        )
+    })
+    .await;
+    match checked {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return ApiError::BadRequest("invalid envelope signature").into_response(),
+        Ok(Err(_)) => {
+            return ApiError::BadRequest("the envelope's signer is unknown").into_response();
+        }
+        Err(_) => return ApiError::Internal("verifying the envelope failed").into_response(),
+    }
+    let accepted = GossipEvent::ExecutionPayloadGossip {
+        slot: block_slot,
+        builder_index: signed.message.builder_index,
+        block_hash: signed.message.payload.block_hash,
+        block_root,
+    };
+    if p2p
+        .publish_execution_payload_envelope(Box::new(signed.into()), Vec::new())
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();

@@ -581,12 +581,15 @@ fn proposer_duties(
 
     // Gloas keeps fulu's lookahead as it is, and `upgrade_to_gloas` carries it
     // over, so a fulu head already holds the first gloas epoch's proposers.
+    // The forks built on gloas keep the lookahead too.
     let proposer_lookahead = match state.as_ref() {
         BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        BeaconState::Eip8483(state) => &state.proposer_lookahead,
+        BeaconState::Pq(state) => &state.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
-                "proposer duties are served from the proposer lookahead of fulu and gloas only",
+                "proposer duties are served from the proposer lookahead of fulu on",
             ));
         }
     };

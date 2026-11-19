@@ -47,7 +47,7 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishPayloadAttestationMessage, PublishPqGossip, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -1848,6 +1848,12 @@ impl Handler<PublishBeaconAggregate> for P2PServer {
 impl Handler<PublishBeaconOperation> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconOperation, _ctx: &Context<Self>) {
         publish_beacon_operation(self, msg.operation).await;
+    }
+}
+
+impl Handler<PublishPqGossip> for P2PServer {
+    async fn handle(&mut self, msg: PublishPqGossip, _ctx: &Context<Self>) {
+        beacon::pq::publish_pq_gossip(self, msg.object);
     }
 }
 

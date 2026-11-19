@@ -87,6 +87,7 @@ pub mod hash;
 pub mod helpers;
 pub mod kzg;
 pub mod payload_attestation_pool;
+pub mod pq_block_production;
 pub mod precheck;
 pub mod stf;
 pub mod sync_committee_pool;

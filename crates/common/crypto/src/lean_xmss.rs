@@ -760,6 +760,17 @@ impl SecretKey {
         })
     }
 
+    /// Builds and caches the bottom tree `leaf_index` is in, without signing:
+    /// a signer that knows which leaves it signs at next pays the tree's
+    /// cost ahead of the deadline rather than at it. Signing anything to the
+    /// same end would use the leaf up.
+    pub fn prepare(&self, leaf_index: LeafIndex) -> Result<(), SignError> {
+        if !self.leaves.contains(&leaf_index) {
+            return Err(SignError::OutOfRange(leaf_index));
+        }
+        self.bottom_tree(leaf_index).map(|_| ())
+    }
+
     /// The bottom tree `leaf_index` is in, with the top layer's signature of its
     /// root: the cached one, or built and cached.
     fn bottom_tree(&self, leaf_index: LeafIndex) -> Result<Arc<BottomTree>, SignError> {
@@ -901,28 +912,32 @@ mod tests {
         assert_eq!(key_gen(&seed).public_key().to_bytes().to_vec(), expected);
     }
 
-    /// Alternating between two bottom trees keeps both built: after the first
-    /// signature in each, signing costs one one-time key, not a tree.
+    /// Alternating between two bottom trees keeps both built, and a third
+    /// evicts the least recently used.
     #[test]
     fn two_bottom_trees_stay_built() {
-        let key = key_gen(&[3; SEED_LEN]);
+        let key = range_key(&[3; SEED_LEN], 0, LeafIndex::MAX);
         let message: Message = [9; 32];
         let attestation_leaf: LeafIndex = (1 << 15) + 7;
         let slot_leaf: LeafIndex = (1 << 30) + (1 << 16) + 8 * 100;
-        let started = std::time::Instant::now();
+        let cached = |key: &SecretKey| -> Vec<u32> {
+            key.bottom
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|tree| tree.index)
+                .collect()
+        };
         key.sign(&message, attestation_leaf).unwrap();
         key.sign(&message, slot_leaf).unwrap();
-        let building = started.elapsed();
-        let started = std::time::Instant::now();
         for offset in 0..4 {
             key.sign(&message, attestation_leaf + offset).unwrap();
             key.sign(&message, slot_leaf + offset).unwrap();
         }
-        let cached = started.elapsed();
-        assert!(
-            cached < building / 4,
-            "{cached:?} signing eight vs {building:?} building two"
-        );
+        let both = [layer_index(attestation_leaf, 1), layer_index(slot_leaf, 1)];
+        assert_eq!(cached(&key), both);
+        key.prepare(5 << LAYER_HEIGHT).unwrap();
+        assert_eq!(cached(&key), [both[1], 5]);
     }
 
     #[test]

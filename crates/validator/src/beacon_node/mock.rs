@@ -1116,6 +1116,30 @@ impl BeaconNodeApi for MockBeaconNode {
         Ok(Some(data))
     }
 
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.guard("submit_pq_payload_attestations")?;
+        Ok(messages.len())
+    }
+
+    async fn produce_pq_block(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &[Root],
+        _graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        self.guard("produce_pq_block")?;
+        Err(Error::InconsistentResponse(
+            "the mock produces no PQ blocks".into(),
+        ))
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, _body: &[u8]) -> Result<()> {
+        self.guard("publish_pq_execution_payload_envelope")
+    }
+
     async fn submit_payload_attestations(
         &self,
         messages: &[gloas::PayloadAttestationMessage],

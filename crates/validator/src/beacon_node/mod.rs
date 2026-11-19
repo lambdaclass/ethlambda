@@ -673,6 +673,29 @@ pub trait BeaconNodeApi: Send + Sync {
         messages: &[gloas::PayloadAttestationMessage],
     ) -> Result<usize>;
 
+    /// The PQ fork's [`Self::submit_payload_attestations`]: leanXMSS-signed
+    /// messages, under the `pq` header.
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize>;
+
+    /// The unsigned PQ block for `slot` and the unsigned envelope revealing
+    /// its self-built payload (ethlambda's `POST
+    /// /eth/v1/validator/pq_blocks/{slot}`), given the proposer's VRF proof
+    /// for the slot.
+    ///
+    /// # Contract: the block is for `slot`, and the envelope names it
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents>;
+
+    /// Publish a signed PQ envelope, given its SSZ body.
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()>;
+
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since
     /// the endpoint requires it as a header rather than inferring it.

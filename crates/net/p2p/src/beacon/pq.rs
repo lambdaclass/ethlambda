@@ -305,6 +305,101 @@ pub(crate) fn triage(
     Some(Dispatch::Validate(Validated::Pq(Box::new(object))))
 }
 
+/// Gossip one of a validator client's PQ messages, which the Beacon API
+/// validated with PQ's gossip rules, on its topic under the digest of its
+/// slot, record it in the seen caches gossip validation reads, and hand the
+/// chain actor what fork choice takes: gossip never delivers a node its own
+/// messages.
+pub(crate) fn publish_pq_gossip(
+    server: &mut P2PServer,
+    object: ethlambda_network_api::PqGossipObject,
+) {
+    use ethlambda_network_api::PqGossipObject;
+    use libp2p::gossipsub::IdentTopic;
+    use libssz::SszEncode as _;
+
+    let slot = match &object {
+        PqGossipObject::Attestation { attestation, .. } => attestation.data.slot,
+        PqGossipObject::Aggregate { aggregate, .. } => aggregate.message.aggregate.data.slot,
+        PqGossipObject::PayloadAttestation(message) => message.data.slot,
+    };
+    let Some(beacon) = server.wire.beacon() else {
+        warn!(slot, "A PQ message reached a lean node; dropping it");
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this PQ message's slot; not publishing"
+        );
+        return;
+    };
+    let (topic, bytes) = match &object {
+        PqGossipObject::Attestation {
+            subnet_id,
+            attestation,
+        } => {
+            server
+                .seen_attestations
+                .record_key(attestation.data.target.epoch, attestation.attester_index);
+            (
+                beacon_topics::attestation_topic_name(digest, *subnet_id),
+                attestation.to_ssz(),
+            )
+        }
+        PqGossipObject::Aggregate { aggregate, .. } => {
+            if let Some(key) = gossip::pq::aggregate_key(aggregate) {
+                let bits = gossip::pq::aggregation_bits(aggregate);
+                server.seen_aggregates.record_parts(&key, &bits);
+            }
+            (
+                beacon_topics::topic_name(digest, beacon_topics::BEACON_AGGREGATE_AND_PROOF),
+                aggregate.to_ssz(),
+            )
+        }
+        PqGossipObject::PayloadAttestation(message) => {
+            server
+                .seen_payload_attestations
+                .record(message.data.slot, message.validator_index);
+            (
+                beacon_topics::topic_name(digest, beacon_topics::PAYLOAD_ATTESTATION_MESSAGE),
+                message.to_ssz(),
+            )
+        }
+    };
+    server.swarm_handle.publish(
+        IdentTopic::new(topic),
+        crate::gossipsub::compress_message(&bytes),
+    );
+    debug!(slot, "Published a validator client's PQ message");
+
+    let Some(blockchain) = server.blockchain.clone() else {
+        return;
+    };
+    match object {
+        PqGossipObject::Attestation { .. } => {}
+        PqGossipObject::Aggregate {
+            aggregate,
+            attesting_indices,
+        } => {
+            let arrival = AggregateArrival {
+                decode_start: StdInstant::now(),
+                handed_off: StdInstant::now(),
+            };
+            let _ = blockchain
+                .new_pq_aggregate(aggregate.message.aggregate.data, attesting_indices, arrival)
+                .inspect_err(|err| warn!(%err, "Failed to hand over a published PQ aggregate"));
+        }
+        PqGossipObject::PayloadAttestation(message) => {
+            let _ = blockchain
+                .new_pq_payload_attestation_message(message, BlockArrival::now())
+                .inspect_err(
+                    |err| warn!(%err, "Failed to hand over a published PQ payload attestation"),
+                );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ethlambda_state_transition::beacon::gossip::RejectReason;
