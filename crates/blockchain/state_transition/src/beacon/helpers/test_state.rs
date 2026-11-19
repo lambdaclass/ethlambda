@@ -652,3 +652,54 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
             .expect("the vector is built at its exact length"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`BeaconState::ssz_append_capacity`] for every fork. The test lives here
+    /// rather than beside that method in `ethlambda-types` because this module
+    /// is the one place a state of every fork is built.
+    ///
+    /// A small registry is the hard case. libssz's container encoder writes
+    /// each fixed-size field past the end of the buffer before moving it into
+    /// place, so a field needs room beyond the encoding's length unless enough
+    /// variable-size data still follows it, and a small state has little. A
+    /// fork that adds a fixed-size field larger than any the capacity counts
+    /// fails here rather than quietly regrowing a buffer the size of the state.
+    #[test]
+    fn ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare() {
+        // A lean genesis with no validators: its fixed-size fields come before
+        // all of its variable-size ones, which hold almost nothing here.
+        let lean = BeaconState::Lean(ethlambda_types::state::State::from_genesis(7, vec![]));
+        let beacon = ForkName::ALL.map(|fork| with_validators_at(fork, 3));
+        for state in beacon.into_iter().chain([lean]) {
+            let fork = state.fork_name();
+            let capacity = state.ssz_append_capacity();
+
+            let encoded = state.to_ssz();
+            let decoded = BeaconState::from_ssz(fork, &encoded).expect("the encoding decodes");
+            assert_eq!(decoded, state, "{fork}");
+
+            // Given the headroom it advertises, the append must not reallocate:
+            // the buffer's address and capacity are the same before and after.
+            // That holds whatever `reserve_exact` rounds to, which its docs
+            // leave open, so the test does not lean on std's exact capacities.
+            // With no prefix this is `to_ssz`'s own path; with one, the
+            // storage layer's, where the encoding starts past a fork tag.
+            for prefix in [&[][..], &[0xAB][..]] {
+                let mut buf = prefix.to_vec();
+                buf.reserve_exact(capacity);
+                let before = (buf.as_ptr(), buf.capacity());
+                state.ssz_append(&mut buf);
+                let after = (buf.as_ptr(), buf.capacity());
+                let len = prefix.len();
+                assert_eq!(
+                    after, before,
+                    "{fork}: ssz_append regrew after {len} prefix bytes"
+                );
+                assert_eq!(buf[len..], encoded, "{fork}");
+            }
+        }
+    }
+}
