@@ -427,29 +427,21 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
 
-    // Resolved once, here, above the bootnode resolution below that reads it:
-    // `beacon`'s `--bootnodes` entries are added to the network's own list,
-    // and loading a directory decodes a multi-megabyte genesis state, so this
-    // must not run twice for one process. `network` is matched by reference so
-    // it is still available, below, to be matched by value into `ChainSetup`.
-    let network_source = match &network {
-        Network::Lean(_) => None,
+    // The network and the bootnodes, each resolved once, here, for the swarm
+    // and discv5 below. The network comes first: `beacon`'s `--bootnodes`
+    // entries are added to its own list, and loading a directory decodes a
+    // multi-megabyte genesis state, so it must not run twice for one process.
+    // `--bootnodes` means a different thing on each chain: a file of ENRs on
+    // `node`, a list added to the network's own on `beacon`. `network` is
+    // matched by reference so it is still available, below, to be matched by
+    // value into `ChainSetup`.
+    let (network_source, bootnodes) = match &network {
+        Network::Lean(lean) => (None, lean_bootnodes(lean.bootnodes.as_deref())?),
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
-            Some(network::NetworkSource::resolve(&spec)?)
-        }
-    };
-
-    // Resolved once, here, for the swarm and discv5 below. `--bootnodes` means
-    // a different thing on each chain: a file of ENRs on `node`, a list added
-    // to the network's own on `beacon`.
-    let bootnodes = match &network {
-        Network::Lean(lean) => lean_bootnodes(lean.bootnodes.as_deref())?,
-        Network::Mainnet { mainnet, .. } => {
-            let source = network_source
-                .as_ref()
-                .expect("network_source is Some whenever network is Network::Mainnet");
-            beacon_bootnodes(&mainnet.bootnodes, source.bootnodes())?
+            let source = network::NetworkSource::resolve(&spec)?;
+            let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes())?;
+            (Some(source), bootnodes)
         }
     };
 
@@ -1074,12 +1066,24 @@ async fn wait_for_shutdown(node: RunningNode) {
 /// A lean network's ENRs are per-deployment, so there is no list to default to
 /// and an absent flag means this node reaches peers only through discv5, which
 /// a lean node runs only with `--discovery.enable`, or by being dialed. That
-/// case warns, because a node that then finds nobody is islanded and otherwise
-/// looks healthy. A file that was named and cannot be read is an error, so a
-/// typo does not look like "no peers".
+/// case warns, and so does a file that yields no usable ENR, because a node
+/// that then finds nobody is islanded and otherwise looks healthy. A file that
+/// was named and cannot be read is an error, so a typo does not look like "no
+/// peers".
 fn lean_bootnodes(file: Option<&Path>) -> eyre::Result<Vec<Bootnode>> {
     match file {
-        Some(path) => Ok(parse_enrs(read_bootnode_strings(path)?)),
+        Some(path) => {
+            let bootnodes = parse_enrs(read_bootnode_strings(path)?);
+            // `parse_enrs` words its own warning for the list, since `beacon`
+            // adds to its result; here the file is the node's whole list.
+            if bootnodes.is_empty() {
+                warn!(
+                    file = %path.display(),
+                    "The --bootnodes file gave no usable bootnode: starting with no bootnodes."
+                );
+            }
+            Ok(bootnodes)
+        }
         None => {
             warn!(
                 "No --bootnodes file supplied: starting with no bootnodes. This node can \
@@ -1103,22 +1107,27 @@ fn lean_bootnodes(file: Option<&Path>) -> eyre::Result<Vec<Bootnode>> {
 ///
 /// Logs the two counts once: the network's half can shrink silently through
 /// skipped entries, and the line is what shows how much of the list the
-/// command line contributed.
+/// command line contributed. Warns when the result is empty, which leaves
+/// discv5 with no seed.
 fn beacon_bootnodes(
     cli_entries: &[String],
     network_entries: Vec<String>,
 ) -> eyre::Result<Vec<Bootnode>> {
     let mut bootnodes = Vec::new();
-    // Trimmed and skipped when empty here rather than in `parse_bootnode`,
-    // which refuses an empty entry: `--bootnodes ""` and a trailing comma
-    // both reach this point as an empty string and mean "nothing".
+    // A blank entry is skipped here, where `parse_bootnode` would refuse it:
+    // `--bootnodes ""` and a trailing comma both leave one, and mean
+    // "nothing".
     for entry in cli_entries.iter().map(|entry| entry.trim()) {
         if entry.is_empty() {
             continue;
         }
         // `allow_hyphen_values` lets a value-less `--bootnodes` take the next
-        // flag as its value. No ENR starts with `--` (a prefix-less one starts
-        // with a single `-`), so this is that flag, not a bootnode.
+        // flag as its value. No ENR starts with `--`, so this is that flag,
+        // not a bootnode. An ENR is an RLP list whose payload is over 55 bytes
+        // (the signature alone is 64) and at most 300, so its first byte is
+        // 0xf8 or 0xf9. In base64 that byte's top six bits (111110) make the
+        // first character `-`, and its low two bits (00 or 01) put the second
+        // character in A-Z or a-f, never `-`.
         if entry.starts_with("--") {
             eyre::bail!(
                 "--bootnodes was given no value: it took the flag \"{entry}\" as its value"
@@ -1132,7 +1141,8 @@ fn beacon_bootnodes(
                 eyre::eyre!(
                     "--bootnodes entry \"{entry}\" is a file: beacon --bootnodes now \
                      takes a comma-separated list of ENRs and multiaddrs, not a file. \
-                     Pass the file's entries joined with commas instead"
+                     Pass the file's entries joined with commas instead. They are added \
+                     to the network's own bootnodes, not put in their place"
                 )
             } else {
                 eyre::eyre!("invalid --bootnodes entry \"{entry}\": {reason}")
@@ -1149,6 +1159,14 @@ fn beacon_bootnodes(
         "Resolved bootnodes"
     );
     bootnodes.extend(from_network);
+    // `parse_enrs` warns about its own list only, and only when that list
+    // named entries; a network directory with no bootnode file names none.
+    if bootnodes.is_empty() {
+        warn!(
+            "No bootnodes: neither --bootnodes nor the network's own list gave one. \
+             discv5 has no seed, so this node finds peers only when one reaches it first."
+        );
+    }
     Ok(bootnodes)
 }
 
@@ -3745,16 +3763,11 @@ validators:
     }
 
     /// Why `beacon_bootnodes` refuses `cli_entries`, panicking if it accepts
-    /// them. `Bootnode` has no `Debug`, so `expect_err` is not available.
+    /// them.
     fn beacon_bootnodes_refusal(cli_entries: &[&str]) -> String {
         let entries: Vec<String> = cli_entries.iter().map(|entry| entry.to_string()).collect();
-        match beacon_bootnodes(&entries, Vec::new()) {
-            Ok(bootnodes) => panic!(
-                "{cli_entries:?} was accepted as {} bootnodes",
-                bootnodes.len()
-            ),
-            Err(err) => format!("{err:#}"),
-        }
+        let err = beacon_bootnodes(&entries, Vec::new()).expect_err("the entries must be refused");
+        format!("{err:#}")
     }
 
     /// Additive, as Lighthouse's `--boot-nodes` is: the command line's entries

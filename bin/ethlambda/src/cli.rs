@@ -977,8 +977,10 @@ mod tests {
         assert_eq!(parse_beacon(args).mainnet.bootnodes, [enr]);
     }
 
-    /// An empty value and a trailing comma parse; the empty entries they leave
-    /// are skipped at startup (`main::beacon_bootnodes`), not refused here.
+    /// An empty value and a trailing comma parse, and refusing them is not
+    /// clap's job: any empty entry they leave is skipped at startup
+    /// (`main::beacon_bootnodes`). The first assertion holds whether clap
+    /// turns `""` into no entry or one empty entry, since startup handles both.
     #[test]
     fn beacon_bootnodes_parses_an_empty_value_and_a_trailing_comma() {
         let mut args = beacon_args();
