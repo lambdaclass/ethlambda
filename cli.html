@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f24e4a36.js";
+            window.path_to_searchindex_js = "searchindex-7f9a9efe.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -502,7 +502,7 @@ or in the same keymanager API request that imports the key. See
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>
 <tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
-<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay</td></tr>
+<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The addresses reach each beacon node as one <code>prepare_beacon_proposer</code> request every slot, listing each validator that has an index on chain and an address, as Lighthouse’s validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay</td></tr>
 <tr><td><code>--gas-limit</code></td><td><code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. <strong>Sepolia and Platåberget schedule <code>200000000</code></strong> (their <code>config.yaml</code>’s <code>GAS_LIMIT_SCHEDULE</code>, which this client does not read yet, <a href="https://github.com/lambdaclass/ethlambda/issues/795">#795</a>), so on either pass <code>--gas-limit 200000000</code>. Must be positive</td></tr>
 <tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, remote keys, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
@@ -777,6 +777,13 @@ a remote entry whose key this process runs from a local keystore removes the
 entry and leaves the local key, and its per-validator settings, as they are.
 Its answer is <code>error</code> too, naming <code>/eth/v1/keystores</code>, and never <code>deleted</code>:
 the key is still signing here until that route removes it.</p>
+<p>A deleted key’s fee recipient is no longer sent to the beacon node, from the
+next slot on. The node keeps the address it was last given for that validator
+until it expires the entry or restarts, so a client the key moved to on the
+same node prepares it with its own address without this one overwriting it.
+An imported key’s fee recipient is first sent at the next epoch boundary, when
+its index is resolved, which is also when its proposer duties are first
+fetched.</p>
 <p>It also serves <code>POST /eth/v1/validator/{pubkey}/voluntary_exit</code>, which signs a
 voluntary exit for a validator this client holds, in a local keystore or in a
 remote signer, and answers with the <code>SignedVoluntaryExit</code>, for the exit’s
@@ -794,7 +801,7 @@ give one validator its own value in place of the command line’s default:</p>
 <tr><th>Setting</th><th>Default</th><th>Takes effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With <code>--builder-proposals</code>, the next builder registration carries it too, usually at the next slot (later while the epoch’s full registration send is still running) and again every slot until a node accepts it or the epoch’s full send carries it, and an ethlambda beacon node takes it from there. A <code>DELETE</code> that leaves a validator with no address at all (no <code>--suggested-fee-recipient</code> either) sends no registration, so the builder keeps paying the address it was last given. From gloas, the proposer preferences carry it, from the next dependent root on</td></tr>
+<tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot’s duties (the next slot’s while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With <code>--builder-proposals</code>, the next builder registration carries it too, usually at the next slot (later while the epoch’s full registration send is still running) and again every slot until a node accepts it or the epoch’s full send carries it, and an ethlambda beacon node takes it from there. A <code>DELETE</code> that leaves a validator with no address at all (no <code>--suggested-fee-recipient</code> either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on</td></tr>
 <tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal</td></tr>
 <tr><td><code>gas_limit</code></td><td><code>--gas-limit</code></td><td>Before gloas, the next builder registration with <code>--builder-proposals</code> (usually at the next slot, later while the epoch’s full registration send is still running, and again every slot until a node accepts it or the epoch’s full send carries it), and stored and served only without it. From gloas, the proposer preferences’ target gas limit, from the next dependent root on, flag or not</td></tr>
 </tbody>

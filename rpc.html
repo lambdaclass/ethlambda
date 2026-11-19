@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f24e4a36.js";
+            window.path_to_searchindex_js = "searchindex-7f9a9efe.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -594,7 +594,9 @@ once a slot.</p>
 </li>
 <li>
 <p><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
-memory (a validator client repeats the call every epoch).</p>
+memory, so a restart forgets it and the node builds its own payloads for the
+zero address until the next call. ethlambda’s validator client repeats the
+call every slot, as Lighthouse’s does.</p>
 </li>
 <li>
 <p><strong><code>register_validator</code></strong> takes a JSON array or an SSZ list of signed
