@@ -279,7 +279,8 @@ faster than the writer persists them, the wait shows up here rather than in
 
 With an execution client the beacon `stf` row also includes a state
 transition that ran while `engine_newPayload` was in flight, and `engine` then
-reports only the wait left after it, zero when the answer was already in. The
+reports only what the request cost beyond it: building it, and the wait left
+after the transition, which is nothing when the answer was already in. The
 execution client's own time is `lean_engine_new_payload_seconds`. A replay has
 no client, so none of this applies to its numbers.
 

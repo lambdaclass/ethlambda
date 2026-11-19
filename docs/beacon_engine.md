@@ -100,6 +100,13 @@ sends it from a spawned task so the HTTP exchange keeps progressing, and runs
 transition against its parent's post-state, with the engine assumed valid. The
 import then costs `max(engine wait, transition)` instead of their sum.
 
+That needs the spawned task to run on another thread while the actor computes,
+and in the node it does: the chain actor runs on `Backend::Thread`, whose thread
+blocks on a multi-thread tokio runtime of its own, and the task runs on that
+runtime's workers. On a current-thread runtime (a `#[tokio::test]` calling
+`process_block` directly) the request only leaves at the `await`, so the two add
+up again: the same result, without the gain.
+
 Why that is the transition `on_block` would run: `on_block` derives the
 `ExecutionEngine` from the verdict in one place, `invalid()` for `INVALIDATED`
 and `valid()` for `NOT_REQUIRED`, `VALID` and optimistic alike, and the
@@ -150,10 +157,11 @@ keeps it harmless:
 
 The overlap shows in the import timing tree: the transition that ran during the
 round trip is reported under `stf` (used or discarded), and `engine` reports only
-the wait that was left once it finished, a recorded zero when the answer was
-already in. Without an execution client, and for forks that have no request to
-send (pre-merge, gloas), nothing overlaps, `engine` is zero, and the path is the
-old one. How long the execution client itself took to answer is
+what the question cost beyond it: building the request (a copy of the
+payload) and the wait that was left once the transition finished, the request's
+construction alone when the answer was already in. Without an execution client,
+and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
+`engine` is zero, and the path is the old one. How long the execution client itself took to answer is
 `lean_engine_new_payload_seconds{outcome}`, timed around every `engine_newPayload*`
 request this module sends (`timed_new_payload`), a gloas envelope's included.
 

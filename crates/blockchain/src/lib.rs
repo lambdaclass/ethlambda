@@ -1826,10 +1826,22 @@ impl BlockChainServer {
                 // Without an engine, or without a request to send (pre-merge
                 // forks, gloas), nothing overlaps and the path is the old one.
                 //
-                // The `engine` section is what the import waited once it had
-                // nothing left to do, so it starts as a recorded zero and only
-                // a request still unanswered when the transition is done
-                // widens it. The execution client's own time is
+                // The overlap needs the spawned task to run on another thread
+                // while this one computes. In the node it does: this actor runs
+                // on `Backend::Thread`, whose thread blocks on a multi-thread
+                // tokio runtime of its own, and the task runs on that
+                // runtime's workers. On a current-thread runtime (a
+                // `#[tokio::test]` calling this directly) the request only
+                // leaves at the `await`, and the two add up again: the same
+                // result, without the gain.
+                //
+                // The `engine` pair spans the whole question, from building the
+                // request to the later of its answer and the transition's end.
+                // The transition lies inside it and the report subtracts it, so
+                // the `engine` row is what the question cost beyond the
+                // transition: building the request, and any wait left once the
+                // transition is done. A recorded zero without a request. The
+                // execution client's own time is
                 // `lean_engine_new_payload_seconds`, observed around the
                 // request itself.
                 let no_wait = Instant::now();
@@ -1878,9 +1890,9 @@ impl BlockChainServer {
                             }
                             Err(err) => (Err(NoVerdict::Task(err)), Instant::now()),
                         };
-                        // The wait begins once the transition is done; an
-                        // answer already in by then leaves it at zero.
-                        timings.engine_start = Some(speculative_end);
+                        // From building the request (`no_wait`) to the later
+                        // of the answer and the transition's end; the report
+                        // takes the transition back out.
                         timings.engine_end = Some(answered_at.max(speculative_end));
                         answer
                     }
@@ -5866,6 +5878,25 @@ mod tests {
             .count()
     }
 
+    /// The `engine` pair runs from building the request to the later of the
+    /// answer and the transition's end, so the speculative transition lies
+    /// inside it and the report can take it back out: nothing the question
+    /// cost before the transition started (building the request) is lost.
+    fn assert_engine_pair_spans_the_speculation(timings: &ImportTimings) {
+        let (Some(engine_start), Some(engine_end)) = (timings.engine_start, timings.engine_end)
+        else {
+            panic!("an asked block records the engine pair");
+        };
+        let (Some(start), Some(end)) = (timings.stf_speculative_start, timings.stf_speculative_end)
+        else {
+            panic!("the premise: a speculation was computed");
+        };
+        assert!(
+            engine_start <= start && end <= engine_end,
+            "the engine pair must span the speculative transition"
+        );
+    }
+
     /// `INVALID`: the speculation, computed with a `valid()` engine, is
     /// dropped, `on_block` runs the transition itself with `invalid()`, and
     /// nothing is imported.
@@ -5893,6 +5924,7 @@ mod tests {
             timings.stf_speculative_start.is_some(),
             "the premise: a speculation was computed while the request was in flight"
         );
+        assert_engine_pair_spans_the_speculation(&timings);
         assert_eq!(
             timings.speculation,
             Some(SpeculationOutcome::DiscardedInvalidated)
@@ -5953,6 +5985,7 @@ mod tests {
             timings.stf_speculative_start.is_some(),
             "the premise: a speculation was computed while the request was in flight"
         );
+        assert_engine_pair_spans_the_speculation(&timings);
         assert_eq!(timings.speculation, Some(SpeculationOutcome::DiscardedHeld));
         assert_eq!(
             result.expect("a hold is not a failure"),

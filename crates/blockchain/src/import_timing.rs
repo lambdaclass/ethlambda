@@ -208,17 +208,19 @@ pub struct ImportTimings {
     pub columns_wait_start: Option<Instant>,
     pub columns_wait_end: Option<Instant>,
 
-    /// Beacon: how long the import sat waiting for the execution client's
-    /// verdict with no consensus work of its own left to do. I/O wait, not
-    /// work.
+    /// Beacon: what the execution client's verdict cost the import beyond the
+    /// state transition it overlapped: building and sending the request (a
+    /// copy of the payload), and then any wait for the answer left once that
+    /// transition finished.
     ///
-    /// The request is sent from a task of its own while the state transition
-    /// runs (see [`Self::stf_speculative_start`]), so this pair starts where that
-    /// transition ended and ends when the answer arrived. Both are the same
-    /// instant, a recorded zero, when there was no request to send (no
-    /// execution client, or a block with no payload in it: pre-merge or
-    /// gloas) or when the answer was already in once the transition finished.
-    /// How long the execution client itself took is
+    /// This pair spans the whole question, from building the request to the
+    /// later of the answer and the end of the transition that ran meanwhile
+    /// (see [`Self::stf_speculative_start`]). That transition lies inside it,
+    /// and the `engine` row reports the pair minus it, the way `stf` excludes
+    /// `writer_wait`, so the overlap is counted once, under `stf`. Both ends
+    /// are the same instant, a recorded zero, when there was no request to
+    /// send (no execution client, or a block with no payload in it: pre-merge
+    /// or gloas). How long the execution client itself took is
     /// `lean_engine_new_payload_seconds`, not this.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
@@ -248,10 +250,12 @@ pub struct ImportTimings {
     /// work. A discarded one is added too, so the transition an `INVALIDATED`
     /// verdict makes `on_block` run again shows as the second transition it
     /// is, and a held block still shows the one it paid for. The `engine` pair
-    /// starts at this pair's end, so the rows still sum to the end-to-end time
-    /// instead of counting the overlap twice. `None` whenever no request was
-    /// sent, which is every import without an execution client and every
-    /// block with no payload to ask about.
+    /// spans this one and its row subtracts it, so the rows still sum to the
+    /// end-to-end time instead of counting the overlap twice. `None` whenever
+    /// no speculation was computed: every import that sent no request (no
+    /// execution client, or no payload to ask about), and a request for a
+    /// block `fork_choice::speculate_transition` declined. Nothing overlapped
+    /// then, and the `engine` row is its whole pair.
     pub stf_speculative_start: Option<Instant>,
     pub stf_speculative_end: Option<Instant>,
     /// Beacon: what became of that speculative transition, set by
@@ -439,18 +443,22 @@ impl ImportTimings {
     ///
     /// The `stf` row excludes `writer_wait` when one was recorded, since the
     /// wait is nested inside the `stf` pair; that keeps the rows summing to
-    /// the end-to-end time and `stf` meaning state-transition work.
+    /// the end-to-end time and `stf` meaning state-transition work. The
+    /// speculative transition moves the same way, out of the `engine` pair it
+    /// ran inside and into `stf`.
     fn rows(&self) -> Vec<Row> {
         let mut stf = Row::new("stf", self.stf_start, self.stf_end);
         let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
         if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
             stf.elapsed = Some(total.saturating_sub(wait));
         }
+        let mut engine = Row::new("engine", self.engine_start, self.engine_end);
         // Also when the import stopped before running its own transition (a
         // held block), so the speculation it paid for is not lost.
         if let Some(spec) = span(self.stf_speculative_start, self.stf_speculative_end) {
             stf.elapsed = Some(stf.elapsed.unwrap_or_default() + spec);
             stf.end = stf.end.or(self.stf_speculative_end);
+            engine.elapsed = engine.elapsed.map(|total| total.saturating_sub(spec));
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -471,7 +479,7 @@ impl ImportTimings {
                 self.columns_wait_start,
                 self.columns_wait_end,
             ),
-            Row::new("engine", self.engine_start, self.engine_end),
+            engine,
             Row::new(
                 "verify_struct",
                 self.verify_structural_start,
@@ -976,18 +984,19 @@ mod tests {
 
     #[test]
     fn an_overlapped_transition_is_charged_to_stf_and_not_to_engine() {
-        // A 100 ms round trip with a 70 ms transition running inside it, then
-        // 20 ms of import. Un-overlapped, that is 100 + 20 ms; overlapped, the
-        // engine row keeps the 30 ms that was left and stf gains the 70 ms.
+        // 5 ms building the request, a 70 ms transition while it is in flight,
+        // 30 ms more waiting for the answer, then 20 ms of import. The engine
+        // row keeps the 35 ms the transition did not hide, building the
+        // request included, and stf gains the 70 ms.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 0, 70);
-        (timings.engine_start, timings.engine_end) = pair(base, 70, 30);
-        (timings.stf_start, timings.stf_end) = pair(base, 100, 20);
+        (timings.engine_start, timings.engine_end) = pair(base, 0, 105);
+        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 5, 70);
+        (timings.stf_start, timings.stf_end) = pair(base, 105, 20);
 
         assert_eq!(
             row_elapsed(&timings, "engine"),
-            Some(Duration::from_millis(30))
+            Some(Duration::from_millis(35))
         );
         assert_eq!(
             row_elapsed(&timings, "stf"),
@@ -1000,9 +1009,25 @@ mod tests {
             .sum();
         assert_eq!(
             rows,
-            Duration::from_millis(120),
-            "the rows still tile the span"
+            Duration::from_millis(125),
+            "the rows still tile the span, building the request included"
         );
+    }
+
+    #[test]
+    fn an_engine_question_with_no_speculation_is_all_engine() {
+        // A request sent, but nothing computed meanwhile (the block failed a
+        // guard the speculation shares with `on_block`): every moment of the
+        // question is the engine's, none of it disappears.
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.engine_start, timings.engine_end) = pair(base, 0, 40);
+
+        assert_eq!(
+            row_elapsed(&timings, "engine"),
+            Some(Duration::from_millis(40))
+        );
+        assert_eq!(row_elapsed(&timings, "stf"), None);
     }
 
     #[test]
@@ -1012,7 +1037,7 @@ mod tests {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 0, 70);
-        (timings.engine_start, timings.engine_end) = pair(base, 70, 300);
+        (timings.engine_start, timings.engine_end) = pair(base, 0, 370);
 
         assert_eq!(
             row_elapsed(&timings, "stf"),
@@ -1026,8 +1051,8 @@ mod tests {
 
     #[test]
     fn an_engine_with_nothing_to_wait_for_is_a_recorded_zero() {
-        // No request sent, or the answer was in before the transition ended:
-        // the row is present and zero, so every beacon block observes it.
+        // No request sent: the row is present and zero, so every beacon block
+        // observes it.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = (Some(base), Some(base));
