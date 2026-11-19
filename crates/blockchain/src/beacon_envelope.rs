@@ -417,10 +417,10 @@ impl BlockChainServer {
         }
 
         // Every sampled column is stored, and a stored column has passed the
-        // structural check, the inclusion proof's gloas counterpart and the KZG
-        // batch in the p2p layer (gossip validation, or `chain_checks_gloas`
-        // for a fetched or parked one) against this block's bid, so none is
-        // read back and verified a second time here. With no commitments there
+        // slot match, the structural check and the KZG batch against this
+        // block's bid's commitments in the p2p layer (gossip validation, or
+        // `chain_checks_gloas` for any other, this node's own included), so
+        // none is read back and verified a second time here. With no commitments there
         // is nothing to sample and nothing to verify.
         // The consensus checks come first, as `verify_execution_payload_envelope`
         // orders them, so the execution client is only ever asked about an

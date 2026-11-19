@@ -825,12 +825,15 @@ fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Confi
 ///
 /// A fulu block whose custody columns are all present gets
 /// [`fork_choice::DataAvailability::ColumnsVerified`]: the sidecars are not
-/// read or decoded, because the table only ever holds ones the p2p layer
-/// already checked in full (structure, inclusion proof, KZG), and the spec's
-/// per-sidecar check would repeat that work on the import thread. Debug builds
-/// keep a safety net on the write side instead, in `on_checked_data_columns`.
-/// Mirrors lighthouse, whose verified-column types carry that proof so import
-/// never re-runs KZG.
+/// read or decoded, because the table only ever holds ones already checked in
+/// full (structure, inclusion proof, KZG), and the spec's per-sidecar check
+/// would repeat that work on the import thread. The p2p layer checks every
+/// sidecar it receives; this node's own proposal's are checked by the Beacon
+/// API before it publishes them (`data_columns::verified_sidecars`). Debug
+/// builds keep a safety net on the write side instead, in
+/// `on_checked_data_columns`. Lighthouse skips the same work at import, with
+/// the proof carried by its verified-column types; here nothing in the type
+/// carries it, and the write gate is what makes it hold.
 fn data_availability_for(
     store: &Store,
     block: &SignedBeaconBlock,
@@ -875,10 +878,12 @@ fn data_availability_for(
             }
 
             // Present means verified: `DataColumns` takes only sidecars the
-            // p2p layer's column checks accepted (see `on_checked_data_columns`),
-            // keyed by the root of the header those checks judged. So the
-            // sidecars are neither read back nor verified again here; the KZG
-            // batch they would cost is the one each already paid on arrival.
+            // p2p layer's column checks accepted, or this node's own
+            // proposal's, which the Beacon API verified before publishing them
+            // (see `on_checked_data_columns`), keyed by the root of the header
+            // they were checked against. So the sidecars are neither read back
+            // nor verified again here; the KZG batch they would cost is the
+            // one each already paid on arrival.
             Some(fork_choice::DataAvailability::ColumnsVerified)
         }
         SignedBeaconBlock::Phase0(_)
@@ -3507,6 +3512,11 @@ impl BlockChainServer {
     /// (`ethlambda_state_transition::beacon::gossip::column::chain_checks`)
     /// for any other. Those cost a KZG batch and a BLS verification per
     /// sidecar, which on this thread delayed every block import behind them.
+    /// The one batch that skips the p2p checks, this node's own proposal's
+    /// custody columns, was verified by the Beacon API before it was published
+    /// (`ethlambda_state_transition::beacon::data_columns::verified_sidecars`).
+    /// Block import counts on all of this: it takes a stored column as
+    /// verified and does not check it again.
     ///
     /// Debug builds run the chain checks once more, so a p2p path that
     /// forwards a sidecar it never checked fails a test instead of reaching

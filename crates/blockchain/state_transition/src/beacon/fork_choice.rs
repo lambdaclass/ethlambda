@@ -642,7 +642,9 @@ pub enum DataAvailability {
     /// [`verify_data_column_sidecar_kzg_proofs`], and was stored under the
     /// block's own root. Only a caller that gates every write of those
     /// sidecars on those checks may make it (the chain actor does, by storing
-    /// only what the p2p layer's column checks accepted), since
+    /// only what the p2p layer's column checks accepted and its own proposal's
+    /// columns, which [`crate::beacon::data_columns::verified_sidecars`]
+    /// checked before they were published), since
     /// [`is_data_available_columns`] takes it on trust and runs nothing. It
     /// exists so import does not decode every stored sidecar and repeat the
     /// KZG batch the sidecar already paid for on arrival; a caller with
@@ -5805,6 +5807,12 @@ pub fn on_execution_payload_envelope(
 /// `engine` argument still answers the engine's part of
 /// `verify_execution_payload_envelope`; such a caller passes
 /// [`stf::ExecutionEngine::valid`] and consults the real engine itself.
+///
+/// The chain actor is such a caller, but holds no sidecars to pass: the
+/// sampled columns it stores were verified before they were stored, so it
+/// calls [`check_execution_payload_envelope_columns_verified`] instead. This
+/// one is for a caller with sidecars nothing has checked yet, which is what
+/// the fixture runner hands [`on_execution_payload_envelope`].
 pub fn check_execution_payload_envelope(
     store: &Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
@@ -5879,8 +5887,9 @@ fn check_envelope(
 /// envelope to the store. Persisted, so a restarted follower keeps the full
 /// branch of this block.
 ///
-/// The caller must have run [`check_execution_payload_envelope`] on the same
-/// envelope; a block the store does not hold is the only case this refuses.
+/// The caller must have run [`check_execution_payload_envelope`] or
+/// [`check_execution_payload_envelope_columns_verified`] on the same envelope;
+/// a block the store does not hold is the only case this refuses.
 pub fn accept_execution_payload_envelope(
     store: &mut Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
