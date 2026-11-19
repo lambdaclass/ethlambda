@@ -50,9 +50,11 @@ use ethlambda_storage::{TargetBalanceCache, TargetBalances};
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::error::Result;
+use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::primitives::{Epoch, Gwei, Root};
 
 use super::accessors::get_current_epoch;
+use super::misc::compute_epoch_at_slot;
 use super::participation::ParticipationTotals;
 
 /// What one block's attestations added to the previous and current epoch's
@@ -160,9 +162,27 @@ pub fn extend_parent_totals(
     (parent.epoch == block_epoch && tracks_epoch(block_epoch)).then(|| delta.applied_to(parent))
 }
 
+/// The post-state totals of `block`, whose parent is `parent_root` and whose
+/// attestations added `delta`, when they can be derived from the parent's
+/// cached ones. `None` means the caller must scan: the block slashes someone
+/// (see the module documentation), or [`extend_parent_totals`] cannot extend
+/// the parent.
+pub fn totals_from_parent(
+    cache: &TargetBalanceCache,
+    parent_root: &Root,
+    block: &SignedBeaconBlock,
+    delta: &TargetBalanceDelta,
+) -> Option<TargetBalances> {
+    if block_has_slashings(block) {
+        return None;
+    }
+    let block_epoch = compute_epoch_at_slot(block.slot());
+    extend_parent_totals(cache, parent_root, block_epoch, delta)
+}
+
 /// Whether the block carries an operation that slashes a validator; see the
 /// module documentation for why such a block is not extended incrementally.
-pub fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
+fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
     match block {
         SignedBeaconBlock::Phase0(b) => {
             !b.message.body.proposer_slashings.is_empty()
@@ -192,14 +212,17 @@ pub fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
             !b.message.body.proposer_slashings.is_empty()
                 || !b.message.body.attester_slashings.is_empty()
         }
-        // Not a Beacon Chain block: nothing here ever carries one.
-        SignedBeaconBlock::Lean(_) => true,
+        SignedBeaconBlock::Lean(_) => {
+            lean_block_unreachable("target_balances::block_has_slashings")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::containers::{ProposerSlashing, gloas};
+    use crate::beacon::preset;
 
     #[test]
     fn a_delta_skips_slashed_validators_and_splits_by_epoch() {
@@ -234,5 +257,46 @@ mod tests {
         let early = Root::repeat_byte(3);
         cache.insert(early, TargetBalances { epoch: 1, ..totals });
         assert_eq!(extend_parent_totals(&cache, &early, 1, &delta), None);
+    }
+
+    #[test]
+    fn a_block_that_slashes_is_not_extended_from_its_parent() {
+        // A slashing removes a validator from the unslashed total, which the
+        // delta does not see, so such a block must go to the full scan even
+        // when its parent's totals are cached for its epoch.
+        let cache = TargetBalanceCache::default();
+        let parent = Root::repeat_byte(1);
+        let totals = TargetBalances {
+            epoch: 5,
+            previous: 100,
+            current: 10,
+        };
+        cache.insert(parent, totals);
+        let delta = TargetBalanceDelta::default();
+        delta.record_new_target(true, 7, false);
+
+        let block = |proposer_slashings| {
+            SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+                message: gloas::BeaconBlock {
+                    slot: 5 * preset::SLOTS_PER_EPOCH + 3,
+                    parent_root: parent,
+                    body: gloas::BeaconBlockBody {
+                        proposer_slashings,
+                        ..gloas::BeaconBlockBody::empty()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+
+        let quiet = block(gloas::ProposerSlashings::default());
+        let extended = totals_from_parent(&cache, &parent, &quiet, &delta).unwrap();
+        assert_eq!((extended.previous, extended.current), (100, 17));
+
+        let slashing = block(gloas::ProposerSlashings::from(vec![
+            ProposerSlashing::default(),
+        ]));
+        assert_eq!(totals_from_parent(&cache, &parent, &slashing, &delta), None);
     }
 }

@@ -193,8 +193,7 @@ use crate::beacon::helpers::misc::{
 };
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::beacon::helpers::target_balances::{
-    TargetBalanceDelta, block_has_slashings, compute_target_balances, extend_parent_totals,
-    tracks_epoch,
+    TargetBalanceDelta, compute_target_balances, totals_from_parent, tracks_epoch,
 };
 use crate::beacon::kzg;
 use crate::beacon::lean_boundary::{lean_block_unreachable, lean_fork_unreachable};
@@ -4383,7 +4382,7 @@ pub fn is_data_available_gloas_columns(
 ///
 /// `extended_totals` is the block's unslashed target balances when the caller
 /// derived them from its parent's cached totals (see
-/// [`extend_parent_totals`]); `None` makes this scan the registry once and
+/// [`totals_from_parent`]); `None` makes this scan the registry once and
 /// cache the result.
 pub fn compute_pulled_up_tip(
     store: &mut Store,
@@ -5469,19 +5468,15 @@ pub fn on_block_speculative(
 
     transition?;
 
-    // The block's target balances when its parent's are cached for this epoch.
-    // Read before `signed_block` moves into the store. A block that slashes
-    // goes to the full scan: see `helpers::target_balances` for why.
-    let extended_totals = if block_has_slashings(&signed_block) {
-        None
-    } else {
-        extend_parent_totals(
-            &store.target_balance_cache(),
-            &parent_root,
-            compute_epoch_at_slot(signed_block.slot()),
-            &target_delta,
-        )
-    };
+    // The block's target balances when its parent's are cached for this epoch
+    // and the block slashes no one. Read before `signed_block` moves into the
+    // store.
+    let extended_totals = totals_from_parent(
+        &store.target_balance_cache(),
+        &parent_root,
+        &signed_block,
+        &target_delta,
+    );
 
     // A block at its epoch's first slot is its own epoch-boundary block: its
     // post-state is the checkpoint state. Cached at import so the tick that
