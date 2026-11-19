@@ -726,9 +726,10 @@ pub enum GossipEvent {
     /// A `proposer_preferences` message passed gossip validation.
     ProposerPreferences(Box<SignedProposerPreferences>),
     /// A `beacon_attestation_{subnet_id}` single attestation passed gossip
-    /// validation (the `single_attestation` event). Boxed: it is the largest
-    /// payload here after the bids, and the event ring is sized for the
-    /// largest variant.
+    /// validation (the `single_attestation` event). Boxed because the bus
+    /// moves the box as is into its `ChainEvent::SingleAttestation`, the
+    /// element its ring stores, which is boxed to keep that ring's slots
+    /// small.
     SingleAttestation(Box<SingleAttestation>),
 }
 

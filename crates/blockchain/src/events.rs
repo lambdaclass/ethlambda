@@ -344,8 +344,10 @@ pub enum ChainEvent {
     ProposerPreferences(Box<Versioned<gloas::SignedProposerPreferences>>),
     /// Beacon `single_attestation`: a subnet attestation passed the
     /// `beacon_attestation_{subnet_id}` rules. Boxed for the reason
-    /// [`ChainEvent::BeaconAttestation`] is; it is also the highest-rate
-    /// topic, so the clone is only made when someone listens.
+    /// [`ChainEvent::BeaconAttestation`] is. It is also the highest-rate
+    /// topic, so the clone is only made while a client is subscribed, though
+    /// to any topic: the bus does not track which ones (see
+    /// [`EventBus::has_subscribers`]).
     SingleAttestation(Box<electra::SingleAttestation>),
 }
 

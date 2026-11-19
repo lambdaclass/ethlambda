@@ -435,7 +435,8 @@ fn publish_gossip_event(server: &P2PServer, object: &Validated) {
             GossipEvent::PayloadAttestationMessage(message.clone())
         }
         // The highest-rate event the node has (every attestation on its
-        // backbone subnets), so nothing is cloned for a node nobody listens to.
+        // backbone subnets), so nothing is cloned for a node nobody listens
+        // to. Any subscriber turns it on, whatever its topics.
         Validated::Attestation { attestation, .. } if sink.has_subscribers() => {
             GossipEvent::SingleAttestation(attestation.clone())
         }
@@ -1185,6 +1186,8 @@ mod tests {
             .forward(server, Instant::now(), outcome)
         };
 
+        // No subscriber: the `has_subscribers` guard keeps even an accepted
+        // attestation from being cloned and sent.
         let silent = Arc::new(RecordingSink::default());
         server.gossip_events = Some(silent.clone());
         forward(&server, Outcome::Accept);
