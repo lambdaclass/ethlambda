@@ -215,21 +215,14 @@ pub fn apply_block(
 }
 
 /// Whether the block carries its proposer's signature.
+///
+/// Checked on its own, never batched: [`apply_block`] runs it before the body
+/// so that a block its proposer never signed costs one pairing to reject.
 pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
 ) -> bool {
-    block_signature_set(state, signed_block).is_some_and(|set| set.verify())
-}
-
-/// The proposer's signature check [`verify_block_signature`] makes, resolved
-/// but not yet run. `None` is a proposer index outside the registry, or a key
-/// or signature that does not validate.
-pub fn block_signature_set(
-    state: &BeaconState,
-    signed_block: &containers::SignedBeaconBlock,
-) -> Option<bls::SignatureSet> {
-    proposer_signature_set(
+    verify_proposer_signature(
         state,
         signed_block.proposer_index(),
         signed_block.message_hash_tree_root(),
