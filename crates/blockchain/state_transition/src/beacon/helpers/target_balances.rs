@@ -39,6 +39,15 @@
 //! boundary, on a cache miss, after a restart, or for a block with slashings,
 //! the totals are computed in full once and cached.
 //!
+//! Gloas does not change the key. A block's pre-state is its parent block's
+//! post-state whether the parent's payload was delivered (FULL) or not
+//! (EMPTY): applying an envelope only verifies it, and a FULL parent's
+//! execution requests are processed inside the child's own block
+//! (`process_parent_execution_payload`). Those are the execution requests of
+//! item 1 above, which set no flag, effective balance or `slashed`. So the
+//! parent's entry, cached from its block post-state, is the right base for a
+//! child on either branch.
+//!
 //! The first two epochs are skipped entirely: justification does not run
 //! there, and the previous and current epoch coincide at genesis, where the
 //! scan reads the current list for both.

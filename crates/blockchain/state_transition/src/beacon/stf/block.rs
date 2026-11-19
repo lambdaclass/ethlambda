@@ -261,8 +261,9 @@ pub fn process_block_header(
     Ok(())
 }
 
-/// What `process_block` may leave unchecked. The default checks everything the
-/// specification does, and is the only value block import uses.
+/// What `process_block` may leave unchecked, and what it collects on the side.
+/// The default checks everything the specification does and collects nothing.
+/// Block import checks everything too, and sets only `target_delta`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockProcessingOptions<'a> {
     pub randao: RandaoVerification,
