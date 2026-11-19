@@ -2,14 +2,19 @@
 //! The vectors are SSZ as the Beacon API served it
 //! (`beacon/testdata/payload_hash/`):
 //!
-//! | fork      | chain       | object               |
-//! |-----------|-------------|----------------------|
-//! | bellatrix | Sepolia     | block, slot 500000   |
-//! | capella   | Sepolia     | block, slot 1900000  |
-//! | deneb     | Hoodi       | block, slot 2003     |
-//! | electra   | Hoodi       | block, slot 70001    |
-//! | fulu      | mainnet     | block, slot 15576000 |
-//! | gloas     | Plataberget | envelope, slot 593101 |
+//! | fork      | chain       | object                | carries                                |
+//! |-----------|-------------|-----------------------|----------------------------------------|
+//! | bellatrix | Sepolia     | block, slot 500000    |                                        |
+//! | capella   | Sepolia     | block, slot 1900000   | withdrawals                            |
+//! | deneb     | Hoodi       | block, slot 2003      |                                        |
+//! | electra   | Hoodi       | block, slot 70001     |                                        |
+//! | fulu      | mainnet     | block, slot 15684701  | 238 transactions, 3 requests (2 types) |
+//! | gloas     | Plataberget | envelope, slot 593101 |                                        |
+//!
+//! The fulu block is finalized and canonical; its bytes are the same from
+//! ethlambda's and Lodestar's Beacon API. It carries one withdrawal request
+//! and two consolidation requests, so its requests hash is over two request
+//! types.
 
 use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
 use ethlambda_types::beacon::containers::electra;
@@ -23,7 +28,7 @@ const BELLATRIX: &[u8] =
 const CAPELLA: &[u8] = include_bytes!("../testdata/payload_hash/sepolia_capella_slot_1900000.ssz");
 const DENEB: &[u8] = include_bytes!("../testdata/payload_hash/hoodi_deneb_slot_2003.ssz");
 const ELECTRA: &[u8] = include_bytes!("../testdata/payload_hash/hoodi_electra_slot_70001.ssz");
-const FULU: &[u8] = include_bytes!("../testdata/payload_hash/mainnet_fulu_slot_15576000.ssz");
+const FULU: &[u8] = include_bytes!("../testdata/payload_hash/mainnet_fulu_slot_15684701.ssz");
 const GLOAS: &[u8] =
     include_bytes!("../testdata/payload_hash/plataberget_gloas_envelope_slot_593101.ssz");
 
@@ -65,6 +70,12 @@ fn consolidation() -> electra::ConsolidationRequest {
     electra::ConsolidationRequest::from_ssz_bytes(&[0; 116]).expect("a fixed-size container")
 }
 
+/// An all-zero withdrawal request, for blocks whose consolidation list (two
+/// at most) may already be full.
+fn withdrawal_request() -> electra::WithdrawalRequest {
+    electra::WithdrawalRequest::from_ssz_bytes(&[0; 76]).expect("a fixed-size container")
+}
+
 fn withdrawal() -> capella::Withdrawal {
     capella::Withdrawal::from_ssz_bytes(&[0; 44]).expect("a fixed-size container")
 }
@@ -102,9 +113,6 @@ fn the_vectors_exercise_what_each_fork_adds() {
             .is_empty(),
         "capella's vector must carry withdrawals"
     );
-    let SignedBeaconBlock::Fulu(fulu) = block(ForkName::Fulu, FULU) else {
-        panic!("fulu");
-    };
     let SignedBeaconBlock::Bellatrix(bellatrix) = block(ForkName::Bellatrix, BELLATRIX) else {
         panic!("bellatrix");
     };
@@ -113,7 +121,27 @@ fn the_vectors_exercise_what_each_fork_adds() {
         bellatrix.message.body.execution_payload,
         bellatrix::ExecutionPayload::default()
     );
-    assert!(!fulu.message.body.execution_payload.transactions.is_empty());
+
+    let mut fulu = block(ForkName::Fulu, FULU);
+    let fulu = &fulu_block(&mut fulu).message.body;
+    // The transactions trie keys a transaction by `rlp(index)`: one byte up to
+    // index 127, two from index 128 (`0x81 0x80`), so the vector needs more
+    // than 128 transactions to reach a two-byte key.
+    assert_eq!(128usize.encode_to_vec(), [0x81, 0x80]);
+    assert!(
+        fulu.execution_payload.transactions.len() > 128,
+        "fulu's vector must reach a two-byte transaction key"
+    );
+    // Real requests of more than one type, so the requests hash is over
+    // several typed entries and not only the empty list's.
+    let requests = ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list(
+        &fulu.execution_requests,
+    );
+    assert!(
+        requests.len() >= 2,
+        "fulu's vector must carry requests of two types"
+    );
+
     assert!(!envelope().message.payload.transactions.is_empty());
 }
 
@@ -159,7 +187,13 @@ fn a_changed_deneb_field_is_refused() {
 #[test]
 fn a_changed_electra_or_fulu_field_is_refused() {
     for (fork, bytes) in [(ForkName::Electra, ELECTRA), (ForkName::Fulu, FULU)] {
-        for what in ["transaction", "parent_root", "request", "extra_data"] {
+        for what in [
+            "transaction",
+            "parent_root",
+            "request",
+            "existing_request",
+            "extra_data",
+        ] {
             let mut changed = block(fork, bytes);
             let (SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner)) = &mut changed
             else {
@@ -175,14 +209,23 @@ fn a_changed_electra_or_fulu_field_is_refused() {
                 }
                 "parent_root" => inner.message.parent_root.0[0] ^= 1,
                 // The requests hash covers a request however empty its
-                // payload: one more consolidation moves it.
+                // payload: one more withdrawal request moves it.
                 "request" => inner
                     .message
                     .body
                     .execution_requests
-                    .consolidations
-                    .push(consolidation())
+                    .withdrawals
+                    .push(withdrawal_request())
                     .expect("room for one more request"),
+                // A changed field inside a request the block already
+                // carries; only the fulu vector has one.
+                "existing_request" => {
+                    let requests = &mut inner.message.body.execution_requests;
+                    if requests.consolidations.is_empty() {
+                        continue;
+                    }
+                    requests.consolidations[0].source_address.0[0] ^= 1;
+                }
                 _ => inner
                     .message
                     .body
