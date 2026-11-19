@@ -8,7 +8,7 @@ use axum::{
     routing::get,
 };
 use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
-use ethlambda_network_api::ConnectedPeer;
+use ethlambda_network_api::{ConnectedPeer, PeerDirection, PeerTableController};
 use ethlambda_storage::Store;
 
 use super::ApiError;
@@ -144,12 +144,21 @@ async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) 
 /// The `PeerConnectionState` values the Beacon API names. A node tracks only
 /// connected peers, so `connected` is the one state that can match anything.
 const PEER_STATES: [&str; 4] = ["disconnected", "connecting", "connected", "disconnecting"];
-const PEER_DIRECTIONS: [&str; 2] = ["inbound", "outbound"];
+/// The `direction` values, spelled by the enum the table stores so the two
+/// cannot drift apart.
+const PEER_DIRECTIONS: [&str; 2] = [
+    PeerDirection::Inbound.as_str(),
+    PeerDirection::Outbound.as_str(),
+];
+
+/// The p2p layer's peer table, `None` without a p2p layer to ask.
+fn peer_table(identity: Option<Extension<crate::BeaconIdentity>>) -> Option<PeerTableController> {
+    identity.and_then(|Extension(identity)| identity.peers)
+}
 
 /// The connected peers, empty without a p2p layer to ask.
 fn connected_peers(identity: Option<Extension<crate::BeaconIdentity>>) -> Vec<ConnectedPeer> {
-    identity
-        .and_then(|Extension(identity)| identity.peers)
+    peer_table(identity)
         .map(|peers| peers.snapshot())
         .unwrap_or_default()
 }
@@ -166,7 +175,8 @@ fn peer_json(peer: &ConnectedPeer) -> serde_json::Value {
 
 /// Every value a repeatable query parameter names, each checked against
 /// `allowed`. Values may also be comma-separated, which some clients send in
-/// place of repeating the parameter.
+/// place of repeating the parameter. Empty values (`?state=`, a trailing
+/// comma) are skipped rather than refused, so `?state=` filters nothing.
 fn filter_values(
     query: &[(String, String)],
     name: &str,
@@ -177,7 +187,7 @@ fn filter_values(
         if key != name {
             continue;
         }
-        for value in raw.split(',') {
+        for value in raw.split(',').filter(|value| !value.is_empty()) {
             if !allowed.contains(&value) {
                 return Err(ApiError::BadRequestDetail(format!(
                     "Invalid {name}: {value}"
@@ -222,12 +232,34 @@ async fn get_peers(
     }))
 }
 
-/// Whether `peer_id` is spelled like a libp2p peer id: non-empty base58. The
-/// text is not decoded, since this crate has no libp2p; a well-formed id that
-/// is not connected is a 404.
+/// Whether `peer_id` is one libp2p's `PeerId::from_str` would accept: base58
+/// text of a multihash that is either sha2-256 (code `0x12`, a digest of at
+/// most 64 bytes) or an inlined key (identity, code `0x00`, at most 42 bytes),
+/// with exactly the digest length its header declares and nothing after it.
+/// Checked by hand, since this crate has no libp2p. A well-formed id that is
+/// not connected is a 404.
 fn is_well_formed_peer_id(peer_id: &str) -> bool {
-    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    !peer_id.is_empty() && peer_id.chars().all(|c| BASE58.contains(c))
+    /// libp2p's `MAX_INLINE_KEY_LENGTH`: the longest key an id inlines.
+    const MAX_INLINE_KEY_LENGTH: usize = 42;
+    /// The largest digest libp2p's multihash holds.
+    const MAX_DIGEST_LENGTH: usize = 64;
+    const IDENTITY: u8 = 0x00;
+    const SHA2_256: u8 = 0x12;
+    let Ok(bytes) = bs58::decode(peer_id).into_vec() else {
+        return false;
+    };
+    // Both codes and every length allowed are below 0x80, so each varint is
+    // a single byte; a longer one names another code or too long a digest.
+    let [code, length, digest @ ..] = bytes.as_slice() else {
+        return false;
+    };
+    let length = usize::from(*length);
+    let longest = match *code {
+        SHA2_256 => MAX_DIGEST_LENGTH,
+        IDENTITY => MAX_INLINE_KEY_LENGTH,
+        _ => return false,
+    };
+    length <= longest && digest.len() == length
 }
 
 /// `GET /eth/v1/node/peers/{peer_id}`: one connected peer. `400` for a
@@ -239,11 +271,8 @@ async fn get_peer(
     if !is_well_formed_peer_id(&peer_id) {
         return ApiError::BadRequestDetail(format!("Invalid peer id: {peer_id}")).into_response();
     }
-    match connected_peers(identity)
-        .iter()
-        .find(|peer| peer.peer_id == peer_id)
-    {
-        Some(peer) => crate::json_response(serde_json::json!({ "data": peer_json(peer) })),
+    match peer_table(identity).and_then(|peers| peers.get(&peer_id)) {
+        Some(peer) => crate::json_response(serde_json::json!({ "data": peer_json(&peer) })),
         None => ApiError::NotFound("peer not found").into_response(),
     }
 }
@@ -251,7 +280,7 @@ async fn get_peer(
 /// `GET /eth/v1/node/peer_count`: peers per state, as quoted integers. Only
 /// `connected` is ever non-zero.
 async fn get_peer_count(identity: Option<Extension<crate::BeaconIdentity>>) -> Response {
-    let connected = connected_peers(identity).len();
+    let connected = peer_table(identity).map_or(0, |peers| peers.len());
     crate::json_response(serde_json::json!({
         "data": {
             "disconnected": "0",
@@ -449,13 +478,21 @@ mod tests {
         }
     }
 
-    /// Two inbound peers and one outbound, the outbound one with an ENR.
+    /// Two inbound peers and one outbound, the outbound one with an ENR. The
+    /// ids only need to sort; the endpoints that list peers never parse them.
     async fn get_from_table(uri: &str) -> axum::response::Response {
         use ethlambda_network_api::PeerDirection::{Inbound, Outbound};
         let table = ethlambda_network_api::PeerTableController::default();
         table.insert(peer("16Uiua", Inbound, None));
         table.insert(peer("16Uiub", Outbound, Some("enr:-abc")));
         table.insert(peer("16Uiuc", Inbound, None));
+        get_with_peers(table, uri).await
+    }
+
+    async fn get_with_peers(
+        table: ethlambda_network_api::PeerTableController,
+        uri: &str,
+    ) -> axum::response::Response {
         let identity = crate::BeaconIdentity {
             peers: Some(table),
             ..Default::default()
@@ -466,6 +503,21 @@ mod tests {
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    /// A peer id libp2p would produce: base58 of a multihash with code `code`
+    /// and `digest`, its length declared in the header.
+    fn multihash_id(code: u8, digest: &[u8]) -> String {
+        let length = u8::try_from(digest.len()).unwrap();
+        bs58::encode([&[code, length][..], digest].concat()).into_string()
+    }
+
+    /// A secp256k1 key inlined the way libp2p does it (identity multihash of
+    /// the protobuf-encoded key), which is what a beacon node's id looks like.
+    fn inlined_key_id(byte: u8) -> String {
+        let mut key = vec![0x08, 0x02, 0x12, 0x21, 0x02];
+        key.extend([byte; 32]);
+        multihash_id(0x00, &key)
     }
 
     fn ids(json: &serde_json::Value) -> Vec<&str> {
@@ -515,6 +567,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_filter_values_are_skipped_rather_than_refused() {
+        // `?state=` names no state, so it filters nothing.
+        let response = get_from_table("/eth/v1/node/peers?state=").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["meta"]["count"], 3);
+
+        // A trailing comma leaves the one real value.
+        let json = body_json(get_from_table("/eth/v1/node/peers?direction=inbound,").await).await;
+        assert_eq!(ids(&json), ["16Uiua", "16Uiuc"]);
+    }
+
+    #[tokio::test]
     async fn a_state_other_than_connected_matches_nothing() {
         let json = body_json(get_from_table("/eth/v1/node/peers?state=disconnected").await).await;
         assert_eq!(json["data"], serde_json::json!([]));
@@ -551,22 +615,61 @@ mod tests {
         assert_eq!(json["data"]["connected"], "0");
     }
 
+    #[test]
+    fn a_peer_id_is_well_formed_only_as_a_whole_libp2p_multihash() {
+        // What libp2p produces: an inlined secp256k1 key, and a sha2-256 hash.
+        assert!(is_well_formed_peer_id(&inlined_key_id(1)));
+        assert!(is_well_formed_peer_id(&multihash_id(0x12, &[7; 32])));
+
+        // Base58 throughout, yet not a peer id.
+        let malformed = [
+            // Too short for a multihash header.
+            "1".to_string(),
+            // Header promises 32 bytes, 31 follow.
+            bs58::encode([&[0x12, 32][..], &[7; 31]].concat()).into_string(),
+            // 32 bytes declared, 33 present.
+            bs58::encode([&[0x12, 32][..], &[7; 33]].concat()).into_string(),
+            // A code that is neither sha2-256 nor identity.
+            multihash_id(0x13, &[7; 32]),
+            // An inlined key longer than libp2p inlines.
+            multihash_id(0x00, &[7; 43]),
+        ];
+        for id in &malformed {
+            assert!(!is_well_formed_peer_id(id), "{id}");
+        }
+
+        // Outside the base58 alphabet (`-`, `0`).
+        assert!(!is_well_formed_peer_id("not-a-peer"));
+        assert!(!is_well_formed_peer_id("16Uiu0"));
+        assert!(!is_well_formed_peer_id(""));
+    }
+
     #[tokio::test]
     async fn one_peer_is_found_missed_or_rejected_as_malformed() {
-        let response = get_from_table("/eth/v1/node/peers/16Uiub").await;
+        use ethlambda_network_api::PeerDirection::Outbound;
+        let connected = inlined_key_id(1);
+        let table = ethlambda_network_api::PeerTableController::default();
+        table.insert(peer(&connected, Outbound, Some("enr:-abc")));
+
+        let uri = format!("/eth/v1/node/peers/{connected}");
+        let response = get_with_peers(table.clone(), &uri).await;
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
-        assert_eq!(json["data"]["peer_id"], "16Uiub");
+        assert_eq!(json["data"]["peer_id"], connected.as_str());
         assert_eq!(json["data"]["direction"], "outbound");
         assert_eq!(json["data"]["enr"], "enr:-abc");
 
-        let response = get_from_table("/eth/v1/node/peers/16Uiuz").await;
+        // Well-formed but not connected.
+        let uri = format!("/eth/v1/node/peers/{}", inlined_key_id(2));
+        let response = get_with_peers(table.clone(), &uri).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        // `-` and `0` are not in the base58 alphabet.
-        let response = get_from_table("/eth/v1/node/peers/not-a-peer").await;
+        // Base58, but not a peer id (an unknown multihash code): a 400, not a
+        // 404.
+        let uri = format!("/eth/v1/node/peers/{}", multihash_id(0x13, &[7; 32]));
+        let response = get_with_peers(table.clone(), &uri).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let response = get_from_table("/eth/v1/node/peers/16Uiu0").await;
+        let response = get_with_peers(table, "/eth/v1/node/peers/not-a-peer").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
