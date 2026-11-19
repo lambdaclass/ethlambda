@@ -18,9 +18,10 @@
 //! client builds the payload. A merge runs on the proving sidecar and costs
 //! seconds when there is more than one child, so it is bounded by a deadline
 //! three quarters of the way to the slot's attestation deadline (Lighthouse's
-//! PQ branch uses the same one). A merge that misses it, fails, or yields a
-//! block `process_stark` refuses is dropped, and the block goes out without
-//! attestations rather than not at all.
+//! PQ branch uses the same one). A merge that misses it or fails is dropped
+//! for the most valuable single-committee attestation alone, whose proof
+//! needs no merging; a block `process_stark` refuses is built again without
+//! attestations, so the block goes out rather than not at all.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,7 +38,7 @@ use ethlambda_state_transition::beacon::{
     fork_choice::{ForkChoiceNode, get_attestation_due_ms, get_head_node, should_build_on_full},
     helpers::{accessors::get_beacon_proposer_index, pq::is_valid_vrf_proof},
     pq_block_production::{
-        PqBlockInputs, assemble_pq_block, parse_pq_execution_requests, pq_payload_inputs,
+        PqBlockInputs, PqPacked, assemble_pq_block, parse_pq_execution_requests, pq_payload_inputs,
         select_pq_attestations,
     },
 };
@@ -269,45 +270,93 @@ async fn pack_attestations(
     if candidates.is_empty() {
         return Default::default();
     }
-    let Some(remaining) = merge_budget(config, slot) else {
-        warn!(%slot, "No time left to merge the PQ attestation proofs");
+    let selected = {
+        let (store, state) = (store.clone(), state.clone());
+        tokio::task::spawn_blocking(move || {
+            select_pq_attestations(&state, candidates, &store.committee_cache())
+        })
+        .await
+    };
+    let packed = match selected {
+        Ok(Ok(packed)) => packed,
+        Ok(Err(err)) => {
+            warn!(%slot, %err, "Selecting the PQ attestations failed");
+            return Default::default();
+        }
+        Err(err) => {
+            warn!(%slot, %err, "The PQ attestation selection task failed");
+            return Default::default();
+        }
+    };
+    if packed.attestations.is_empty() {
         return Default::default();
+    }
+    // One child's proof is the block's as it is; more must be merged.
+    let fallback = packed.first_unmerged();
+    if packed.children.len() == 1 {
+        return unmerged(slot, packed);
+    }
+    let children = packed.children.len();
+    let fall_back = |reason: &str| {
+        warn!(%slot, children, reason, "Packing one PQ attestation instead of merging every proof");
+        fallback
+            .clone()
+            .map_or_else(Default::default, |single| unmerged(slot, single))
+    };
+    let Some(remaining) = merge_budget(config, slot) else {
+        return fall_back("no time left to merge");
     };
     let Ok(permit) = MERGE_PERMIT.try_acquire() else {
-        warn!(%slot, "A PQ proof merge is still running; packing no attestations");
-        return Default::default();
+        return fall_back("a merge is still running");
     };
-    let (store, state) = (store.clone(), state.clone());
     let job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let started = Instant::now();
-        let packed = select_pq_attestations(&state, candidates, &store.committee_cache())
-            .map_err(|err| err.to_string())?;
-        let proof = packed.merge().map_err(|err| err.to_string())?;
-        Ok::<_, String>((packed, proof, started.elapsed()))
+        let proof = packed.merge().map_err(|err| err.to_string());
+        // Logged when it ends, deadline or not: what a merge costs here.
+        info!(
+            %slot,
+            children,
+            took_ms = started.elapsed().as_millis() as u64,
+            ok = proof.is_ok(),
+            "Merged PQ attestation proofs"
+        );
+        proof.map(|proof| (packed, proof))
     });
     match tokio::time::timeout(remaining, job).await {
-        Ok(Ok(Ok((packed, proof, took)))) => {
+        Ok(Ok(Ok((packed, proof)))) => {
             info!(
                 %slot,
                 attestations = packed.attestations.len(),
-                children = packed.children.len(),
+                children,
                 proof_bytes = proof.len(),
-                took_ms = took.as_millis() as u64,
                 "Packed PQ attestations"
             );
             (packed.attestations, proof)
         }
-        Ok(Ok(Err(err))) => {
-            warn!(%slot, %err, "Packing the PQ attestations failed");
-            Default::default()
+        Ok(Ok(Err(err))) => fall_back(&format!("the merge failed: {err}")),
+        Ok(Err(err)) => fall_back(&format!("the merge task failed: {err}")),
+        Err(_) => fall_back(&format!(
+            "the merge missed its {} ms budget",
+            remaining.as_millis()
+        )),
+    }
+}
+
+/// `packed` with its one child's proof as the block's, nothing merged.
+fn unmerged(slot: Slot, packed: PqPacked) -> (Vec<pq::Attestation>, Vec<u8>) {
+    match packed.merge() {
+        Ok(proof) => {
+            info!(
+                %slot,
+                attestations = packed.attestations.len(),
+                proof_bytes = proof.len(),
+                "Packed PQ attestations"
+            );
+            (packed.attestations, proof)
         }
-        Ok(Err(err)) => {
-            warn!(%slot, %err, "The PQ attestation packing task failed");
-            Default::default()
-        }
-        Err(_) => {
-            warn!(%slot, budget_ms = remaining.as_millis() as u64, "Merging the PQ attestation proofs missed its deadline");
+        Err(err) => {
+            warn!(%slot, %err, "A single PQ proof would not pass through the merge");
             Default::default()
         }
     }

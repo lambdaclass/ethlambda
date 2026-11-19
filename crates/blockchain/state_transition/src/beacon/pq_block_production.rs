@@ -23,7 +23,7 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::gloas::{get_attestation_participation_flag_indices, gloas_state_ref};
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::helpers::pq::{
-    AggregateStatement, get_attestation_statements, get_attesting_indices,
+    AggregateStatement, get_attestation_statements, get_attesting_indices, get_committee_indices,
 };
 use crate::beacon::preset;
 use crate::beacon::primitives::{
@@ -280,7 +280,7 @@ fn check_envelope(
 /// `stark.MergeProofs` folds into the block's `proof`, in the order
 /// `process_stark` reads the statements: the attestations', then each one's
 /// committees ascending (PQ `validator.md`, "Proof").
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PqPacked {
     pub attestations: Vec<pq::Attestation>,
     pub children: Vec<(Vec<AggregateStatement>, pq::AttestationProof)>,
@@ -296,6 +296,19 @@ impl PqPacked {
             .map(|(statements, proof)| (statements.as_slice(), &proof[..]))
             .collect();
         stark::merge_proofs(&children)
+    }
+
+    /// The first attestation alone, when it covers a single committee: its
+    /// aggregate's proof is then the block's `proof` as it is, with nothing
+    /// to merge. What a proposer packs when merging every child would not
+    /// finish in time; the first is the one the greedy pick valued most.
+    pub fn first_unmerged(&self) -> Option<PqPacked> {
+        let first = self.attestations.first()?;
+        let child = self.children.first()?;
+        (get_committee_indices(&first.committee_bits).len() == 1).then(|| PqPacked {
+            attestations: vec![first.clone()],
+            children: vec![child.clone()],
+        })
     }
 }
 
@@ -455,7 +468,6 @@ mod tests {
     use crate::beacon::containers::shared::{AttestationData, Checkpoint};
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot};
-    use crate::beacon::helpers::pq::get_committee_indices;
     use crate::beacon::helpers::test_state::with_validators_at;
     use crate::beacon::primitives::Slot;
 
@@ -593,6 +605,8 @@ mod tests {
         assert_eq!(packed_statements, expected);
         // The reference merge is the children's proofs concatenated.
         assert_eq!(packed.merge().unwrap(), [vec![1; 4], vec![2; 4]].concat());
+        // Spanning two committees, it has no unmerged fallback.
+        assert!(packed.first_unmerged().is_none());
     }
 
     /// An aggregate whose attesters already hold every flag it would set adds
@@ -611,6 +625,12 @@ mod tests {
             1,
             "packed while it credits someone"
         );
+        // One committee: its own proof is the block's, nothing to merge.
+        let single = before
+            .first_unmerged()
+            .expect("a single-committee attestation");
+        assert_eq!(single.children.len(), 1);
+        assert_eq!(single.merge().unwrap(), vec![1; 4]);
 
         let current = data.target.epoch == get_current_epoch(&state);
         assert!(
