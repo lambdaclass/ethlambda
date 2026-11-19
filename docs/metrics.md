@@ -579,7 +579,7 @@ ethlambda-specific, not part of the leanMetrics spec.
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs `sum(lean_beacon_pubkey_cache_entries)` now | On each key added; the cache never removes one | structure=map,table |
 | `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
