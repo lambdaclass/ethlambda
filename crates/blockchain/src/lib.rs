@@ -5824,6 +5824,131 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // The state transition overlapped with an answering execution client.
+    //
+    // `process_block` sends `engine_newPayloadV4` from a task and computes
+    // the block's transition meanwhile. These drive it against the mock
+    // execution client the envelope tests use, for the verdicts that must
+    // throw that speculation away. The block is the structurally minimal
+    // fulu one over `bare_state`, so its transition fails whatever the
+    // verdict; what is under test is the verdict's routing, not the import.
+    // -----------------------------------------------------------------
+
+    /// A server asking `client`, holding a post-state for a zero parent root,
+    /// and a payload-carrying fulu block at slot 1 on that parent.
+    fn server_asking(
+        client: EngineClient,
+        genesis_time: u64,
+    ) -> (BlockChainServer, SignedBeaconBlock) {
+        let mut server = beacon_server(beacon_store(genesis_time, 0));
+        server.engine = Some(client);
+        // A block at the zero root too, for `on_block`'s finalized-chain walk.
+        server
+            .store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        server
+            .store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        (server, fulu_block(H256::ZERO, 1, 0))
+    }
+
+    fn new_payload_v4_requests(
+        mock: &Arc<std::sync::Mutex<crate::beacon_envelope::tests::MockState>>,
+    ) -> usize {
+        crate::beacon_envelope::tests::methods(mock)
+            .iter()
+            .filter(|method| *method == "engine_newPayloadV4")
+            .count()
+    }
+
+    /// `INVALID`: the speculation, computed with a `valid()` engine, is
+    /// dropped, `on_block` runs the transition itself with `invalid()`, and
+    /// nothing is imported.
+    #[tokio::test]
+    async fn an_invalid_verdict_discards_the_speculation_and_imports_nothing() {
+        use crate::beacon_envelope::tests::{mock_engine, status_json};
+
+        let (client, mock) =
+            mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
+        let (mut server, block) = server_asking(client, GENESIS_TIME);
+        let block_root = block.message_hash_tree_root();
+        // The store's clock at the block's slot, so `on_block` gets past its
+        // future-block guard and reaches the verdict.
+        let config = server.store.config();
+        fork_choice::on_tick(
+            &mut server.store,
+            GENESIS_TIME + config.seconds_per_slot,
+            &config,
+        );
+
+        let (timings, result) = server.process_block(block, ImportTimings::default()).await;
+
+        assert_eq!(new_payload_v4_requests(&mock), 1, "asked exactly once");
+        assert!(
+            timings.stf_speculative_start.is_some(),
+            "the premise: a speculation was computed while the request was in flight"
+        );
+        assert_eq!(
+            timings.speculation,
+            Some(SpeculationOutcome::DiscardedInvalidated)
+        );
+        let err = format!(
+            "{:?}",
+            result.expect_err("an INVALID payload does not import")
+        );
+        // The minimal block's own transition error (a fulu block on a phase0
+        // state): `on_block` got past every guard before the transition and
+        // failed in the transition it ran itself, which is where the verdict
+        // is applied, rather than at a guard in front of it.
+        assert!(
+            err.contains("the block's fork matches the state's"),
+            "the import must fail in the transition, not at a guard before it: {err}"
+        );
+        assert!(!server.store.has_state(&block_root).expect("DB read"));
+    }
+
+    /// `SYNCING` for a block that is not an optimistic candidate: there is a
+    /// verdict, but not one the block may be imported on, so it is held and
+    /// the speculation is dropped.
+    #[tokio::test]
+    async fn a_syncing_verdict_for_a_non_candidate_holds_the_block_and_discards_the_speculation() {
+        use crate::beacon_envelope::tests::{mock_engine, status_json};
+
+        let (client, mock) =
+            mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
+        // Genesis now, so slot 1 is recent by the wall clock and only an
+        // execution parent could make the block a candidate. It has none.
+        let (mut server, block) = server_asking(client, unix_now_ms() / 1000);
+        let block_root = block.message_hash_tree_root();
+        assert!(
+            !fork_choice::is_optimistic_candidate_block(
+                &server.store,
+                server.wall_clock_slot(),
+                block.slot(),
+                block.parent_root(),
+                server.safe_slots_to_import_optimistically,
+            ),
+            "the premise: the block is not an optimistic candidate"
+        );
+
+        let (timings, result) = server.process_block(block, ImportTimings::default()).await;
+
+        assert_eq!(new_payload_v4_requests(&mock), 1, "asked exactly once");
+        assert!(
+            timings.stf_speculative_start.is_some(),
+            "the premise: a speculation was computed while the request was in flight"
+        );
+        assert_eq!(timings.speculation, Some(SpeculationOutcome::DiscardedHeld));
+        assert_eq!(
+            result.expect("a hold is not a failure"),
+            ImportOutcome::Held
+        );
+        assert!(!server.store.has_state(&block_root).expect("DB read"));
+    }
+
     #[tokio::test]
     async fn a_tick_leaves_a_block_held_while_a_column_is_still_missing() {
         let store = beacon_store(GENESIS_TIME, 0);
