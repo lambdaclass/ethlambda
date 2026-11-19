@@ -233,8 +233,13 @@ pub fn chain_checks_gloas(
 /// [`kzg_verdict`], or to [`kzg_verdicts`] with the other sidecars of the same
 /// block.
 ///
-/// Meant to live as long as one group's checks: what it remembers is the
-/// store as it stood when that group was judged.
+/// Meant to live as long as one group's checks. Each answer it remembers is the
+/// store as it stood when that answer was first worked out, not when a later
+/// sidecar asks: a parent whose post-state lands partway through a group
+/// leaves the rest of the group parked on the answer given before it. That
+/// costs a round trip, not the sidecars: the chain actor's
+/// `park_data_columns` sends back at once any sidecar whose block can be
+/// judged by the time it arrives.
 pub struct ChainPrechecks<'a> {
     store: &'a Store,
     now_ms: u64,
@@ -366,7 +371,9 @@ impl<'a> ChainPrechecks<'a> {
             .entry(sidecar.beacon_block_root)
             .or_insert_with(|| gloas_block(store, &sidecar.beacon_block_root));
         match gloas_before_kzg(sidecar, block) {
-            Ok(commitments) => Ok(PendingKzg { commitments }),
+            Ok(commitments) => Ok(PendingKzg {
+                commitments: commitments.to_vec(),
+            }),
             Err(Outcome::Queue(QueueReason::BlockUnknown | QueueReason::BlockNotReady)) => {
                 Err(ChainVerdict::AwaitParent)
             }
@@ -482,8 +489,12 @@ fn kzg_verdict_ref(sidecar: &ColumnRef<'_>, pending: &PendingKzg) -> ChainVerdic
 /// sidecar. How many go in one call is the caller's to bound, since the
 /// cells are copied into it and a failed batch is re-run one by one.
 pub fn kzg_verdicts(items: &[(&AnyDataColumnSidecar, &PendingKzg)]) -> Vec<ChainVerdict> {
-    if let [(sidecar, pending)] = items {
-        return vec![kzg_verdict(sidecar, pending)];
+    match items {
+        // Nothing to verify, and nothing to time: an empty call must not add
+        // an observation to the KZG histogram.
+        [] => return Vec::new(),
+        [(sidecar, pending)] => return vec![kzg_verdict(sidecar, pending)],
+        _ => {}
     }
     let refs: Vec<ColumnRef<'_>> = items.iter().map(|(sidecar, _)| (*sidecar).into()).collect();
     let columns: Vec<fork_choice::ColumnCells<'_>> = refs
@@ -682,7 +693,7 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
     // [REJECT] The sidecar's column data passes KZG verification.
     let kzg = {
         let _timing = metrics::time_data_column_kzg_verify();
-        fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(sidecar, &kzg_commitments)
+        fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(sidecar, kzg_commitments)
     };
     if !matches!(kzg, Ok(true)) {
         return Outcome::Reject(RejectReason::Kzg);
@@ -732,11 +743,12 @@ fn gloas_block(store: &Store, root: &Root) -> Result<GloasBlock, Outcome> {
 /// same order, against `block` as [`gloas_block`] found it. `Ok` carries the
 /// commitments the proofs are checked against (the block's bid's), and means
 /// "accepted unless the proofs fail"; an `Err` is the verdict whatever the
-/// proofs say.
-fn gloas_before_kzg(
+/// proofs say. The commitments are borrowed from `block`, so gossip checks
+/// against them without a copy and only a [`PendingKzg`] takes one.
+fn gloas_before_kzg<'a>(
     sidecar: &gloas::DataColumnSidecar,
-    block: &Result<GloasBlock, Outcome>,
-) -> Result<Vec<KzgCommitment>, Outcome> {
+    block: &'a Result<GloasBlock, Outcome>,
+) -> Result<&'a [KzgCommitment], Outcome> {
     let block = block.as_ref().map_err(|outcome| *outcome)?;
     // [REJECT] The sidecar's slot matches the slot of the block.
     if sidecar.slot != block.slot {
@@ -747,7 +759,7 @@ fn gloas_before_kzg(
     if !fork_choice::gloas_verify_data_column_sidecar(sidecar, kzg_commitments) {
         return Err(Outcome::Reject(RejectReason::Malformed));
     }
-    Ok(kzg_commitments.clone())
+    Ok(kzg_commitments)
 }
 
 /// The block a gloas sidecar is judged against, or the verdict that says why
