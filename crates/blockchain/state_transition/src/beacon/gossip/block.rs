@@ -181,7 +181,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     };
     // [REJECT] The finalized checkpoint is an ancestor of the block. Only a
     // conflict is answered here; a walk that could not finish queues after
-    // the gloas rules below.
+    // the gloas rules below. The verdict is never an IGNORE.
     //
     // The specification checks the gloas parent-payload rule first. Here it
     // comes after this rule and the bid's two, as it already did after the
@@ -190,8 +190,8 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     // of the few places the chain actor holds per parent
     // (`MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD`), only to fail on import once the
     // envelope verifies.
-    let ancestry = finalized_ancestry(store, parent_root);
-    if let Err(outcome @ Outcome::Reject(_)) = ancestry.verdict() {
+    let ancestry = finalized_ancestry(store, parent_root).verdict();
+    if let Err(outcome @ Outcome::Reject(_)) = ancestry {
         return outcome;
     }
     if let Some(gloas_block) = gloas_block {
@@ -236,7 +236,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
             return Outcome::Reject(RejectReason::BidNotOnParentHead);
         }
     }
-    if let Err(outcome) = ancestry.verdict() {
+    if let Err(outcome) = ancestry {
         return outcome;
     }
     // [REJECT] (before gloas) The execution payload's timestamp is the
@@ -836,6 +836,34 @@ mod tests {
         assert_eq!(
             stateful_checks(&store, &block, block.message_hash_tree_root()),
             Outcome::Queue(QueueReason::ParentPayloadUnverified)
+        );
+    }
+
+    /// Once the FULL parent's envelope is verified, the rule lets the block
+    /// through to the checks after it: here the finalized-ancestry walk,
+    /// which queues since the parent was stored without a `LiveChain` row.
+    #[test]
+    fn a_gloas_block_on_a_verified_full_parent_goes_on_to_the_next_check() {
+        use crate::beacon::gloas_block_production::test_support as production;
+
+        let (mut store, block) = gloas_child_of_unverified_parent(true);
+        let parent_root = block.parent_root();
+        let (parent_slot, _) = store.block_entry(&parent_root).expect("stored parent");
+        // Any envelope naming the parent: `is_payload_verified` reads only
+        // that its root was recorded.
+        let state = production::state_to_build_on();
+        let mut envelope = production::produce(&state, true, Vec::new())
+            .expect("produce")
+            .envelope;
+        envelope.beacon_block_root = parent_root;
+        let envelope = gloas::SignedExecutionPayloadEnvelope {
+            message: envelope,
+            signature: Default::default(),
+        };
+        store.insert_verified_payload(parent_slot, &envelope);
+        assert_eq!(
+            stateful_checks(&store, &block, block.message_hash_tree_root()),
+            Outcome::Queue(QueueReason::ParentNotReady)
         );
     }
 
