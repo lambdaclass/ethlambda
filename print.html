@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-85125f25.js";
+            window.path_to_searchindex_js = "searchindex-e7776a9c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -6328,6 +6328,7 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>lean_state_write_queue_depth</code></td><td>Gauge</td><td>States handed to the background writer but not yet committed</td><td>On every hand-off and on every commit</td><td></td></tr>
 <tr><td><code>lean_state_write_seconds</code></td><td>Histogram</td><td>Time the background writer spends encoding, diffing and committing one state</td><td>Per state written</td><td></td></tr>
 <tr><td><code>lean_state_cache_lookups_total</code></td><td>Counter</td><td>State cache lookups, by the <code>Store</code> method that made them, the kind of state asked for, and whether the cache held it</td><td>On every <code>get_state</code> (and the writer’s own parent read), <code>has_state</code> and <code>cached_state</code> call</td><td>method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss</td></tr>
+<tr><td><code>lean_state_rebuilds_total</code></td><td>Counter</td><td>Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root</td><td>On every <code>get_state</code> miss (and the writer’s own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero</td><td>role=led,joined</td></tr>
 </tbody>
 </table>
 </div>
@@ -6355,6 +6356,17 @@ or <code>has_state</code> miss means the state was not resident and came from th
 buffer or RocksDB. A <code>cached_state</code> miss with <code>kind="checkpoint"</code> means fork
 choice’s <code>checkpoint_state</code> rebuilt the state, running <code>process_slots</code> up to the
 epoch boundary when the checkpoint’s block precedes it.</p>
+<p><strong><code>lean_state_rebuilds_total{role="led"}</code> is the number of states actually
+read and decoded from storage.</strong> A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. <code>role="joined"</code> counts misses that found a rebuild of
+the same root already under way and took the state it read instead, so every
+join has the lead it waited on beside it. A lookup that finds no state for
+its root, or fails, counts under neither, and so does a lead that finds the
+state already cached by a rebuild that settled since its own miss, along with
+whoever waited on it. A burst of joins next to a single lead is the pattern a
+late block’s custody columns produce, each gossiped one that gossip queued
+checked on its own task against a parent state that has left the cache.</p>
 <h3 id="beacon-gossip-validation"><a class="header" href="#beacon-gossip-validation">Beacon Gossip Validation</a></h3>
 <p>Every beacon gossip message gets a verdict before gossipsub forwards it
 (<code>validate_messages()</code> is on for the beacon wire only), <code>beacon_aggregate_and_proof</code>
@@ -7770,7 +7782,37 @@ of parent-linked diffs; on beacon it is one hop, to the interval’s snapshot.</
    table and is memoized in the LRU cache before being returned.
 </code></pre>
 <p>If the diff chain is broken or the target’s header is missing, <code>get_state</code>
-returns <code>None</code> rather than a partial state.</p>
+returns <code>None</code> rather than a partial state. If a read fails, or a state on
+the way does not decode (a snapshot, a delta that does not apply to its base,
+a lean snapshot or diff), it returns an error rather than panicking:
+<code>Error::StateRebuild</code> wrapping <code>Error::Storage</code> or <code>Error::CorruptState</code>. A
+<code>BlockHeaders</code> row that does not decode still panics, in the slot lookup that
+reads it before any state row. The store logs every failed rebuild at <code>error</code>
+(<code>State rebuild failed</code>, with the root), once per read rather than once per
+caller, since most callers report the error as something else or not at all.
+Each caller decides what an error costs: p2p’s column checks drop the sidecar
+whose check read it, and do not remember the error, so the next sidecar of the
+same block reads again; fork choice and the state writer still panic on it.</p>
+<p>Concurrent misses on one root rebuild it once (<code>StateRebuilds</code> in
+<code>crates/storage/src/state_writer.rs</code>, a <code>OnceLock</code> per root under way). The
+first caller rebuilds. Every other caller that misses on that root while the
+rebuild is under way waits for it and gets the same state, so p2p’s column
+checks of separate deliveries of one block’s columns (each gossiped column
+gossip queued is a delivery of its own; a fetched answer or a replayed batch
+reads the parent state once for the whole block, through <code>ChainPrechecks</code>),
+the chain actor and the RPC asking for one evicted parent state cost one
+snapshot read and one decode, not one each. A corrupt state is shared the same way, so it is
+read once rather than once per caller, and every caller waiting on it fails;
+since a later read fails again, a late block’s custody columns are all dropped
+when their parent’s state does not decode. A failed read
+(<code>Error::Storage</code>) is not shared, since it can be transient: a caller only
+ever gets one from a read it ran itself, and the callers that waited on it go
+round again and share a read of their own. That keeps a p2p column check’s
+failed read from reaching fork choice’s or the state writer’s panic on a read
+they never made. The first caller out removes the rebuild’s entry; a miss
+arriving before that takes the settled result (or, for a failed read, goes
+round again), and any later miss reads storage again. A rebuild that panics
+hands the waiting callers nothing, and one of them rebuilds for the rest.</p>
 <h2 id="write-paths-what-a-block-import-persists"><a class="header" href="#write-paths-what-a-block-import-persists">Write Paths: What a Block Import Persists</a></h2>
 <p>Block import (<code>on_block</code> in <code>crates/blockchain/src/store.rs</code>) commits a
 sequence of independent write batches:</p>
