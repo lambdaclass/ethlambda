@@ -570,7 +570,10 @@ counted.
   here saves that path a revert.
 - **Not covered:** a block fetched by `beacon_blocks_by_range/root`, and a
   gossip block answered `Queue` or forwarded under `Ignore(Overloaded)`, reach
-  the chain actor unhashed. The execution client still checks them.
+  the chain actor unhashed. The execution client still checks them. That
+  includes a block this rule IGNOREd on gossip: if a child arrives naming it
+  as its parent, it is fetched by root and imported unhashed, so for that block
+  the early import's revert is delayed rather than saved.
 - **Cost and counter:** one transactions trie plus the RLP and keccak of the
   header, on the blocking validation thread and inside its permit
   (`gossip_validation_permits` on gossip, `column_check_permits` for a fetched
@@ -586,8 +589,11 @@ counted.
   `lean_beacon_payload_block_hash_mismatch_total{kind}` counts mismatches
   (`block` IGNOREd, `envelope` counted only) and a `warn!` names the slot and
   root.
-- **Equivalence:** a stricter filter, never a looser one: every block it
-  ignores carries a payload the execution client would call `INVALID`.
+- **Equivalence:** a stricter filter, never a looser one, as long as this
+  header encoding is the execution layer's: every block it ignores then
+  carries a payload the execution client would call `INVALID`. The real-chain
+  vectors are what pin the encoding per fork, and gloas only counts a mismatch
+  because its header is not final yet.
 
 ## The envelope check reads the cached state root
 
