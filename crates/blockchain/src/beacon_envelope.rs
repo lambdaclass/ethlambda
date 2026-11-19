@@ -576,11 +576,11 @@ impl BlockChainServer {
         self.envelopes.verified.push_back(root);
         let message = &held.envelope.message;
         self.events.publish_envelope_imported(
-            &self.store,
             slot,
             message.builder_index,
             message.payload.block_hash,
             root,
+            status,
         );
         true
     }
@@ -2437,6 +2437,7 @@ mod tests {
         let (client, _mock) =
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
+        let mut rx = server.events.subscribe();
 
         server
             .receive_envelope(valid_envelope_for_full_parent(), 0)
@@ -2448,6 +2449,14 @@ mod tests {
         assert_eq!(status, PayloadStatusEnum::Syncing);
         assert!(status.is_not_validated());
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        // The `execution_payload` event says the payload is not vouched for.
+        let imported: Vec<bool> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::ChainEvent::ExecutionPayload(payload) => Some(payload.execution_optimistic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported, [true]);
     }
 
     #[tokio::test]

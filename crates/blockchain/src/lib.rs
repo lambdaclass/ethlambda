@@ -5837,7 +5837,7 @@ mod tests {
         ExecutionPayloadEvent, HEAD_EVENT_RECENCY_SLOTS, Versioned,
     };
     use ethlambda_storage::ForkCheckpoints;
-    use ethlambda_types::beacon::fork_choice::PayloadStatus;
+    use ethlambda_types::beacon::fork_choice::{PayloadStatus, PayloadStatusEnum};
     use tokio::sync::broadcast;
 
     const G: H256 = H256::repeat_byte(0x10);
@@ -6374,9 +6374,15 @@ mod tests {
     /// `execution_payload_available`, in that order.
     #[test]
     fn an_imported_envelope_publishes_execution_payload_then_available() {
-        let (store, events, mut rx) = fork_fixture(B);
+        let (_store, events, mut rx) = fork_fixture(B);
 
-        events.publish_envelope_imported(&store, 2, 42, H256::repeat_byte(0x77), B);
+        events.publish_envelope_imported(
+            2,
+            42,
+            H256::repeat_byte(0x77),
+            B,
+            PayloadStatusEnum::Valid,
+        );
 
         let emitted = drain_all(&mut rx);
         assert_eq!(emitted.len(), 2, "{emitted:?}");
@@ -6402,6 +6408,28 @@ mod tests {
                 }
             ),
             other => panic!("expected execution_payload_available second, got {other:?}"),
+        }
+    }
+
+    /// An envelope imported on a verdict short of `VALID` is reported
+    /// optimistic, whatever the store's optimistic set says: a gloas root never
+    /// enters that set.
+    #[test]
+    fn an_envelope_imported_on_syncing_or_accepted_is_optimistic() {
+        let (store, events, mut rx) = fork_fixture(B);
+        assert!(!store.is_beacon_optimistic(B));
+
+        for verdict in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            events.publish_envelope_imported(2, 42, H256::repeat_byte(0x77), B, verdict);
+            match drain_all(&mut rx).as_slice() {
+                [
+                    ChainEvent::ExecutionPayload(payload),
+                    ChainEvent::ExecutionPayloadAvailable(_),
+                ] => {
+                    assert!(payload.execution_optimistic, "{verdict:?}")
+                }
+                other => panic!("expected execution_payload then available, got {other:?}"),
+            }
         }
     }
 

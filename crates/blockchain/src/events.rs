@@ -36,7 +36,7 @@ use ethlambda_types::beacon::containers::{
     phase0,
 };
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::fork_choice::PayloadStatus;
+use ethlambda_types::beacon::fork_choice::{PayloadStatus, PayloadStatusEnum};
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use ethlambda_types::checkpoint::Checkpoint;
@@ -808,19 +808,24 @@ impl ChainEvents {
     }
 
     /// Beacon `execution_payload` and `execution_payload_available` for an
-    /// envelope the actor just imported.
+    /// envelope the actor just imported on the execution client's `verdict`.
     ///
     /// Both here, in that order: the actor imports an envelope only once its
     /// payload verified and every sampled column of its blobs is stored (see
     /// `apply_or_hold_envelope`), which is what `execution_payload_available`
     /// reports, so the two moments are one.
+    ///
+    /// `execution_optimistic` is whether `verdict` falls short of `VALID`
+    /// (`SYNCING` and `ACCEPTED` import too). Not the store's optimistic set,
+    /// which holds pre-gloas blocks only: a gloas block carries no payload of
+    /// its own to ask about, so its root never enters it.
     pub(crate) fn publish_envelope_imported(
         &self,
-        store: &Store,
         slot: u64,
         builder_index: u64,
         block_hash: H256,
         block_root: H256,
+        verdict: PayloadStatusEnum,
     ) {
         if !self.bus.has_subscribers() {
             return;
@@ -831,7 +836,7 @@ impl ChainEvents {
                 builder_index,
                 block_hash,
                 block_root,
-                execution_optimistic: store.is_beacon_optimistic(block_root),
+                execution_optimistic: verdict != PayloadStatusEnum::Valid,
             }));
         self.bus.emit(ChainEvent::ExecutionPayloadAvailable(
             ExecutionPayloadAvailableEvent { slot, block_root },
