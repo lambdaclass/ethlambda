@@ -13,6 +13,7 @@ mod state_codec;
 mod state_diff;
 mod state_writer;
 mod store;
+mod target_balance_cache;
 
 pub use active_balance_cache::{ActiveBalanceCache, ActiveBalanceKey};
 pub use api::{
@@ -25,6 +26,7 @@ pub use error::Error;
 pub use liveness::ObservedLiveness;
 pub use proto_array::{ProtoArrayError, WeightRules};
 pub use pubkey_index_cache::PubkeyIndexCache;
+pub use target_balance_cache::{TargetBalanceCache, TargetBalances};
 // `CacheKey` lives in `state_writer` (beside the `StateCache` it keys), not
 // `store`; re-exported here so the public path (`ethlambda_storage::CacheKey`)
 // is unaffected by which module owns it.

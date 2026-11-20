@@ -14,6 +14,7 @@ use crate::liveness::ObservedLiveness;
 use crate::pools::{AttestationPool, OperationPool};
 use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
 use crate::pubkey_index_cache::PubkeyIndexCache;
+use crate::target_balance_cache::TargetBalanceCache;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -1261,6 +1262,10 @@ pub struct Store {
     /// `beacon::helpers::accessors::ActiveBalanceCacheExt` for the
     /// state-aware half. Always empty on lean.
     active_balance_cache: Arc<ActiveBalanceCache>,
+    /// Each imported block's unslashed target balances, so the pulled-up tip
+    /// extends its parent's instead of rescanning the registry. See
+    /// [`TargetBalanceCache`]. Always empty on lean.
+    target_balance_cache: Arc<TargetBalanceCache>,
     /// Pubkey to validator index, shared like [`Self::active_balance_cache`].
     /// See [`PubkeyIndexCache`], and `ethlambda-state-transition`'s
     /// `beacon::helpers::accessors::PubkeyIndexCacheExt` for the state-aware
@@ -1913,6 +1918,7 @@ impl Store {
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
+            target_balance_cache: Arc::new(TargetBalanceCache::default()),
             pubkey_index_cache: Arc::new(PubkeyIndexCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -2245,6 +2251,10 @@ impl Store {
                     }
                 }
                 Chain::Beacon => {
+                    // An entry below the finalized epoch is never read again:
+                    // a block consults its parent's only within one epoch.
+                    self.target_balance_cache
+                        .prune_below(finalized.slot / SLOTS_PER_EPOCH);
                     // `finalized.slot` is the finalized *epoch's* start slot
                     // (`Store::beacon_checkpoint_as_stored`), which can name a
                     // slot nobody ever built a block for. Pruning to it
@@ -3394,6 +3404,13 @@ impl Store {
     /// An owned `Arc` for the same reason as [`Self::committee_cache`].
     pub fn active_balance_cache(&self) -> Arc<ActiveBalanceCache> {
         Arc::clone(&self.active_balance_cache)
+    }
+
+    /// The per-block target-balance cache shared by every clone of this store.
+    ///
+    /// An owned `Arc` for the same reason as [`Self::committee_cache`].
+    pub fn target_balance_cache(&self) -> Arc<TargetBalanceCache> {
+        Arc::clone(&self.target_balance_cache)
     }
 
     /// The pubkey-index cache shared by every clone of this store.

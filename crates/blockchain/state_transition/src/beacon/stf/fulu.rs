@@ -49,6 +49,7 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 use crate::beacon::stf::signatures::SignatureBatch;
 
@@ -91,6 +92,7 @@ pub fn process_block(
         caches.committees,
         caches.active_balances,
         caches.pubkey_indices,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
@@ -235,6 +237,7 @@ pub fn process_execution_payload(
 /// the two do not diverge in practice; this copy exists to match the
 /// specification's own text for this fork rather than to fix an observed
 /// bug in the shared version.
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -242,6 +245,7 @@ pub fn process_operations(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // [Modified in Fulu]
@@ -279,6 +283,7 @@ pub fn process_operations(
                 proposer_index,
                 committees,
                 active_balances,
+                target_delta,
                 signatures,
             )?;
         }
