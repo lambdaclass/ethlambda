@@ -76,6 +76,7 @@ use crate::beacon::helpers::misc::{
 };
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
@@ -662,6 +663,7 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
@@ -772,21 +774,27 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `is_valid_indexed_attestation` above refused any `attesting_indices` that
+    // is not strictly ascending, so the reader walks each leaf once rather than
+    // descending the tree for every attester.
+    let mut reader = participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -796,13 +804,15 @@ pub fn process_attestation(
             // `get_base_reward(state, index)` inlined against the hoisted
             // per-increment value above, keeping the helper's own order of
             // operations so the result is bit-identical.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (increments, _, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
             let reward = (increments * base_reward_per_increment)
@@ -814,8 +824,17 @@ pub fn process_attestation(
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (_, effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
+        }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -826,15 +845,20 @@ pub fn process_attestation(
         let mut fields = block_mut(state, "process_attestation")?;
         let participation_mut = fields.epoch_participation_mut(current_epoch_target);
         let participation_len = participation_mut.len();
-        for (index, new_flags) in updates {
-            let flags =
-                participation_mut
-                    .get_mut(index as usize)
-                    .ok_or(Error::IndexOutOfBounds {
-                        index: index as usize,
-                        len: participation_len,
-                    })?;
-            *flags |= new_flags;
+        // A blind write of `current_flags | new_flags`, which the read phase
+        // stored, rather than `|=` on the stored value. That is exact:
+        // `is_valid_indexed_attestation` above refused a repeated index, so
+        // each index is written once, and nothing writes this list between the
+        // read phase and here, so the stored value is still `current_flags`. It
+        // saves the tree descent `get_mut` makes to copy the old value into the
+        // write buffer.
+        for (index, flags) in updates {
+            if !participation_mut.set(index as usize, flags) {
+                return Err(Error::IndexOutOfBounds {
+                    index: index as usize,
+                    len: participation_len,
+                });
+            }
         }
     }
 
@@ -1797,6 +1821,7 @@ pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec
 /// len(body.deposits) == 0`, unconditionally, with no `process_deposit` call
 /// at all), so it keeps its own copy, [`super::fulu::process_operations`],
 /// rather than calling this one.
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -1804,6 +1829,7 @@ pub fn process_operations(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let deposit_requests_start_index =
@@ -1853,6 +1879,7 @@ pub fn process_operations(
                 proposer_index,
                 committees,
                 active_balances,
+                target_delta,
                 signatures,
             )?;
         }
@@ -1924,6 +1951,7 @@ pub fn process_block(
         caches.committees,
         caches.active_balances,
         caches.pubkey_indices,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(

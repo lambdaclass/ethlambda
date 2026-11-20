@@ -83,9 +83,12 @@ mod update_map;
 mod vector;
 
 pub use cursor::{ElemCow, IterCow};
+pub use interface::SortedReader;
 pub use iter::Iter;
 pub use list::List;
-pub use progressive_list::{ProgressiveIter, ProgressiveIterCow, ProgressiveList};
+pub use progressive_list::{
+    ProgressiveIter, ProgressiveIterCow, ProgressiveList, ProgressiveSortedReader,
+};
 pub use update_map::{UpdateMap, VecMap};
 pub use vector::Vector;
 

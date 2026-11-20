@@ -585,6 +585,14 @@ impl BlockChainServer {
         if !self.new_payloads.awaits_envelope_answer(&root) {
             self.envelopes.verified.push_back(root);
         }
+        let message = &held.envelope.message;
+        self.events.publish_envelope_imported(
+            slot,
+            message.builder_index,
+            message.payload.block_hash,
+            root,
+            status,
+        );
         true
     }
 
@@ -2369,6 +2377,60 @@ pub(crate) mod tests {
         envelope.message.payload.block_hash
     }
 
+    /// The actor's import of an envelope is what publishes `execution_payload`,
+    /// and `execution_payload_available` right after it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_imported_envelope_emits_execution_payload_then_available() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        let mut rx = server.events.subscribe();
+        let envelope = valid_envelope_for_full_parent();
+        let builder_index = envelope.message.builder_index;
+        let block_hash = payload_hash(&envelope);
+
+        server.receive_envelope(envelope, 0).await;
+
+        let payload_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::ChainEvent::ExecutionPayload(_)
+                        | crate::ChainEvent::ExecutionPayloadAvailable(_)
+                )
+            })
+            .collect();
+        let slot = server
+            .store
+            .block_slot_and_state_root(&root(FULL_PARENT))
+            .expect("the parent is imported")
+            .0;
+        match payload_events.as_slice() {
+            [
+                crate::ChainEvent::ExecutionPayload(payload),
+                crate::ChainEvent::ExecutionPayloadAvailable(available),
+            ] => {
+                assert_eq!(
+                    (payload.slot, payload.builder_index, payload.block_hash),
+                    (slot, builder_index, block_hash)
+                );
+                assert_eq!(payload.block_root, root(FULL_PARENT));
+                assert!(!payload.execution_optimistic);
+                assert_eq!(
+                    (available.slot, available.block_root),
+                    (slot, root(FULL_PARENT))
+                );
+            }
+            other => panic!("expected execution_payload then available, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
@@ -2415,6 +2477,7 @@ pub(crate) mod tests {
         let (client, _mock) =
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
+        let mut rx = server.events.subscribe();
 
         server
             .receive_envelope(valid_envelope_for_full_parent(), 0)
@@ -2426,6 +2489,14 @@ pub(crate) mod tests {
         assert_eq!(status, PayloadStatusEnum::Syncing);
         assert!(status.is_not_validated());
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        // The `execution_payload` event says the payload is not vouched for.
+        let imported: Vec<bool> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::ChainEvent::ExecutionPayload(payload) => Some(payload.execution_optimistic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported, [true]);
     }
 
     #[tokio::test]
