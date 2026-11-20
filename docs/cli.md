@@ -397,7 +397,9 @@ the compatible nodes schedule and the client does not have yet is adopted by the
 slot clock and every signing domain together, and the client logs at `warn`
 which fields moved. A fork scheduled by one node and not another takes the
 lowest epoch, with a warning naming the nodes; the node without it stops being
-used when the fork's epoch arrives. A fork that is already active is never moved:
+used when the fork's epoch arrives. A node that stops answering keeps its say in
+that for one more epoch and then loses it, so an unreachable node cannot hold a
+fork at an epoch the network has postponed. A fork that is already active is never moved:
 a node that reports another epoch or version for it is on another chain. The
 client does not need a restart for a fork the network schedules after it
 started.

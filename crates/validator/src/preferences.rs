@@ -131,9 +131,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use ethlambda_types::beacon::constants::DOMAIN_PROPOSER_PREFERENCES;
 use ethlambda_types::beacon::containers::gloas::{ProposerPreferences, SignedProposerPreferences};
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, ExecutionAddress, Root, Slot};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Domain, Epoch, ExecutionAddress, Root, Slot};
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use futures_util::future::join_all;
 use tokio::sync::RwLock;
@@ -249,6 +250,13 @@ pub struct PreferencesService<B> {
     /// sent again once an epoch after. A reorg that moves the root starts a
     /// new entry. Pruned below the current epoch.
     sent: Mutex<HashMap<(Slot, Root), Sent>>,
+    /// The signing domain each target epoch's preferences in `sent` were
+    /// signed under. The chain check can move a fork that is still in the
+    /// future, and with it this domain; the entries signed under the old one
+    /// are then signatures no node accepts, and are forgotten so they are
+    /// signed again (see [`Self::forget_if_the_domain_moved`]). Pruned like
+    /// `sent`.
+    signed_under: Mutex<HashMap<Epoch, Domain>>,
     /// Epochs whose missing fee recipients were already warned about, so the
     /// warning is once per epoch rather than once per slot. Pruned like
     /// `sent`.
@@ -306,6 +314,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             context,
             settings,
             sent: Mutex::new(HashMap::new()),
+            signed_under: Mutex::new(HashMap::new()),
             no_fee_warned: Mutex::new(HashSet::new()),
             fetch_warned: Mutex::new(HashSet::new()),
             in_flight: InFlight::default(),
@@ -334,8 +343,44 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         let epoch = compute_epoch_at_slot(current_slot);
         let epoch_start = compute_start_slot_at_epoch(epoch);
         lock(&self.sent).retain(|(slot, _), _| *slot >= epoch_start);
+        lock(&self.signed_under).retain(|signed, _| *signed >= epoch);
         lock(&self.no_fee_warned).retain(|warned| *warned >= epoch);
         lock(&self.fetch_warned).retain(|warned| *warned >= epoch);
+    }
+
+    /// The domain `target`'s preferences are signed under now, the one
+    /// `SigningContext::sign_proposer_preferences` uses.
+    fn domain(&self, target: Epoch) -> Domain {
+        self.context.domain(DOMAIN_PROPOSER_PREFERENCES, target)
+    }
+
+    /// Forget `target`'s kept preferences when the schedule swap moved the
+    /// domain they were signed under, and note `domain` as the one in force.
+    ///
+    /// A kept preference is otherwise sent again exactly as signed, which
+    /// after a swap is a signature over the old fork version: every node
+    /// refuses it, and an entry some node once took is never signed again.
+    /// Forgetting them has the poll sign each one afresh under the new
+    /// domain, with the settings in force now.
+    fn forget_if_the_domain_moved(&self, target: Epoch, domain: Domain) {
+        let before = lock(&self.signed_under).insert(target, domain);
+        if before.is_none_or(|before| before == domain) {
+            return;
+        }
+        let slots = compute_start_slot_at_epoch(target)..compute_start_slot_at_epoch(target + 1);
+        let mut sent = lock(&self.sent);
+        let held = sent.len();
+        sent.retain(|(slot, _), _| !slots.contains(slot));
+        let forgotten = held - sent.len();
+        drop(sent);
+        if forgotten > 0 {
+            info!(
+                epoch = target,
+                forgotten,
+                "The fork schedule changed the proposer preferences' signing domain; signing \
+                 this epoch's again"
+            );
+        }
     }
 
     /// Both target epochs, at once, so a node that does not answer costs the
@@ -413,6 +458,10 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         };
         let dependent_root = duties.dependent_root;
         let round = round_of(current_slot);
+        // Before anything kept is read: what was signed under a domain the
+        // schedule has since moved is not sent again.
+        let domain = self.domain(target);
+        self.forget_if_the_domain_moved(target, domain);
 
         let mut owed = Vec::new();
         let mut resend = Vec::new();
@@ -487,6 +536,17 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         }
 
         let signed = self.sign(store, owed).await;
+        if self.domain(target) != domain {
+            // The schedule moved while these were being signed, so some may
+            // be over the old domain. None is sent or kept: the next poll
+            // forgets the epoch's entries and signs them all again.
+            debug!(
+                epoch = target,
+                "The signing domain moved while proposer preferences were signed; leaving them \
+                 to the next poll"
+            );
+            return 0;
+        }
 
         // The target epoch's fork, which is what the submitted objects belong
         // to (always gloas here).

@@ -36,6 +36,7 @@ use ethlambda_types::beacon::signing::{
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -94,6 +95,10 @@ pub struct SigningContext {
     pub genesis_validators_root: Root,
     /// Selection proofs already produced; see [`Self::sign_selection_proof`].
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+    /// How many times the schedule has been replaced. Written with the
+    /// selection proofs' lock held, so a proof signed across a swap can tell
+    /// it was: see [`Self::sign_selection_proof`].
+    schedule_generation: AtomicU64,
     /// One permit per remote signature being verified; see [`Self::verified`].
     verifications: Arc<Semaphore>,
 }
@@ -187,6 +192,7 @@ impl SigningContext {
             config,
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
+            schedule_generation: AtomicU64::new(0),
             verifications: Arc::new(Semaphore::new(cores)),
         }
     }
@@ -203,9 +209,17 @@ impl SigningContext {
     /// The one way to change the schedule, so the two cannot be done
     /// separately: a remembered proof is a signature over a domain, and a
     /// domain that moved makes it one no node accepts.
+    ///
+    /// All three steps happen with the proofs' lock held. A reader of the
+    /// memory therefore sees it either before the swap or emptied after it,
+    /// never the old proofs beside the new schedule, and a proof that was
+    /// being signed across the swap finds the generation moved and is not
+    /// remembered.
     pub fn replace_config(&self, config: Config) {
+        let mut proofs = self.selection_proofs();
         self.config.store(config);
-        self.selection_proofs().clear();
+        self.schedule_generation.fetch_add(1, Ordering::Release);
+        proofs.clear();
     }
 
     /// Whether `signature` is `pubkey`'s signature over `root`, checked on
@@ -643,21 +657,33 @@ impl SigningContext {
         if let Some(proof) = remembered {
             return Ok(proof);
         }
-        let proof = self
-            .sign(
-                store,
-                pubkey,
-                self.selection_proof_signing_root(slot),
-                compute_epoch_at_slot(slot),
-                SigningBody::AggregationSlot {
-                    aggregation_slot: AggregationSlot { slot },
-                },
-            )
-            .await?;
-        let mut proofs = self.selection_proofs();
-        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
-        proofs.insert((*pubkey, slot), proof);
-        Ok(proof)
+        loop {
+            // Read before the signing root is computed, so a schedule swap
+            // that lands anywhere from here to the insert below is seen.
+            let generation = self.schedule_generation.load(Ordering::Acquire);
+            let proof = self
+                .sign(
+                    store,
+                    pubkey,
+                    self.selection_proof_signing_root(slot),
+                    compute_epoch_at_slot(slot),
+                    SigningBody::AggregationSlot {
+                        aggregation_slot: AggregationSlot { slot },
+                    },
+                )
+                .await?;
+            let mut proofs = self.selection_proofs();
+            if self.schedule_generation.load(Ordering::Acquire) != generation {
+                // The schedule was replaced while this was being signed (a
+                // remote signer's round trip is long enough). The proof may
+                // be over the old domain, and remembering it would put back
+                // what the swap just cleared: sign again under the new one.
+                continue;
+            }
+            proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
+            proofs.insert((*pubkey, slot), proof);
+            return Ok(proof);
+        }
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of

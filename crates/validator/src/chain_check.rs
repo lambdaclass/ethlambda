@@ -328,7 +328,8 @@ pub fn merge_schedule(
 /// (`FallbackBeaconNode::served_configs`), not from this round's answers
 /// alone: a node that misses one round keeps its say, so the merge neither
 /// waits an epoch for it nor flips the duty offsets to the next node's while
-/// it is away. After startup the client's schedule is only ever replaced
+/// it is away. One that stays away longer loses it, so it cannot hold a fork
+/// at an epoch the network has since moved. After startup the client's schedule is only ever replaced
 /// here.
 pub async fn check_once<B: BeaconNodeApi>(
     nodes: &FallbackBeaconNode<B>,
@@ -354,7 +355,7 @@ pub async fn check_once<B: BeaconNodeApi>(
         return;
     }
 
-    let compatible = nodes.served_configs();
+    let compatible = nodes.served_configs(epoch);
     if let Some(config) = follow_schedule(&ours.config, &compatible, epoch) {
         context.replace_config(config);
     }
@@ -928,6 +929,57 @@ mod tests {
         check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
 
         assert_eq!(*context.config(), Config::mainnet());
+    }
+
+    /// A node that stays unreachable does not hold a fork at the epoch it last
+    /// reported: once its answer is too old, the postponement the reachable
+    /// node serves is followed.
+    #[tokio::test]
+    async fn an_unreachable_node_does_not_pin_a_postponed_fork() {
+        let (context, _) = context_and_clock();
+        let scheduled = with_gloas(NOW + 10, [8, 0, 0, 0]);
+        let fallback = established(vec![
+            node().with_spec(scheduled.clone()),
+            node().with_spec(scheduled.clone()),
+        ])
+        .await;
+        context.replace_config(scheduled);
+
+        fallback.nodes()[1]
+            .failures
+            .lock()
+            .expect("lock")
+            .insert("spec", "down".to_string());
+        fallback.nodes()[0].set_spec(with_gloas(NOW + 100, [8, 0, 0, 0]));
+
+        // Within an epoch of its last answer the silent node still counts.
+        check_once(&fallback, genesis(), &context, NOW + 1, CheckScope::All).await;
+        assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 10);
+
+        check_once(&fallback, genesis(), &context, NOW + 2, CheckScope::All).await;
+        assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 100);
+    }
+
+    /// A node skipped for being on another chain did not take what was sent,
+    /// so the delivery is partial however many usable nodes accepted.
+    #[tokio::test]
+    async fn a_send_that_skipped_a_node_is_not_delivered_everywhere() {
+        use crate::beacon_node::Delivery;
+        use ethlambda_types::beacon::containers::gloas::SignedProposerPreferences;
+
+        let fallback = established(vec![
+            node(),
+            node().with_genesis_root(Root::repeat_byte(0xbb)),
+        ])
+        .await;
+        let preference = SignedProposerPreferences::default();
+
+        let delivery = fallback
+            .submit_proposer_preferences(ForkName::Gloas, std::slice::from_ref(&preference))
+            .await
+            .expect("the usable node accepted");
+
+        assert_eq!(delivery, Delivery::Partly);
     }
 
     /// A node that moves a fork already active is on another chain: it is
