@@ -465,9 +465,6 @@ pub const XMSS_LEAVES_PER_SLOT: u64 = 1 << 3;
 
 /// The depth of the tree under a validator's VRF root: a leaf per slot.
 pub const VRF_TREE_DEPTH: usize = 31;
-/// Prefixed to a secret and its index to derive the leaf of a VRF tree that
-/// commits to the secret (`compute_vrf_leaf`).
-pub const VRF_LEAF_DOMAIN: &[u8] = b"VRF_LEAF";
 
 /// The slot leaf a beacon block (and so a proposer slashing's headers) is
 /// signed at.

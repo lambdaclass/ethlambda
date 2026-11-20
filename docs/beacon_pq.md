@@ -1,7 +1,7 @@
 # The PQ fork
 
-consensus-specs' `pq` branch (pinned here at
-`b5d422b255db80c9bbc48f515370655ecc8bf6e5`) specifies an emergency fork that
+consensus-specs' `pq` branch (pinned here at the pq-devnet-0 spec,
+`2f43bc0f989f47af81df390a90bc1f78e2436323`) specifies an emergency fork that
 replaces BLS with leanXMSS, a hash-based signature scheme believed secure
 against a quantum adversary. It comes as two feature forks after gloas:
 
@@ -237,27 +237,26 @@ previous, current and lookahead epochs.
 ## The VRF tree
 
 XMSS signatures are not unique, so a RANDAO reveal signed with one could be
-ground. A validator instead has a secret for each slot,
-`compute_vrf_secret(vrf_seed, slot)`, and registers as its VRF root the root
-of a Merkle tree of depth `VRF_TREE_DEPTH` (31), hashed with Keccak-256,
-whose leaf for a slot is `compute_vrf_leaf(secret, slot)`: a hash of
-`VRF_LEAF_DOMAIN`, the secret and the slot. The reveal is the secret followed
-by the leaf's branch, and `process_randao` mixes the secret in.
+ground. A validator instead registers as its VRF root the root of a Merkle
+tree of depth `VRF_TREE_DEPTH` (31), hashed with Keccak-256, whose leaf for a
+slot is `compute_vrf_leaf(vrf_seed, slot) = keccak256(vrf_seed || le64(slot))`
+(consensus-specs `pq` at `2f43bc0f`, the pq-devnet-0 spec). The reveal is the
+leaf followed by its branch, and `process_randao` mixes the leaf in.
 
-Two consequences, both deliberate in the specification:
-
-- **A reveal discloses only its own slot's secret.** The branch holds
-  commitments, never secrets. (Before `b5d422b2` the leaf was the secret
-  itself, so the sibling leaf in a branch was the neighbouring slot's reveal.)
-- **The root costs the whole tree.** A leaf commits to its index, so no two
-  leaves are equal and no subtree can be reused: the root takes three
-  Keccak-256 calls for each of `2^31` leaves, about 100 seconds of all 14
-  cores of an Apple M4 Max (`vrf::tests::the_whole_tree_...`, `--ignored`).
+The root costs the whole tree: a leaf hashes its index, so no two leaves are
+equal and no subtree can be reused, about two Keccak-256 calls for each of
+`2^31` leaves (`vrf::tests::the_whole_tree_...`, `--ignored`).
+ethereum-package publishes each genesis validator's root and leaf 0's branch,
+which `ethlambda_crypto::vrf::tests::matches_ethereum_packages_published_state`
+checks validator 0's against.
 
 `is_valid_vrf_proof` folds the branch itself (`vrf::fold_vrf_branch`), not
-through the SHA-256 `is_valid_merkle_branch`. The leaf commits to the whole
-slot while the branch reads only its low 31 bits, so a proof for `slot` does
-not open `slot + 2^31`.
+through the SHA-256 `is_valid_merkle_branch`. It reads the slot's low 31 bits
+only, so a proof for `slot` also opens `slot + 2^31`, as the specification
+has it.
+
+consensus-specs' later `b5d422b2` makes each leaf commit to a per-slot secret
+and reveals the secret instead; branch `pq-devnet-0-b5d422b2` follows it.
 
 ## Inclusion delay
 
@@ -296,13 +295,14 @@ it:
 2. With `--vrf-state-url` (a URL or a path), the key's record in a file of
    precomputed states, read at its validator index: ethereum-package's
    `vrf_state_url` format, 1028 bytes a validator (the root, four zero
-   bytes, then leaf 0's branch), which `ethlambda pq-keys` writes. The
-   record must fold the key's own leaf 0 to its root, so a record of another
-   validator's, or of another VRF rule's, falls through to the next source.
+   bytes, then leaf 0's branch), which ethereum-package publishes for its
+   genesis validators and `ethlambda pq-keys` writes. The record must fold
+   the key's own leaf 0 to its root, so a record of another validator's, or
+   of another VRF rule's, falls through to the next source.
    A proof then hashes only the leaves below the slot's highest bit, a few
    milliseconds on a young chain.
 3. The whole tree, hashed. It keeps the `2^15` nodes 16 levels above the
-   leaves (1 MiB, commitments only, so no secret), and a proof rebuilds one
+   leaves (1 MiB), and a proof rebuilds one
    `2^16`-leaf subtree, about 30 ms. The hashing runs in a rayon pool of its
    own, one thread short of the cores: leanXMSS signing parallelizes on
    rayon's global pool, which runs a job from outside it only once a
@@ -374,7 +374,7 @@ No consensus-specs release ships fixtures for either fork. The pyspec on the
 
 ```sh
 git clone https://github.com/ethereum/consensus-specs && cd consensus-specs
-git checkout b5d422b255db80c9bbc48f515370655ecc8bf6e5
+git checkout 2f43bc0f989f47af81df390a90bc1f78e2436323
 make test reftests=true fork=eip8483 preset=minimal
 make test reftests=true fork=pq preset=minimal
 ```
@@ -415,11 +415,6 @@ generated.
   all known a slot earlier, so a node could merge during slot `N - 1` for a
   proposer it serves, where today a slow merge costs every attestation but
   one.
-- Interop on `b5d422b2`'s VRF rule: neither ethPandaOps' genesis generator
-  nor Lighthouse's PQ branch uses it yet, so the published key and state
-  files fail `is_valid_vrf_proof`, and a network with Lighthouse cannot run.
-  An ethlambda-only network runs on files `ethlambda pq-keys` writes (see
-  `tooling/pq-devnet/README.md`).
 - PQ block production does not weigh builder bids: it self-builds, and the
   PQ builder market it would read is filled but unused.
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ

@@ -872,6 +872,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
+  `2f43bc0f`, the pq-devnet-0 spec; branch `pq-devnet-0-b5d422b2` follows
   `b5d422b2`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
@@ -882,26 +883,25 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   aggregates and payload attestations reach fork choice, and envelopes of
   every fork travel as the fork-tagged `containers::SignedExecutionPayloadEnvelope`
   (storage decodes one by its slot's fork, req/resp by the chunk's context
-  bytes, the engine gets each fork's typed requests list). It was run next to
+  bytes, the engine gets each fork's typed requests list). It runs next to
   Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`),
-  with its own validators (before `b5d422b2` changed the VRF tree, which no
-  other client's tooling follows yet): the validator client derives each
+  with its own validators: the validator client derives each
   validator's leanXMSS key and VRF seed from its BLS key
   (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
   in the aggregation committee), casts PTC votes and proposes, each signature
   at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
-  `2^31` leaves, each committing to its slot's secret) takes about 100 s of
+  `2^31` leaves, each `keccak256(vrf_seed || le64(slot))`) takes minutes of
   every core per key, so a background thread hashes it after startup (in a
   rayon pool of its own: on the global one it starves every leanXMSS
   signature until done) and stores its upper nodes in
   `<validators-dir>/pq_vrf_trees/`; a proposal before its key's tree is
   ready is missed. `--vrf-state-url` loads precomputed tree states instead
-  (ethereum-package's `vrf_state_url` format, which `ethlambda pq-keys`
-  writes along with the genesis key file), and every leaf signed is recorded
-  durably in `<validators-dir>/pq_signed_leaves.bin` before its signature
-  exists. An ethlambda-only devnet at `b5d422b2` (`tooling/pq-devnet/`,
-  "ethlambda alone") proposes with blobs, finalizes and survives a validator
-  client restart. The beacon node builds PQ blocks through `POST
+  (ethereum-package's `vrf_state_url` file, which the package publishes and
+  `ethlambda pq-keys` writes along with the genesis key file), and every leaf
+  signed is recorded durably in `<validators-dir>/pq_signed_leaves.bin`
+  before its signature exists. With Lighthouse, ethlambda's blocks, envelopes,
+  data columns, aggregates and PTC votes are accepted, and the validator
+  client survives a restart. The beacon node builds PQ blocks through `POST
   /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
   `pq_block_production.rs`), packing attestations from the validated
   aggregates in `Store::pq_aggregate_pool` with their proofs merged on the

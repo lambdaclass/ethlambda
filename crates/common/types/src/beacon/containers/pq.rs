@@ -1,6 +1,6 @@
 //! Containers whose shape is specific to the PQ fork (consensus-specs
 //! `specs/_features/pq`, on the `pq` branch at
-//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
+//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
 //!
 //! The fork replaces BLS with leanXMSS. Every signed container trades its
 //! `BLSSignature` for an [`XmssSignature`]; [`Attestation`] loses its signature

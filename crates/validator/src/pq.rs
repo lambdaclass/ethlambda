@@ -578,7 +578,7 @@ mod tests {
 
         let proof = vrf_proof(&pubkey, 5).unwrap();
         assert_eq!(proof.len(), 32);
-        assert_eq!(proof[0].0, vrf::compute_vrf_secret(&vrf_seed, 5));
+        assert_eq!(proof[0].0, vrf::compute_vrf_leaf(&vrf_seed, 5));
         let branch = proof[1..].iter().map(|node| &node.0);
         let root: [u8; 32] = bytes[bytes.len() - 32..].try_into().unwrap();
         assert_eq!(vrf::fold_vrf_branch(&proof[0].0, branch, 5), root);
@@ -598,7 +598,7 @@ mod tests {
     fn stand_in_state_record(vrf_seed: vrf::Node) -> Vec<u8> {
         let mut branch = vrf::VrfTree::with_depth(vrf_seed, 16).compact_state().1;
         branch.extend((16..31).map(|height| [height as u8; 32]));
-        let root = vrf::fold_vrf_branch(&vrf::compute_vrf_secret(&vrf_seed, 0), &branch, 0);
+        let root = vrf::fold_vrf_branch(&vrf::compute_vrf_leaf(&vrf_seed, 0), &branch, 0);
         vrf::VrfTree::from_compact_state(vrf_seed, root, branch)
             .unwrap()
             .to_state_record()

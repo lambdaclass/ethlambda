@@ -1,7 +1,7 @@
 # A PQ-at-genesis devnet where ethlambda validates too: Lighthouse
 # (pq-devnet-0) with 48 validators (75%, enough to finalize alone), an
-# ethlambda beacon node and validator client with 16. Not runnable at
-# b5d422b2 until Lighthouse moves to its VRF rule. See README.md.
+# ethlambda beacon node and validator client with 16. Lighthouse's image
+# must be on leanVM bindings v0.15.0, as ethlambda's sidecar is. See README.md.
 participants:
   - el_type: geth
     cl_type: lighthouse

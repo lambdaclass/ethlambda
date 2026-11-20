@@ -1,10 +1,8 @@
-# An ethlambda-only PQ-at-genesis devnet at consensus-specs pq b5d422b2: two
-# ethlambda beacon nodes, each with its own ethlambda validator client. The
-# genesis's leanXMSS keys and VRF roots, and the validator clients' VRF tree
-# states, come from `ethlambda pq-keys` served on the host (see README.md,
-# "ethlambda alone"), because the published files follow the VRF rule
-# b5d422b2 replaced. `validator_count` must not exceed the `--count` the
-# files were written for.
+# An ethlambda-only PQ-at-genesis devnet at consensus-specs pq 2f43bc0f (the
+# pq-devnet-0 spec): two ethlambda beacon nodes, each with its own ethlambda
+# validator client, on ethereum-package's published leanXMSS keys and VRF
+# roots. The validator clients read the package's published VRF tree states,
+# served from the host (see README.md, "ethlambda alone").
 participants:
   - el_type: geth
     cl_type: ethlambda
@@ -13,7 +11,7 @@ participants:
     vc_image: ethlambda:pq-local
     vc_extra_params:
       - --init-slashing-protection
-      - --vrf-state-url=http://host.docker.internal:8641/b9dec4e1daa17dfe.vrf
+      - --vrf-state-url=http://host.docker.internal:8642/b9dec4e1daa17dfe.vrf
     validator_count: 16
     supernode: true
   - el_type: geth
@@ -23,7 +21,7 @@ participants:
     vc_image: ethlambda:pq-local
     vc_extra_params:
       - --init-slashing-protection
-      - --vrf-state-url=http://host.docker.internal:8641/b9dec4e1daa17dfe.vrf
+      - --vrf-state-url=http://host.docker.internal:8642/b9dec4e1daa17dfe.vrf
     validator_count: 16
     supernode: true
 network_params:
@@ -31,13 +29,7 @@ network_params:
   fulu_fork_epoch: 0
   gloas_fork_epoch: 0
   pq_fork_epoch: 0
-  # eth-beacon-genesis reads <url>/b9dec4e1daa17dfe.bin, the default
-  # mnemonic's file, and derives (under its own, older rule) any record the
-  # file lacks: its log must say "0 derived".
-  xmss_pubkey_url: http://host.docker.internal:8641
-ethereum_genesis_generator_params:
-  # The generator `:pq` named on 2026-11-19, whose key file name
-  # (`leanxmss-full-keccak-vrf-keys`) `ethlambda pq-keys` writes.
-  image: ethpandaops/ethereum-genesis-generator@sha256:296c352575e5d6cb2bf22e179165f21c39a8114f27804540c2b84bf806820e33
+  # The validator clients derive their leanXMSS keys at startup; genesis waits.
+  genesis_delay: 120
 additional_services:
   - dora
