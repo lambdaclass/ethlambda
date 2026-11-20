@@ -121,9 +121,11 @@ affected devnet):
    advancing (jumping square/pronic slots) with finalized=0, it's the bootstrap
    regime — leave it (see the young-devnet section above).
 0b. **Per-node picture, from the host itself.** `host-check.sh [NODES]` on the
-   affected server: which containers are down/restarting, which heads lag past the
-   sync-gate threshold (those nodes stop attesting and proposing), and whether one
-   `AGG=yes` still exists per subnet. It reads only `127.0.0.1`, so it works when
+   affected server: which containers are down/restarting, which heads lag the
+   host's best by more than 4 slots, which nodes read `syncing` in the SYNC column
+   (only those stop attesting and proposing: a node far behind with no peer
+   reporting a head ahead reads `synced` and keeps voting on its stale head), and
+   whether one `AGG=yes` still exists per subnet. It reads only `127.0.0.1`, so it works when
    remote_write or the central stack is the thing that is broken.
 1. **Vote math.** Threshold is `ceil(2/3 · NODES)` for that devnet. Pull recent
    `Checkpoint justified ... vote_count=V threshold=T` from a stable node. If

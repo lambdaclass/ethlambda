@@ -81,15 +81,29 @@ pub(super) async fn handle_envelope_fetch_failure(
 }
 
 /// Let range sync go on after a gloas batch's envelopes: whether they were
-/// delivered, refused, or never came. Does nothing when no batch is waiting.
-pub(crate) async fn release_envelope_gate(server: &mut P2PServer, ctx: &Context<P2PServer>) {
-    let Some(state) = &mut server.range_sync_state else {
-        return;
-    };
-    if !std::mem::take(&mut state.envelopes_pending) {
-        return;
+/// delivered, refused, or never came. Does nothing when no batch of
+/// `session`'s is waiting (see [`take_envelope_gate`]).
+pub(crate) async fn release_envelope_gate(
+    server: &mut P2PServer,
+    ctx: &Context<P2PServer>,
+    session: Option<u64>,
+) {
+    if take_envelope_gate(server, session) {
+        request_next_beacon_range_batch(server, ctx).await;
     }
-    request_next_beacon_range_batch(server, ctx).await;
+}
+
+/// Open the envelope gate of the range session `session`, returning whether
+/// a batch was waiting on it. Only that session's: an envelope request can
+/// outlive the session that sent it (a session that ran out of range or
+/// peers ends without purging its requests), and so can the check after its
+/// answer, which runs on its own task, and neither may let a later session's
+/// next batch go before that session's own envelopes are forwarded.
+pub(crate) fn take_envelope_gate(server: &mut P2PServer, session: Option<u64>) -> bool {
+    match &mut server.range_sync_state {
+        Some(state) if Some(state.id) == session => std::mem::take(&mut state.envelopes_pending),
+        _ => false,
+    }
 }
 
 /// Fetch the envelope of `block_root` from a random connected peer.
@@ -297,11 +311,13 @@ pub(crate) async fn request_beacon_envelopes_by_range(
         debug!(%peer, "Failed to send ExecutionPayloadEnvelopesByRange request (swarm adapter closed)");
         return false;
     };
+    let session = server.range_sync_state.as_ref().map(|state| state.id);
     server.outbound_requests.insert(
         request_id,
         PendingRequestKind::EnvelopeRange {
             start_slot,
             end_slot,
+            session,
         },
     );
     if let Some(state) = &mut server.range_sync_state {
@@ -340,8 +356,8 @@ fn retain_envelopes_in_range(
 pub(super) async fn handle_envelopes_by_range_response(
     server: &mut P2PServer,
     peer: PeerId,
-    start_slot: u64,
-    end_slot: u64,
+    (start_slot, end_slot): (u64, u64),
+    session: Option<u64>,
     envelopes: Vec<SignedExecutionPayloadEnvelope>,
     ctx: &Context<P2PServer>,
 ) {
@@ -350,7 +366,7 @@ pub(super) async fn handle_envelopes_by_range_response(
 
     if server.blockchain.is_none() {
         debug!(%peer, "No blockchain handler available");
-        release_envelope_gate(server, ctx).await;
+        release_envelope_gate(server, ctx, session).await;
         return;
     }
 
@@ -358,13 +374,17 @@ pub(super) async fn handle_envelopes_by_range_response(
     if dropped > 0 {
         debug!(%peer, start_slot, end_slot, dropped, "Dropping out-of-range envelopes");
     }
+    // The release names the session that asked: the check runs on its own
+    // task, and that session may have ended by the time it finishes.
     let resume = ctx.clone();
     let done: envelope_checks::Done = Box::new(move || {
-        send_after(
-            Duration::ZERO,
-            resume,
-            p2p_protocol::ResumeRangeAfterEnvelopes,
-        );
+        if let Some(session) = session {
+            send_after(
+                Duration::ZERO,
+                resume,
+                p2p_protocol::ResumeRangeAfterEnvelopes { session },
+            );
+        }
     });
     envelope_checks::check_and_forward_then(server, envelopes, Some(done));
 }
@@ -577,7 +597,7 @@ mod tests {
         );
         assert!(matches!(
             kind,
-            PendingRequestKind::EnvelopeRange { start_slot, end_slot }
+            PendingRequestKind::EnvelopeRange { start_slot, end_slot, .. }
                 if *start_slot == first_gloas_slot
                     && *end_slot == first_gloas_slot + MAX_REQUEST_PAYLOADS - 1
         ));
@@ -587,6 +607,48 @@ mod tests {
         assert!(state.next_batch().is_none());
         state.envelopes_pending = false;
         assert!(state.next_batch().is_some());
+    }
+
+    /// Finding: an envelope request, or the check after its answer, that
+    /// outlived its range session released whatever session was running
+    /// then, so a later session's next batch could go before that session's
+    /// own envelopes were forwarded.
+    #[tokio::test]
+    async fn an_envelope_release_opens_only_its_own_sessions_gate() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let mut server = crate::test_support::unconnected_beacon_server(config, 0).await;
+        let peer = PeerId::random();
+        server
+            .connected_peers
+            .insert(peer, ConnectionDirection::Outbound);
+        let new_session = |server: &mut P2PServer| {
+            server.range_sync_state = Some(crate::RangeSyncState::new(0..100_000, peer, 99_999));
+            server.range_sync_state.as_ref().unwrap().id
+        };
+
+        // A session asks for a batch's envelopes, then ends without purging
+        // the request (it ran out of range or of peers).
+        let ended = new_session(&mut server);
+        assert!(request_beacon_envelopes_by_range(&mut server, peer, 0, 64).await);
+        let (_, kind) = server.outbound_requests.iter().next().unwrap();
+        assert!(matches!(
+            kind,
+            PendingRequestKind::EnvelopeRange { session, .. } if *session == Some(ended)
+        ));
+        server.range_sync_state = None;
+
+        // A later session waits on envelopes of its own.
+        let running = new_session(&mut server);
+        assert!(request_beacon_envelopes_by_range(&mut server, peer, 64, 64).await);
+        assert!(server.range_sync_state.as_ref().unwrap().envelopes_pending);
+
+        // The ended session's answer, failure or check releases nothing.
+        assert!(!take_envelope_gate(&mut server, Some(ended)));
+        assert!(!take_envelope_gate(&mut server, None));
+        assert!(server.range_sync_state.as_ref().unwrap().envelopes_pending);
+        // Its own does.
+        assert!(take_envelope_gate(&mut server, Some(running)));
+        assert!(!server.range_sync_state.as_ref().unwrap().envelopes_pending);
     }
 
     /// The release runs the completion callback even with nothing to forward,

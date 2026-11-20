@@ -60,6 +60,8 @@ either = "1"
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing.workspace = true
 thiserror.workspace = true
+# Bounds `beacon::engine_columns::PublishedColumns`, like the gossip seen caches.
+lru.workspace = true
 
 rand = "0.8"
 
