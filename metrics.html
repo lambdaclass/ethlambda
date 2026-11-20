@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2fad5026.js";
+            window.path_to_searchindex_js = "searchindex-4aba02a1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -771,6 +771,7 @@ leanMetrics spec.</p>
 </thead>
 <tbody>
 <tr><td><code>lean_beacon_committee_cache_lookups_total</code></td><td>Counter</td><td>Committee lookups, by whether the cache served them</td><td>On every <code>CommitteeCacheExt::committees</code> call: the state transition’s, fork choice’s and p2p’s gossip validation’s attestation processing</td><td>result=hit,miss,unkeyable</td></tr>
+<tr><td><code>lean_beacon_signature_batch_disagreements_total</code></td><td>Counter</td><td>Signature batches that failed although the set the search for the failing one narrowed to verifies on its own: a bug in the batch check. The block is rejected anyway, so any non-zero value means valid blocks may be refused</td><td>When a block’s deferred signature batch fails and the set its bisection lands on passes alone</td><td></td></tr>
 </tbody>
 </table>
 </div>
