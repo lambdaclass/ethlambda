@@ -615,20 +615,31 @@ pub fn verify_signature(pubkey: &PublicKey, message: &Message, signature: &Signa
 /// A leaf index past `u32::MAX` never verifies: a signature carries four bytes
 /// of it. Neither does a signature of the wrong length, the way the reference
 /// implementation's decoding failure reads as `False`.
+///
+/// Through leanVM's own `lean_xmss` (bindings v0.15.0), the verifier
+/// pq-devnet-0 runs, not this module's port: the two agree byte for byte
+/// (`the_port_signs_and_verifies_as_leanvm_does`), but the network's verifier
+/// is leanVM's.
 pub fn verify(
     pubkey: &[u8; PUBKEY_SIZE],
     leaf_index: u64,
     message: &Message,
     signature: &[u8],
 ) -> bool {
-    let Some(signature) = Signature::from_bytes(signature) else {
+    let Ok(bytes) = <&[u8; SIGNATURE_SIZE]>::try_from(signature) else {
         return false;
     };
-    if u64::from(signature.leaf_index) != leaf_index {
+    if signature_index(bytes) != Some(leaf_index) {
         return false;
     }
-    verify_signature(&PublicKey::from_bytes(pubkey), message, &signature)
+    let signature = leanvm_lean_xmss::LeanXmssSignature::from_bytes(bytes);
+    let pubkey = leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(pubkey);
+    leanvm_lean_xmss::verify(&pubkey, message, &signature)
 }
+
+const _: () = assert!(
+    PUBKEY_SIZE == leanvm_lean_xmss::PUB_KEY_SIZE && SIGNATURE_SIZE == leanvm_lean_xmss::SIG_SIZE
+);
 
 /// The specification's `xmss.GetLeafIndex(signature)`: the leaf index a
 /// signature carries, its first four bytes as a little-endian integer, read
@@ -894,6 +905,26 @@ mod tests {
         assert_eq!(key.public_key().to_bytes(), pubkey);
         let signed = key.sign(&message, KAT_LEAF_INDEX as LeafIndex).unwrap();
         assert_eq!(signed.to_bytes(), signature);
+    }
+
+    /// leanVM's own `lean_xmss` (bindings v0.15.0), which signs for the
+    /// validator client and verifies for [`verify`], grows the same key from
+    /// consensus-specs' seed and signs its message into the same bytes, which
+    /// the port then verifies.
+    #[test]
+    fn the_port_signs_and_verifies_as_leanvm_does() {
+        let (pubkey, message, signature) = kat();
+        let seed: Seed = std::array::from_fn(|i| i as u8);
+        let (key, public) = leanvm_lean_xmss::key_gen(&seed);
+        assert_eq!(public.to_bytes(), pubkey);
+        let signed = leanvm_lean_xmss::sign(&key, &message, KAT_LEAF_INDEX as LeafIndex);
+        assert_eq!(signed.to_bytes().to_vec(), signature);
+        let ported = Signature::from_bytes(&signed.to_bytes()).unwrap();
+        assert!(verify_signature(
+            &PublicKey::from_bytes(&pubkey),
+            &message,
+            &ported
+        ));
     }
 
     /// The key ethpandaops' genesis tooling and Lighthouse give validator 0 of
