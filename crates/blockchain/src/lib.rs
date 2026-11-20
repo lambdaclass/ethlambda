@@ -427,6 +427,7 @@ impl BlockChain {
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
             custody_columns,
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
@@ -540,6 +541,10 @@ pub struct BlockChainServer {
     /// The columns this node samples, computed once at startup from its node
     /// id (see `das::custody_columns`). Empty on lean.
     custody_columns: Vec<u64>,
+
+    /// Admission limits on asking the execution client for a held block's
+    /// blobs (see `beacon_blobs::AskBudget`).
+    blob_asks: beacon_blobs::AskBudget,
 
     /// The execution client this follower validates payloads against, when one
     /// is configured. `None` is `--execution-endpoint` absent, in which case
@@ -2150,6 +2155,7 @@ impl BlockChainServer {
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
             custody_columns: Vec::new(),
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
@@ -3318,7 +3324,10 @@ impl BlockChainServer {
         // Before the block is moved into the store. Only the first hold asks:
         // a redelivery of a held root must not re-query the execution client.
         // Only a recent block does, checked before the signature so range
-        // sync pays for neither. Only a block whose proposer signature
+        // sync pays for neither. Only within the ask budget (per block slot
+        // and in flight, see `beacon_blobs::AskBudget`), spent before the
+        // signature so a flood of distinct roots for one recent slot cannot
+        // buy unbounded BLS work here. Only a block whose proposer signature
         // verifies does: the built columns go through every chain check
         // before they leave `beacon_blobs`, but a block that already fails
         // here is not worth an engine call and a cell computation.
@@ -3327,6 +3336,7 @@ impl BlockChainServer {
             && !inner.message.body.blob_kzg_commitments.is_empty()
             && !self.blocks_awaiting_columns.contains_key(&block_root)
             && beacon_blobs::recent_enough_to_ask(slot, current_slot)
+            && let Some(permit) = self.blob_asks.admit(slot, current_slot)
             && beacon_blobs::signed_by_its_proposer(&self.store, &block, block_root)
         {
             beacon_blobs::spawn_fetch(
@@ -3336,6 +3346,7 @@ impl BlockChainServer {
                 inner.clone(),
                 block_root,
                 self.custody_columns.clone(),
+                permit,
             );
         }
 
@@ -4661,6 +4672,7 @@ mod tests {
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
             custody_columns: Vec::new(),
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,

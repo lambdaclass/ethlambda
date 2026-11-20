@@ -74,6 +74,9 @@
 //! the async runtime and off the chain actor, which only ever sees the
 //! finished columns, through p2p.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ethlambda_engine::EngineClient;
@@ -113,6 +116,74 @@ pub(crate) const MAX_ASK_AGE_SLOTS: u64 = 4;
 /// the execution client about (see [`MAX_ASK_AGE_SLOTS`]).
 pub(crate) fn recent_enough_to_ask(slot: u64, current_slot: u64) -> bool {
     slot.saturating_add(MAX_ASK_AGE_SLOTS) >= current_slot
+}
+
+/// How many held blocks of one slot may be considered for an execution-client
+/// ask, counting every block whose precheck runs, not only those that pass it.
+///
+/// [`MAX_ASK_AGE_SLOTS`] bounds which slots qualify, not how many blocks: a
+/// peer answering by root can hand the actor any number of distinct roots for
+/// a recent slot, each costing a BLS verification on the chain actor
+/// ([`signed_by_its_proposer`]) and, past the parent's lookahead (where any
+/// registered validator's signature passes the precheck), an engine call, a
+/// cell computation and a parent-state advance in [`check_built`]. An honest
+/// slot has one block, two when its proposer equivocates; the rest is room for
+/// a forged copy arriving first. Once a slot's budget is spent its blocks are
+/// left to gossip and the peer asks, which is where a miss leaves them anyway.
+pub(crate) const MAX_ASKS_PER_SLOT: u8 = 4;
+
+/// How many execution-client asks may be in flight at once, from the engine
+/// call through the cell computation and the chain checks on the blocking
+/// pool. A hold finding them all taken does not ask.
+pub(crate) const MAX_ASKS_IN_FLIGHT: usize = 4;
+
+/// The admission limits on execution-client asks ([`MAX_ASKS_PER_SLOT`],
+/// [`MAX_ASKS_IN_FLIGHT`]), owned by the chain actor.
+#[derive(Debug, Default)]
+pub(crate) struct AskBudget {
+    /// Asks admitted per block slot, for slots still inside
+    /// [`MAX_ASK_AGE_SLOTS`].
+    per_slot: BTreeMap<u64, u8>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl AskBudget {
+    /// Admit one ask for a held block at `slot`, spending one of that slot's
+    /// [`MAX_ASKS_PER_SLOT`] and taking an in-flight slot that is released
+    /// when the returned permit drops. `None` when either is exhausted.
+    ///
+    /// Called before the precheck, so a block that fails it still spends its
+    /// slot's budget: that is what bounds the BLS verifications.
+    pub(crate) fn admit(&mut self, slot: u64, current_slot: u64) -> Option<AskPermit> {
+        let oldest = current_slot.saturating_sub(MAX_ASK_AGE_SLOTS);
+        self.per_slot = self.per_slot.split_off(&oldest);
+        let asked = self.per_slot.entry(slot).or_default();
+        if *asked >= MAX_ASKS_PER_SLOT {
+            metrics::inc_engine_get_blobs_skipped("slot_budget");
+            return None;
+        }
+        let taken = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_ASKS_IN_FLIGHT).then_some(n + 1)
+            });
+        if taken.is_err() {
+            metrics::inc_engine_get_blobs_skipped("in_flight");
+            return None;
+        }
+        *asked += 1;
+        Some(AskPermit(Arc::clone(&self.in_flight)))
+    }
+}
+
+/// One in-flight execution-client ask; releases its slot on drop.
+#[derive(Debug)]
+pub(crate) struct AskPermit(Arc<AtomicUsize>);
+
+impl Drop for AskPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Whether a held block may have its columns built from the execution
@@ -175,6 +246,7 @@ pub(crate) fn spawn_fetch(
     block: electra::SignedBeaconBlock,
     block_root: H256,
     custody_columns: Vec<u64>,
+    permit: AskPermit,
 ) {
     tokio::spawn(fetch_and_publish(
         engine,
@@ -183,9 +255,12 @@ pub(crate) fn spawn_fetch(
         block,
         block_root,
         custody_columns,
+        permit,
     ));
 }
 
+/// `permit` is held until the blocking work ends, so it bounds the cell
+/// computation and the chain checks too, not only the engine call.
 async fn fetch_and_publish(
     engine: EngineClient,
     p2p: BlockChainToP2PRef,
@@ -193,6 +268,7 @@ async fn fetch_and_publish(
     block: electra::SignedBeaconBlock,
     block_root: H256,
     custody_columns: Vec<u64>,
+    permit: AskPermit,
 ) {
     let slot = block.message.slot;
     let versioned_hashes: Vec<H256> = block
@@ -226,6 +302,7 @@ async fn fetch_and_publish(
 
     let blob_count = entries.len();
     let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         // The block was imported while the execution client answered (gossip
         // completed it first): nothing left to supply.
         match store.has_state(&block_root) {
@@ -738,7 +815,19 @@ mod tests {
         let (engine, requests) = mock_engine(answer_for(&blobs)).await;
         let p2p = Arc::new(crate::tests::RecordingP2P::default());
 
-        fetch_and_publish(engine, p2p.clone(), store, inner, root, CUSTODY.to_vec()).await;
+        let permit = AskBudget::default()
+            .admit(1, 1)
+            .expect("an empty budget admits");
+        fetch_and_publish(
+            engine,
+            p2p.clone(),
+            store,
+            inner,
+            root,
+            CUSTODY.to_vec(),
+            permit,
+        )
+        .await;
 
         assert_eq!(requests.load(Ordering::SeqCst), 1, "the engine was asked");
         assert!(p2p.checks.lock().unwrap().is_empty());
@@ -863,6 +952,65 @@ mod tests {
                 "validator {named}'s columns handed over"
             );
         }
+    }
+
+    /// A slot's budget is spent by every admitted ask, whatever its precheck
+    /// says, and frees up only as the slot leaves the age window; the
+    /// in-flight cap frees up as permits drop.
+    #[test]
+    fn the_ask_budget_bounds_asks_per_slot_and_in_flight() {
+        let mut budget = AskBudget::default();
+        let held: Vec<AskPermit> = (0..MAX_ASKS_IN_FLIGHT)
+            .map(|i| budget.admit(10 + i as u64, 10).expect("room in flight"))
+            .collect();
+        assert!(budget.admit(20, 20).is_none(), "every in-flight slot taken");
+        drop(held);
+
+        for _ in 0..MAX_ASKS_PER_SLOT {
+            let _ = budget.admit(30, 30).expect("room in the slot");
+        }
+        assert!(budget.admit(30, 30).is_none(), "slot 30's budget spent");
+        assert!(budget.admit(31, 31).is_some(), "another slot has its own");
+        assert!(
+            budget.admit(30, 30 + MAX_ASK_AGE_SLOTS).is_none(),
+            "still inside the window"
+        );
+        assert!(
+            budget.admit(31, 31 + MAX_ASK_AGE_SLOTS + 1).is_some(),
+            "a pruned slot starts over"
+        );
+    }
+
+    /// Distinct roots for one recent slot, each with a bad signature: only the
+    /// slot's budget of them reaches the precheck, and none the engine.
+    #[tokio::test]
+    async fn a_flood_of_forged_roots_for_one_slot_spends_only_its_budget() {
+        let (engine, requests) = mock_engine("null".to_string()).await;
+        let (mut server, _p2p) = beacon_server_recording(store_with_keyed_parent());
+        server.engine = Some(engine);
+        server.custody_columns = CUSTODY.to_vec();
+
+        for seed in 0..(MAX_ASKS_PER_SLOT + 3) {
+            let mut block = block_committing_to(&[blob_bytes(20)]);
+            let SignedBeaconBlock::Fulu(inner) = &mut block else {
+                unreachable!("fulu_block builds a fulu block");
+            };
+            inner.message.body.graffiti = H256::repeat_byte(seed + 1);
+            server.hold_block_for_columns(block, 1, ImportTimings::default());
+        }
+        let genuine = block_committing_to(&[blob_bytes(20)]);
+        server.hold_block_for_columns(genuine, 1, ImportTimings::default());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "the budget was spent by the forged roots before the genuine one"
+        );
+        assert_eq!(
+            server.blob_asks.per_slot.get(&1).copied(),
+            Some(MAX_ASKS_PER_SLOT)
+        );
     }
 
     /// An altered copy of a block (its body changed after signing, the

@@ -1735,6 +1735,24 @@ pub fn inc_engine_get_blobs(outcome: &str) {
         .inc();
 }
 
+/// Held blocks not asked about because the execution-client ask budget was
+/// spent (`beacon_blobs::AskBudget`): `slot_budget` (the block's slot already
+/// had its share of asks) or `in_flight` (too many asks running).
+pub fn inc_engine_get_blobs_skipped(reason: &str) {
+    static LEAN_ENGINE_GET_BLOBS_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_get_blobs_skipped_total",
+                "Held blocks not asked about because the engine_getBlobsV2 ask budget was spent",
+                &["reason"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_SKIPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// How long one `engine_getBlobsV2` round trip took, whatever its outcome.
 ///
 /// The buckets stop at the call's own timeout, so a mass in the last bucket

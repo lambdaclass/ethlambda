@@ -18,7 +18,9 @@
 //! Recording comes before publishing on purpose. A copy of the same column that
 //! gossip delivers afterwards then finds its key taken and is ignored rather
 //! than re-forwarded, and a column gossip already accepted is not published a
-//! second time. Gossip records a column only once its verdict is `Accept`
+//! second time. A column whose key is taken is still handed to the chain actor:
+//! the key carries no block root, so it may be another block's of the same
+//! slot and proposer, and the seen cache only gates publication, not storage. Gossip records a column only once its verdict is `Accept`
 //! (`verdict::Validated::record_seen`), so a copy still being validated when
 //! these are recorded is ignored too, as any second valid copy is.
 
@@ -63,14 +65,21 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
             continue;
         }
         let header = &fulu.signed_block_header.message;
+        batch_header.get_or_insert_with(|| (header.slot, header.hash_tree_root()));
+        // The key is taken: not published, but still forwarded. The key is
+        // (slot, proposer, index) with no root, so it may belong to another
+        // block of the same slot (an equivocating proposer's), whose stored
+        // columns do nothing for this one; these passed every chain check, and
+        // dropping them would leave this block held on data this node has.
+        // When it is this block's own copy, the chain finds it stored.
         if !server
             .seen_columns
             .record(header.slot, header.proposer_index, index)
         {
             already_seen += 1;
+            fresh.push((sidecar, None));
             continue;
         }
-        batch_header.get_or_insert_with(|| (header.slot, header.hash_tree_root()));
         let topic = server
             .wire
             .beacon()
@@ -94,7 +103,7 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
         }
         forwarded.push(sidecar);
     }
-    let unpublished = forwarded.len() as u64 - published;
+    let unpublished = forwarded.len() as u64 - published - already_seen;
 
     if let Some((slot, block_root)) = batch_header {
         if missing_digest {
@@ -218,14 +227,26 @@ mod tests {
         assert_eq!(decoded, sidecar(1));
     }
 
+    /// A taken seen-cache key stops publication, not the hand-over: the key
+    /// has no block root, so it may be another block's of the same slot and
+    /// proposer (an equivocation), whose columns do not complete this one.
     #[tokio::test]
-    async fn a_column_gossip_already_accepted_is_not_forwarded() {
+    async fn a_column_whose_key_is_taken_is_forwarded_but_not_published() {
         let (mut server, chain) = server_custodying(&[1, 2]).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
         assert!(server.seen_columns.record(SLOT, PROPOSER, 1));
 
         publish_and_forward(&mut server, vec![sidecar(1), sidecar(2)]);
 
-        assert_eq!(forwarded_indices(&chain), [vec![2]]);
+        assert_eq!(forwarded_indices(&chain), [vec![1, 2]]);
+        let mut published = 0;
+        while let Ok(command) = commands.try_recv() {
+            if let SwarmCommand::Publish { .. } = command {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 1, "only column 2's key was free");
     }
 
     #[tokio::test]

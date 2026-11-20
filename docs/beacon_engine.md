@@ -341,6 +341,18 @@ calls and cell computations. Such a block's columns are asked of peers as soon
 as it is held, so it does not wait for a redrive either way. How often the
 execution client would still hold an older block's blobs is not measured.
 
+The age bound limits which slots qualify, not how many blocks: a peer answering
+by root can hand over any number of distinct roots for a recent slot. So an ask
+is also admitted against a budget, before the precheck runs:
+`MAX_ASKS_PER_SLOT` (4) per block slot, spent whether or not the precheck
+passes, and `MAX_ASKS_IN_FLIGHT` (4) at once, held from the engine call through
+the cell computation and the chain checks. That bounds the BLS verifications
+on the chain actor and the blocking-pool work a flood of forged roots can buy.
+The cost: forged roots that arrive first can spend a slot's budget before the
+genuine block, which is then left to gossip and the peer asks, where a miss
+leaves it anyway. Skips are counted in
+`lean_engine_get_blobs_skipped_total{reason}`.
+
 The precheck is a filter, not the guard: the built columns go through every
 chain check before they are published (see the build below). It saves an engine
 call and a cell computation for a block whose signature already fails, which
@@ -422,6 +434,7 @@ before the columns are published.
 | Metric | Reads |
 |---|---|
 | `lean_engine_get_blobs_total{outcome}` | Attempts: `hit`, `miss`, `error` |
+| `lean_engine_get_blobs_skipped_total{reason}` | Holds not asked about, the ask budget spent: `slot_budget`, `in_flight` |
 | `lean_engine_get_blobs_duration_seconds` | One round trip, whatever the outcome |
 | `lean_engine_blobs_to_columns_seconds` | Cell computation plus sidecar build |
 | `lean_engine_blob_columns_refused_total{reason}` | Built columns the chain checks refused, by rule (`kzg`, `wrong_proposer`, ...); any of these points at the execution client or a forged block |
