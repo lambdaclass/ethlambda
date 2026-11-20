@@ -4625,15 +4625,19 @@ fn pulled_up_checkpoints(
     let mut justification = JustificationState::from_state(state);
     if tracks_epoch(justification.current_epoch) {
         let totals = match extended_totals {
-            Some(totals) => totals,
+            Some(totals) => {
+                // Only an extended total is checked: a scanned one would be
+                // compared with a second copy of the same scan.
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    totals,
+                    compute_target_balances(state)?,
+                    "incremental target balances diverged from a full scan"
+                );
+                totals
+            }
             None => compute_target_balances(state)?,
         };
-        #[cfg(debug_assertions)]
-        assert_eq!(
-            totals,
-            compute_target_balances(state)?,
-            "incremental target balances diverged from a full scan"
-        );
         store.target_balance_cache().insert(block_root, totals);
 
         // Floored exactly as `ParticipationTotals` floors its three totals;
