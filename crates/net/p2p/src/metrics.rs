@@ -354,7 +354,7 @@ static LEAN_BEACON_GOSSIP_MESSAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::ne
 static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "lean_beacon_status_digest_mismatch_total",
-        "Beacon Status requests whose fork digest did not match ours"
+        "Peers whose beacon Status moved onto a fork digest we do not hold, counted once per move"
     )
     .unwrap()
 });
@@ -626,8 +626,45 @@ pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
         .inc();
 }
 
+/// Count a peer whose `Status` has moved onto a fork digest this node does not
+/// hold: once when it moves there, not on every `Status` it sends from there,
+/// so the periodic refresh does not inflate it with connection age.
 pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
+}
+
+static LEAN_SYNC_PEERS_HELD_BACK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_sync_peers_held_back",
+        "Peers whose Status head does not count towards the sync gate's network head, by reason",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Publish how many peers' `Status` heads are held back from the network head
+/// the sync gate reads: `suspect` for peers whose range blocks never imported
+/// or that kept failing range requests, `cooling` for the others cooling down
+/// from a failed range request, `future` for the others whose latest head sat
+/// past the wall clock (most peers there points at a slow local clock). Set
+/// from a full count whenever the network head is published, which is at
+/// least once a slot.
+pub(crate) fn set_sync_peers_held_back(held_back: crate::peer_heads::HeldBack) {
+    let as_gauge = |count: usize| i64::try_from(count).unwrap_or(i64::MAX);
+    let crate::peer_heads::HeldBack {
+        suspects,
+        cooling,
+        future,
+    } = held_back;
+    for (reason, count) in [
+        ("suspect", suspects),
+        ("cooling", cooling),
+        ("future", future),
+    ] {
+        LEAN_SYNC_PEERS_HELD_BACK
+            .with_label_values(&[reason])
+            .set(as_gauge(count));
+    }
 }
 
 /// Publish the current fork digest as a label, so a dashboard can tell at a

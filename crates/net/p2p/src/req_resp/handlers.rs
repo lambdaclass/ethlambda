@@ -54,12 +54,13 @@ use crate::beacon::transition;
 use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::MAX_REQUEST_BLOCKS;
+use crate::peer_heads::{self, Report};
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
-    BACKOFF_MULTIPLIER, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE,
-    P2PServer, PendingColumnRequest, PendingRequest, PendingRequestKind, RANGE_BATCH_CUSTODY_WAIT,
-    RangeSyncState, ReqRespProtocol, ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics,
-    p2p_protocol,
+    BACKOFF_MULTIPLIER, BatchBlock, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES,
+    MAX_SYNC_RANGE, P2PServer, PendingColumnRequest, PendingRequest, PendingRequestKind,
+    RANGE_BATCH_CUSTODY_WAIT, RangeSyncState, ReqRespProtocol, ReqRespRequestId,
+    UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
 };
 use ethlambda_types::time::unix_now_ms;
 use libp2p::request_response::ResponseChannel;
@@ -126,7 +127,7 @@ pub async fn handle_req_resp_message(
                             kind = "beacon_status_request",
                             peer_count, "P2P message received"
                         );
-                        handle_status_request(server, peer, peer_status, channel).await;
+                        handle_status_request(server, peer, peer_status, channel, ctx).await;
                     }
                     Request::Ping(ping) => {
                         trace!(kind = "beacon_ping", peer_count, "P2P message received");
@@ -323,9 +324,11 @@ pub async fn handle_req_resp_message(
                                 Some(PendingRequestKind::EnvelopeRange {
                                     start_slot,
                                     end_slot,
+                                    session,
                                 }) => {
+                                    let span = (start_slot, end_slot);
                                     handle_envelopes_by_range_response(
-                                        server, peer, start_slot, end_slot, envelopes, ctx,
+                                        server, peer, span, session, envelopes, ctx,
                                     )
                                     .await;
                                 }
@@ -416,8 +419,8 @@ pub async fn handle_req_resp_message(
                         debug!(%peer, ?code, %error_str, "Received error response");
 
                         match server.outbound_requests.remove(&request_id) {
-                            Some(PendingRequestKind::Range { .. }) => {
-                                fail_range_request(server, &peer);
+                            Some(PendingRequestKind::Range { end_slot, .. }) => {
+                                fail_range_request(server, &peer, end_slot);
                             }
                             Some(PendingRequestKind::Root(root)) => {
                                 // An error response completes the exchange, so
@@ -455,10 +458,20 @@ pub async fn handle_req_resp_message(
                             // Nothing retries it, and the chain actor re-asks
                             // by root; but range pacing waits on the answer,
                             // so it must be released here.
-                            Some(PendingRequestKind::EnvelopeRange { .. }) => {
-                                release_envelope_gate(server, ctx).await;
+                            Some(PendingRequestKind::EnvelopeRange { session, .. }) => {
+                                release_envelope_gate(server, ctx, session).await;
                             }
-                            None => {}
+                            // An untracked request. A `Status` answered with
+                            // an error (`RateLimited`, say) ends a handshake
+                            // as surely as a failure does, or the peer would
+                            // never be refreshed. Carrying no head, it does
+                            // not count as the handshake's answer (see
+                            // `PeerHeads::answered`).
+                            None => {
+                                if is_status_protocol(request_id.protocol) {
+                                    server.peer_heads.end_status_request(&peer);
+                                }
+                            }
                         }
                     }
                 }
@@ -487,7 +500,7 @@ pub async fn handle_req_resp_message(
                     start_slot,
                     end_slot,
                 }) => {
-                    fail_range_request(server, &peer);
+                    fail_range_request(server, &peer, end_slot);
                     debug!(
                         %peer,
                         start_slot,
@@ -529,6 +542,7 @@ pub async fn handle_req_resp_message(
                 Some(PendingRequestKind::EnvelopeRange {
                     start_slot,
                     end_slot,
+                    session,
                 }) => {
                     debug!(
                         %peer,
@@ -536,7 +550,7 @@ pub async fn handle_req_resp_message(
                         end_slot,
                         "ExecutionPayloadEnvelopesByRange request failed; envelopes fall back to the by-root path"
                     );
-                    release_envelope_gate(server, ctx).await;
+                    release_envelope_gate(server, ctx, session).await;
                 }
                 // The handshake is the only *tracked* request kind absent
                 // here: every other outcome for a `Root`, `Range` or `Columns`
@@ -544,12 +558,20 @@ pub async fn handle_req_resp_message(
                 // untracked handshake or an id this process never recorded.
                 // Only the former is worth acting on: a peer that has dropped
                 // `status/1` refuses the stream outright, and without a
-                // handshake it never enters the sync peer set at all.
+                // handshake it never enters the sync peer set at all. Only a
+                // refused `status/1` is retried at once, on `status/2`. A
+                // refused `status/2` is not, or the two would bounce off a
+                // peer that speaks neither; it is noted instead, so the next
+                // refresh asks in `status/1` rather than repeating a version
+                // the peer has dropped (a refresh asks in whichever version
+                // the peer last answered).
                 None => {
-                    if matches!(
+                    let unsupported = matches!(
                         error,
                         request_response::OutboundFailure::UnsupportedProtocols
-                    ) {
+                    );
+                    if on_status_failure(server, peer, request_id.protocol, unsupported) {
+                        // The handshake goes on, on `status/2`.
                         crate::beacon::handler::retry_status_on_other_version(server, peer).await;
                     }
                 }
@@ -609,6 +631,17 @@ pub(super) fn respond(
         .send_response(channel, Response::success(payload));
 }
 
+/// Whether `protocol` is one of the `Status` protocols, whose requests
+/// `outbound_requests` does not track.
+fn is_status_protocol(protocol: ReqRespProtocol) -> bool {
+    matches!(
+        protocol,
+        ReqRespProtocol::LeanStatus
+            | ReqRespProtocol::BeaconStatusV1
+            | ReqRespProtocol::BeaconStatusV2
+    )
+}
+
 /// Answer a request with an error code and a reason.
 pub(super) fn refuse(
     server: &mut P2PServer,
@@ -630,40 +663,122 @@ async fn handle_lean_status_request(
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
     let our_status = build_status(&server.store);
     respond(server, channel, ResponsePayload::LeanStatus(our_status));
+
+    // A peer's `Status` request tells us its head as surely as its answer to
+    // ours does, and it postpones our own refresh to that peer (see
+    // `PeerHeads::due_for_refresh`). Between two nodes whose refresh timers
+    // fire at different points in the slot, one of them only ever receives
+    // requests, so a request that shows a lead has to be able to start the
+    // sync too. Lighthouse does the same: both go through `process_status`.
+    // At most one a slot per peer is acted on: requests are not rate limited
+    // on the wire, and each now reads the store and may start a batch.
+    // Connected first, so a request handled after the disconnect does not
+    // use up the next connection's slot.
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    if server.connected_peers.contains_key(&peer) && server.peer_heads.inbound_due(peer, wall_slot)
+    {
+        on_lean_status_request(server, peer, &request).await;
+    }
 }
 
-async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
-    trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+/// A lean peer's own `Status` request, once answered: recorded, and synced
+/// towards like an answer to a refresh, whose lead it is held to since it
+/// arrives as often as one.
+async fn on_lean_status_request(server: &mut P2PServer, peer: PeerId, status: &Status) {
+    let refresh_lead = Some(peer_heads::thresholds(&server.store).peer_lead);
+    on_lean_status(server, peer, status, refresh_lead).await;
+}
 
-    let our_head_slot = server.store.head_slot();
-    if status.head.slot <= our_head_slot {
+/// Record a lean peer's `Status`, whether its request or its answer to ours,
+/// and start or extend a range sync when it leaves this node behind (see
+/// [`status_sync_target`] for `refresh_lead`).
+async fn on_lean_status(
+    server: &mut P2PServer,
+    peer: PeerId,
+    status: &Status,
+    refresh_lead: Option<u64>,
+) {
+    // A head this node already imported leaves nothing to fetch from this
+    // peer, and one past the clock or from a peer already gone is not synced
+    // towards at all.
+    if peer_heads::observe(server, peer, status.head.slot, status.head.root) != Report::Counted {
         return;
     }
-    let gap = status.head.slot - our_head_slot;
+    let our_head_slot = server.store.head_slot();
+    if sync_towards_peer(server, peer, status.head.slot, our_head_slot, refresh_lead) {
+        request_next_range_batch(server).await;
+        trace!(%peer, "Long-range sync: using BlocksByRange");
+    }
+}
+
+/// Start a range sync towards `peer`'s advertised head, or extend the running
+/// one, when [`status_sync_target`] says its `Status` leaves this node behind.
+/// Returns whether it did, for the caller to send the next batch over its own
+/// chain's protocol. A batch already in flight stays the only one: the next
+/// goes out when it completes.
+fn sync_towards_peer(
+    server: &mut P2PServer,
+    peer: PeerId,
+    peer_head_slot: u64,
+    head_slot: u64,
+    refresh_lead: Option<u64>,
+) -> bool {
+    // A peer that just failed a range request is not synced towards again
+    // for a refresh interval (see `PeerHeads::range_cooling_down`), nor one
+    // whose blocks left the head where it was (see `PeerHeads::suspects`).
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    let cooldown = peer_heads::thresholds(&server.store).status_refresh_slots;
+    if server
+        .peer_heads
+        .range_cooling_down(&peer, wall_slot, cooldown)
+        || server.peer_heads.is_suspect(&peer)
+    {
+        return false;
+    }
+    let fetched_through = server.range_fetched_through;
+    let Some(target_range) =
+        status_sync_target(fetched_through, head_slot, peer_head_slot, refresh_lead)
+    else {
+        return false;
+    };
     debug!(
         %peer,
-        peer_head_slot = status.head.slot,
-        local_head_slot = our_head_slot,
-        slot_gap = gap,
-        "Peer status head is ahead of local head"
+        peer_head_slot,
+        head_slot,
+        fetched_through,
+        start_slot = target_range.start,
+        end_exclusive = target_range.end,
+        "Peer status head is ahead of what has been fetched"
     );
-
-    let start_slot = our_head_slot.saturating_add(1);
-    let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
-
+    let end_exclusive = target_range.end;
     match &mut server.range_sync_state {
-        Some(state) => state.merge_peer(peer, status.head.slot, end_exclusive),
+        Some(state) => state.merge_peer(peer, peer_head_slot, end_exclusive),
         None => {
-            server.range_sync_state = Some(RangeSyncState::new(
-                start_slot..end_exclusive,
-                peer,
-                status.head.slot,
-            ));
+            server.range_sync_state = Some(RangeSyncState::new(target_range, peer, peer_head_slot));
         }
     }
+    true
+}
 
-    request_next_range_batch(server).await;
-    trace!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
+/// Record the peer's answer to our `Status`, and start or extend range sync
+/// when [`status_sync_target`] says it leaves this node behind.
+///
+/// Measured from the higher of the store's head and
+/// [`P2PServer::range_fetched_through`], as beacon's is: a range session that
+/// handed its blocks to the chain actor and completed leaves them queued
+/// behind the actor's mailbox, and an answer measured from the head alone
+/// would fetch them all again.
+async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
+    trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+    // Checked first, so an answer delivered after the disconnect does not
+    // count against the next connection's handshake.
+    let connected = server.connected_peers.contains_key(&peer);
+    if connected {
+        server.peer_heads.end_status_request(&peer);
+    }
+    let refresh = connected && server.peer_heads.answer_is_refresh(peer);
+    let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
+    on_lean_status(server, peer, &status, refresh_lead).await;
 }
 
 async fn handle_lean_blocks_by_root_request(
@@ -844,41 +959,89 @@ async fn handle_lean_blocks_by_range_response(
 ) {
     trace!(%peer, count = blocks.len(), "Received BlocksByRange response");
 
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .filter(|block| {
+            let slot = block.message.slot;
+            let in_range = (start_slot..=end_slot).contains(&slot);
+            if !in_range {
+                debug!(%peer, %slot, start_slot, end_slot, "Received block outside requested range");
+            }
+            in_range
+        })
+        .collect();
+    // No block in the range asked for is as good as no answer, below the head
+    // the peer claims too, although an honest chain can skip every slot of
+    // such a span: the two cannot be told apart from here, and a peer excused
+    // for it would take a batch on every `Status` it sends, the session's
+    // cursor never moving past the span (see the stall window in
+    // `docs/spec_deviations.md`).
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
-        debug!(%peer, start_slot, end_slot, "Received empty BlocksByRange response");
+        fail_range_request(server, &peer, end_slot);
+        debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
 
     let Some(ref blockchain) = server.blockchain else {
-        server.range_sync_state = None;
+        server.end_range_session();
         debug!(%peer, "No blockchain handler available");
         return;
     };
 
+    // The lowest block's parent links this batch to the one below it; see
+    // `HeadWatch::note_delivery`.
+    let first = blocks
+        .iter()
+        .map(|block| &block.message)
+        .min_by_key(|block| block.slot)
+        .map(|block| BatchBlock {
+            slot: block.slot,
+            root: block.parent_root,
+        });
+    let mut handed_over_through: Option<BatchBlock> = None;
     for block in blocks {
         let slot = block.message.slot;
-
-        if slot < start_slot || slot > end_slot {
-            debug!(%peer, %slot, start_slot, end_slot, "Received block outside requested range");
-            continue;
-        }
-
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(
+        let handed_over = blockchain.new_block(
             SignedBeaconBlock::Lean(block),
             BlockSource::Sync,
             BlockArrival::now(),
             BlockAnnouncement::Silent,
-        ) {
-            error!(
+        );
+        match handed_over {
+            // Highest slot handed to the actor, not the highest imported; see
+            // `range_sync_target`.
+            Ok(_) => {
+                server.range_fetched_through = server.range_fetched_through.max(slot);
+                if handed_over_through.is_none_or(|last| last.slot < slot) {
+                    handed_over_through = Some(BatchBlock {
+                        slot,
+                        root: block_root,
+                    });
+                }
+            }
+            Err(err) => error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
                 "Failed to forward range-fetched block to blockchain"
-            );
+            ),
         }
     }
 
+    // Whether what was handed over imports is judged by the head: reaching it
+    // ends the peer's run of failures, and a whole window without reaching it
+    // makes the peer a suspect (see `expire_range_watermark`).
+    let (Some(first), Some(last)) = (first, handed_over_through) else {
+        // Nothing reached the chain actor, whose mailbox is gone: the session
+        // makes no progress, and the peer is not to blame.
+        server.end_range_session();
+        return;
+    };
+    // Judged by the end it was asked for, unless the next batch shows the
+    // slots after its last block empty (see `HeadWatch::note_delivery`).
+    server
+        .head_watch
+        .note_delivery(peer, end_slot, first, Some(last));
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -1421,7 +1584,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
             count,
             "Failed to send BlocksByRange request"
         );
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, batch.end.saturating_sub(1));
         return false;
     };
 
@@ -1535,7 +1698,7 @@ pub(super) async fn request_next_beacon_range_batch(
             planned,
             "Failed to send BeaconBlocksByRange request"
         );
-        fail_range_request(server, &peer);
+        fail_range_request(server, &peer, batch.end.saturating_sub(1));
         return false;
     }
 
@@ -1639,7 +1802,47 @@ fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u
         .collect()
 }
 
-fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
+/// Act on a failed untracked request to `peer` over `protocol`, where
+/// `unsupported` says the peer refused the protocol outright. Only a `Status`
+/// request is acted on. Returns whether to retry the handshake on
+/// `status/2`, which leaves it out; any other failure of a `Status` request
+/// ends it.
+fn on_status_failure(
+    server: &mut P2PServer,
+    peer: PeerId,
+    protocol: ReqRespProtocol,
+    unsupported: bool,
+) -> bool {
+    let refused = unsupported && server.connected_peers.contains_key(&peer);
+    if protocol == ReqRespProtocol::BeaconStatusV2 && refused {
+        // A peer asked in `status/2` either answered in it before (and has
+        // dropped it) or refused `status/1` just now: on a peer last noted as
+        // `status/1`, both are refused, and refreshing it is pointless.
+        if server.peer_heads.status_version(&peer) == StatusVersion::V1 {
+            server.peer_heads.mute(peer);
+        } else {
+            server
+                .peer_heads
+                .note_status_version(peer, StatusVersion::V1);
+        }
+    }
+    if protocol == ReqRespProtocol::BeaconStatusV1 && refused {
+        return true;
+    }
+    if is_status_protocol(protocol) {
+        // A handshake that failed is over: the refresh takes its place. A
+        // failed refresh changes nothing here.
+        server.peer_heads.end_status_request(&peer);
+    }
+    false
+}
+
+/// Count a failed range request, whose last slot is `end_slot`, against
+/// `peer` (a cooldown, and suspicion once they add up; see
+/// [`peer_heads::note_range_failure`]), and take it out of the range session,
+/// which ends with no peer left.
+fn fail_range_request(server: &mut P2PServer, peer: &PeerId, end_slot: u64) {
+    peer_heads::note_range_failure(server, peer, end_slot);
     let should_clear = if let Some(state) = &mut server.range_sync_state {
         state.fail_peer(peer);
         state.peer_set.is_empty()
@@ -1647,8 +1850,11 @@ fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
         false
     };
 
+    // With no peer left the session ends the one way every other path ends
+    // it, its requests with it. None should be out, one batch being in
+    // flight at a time, but one left would complete a later session's batch.
     if should_clear {
-        server.range_sync_state = None;
+        server.end_range_session();
     }
 }
 
@@ -2182,19 +2388,17 @@ fn beacon_wire_or_refuse(
 ///
 /// Does not use [`beacon_wire_or_refuse`]: that helper takes `&mut P2PServer`
 /// and returns a `&BeaconWire` tied to its whole lifetime, which is fine for
-/// [`handle_ping`] and [`handle_metadata_request`] below, neither of which
-/// needs another field of `server` alive at the same time. This handler does:
-/// `build_status` now reads `&server.store` alongside `wire`, and a `wire`
-/// borrowed through that helper's `&mut P2PServer` parameter would hold the
-/// whole server borrowed for as long as it lives, not just `server.wire`,
-/// which would make `&server.store` a conflicting borrow. Reading
-/// `server.wire.beacon()` directly, as below, borrows only that one field, so
-/// `&server.store` can be taken alongside it.
+/// [`handle_ping`] and [`handle_metadata_request`] below, which need nothing
+/// else of `server` while it lives. This handler reads the peer's digest
+/// against `wire` and then needs `server` again (the cached `Status`, the
+/// peer's records), so it reads `server.wire.beacon()` directly: a borrow of
+/// that one field, which ends where `wire` is last used.
 async fn handle_status_request(
     server: &mut P2PServer,
     peer: PeerId,
     peer_status: BeaconStatus,
     channel: ResponseChannel<Response>,
+    ctx: &Context<P2PServer>,
 ) {
     if server.wire.beacon().is_none() {
         warn!(%peer, "Beacon request arrived on a lean node; refusing");
@@ -2209,29 +2413,96 @@ async fn handle_status_request(
     // Re-taken as a shared borrow of just `server.wire`, now that the
     // `refuse` above (which needs `&mut server`) is behind us.
     let wire = server.wire.beacon().expect("checked above");
+    let peer_digest = peer_status.fork_digest();
+    let our_digest = wire.fork_digest;
+    let held = wire.holds_digest(peer_digest);
+    // Recorded only from a digest this node syncs from, as an answer is
+    // below: a peer still on a superseded digest is not on the chain being
+    // followed.
+    let syncable = held && transition::is_syncable_digest(wire, peer_digest, unix_now_ms());
 
-    if !wire.holds_digest(peer_status.fork_digest()) {
+    // Answered first, so recording the peer's head (store lookups, possibly a
+    // range batch) never holds up the answer. Cached (see
+    // `P2PServer::beacon_status_v2`), however many requests arrive.
+    let Some(our_status_v2) = server.beacon_status_v2() else {
+        return;
+    };
+    let our_status =
+        beacon_handler::status_in_version(&our_status_v2, StatusVersion::of(&peer_status));
+    respond(server, channel, ResponsePayload::Status(our_status));
+
+    // Recorded only for a peer still connected: `forget` has already run for
+    // one that is not.
+    // At most one request a slot per peer is acted on, as on lean.
+    let wall_slot = crate::wall_clock_slot(&server.store);
+    let connected = server.connected_peers.contains_key(&peer);
+    // A peer on a digest this node does not sync from has no claim on the
+    // chain being followed, however soon after its last request it says so.
+    // Dropping one is cheap; it is the rest that is paced.
+    if connected && !syncable {
+        peer_heads::drop_claim(server, &peer);
+    }
+    let act_on = connected && server.peer_heads.inbound_due(peer, wall_slot);
+    if act_on {
+        server
+            .peer_heads
+            .note_status_version(peer, StatusVersion::of(&peer_status));
+    }
+    let mut counted = false;
+    if !act_on {
+        // Nothing to record.
+    } else if !held {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
-        // becomes visible.
-        warn!(
-            %peer,
-            peer_digest = %hex::encode(peer_status.fork_digest()),
-            our_digest = %hex::encode(wire.fork_digest),
-            "Peer is on another fork digest"
-        );
-        metrics::inc_beacon_status_digest_mismatch();
+        // becomes visible, so it is counted when the peer moves onto it, not
+        // again on every `Status` the peer sends from there.
+        if server.peer_heads.note_digest(peer, Some(peer_digest)) {
+            warn!(
+                %peer,
+                peer_digest = %hex::encode(peer_digest),
+                our_digest = %hex::encode(our_digest),
+                "Peer is on another fork digest"
+            );
+            metrics::inc_beacon_status_digest_mismatch();
+        } else {
+            debug!(%peer, peer_digest = %hex::encode(peer_digest), "Peer still on another fork digest");
+        }
     } else {
+        server.peer_heads.note_digest(peer, None);
         trace!(
             %peer,
             peer_head_slot = peer_status.head_slot(),
             peer_finalized_epoch = peer_status.finalized_epoch(),
             "Beacon status received"
         );
+        if syncable {
+            let report = peer_heads::observe(
+                server,
+                peer,
+                peer_status.head_slot(),
+                peer_status.head_root(),
+            );
+            counted = report == Report::Counted;
+        }
     }
-    let our_status =
-        beacon_handler::build_status(&server.store, wire, StatusVersion::of(&peer_status));
-    respond(server, channel, ResponsePayload::Status(our_status));
+
+    // As on lean (see `handle_lean_status_request`), a request that shows a
+    // lead starts the sync the way a refresh answer does.
+    if !counted {
+        return;
+    }
+    let head_slot = server.head_slot();
+    let refresh_lead = Some(peer_heads::thresholds(&server.store).peer_lead);
+    if sync_towards_peer(
+        server,
+        peer,
+        peer_status.head_slot(),
+        head_slot,
+        refresh_lead,
+    ) {
+        request_next_beacon_range_batch(server, ctx).await;
+        trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
+    }
 }
 
 /// Answer `ping/1` with our metadata sequence number.
@@ -2287,7 +2558,7 @@ fn handle_goodbye(peer: PeerId, goodbye: Goodbye) {
 /// How far this node has the chain is the higher of two floors, because each
 /// one misses blocks the other sees:
 ///
-/// - `fetched_through` is `server.beacon_fetched_through`, the highest slot a
+/// - `fetched_through` is `server.range_fetched_through`, the highest slot a
 ///   range answer has handed to the chain actor. Delivery is a message and
 ///   import is work, so the store's head lags a delivered batch by the whole
 ///   actor mailbox. Driven off the store's head alone, the live follower kept
@@ -2301,9 +2572,9 @@ fn handle_goodbye(peer: PeerId, goodbye: Goodbye) {
 ///   which held a gossip block 4.2 s in the chain actor's queue. The head is
 ///   a safe floor, since a head block's whole ancestry is already imported.
 ///
-/// Bounded by [`MAX_SYNC_RANGE`], the same ceiling
-/// `handle_lean_status_response` bounds its own request span by.
-fn beacon_sync_target(
+/// Bounded by [`MAX_SYNC_RANGE`], the same ceiling both chains' range syncs
+/// are bounded by.
+fn range_sync_target(
     fetched_through: u64,
     head_slot: u64,
     peer_head_slot: u64,
@@ -2318,14 +2589,38 @@ fn beacon_sync_target(
     Some(start_slot..end_exclusive)
 }
 
-/// Record the peer's answer to our handshake, and start or extend the
-/// anchor-to-head range sync when [`beacon_sync_target`] says it leaves this
+/// The range a peer's `Status` should start or extend a range sync over, on
+/// either chain: [`range_sync_target`], unless the `Status` is an answer to a
+/// *refresh* or the peer's own request (`refresh_lead` is then
+/// `SyncThresholds::peer_lead`) and leads what this node has fetched by no
+/// more than that.
+///
+/// A handshake answer starts a range sync at any lead, as it always has.
+/// Refreshes and requests land every few slots on a node that is keeping up
+/// with gossip, where a peer a slot ahead is ordinary and a one-block range
+/// request would only race gossip; past the lead the sync gate reads as
+/// behind, and one of the two is what notices, since nothing else would
+/// start the sync.
+fn status_sync_target(
+    fetched_through: u64,
+    head_slot: u64,
+    peer_head_slot: u64,
+    refresh_lead: Option<u64>,
+) -> Option<std::ops::Range<u64>> {
+    let target = range_sync_target(fetched_through, head_slot, peer_head_slot)?;
+    match refresh_lead {
+        Some(lead) if target.end - target.start <= lead => None,
+        _ => Some(target),
+    }
+}
+
+/// Record the peer's answer to our `Status`, and start or extend the
+/// anchor-to-head range sync when [`status_sync_target`] says it leaves this
 /// node behind.
 ///
 /// The beacon counterpart of `handle_lean_status_response`: same merge-or-
 /// create on `range_sync_state` and the same kick of the first batch,
-/// differing only in what "behind" is measured against (see
-/// [`beacon_sync_target`]) and in which function sends the batch
+/// differing only in which function sends the batch
 /// ([`request_next_beacon_range_batch`], so the beacon protocol id and
 /// `MAX_REQUEST_BLOCKS_DENEB` apply).
 async fn handle_status_response(
@@ -2334,68 +2629,82 @@ async fn handle_status_response(
     status: BeaconStatus,
     ctx: &Context<P2PServer>,
 ) {
+    // An answer delivered after the disconnect: `forget` has already run, and
+    // nothing recorded now would ever be cleared.
+    if !server.connected_peers.contains_key(&peer) {
+        return;
+    }
+    // Any answer ends the handshake, from whatever digest: the peer may be
+    // refreshed from now on.
+    server.peer_heads.end_status_request(&peer);
     let Some(wire) = server.wire.beacon() else {
         return;
     };
-    if !wire.holds_digest(status.fork_digest()) {
-        warn!(
-            %peer,
-            peer_digest = %hex::encode(status.fork_digest()),
-            our_digest = %hex::encode(wire.fork_digest),
-            "Handshake answered from another fork digest"
-        );
-        metrics::inc_beacon_status_digest_mismatch();
+    let peer_digest = status.fork_digest();
+    let our_digest = wire.fork_digest;
+    let held = wire.holds_digest(peer_digest);
+    let syncable = held && transition::is_syncable_digest(wire, peer_digest, unix_now_ms());
+    server
+        .peer_heads
+        .note_status_version(peer, StatusVersion::of(&status));
+    if !held {
+        // Counted when the peer moves onto the digest, not again on every
+        // refresh of a connection that stays there; see the request side.
+        if server.peer_heads.note_digest(peer, Some(peer_digest)) {
+            warn!(
+                %peer,
+                peer_digest = %hex::encode(peer_digest),
+                our_digest = %hex::encode(our_digest),
+                "Status answered from another fork digest"
+            );
+            metrics::inc_beacon_status_digest_mismatch();
+        } else {
+            debug!(%peer, peer_digest = %hex::encode(peer_digest), "Peer still on another fork digest");
+        }
+        peer_heads::drop_claim(server, &peer);
         return;
     }
+    server.peer_heads.note_digest(peer, None);
     // Answered at any held digest, but only synced from on the current one (or
     // the next, within clock skew): after a boundary, a peer still on the old
     // digest has not upgraded, and its chain is not the one being followed.
-    if !transition::is_syncable_digest(wire, status.fork_digest(), unix_now_ms()) {
+    if !syncable {
         debug!(
             %peer,
-            peer_digest = %hex::encode(status.fork_digest()),
-            our_digest = %hex::encode(wire.fork_digest),
+            peer_digest = %hex::encode(peer_digest),
+            our_digest = %hex::encode(our_digest),
             "Not syncing from a peer on a superseded fork digest"
         );
+        peer_heads::drop_claim(server, &peer);
         return;
     }
+    // The handshake is the first answer this node can sync from, whatever it
+    // shows: one from another digest around a fork boundary must not use up
+    // its any-lead start, but one with a head this node holds (or past the
+    // clock) does, since the handshake found nothing to fetch and later
+    // leads are the refresh's to judge.
+    let refresh = server.peer_heads.answer_is_refresh(peer);
     let peer_head_slot = status.head_slot();
     trace!(
         %peer,
         peer_head_slot,
         peer_finalized_epoch = status.finalized_epoch(),
-        "Beacon handshake complete"
+        refresh,
+        "Beacon Status answered"
     );
-
-    // A whole-block decode per handshake, the same one `build_status` already
-    // pays to send ours.
-    let head_slot = server.store.beacon_head().map_or(0, |(slot, _)| slot);
-    let Some(target_range) =
-        beacon_sync_target(server.beacon_fetched_through, head_slot, peer_head_slot)
-    else {
+    // A head this node already imported leaves nothing to fetch from this
+    // peer (on a node keeping up, that is nearly every refresh answer), and
+    // one past the clock or from a peer already gone is not synced towards.
+    if peer_heads::observe(server, peer, peer_head_slot, status.head_root()) != Report::Counted {
         return;
-    };
-
-    debug!(
-        %peer,
-        peer_head_slot,
-        fetched_through = server.beacon_fetched_through,
-        head_slot,
-        start_slot = target_range.start,
-        end_exclusive = target_range.end,
-        "Beacon peer status head is ahead of what has been fetched"
-    );
-
-    let end_exclusive = target_range.end;
-    match &mut server.range_sync_state {
-        Some(state) => state.merge_peer(peer, peer_head_slot, end_exclusive),
-        None => {
-            server.range_sync_state = Some(RangeSyncState::new(target_range, peer, peer_head_slot));
-        }
     }
 
-    request_next_beacon_range_batch(server, ctx).await;
-    trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
+    let head_slot = server.head_slot();
+    let refresh_lead = refresh.then(|| peer_heads::thresholds(&server.store).peer_lead);
+    if sync_towards_peer(server, peer, peer_head_slot, head_slot, refresh_lead) {
+        request_next_beacon_range_batch(server, ctx).await;
+        trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
+    }
 }
 
 /// Record a pong. Nothing is driven off one yet.
@@ -3113,7 +3422,8 @@ fn take_column_answer(
 /// answer has no counterpart here, because it needs none:
 /// [`handle_blocks_by_root_response`] answers for both wires. A block outside
 /// the range is dropped on its own rather than failing the batch, since the
-/// rest of the answer may still be what was requested. The chunk-level checks
+/// rest of the answer may still be what was requested; an answer with no
+/// block in the range fails it, like an empty one. The chunk-level checks
 /// that *do* fail the whole answer, on the fork digest and the SSZ shape,
 /// already ran in the codec.
 async fn handle_beacon_blocks_by_range_response(
@@ -3126,9 +3436,22 @@ async fn handle_beacon_blocks_by_range_response(
 ) {
     trace!(%peer, count = blocks.len(), "Received beacon blocks response");
 
+    let received = blocks.len();
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .filter(|block| {
+            let slot = block.slot();
+            let in_range = (start_slot..=end_slot).contains(&slot);
+            if !in_range {
+                debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
+            }
+            in_range
+        })
+        .collect();
+    // As on lean: no block in the range asked for is as good as no answer.
     if blocks.is_empty() {
-        fail_range_request(server, &peer);
-        debug!(%peer, start_slot, end_slot, "Received empty BeaconBlocksByRange response");
+        fail_range_request(server, &peer, end_slot);
+        debug!(%peer, start_slot, end_slot, "Received no block in the requested range");
         return;
     }
 
@@ -3136,25 +3459,35 @@ async fn handle_beacon_blocks_by_range_response(
         // No actor to forward into. A range session makes no progress either
         // way, so it is dropped rather than spun uselessly on further
         // batches, matching handle_lean_blocks_by_range_response.
-        server.range_sync_state = None;
+        server.end_range_session();
         debug!(%peer, "No blockchain handler available");
         return;
     };
 
-    let received = blocks.len();
-    let mut accepted = 0usize;
+    let in_range = blocks.len();
     let mut highest_forwarded_slot: Option<u64> = None;
+    // As on lean: the lowest block's parent links this batch to the one
+    // below it, and the highest block's root, when it stops short of the end
+    // asked for, to the one above. That root is a whole-block merkleization,
+    // so it is paid for a short batch alone.
+    let first = blocks
+        .iter()
+        .min_by_key(|block| block.slot())
+        .map(|block| BatchBlock {
+            slot: block.slot(),
+            root: block.parent_root(),
+        });
+    let short_tail = blocks
+        .iter()
+        .max_by_key(|block| block.slot())
+        .filter(|block| block.slot() < end_slot)
+        .map(|block| BatchBlock {
+            slot: block.slot(),
+            root: block.message_hash_tree_root(),
+        });
 
     for block in blocks {
         let slot = block.slot();
-        if slot < start_slot || slot > end_slot {
-            debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
-            continue;
-        }
-
-        highest_forwarded_slot =
-            Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
-        accepted += 1;
 
         // No block root in the failure log: reaching it means the actor
         // mailbox send failed, which `%peer` and `%slot` already identify,
@@ -3162,7 +3495,7 @@ async fn handle_beacon_blocks_by_range_response(
         // (execution payload included) that would then be paid for every
         // block on the sync path. [`handle_blocks_by_root_response`] computes
         // one because it has an answer to check; a range batch does not.
-        let _ = blockchain
+        let handed_over = blockchain
             .new_block(
                 block,
                 BlockSource::Sync,
@@ -3172,9 +3505,17 @@ async fn handle_beacon_blocks_by_range_response(
             .inspect_err(
                 |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
             );
+        if handed_over.is_ok() {
+            highest_forwarded_slot = highest_forwarded_slot.max(Some(slot));
+        }
     }
 
-    debug!(%peer, received, accepted, "Beacon blocks received");
+    debug!(%peer, received, in_range, "Beacon blocks received");
+    let (Some(first), Some(highest)) = (first, highest_forwarded_slot) else {
+        // As on lean: nothing reached the chain actor, whose mailbox is gone.
+        server.end_range_session();
+        return;
+    };
 
     // The batch's blocks are all in the actor's mailbox now; ask for the
     // envelopes of the same span only after that. On a gloas span the next
@@ -3189,11 +3530,17 @@ async fn handle_beacon_blocks_by_range_response(
     .await;
 
     // Highest slot *handed to* the actor, not the highest imported: see
-    // [`beacon_sync_target`] for why range sync reads this beside the store's
+    // [`range_sync_target`] for why range sync reads this beside the store's
     // head rather than the head alone.
-    if let Some(highest) = highest_forwarded_slot {
-        server.beacon_fetched_through = server.beacon_fetched_through.max(highest);
-    }
+    // As on lean: what was handed over is judged by the head.
+    server.range_fetched_through = server.range_fetched_through.max(highest);
+    // As on lean: judged by the end it was asked for, unless the next batch
+    // shows the slots after its last block empty. A last block that never
+    // reached the actor links nothing.
+    let short_tail = short_tail.filter(|last| last.slot == highest);
+    server
+        .head_watch
+        .note_delivery(peer, end_slot, first, short_tail);
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
         if range_session_exhausted(state) {
@@ -3220,7 +3567,7 @@ async fn retire_unanswered(
 ) {
     match kind {
         PendingRequestKind::Root(root) => handle_fetch_failure(server, root, peer, ctx).await,
-        PendingRequestKind::Range { .. } => fail_range_request(server, &peer),
+        PendingRequestKind::Range { end_slot, .. } => fail_range_request(server, &peer, end_slot),
         PendingRequestKind::Columns {
             block_root,
             columns,
@@ -3238,7 +3585,9 @@ async fn retire_unanswered(
         PendingRequestKind::EnvelopeRoot(block_root) => {
             handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
         }
-        PendingRequestKind::EnvelopeRange { .. } => release_envelope_gate(server, ctx).await,
+        PendingRequestKind::EnvelopeRange { session, .. } => {
+            release_envelope_gate(server, ctx, session).await;
+        }
     }
 }
 
@@ -3246,6 +3595,7 @@ async fn retire_unanswered(
 pub(crate) mod tests {
     use super::*;
     use crate::ConnectionDirection;
+    use ethlambda_network_api::sync::SyncThresholds;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
@@ -3333,7 +3683,10 @@ pub(crate) mod tests {
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
-            beacon_fetched_through: 0,
+            range_fetched_through: 0,
+            beacon_status: None,
+            head_watch: crate::HeadWatch::default(),
+            peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
             discovery: Some(crate::discovery::dial::DiscoveryState::new(
@@ -4422,37 +4775,979 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn beacon_sync_target_keys_off_fetched_through_while_the_head_lags() {
+    fn range_sync_target_keys_off_fetched_through_while_the_head_lags() {
         // A batch already handed to the chain actor but not yet imported
         // leaves the store's own head behind `fetched_through`; the sync
         // target must still be computed from `fetched_through`. See
-        // `beacon_sync_target`'s own doc comment for why the store's head
+        // `range_sync_target`'s own doc comment for why the store's head
         // alone is the wrong signal to drive this off: it is what pulled
         // 11,213 blocks off the wire to import 100 on the live follower.
-        assert_eq!(beacon_sync_target(100, 40, 150), Some(101..151));
+        assert_eq!(range_sync_target(100, 40, 150), Some(101..151));
         // A peer at or behind what has already been fetched has nothing to
         // offer, regardless of what the store's own (possibly much lower)
         // head happens to be.
-        assert_eq!(beacon_sync_target(150, 40, 150), None);
-        assert_eq!(beacon_sync_target(150, 40, 100), None);
+        assert_eq!(range_sync_target(150, 40, 150), None);
+        assert_eq!(range_sync_target(150, 40, 100), None);
     }
 
     #[test]
-    fn beacon_sync_target_starts_after_a_head_gossip_moved_past_fetched_through() {
+    fn range_sync_target_starts_after_a_head_gossip_moved_past_fetched_through() {
         // A caught-up follower imports from gossip, which leaves
         // `fetched_through` at its last range batch. A peer one block ahead
         // is owed that one block, not every block since that batch.
-        assert_eq!(beacon_sync_target(100, 149, 150), Some(150..151));
+        assert_eq!(range_sync_target(100, 149, 150), Some(150..151));
         // A peer at or behind the head has nothing to offer, however far
         // behind `fetched_through` is.
-        assert_eq!(beacon_sync_target(100, 150, 150), None);
-        assert_eq!(beacon_sync_target(100, 160, 150), None);
+        assert_eq!(range_sync_target(100, 150, 150), None);
+        assert_eq!(range_sync_target(100, 160, 150), None);
     }
 
     #[test]
-    fn beacon_sync_target_is_bounded_by_max_sync_range() {
-        let target = beacon_sync_target(0, 0, u64::MAX).expect("peer is far ahead");
+    fn range_sync_target_is_bounded_by_max_sync_range() {
+        let target = range_sync_target(0, 0, u64::MAX).expect("peer is far ahead");
         assert_eq!(target, 1..(1 + MAX_SYNC_RANGE));
+    }
+
+    #[test]
+    fn a_handshake_answer_starts_a_range_sync_at_any_lead() {
+        assert_eq!(status_sync_target(0, 10, 11, None), Some(11..12));
+    }
+
+    #[test]
+    fn a_refresh_answer_starts_one_only_past_the_peer_lead() {
+        let lead = SyncThresholds::BEACON.peer_lead;
+        assert_eq!(status_sync_target(0, 100, 100 + lead, Some(lead)), None);
+        assert_eq!(
+            status_sync_target(0, 100, 101 + lead, Some(lead)),
+            Some(101..(102 + lead))
+        );
+    }
+
+    #[test]
+    fn a_refresh_answer_measures_its_lead_past_what_was_fetched() {
+        // Finding: a lean catch-up handed slots up to 2000 to the chain actor,
+        // which has imported only up to 1200. A peer at 2050 is 50 past what
+        // was fetched, so the range starts at 2001, not back at 1201.
+        let lead = SyncThresholds::LEAN.peer_lead;
+        assert_eq!(
+            status_sync_target(2000, 1200, 2050, Some(lead)),
+            Some(2001..2051)
+        );
+        assert_eq!(
+            status_sync_target(2000, 1200, 2000 + lead, Some(lead)),
+            None
+        );
+    }
+
+    fn lean_status_at(root: H256, slot: u64) -> Status {
+        Status {
+            finalized: Checkpoint::default(),
+            head: Checkpoint { root, slot },
+        }
+    }
+
+    /// A peer this server counts as connected, which is what lets its
+    /// `Status` count.
+    fn connected_peer(server: &mut P2PServer) -> PeerId {
+        let peer = PeerId::random();
+        server
+            .connected_peers
+            .insert(peer, ConnectionDirection::Inbound);
+        peer
+    }
+
+    #[tokio::test]
+    async fn a_lean_refresh_answer_starts_range_sync_only_past_the_lead() {
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let lead = SyncThresholds::LEAN.peer_lead;
+        let unknown = H256::repeat_byte(0x11);
+        let our_head = server.store.head().expect("head exists");
+        // The handshake's answer, level with us: every later one is to a
+        // refresh.
+        handle_lean_status_response(&mut server, lean_status_at(our_head, 0), peer).await;
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, lead), peer).await;
+        assert!(server.range_sync_state.is_none());
+        // The answer still counts towards the network head the gate reads.
+        assert_eq!(server.store.network_head(), Some(lead));
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, lead + 1), peer).await;
+        let state = server.range_sync_state.as_ref().expect("past the lead");
+        assert_eq!(state.current_range, 1..(lead + 2));
+    }
+
+    #[tokio::test]
+    async fn a_lean_status_answer_skips_blocks_already_handed_to_the_chain() {
+        // Finding: lean had no fetched-through watermark, so every answer
+        // during a catch-up re-requested blocks still queued for import.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        server.range_fetched_through = 2000;
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, 2000), peer).await;
+        assert!(server.range_sync_state.is_none());
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, 2050), peer).await;
+        let state = server
+            .range_sync_state
+            .as_ref()
+            .expect("past what was fetched");
+        assert_eq!(state.current_range.start, 2001);
+    }
+
+    #[tokio::test]
+    async fn a_lean_answer_naming_a_block_this_node_holds_is_no_lead() {
+        // Finding: a peer whose head we already imported (here our own head,
+        // under any slot it likes) is not ahead of us, so it neither moves the
+        // network head nor starts a range sync.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let our_head = server.store.head().expect("head exists");
+
+        handle_lean_status_response(&mut server, lean_status_at(our_head, 50), peer).await;
+        assert!(server.range_sync_state.is_none());
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn a_lean_status_request_past_the_lead_starts_range_sync() {
+        // Finding: a request postpones our own refresh to its sender, so
+        // between two nodes one may only ever receive requests. The request's
+        // head starts the sync, held to a refresh answer's lead (the lead the
+        // request handler passes).
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let lead = SyncThresholds::LEAN.peer_lead;
+        let unknown = H256::repeat_byte(0x11);
+
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, lead)).await;
+        assert!(server.range_sync_state.is_none());
+
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        let state = server.range_sync_state.as_ref().expect("past the lead");
+        assert_eq!(state.current_range, 1..501);
+        assert!(state.in_flight, "the first batch goes out at once");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_failed_a_range_request_is_not_synced_towards_at_once() {
+        // Finding: a peer's requests are not rate limited and the highest head
+        // gets the next batch, so a peer claiming a head it does not serve
+        // rejoined after every failure and took every batch.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+
+        fail_range_request(&mut server, &liar, 10);
+        assert!(server.range_sync_state.is_none());
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
+        assert!(server.range_sync_state.is_none());
+        // Nor does its claim count towards the network head the gate reads.
+        assert_eq!(server.store.network_head(), None);
+
+        // An honest peer is synced from meanwhile.
+        let honest = connected_peer(&mut server);
+        on_lean_status_request(&mut server, honest, &lean_status_at(unknown, 400)).await;
+        let state = server.range_sync_state.as_ref().expect("honest peer");
+        assert!(state.peer_set.contains_key(&honest));
+        assert!(!state.peer_set.contains_key(&liar));
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_block_in_range_is_a_failure() {
+        // Finding: one stray block counted as a successful answer, which
+        // cleared the peer's cooldown without serving anything, so a liar
+        // kept the highest head and took every batch.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let stray = vec![signed_block(500, H256::ZERO)];
+        handle_lean_blocks_by_range_response(&mut server, stray, peer, 10, 20).await;
+        let wall = crate::wall_clock_slot(&server.store);
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        assert!(server.peer_heads.range_cooling_down(&peer, wall, interval));
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_below_the_claimed_head_still_counts() {
+        // Excusing an empty answer below the head a peer claims (where an
+        // honest chain can have skipped every slot) let a liar claiming a
+        // high head take a batch on every `Status` it sent, with nothing held
+        // against it: the session's cursor never moves past an empty span, so
+        // the batch holding its head was never asked for.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        handle_lean_blocks_by_range_response(&mut server, Vec::new(), liar, 10, 20).await;
+        let wall = crate::wall_clock_slot(&server.store);
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        assert!(server.peer_heads.range_cooling_down(&liar, wall, interval));
+        assert!(server.range_sync_state.is_none());
+        // Its next `Status` starts no session towards it.
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 501)).await;
+        assert!(server.range_sync_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_claim_lapsed_is_suspected_through_its_session_head() {
+        // Finding: a peer whose claim expired while its third failing
+        // request was out escaped suspicion, there being no head to suspect
+        // it through.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        fail_range_request(&mut server, &peer, 10);
+        fail_range_request(&mut server, &peer, 10);
+        server.range_sync_state = Some(RangeSyncState::new(1..500, peer, 500));
+        server.peer_heads.expire(u64::MAX, 0);
+        assert_eq!(server.peer_heads.claimed_head(&peer), None);
+        assert!(!server.peer_heads.is_suspect(&peer));
+        fail_range_request(&mut server, &peer, 10);
+        assert!(server.peer_heads.is_suspect(&peer));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_left_the_session_is_suspected_through_its_failed_request() {
+        // Finding: a peer whose claim was dropped (and with it its place in
+        // the range session) while its third failing request was out had no
+        // head left to suspect it through.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let other = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        fail_range_request(&mut server, &peer, 10);
+        fail_range_request(&mut server, &peer, 10);
+        // Back in a session another peer keeps alive, then out of it with its
+        // claim, its third request still out.
+        let mut session = RangeSyncState::new(1..501, other, 500);
+        session.merge_peer(peer, 500, 501);
+        server.range_sync_state = Some(session);
+        peer_heads::drop_claim(&mut server, &peer);
+        let state = server.range_sync_state.as_ref().expect("kept alive");
+        assert!(!state.peer_set.contains_key(&peer));
+        assert!(!server.peer_heads.is_suspect(&peer));
+        fail_range_request(&mut server, &peer, 20);
+        assert!(server.peer_heads.is_suspect(&peer));
+        // Through that request's last slot: cleared once the head passes it.
+        let wall = crate::wall_clock_slot(&server.store);
+        peer_heads::clear_suspects(&mut server, 19, wall);
+        assert!(server.peer_heads.is_suspect(&peer));
+        peer_heads::clear_suspects(&mut server, 20, wall);
+        assert!(!server.peer_heads.is_suspect(&peer));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_lowers_its_claim_is_suspected_through_its_session_head() {
+        // Finding: suspicion ran through the peer's current claim first, which
+        // the peer controls. One that joined the session on a high head, then
+        // sent a `Status` with a head just above ours and a root this node
+        // does not hold, kept its place in the session at the high head (that
+        // `Status` syncs towards nothing, so it is never merged), and its
+        // suspicion, through the lowered claim, cleared at the next tick.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let high = lean_status_at(H256::repeat_byte(0x11), 5_000);
+        on_lean_status_request(&mut server, liar, &high).await;
+        fail_range_request(&mut server, &liar, 64);
+        fail_range_request(&mut server, &liar, 64);
+        // Back in the session on its high head, as once its cooldown runs
+        // out, then a claim lowered to slot 1.
+        server.range_sync_state = Some(RangeSyncState::new(1..5_001, liar, 5_000));
+        let lowered = lean_status_at(H256::repeat_byte(0x22), 1);
+        on_lean_status_request(&mut server, liar, &lowered).await;
+        assert_eq!(server.peer_heads.claimed_head(&liar), Some(1));
+        let state = server.range_sync_state.as_ref().expect("still running");
+        assert_eq!(state.peer_set.get(&liar), Some(&5_000));
+        fail_range_request(&mut server, &liar, 64);
+        assert!(server.peer_heads.is_suspect(&liar));
+        // Through the session's head: a head past the claim and past the
+        // failed request does not clear it, one at the session's head does.
+        let wall = crate::wall_clock_slot(&server.store);
+        peer_heads::clear_suspects(&mut server, 64, wall);
+        assert!(server.peer_heads.is_suspect(&liar));
+        peer_heads::clear_suspects(&mut server, 4_999, wall);
+        assert!(server.peer_heads.is_suspect(&liar));
+        peer_heads::clear_suspects(&mut server, 5_000, wall);
+        assert!(!server.peer_heads.is_suspect(&liar));
+    }
+
+    #[tokio::test]
+    async fn a_claim_found_held_at_a_publish_takes_its_peer_out_of_the_session() {
+        // Finding: a claim whose head was imported after it was counted was
+        // dropped at the next publish, but its peer stayed in the range
+        // session, to be sent a batch on a head it had nothing above.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let block = signed_block(5, server.store.head().expect("a head"));
+        let root = block.message.hash_tree_root();
+        on_lean_status_request(&mut server, peer, &lean_status_at(root, 5)).await;
+        assert!(server.range_sync_state.is_some());
+        server
+            .store
+            .insert_signed_block(root, SignedBeaconBlock::Lean(block))
+            .expect("insert");
+        let head = ForkCheckpoints::head_only(root);
+        server.store.update_checkpoints(head).expect("advance head");
+        peer_heads::publish(&mut server);
+        assert_eq!(server.store.network_head(), None);
+        assert!(server.range_sync_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_peer_leaves_the_range_session() {
+        // A member that had no batch in flight stayed in the session after
+        // its disconnect, to be picked for a batch it could not answer.
+        let mut server = unconnected_server().await;
+        let (gone, other) = (connected_peer(&mut server), connected_peer(&mut server));
+        let mut session = RangeSyncState::new(1..501, other, 500);
+        session.merge_peer(gone, 600, 601);
+        server.range_sync_state = Some(session);
+        server.connected_peers.remove(&gone);
+        peer_heads::forget(&mut server, &gone);
+        let state = server.range_sync_state.as_ref().expect("kept alive");
+        assert!(!state.peer_set.contains_key(&gone));
+        assert!(state.peer_set.contains_key(&other));
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_that_empties_the_session_ends_it_with_its_batch() {
+        // libp2p reports the closed connection before the batch's own
+        // failure, which then finds no request: nothing is left in flight to
+        // answer for a later session.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        server.connected_peers.remove(&peer);
+        peer_heads::forget(&mut server, &peer);
+        assert!(server.range_sync_state.is_none());
+        let batch_in_flight = server
+            .outbound_requests
+            .values()
+            .any(|kind| matches!(kind, PendingRequestKind::Range { .. }));
+        assert!(!batch_in_flight);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_head_this_node_holds_leaves_the_range_session() {
+        // Its session head was merged in on an earlier claim: it has nothing
+        // left to give, and a batch to it would fail on a head it left.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        let ours = server.store.head().expect("a head");
+        on_lean_status_request(&mut server, peer, &lean_status_at(ours, 0)).await;
+        assert!(server.range_sync_state.is_none());
+        let batch_in_flight = server
+            .outbound_requests
+            .values()
+            .any(|kind| matches!(kind, PendingRequestKind::Range { .. }));
+        assert!(!batch_in_flight);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_claim_is_dropped_leaves_the_range_session() {
+        // Finding: a peer whose claim was dropped (a head past the clock, a
+        // digest this node does not sync from) stayed in the range session,
+        // where the next batch could still go to it on the head it merged
+        // in before.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        let batch_in_flight = |server: &P2PServer| {
+            server
+                .outbound_requests
+                .values()
+                .any(|kind| matches!(kind, PendingRequestKind::Range { .. }))
+        };
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        assert!(batch_in_flight(&server));
+        let future = crate::wall_clock_slot(&server.store) + 100;
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, future)).await;
+        assert!(server.range_sync_state.is_none());
+        // Its batch goes with the session: answered after another peer
+        // started one, it would complete that session's batch.
+        assert!(!batch_in_flight(&server));
+
+        on_lean_status_request(&mut server, peer, &lean_status_at(unknown, 500)).await;
+        assert!(server.range_sync_state.is_some());
+        peer_heads::drop_claim(&mut server, &peer);
+        assert!(server.range_sync_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_peer_refusing_both_status_versions_is_no_longer_refreshed() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let peer = connected_peer(&mut server);
+        server.peer_heads.due_for_refresh([peer], 10, 2);
+        server.peer_heads.begin_status_request(peer, 10);
+        // The handshake opens on `status/1`. Refused, it goes on on
+        // `status/2`, still out.
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(on_status_failure(&mut server, peer, v1, true));
+        assert!(server.peer_heads.is_awaiting_answer(&peer));
+        // Refused too: the handshake is over, and the peer is not asked again.
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, peer, v2, true));
+        assert!(!server.peer_heads.is_awaiting_answer(&peer));
+        assert!(
+            server
+                .peer_heads
+                .due_for_refresh([peer], 1_000, 2)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_a_peer_already_gone_records_nothing() {
+        // Handled after the disconnect, a refusal would mute the peer, or note
+        // its version, past `forget` and into its next connection.
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let gone = PeerId::random();
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(!on_status_failure(&mut server, gone, v1, true));
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, gone, v2, true));
+        assert_eq!(server.peer_heads.status_version(&gone), StatusVersion::V1);
+        server.peer_heads.due_for_refresh([gone], 10, 2);
+        assert_eq!(
+            server.peer_heads.due_for_refresh([gone], 1_000, 2),
+            vec![gone]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_drops_status_2_is_asked_in_status_1() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let peer = connected_peer(&mut server);
+        server.peer_heads.due_for_refresh([peer], 10, 2);
+        server
+            .peer_heads
+            .note_status_version(peer, StatusVersion::V2);
+        server.peer_heads.begin_status_request(peer, 10);
+        let v2 = ReqRespProtocol::BeaconStatusV2;
+        assert!(!on_status_failure(&mut server, peer, v2, true));
+        assert_eq!(server.peer_heads.status_version(&peer), StatusVersion::V1);
+        assert_eq!(
+            server.peer_heads.due_for_refresh([peer], 1_000, 2),
+            vec![peer]
+        );
+        // A failure other than a refusal (a timeout) only ends the request.
+        server.peer_heads.begin_status_request(peer, 1_000);
+        let v1 = ReqRespProtocol::BeaconStatusV1;
+        assert!(!on_status_failure(&mut server, peer, v1, false));
+        assert!(!server.peer_heads.is_awaiting_answer(&peer));
+        assert_eq!(server.peer_heads.status_version(&peer), StatusVersion::V1);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_keeps_failing_becomes_a_suspect_for_its_claim() {
+        // Finding: a cooldown runs out, and with the head moving on by gossip
+        // each return of the claim started the stall window over, so a peer
+        // failing every range request kept duties flapping off.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 500)).await;
+        for _ in 0..2 {
+            fail_range_request(&mut server, &liar, 10);
+            assert!(!server.peer_heads.is_suspect(&liar));
+        }
+        fail_range_request(&mut server, &liar, 10);
+        assert!(server.peer_heads.is_suspect(&liar));
+    }
+
+    #[tokio::test]
+    async fn a_head_past_the_clock_starts_no_range_sync() {
+        // Finding: a head past the clock was left out of the network head but
+        // still merged into the range sync, where `next_batch` prefers the
+        // highest head, so the liar got the next batch on every refresh.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let future = crate::wall_clock_slot(&server.store) + 100;
+        let unknown = H256::repeat_byte(0x11);
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, future), peer).await;
+        assert!(server.range_sync_state.is_none());
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn a_status_from_a_peer_no_longer_connected_is_ignored() {
+        // Finding: a `Status` handled after its sender's disconnect left a
+        // head that `forget` had already run for, so nothing removed it.
+        let mut server = unconnected_server().await;
+        let gone = PeerId::random();
+        let unknown = H256::repeat_byte(0x11);
+
+        handle_lean_status_response(&mut server, lean_status_at(unknown, 500), gone).await;
+        assert!(server.range_sync_state.is_none());
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn the_refresh_asks_one_slots_share_of_the_due_peers() {
+        let mut server = unconnected_server().await;
+        let interval = SyncThresholds::LEAN.status_refresh_slots;
+        let wall = crate::wall_clock_slot(&server.store);
+        // Five, so that asking nobody (five still due, three returned) and
+        // asking the share (three awaiting an answer) cannot look alike.
+        let peers: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
+        for &peer in &peers {
+            server
+                .connected_peers
+                .insert(peer, ConnectionDirection::Inbound);
+            // Last heard from an interval ago, so due now.
+            server
+                .peer_heads
+                .record(peer, 0, H256::ZERO, wall.saturating_sub(interval), false);
+        }
+
+        server.refresh_due_peer_statuses_at(wall).await;
+
+        // This slot's share was asked, and awaits its answers.
+        let share = peers.len().div_ceil(interval as usize);
+        let asked = peers
+            .iter()
+            .filter(|peer| server.peer_heads.is_awaiting_answer(peer))
+            .count();
+        assert_eq!(asked, share);
+    }
+
+    /// [`crate::HeadWatch::flat_for`] once a slot through `walls`, as the
+    /// refresh timer calls it, returning the last count.
+    fn flat_through(
+        watch: &mut crate::HeadWatch,
+        head: u64,
+        walls: std::ops::RangeInclusive<u64>,
+        delivering: bool,
+    ) -> u64 {
+        walls
+            .map(|wall| watch.flat_for(head, wall, delivering))
+            .last()
+            .expect("at least one slot")
+    }
+
+    /// [`P2PServer::expire_range_watermark`] once a slot through `walls`, as
+    /// the refresh timer runs it.
+    fn expire_through(server: &mut P2PServer, walls: std::ops::RangeInclusive<u64>) {
+        for wall in walls {
+            server.expire_range_watermark(wall);
+        }
+    }
+
+    #[test]
+    fn a_head_watch_counts_from_the_first_delivery_since_the_head_moved() {
+        let mut watch = crate::HeadWatch::default();
+        assert_eq!(watch.flat_for(5, 10, false), 0);
+        assert_eq!(flat_through(&mut watch, 5, 11..=20, false), 10);
+        // A delivery starts the count afresh, once: later ones do not move it.
+        flat_through(&mut watch, 5, 21..=29, false);
+        assert_eq!(watch.flat_for(5, 30, true), 0);
+        assert_eq!(flat_through(&mut watch, 5, 31..=40, true), 10);
+        assert_eq!(flat_through(&mut watch, 5, 41..=45, false), 15);
+        // A head that keeps moving, however slowly, is never flat for long.
+        for (head, wall) in [(6, 50), (7, 65), (8, 80)] {
+            assert_eq!(watch.flat_for(head, wall, true), 0);
+            assert_eq!(
+                flat_through(&mut watch, head, wall + 1..=wall + 14, true),
+                14
+            );
+        }
+        // Moving back counts as moving.
+        assert_eq!(watch.flat_for(4, 100, false), 0);
+        // The head reaching what a peer handed over takes it off the list:
+        // that, not an answer reaching the chain actor, clears its failures.
+        let served = PeerId::random();
+        watch.note_whole_batch(served, 105);
+        assert!(watch.reached(104).is_empty());
+        assert_eq!(watch.reached(105), vec![served]);
+        // A peer whose blocks the head has not reached is still on the hook
+        // after the head moves: a valid prefix does not clear the rest.
+        let partly_valid = PeerId::random();
+        watch.note_whole_batch(partly_valid, 120);
+        assert_eq!(watch.flat_for(110, 101, false), 0);
+        assert_eq!(watch.note_drop(110, 102), vec![(partly_valid, 120)]);
+        assert_eq!(watch.flat_for(4, 103, false), 0);
+        // A drop hands back who delivered; each drop at a head doubles the
+        // wait, and moving resets it.
+        watch.note_whole_batch(PeerId::random(), 200);
+        assert_eq!(watch.patience(16), 16);
+        assert_eq!(watch.note_drop(4, 110).len(), 1);
+        assert_eq!(watch.patience(16), 32);
+        assert!(watch.note_drop(4, 140).is_empty());
+        assert_eq!(watch.patience(16), 64);
+        assert_eq!(watch.flat_for(5, 150, false), 0);
+        assert_eq!(watch.patience(16), 16);
+        // The wait is capped.
+        for wall in 0..10 {
+            watch.note_drop(5, 200 + wall);
+        }
+        assert_eq!(watch.patience(16), 16 * 16);
+    }
+
+    #[test]
+    fn a_drop_blames_only_the_lowest_batch_the_head_never_reached() {
+        // Finding: every deliverer since the head last moved was made a
+        // suspect, an honest peer serving later batches too, whose blocks
+        // could not connect without the bad batch below them.
+        let mut watch = crate::HeadWatch::default();
+        let (first, later) = (PeerId::random(), PeerId::random());
+        watch.note_whole_batch(first, 164);
+        watch.note_whole_batch(later, 228);
+        watch.note_whole_batch(later, 292);
+        watch.note_whole_batch(first, 356);
+        assert_eq!(watch.note_drop(100, 200), vec![(first, 356)]);
+        // The rest are forgotten, not held for the next drop.
+        assert!(watch.note_drop(100, 300).is_empty());
+    }
+
+    #[test]
+    fn a_long_run_of_batches_keeps_its_lowest_end_for_the_blame() {
+        // Finding: over the cap, a peer's oldest (and lowest) batch end was
+        // forgotten first, so a liar delivering a bad batch and then many
+        // more had a lowest end above an honest peer's and escaped the blame.
+        let mut watch = crate::HeadWatch::default();
+        let (liar, honest) = (PeerId::random(), PeerId::random());
+        watch.note_whole_batch(liar, 1_124);
+        watch.note_whole_batch(honest, 2_148);
+        for batch in 3..=20u64 {
+            watch.note_whole_batch(liar, batch * 1_024 + 100);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, 20 * 1_024 + 100)]);
+    }
+
+    #[test]
+    fn over_the_cap_the_only_lowest_or_highest_end_is_kept_wherever_it_sits() {
+        // Finding: with every end the lowest or the highest, the one at index
+        // 1 was forgotten, which can be the only copy of either.
+        let (low, mid, high) = (300, 400, 500);
+        let over_cap = 17;
+
+        // The only lowest at index 1: forgotten, the drop blamed the honest
+        // peer in between.
+        let mut watch = crate::HeadWatch::default();
+        let (liar, honest) = (PeerId::random(), PeerId::random());
+        watch.note_whole_batch(honest, mid);
+        watch.note_whole_batch(liar, high);
+        watch.note_whole_batch(liar, low);
+        for _ in 2..over_cap {
+            watch.note_whole_batch(liar, high);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, high)]);
+
+        // The only highest at index 1: forgotten, the suspicion ran only
+        // through the lowest.
+        let mut watch = crate::HeadWatch::default();
+        watch.note_whole_batch(liar, low);
+        watch.note_whole_batch(liar, high);
+        for _ in 2..over_cap {
+            watch.note_whole_batch(liar, low);
+        }
+        assert_eq!(watch.note_drop(100, 200), vec![(liar, high)]);
+    }
+
+    #[test]
+    fn a_short_batch_the_next_one_builds_on_is_held_to_its_last_block() {
+        // Finding: a batch whose last slots were missed on the chain was held
+        // to the end it was asked for, which the head never reaches, so its
+        // honest sender took the blame when the batch above never imported.
+        let (honest, liar) = (PeerId::random(), PeerId::random());
+        let last = BatchBlock {
+            slot: 560,
+            root: H256::repeat_byte(0x56),
+        };
+        let deliver_short = |watch: &mut crate::HeadWatch| {
+            let first = BatchBlock {
+                slot: 501,
+                root: H256::repeat_byte(0x50),
+            };
+            watch.note_delivery(honest, 564, first, Some(last));
+        };
+
+        // The batch above names its last block as the parent, past its end:
+        // slots 561 to 564 are empty on that chain.
+        let mut watch = crate::HeadWatch::default();
+        deliver_short(&mut watch);
+        let builds_on = BatchBlock {
+            slot: 565,
+            root: last.root,
+        };
+        watch.note_delivery(liar, 628, builds_on, None);
+        assert_eq!(watch.reached(560), vec![honest]);
+        assert_eq!(watch.note_drop(560, 600), vec![(liar, 628)]);
+
+        // Any other parent, or a first block within its span, leaves it held
+        // to its end: the chain has a block there it did not hand over.
+        let elsewhere = [
+            BatchBlock {
+                slot: 565,
+                root: H256::repeat_byte(0x99),
+            },
+            BatchBlock {
+                slot: 563,
+                root: last.root,
+            },
+        ];
+        for first in elsewhere {
+            let mut watch = crate::HeadWatch::default();
+            deliver_short(&mut watch);
+            watch.note_delivery(liar, 628, first, None);
+            assert!(watch.reached(560).is_empty());
+            assert_eq!(watch.note_drop(560, 600), vec![(honest, 564)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_range_failure_after_the_disconnect_leaves_no_cooldown() {
+        // Finding: libp2p reports a closed connection before the request it
+        // failed, so the failure was noted after `forget` and held back the
+        // peer's next handshake.
+        let mut server = unconnected_server().await;
+        let peer = PeerId::random();
+        fail_range_request(&mut server, &peer, 10);
+        let wall = crate::wall_clock_slot(&server.store);
+        assert!(!server.peer_heads.range_cooling_down(&peer, wall, 2));
+    }
+
+    #[tokio::test]
+    async fn a_watermark_the_head_never_reaches_is_dropped_after_a_stall_window() {
+        // Finding: the watermark only ever rose, so blocks handed over above
+        // the head that never imported were never range-requested again.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        // The count starts at the first tick that sees blocks handed over,
+        // however long the head was flat before, so they get a whole window.
+        server.range_fetched_through = 2000;
+        expire_through(&mut server, 100..=100 + window);
+        assert_eq!(server.range_fetched_through, 2000);
+        server.expire_range_watermark(101 + window);
+        assert_eq!(server.range_fetched_through, head);
+
+        // Handed over again at the same head: a window twice as long.
+        server.range_fetched_through = 2000;
+        let delivered = 102 + window;
+        expire_through(&mut server, delivered..=delivered + 2 * window);
+        assert_eq!(server.range_fetched_through, 2000);
+        server.expire_range_watermark(delivered + 2 * window + 1);
+        assert_eq!(server.range_fetched_through, head);
+    }
+
+    #[tokio::test]
+    async fn a_pause_is_not_time_the_head_sat_flat() {
+        // Finding: the count was a difference of wall-clock slots, so a
+        // process paused for longer than the window (`docker pause`, a host
+        // suspend) found it spent on its first tick after the resume, before
+        // the chain actor had imported anything: the session was purged and
+        // the lowest batch's sender suspected, its blocks being fine.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        let honest = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, honest, 2000));
+        server.range_fetched_through = 64;
+        server.head_watch.note_whole_batch(honest, 64);
+        expire_through(&mut server, 100..=103);
+        // Paused for ten windows: the resume's tick counts a step.
+        let resumed = 103 + 10 * window;
+        server.expire_range_watermark(resumed);
+        assert_eq!(server.range_fetched_through, 64);
+        assert!(server.range_sync_state.is_some());
+        assert!(!server.peer_heads.is_suspect(&honest));
+        // A head that stays flat while watched still runs the window out:
+        // three slots before the pause, two for the resume, the rest after.
+        let last_watched = resumed + window - 5;
+        expire_through(&mut server, resumed + 1..=last_watched);
+        assert_eq!(server.range_fetched_through, 64);
+        server.expire_range_watermark(last_watched + 1);
+        assert_eq!(server.range_fetched_through, head);
+        assert!(server.peer_heads.is_suspect(&honest));
+    }
+
+    #[test]
+    fn a_clock_stepped_back_does_not_stop_the_head_watch() {
+        // Finding: the count was a difference of wall-clock slots, so a clock
+        // that ran ahead and was then stepped back read zero until it passed
+        // the old reading again, and blocks that never imported were not
+        // fetched again for as long as the step.
+        let mut watch = crate::HeadWatch::default();
+        assert_eq!(watch.flat_for(5, 100, true), 0);
+        assert_eq!(flat_through(&mut watch, 5, 101..=103, true), 3);
+        // One tick with the clock a hundred slots ahead, a gap counted as
+        // two slots; then the clock is stepped back to the right time.
+        assert_eq!(watch.flat_for(5, 203, true), 5);
+        assert_eq!(watch.flat_for(5, 104, true), 5);
+        assert_eq!(flat_through(&mut watch, 5, 105..=110, true), 11);
+    }
+
+    #[tokio::test]
+    async fn a_head_that_moves_back_below_the_watermark_lowers_it_at_once() {
+        // Finding: after a range sync completed, a head moved back (an
+        // `INVALID` cut) left the watermark above it, so the cut-out range
+        // was never asked for again from the branch the head now follows.
+        let mut server = unconnected_server().await;
+        server.store.set_judged_head_slot(Some(100));
+        server.range_fetched_through = 100;
+        server.expire_range_watermark(200);
+        assert_eq!(server.range_fetched_through, 100);
+        // A session was running, with a batch delivered by a peer.
+        let peer = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(101..200, peer, 200));
+        server.head_watch.note_whole_batch(peer, 100);
+        server.store.set_judged_head_slot(Some(90));
+        server.expire_range_watermark(201);
+        assert_eq!(server.range_fetched_through, 90);
+        // The session goes, its cursor being past the cut-out span, and the
+        // delivery is held against nobody.
+        assert!(server.range_sync_state.is_none());
+        assert!(server.head_watch.reached(u64::MAX).is_empty());
+        assert!(!server.peer_heads.has_suspects());
+    }
+
+    #[tokio::test]
+    async fn the_count_waits_for_blocks_above_the_head() {
+        // Finding: a session that delivered nothing, or the watermark seeded
+        // at the anchor on startup, started the count, so the first real
+        // batch, a window later, was dropped at the next tick and its honest
+        // sender made a suspect.
+        let mut server = unconnected_server().await;
+        let head = server.store.head_slot();
+        let window = SyncThresholds::LEAN.stall_window;
+        let honest = connected_peer(&mut server);
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, honest, 2000));
+        for wall in 100..=100 + 2 * window {
+            server.expire_range_watermark(wall);
+        }
+        // The first batch lands: it gets a whole window from here.
+        server.range_fetched_through = 64;
+        server.head_watch.note_whole_batch(honest, 64);
+        let delivered = 101 + 2 * window;
+        expire_through(&mut server, delivered..=delivered + window);
+        assert_eq!(server.range_fetched_through, 64);
+        assert!(!server.peer_heads.is_suspect(&honest));
+        server.expire_range_watermark(delivered + window + 1);
+        assert_eq!(server.range_fetched_through, head);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_blocks_never_import_is_cut_off_after_a_window() {
+        // Finding: a peer answering every batch with in-range blocks that
+        // never import kept the watermark rising and its count restarting,
+        // so honest peers' heads stayed below it and were never synced from.
+        let mut server = unconnected_server().await;
+        let liar = connected_peer(&mut server);
+        let honest = connected_peer(&mut server);
+        let window = SyncThresholds::LEAN.stall_window;
+        server.range_sync_state = Some(RangeSyncState::new(1..2000, liar, 2000));
+        // Its next batch is in flight when the drop comes.
+        let in_flight = server
+            .swarm_handle
+            .send_request(
+                liar,
+                Request::BlocksByRange(BlocksByRangeRequest::new(1, 10)),
+                ReqRespProtocol::LeanBlocksByRange,
+            )
+            .await
+            .expect("a request id");
+        let batch = PendingRequestKind::Range {
+            start_slot: 1,
+            end_slot: 10,
+        };
+        server.outbound_requests.insert(in_flight, batch);
+        // And its envelope request, for the same blocks.
+        let envelopes_in_flight = server
+            .swarm_handle
+            .send_request(
+                liar,
+                Request::BlocksByRange(BlocksByRangeRequest::new(1, 10)),
+                ReqRespProtocol::LeanBlocksByRange,
+            )
+            .await
+            .expect("a request id");
+        let session = server.range_sync_state.as_ref().map(|state| state.id);
+        let envelopes = PendingRequestKind::EnvelopeRange {
+            start_slot: 1,
+            end_slot: 10,
+            session,
+        };
+        server
+            .outbound_requests
+            .insert(envelopes_in_flight, envelopes);
+        // A batch every slot, none of which moves the head.
+        for (batch, wall) in (100..=101 + window).enumerate() {
+            server.range_fetched_through = 100 * (batch as u64 + 1);
+            server
+                .head_watch
+                .note_whole_batch(liar, server.range_fetched_through);
+            server.expire_range_watermark(wall);
+        }
+        let head = server.store.head_slot();
+        assert_eq!(server.range_fetched_through, head);
+        assert!(server.range_sync_state.is_none(), "the session ends");
+        assert!(
+            !server.outbound_requests.contains_key(&in_flight),
+            "its answer is not taken"
+        );
+        assert!(!server.outbound_requests.contains_key(&envelopes_in_flight));
+        assert!(server.peer_heads.is_suspect(&liar));
+        // Its claims do not count, and its requests start nothing.
+        let unknown = H256::repeat_byte(0x11);
+        on_lean_status_request(&mut server, liar, &lean_status_at(unknown, 900)).await;
+        assert_eq!(server.store.network_head(), None);
+        assert!(server.range_sync_state.is_none());
+
+        // The honest peer is synced from, starting at the head.
+        on_lean_status_request(&mut server, honest, &lean_status_at(unknown, 500)).await;
+        let state = server.range_sync_state.as_ref().expect("honest peer");
+        assert_eq!(state.current_range.start, head + 1);
+        assert!(!state.peer_set.contains_key(&liar));
+    }
+
+    #[tokio::test]
+    async fn a_claim_whose_head_was_imported_since_is_no_lead() {
+        // Finding: whether a claim's head is held was checked only when its
+        // `Status` arrived, so a head imported later (a lighter branch) went
+        // on counting as a lead until the peer's next `Status`.
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let wall = crate::wall_clock_slot(&server.store);
+        let our_head = server.store.head().expect("head exists");
+        // Counted when it arrived, as if the block was not held then...
+        server.peer_heads.record(peer, 50, our_head, wall, false);
+        // ...and held now: the next publish drops it.
+        peer_heads::publish(&mut server);
+        assert_eq!(server.store.network_head(), None);
+    }
+
+    #[tokio::test]
+    async fn the_refresh_timer_ages_out_a_claim_nobody_repeats() {
+        let mut server = unconnected_server().await;
+        let peer = connected_peer(&mut server);
+        let wall = crate::wall_clock_slot(&server.store);
+        let lifetime = SyncThresholds::LEAN.report_lifetime();
+        let reported_at = wall.saturating_sub(lifetime + 1);
+        server
+            .peer_heads
+            .record(peer, 100, H256::ZERO, reported_at, false);
+        // As published when the report arrived.
+        let published = server.peer_heads.network_head(reported_at, 2);
+        server.store.set_network_head(published);
+        assert_eq!(server.store.network_head(), Some(100));
+
+        server.refresh_due_peer_statuses().await;
+        assert_eq!(server.store.network_head(), None);
     }
 
     #[test]
