@@ -398,6 +398,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Derived the validators' PQ keys"
         );
+        // Before any duty signs: the leaves a previous run signed stay spent.
+        let kept =
+            pq::open_leaf_record(&config.validators_dir, current_slot).map_err(|source| {
+                Error::Io {
+                    path: config
+                        .validators_dir
+                        .join(pq::LEAF_RECORD_FILE)
+                        .display()
+                        .to_string(),
+                    source,
+                }
+            })?;
+        info!(leaves = kept, "Opened the PQ leaf record");
         prepare_vrf_trees(
             pubkeys,
             config.validators_dir.clone(),

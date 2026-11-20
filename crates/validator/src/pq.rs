@@ -28,13 +28,14 @@
 //! Every message has a leaf of its own (an attestation one per target epoch,
 //! everything else one per slot and kind), so the slashing protection record
 //! already covers blocks (one per slot) and attestations (one per target).
-//! The other per-slot messages (payload attestations, aggregates,
-//! envelopes) are guarded here, in memory: one signing root per leaf. The
-//! specification asks for that record to persist across restarts; this one
-//! does not, so a client restarted within a slot could sign a second
-//! different message at one of those leaves.
+//! The other per-slot messages (payload attestations, aggregates, proposer
+//! preferences, envelopes) are guarded here: one signing root per leaf, kept
+//! in [`LEAF_RECORD_FILE`] under the validators directory and flushed to disk
+//! before the signature exists, so a restart, however quick, cannot sign a
+//! second message at a leaf (see [`open_leaf_record`]).
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -49,6 +50,20 @@ pub use ethlambda_types::beacon::constants::{
     LEAF_OFFSET_AGGREGATE_AND_PROOF, LEAF_OFFSET_BEACON_PROPOSER,
     LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE, LEAF_OFFSET_PTC_ATTESTER,
 };
+
+/// The file under the validators directory that keeps every leaf this
+/// client signed at and the root it signed there: [`LEAF_RECORD_SIZE`]-byte
+/// records (the 48-byte BLS key, the leaf as a little-endian `u64`, the
+/// signing root), appended and flushed before each first signature at a
+/// leaf.
+pub const LEAF_RECORD_FILE: &str = "pq_signed_leaves.bin";
+
+const LEAF_RECORD_SIZE: usize = 48 + 8 + 32;
+
+/// How many slots back [`open_leaf_record`] keeps a leaf. The client signs
+/// only for the current slot, the next epoch's proposals' preferences and the
+/// current target epoch, so a leaf two epochs old is never asked for again.
+const LEAF_RECORD_KEEP_SLOTS: Slot = 2 * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 
 /// The directory under the validators directory that holds each key's VRF
 /// tree nodes, one file per validator, named by its BLS public key.
@@ -75,9 +90,110 @@ fn registry() -> &'static RwLock<Registry> {
     REGISTRY.get_or_init(Default::default)
 }
 
-fn signed_leaves() -> &'static Mutex<HashMap<(BlsPubkey, u64), Root>> {
-    static SIGNED: OnceLock<Mutex<HashMap<(BlsPubkey, u64), Root>>> = OnceLock::new();
+/// Every leaf signed at, with its root, and the file that keeps them.
+#[derive(Default)]
+struct LeafRecord {
+    roots: HashMap<(BlsPubkey, u64), Root>,
+    /// `None` until [`open_leaf_record`]: the record is then in memory only,
+    /// as in tests.
+    file: Option<std::fs::File>,
+}
+
+impl LeafRecord {
+    /// The record at `path`, without the leaves of slots before `keep_from`,
+    /// rewritten that way so it does not grow without bound, and open for
+    /// appending. A torn trailing record is dropped: it was never flushed, so
+    /// no signature at its leaf left the process.
+    fn open(path: &Path, keep_from: Slot) -> std::io::Result<(Self, usize)> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let mut roots = HashMap::new();
+        let mut kept = Vec::with_capacity(bytes.len());
+        for record in bytes.chunks_exact(LEAF_RECORD_SIZE) {
+            let pubkey = BlsPubkey(record[..48].try_into().expect("48 bytes"));
+            let leaf = u64::from_le_bytes(record[48..56].try_into().expect("8 bytes"));
+            let root = Root::from(<[u8; 32]>::try_from(&record[56..]).expect("32 bytes"));
+            if leaf_slot(leaf).is_some_and(|slot| slot < keep_from) {
+                continue;
+            }
+            if roots.insert((pubkey, leaf), root).is_none() {
+                kept.extend_from_slice(record);
+            }
+        }
+        crate::secure_fs::write_private_durably(path, &kept).map_err(std::io::Error::other)?;
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        let count = roots.len();
+        Ok((
+            Self {
+                roots,
+                file: Some(file),
+            },
+            count,
+        ))
+    }
+
+    /// Claims `leaf` of `pubkey` for `root`: refused when the leaf already
+    /// signed another root, and recorded durably the first time.
+    fn claim(&mut self, pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<(), PqSignError> {
+        match self.roots.get(&(*pubkey, leaf)) {
+            Some(previous) if *previous != root => return Err(PqSignError::LeafUsed(leaf)),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        if let Some(file) = &mut self.file {
+            let mut record = Vec::with_capacity(LEAF_RECORD_SIZE);
+            record.extend_from_slice(&pubkey.0);
+            record.extend_from_slice(&leaf.to_le_bytes());
+            record.extend_from_slice(&root.0);
+            file.write_all(&record)
+                .and_then(|()| file.sync_data())
+                .map_err(PqSignError::Record)?;
+        }
+        self.roots.insert((*pubkey, leaf), root);
+        Ok(())
+    }
+}
+
+/// The slot a leaf belongs to (the target epoch's first slot for an
+/// attestation's), or `None` for the reserved and builder leaves, which the
+/// record keeps for good.
+fn leaf_slot(leaf: u64) -> Option<Slot> {
+    let per_slot = XMSS_RESERVED_LEAVES + XMSS_ATTESTATION_LEAVES + XMSS_BUILDER_BID_LEAVES;
+    if leaf >= per_slot {
+        return Some((leaf - per_slot) / XMSS_LEAVES_PER_SLOT);
+    }
+    let attestations = XMSS_RESERVED_LEAVES..XMSS_RESERVED_LEAVES + XMSS_ATTESTATION_LEAVES;
+    attestations
+        .contains(&leaf)
+        .then(|| (leaf - XMSS_RESERVED_LEAVES) * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH)
+}
+
+fn signed_leaves() -> &'static Mutex<LeafRecord> {
+    static SIGNED: OnceLock<Mutex<LeafRecord>> = OnceLock::new();
     SIGNED.get_or_init(Default::default)
+}
+
+/// Opens `validators_dir`'s leaf record and takes it as this process's: the
+/// leaves signed before a restart stay spent. Leaves of slots more than
+/// [`LEAF_RECORD_KEEP_SLOTS`] before `current_slot` are dropped from it.
+/// Returns how many leaves it holds. Call it once, before any PQ signature.
+pub fn open_leaf_record(validators_dir: &Path, current_slot: Slot) -> std::io::Result<usize> {
+    let keep_from = current_slot.saturating_sub(LEAF_RECORD_KEEP_SLOTS);
+    let (mut record, count) = LeafRecord::open(&validators_dir.join(LEAF_RECORD_FILE), keep_from)?;
+    let mut global = signed_leaves().lock().expect("PQ leaf record poisoned");
+    // Anything this process signed before opening is kept, and written
+    // through so the next start sees it too.
+    for ((pubkey, leaf), root) in std::mem::take(&mut global.roots) {
+        record.claim(&pubkey, leaf, root).map_err(|err| match err {
+            PqSignError::Record(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+    }
+    *global = record;
+    Ok(count)
 }
 
 /// Derives and registers the PQ key of the validator whose BLS key is
@@ -171,6 +287,8 @@ pub enum PqSignError {
     VrfTreeNotReady,
     #[error("slot {0} is past the VRF tree's last leaf")]
     SlotPastVrfTree(Slot),
+    #[error("could not record the leaf before signing: {0}")]
+    Record(std::io::Error),
 }
 
 /// Where [`prepare_vrf_tree`] got a key's VRF tree.
@@ -340,16 +458,10 @@ pub fn prepare_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<Vrf
 /// Blocking: building a bottom tree takes about a second and a half.
 pub fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, PqSignError> {
     let key = key(pubkey).ok_or(PqSignError::UnknownValidator)?;
-    {
-        let mut signed = signed_leaves().lock().expect("PQ leaf record poisoned");
-        match signed.get(&(*pubkey, leaf)) {
-            Some(previous) if *previous != root => return Err(PqSignError::LeafUsed(leaf)),
-            Some(_) => {}
-            None => {
-                signed.insert((*pubkey, leaf), root);
-            }
-        }
-    }
+    signed_leaves()
+        .lock()
+        .expect("PQ leaf record poisoned")
+        .claim(pubkey, leaf, root)?;
     let leaf_index = u32::try_from(leaf).map_err(|_| PqSignError::LeafUsed(leaf))?;
     let signature = key
         .xmss
@@ -532,6 +644,62 @@ mod tests {
             stored.proof(9).unwrap(),
             proof.iter().map(|node| node.0).collect::<Vec<_>>()
         );
+    }
+
+    /// A leaf claimed for one root stays claimed across a reopening of the
+    /// record, which drops only the leaves of slots before its window and a
+    /// torn trailing record.
+    #[test]
+    fn the_leaf_record_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(LEAF_RECORD_FILE);
+        let pubkey = BlsPubkey([14; 48]);
+        let recent = slot_leaf(100, LEAF_OFFSET_PTC_ATTESTER);
+        let old = slot_leaf(10, LEAF_OFFSET_PTC_ATTESTER);
+        let reserved = 7;
+        {
+            let (mut record, count) = LeafRecord::open(&path, 0).unwrap();
+            assert_eq!(count, 0);
+            for leaf in [recent, old, reserved] {
+                record.claim(&pubkey, leaf, Root::from([1; 32])).unwrap();
+            }
+            record.claim(&pubkey, recent, Root::from([1; 32])).unwrap();
+            assert!(matches!(
+                record.claim(&pubkey, recent, Root::from([2; 32])),
+                Err(PqSignError::LeafUsed(_))
+            ));
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * LEAF_RECORD_SIZE as u64
+        );
+        // A write torn by a crash: never flushed, never signed.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[9; LEAF_RECORD_SIZE - 1]).unwrap();
+        drop(file);
+
+        let (mut record, count) = LeafRecord::open(&path, 50).unwrap();
+        assert_eq!(
+            count, 2,
+            "the old slot's leaf is dropped, the reserved one kept"
+        );
+        assert!(matches!(
+            record.claim(&pubkey, recent, Root::from([2; 32])),
+            Err(PqSignError::LeafUsed(_))
+        ));
+        assert!(matches!(
+            record.claim(&pubkey, reserved, Root::from([2; 32])),
+            Err(PqSignError::LeafUsed(_))
+        ));
+        record.claim(&pubkey, old, Root::from([2; 32])).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * LEAF_RECORD_SIZE as u64
+        );
+        assert_eq!(leaf_slot(attestation_leaf(3)), Some(96));
     }
 
     #[test]
