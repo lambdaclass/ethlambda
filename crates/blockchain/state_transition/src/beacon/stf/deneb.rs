@@ -50,6 +50,7 @@ use crate::beacon::helpers::mutators::{
     decrease_balance, increase_balance, initiate_validator_exit,
 };
 use crate::beacon::helpers::predicates::is_active_validator;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
@@ -113,6 +114,7 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
@@ -163,6 +165,7 @@ fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let outstanding = state
@@ -206,6 +209,7 @@ fn process_operations(
                 proposer_index,
                 committees,
                 active_balances,
+                target_delta,
                 signatures,
             )?;
         }
@@ -328,6 +332,7 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
@@ -423,10 +428,13 @@ pub fn process_attestation(
             })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -438,13 +446,15 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (increments, _, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
             let reward = (increments * base_reward_per_increment)
@@ -455,6 +465,15 @@ pub fn process_attestation(
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
+        }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (_, effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
         }
         if new_flags != 0 {
             updates.push((index, current_flags | new_flags));

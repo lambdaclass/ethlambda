@@ -56,6 +56,7 @@ use crate::beacon::helpers::capella::{
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_signing_root};
 use crate::beacon::helpers::mutators::decrease_balance;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{H256, HashTreeRoot as _};
 use crate::beacon::stf::signatures::SignatureBatch;
@@ -105,6 +106,7 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
@@ -378,6 +380,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::operations::process_operations(
@@ -390,6 +393,7 @@ pub fn process_operations(
         config,
         committees,
         active_balances,
+        target_delta,
         signatures,
     )?;
     for signed_change in bls_to_execution_changes {

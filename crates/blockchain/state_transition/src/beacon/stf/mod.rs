@@ -177,8 +177,39 @@ pub fn state_transition(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
 ) -> Result<()> {
+    state_transition_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`state_transition`] with explicit [`block::BlockProcessingOptions`], for
+/// the caller that collects the block's target-balance delta.
+#[allow(clippy::too_many_arguments)]
+pub fn state_transition_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    caches: BlockCaches<'_>,
+    options: block::BlockProcessingOptions,
+) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
-    apply_block(state, signed_block, validate_result, config, engine, caches)
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        options,
+    )
 }
 
 /// [`state_transition`] from the point where `state` is already at the block's
@@ -197,6 +228,28 @@ pub fn apply_block(
     config: &Config,
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
+) -> Result<()> {
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`apply_block`] with explicit [`block::BlockProcessingOptions`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    caches: BlockCaches<'_>,
+    options: block::BlockProcessingOptions,
 ) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
@@ -224,14 +277,7 @@ pub fn apply_block(
         )?;
     }
 
-    block::process_block(
-        state,
-        signed_block,
-        config,
-        engine,
-        caches,
-        block::BlockProcessingOptions::default(),
-    )?;
+    block::process_block(state, signed_block, config, engine, caches, options)?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
     state.apply_pending_mutations();
