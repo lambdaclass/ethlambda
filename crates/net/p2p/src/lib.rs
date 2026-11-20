@@ -2571,26 +2571,43 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 ///   this node prefers QUIC wherever a peer offers it.
 ///
 /// `/dns*` is refused: a [`Bootnode`] holds an address, and the swarm has no
-/// DNS transport to resolve a name with. Unlike [`parse_enrs`], a bad entry is
-/// an error rather than a warning, since an operator typed it on the command
-/// line.
+/// DNS transport to resolve a name with. So is an IPv6 entry, of either form,
+/// that is only a discv5 contact, since discovery listens on IPv4. Unlike
+/// [`parse_enrs`], a bad entry is an error rather than a warning, since an
+/// operator typed it on the command line.
 pub fn parse_bootnode(entry: &str) -> Result<Bootnode, String> {
     let entry = entry.trim();
     if entry.is_empty() {
         return Err("empty bootnode entry".to_string());
     }
-    if entry.starts_with('/') {
-        return parse_bootnode_multiaddr(entry);
+    let bootnode = if entry.starts_with('/') {
+        parse_bootnode_multiaddr(entry)?
+    } else if entry.starts_with("enr:") {
+        parse_enr(entry).map_err(|reason| format!("invalid ENR: {reason}"))?
+    } else {
+        // Without the prefix the entry could equally be a mistyped address
+        // (say `1.2.3.4:9000`), so say both readings failed rather than report
+        // a bare RLP error for an entry that was never meant as an ENR.
+        parse_enr(&format!("enr:{entry}")).map_err(|reason| {
+            format!("neither a multiaddr (those start with /) nor a valid ENR: {reason}")
+        })?
+    };
+
+    // A discv5 contact and nothing else, at an IPv6 address, could never be
+    // reached: discovery listens on the IPv4 wildcard (`run_node` binds
+    // `0.0.0.0`), and an IPv4 socket cannot send to an IPv6 address. Refused
+    // for the reason a non-secp256k1 discv5 contact is (see
+    // `parse_bootnode_multiaddr`): nothing could use it. An IPv6 entry with a
+    // QUIC or TCP port is kept, since the swarm dials it, not the discovery
+    // socket.
+    if bootnode.ip.is_ipv6() && bootnode.quic_port.is_none() && bootnode.tcp_port.is_none() {
+        return Err(
+            "an IPv6 bootnode with only a discv5 (udp) port cannot be reached: discovery \
+             listens on IPv4 only, so give its IPv4 address"
+                .to_string(),
+        );
     }
-    if entry.starts_with("enr:") {
-        return parse_enr(entry).map_err(|reason| format!("invalid ENR: {reason}"));
-    }
-    // Without the prefix the entry could equally be a mistyped address (say
-    // `1.2.3.4:9000`), so say both readings failed rather than report a bare
-    // RLP error for an entry that was never meant as an ENR.
-    parse_enr(&format!("enr:{entry}")).map_err(|reason| {
-        format!("neither a multiaddr (those start with /) nor a valid ENR: {reason}")
-    })
+    Ok(bootnode)
 }
 
 /// The multiaddr half of [`parse_bootnode`], walked component by component so
@@ -4640,6 +4657,21 @@ mod tests {
 
         assert_eq!(bootnode.ip, "2001:db8::1".parse::<IpAddr>().unwrap());
         assert_eq!(bootnode.tcp_port, Some(9000));
+    }
+
+    /// The swarm dials an IPv6 address, but discovery listens on IPv4 only, so
+    /// an IPv6 entry that is only a discv5 contact could never be reached.
+    #[test]
+    fn parse_bootnode_refuses_an_ip6_discv5_contact() {
+        let peer_id = secp256k1_peer_id();
+
+        let quic = parse_bootnode(&format!("/ip6/2001:db8::1/udp/9001/quic-v1/p2p/{peer_id}"))
+            .expect("an IPv6 QUIC entry is dialed by the swarm");
+        assert_eq!(quic.quic_port, Some(9001));
+
+        let reason = bootnode_refusal(&format!("/ip6/2001:db8::1/udp/9000/p2p/{peer_id}"));
+        assert!(reason.contains("IPv6"), "{reason}");
+        assert!(reason.contains("IPv4"), "{reason}");
     }
 
     #[test]

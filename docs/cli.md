@@ -260,6 +260,10 @@ in its place, which is Lighthouse's behavior too. Giving the flag used to
 replace that list; now the network's bootnodes are always used, and the flag
 only adds to them.
 
+An IPv6 entry is dialed like an IPv4 one, but discv5 listens on IPv4 only, so
+an IPv6 entry that is only a discv5 contact (`/ip6/<ip>/udp/<port>`, or an ENR
+whose only address is `ip6` and whose only port is `udp`) is refused.
+
 Every entry is checked at startup. One that does not parse, or that is
 unusable (an ENR with no `quic`, `tcp` or `udp` port, a port of `0`, and so
 on), is a startup error naming the entry: an operator who typed it meant to

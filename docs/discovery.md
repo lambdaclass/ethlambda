@@ -219,7 +219,10 @@ key coming from the address and the peer id:
 
 A UDP multiaddr names the peer's discovery port, not a libp2p listener, which
 is how Lighthouse reads one too. A peer reachable more than one way takes one
-entry per transport, and the entries are merged under its peer id.
+entry per transport, and the entries are merged under its peer id. An `/ip6`
+UDP multiaddr is refused: discovery binds the IPv4 wildcard, and an IPv4
+socket cannot reach an IPv6 address. `/ip6` with `tcp` or `quic-v1` is dialed
+by the swarm and accepted.
 
 The form follows Lighthouse's `--boot-nodes`, with four deliberate departures:
 
