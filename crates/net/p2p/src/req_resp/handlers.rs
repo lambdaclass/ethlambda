@@ -3336,6 +3336,9 @@ pub(crate) mod tests {
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            engine_published_columns: crate::beacon::engine_columns::PublishedColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),

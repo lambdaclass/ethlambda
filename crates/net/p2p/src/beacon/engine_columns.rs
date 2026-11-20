@@ -20,20 +20,60 @@
 //! than re-forwarded, and a column gossip already accepted is not published a
 //! second time. A column whose key is taken is still handed to the chain actor:
 //! the key carries no block root, so it may be another block's of the same
-//! slot and proposer, and the seen cache only gates publication, not storage. Gossip records a column only once its verdict is `Accept`
-//! (`verdict::Validated::record_seen`), so a copy still being validated when
-//! these are recorded is ignored too, as any second valid copy is.
+//! slot and proposer, and the seen cache only gates publication, not storage.
+//!
+//! One copy is the exception: the identical column gossip delivered just
+//! before, still in validation. Gossip records a column only once its verdict
+//! is `Accept` (`verdict::Validated::record_seen`), so that copy's verdict
+//! finds the key taken. Its bytes, and so its message id, are the ones
+//! published here, and gossipsub put that id in its duplicate cache on
+//! arrival, before validation, so the publish was refused as
+//! `PublishError::Duplicate` and sent nothing. Downgrading the verdict to
+//! `Ignore(AlreadySeen)` would then relay neither copy. [`PublishedColumns`]
+//! remembers the ids published here so the verdict keeps its `Accept` and
+//! gossipsub relays the copy it holds.
+
+use std::num::NonZeroUsize;
 
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::primitives::HashTreeRoot as _;
-use libp2p::gossipsub::IdentTopic;
+use libp2p::gossipsub::{IdentTopic, MessageId};
+use lru::LruCache;
 use tracing::{debug, error, info, warn};
 
 use crate::beacon::topics as beacon_topics;
 use crate::gossipsub::compress_message;
-use crate::{P2PServer, metrics};
+use crate::{P2PServer, metrics, published_message_id};
+
+/// Gossipsub message ids of the columns [`publish_and_forward`] published.
+///
+/// A gossip copy that reaches its verdict with one of these ids was in
+/// validation when the column was published here: had it arrived after,
+/// gossipsub would have dropped it as a duplicate of our own publish before
+/// it reached this actor. So that publish sent nothing (see the module doc),
+/// and the copy's `Accept` stands although its seen-cache key is taken, by
+/// this very column. Bounded by capacity, like the seen caches: an id whose
+/// gossip copy never comes is only evicted.
+pub(crate) struct PublishedColumns(LruCache<MessageId, ()>);
+
+impl PublishedColumns {
+    pub(crate) fn new(capacity: NonZeroUsize) -> Self {
+        Self(LruCache::new(capacity))
+    }
+
+    fn insert(&mut self, id: MessageId) {
+        self.0.put(id, ());
+    }
+
+    /// Whether `id` is one this node published from the execution layer,
+    /// forgetting it: gossipsub delivers one id at most once while it is in
+    /// its duplicate cache, which outlives any validation.
+    pub(crate) fn take(&mut self, id: &MessageId) -> bool {
+        self.0.pop(id).is_some()
+    }
+}
 
 /// Record each sidecar in the seen cache, publish the newly recorded ones on
 /// their subnets, and hand them to the chain actor.
@@ -96,9 +136,10 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
     let mut forwarded = Vec::with_capacity(fresh.len());
     for (sidecar, topic) in fresh {
         if let Some(topic) = topic {
-            server
-                .swarm_handle
-                .publish(topic, compress_message(&sidecar.to_ssz()));
+            let ssz = sidecar.to_ssz();
+            let message_id = published_message_id(&topic.hash(), &ssz);
+            server.engine_published_columns.insert(message_id);
+            server.swarm_handle.publish(topic, compress_message(&ssz));
             published += 1;
         }
         forwarded.push(sidecar);
@@ -141,11 +182,13 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
 mod tests {
     use std::sync::Arc;
 
+    use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
 
     use super::*;
     use crate::beacon::decode::decode_data_column_sidecar;
+    use crate::beacon::verdict::{Validated, settle_message};
     use crate::gossipsub::decompress_message;
     use crate::swarm_adapter::{SwarmCommand, SwarmHandle};
     use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
@@ -247,6 +290,49 @@ mod tests {
             }
         }
         assert_eq!(published, 1, "only column 2's key was free");
+    }
+
+    /// The published column's own copy, delivered by gossip just before and
+    /// still in validation, keeps its `Accept`: gossipsub refused our publish
+    /// as a duplicate of it, so it is the only copy left to relay. Another
+    /// copy for the same key (an equivocating block's column) is still a
+    /// second valid one, and so is the same copy delivered again.
+    #[tokio::test]
+    async fn a_gossip_copy_of_a_published_column_keeps_its_accept() {
+        let (mut server, _chain) = server_custodying(&[1]).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+
+        publish_and_forward(&mut server, vec![sidecar(1)]);
+
+        let Ok(SwarmCommand::Publish { topic, data }) = commands.try_recv() else {
+            panic!("column 1 is new and custodied, so it is published");
+        };
+        // The id gossipsub computes for a received copy of those bytes.
+        let received = libp2p::gossipsub::Message {
+            source: None,
+            data,
+            sequence_number: None,
+            topic: topic.hash(),
+        };
+        let gossip_id = crate::compute_message_id(&received);
+        let object = Validated::Column(Box::new(sidecar(1)));
+        let other_id = MessageId(vec![0; 20]);
+
+        assert_eq!(
+            settle_message(&mut server, &other_id, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen),
+            "a different message for the taken key is a second valid copy"
+        );
+        assert_eq!(
+            settle_message(&mut server, &gossip_id, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle_message(&mut server, &gossip_id, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen),
+            "the id is taken once"
+        );
     }
 
     #[tokio::test]

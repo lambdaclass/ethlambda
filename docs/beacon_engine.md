@@ -395,6 +395,14 @@ if and only if this node is subscribed to them, which here means its custody
 columns, and forwards one batch to the chain actor. The chain actor stores the
 columns and releases the held block through the usual completeness check.
 
+One copy gossip delivers is not ignored: the identical column, received just
+before and still in validation when the execution-layer copy is recorded.
+Gossipsub put its message id in the duplicate cache on arrival, so our publish
+of the same bytes was refused as a duplicate and sent nothing; ignoring the
+gossip copy too would relay the column to no one. p2p remembers the message ids
+it published (`engine_columns::PublishedColumns`), and a gossip verdict under
+one of them keeps its `Accept`.
+
 ```
 hold (1st, recent) -> engine_getBlobsV2       1 s, one attempt
                        |-- null / error  -> count; gossip and peer asks carry on
