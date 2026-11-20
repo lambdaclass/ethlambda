@@ -360,8 +360,9 @@ mainnet era 1422 (deneb blocks) that took a block from about 1.7 s to about
 0.3 s. The header, RANDAO and sync-aggregate steps still look it up once each.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through `helpers::participation`. One walk of `iter_validators()`, zipped with
-the flat participation slices, produces each validator's flags, its effective
+through `helpers::participation`. One walk of `iter_validators()`, in lockstep
+with both participation lists' iterators (`ParticipationRef`, since the lists
+are tree-backed), produces each validator's flags, its effective
 balance and the balance totals (an `EpochSummary`); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
 for those three steps only, since registry updates change what it read. The
@@ -387,6 +388,28 @@ validator they name deferred until they are done. The genesis epoch and states
 whose registry-sized lists differ in length fall back to the step-by-step path.
 The debug oracle runs the specification-shaped steps on a clone and asserts the
 two full states hash equal.
+
+### Participation lists and pending deposits
+
+The two participation lists (one byte per validator, 2.4 MB each on mainnet)
+and `pending_deposits` are tree-backed too. As flat `SszList`s they were
+re-merkleized from scratch for every state root, which profiled at most of
+`BeaconState::hash_tree_root`; a block only flips flags for the validators it
+attests for, so the tree rehashes the leaves holding those. Writes to the
+participation lists are buffered densely (the default `VecMap`), unlike the
+registry's `BTreeMap`: a block writes tens of thousands of scattered entries, and
+measured at mainnet size the `BTreeMap`'s inserts cost several times the hashing
+they save, while the dense buffer is an indexed write. The epoch
+rotation does not buffer: it moves `current` into `previous` and builds a fresh
+zeroed list. `pending_deposits` only grows at the end during a block and is
+rebuilt from a `Vec` once per epoch, so a `BTreeMap` buffer fits it too.
+
+Reads go through `BeaconState::altair_validator_lists`, which returns
+`ParticipationRef`s (there is no slice to hand out); a full scan walks
+`ParticipationRef::iter` in lockstep with `iter_validators`, since each `get` is
+a tree descent. Element writes go through `epoch_participation_mut`, which
+returns a `ParticipationMut`. The SSZ encoding is unchanged, so `DB_VERSION` is
+too.
 
 ## Gloas
 
@@ -483,11 +506,12 @@ of keeping copies.
 EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
 chain of growing subtrees (EIP-7916), and makes the big containers progressive
 (EIP-7495); a progressive container has no fixed depth. The other progressive
-lists are libssz's `ProgressiveList`. The registry is the exception:
-`validators` and `balances` stay tree-backed, through
+lists are libssz's `ProgressiveList`. The exceptions stay tree-backed, through
 `ethlambda_ssz_tree::ProgressiveList`, which has the same persistent nodes,
 update buffer and rebase as the bounded `List` and the same method set, so a
-gloas state shares subtrees with its parent the way earlier ones do.
+gloas state shares subtrees with its parent the way earlier ones do: `validators`
+and `balances`, the two participation lists and `pending_deposits`. (The
+inactivity scores are still a flat progressive list.)
 
 The registry therefore has two list types across the forks, and an accessor
 cannot return either one. The whole-registry accessors were replaced by

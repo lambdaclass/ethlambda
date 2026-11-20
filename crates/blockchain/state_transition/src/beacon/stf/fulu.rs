@@ -49,7 +49,9 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::{BlockCaches, ExecutionEngine};
 
@@ -62,6 +64,7 @@ use super::{BlockCaches, ExecutionEngine};
 /// for [`super::electra::process_execution_payload`] and
 /// [`super::electra::process_operations`]. See the module docs for why these
 /// are the only steps this fork's specification asks to change.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
@@ -69,6 +72,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -79,7 +83,7 @@ pub fn process_block(
     )?;
     super::electra::process_withdrawals(state, &block.body.execution_payload)?;
     process_execution_payload(state, &block.body, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -88,12 +92,15 @@ pub fn process_block(
         caches.committees,
         caches.active_balances,
         caches.pubkey_indices,
+        options.target_delta,
+        signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
         caches.active_balances,
         caches.pubkey_indices,
+        signatures,
     )?;
     Ok(())
 }
@@ -230,6 +237,7 @@ pub fn process_execution_payload(
 /// the two do not diverge in practice; this copy exists to match the
 /// specification's own text for this fork rather than to fix an observed
 /// bug in the shared version.
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -237,6 +245,8 @@ pub fn process_operations(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // [Modified in Fulu]
     verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
@@ -247,6 +257,7 @@ pub fn process_operations(
             proposer_slashing,
             config,
             active_balances,
+            signatures,
         )?;
     }
     for attester_slashing in body.attester_slashings.iter() {
@@ -255,6 +266,7 @@ pub fn process_operations(
             attester_slashing,
             config,
             active_balances,
+            signatures,
         )?;
     }
     // `electra::process_attestation` is handed the proposer rather than looking
@@ -271,16 +283,24 @@ pub fn process_operations(
                 proposer_index,
                 committees,
                 active_balances,
+                target_delta,
+                signatures,
             )?;
         }
     }
     // [Modified in Fulu]
     // Removed `process_deposit`
     for voluntary_exit in body.voluntary_exits.iter() {
-        super::electra::process_voluntary_exit(state, voluntary_exit, config, active_balances)?;
+        super::electra::process_voluntary_exit(
+            state,
+            voluntary_exit,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
-        super::electra::process_bls_to_execution_change(state, signed_change, config)?;
+        super::electra::process_bls_to_execution_change(state, signed_change, config, signatures)?;
     }
     process_execution_requests(
         state,
@@ -354,8 +374,8 @@ pub fn process_execution_requests(
 /// redefine `process_deposit_request` either, so it inherits this fork's
 /// version rather than electra's, and the only thing that kept a gloas state
 /// from calling this exact copy was the queue's own type
-/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
-/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// ([`crate::beacon::containers::gloas::PendingDeposits`], an
+/// `ethlambda_ssz_tree::ProgressiveList`, EIP-7688), which
 /// [`crate::beacon::helpers::electra::PendingQueueFields::push_pending_deposit`]
 /// already abstracts over.
 pub fn process_deposit_request(

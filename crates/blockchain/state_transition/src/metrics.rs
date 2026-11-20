@@ -45,6 +45,23 @@ pub fn inc_finalizations(result: &str) {
     LEAN_FINALIZATIONS_TOTAL.with_label_values(&[result]).inc();
 }
 
+static LEAN_BEACON_SIGNATURE_BATCH_DISAGREEMENTS_TOTAL: LazyLock<IntCounter> =
+    LazyLock::new(|| {
+        register_int_counter!(
+            "lean_beacon_signature_batch_disagreements_total",
+            "Signature batches that failed although the set they narrowed to verifies on its own"
+        )
+        .unwrap()
+    });
+
+/// A block's signature batch failed, but the set its search for the failing
+/// one landed on verifies alone, which only a bug in the batch check can
+/// cause. The block is rejected all the same, so a non-zero value means this
+/// node may be refusing valid blocks.
+pub fn inc_signature_batch_disagreements() {
+    LEAN_BEACON_SIGNATURE_BATCH_DISAGREEMENTS_TOTAL.inc();
+}
+
 static LEAN_BEACON_COMMITTEE_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_beacon_committee_cache_lookups_total",
