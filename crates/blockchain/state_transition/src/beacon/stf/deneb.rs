@@ -56,7 +56,7 @@ use crate::beacon::primitives::{
 };
 use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -81,8 +81,7 @@ pub fn process_block(
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -112,14 +111,15 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
+        caches.active_balances,
+        caches.pubkey_indices,
         signatures,
     )?;
     Ok(())
@@ -178,10 +178,22 @@ fn process_operations(
     )?;
 
     for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config, signatures)?;
+        super::operations::process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(state, attester_slashing, config, signatures)?;
+        super::operations::process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     // One proposer lookup for the list, not one per attestation: see the same
     // loop in `super::operations::process_operations`.

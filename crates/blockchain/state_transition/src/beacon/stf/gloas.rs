@@ -54,7 +54,7 @@ use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
     get_previous_epoch, get_randao_mix,
 };
@@ -79,7 +79,7 @@ use crate::beacon::primitives::{
 };
 use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -104,8 +104,7 @@ pub fn process_block(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -113,7 +112,13 @@ pub fn process_block(
     let parent_slot = state.latest_block_header().slot;
 
     // [New in Gloas:EIP7732]
-    process_parent_execution_payload(state, block, config)?;
+    process_parent_execution_payload(
+        state,
+        block,
+        config,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     super::block::process_block_header(
         state,
         block.slot,
@@ -139,14 +144,15 @@ pub fn process_block(
         &block.body,
         parent_slot,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
+        caches.active_balances,
+        caches.pubkey_indices,
         signatures,
     )?;
     Ok(())
@@ -163,20 +169,11 @@ pub fn process_block_and_verify(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     SignatureBatch::deferred(|signatures| {
-        process_block(
-            state,
-            block,
-            config,
-            committees,
-            active_balances,
-            options,
-            signatures,
-        )
+        process_block(state, block, config, caches, options, signatures)
     })
 }
 
@@ -958,6 +955,8 @@ pub fn apply_parent_execution_payload(
     state: &mut BeaconState,
     requests: &gloas::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let (parent_bid, parent_slot, parent_epoch) = {
         let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
@@ -997,10 +996,22 @@ pub fn apply_parent_execution_payload(
         crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        crate::beacon::stf::electra::process_withdrawal_request(state, withdrawal, config)?;
+        crate::beacon::stf::electra::process_withdrawal_request(
+            state,
+            withdrawal,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for consolidation in requests.consolidations.iter() {
-        crate::beacon::stf::electra::process_consolidation_request(state, consolidation, config)?;
+        crate::beacon::stf::electra::process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for builder_deposit in requests.builder_deposits.iter() {
         process_builder_deposit_request(state, builder_deposit, config)?;
@@ -1064,6 +1075,8 @@ pub fn process_parent_execution_payload(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let bid = &block.body.signed_execution_payload_bid.message;
     let parent_bid = gloas_state_ref(state, "process_parent_execution_payload")?
@@ -1085,7 +1098,7 @@ pub fn process_parent_execution_payload(
         requests.hash_tree_root() == parent_bid.execution_requests_root,
         "process_parent_execution_payload: hash_tree_root(requests) == parent_bid.execution_requests_root",
     )?;
-    apply_parent_execution_payload(state, requests, config)
+    apply_parent_execution_payload(state, requests, config, active_balances, pubkey_indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1253,7 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let (proposer_index, current_epoch) = crate::beacon::stf::operations::verify_proposer_slashing(
@@ -1264,7 +1278,7 @@ pub fn process_proposer_slashing(
         clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
     }
 
-    slash_validator(state, proposer_index, None, config)?;
+    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
 
@@ -1307,6 +1321,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &gloas::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
@@ -1332,6 +1347,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -1686,10 +1702,22 @@ pub fn process_operations(
 
     // [Modified in Gloas:EIP7732]
     for proposer_slashing in body.proposer_slashings.iter() {
-        process_proposer_slashing(state, proposer_slashing, config, signatures)?;
+        process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config, signatures)?;
+        process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
@@ -1707,6 +1735,7 @@ pub fn process_operations(
             state,
             voluntary_exit,
             config,
+            active_balances,
             signatures,
         )?;
     }

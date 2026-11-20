@@ -33,16 +33,14 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, bellatrix};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
-};
+use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, ExecutionBlockHash, HashTreeRoot as _, Root, Slot, Uint256,
 };
 use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -70,8 +68,7 @@ pub fn process_block(
     block: &bellatrix::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -95,14 +92,15 @@ pub fn process_block(
         &block.body.deposits,
         &block.body.voluntary_exits,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
+        caches.active_balances,
+        caches.pubkey_indices,
         signatures,
     )?;
     Ok(())
