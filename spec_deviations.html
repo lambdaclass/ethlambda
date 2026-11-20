@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-27f439f8.js";
+            window.path_to_searchindex_js = "searchindex-e399118f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -1000,6 +1000,26 @@ root. <code>prepare_beacon_proposer</code>, which a restart loses too, is re-sen
 slot instead: it is one request for every validator, where the kept
 preferences are one request each, since a node answers a call carrying
 several with one status for all of them.</li>
+</ul>
+<h2 id="the-validator-client-sends-committee_index0-at-gloas-slots"><a class="header" href="#the-validator-client-sends-committee_index0-at-gloas-slots">The validator client sends <code>committee_index=0</code> at gloas slots</a></h2>
+<ul>
+<li><strong>Beacon API:</strong> <code>GET /eth/v1/validator/attestation_data</code> marks
+<code>committee_index</code> deprecated and optional: “For slots in Electra and later,
+this parameter MAY always be set to 0. For slots in Gloas and later, this
+parameter SHOULD be omitted.”</li>
+<li><strong>ethlambda:</strong> the validator client sends <code>committee_index=0</code> at every fork,
+gloas included (<code>HttpBeaconNode::attestation_data_path</code>).</li>
+<li><strong>Why:</strong> Lighthouse (v8.3.3, and <code>unstable</code>) still declares the parameter
+required and answers a query without it with a <code>400</code>, so omitting it would
+miss every gloas attestation against a Lighthouse beacon node. The value
+changes nothing: Lighthouse’s handler produces the data for committee 0
+whatever the query names, ethlambda’s own beacon node ignores the
+parameter, and the answer’s <code>index</code> is the payload signal whatever was
+asked. ethlambda’s beacon node still answers a query that omits it, as
+spec-following validator clients send.</li>
+<li><strong>Until:</strong> Lighthouse’s <code>ValidatorAttestationDataQuery</code> makes
+<code>committee_index</code> optional. The gloas query can then omit it again, as the
+Beacon API asks.</li>
 </ul>
 
                     </main>
