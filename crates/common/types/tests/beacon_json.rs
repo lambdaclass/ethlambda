@@ -492,8 +492,8 @@ fn altair_state() -> altair::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -639,8 +639,8 @@ fn bellatrix_state() -> bellatrix::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -796,8 +796,8 @@ fn capella_state() -> capella::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -965,8 +965,8 @@ fn deneb_state() -> deneb::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -1160,8 +1160,8 @@ fn electra_state() -> electra::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -1187,7 +1187,8 @@ fn electra_state() -> electra::BeaconState {
         earliest_exit_epoch: 53,
         consolidation_balance_to_consume: 54,
         earliest_consolidation_epoch: 55,
-        pending_deposits: SszList::try_from(vec![fixtures::pending_deposit(60)])
+        pending_deposits: vec![fixtures::pending_deposit(60)]
+            .try_into()
             .expect("within capacity"),
         pending_partial_withdrawals: SszList::try_from(vec![fixtures::pending_partial_withdrawal(
             70,
@@ -1251,8 +1252,8 @@ fn fulu_state() -> fulu::BeaconState {
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
         randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
         slashings: fixtures::tree_vector(1_000_000_000u64),
-        previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
-        current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
+        previous_epoch_participation: vec![7u8].try_into().expect("within capacity"),
+        current_epoch_participation: vec![9u8].try_into().expect("within capacity"),
         justification_bits: {
             let mut bits = shared::JustificationBits::new();
             bits.set(0, true).expect("in bounds");
@@ -1278,7 +1279,8 @@ fn fulu_state() -> fulu::BeaconState {
         earliest_exit_epoch: 53,
         consolidation_balance_to_consume: 54,
         earliest_consolidation_epoch: 55,
-        pending_deposits: SszList::try_from(vec![fixtures::pending_deposit(60)])
+        pending_deposits: vec![fixtures::pending_deposit(60)]
+            .try_into()
             .expect("within capacity"),
         pending_partial_withdrawals: SszList::try_from(vec![fixtures::pending_partial_withdrawal(
             70,

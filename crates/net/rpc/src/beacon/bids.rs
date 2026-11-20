@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     builder_market::SharedBuilderMarket,
     gossip::{
@@ -30,7 +30,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::{containers::gloas::SignedExecutionPayloadBid, fork::ForkName};
 use tracing::{debug, warn};
 
-use crate::beacon::{ApiError, BodyEncoding};
+use crate::beacon::{ApiError, BodyEncoding, copy_if_listened, emit_accepted};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new().route("/eth/v1/beacon/execution_payload_bids", post(post_bid))
@@ -82,6 +82,7 @@ async fn post_bid(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(market): Extension<SharedBuilderMarket>,
+    events: Option<Extension<ethlambda_blockchain::EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -141,8 +142,14 @@ async fn post_bid(
     if !market.record_bid(bid.clone()) {
         return bad_request(describe(&Outcome::Ignore(IgnoreReason::AlreadySeen)));
     }
+    let for_event = copy_if_listened(events.as_deref(), &bid);
     match p2p.publish_execution_payload_bid(bid) {
         Ok(()) => {
+            if let Some(bid) = for_event {
+                emit_accepted(events.as_deref(), || {
+                    GossipEvent::ExecutionPayloadBid(Box::new(bid))
+                });
+            }
             debug!(
                 slot,
                 builder_index, "Accepted execution payload bid for gossip"

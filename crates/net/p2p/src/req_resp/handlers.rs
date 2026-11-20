@@ -3383,6 +3383,7 @@ pub(crate) mod tests {
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
+            gossip_events: None,
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }
