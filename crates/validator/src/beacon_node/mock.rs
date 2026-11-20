@@ -64,6 +64,8 @@ pub struct MockBeaconNode {
     /// still refuse is exactly "synced, but optimistic".
     pub optimistic: bool,
     pub validators: Vec<ValidatorEntry>,
+    /// What `registry` answers: every entry, pubkeys as a state holds them.
+    pub registry: Vec<(ValidatorIndex, [u8; 48])>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
     /// What `proposer_duties_v2` answers with, by epoch, like `proposers`.
@@ -846,6 +848,11 @@ impl BeaconNodeApi for MockBeaconNode {
             return Ok(Vec::new());
         }
         Ok(self.validators.clone())
+    }
+
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        self.guard("registry")?;
+        Ok(self.registry.clone())
     }
 
     async fn attester_duties(

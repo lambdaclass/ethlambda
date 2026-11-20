@@ -198,17 +198,62 @@ pub fn open_leaf_record(validators_dir: &Path, current_slot: Slot) -> std::io::R
     Ok(count)
 }
 
+/// The size of one record of ethereum-package's leanXMSS cache file
+/// (`xmss_cache_url`): what leanVM's `cache_to_bytes` writes for a key holding
+/// two bottom trees, its top tree's cached level (4096 bytes) then, for each
+/// bottom tree, its index, its top-layer signature and its cached level (5300
+/// bytes). leanVM keeps those sizes private; a record of another length is
+/// refused by `from_cache_bytes` anyway.
+pub const XMSS_CACHE_RECORD_SIZE: usize = 4096 + 2 * 5300;
+
+/// A key's record in the leanXMSS cache, with the public key the registry
+/// holds for the validator it was looked up by.
+pub struct XmssCacheRecord {
+    pub registered: [u8; leanvm_lean_xmss::PUB_KEY_SIZE],
+    pub bytes: Vec<u8>,
+}
+
+/// Where [`derive_and_register`] got a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// Loaded from its leanXMSS cache record.
+    Cached,
+    /// Built from its seed; no cache record was offered.
+    Built,
+    /// Built from its seed after its cache record was refused: not this
+    /// key's, or damaged.
+    CacheRefused,
+}
+
 /// Derives and registers the PQ key of the validator whose BLS key is
 /// `pubkey` and secret key `secret` (32 bytes, big-endian, as a keystore
-/// holds it). Slow, and on the calling thread alone: leanVM's key generation
-/// (about 2.4 s), plus building the bottom trees its next attestation and
-/// per-slot signatures fall in (about 2.5 s each). Run it off the async
-/// runtime, and spread many keys across cores.
+/// holds it).
+///
+/// With a `cached` record that is this key's, the key loads from it in
+/// milliseconds. Otherwise it is built: slow, and on the calling thread
+/// alone, leanVM's key generation (about 2.4 s). Either way the bottom trees
+/// its next attestation and per-slot signatures fall in are then built if the
+/// key lacks them (about 2.5 s each). Run it off the async runtime, and
+/// spread many keys across cores.
 ///
 /// The key signs from here on. Its VRF tree, which only a proposal reads, is
 /// [`prepare_vrf_tree`]'s to supply.
-pub fn derive_and_register(pubkey: BlsPubkey, secret: &[u8; 32], current_slot: Slot) {
-    let xmss = pq_keys::xmss_key(secret);
+pub fn derive_and_register(
+    pubkey: BlsPubkey,
+    secret: &[u8; 32],
+    current_slot: Slot,
+    cached: Option<&XmssCacheRecord>,
+) -> KeySource {
+    let loaded = cached.map(|record| {
+        let registered = leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(&record.registered);
+        let seed = pq_keys::xmss_seed(secret);
+        LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &registered, &record.bytes)
+    });
+    let (xmss, source) = match loaded {
+        Some(Some(xmss)) => (xmss, KeySource::Cached),
+        Some(None) => (pq_keys::xmss_key(secret), KeySource::CacheRefused),
+        None => (pq_keys::xmss_key(secret), KeySource::Built),
+    };
     let mut request_key = [0u8; 48];
     request_key[16..].copy_from_slice(&xmss.public_key().to_bytes());
     // Warm the two bottom trees duties sign in, so the first signature of each
@@ -226,6 +271,31 @@ pub fn derive_and_register(pubkey: BlsPubkey, secret: &[u8; 32], current_slot: S
     let mut registry = registry().write().expect("PQ key registry poisoned");
     registry.by_request.insert(request_key, pubkey);
     registry.by_bls.insert(pubkey, key);
+    source
+}
+
+/// The index of each of `keys`' registry entries: the one whose XMSS key's
+/// public parameter (its request form's last 16 bytes) is the one the key's
+/// seed gives. What the leanXMSS cache is looked up by, before any key is
+/// built. A key with no such entry is left out.
+pub fn indices_by_public_param(
+    keys: &[(BlsPubkey, [u8; 32])],
+    registry: &[(u64, [u8; 48])],
+) -> HashMap<BlsPubkey, (u64, [u8; leanvm_lean_xmss::PUB_KEY_SIZE])> {
+    let wanted: HashMap<[u8; 16], BlsPubkey> = keys
+        .iter()
+        .map(|(pubkey, secret)| (pq_keys::xmss_public_param(secret), *pubkey))
+        .collect();
+    registry
+        .iter()
+        .filter(|(_, request)| request[..16] == [0; 16])
+        .filter_map(|(index, request)| {
+            let param: [u8; 16] = request[32..].try_into().expect("16 bytes");
+            let pubkey = wanted.get(&param)?;
+            let registered = request[16..].try_into().expect("32 bytes");
+            Some((*pubkey, (*index, registered)))
+        })
+        .collect()
 }
 
 /// Whether any key is registered: the network schedules PQ and this client
@@ -391,49 +461,90 @@ pub fn adopt_vrf_state(
     Ok(())
 }
 
-/// The precomputed VRF state record of validator `index` from `source`: an
-/// HTTP(S) URL of a whole file of [`vrf::STATE_RECORD_SIZE`]-byte records,
-/// asked for the one record by range, or a path to such a file. `None` when
-/// the file does not reach that index.
-pub async fn fetch_vrf_state(
-    client: &reqwest::Client,
-    source: &str,
-    index: u64,
-) -> Result<Option<Vec<u8>>, String> {
-    let size = vrf::STATE_RECORD_SIZE as u64;
-    let first = index * size;
-    if !(source.starts_with("http://") || source.starts_with("https://")) {
-        // Read whole: such a file is about a kilobyte per validator, and this
-        // runs once per key, off the duty path.
-        let bytes = std::fs::read(source).map_err(|err| err.to_string())?;
-        let end = (first + size) as usize;
-        return Ok(bytes.get(first as usize..end).map(<[u8]>::to_vec));
+/// A file of fixed-size records indexed by validator index, read one record
+/// at a time: ethereum-package's `vrf_state_url` ([`vrf::STATE_RECORD_SIZE`])
+/// and `xmss_cache_url` ([`XMSS_CACHE_RECORD_SIZE`]) files. The source is an
+/// HTTP(S) URL, asked for each record by range, or a path.
+///
+/// A local file is read once. So is a remote one whose server ignores the
+/// range and sends the whole file: kept and sliced from then on, rather than
+/// downloaded again per key. Callers fetch one record before fetching the
+/// rest concurrently, so a whole-file answer is downloaded once.
+pub struct RecordFile {
+    client: reqwest::Client,
+    source: String,
+    record_size: usize,
+    whole: tokio::sync::Mutex<Option<Arc<Vec<u8>>>>,
+}
+
+impl RecordFile {
+    pub fn new(client: reqwest::Client, source: String, record_size: usize) -> Self {
+        Self {
+            client,
+            source,
+            record_size,
+            whole: tokio::sync::Mutex::new(None),
+        }
     }
-    let response = client
-        .get(source)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={first}-{}", first + size - 1),
-        )
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
-    let status = response.status();
-    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        return Ok(None);
+
+    pub fn source(&self) -> &str {
+        &self.source
     }
-    if !status.is_success() {
-        return Err(format!("{source} answered {status}"));
+
+    fn slice(&self, whole: &[u8], index: u64) -> Option<Vec<u8>> {
+        let first = usize::try_from(index).ok()?.checked_mul(self.record_size)?;
+        whole
+            .get(first..first.checked_add(self.record_size)?)
+            .map(<[u8]>::to_vec)
     }
-    let body = response.bytes().await.map_err(|err| err.to_string())?;
-    // A server that ignores the range sends the whole file.
-    let record = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        body.get(..size as usize)
-    } else {
-        body.get(first as usize..(first + size) as usize)
-    };
-    Ok(record.map(<[u8]>::to_vec))
+
+    /// Record `index`. `None` when the file does not reach it.
+    pub async fn fetch(&self, index: u64) -> Result<Option<Vec<u8>>, String> {
+        if let Some(whole) = self.whole.lock().await.clone() {
+            return Ok(self.slice(&whole, index));
+        }
+        let remote = self.source.starts_with("http://") || self.source.starts_with("https://");
+        if !remote {
+            let mut whole = self.whole.lock().await;
+            if whole.is_none() {
+                let bytes = tokio::fs::read(&self.source)
+                    .await
+                    .map_err(|err| format!("{}: {err}", self.source))?;
+                *whole = Some(Arc::new(bytes));
+            }
+            let bytes = whole.clone().expect("just read");
+            return Ok(self.slice(&bytes, index));
+        }
+        let size = self.record_size as u64;
+        let first = index * size;
+        let response = self
+            .client
+            .get(&self.source)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={first}-{}", first + size - 1),
+            )
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = response.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("{} answered {status}", self.source));
+        }
+        let body = response.bytes().await.map_err(|err| err.to_string())?;
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            return Ok(body.get(..self.record_size).map(<[u8]>::to_vec));
+        }
+        // The server ignored the range and sent the whole file: keep it.
+        let whole = Arc::new(body.to_vec());
+        let record = self.slice(&whole, index);
+        *self.whole.lock().await = Some(whole);
+        Ok(record)
+    }
 }
 
 /// Gives `pubkey`'s registered key its VRF tree: the one stored under
@@ -507,7 +618,7 @@ mod tests {
     fn a_request_key_maps_back_and_a_leaf_signs_once() {
         let secret = [7u8; 32];
         let pubkey = BlsPubkey([9; 48]);
-        derive_and_register(pubkey, &secret, 0);
+        derive_and_register(pubkey, &secret, 0, None);
         let request = request_key(&pubkey).unwrap();
         assert_eq!(request[..16], [0; 16]);
         assert_eq!(bls_for_request_key(&request), Some(pubkey));
@@ -528,6 +639,115 @@ mod tests {
             sign(&pubkey, 1 << 32, Root::from([1; 32])),
             Err(PqSignError::LeafOutOfRange(_))
         ));
+    }
+
+    /// What ethereum-package's leanXMSS cache file holds for the key `secret`
+    /// grows: leanVM's `cache_to_bytes` of it holding the bottom trees of the
+    /// first attestation and slot leaves. With the key's public key.
+    fn cache_record(secret: &[u8; 32]) -> ([u8; 32], Vec<u8>) {
+        let key = pq_keys::xmss_key(secret);
+        key.prepare(attestation_leaf(0) as u32);
+        key.prepare(slot_leaf(0, 0) as u32);
+        let bytes = key.cache_to_bytes();
+        assert_eq!(bytes.len(), XMSS_CACHE_RECORD_SIZE);
+        (key.public_key().to_bytes(), bytes)
+    }
+
+    #[test]
+    fn a_key_is_found_by_its_public_parameter_and_loads_from_its_cache_record() {
+        let secret = [15u8; 32];
+        let pubkey = BlsPubkey([15; 48]);
+        let (public, bytes) = cache_record(&secret);
+
+        // Found in the registry with no tree built: by its public parameter,
+        // past a BLS entry and an XMSS entry with another parameter.
+        let mut request = [0u8; 48];
+        request[16..].copy_from_slice(&public);
+        let mut other = request;
+        other[47] ^= 1;
+        let mut bls = [0u8; 48];
+        bls[0] = 0xa0;
+        let registry = [(0, bls), (1, other), (2, request)];
+        let found = indices_by_public_param(&[(pubkey, secret)], &registry);
+        assert_eq!(found, HashMap::from([(pubkey, (2, public))]));
+
+        let record = XmssCacheRecord {
+            registered: public,
+            bytes: bytes.clone(),
+        };
+        assert_eq!(
+            derive_and_register(pubkey, &secret, 0, Some(&record)),
+            KeySource::Cached
+        );
+        assert_eq!(request_key(&pubkey), Some(request));
+        let leaf = slot_leaf(3, LEAF_OFFSET_PTC_ATTESTER);
+        let signature = sign(&pubkey, leaf, Root::from([4; 32])).unwrap();
+        assert!(ethlambda_crypto::lean_xmss::verify(
+            &public,
+            leaf,
+            &[4; 32],
+            &signature.0
+        ));
+        // A loaded key signs what a built one does.
+        let built = pq_keys::xmss_key(&secret);
+        let expected = leanvm_lean_xmss::sign(&built, &[4; 32], leaf as u32);
+        assert_eq!(signature.0, expected.to_bytes());
+
+        // A damaged record, or one under another public key, is refused and
+        // the key built.
+        let mut damaged = bytes.clone();
+        damaged[100] ^= 1;
+        let damaged = XmssCacheRecord {
+            registered: public,
+            bytes: damaged,
+        };
+        assert_eq!(
+            derive_and_register(BlsPubkey([16; 48]), &secret, 0, Some(&damaged)),
+            KeySource::CacheRefused
+        );
+        let mut elsewhere = public;
+        elsewhere[0] ^= 1;
+        let misregistered = XmssCacheRecord {
+            registered: elsewhere,
+            bytes,
+        };
+        assert_eq!(
+            derive_and_register(BlsPubkey([17; 48]), &secret, 0, Some(&misregistered)),
+            KeySource::CacheRefused
+        );
+    }
+
+    /// A server that ignores `Range` sends the whole file each time: it is
+    /// downloaded once and sliced from then on.
+    #[tokio::test]
+    async fn a_whole_file_answer_is_downloaded_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let file: Vec<u8> = (0..30u8).collect();
+        let app = {
+            let hits = hits.clone();
+            axum::Router::new().route(
+                "/records",
+                axum::routing::get(move || {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let file = file.clone();
+                    async move { file }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let records = RecordFile::new(
+            reqwest::Client::new(),
+            format!("http://{address}/records"),
+            10,
+        );
+        assert_eq!(records.fetch(1).await.unwrap(), Some((10..20).collect()));
+        assert_eq!(records.fetch(0).await.unwrap(), Some((0..10).collect()));
+        assert_eq!(records.fetch(3).await.unwrap(), None);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// The bytes of a tree for `vrf_seed` that `from_bytes` accepts. A whole
@@ -559,7 +779,7 @@ mod tests {
     fn a_key_signs_before_its_vrf_tree_and_proves_once_it_is_stored() {
         let secret = [8u8; 32];
         let pubkey = BlsPubkey([10; 48]);
-        derive_and_register(pubkey, &secret, 0);
+        derive_and_register(pubkey, &secret, 0, None);
         // Registered and signing, with no tree yet: a proposal is refused.
         assert!(sign(&pubkey, attestation_leaf(0), Root::from([1; 32])).is_ok());
         assert!(matches!(
@@ -615,7 +835,7 @@ mod tests {
     async fn a_precomputed_state_gives_a_key_its_tree_for_this_and_the_next_start() {
         let secret = [12u8; 32];
         let pubkey = BlsPubkey([13; 48]);
-        derive_and_register(pubkey, &secret, 0);
+        derive_and_register(pubkey, &secret, 0, None);
         let vrf_seed = pq_keys::vrf_seed(&secret);
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(restore_vrf_tree(&pubkey, directory.path()), None);
@@ -625,13 +845,13 @@ mod tests {
         let theirs = stand_in_state_record([3; 32]);
         let file = directory.path().join("states.vrf");
         std::fs::write(&file, [theirs.clone(), ours.clone()].concat()).unwrap();
-        let client = reqwest::Client::new();
-        let source = file.to_str().unwrap();
-        assert_eq!(
-            fetch_vrf_state(&client, source, 1).await.unwrap(),
-            Some(ours.clone())
+        let states = RecordFile::new(
+            reqwest::Client::new(),
+            file.to_str().unwrap().to_string(),
+            vrf::STATE_RECORD_SIZE,
         );
-        assert_eq!(fetch_vrf_state(&client, source, 2).await.unwrap(), None);
+        assert_eq!(states.fetch(1).await.unwrap(), Some(ours.clone()));
+        assert_eq!(states.fetch(2).await.unwrap(), None);
 
         // Another validator's record is refused, ours adopted and stored.
         assert!(matches!(

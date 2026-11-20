@@ -44,6 +44,15 @@ pub fn xmss_key(bls_secret_key: &[u8; 32]) -> leanvm_lean_xmss::LeanXmssExpanded
     leanvm_lean_xmss::key_gen(&xmss_seed(bls_secret_key)).0
 }
 
+/// The public parameter of a validator's leanXMSS key: the last 16 bytes of
+/// its public key, derived from the seed by two hashes, without building a
+/// tree. What a validator finds its own registry entry by before it has its
+/// key (the root, the other 16 bytes, needs the whole top tree).
+pub fn xmss_public_param(bls_secret_key: &[u8; 32]) -> [u8; 16] {
+    use leanvm_lean_xmss::internals::{public_param, scheme_seed};
+    public_param(&scheme_seed(&xmss_seed(bls_secret_key)))
+}
+
 /// The BIP-39 seed of `mnemonic` with no passphrase: PBKDF2-HMAC-SHA512 over
 /// 2048 rounds, salted with `"mnemonic"`. What genesis generators and
 /// deposit tools derive validator keys from.
@@ -141,9 +150,8 @@ mod tests {
     #[test]
     fn lighthouse_known_xmss_key() {
         let sk = hex32("2892f3ba475c3640a67fe730798ad9c4eed3a6d934db85f91c41cfc837ce8834");
-        assert_eq!(
-            xmss_key(&sk).public_key().to_bytes(),
-            hex32("155a29b971da2b771fdf52c768af63fa03f78f25487e3e0ed03d012b7039d88b")
-        );
+        let public = hex32("155a29b971da2b771fdf52c768af63fa03f78f25487e3e0ed03d012b7039d88b");
+        assert_eq!(xmss_key(&sk).public_key().to_bytes(), public);
+        assert_eq!(xmss_public_param(&sk), public[16..]);
     }
 }

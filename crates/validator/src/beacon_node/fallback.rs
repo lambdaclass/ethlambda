@@ -327,6 +327,10 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        self.try_each("registry", |node| node.registry()).await
+    }
+
     async fn attester_duties(
         &self,
         epoch: Epoch,

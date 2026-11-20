@@ -34,8 +34,9 @@ tracing.workspace = true
 # `time` for the duty loop's sleep between slots, `rt` for `spawn_blocking`,
 # which keeps the slashing-protection record's disk flush off the executor.
 # Declared here rather than relied on through workspace feature unification,
-# so this crate still builds if it is ever compiled on its own.
-tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# so this crate still builds if it is ever compiled on its own. `sync` and
+# `fs` for the PQ record files (`pq::RecordFile`).
+tokio = { workspace = true, features = ["time", "macros", "rt", "sync", "fs"] }
 # `CancellationToken`: the signal that stops the client when the
 # slashing-protection record becomes unusable, and the one that tells the
 # keymanager server to finish its requests in flight.

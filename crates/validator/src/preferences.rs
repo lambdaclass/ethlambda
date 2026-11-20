@@ -1051,7 +1051,7 @@ mod tests {
         let store = Arc::new(RwLock::new(store));
         let slot = slot_in(GLOAS_EPOCH, 10);
         let current = slot_in(GLOAS_EPOCH, 1);
-        crate::pq::derive_and_register(pubkeys[0], &[21; 32], current);
+        crate::pq::derive_and_register(pubkeys[0], &[21; 32], current, None);
         let mut config = context().config.clone();
         config = config
             .with_fork_epoch(ForkName::Eip8483, GLOAS_EPOCH)

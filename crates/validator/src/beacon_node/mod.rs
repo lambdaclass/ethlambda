@@ -419,6 +419,16 @@ pub trait BeaconNodeApi: Send + Sync {
     /// loaded, and the answer it wants is "none of them", not "all of them".
     async fn validator_indices(&self, pubkeys: &[BlsPubkey]) -> Result<Vec<ValidatorEntry>>;
 
+    /// Every validator in the head state's registry: its index and its
+    /// pubkey exactly as the state holds it (on the PQ fork, an XMSS key in
+    /// request form), with no mapping to a local key.
+    ///
+    /// The whole registry, deliberately: before a PQ key is built its only
+    /// known part is its public parameter, which no id lookup takes, so the
+    /// leanXMSS cache (`crate::pq::xmss_cache`) finds a key's entry by scanning
+    /// for it. Only that startup lookup calls this, on networks of devnet size.
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>>;
+
     /// The attester duties for `indices` in `epoch`, and the block root the
     /// schedule was computed against. A reorg past that root invalidates the
     /// schedule; the caller is the one that notices, by comparing roots.

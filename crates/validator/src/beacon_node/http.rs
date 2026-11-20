@@ -709,6 +709,25 @@ impl BeaconNodeApi for HttpBeaconNode {
             .collect()
     }
 
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        // No ids: the endpoint answers for every validator.
+        let response: DataResponse<Vec<ValidatorEntryDto>> =
+            self.get("/eth/v1/beacon/states/head/validators").await?;
+        response
+            .data
+            .into_iter()
+            .map(|entry| {
+                let text = entry.validator.pubkey;
+                let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(&text))
+                    .map_err(|err| Error::Decode(format!("bad pubkey hex: {err}")))?;
+                let pubkey = <[u8; 48]>::try_from(bytes).map_err(|got| {
+                    Error::Decode(format!("pubkey is {} bytes, expected 48", got.len()))
+                })?;
+                Ok((entry.index, pubkey))
+            })
+            .collect()
+    }
+
     async fn attester_duties(
         &self,
         epoch: Epoch,
