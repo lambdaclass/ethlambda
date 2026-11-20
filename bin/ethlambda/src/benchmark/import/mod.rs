@@ -9,6 +9,7 @@ use eyre::WrapErr as _;
 
 pub(crate) mod corpus;
 pub(crate) mod fetch;
+pub(crate) mod process;
 pub(crate) mod replay;
 pub(crate) mod source;
 

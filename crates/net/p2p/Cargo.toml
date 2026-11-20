@@ -13,6 +13,7 @@ version.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-storage.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-telemetry.workspace = true
 ethlambda-types.workspace = true
 # For `verify_data_column_sidecar`, the one sidecar check cheap enough to run
 # in the gossip loop: pure structural validation, no KZG. `blst` and `c-kzg`

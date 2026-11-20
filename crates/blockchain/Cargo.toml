@@ -18,6 +18,7 @@ ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-telemetry.workspace = true
 ethlambda-types.workspace = true
 ethlambda-test-fixtures.workspace = true
 

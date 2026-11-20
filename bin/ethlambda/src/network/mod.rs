@@ -336,7 +336,8 @@ impl NetworkSource {
         }
     }
 
-    /// The bootnodes this network ships, before `--bootnodes` overrides them.
+    /// The bootnodes this network ships, which `beacon`'s `--bootnodes`
+    /// entries are added to (never replace).
     pub(crate) fn bootnodes(&self) -> Vec<String> {
         match self {
             Self::BuiltIn(built_in) => built_in.bootnodes.clone(),
