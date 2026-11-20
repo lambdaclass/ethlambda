@@ -2670,13 +2670,18 @@ impl BlockChainServer {
     /// Run the Fast Confirmation Rule once and publish its `fast_confirmation`
     /// event, from the head fork choice just recorded.
     ///
-    /// Skipped, and the rule's variables reset to the finalized checkpoint,
-    /// while the head is more than [`events::HEAD_EVENT_RECENCY_SLOTS`] behind
-    /// the wall clock: the rule assumes synchrony from the start of the
-    /// previous slot, a catching-up node has none, and its stored heads would
-    /// be stale (and eventually pruned). Same staleness gate as the `head`
-    /// event. A failure is logged and the event withheld; the next slot runs
-    /// again from the variables as they were.
+    /// Skipped, and the rule reset ([`Store::reset_fast_confirmation`]), while
+    /// the head is more than [`events::HEAD_EVENT_RECENCY_SLOTS`] behind the
+    /// wall clock: the rule assumes synchrony from the start of the previous
+    /// slot, a catching-up node has none, and its stored heads would be stale
+    /// (and eventually pruned). Same staleness gate as the `head` event.
+    ///
+    /// Also skipped once the slot's attestation deadline has passed (a tick
+    /// held up behind a long import, say): the specification requires
+    /// `update_fast_confirmation_variables` to run before
+    /// `get_attestation_due_ms` into the slot. The slot then has no run, and
+    /// the next one starts over (see `fast_confirmation::run_fast_confirmation`).
+    /// A failed run is logged and the event withheld, with the same effect.
     fn run_fast_confirmation(&mut self) {
         let Some((head_slot, head_root)) = self.store.beacon_head() else {
             return;
@@ -2686,16 +2691,48 @@ impl BlockChainServer {
             return;
         }
         let config = self.store.config();
+        // Read now, after the head computation, rather than at the tick: the
+        // variables are updated by the run below.
+        let slot = fork_choice::get_current_slot(&self.store, &config);
+        let deadline_ms = config
+            .genesis_time_ms()
+            .saturating_add(slot.saturating_mul(config.slot_duration_ms))
+            .saturating_add(fork_choice::get_attestation_due_ms(
+                compute_epoch_at_slot(slot),
+                &config,
+            ));
+        let now_ms = unix_now_ms();
+        if now_ms >= deadline_ms {
+            warn!(
+                %slot,
+                late_ms = now_ms - deadline_ms,
+                "Skipping this slot's fast confirmation run: past the attestation deadline; \
+                 the next slot's run starts over"
+            );
+            return;
+        }
+        if let Some(last_slot) = self.store.fast_confirmation_slot()
+            && last_slot + 1 < slot
+        {
+            info!(
+                %slot,
+                last_slot,
+                "Fast confirmation starts over: a slot went by without a run"
+            );
+        }
         let result = {
             let _timing = metrics::time_beacon_fast_confirmation();
             fast_confirmation::run_fast_confirmation(&self.store, &config, head_root)
         };
         match result {
-            Ok(confirmation) => self.events.publish_fast_confirmation(
+            Ok(Some(confirmation)) => self.events.publish_fast_confirmation(
                 confirmation.block,
                 confirmation.slot,
                 confirmation.current_slot,
             ),
+            // This slot already had its run (a tick that fired while the wall
+            // clock still read the slot before).
+            Ok(None) => {}
             Err(err) => warn!(%err, "Fast confirmation run failed"),
         }
     }

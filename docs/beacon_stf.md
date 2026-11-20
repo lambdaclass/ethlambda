@@ -590,14 +590,25 @@ assertion). A later bump should diff those three files against that commit.
   specification names it. `FastConfirmationStore` is the specification's own
   store: a borrowed fork-choice `Store` plus the six variables. The variables
   live in the `Store` between runs (`Store::fast_confirmation`, beside the rest
-  of the beacon fork-choice scratch); only `confirmed_root` is persisted.
+  of the beacon fork-choice scratch), with the slot of the run that wrote
+  them; only the reported confirmed root is persisted.
 - **When it runs.** Once per slot, in the beacon actor's tick, after the clock
   advance, the deferred aggregates and the head recompute (so past slots'
   attestations are applied) and before `forkchoiceUpdated`, whose safe block it
-  decides. Not on imports, which recompute the head many times a slot. It is
-  skipped, and its variables reset to the finalized checkpoint, while the head
-  is more than 32 slots behind the wall clock (the `head` event's gate): the
-  rule assumes synchrony from the start of the previous slot.
+  decides. Not on imports, which recompute the head many times a slot. A
+  second run for a slot (a tick that fired while the wall clock still read the
+  slot before) is not run. It is skipped, and reset, while the head is more
+  than 32 slots behind the wall clock (the `head` event's gate): the rule
+  assumes synchrony from the start of the previous slot. It is skipped, too,
+  when the tick is handled past the slot's attestation deadline, which the
+  specification sets for `update_fast_confirmation_variables`.
+- **Missed slots.** The variables must be updated in every slot (the observed
+  checkpoints rotate only in an epoch boundary's own slot, and
+  `previous_slot_head` must be the previous slot's head), so a run whose
+  previous run was not in the slot before starts over from the finalized
+  checkpoint, the way a restarted node does, and the root last reported goes
+  to the restart rule below. How often that happens on a live node is not
+  measured; each one is logged.
 - **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
   the engine's safe block hash (`get_safe_execution_block_hash`), which falls
   back to the finalized block while the confirmed one is off the head's chain
@@ -633,8 +644,14 @@ assertion). A later bump should diff those three files against that commit.
   about 14 ms in its first, as the head computation's once-an-epoch
   proto-array rebuild does. `lean_beacon_fast_confirmation_time_seconds` times
   a run.
-- **Restart.** The confirmed root is persisted when it changes, and the first
-  synced run of a process offers it to `get_restart_resilient_confirmed_root`.
+- **Restart.** The reported confirmed root is persisted when it changes. A
+  run that starts over (the first synced run of a process, or one after a
+  missed slot) holds the root reported before it, and every run asks
+  `get_restart_resilient_confirmed_root` about it until the rule's own answer
+  wins, at which point it is dropped. As in the specification, that function
+  only decides what is reported (the event and the safe block); its answer is
+  never written into the rule's own `confirmed_root`, so the rule extends its
+  own confirmation chain with the observed checkpoints it actually has.
 - **Tests.** No fixtures exist; the pyspec scenarios are ported as unit tests in
   the module, on a store built directly (see the comment above them for what
   they emulate and which scenarios are not ported).

@@ -932,9 +932,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
 - **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, consensus-specs
   `master` @ `f993cf2`, not the pinned release): run once per slot by the beacon
-  actor's tick after the head recompute and before `forkchoiceUpdated`; its
-  confirmed root is the engine's safe hash and feeds the `fast_confirmation`
-  event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
+  actor's tick after the head recompute and before `forkchoiceUpdated` (not
+  past the slot's attestation deadline; a run after a slot without one starts
+  over like a restart, offering the last reported root to
+  `get_restart_resilient_confirmed_root`, whose answer is reported but never
+  written into the rule's own `confirmed_root`); its reported root is the
+  engine's safe hash while it is on the head's chain, and feeds the
+  `fast_confirmation` event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
   in a `RunContext`. It runs on the actor, so it must stay about as cheap as
   `get_head`: it reads the fork choice's caches rather than the registry or
   every vote (balance sources from the per-checkpoint `JustifiedBalances`,

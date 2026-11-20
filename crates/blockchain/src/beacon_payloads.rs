@@ -503,7 +503,7 @@ mod tests {
 
     fn confirm(store: &Store, root: H256) {
         let checkpoint = ethlambda_types::beacon::containers::Checkpoint { epoch: 0, root };
-        store.set_fast_confirmation(FastConfirmationVariables::at_finalized(checkpoint));
+        store.set_fast_confirmation(0, FastConfirmationVariables::at_finalized(checkpoint), root);
     }
 
     fn gloas_block(
