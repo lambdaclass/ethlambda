@@ -949,6 +949,22 @@ impl BeaconNodeApi for HttpBeaconNode {
         .map(|()| Delivery::Everywhere)
     }
 
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        if preferences.is_empty() {
+            return Ok(Delivery::Everywhere);
+        }
+        self.post_no_content(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+        .map(|()| Delivery::Everywhere)
+    }
+
     async fn execution_payload_envelope(
         &self,
         slot: Slot,

@@ -127,7 +127,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use ethlambda_types::beacon::constants::LEAF_OFFSET_PROPOSER_PREFERENCES;
 use ethlambda_types::beacon::containers::gloas::{ProposerPreferences, SignedProposerPreferences};
+use ethlambda_types::beacon::containers::pq;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, ExecutionAddress, Root, Slot};
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
@@ -208,6 +210,24 @@ impl Sent {
     }
 }
 
+/// Where one `(proposal_slot, dependent_root)`'s PQ preference stands.
+///
+/// Simpler than [`Sent`] because a PQ preference is never signed afresh: it
+/// is signed with leanXMSS at its proposal slot's preferences leaf, which
+/// takes one message only (`pq/p2p-interface.md`: a proposer "must not sign
+/// preferences for the same proposal slot under two different dependent
+/// roots"). `crate::pq` refuses a second root at the leaf, so a reorg that
+/// moves the dependent root leaves the slot without preferences rather than
+/// with two. The message as signed is sent until every node holds it, then
+/// again once a round like gloas's.
+#[derive(Debug, Clone)]
+struct PqSent {
+    signed: pq::SignedProposerPreferences,
+    /// The round every node last accepted it in, `None` while some node has
+    /// not.
+    everywhere: Option<Epoch>,
+}
+
 /// Where a preference stood before this poll sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Before {
@@ -245,6 +265,9 @@ pub struct PreferencesService<B> {
     /// sent again once an epoch after. A reorg that moves the root starts a
     /// new entry. Pruned below the current epoch.
     sent: Mutex<HashMap<(Slot, Root), Sent>>,
+    /// The PQ fork's, by `(proposal_slot, dependent_root)`: see [`PqSent`].
+    /// Pruned like `sent`.
+    pq_sent: Mutex<HashMap<(Slot, Root), PqSent>>,
     /// Epochs whose missing fee recipients were already warned about, so the
     /// warning is once per epoch rather than once per slot. Pruned like
     /// `sent`.
@@ -302,6 +325,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             context,
             settings,
             sent: Mutex::new(HashMap::new()),
+            pq_sent: Mutex::new(HashMap::new()),
             no_fee_warned: Mutex::new(HashSet::new()),
             fetch_warned: Mutex::new(HashSet::new()),
             in_flight: InFlight::default(),
@@ -330,6 +354,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         let epoch = compute_epoch_at_slot(current_slot);
         let epoch_start = compute_start_slot_at_epoch(epoch);
         lock(&self.sent).retain(|(slot, _), _| *slot >= epoch_start);
+        lock(&self.pq_sent).retain(|(slot, _), _| *slot >= epoch_start);
         lock(&self.no_fee_warned).retain(|warned| *warned >= epoch);
         lock(&self.fetch_warned).retain(|warned| *warned >= epoch);
     }
@@ -409,6 +434,11 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         };
         let dependent_root = duties.dependent_root;
         let round = round_of(current_slot);
+        if self.context.config.fork_at_epoch(target) == ForkName::Pq {
+            return self
+                .publish_pq_epoch(current_slot, target, dependent_root, duties.duties, pubkeys)
+                .await;
+        }
 
         let mut owed = Vec::new();
         let mut resend = Vec::new();
@@ -503,6 +533,110 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             );
         }
         tallies.iter().filter(|tally| tally.published).count()
+    }
+
+    /// [`Self::publish_epoch`] at a PQ epoch: each owed preference is signed
+    /// once, with leanXMSS at its slot's preferences leaf (see [`PqSent`]),
+    /// and sent, as signed, to every node until all of them hold it, then
+    /// again once a round. Returns how many some node accepted for the first
+    /// time.
+    async fn publish_pq_epoch(
+        &self,
+        current_slot: Slot,
+        target: Epoch,
+        dependent_root: Root,
+        duties: Vec<ProposerDutyDto>,
+        pubkeys: &HashSet<BlsPubkey>,
+    ) -> usize {
+        let round = round_of(current_slot);
+        let mut published = 0;
+        let mut no_fee_recipient = 0usize;
+        for duty in within_epoch(target, duties) {
+            if self.started(duty.slot, current_slot) {
+                continue;
+            }
+            let Ok(pubkey) = parse_pubkey(&duty.pubkey) else {
+                continue;
+            };
+            if !pubkeys.contains(&pubkey) {
+                continue;
+            }
+            let key = (duty.slot, dependent_root);
+            let held = lock(&self.pq_sent).get(&key).cloned();
+            let (signed, first) = match held {
+                Some(PqSent {
+                    everywhere: Some(done),
+                    ..
+                }) if done >= round => continue,
+                Some(PqSent { signed, .. }) => (signed, false),
+                None => {
+                    let Some((fee_recipient, target_gas_limit)) =
+                        self.settings.fee_recipient_and_gas_limit(&pubkey)
+                    else {
+                        no_fee_recipient += 1;
+                        continue;
+                    };
+                    let message = ProposerPreferences {
+                        dependent_root,
+                        proposal_slot: duty.slot,
+                        validator_index: duty.validator_index,
+                        fee_recipient,
+                        target_gas_limit,
+                    };
+                    let root = self.context.proposer_preferences_signing_root(&message);
+                    let leaf = crate::pq::slot_leaf(duty.slot, LEAF_OFFSET_PROPOSER_PREFERENCES);
+                    match crate::pq::sign(&pubkey, leaf, root) {
+                        Ok(signature) => {
+                            (pq::SignedProposerPreferences { message, signature }, true)
+                        }
+                        // Most often a reorg: the slot was signed for under
+                        // another dependent root, and its leaf takes one.
+                        Err(err) => {
+                            debug!(
+                                slot = duty.slot,
+                                validator = duty.validator_index,
+                                %err,
+                                "Not signing PQ proposer preferences for this slot"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            let answer = self
+                .beacon_node
+                .submit_pq_proposer_preferences(std::slice::from_ref(&signed))
+                .await;
+            let everywhere = match &answer {
+                Ok(Delivery::Everywhere) => Some(round),
+                Ok(Delivery::Partly) => None,
+                Err(err) => {
+                    crate::metrics::inc_proposer_preferences_failures();
+                    if first && !self.started(duty.slot, current_slot) {
+                        warn!(
+                            slot = duty.slot,
+                            validator = duty.validator_index,
+                            %err,
+                            "No beacon node accepted a PQ proposer preference; sending it again \
+                             each slot"
+                        );
+                    }
+                    None
+                }
+            };
+            if first && answer.is_ok() {
+                published += 1;
+            }
+            lock(&self.pq_sent).insert(key, PqSent { signed, everywhere });
+        }
+        if no_fee_recipient > 0 && lock(&self.no_fee_warned).insert(target) {
+            warn!(
+                epoch = target,
+                skipped = no_fee_recipient,
+                "Validators without a fee recipient publish no proposer preferences"
+            );
+        }
+        published
     }
 
     /// Sign each of `owed`, skipping with a warning any it cannot sign, such as
@@ -900,6 +1034,72 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[1].1[0].message.dependent_root, Root::repeat_byte(0x33));
         assert!(verifies(&pubkeys[0], &sent[1].1[0]));
+    }
+
+    /// At a PQ epoch a preference is signed with leanXMSS at its slot's
+    /// preferences leaf, sent once while every node holds it, and never
+    /// signed again for that slot under another dependent root: the leaf
+    /// takes one message.
+    #[tokio::test]
+    async fn a_pq_preference_is_signed_once_per_slot_at_its_leaf() {
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let slot = slot_in(GLOAS_EPOCH, 10);
+        let current = slot_in(GLOAS_EPOCH, 1);
+        crate::pq::derive_and_register(pubkeys[0], &[21; 32], current);
+        let mut config = context().config.clone();
+        config = config
+            .with_fork_epoch(ForkName::Eip8483, GLOAS_EPOCH)
+            .with_fork_epoch(ForkName::Pq, GLOAS_EPOCH);
+        let context = Arc::new(SigningContext {
+            config,
+            genesis_validators_root: Root::repeat_byte(0x42),
+        });
+        let node = Arc::new(MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![duty(&pubkeys[0], 3, slot)],
+        ));
+        let service = Arc::new(PreferencesService::new(
+            node.clone(),
+            context.clone(),
+            settings(Some(FEE_RECIPIENT)),
+        ));
+
+        service.clone().poll(current, store.clone()).await;
+        let sent = node.submitted_pq_preferences.lock().expect("lock").clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            submitted(&node).is_empty(),
+            "no gloas preference at a PQ epoch"
+        );
+        let entry = &sent[0];
+        assert_eq!(entry.message.proposal_slot, slot);
+        assert_eq!(entry.message.dependent_root, Root::repeat_byte(0x11));
+        let leaf = crate::pq::slot_leaf(slot, LEAF_OFFSET_PROPOSER_PREFERENCES);
+        let public: [u8; 32] = crate::pq::request_key(&pubkeys[0]).unwrap()[16..]
+            .try_into()
+            .unwrap();
+        let root = context.proposer_preferences_signing_root(&entry.message);
+        assert!(ethlambda_crypto::lean_xmss::verify(
+            &public,
+            leaf,
+            &root.0,
+            &entry.signature.0
+        ));
+
+        // Held everywhere: not sent again this round.
+        service.clone().poll(current + 1, store.clone()).await;
+        assert_eq!(node.submitted_pq_preferences.lock().expect("lock").len(), 1);
+
+        // A reorg moves the dependent root: the slot's leaf is spent.
+        node.set_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x33),
+            vec![duty(&pubkeys[0], 3, slot)],
+        );
+        service.poll(current + 2, store).await;
+        assert_eq!(node.submitted_pq_preferences.lock().expect("lock").len(), 1);
     }
 
     /// A reorg that moves a slot from one of this client's validators to

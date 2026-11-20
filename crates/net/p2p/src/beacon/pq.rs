@@ -366,6 +366,7 @@ pub(crate) fn publish_pq_gossip(
         PqGossipObject::Attestation { attestation, .. } => attestation.data.slot,
         PqGossipObject::Aggregate { aggregate, .. } => aggregate.message.aggregate.data.slot,
         PqGossipObject::PayloadAttestation(message) => message.data.slot,
+        PqGossipObject::ProposerPreferences(preferences) => preferences.message.proposal_slot,
     };
     let Some(beacon) = server.wire.beacon() else {
         warn!(slot, "A PQ message reached a lean node; dropping it");
@@ -415,6 +416,12 @@ pub(crate) fn publish_pq_gossip(
                 message.to_ssz(),
             )
         }
+        // The Beacon API recorded it in the PQ builder market it shares with
+        // gossip validation, so a peer relaying it back is already seen.
+        PqGossipObject::ProposerPreferences(preferences) => (
+            beacon_topics::topic_name(digest, beacon_topics::PROPOSER_PREFERENCES),
+            preferences.to_ssz(),
+        ),
     };
     server.swarm_handle.publish(
         IdentTopic::new(topic),
@@ -446,6 +453,8 @@ pub(crate) fn publish_pq_gossip(
                     |err| warn!(%err, "Failed to hand over a published PQ payload attestation"),
                 );
         }
+        // Read by bid validation and block production, never by fork choice.
+        PqGossipObject::ProposerPreferences(_) => {}
     }
 }
 

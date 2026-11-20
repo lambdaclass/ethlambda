@@ -542,6 +542,40 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         }
     }
 
+    /// [`Self::submit_proposer_preferences`]'s delivery, for the PQ fork's
+    /// container: every node gets it, since each gossips only what it took.
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        let outcome_unknown = std::sync::atomic::AtomicBool::new(false);
+        let delivery = self
+            .try_all_quiet(
+                "submit_pq_proposer_preferences",
+                "it will not gossip these proposer preferences",
+                |node| {
+                    let outcome_unknown = &outcome_unknown;
+                    Box::pin(async move {
+                        node.submit_pq_proposer_preferences(preferences)
+                            .await
+                            .inspect_err(|err| {
+                                if err.outcome_unknown() {
+                                    outcome_unknown
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            })
+                    })
+                },
+            )
+            .await;
+        match delivery {
+            Err(Error::AllBeaconNodesFailed(detail)) if outcome_unknown.into_inner() => {
+                Err(Error::NoNodeConfirmed(detail))
+            }
+            other => other,
+        }
+    }
+
     /// Fails over like any query: the envelope the node cached is only on the
     /// node that produced the block, and one that did not answers 404.
     async fn execution_payload_envelope(

@@ -15,14 +15,22 @@ use axum::{
     routing::post,
 };
 use ethlambda_blockchain::EventBus;
-use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
+use ethlambda_network_api::{GossipEvent, PqGossipObject, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket,
-    gossip::{IgnoreReason, Outcome, proposer_preferences::validate},
+    builder_market::{
+        BuilderMarket, SharedBuilderMarket, SharedPqBuilderMarket, SignedBid, SignedPreferences,
+    },
+    gossip::{
+        IgnoreReason, Outcome,
+        proposer_preferences::{PreferencesRules, validate},
+    },
     preset,
 };
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::{containers::gloas::SignedProposerPreferences, fork::ForkName};
+use ethlambda_types::beacon::{
+    containers::{gloas::SignedProposerPreferences, pq},
+    fork::ForkName,
+};
 use serde::Serialize;
 use tracing::{debug, warn};
 
@@ -59,10 +67,15 @@ struct Failure {
 /// against them, then gossiped; the others are reported by position and the
 /// rest still go out. An entry already cached, identical, is a success that is
 /// not republished.
+///
+/// Under `Eth-Consensus-Version: pq` the entries are PQ's container, signed
+/// with leanXMSS, judged by the same rules over the PQ builder market gossip
+/// validates against.
 async fn post_proposer_preferences(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(market): Extension<SharedBuilderMarket>,
+    pq_market: Option<Extension<SharedPqBuilderMarket>>,
     events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
@@ -71,22 +84,55 @@ async fn post_proposer_preferences(
     // Prysm hardcodes it, the others (this one's too) take the fork of the
     // preference's slot. Fulu is still accepted, as leniency towards a client
     // that names the fork of its wall clock instead.
-    if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas]) {
+    if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas, ForkName::Pq]) {
         return err.into_response();
     }
-    let preferences = match decode_list::<SignedProposerPreferences>(&headers, &body) {
-        Ok(preferences) => preferences,
-        Err(err) => return err.into_response(),
-    };
-    if preferences.len() > MAX_ENTRIES {
-        return ApiError::BadRequest("too many signed proposer preferences").into_response();
-    }
-
+    let is_pq = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(ForkName::parse)
+        == Some(ForkName::Pq);
     let events = events.map(|Extension(events)| events);
-    let validated = tokio::task::spawn_blocking(move || {
-        submit(&store, &p2p, &market, events.as_ref(), preferences)
-    })
-    .await;
+    let validated = if is_pq {
+        let Some(Extension(market)) = pq_market else {
+            return ApiError::Internal("no PQ builder market").into_response();
+        };
+        let preferences = match decode_list::<pq::SignedProposerPreferences>(&headers, &body) {
+            Ok(preferences) => preferences,
+            Err(err) => return err.into_response(),
+        };
+        if preferences.len() > MAX_ENTRIES {
+            return ApiError::BadRequest("too many signed proposer preferences").into_response();
+        }
+        tokio::task::spawn_blocking(move || {
+            submit(&store, &market, preferences, |signed| {
+                p2p.publish_pq_gossip(PqGossipObject::ProposerPreferences(Box::new(signed)))
+                    .map_err(|_| ())
+            })
+        })
+        .await
+    } else {
+        let preferences = match decode_list::<SignedProposerPreferences>(&headers, &body) {
+            Ok(preferences) => preferences,
+            Err(err) => return err.into_response(),
+        };
+        if preferences.len() > MAX_ENTRIES {
+            return ApiError::BadRequest("too many signed proposer preferences").into_response();
+        }
+        tokio::task::spawn_blocking(move || {
+            submit(&store, &market, preferences, |signed| {
+                let for_event = signed.clone();
+                p2p.publish_proposer_preferences(signed)
+                    .map_err(|_| ())
+                    .inspect(|()| {
+                        emit_accepted(events.as_ref(), || {
+                            GossipEvent::ProposerPreferences(Box::new(for_event))
+                        })
+                    })
+            })
+        })
+        .await
+    };
     let failures = match validated {
         Ok(failures) => failures,
         Err(_) => return ApiError::Internal("validating the preferences failed").into_response(),
@@ -106,26 +152,28 @@ async fn post_proposer_preferences(
 
 /// Whether `market` holds `signed` itself for its slot and dependent root,
 /// rather than another message: an identical entry is a success.
-fn holds(market: &SharedBuilderMarket, signed: &SignedProposerPreferences) -> bool {
-    let message = &signed.message;
+fn holds<B: SignedBid, P: SignedPreferences + PartialEq>(
+    market: &BuilderMarket<B, P>,
+    signed: &P,
+) -> bool {
+    let message = signed.message();
     let held = market.preferences(message.proposal_slot, message.dependent_root);
     held.as_ref() == Some(signed)
 }
 
 /// Validate, record and publish each entry, in order.
-fn submit(
+fn submit<B: SignedBid, P: PreferencesRules + PartialEq>(
     store: &Store,
-    p2p: &RpcToP2PRef,
-    market: &SharedBuilderMarket,
-    events: Option<&EventBus>,
-    preferences: Vec<SignedProposerPreferences>,
+    market: &BuilderMarket<B, P>,
+    preferences: Vec<P>,
+    mut publish: impl FnMut(P) -> Result<(), ()>,
 ) -> Vec<Failure> {
     let now_ms = unix_ms();
     let wall_slot = crate::beacon::node::wall_slot(store);
     let mut failures = Vec::new();
     for (index, signed) in preferences.into_iter().enumerate() {
-        let slot = signed.message.proposal_slot;
-        let validator = signed.message.validator_index;
+        let slot = signed.message().proposal_slot;
+        let validator = signed.message().validator_index;
         // An entry identical to the one held is a success, checked before
         // `validate` so no rule of it (a started slot, say) can refuse a
         // resubmission, and at no signature check's cost. Asked again after a
@@ -163,15 +211,9 @@ fn submit(
             });
             continue;
         }
-        let for_event = signed.clone();
-        match p2p.publish_proposer_preferences(signed) {
-            Ok(()) => {
-                emit_accepted(events, || {
-                    GossipEvent::ProposerPreferences(Box::new(for_event))
-                });
-                debug!(%slot, validator, "Accepted proposer preferences for gossip")
-            }
-            Err(_) => failures.push(Failure {
+        match publish(signed) {
+            Ok(()) => debug!(%slot, validator, "Accepted proposer preferences for gossip"),
+            Err(()) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),
             }),
