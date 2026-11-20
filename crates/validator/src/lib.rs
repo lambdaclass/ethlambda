@@ -381,11 +381,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         let current_slot = clock.now().unwrap_or(0);
         let started = std::time::Instant::now();
         info!(count, pq_epoch, "Deriving the validators' PQ keys");
+        // leanVM derives a key on one thread, so the keys go across rayon's
+        // pool: one per core, not one OS thread per validator.
         tokio::task::spawn_blocking(move || {
-            std::thread::scope(|scope| {
-                for (pubkey, secret) in &secrets {
-                    scope.spawn(move || pq::derive_and_register(*pubkey, secret, current_slot));
-                }
+            use rayon::prelude::*;
+            secrets.par_iter().for_each(|(pubkey, secret)| {
+                pq::derive_and_register(*pubkey, secret, current_slot)
             });
         })
         .await

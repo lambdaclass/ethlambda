@@ -39,7 +39,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use ethlambda_crypto::{lean_xmss, pq_keys, vrf};
+use ethlambda_crypto::leanvm_lean_xmss::{self, LeanXmssExpandedSecretKey};
+use ethlambda_crypto::{pq_keys, vrf};
 use ethlambda_types::beacon::constants::{
     XMSS_ATTESTATION_LEAVES, XMSS_BUILDER_BID_LEAVES, XMSS_LEAVES_PER_SLOT, XMSS_RESERVED_LEAVES,
 };
@@ -71,7 +72,8 @@ pub const VRF_TREE_DIRECTORY: &str = "pq_vrf_trees";
 
 /// A validator's PQ key material.
 pub struct PqKey {
-    xmss: lean_xmss::SecretKey,
+    /// leanVM's key: it caches the last few bottom trees it signed in.
+    xmss: LeanXmssExpandedSecretKey,
     vrf_seed: vrf::Node,
     /// Empty until [`prepare_vrf_tree`] has read or hashed the tree.
     vrf: OnceLock<vrf::VrfTree>,
@@ -198,9 +200,10 @@ pub fn open_leaf_record(validators_dir: &Path, current_slot: Slot) -> std::io::R
 
 /// Derives and registers the PQ key of the validator whose BLS key is
 /// `pubkey` and secret key `secret` (32 bytes, big-endian, as a keystore
-/// holds it). Slow: a leanXMSS key generation (about a second and a half
-/// across cores), plus building the bottom trees its next attestation and
-/// per-slot signatures fall in. Run it off the async runtime.
+/// holds it). Slow, and on the calling thread alone: leanVM's key generation
+/// (about 2.4 s), plus building the bottom trees its next attestation and
+/// per-slot signatures fall in (about 2.5 s each). Run it off the async
+/// runtime, and spread many keys across cores.
 ///
 /// The key signs from here on. Its VRF tree, which only a proposal reads, is
 /// [`prepare_vrf_tree`]'s to supply.
@@ -209,10 +212,11 @@ pub fn derive_and_register(pubkey: BlsPubkey, secret: &[u8; 32], current_slot: S
     let mut request_key = [0u8; 48];
     request_key[16..].copy_from_slice(&xmss.public_key().to_bytes());
     // Warm the two bottom trees duties sign in, so the first signature of each
-    // kind does not pay for one at its deadline.
+    // kind does not pay for one at its deadline. Leaf indices fit leanVM's
+    // `u32` for any slot this client reaches.
     let epoch = current_slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-    let _ = xmss.prepare(attestation_leaf(epoch) as u32);
-    let _ = xmss.prepare(slot_leaf(current_slot, 0) as u32);
+    xmss.prepare(attestation_leaf(epoch) as u32);
+    xmss.prepare(slot_leaf(current_slot, 0) as u32);
     let key = Arc::new(PqKey {
         xmss,
         vrf_seed: pq_keys::vrf_seed(secret),
@@ -281,8 +285,8 @@ pub enum PqSignError {
     UnknownValidator,
     #[error("leaf {0} already signed a different message")]
     LeafUsed(u64),
-    #[error("leanXMSS: {0:?}")]
-    Sign(lean_xmss::SignError),
+    #[error("leaf {0} is past the key's last leaf")]
+    LeafOutOfRange(u64),
     #[error("the VRF tree is still being hashed")]
     VrfTreeNotReady,
     #[error("slot {0} is past the VRF tree's last leaf")]
@@ -455,24 +459,21 @@ pub fn prepare_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<Vrf
 /// Signs `root` at `leaf` with `pubkey`'s leanXMSS key. Refuses a leaf this
 /// process already signed a different root at; the same root again is
 /// re-signed, which yields the same bytes (signing is deterministic).
-/// Blocking: building a bottom tree takes about a second and a half.
+/// Blocking: building a bottom tree takes about 2.5 s, single-threaded.
 pub fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, PqSignError> {
     let key = key(pubkey).ok_or(PqSignError::UnknownValidator)?;
+    // Checked before the claim, so an unsignable leaf is not recorded as spent.
+    let leaf_index = u32::try_from(leaf).map_err(|_| PqSignError::LeafOutOfRange(leaf))?;
     signed_leaves()
         .lock()
         .expect("PQ leaf record poisoned")
         .claim(pubkey, leaf, root)?;
-    let leaf_index = u32::try_from(leaf).map_err(|_| PqSignError::LeafUsed(leaf))?;
-    let signature = key
-        .xmss
-        .sign(&root.0, leaf_index)
-        .map_err(PqSignError::Sign)?;
-    let bytes: [u8; ethlambda_types::beacon::constants::XMSS_SIGNATURE_SIZE] = signature
-        .to_bytes()
-        .try_into()
-        .expect("a leanXMSS signature is XMSS_SIGNATURE_SIZE bytes");
-    Ok(XmssSignature(bytes))
+    let signature = leanvm_lean_xmss::sign(&key.xmss, &root.0, leaf_index);
+    Ok(XmssSignature(signature.to_bytes()))
 }
+
+const _: () =
+    assert!(leanvm_lean_xmss::SIG_SIZE == ethlambda_types::beacon::constants::XMSS_SIGNATURE_SIZE);
 
 /// `pubkey`'s VRF proof for `slot`, its RANDAO reveal at PQ
 /// (`compute_vrf_proof`): the slot's secret, then its leaf's branch. Blocking
@@ -520,7 +521,13 @@ mod tests {
             Err(PqSignError::LeafUsed(_))
         ));
         let public = request[16..].try_into().unwrap();
-        assert!(lean_xmss::verify(&public, leaf, &[1; 32], &first.0));
+        assert!(ethlambda_crypto::lean_xmss::verify(
+            &public, leaf, &[1; 32], &first.0
+        ));
+        assert!(matches!(
+            sign(&pubkey, 1 << 32, Root::from([1; 32])),
+            Err(PqSignError::LeafOutOfRange(_))
+        ));
     }
 
     /// The bytes of a tree for `vrf_seed` that `from_bytes` accepts. A whole

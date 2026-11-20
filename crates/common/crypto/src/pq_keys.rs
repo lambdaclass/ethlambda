@@ -36,10 +36,12 @@ pub fn vrf_seed(bls_secret_key: &[u8; 32]) -> vrf::Node {
     sha256_concat(b"vrf-seed", bls_secret_key)
 }
 
-/// A validator's leanXMSS key. Generating it builds the key's whole top tree:
-/// about a second and a half across cores.
-pub fn xmss_key(bls_secret_key: &[u8; 32]) -> lean_xmss::SecretKey {
-    lean_xmss::key_gen(&xmss_seed(bls_secret_key))
+/// A validator's leanXMSS key, grown by leanVM's own `lean_xmss` (bindings
+/// v0.15.0), the implementation pq-devnet-0 signs with. Generating it builds
+/// the key's whole top tree on the calling thread: about 2.4 s, single-threaded,
+/// so a caller with many keys spreads them across cores.
+pub fn xmss_key(bls_secret_key: &[u8; 32]) -> leanvm_lean_xmss::LeanXmssExpandedSecretKey {
+    leanvm_lean_xmss::key_gen(&xmss_seed(bls_secret_key)).0
 }
 
 /// The BIP-39 seed of `mnemonic` with no passphrase: PBKDF2-HMAC-SHA512 over
