@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-55c98210.js";
+            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-dd44a827.js"></script>
+        <script src="toc-9d125e03.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -3680,7 +3680,9 @@ subnets</a>).</p>
 sync committee messages, blocks with their columns, operations), plus relayed
 validated gossip.</p>
 <p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
+ENR was skipped with a warning. That holds for a run without <code>--bootnodes</code>,
+whose entries are counted on top (in <code>seeds</code> only when they carry a discv5
+port). <code>topics=17</code> proves the subscription set: the 7
 global topics, the 8 column subnets this run’s (randomly generated) node id
 selected, and the 2 attestation subnets the same id selected; <code>columns=8</code> and
 <code>attestation_subnets=[…]</code> confirm the two families directly.</p>
@@ -4208,15 +4210,16 @@ one <code>CommonOptions</code> struct flattened into each.</p>
 <tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port. <code>beacon</code> binds it too, off its own anchored store rather than an empty one; the lean-shaped <code>/lean/v0</code> routes still don’t answer for it (see <a href="#beacon-flags"><code>beacon</code> flags</a> below)</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics and debug server port. Equal to <code>--api-port</code> merges the routers onto one listener</td></tr>
 <tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code></td><td>Hex file holding the secp256k1 key that is this node’s libp2p and discv5 identity. When omitted, the key stored in <code>--data-dir</code> as <code>node.key</code> is used, generated and stored there (mode <code>0600</code>) on the directory’s first start, so the PeerId and ENR stay the same across restarts until the directory is wiped</td></tr>
-<tr><td><code>--bootnodes</code></td><td>see below</td><td>Bootnode ENR list: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated)</td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>see below</td><td>API base URLs, tried in order until one answers. Supplies <code>node</code>’s starting state on the lean API, and <code>beacon</code>’s anchor on a standard Beacon API; required on a fresh <code>beacon</code> data directory only for a built-in network, since a loaded network anchors at its own <code>genesis.ssz</code> instead. See <a href="#checkpoint-sync"><code>checkpoint_sync.md</code></a></td></tr>
 <tr><td><code>--discovery.port</code></td><td><code>9000</code></td><td>discv5 UDP port; must differ from <code>--gossipsub-port</code>. See <a href="#peer-discovery-discv5">Peer discovery</a></td></tr>
 <tr><td><code>--discovery.advertise-ip</code></td><td>bind address</td><td>IP published in the ENR</td></tr>
 <tr><td><code>--discovery.target-peers</code></td><td><code>200</code></td><td>Connected-peer count above which discovery stops dialing</td></tr>
+<tr><td><code>--telemetry.clickhouse-url</code></td><td>off</td><td>ClickHouse HTTP endpoint for per-block <code>block_events</code> rows; also read from <code>ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL</code>, the place for a URL with a password. See <a href="#block-telemetry-clickhouse">Block telemetry</a></td></tr>
+<tr><td><code>--telemetry.client-name</code></td><td><code>--node-id</code> / <code>ethlambda@&lt;hostname&gt;</code></td><td><code>meta_client_name</code> on those rows; requires the URL</td></tr>
 </tbody>
 </table>
 </div>
-<p>Three of those have no clap default, because the two chains answer them
+<p>Two of those have no clap default, because the two chains answer them
 differently. A single <code>default_value</code> can only say one thing, so the flag
 carries none and each chain resolves an absent value itself:</p>
 <div class="table-wrapper">
@@ -4226,11 +4229,14 @@ carries none and each chain resolves an absent value itself:</p>
 </thead>
 <tbody>
 <tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code>, generated on the directory’s first start</td><td>same</td></tr>
-<tr><td><code>--bootnodes</code></td><td>no bootnodes: peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed, warned about</td><td>falls back to the resolved network’s own bootnode list: a built-in network’s embedded list, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>start from a resumable DB, else from genesis</td><td>start from a resumable DB, else anchor at the resolved network’s own genesis (loaded network only), else abort</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>--bootnodes</code> is taken by both too, but not with one meaning, so it is listed
+under each sub-command instead: on <code>node</code> it names a file of ENRs, and on
+<code>beacon</code> it is a list of ENRs and multiaddrs added to the network’s own
+bootnodes.</p>
 <p>Whether discv5 runs is not a common flag. <code>beacon</code> always runs it, since
 published mainnet bootnode ENRs carry no <code>quic</code> entry and so are not statically
 dialable; <code>node</code> runs it only with <code>--discovery.enable</code> (see below). Where it
@@ -4254,6 +4260,7 @@ is published.</p>
 <tr><td><code>--hash-sig-keys-dir</code></td><td>required</td><td>Directory of per-validator XMSS keys</td></tr>
 <tr><td><code>--node-id</code></td><td>required</td><td>The key in <code>annotated_validators.yaml</code> naming this node, e.g. <code>ethlambda_0</code></td></tr>
 <tr><td><code>--is-aggregator</code></td><td><code>false</code></td><td>Seed the runtime aggregator flag</td></tr>
+<tr><td><code>--bootnodes</code></td><td>none, warned about</td><td>Path to a bootnode ENR file: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated). An unusable entry is skipped with a warning. Without the flag the node starts with no bootnodes, since a lean network has no built-in list, and reaches peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed</td></tr>
 <tr><td><code>--discovery.enable</code></td><td><code>false</code></td><td>Run discv5 peer discovery; off, the node peers from <code>--bootnodes</code> alone. See <a href="#peer-discovery-discv5">Peer discovery</a></td></tr>
 <tr><td><code>--aggregate-subnet-ids</code></td><td>this node’s subnets</td><td>Subnets to aggregate on; requires <code>--is-aggregator</code></td></tr>
 <tr><td><code>--attestation-committee-count</code></td><td>from <code>validator-config.yaml</code>, else <code>1</code></td><td>Committees per slot</td></tr>
@@ -4307,7 +4314,7 @@ client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
 <a href="#the-execution-layer-pairing">the execution layer pairing</a> for what each verdict does and
 for the limitations that go with the retry ladder.</p>
-<p><code>beacon</code> takes one more flag of its own, and two common flags also mean
+<p><code>beacon</code> takes two more flags of its own, and two common flags also mean
 something specific here.</p>
 <div class="table-wrapper">
 <table>
@@ -4316,6 +4323,7 @@ something specific here.</p>
 </thead>
 <tbody>
 <tr><td><code>--network</code></td><td><code>mainnet</code></td><td>A built-in network name (<code>mainnet</code>, <code>sepolia</code>, <code>hoodi</code> or <code>plataberget</code>), or a path to a directory of published network files. A value containing a slash is always a path, so <code>mainnet</code> is the built-in and <code>./mainnet</code> is a directory. The directory must hold <code>config.yaml</code> and <code>genesis.ssz</code>, and may hold <code>bootstrap_nodes.yaml</code> or <code>bootstrap_nodes.txt</code></td></tr>
+<tr><td><code>--bootnodes</code></td><td>none: the network’s own list alone</td><td>Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network’s own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a></td></tr>
 </tbody>
 </table>
 </div>
@@ -4339,8 +4347,10 @@ the same way, so a wrong constant fails at startup rather than following the
 wrong chain.</p>
 <p><code>beacon</code> therefore takes no genesis config, validator registry, or bootnode file
 of its own the way <code>node</code> does: those are read off the resolved network instead
-of being separate operator input. A <code>config.yaml</code> (a directory’s, or a built-in
-network’s embedded one) is read permissively: absent keys fall back to mainnet’s values,
+of being separate operator input, and <code>beacon</code>’s <code>--bootnodes</code> only adds entries
+to the network’s list (see <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a>). A
+<code>config.yaml</code> (a directory’s, or a built-in network’s embedded one) is read
+permissively: absent keys fall back to mainnet’s values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its <code>PRESET_BASE</code> is checked against the
@@ -4379,6 +4389,62 @@ either way, the same way <code>node</code>’s does.</p>
 site serves both chains, but it picks the router by the store’s chain, so a
 <code>beacon</code> run serves the Beacon API under <code>/eth/v1</code> and <code>/eth/v2</code> and answers a
 <code>/lean/v0/...</code> path with a 404. See <a href="#http-api-1"><code>rpc.md</code></a>.</p>
+<h3 id="bootnodes-on-beacon"><a class="header" href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a></h3>
+<p><code>beacon</code>’s <code>--bootnodes</code> is a list, not a file, modeled on Lighthouse’s
+<code>--boot-nodes</code>. Entries are comma-separated and the flag may be repeated, all
+of its values combined; each entry is trimmed, and an empty one is ignored. An
+entry is either an ENR, written with or without its <code>enr:</code> prefix, or a
+multiaddr, which starts with <code>/</code>:</p>
+<pre><code class="language-sh">ethlambda beacon --network hoodi --checkpoint-sync-url &lt;URL&gt; \
+  --bootnodes enr:-Iq4Q…,/ip4/203.0.113.7/tcp/9000/p2p/16Uiu2HAm… \
+  --bootnodes /ip4/203.0.113.8/udp/9000/p2p/16Uiu2HAk…
+</code></pre>
+<p>A multiaddr is <code>/ip4/&lt;ip&gt;</code> or <code>/ip6/&lt;ip&gt;</code>, then one transport, then
+<code>/p2p/&lt;peer-id&gt;</code>. The transport decides what the entry is used for:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transport</th><th>The peer is</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tcp/&lt;port&gt;</code></td><td>dialed over TCP</td></tr>
+<tr><td><code>udp/&lt;port&gt;/quic-v1</code></td><td>dialed over QUIC</td></tr>
+<tr><td><code>udp/&lt;port&gt;</code></td><td>not dialed directly: the port is the peer’s discv5 port, so the entry seeds discovery, which is how Lighthouse reads a UDP multiaddr too</td></tr>
+</tbody>
+</table>
+</div>
+<p>QUIC is <code>quic-v1</code> only; the older draft <code>/quic</code> is refused. The
+<code>/p2p/&lt;peer-id&gt;</code> is required, and DNS multiaddrs (<code>/dns</code>, <code>/dns4</code>, <code>/dns6</code>,
+<code>/dnsaddr</code>) are refused, so write the address as <code>/ip4</code> or <code>/ip6</code>. Those two are
+departures from Lighthouse; <a href="#multiaddrs">Peer discovery</a> lists
+them with the rest.</p>
+<p>The entries are added to the resolved network’s own list (a built-in network’s
+embedded one, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code>), never put
+in its place, which is Lighthouse’s behavior too. Giving the flag used to
+replace that list; now the network’s bootnodes are always used, and the flag
+only adds to them. Nothing turns them off: each one with a QUIC or TCP port is
+dialed at startup and redialed 12 seconds after every failed dial or
+disconnect, even on a host that cannot reach it. To run on other bootnodes
+alone, load the network from a directory whose <code>bootstrap_nodes.yaml</code> lists
+only those.</p>
+<p>An IPv6 entry is dialed like an IPv4 one, but discv5 binds the IPv4 wildcard
+and an IPv4 socket cannot reach an IPv6 address, so an IPv6 entry that is only
+a discv5 contact (<code>/ip6/&lt;ip&gt;/udp/&lt;port&gt;</code>, or an ENR whose only address is <code>ip6</code>
+and whose only port is <code>udp</code>) is refused. The check reads the address discovery
+binds rather than assuming IPv4, so it lifts on its own once discovery binds
+IPv6 (<a href="https://github.com/lambdaclass/ethlambda/issues/853">#853</a>).</p>
+<p>Every entry is checked at startup. One that does not parse, or that is
+unusable (an ENR with no <code>quic</code>, <code>tcp</code> or <code>udp</code> port, a port of <code>0</code>, and so
+on), is a startup error naming the entry: an operator who typed it meant to
+reach that peer, and skipping it would leave the node running on a list it was
+not given. The network’s own list keeps the old rule, a bad entry there being
+skipped with a warning, as <code>node</code> skips one in its file.</p>
+<p><strong>A file path is no longer accepted.</strong> Startup fails on one, with a hint that
+<code>--bootnodes</code> now takes a list; so does a missing path ending in <code>.yaml</code>,
+<code>.yml</code> or <code>.txt</code>. A launch script that passed <code>beacon</code> a bootnode file must
+pass the records it lists joined with commas instead (without a YAML list’s
+<code>- </code> markers or any comments), or, for a network loaded from a directory, list
+them in that directory’s <code>bootstrap_nodes.yaml</code>.</p>
 <h2 id="what-ethlambda-beacon-does-today"><a class="header" href="#what-ethlambda-beacon-does-today">What <code>ethlambda beacon</code> does today</a></h2>
 <p>It follows the resolved network as a non-validating follower. It anchors a
 RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, joins
@@ -4402,7 +4468,7 @@ not chain-specific, branches once, and shares the shutdown:</p>
 <tr><td>raise <code>RLIMIT_NOFILE</code></td><td>shared</td><td>shared</td></tr>
 <tr><td><code>HIVE_LEAN_TEST_DRIVER</code> early return</td><td>yes</td><td>no: those endpoints are lean’s</td></tr>
 <tr><td>resolve <code>--network</code> into a <code>NetworkSource</code></td><td>n/a: lean has no <code>--network</code></td><td>classify the value (built-in name vs. directory); parse the <code>config.yaml</code> (embedded, or the directory’s) and check <code>PRESET_BASE</code> against the compiled preset and the constant-backed keys against their constants; for a directory, then decode <code>genesis.ssz</code></td></tr>
-<tr><td>read <code>--bootnodes</code> (falls back to the chain’s default list; see the table above)</td><td>shared</td><td>shared</td></tr>
+<tr><td>read <code>--bootnodes</code></td><td>a file of ENRs; absent means no bootnodes, warned about</td><td>a comma-separated list of ENRs and multiaddrs, added to the resolved network’s own list; a bad entry is a startup error (see <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a>)</td></tr>
 <tr><td>build the aggregator, sync-status and event handles</td><td>shared</td><td>shared</td></tr>
 <tr><td>open <code>--data-dir</code>’s RocksDB backend</td><td>shared</td><td>shared</td></tr>
 <tr><td>resolve <code>--node-key</code>, else load <code>&lt;data-dir&gt;/node.key</code>, generating it on first start (after the open, so RocksDB’s lock covers the write)</td><td>shared</td><td>shared</td></tr>
@@ -6470,6 +6536,19 @@ samples nothing and publishes no series here.</p>
 </tbody>
 </table>
 </div>
+<h3 id="block-telemetry"><a class="header" href="#block-telemetry">Block Telemetry</a></h3>
+<p>Present only with <code>--telemetry.clickhouse-url</code>; see <a href="#block-telemetry-clickhouse">Block telemetry</a>. Both series are published at zero at startup, so a node whose inserts never succeed shows a rising failure count next to zero inserted rows instead of no series.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_telemetry_rows_total</code></td><td>Counter</td><td><code>block_events</code> rows, by what became of them</td><td>On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows the shutdown flush could not deliver)</td><td>outcome=inserted,dropped</td></tr>
+<tr><td><code>lean_telemetry_insert_failures_total</code></td><td>Counter</td><td>Failed ClickHouse insert attempts, refusals included</td><td>On every failed insert; a failed best-effort schema statement alone is not counted</td><td></td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
 <p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
 <p>The bucket boundaries are the interval and slot edges of the default 4-second cadence. Prometheus fixes buckets when a histogram is registered, so a network that sets <code>MILLISECONDS_PER_SLOT</code> reads these histograms against the default grid rather than its own; the <code>position</code> label still follows the configured interval width.</p>
@@ -6843,6 +6922,54 @@ epoch-crossing import should hit. Misses mean the worker had not finished (the
 block raced it, see <code>lean_beacon_epoch_precompute_seconds</code> against the slot
 duration), the node was syncing, or the entry was evicted from the state cache.
 A <code>timer</code> start with no matching <code>head</code> start means the last slot was skipped.</p>
+<h3 id="beacon-state-transition-phases"><a class="header" href="#beacon-state-transition-phases">Beacon State Transition Phases</a></h3>
+<p>Where the time of one beacon state transition goes. <code>lean_block_import_phase_seconds{phase="stf"}</code>
+says how long an import’s transition took; this says which step.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_stf_phase_seconds</code></td><td>Histogram</td><td>Time one step of the beacon state transition took</td><td>Once per step per transition, when the step finishes (a step that did not run writes nothing)</td><td>context=import,other; phase (see below)</td><td>0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>phase</code> is one of <code>BEACON_STF_PHASES</code> (<code>crates/blockchain/state_transition/src/metrics.rs</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Covers</th></tr>
+</thead>
+<tbody>
+<tr><td><code>process_slots</code></td><td>Advancing the state to the block’s slot, <strong>excluding</strong> epoch work: per-slot root bookkeeping, fork upgrades, the closing flush</td></tr>
+<tr><td><code>process_epoch</code></td><td>The epoch transition, once per boundary crossed (a long skip observes it several times)</td></tr>
+<tr><td><code>block_signature</code></td><td>The proposer’s signature over the block, when the caller asked for result validation</td></tr>
+<tr><td><code>block_header</code></td><td>The header check, including the hash of the block body it commits to</td></tr>
+<tr><td><code>randao</code></td><td>The mix update and the building of the reveal’s signature set; the reveal (and, on gloas, the bid pending before it) is verified in <code>batch_signatures</code></td></tr>
+<tr><td><code>eth1_data</code></td><td>The eth1 vote</td></tr>
+<tr><td><code>execution_payload</code></td><td>Withdrawals and the execution payload; gloas: the parent payload, then the withdrawals and the bid, two observations per block</td></tr>
+<tr><td><code>proposer_slashings</code>, <code>attester_slashings</code>, <code>attestations</code>, <code>deposits</code>, <code>voluntary_exits</code>, <code>bls_to_execution_changes</code>, <code>payload_attestations</code></td><td>One observation per block for the whole list, absent when the list is empty; the fork must have the list. Through fulu, <code>attestations</code> includes the one proposer lookup the whole list shares</td></tr>
+<tr><td><code>execution_requests</code></td><td>Electra and fulu’s requests of the execution layer</td></tr>
+<tr><td><code>sync_aggregate</code></td><td>The sync aggregate, altair onward</td></tr>
+<tr><td><code>batch_signatures</code></td><td>The random-weight check of every signature the block’s steps deferred (RANDAO reveal, attestations, slashings, exits, BLS changes, sync aggregate). The steps’ own phases cover building those signature sets, not verifying them. Observed once per check, so a block can observe it more than once: the reveal’s check also verifies whatever is still pending (gloas: the bid), and a slashing, exit or BLS change verifies before it writes. A check that runs inside another phase is taken out of that phase, so the phases do not double count</td></tr>
+<tr><td><code>state_root</code></td><td>The post-state flush and <code>hash_tree_root</code> that checks <code>block.state_root</code>; only observed when the caller validates the result</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong><code>context</code> keeps background work out of an import’s numbers.</strong> The epoch
+precompute worker runs <code>process_epoch</code> on its own thread while an import runs,
+so one series would charge the worker’s seconds to whichever import was in
+flight. <code>context="import"</code> is written only by the import path
+(<code>fork_choice::on_block</code>’s transition, including the speculative one an import
+runs while <code>engine_newPayload</code> is in flight; a build with debug assertions also
+observes the second transition that checks a used speculation); every other
+caller (the precompute worker, checkpoint-state advances, block production,
+gossip validation) writes <code>context="other"</code>. A dashboard that wants an
+import’s cost reads <code>context="import"</code>; one that wants the precompute worker’s
+reads <code>other</code>, which also holds the other callers, so
+<code>lean_beacon_epoch_precompute_seconds</code> is the cleaner series for the worker
+alone.</p>
 <h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
 <p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
 gossip validation) resolves its signers’ compressed public keys to validated
@@ -7102,6 +7229,186 @@ belongs with them on a gloas network.</p>
 <p>lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.
 To work around this, enable the <a href="https://docs.docker.com/enterprise/security/hardened-desktop/settings-management/settings-reference/#enable-host-networking">“Enable host networking” option</a> in Docker Desktop settings under Resources &gt; Network.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="block-telemetry-clickhouse"><a class="header" href="#block-telemetry-clickhouse">Block telemetry (ClickHouse)</a></h1>
+<p>With <code>--telemetry.clickhouse-url</code>, a node writes one row per point in each
+block’s life, and per data column arrival, to a ClickHouse table named
+<code>block_events</code>. The table layout is <a href="https://github.com/gattaca-com/silver">Silver</a>’s,
+so both clients’ rows can share one table and one set of queries.</p>
+<p>Rows are batched and sent over ClickHouse’s HTTP interface on a one second
+tick, with one request in flight at a time, since ClickHouse writes a part per
+insert. A full request’s worth of backlog goes out without waiting for the next
+tick. A failed request is retried on a later tick, with the backlog capped so an
+unreachable ClickHouse costs bounded memory (the oldest rows are dropped first).
+A batch ClickHouse rejects as malformed (HTTP 400) is dropped instead, since
+retrying it would block every later row. Refusals are logged at <code>warn</code> on the
+first and then at most once a minute, with the batches and rows dropped since
+the last report, so a table whose schema the rows do not fit stays visible. A
+row field the table lacks is ignored rather than refusing the batch
+(<code>input_format_skip_unknown_fields</code>), so a table created by an older layout
+still takes the columns it has.</p>
+<p>On a graceful shutdown the writer sends what is still pending before the node
+exits, waiting at most 12 seconds; rows it cannot deliver are counted as
+dropped.</p>
+<p>Delivery is at least once: a request that times out after ClickHouse committed
+it is sent again, so a query should take <code>min</code>/<code>any</code> per block, stage and client
+rather than count rows. Rows still pending when the node exits are lost.
+<code>lean_telemetry_rows_total</code> and <code>lean_telemetry_insert_failures_total</code> say what
+happened to the rows. The table is created on first use; that statement is best
+effort, so a user that may insert but not create still works against an existing
+table.</p>
+<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--telemetry.clickhouse-url</code> (or <code>ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL</code>)</td><td>off</td><td>ClickHouse HTTP endpoint, e.g. <code>http://127.0.0.1:8123</code>. <code>user:pass@</code> in the URL is sent as basic auth; <code>?database=</code> passes through. Pass a URL with a password through the environment variable: a command line is readable by any local user</td></tr>
+<tr><td><code>--telemetry.client-name</code></td><td><code>--node-id</code> (<code>node</code>), <code>ethlambda@&lt;hostname&gt;</code> (<code>beacon</code>)</td><td><code>meta_client_name</code> on every row; requires the URL</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>meta_network_name</code> is the network’s <code>CONFIG_NAME</code> on <code>beacon</code> (<code>unknown</code> when a
+loaded network directory has none) and <code>lean-&lt;genesis time&gt;</code> on <code>node</code> (the
+genesis Unix time in seconds), so lean devnets sharing one table, or one devnet
+reset with a new genesis, stay apart.</p>
+<p>In a container, set <code>--telemetry.client-name</code> (or the container’s hostname):
+Docker’s default hostname is the container ID, so the <code>beacon</code> default would
+change on every recreate and split one node’s rows across names. Only
+<code>http</code>/<code>https</code> URLs are accepted; ClickHouse’s native port (9000) is not this
+interface. A rejected URL is never echoed back, since it may hold a password.</p>
+<h2 id="columns"><a class="header" href="#columns">Columns</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Column</th><th>Content</th></tr>
+</thead>
+<tbody>
+<tr><td><code>event_date_time</code></td><td>Wall clock of the event, nanoseconds</td></tr>
+<tr><td><code>stage</code></td><td>Which point in the block’s life (below)</td></tr>
+<tr><td><code>slot</code>, <code>slot_start_date_time</code></td><td>The block’s slot and when it started</td></tr>
+<tr><td><code>time_into_slot_ms</code></td><td>Offset from the slot start; NULL outside the two slots after it (catch-up, backfill)</td></tr>
+<tr><td><code>block_root</code></td><td><code>0x</code>-prefixed</td></tr>
+<tr><td><code>source</code></td><td>Blocks: <code>gossip</code>, <code>sync</code> (<code>replay</code> comes only from the offline benchmark and replay commands, which never install telemetry). Columns: <code>gossip</code>, <code>by_root</code>, <code>by_range</code>, <code>local</code>, <code>recheck</code></td></tr>
+<tr><td><code>verdict</code></td><td><code>el_verdict</code> rows only: <code>Valid</code>, <code>Optimistic</code>, <code>Invalid</code></td></tr>
+<tr><td><code>column_index</code></td><td><code>column_*</code> rows only</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="stages"><a class="header" href="#stages">Stages</a></h2>
+<p>Block rows are written once a block’s import finishes (imported by its own
+state transition, or failed); a block that never leaves a hold has no rows, and
+a re-delivery of a block already stored writes none. Silver’s names are used
+where the meaning matches; every other section of the
+<a href="#block-import-timing">import timing</a> is written as
+<code>&lt;section&gt;_start</code> and <code>&lt;section&gt;_end</code>. The only block that writes no rows is
+lean’s locally built one, which crossed no wire and carries no source. A block
+re-delivered after waiting for its slot reports under its original source and
+adds <code>defer_start</code> and <code>defer_end</code>. On <code>beacon</code>, a proposal handed over by a
+validator client enters as <code>gossip</code>, with <code>received</code> at the hand-off and no
+<code>decode_end</code> row.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Stage</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>received</code></td><td>The block came off the wire (gossip) or was handed to the chain actor (req/resp)</td></tr>
+<tr><td><code>da_available</code></td><td>The data-availability check passed for a block that needed columns. A block with nothing to wait for (no blobs, or gloas, whose data gates the envelope instead) writes <code>da_check_end</code> instead</td></tr>
+<tr><td><code>el_sent</code>, <code>el_verdict</code></td><td><code>engine_newPayload</code> sent and answered; only when an execution client answered</td></tr>
+<tr><td><code>stf_done</code></td><td>The state transition finished</td></tr>
+<tr><td><code>attestable</code></td><td>The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported and the new head includes gets the same time (a block imported onto a losing branch never became attestable and writes none), and only when that head computation succeeded (a failed one moves nothing, so writes no <code>attestable</code>); lean updates its head per block</td></tr>
+<tr><td><code>failed</code></td><td>The import failed; <code>stf_done</code> and lean’s <code>attestable</code> are then written as <code>stf_end</code> and <code>fc_head_end</code></td></tr>
+<tr><td><code>column_recv</code>, <code>column_validated</code></td><td>A data column arrived, and passed validation. Written only for a column that passed (or, for <code>column_recv</code>, was judged to wait for its block), as Silver does, so rejected columns and re-delivered stored ones write nothing. At least once per block, column and stage: a column delivered again while it waits, or two copies passing at once in separate deliveries, write again, so take the earliest. A copy repeated within one delivery (one peer’s answer, say) is dropped unchecked and writes nothing. A column that waited writes <code>column_validated</code> with source <code>recheck</code>, so join the two on block root and column index, not on source. By-root and by-range answers stamp every column with the moment the whole answer reached the handler. A gossip-accepted column’s <code>column_validated</code> comes after the verdict’s trip back through the p2p actor; a checked one’s when its check finished, which is when the KZG sub-batch it was verified in (at most 16 of its block’s columns) finished, not when its block’s last one did</td></tr>
+<tr><td><code>cascade_*</code>, <code>prune_*</code>, <code>get_head_*</code>, <code>fcu_*</code></td><td>Once per arrival, filed under the arriving block, when that block was imported in that cascade</td></tr>
+</tbody>
+</table>
+</div>
+<p>With an execution client, ethlambda computes the block’s state transition
+while <code>engine_newPayload</code> is in flight, and keeps it only for a verdict that
+agrees with it. <code>el_sent</code> to <code>stf_done</code> still covers both, but <code>stf_start</code> no
+longer separates them. When the overlapped transition is kept, it ran inside
+<code>el_sent</code>..<code>el_verdict</code>, and <code>stf_start</code>..<code>stf_done</code> is only the rest of
+<code>on_block</code> after the verdict. When it is discarded (an <code>Invalid</code> verdict),
+<code>stf_start</code>..<code>stf_done</code> runs the transition again. The overlapped transition
+writes no row of its own: the import’s log line and
+<code>lean_block_import_phase_seconds{phase="stf"}</code> count it.</p>
+<p><code>source</code> and <code>verdict</code> are ethlambda’s own values on every row, not Silver’s
+(<code>Gossip</code>, <code>Rpc</code>, <code>Syncing</code>, …); a query shared with Silver’s rows must
+match both.</p>
+<h2 id="every-stage-written"><a class="header" href="#every-stage-written">Every stage written</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Group</th><th>Stages</th></tr>
+</thead>
+<tbody>
+<tr><td>Per block, in order</td><td><code>received</code>, <code>decode_end</code>, <code>queue_end</code>, <code>defer_start</code>, <code>defer_end</code>, <code>admit_start</code>, <code>admit_end</code>, <code>guards_start</code>, <code>guards_end</code>, <code>preamble_start</code>, <code>preamble_end</code>, <code>parent_wait_start</code>, <code>parent_wait_end</code>, <code>cascade_wait_start</code>, <code>cascade_wait_end</code>, <code>da_check_start</code>, <code>da_available</code> (or <code>da_check_end</code>), <code>columns_wait_start</code>, <code>columns_wait_end</code>, <code>verify_struct_start</code>, <code>verify_struct_end</code>, <code>verify_crypto_start</code>, <code>verify_crypto_end</code>, <code>stf_start</code>, <code>stf_done</code>, <code>writer_wait_start</code>, <code>writer_wait_end</code>, <code>db_write_start</code>, <code>db_write_end</code>, <code>fc_head_start</code>, <code>attestable</code> (lean), <code>block_atts_start</code>, <code>block_atts_end</code></td></tr>
+<tr><td>Per block, with an execution client</td><td><code>el_sent</code>, <code>el_verdict</code></td></tr>
+<tr><td>Per block, on failure</td><td><code>stf_end</code> and <code>fc_head_end</code> in place of <code>stf_done</code> and <code>attestable</code>, plus <code>failed</code></td></tr>
+<tr><td>Per arrival</td><td><code>cascade_start</code>, <code>cascade_end</code>, <code>prune_start</code>, <code>prune_end</code>, <code>get_head_start</code>, <code>get_head_end</code>, <code>fcu_start</code>, <code>fcu_end</code>, and (beacon) <code>attestable</code></td></tr>
+<tr><td>Per column</td><td><code>column_recv</code>, <code>column_validated</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Only the stages a block actually crossed are written. <code>decode</code> and <code>queue</code> write
+only their <code>_end</code> rows, since <code>received</code> is their start. <code>admit_*</code> is the
+chain actor’s admission section; it is written here and listed in no other doc.</p>
+<h2 id="known-gaps"><a class="header" href="#known-gaps">Known gaps</a></h2>
+<ul>
+<li>
+<p>On a node with a validator client, its own beacon proposals appear under
+<code>source = 'gossip'</code> with near-zero arrival latency. Filter them out by their
+missing <code>decode_end</code> row when comparing with another client.</p>
+</li>
+<li>
+<p>A held block keeps its arrival marks (<code>received</code>, <code>decode_end</code>,
+<code>queue_end</code>, <code>defer_*</code>, <code>admit_*</code>, the starts of its waits) across the
+hold, but the sections after them (<code>guards_*</code>, <code>da_check_*</code>, the import
+itself) are the final pass’s: an earlier pass’s failed check is not
+written.</p>
+</li>
+<li>
+<p>A block re-delivered while held reports the last delivery as <code>received</code>,
+not the first (the import timing histogram does the same).</p>
+</li>
+<li>
+<p>Some blocks released from a hold carry no timings and write no rows, e.g.
+one held again by the execution client after its columns arrived. A block
+the execution client could not judge, or that is not an optimistic
+candidate, writes no rows either.</p>
+</li>
+<li>
+<p>An ancestor read back from storage (mainly after a restart) reports that
+read as its <code>received</code>.</p>
+</li>
+<li>
+<p>On gloas the payload goes to the execution client with its envelope, not
+the block, so gloas blocks have no <code>el_*</code> rows; a gloas block held for its
+parent’s payload has no wait section of its own.</p>
+</li>
+<li>
+<p>Lean’s <code>attestable</code> is the end of its head update plus the bookkeeping an
+import ends with (events, eviction, table sizes), sub-millisecond in
+practice.</p>
+</li>
+</ul>
+<h2 id="a-query-to-start-from"><a class="header" href="#a-query-to-start-from">A query to start from</a></h2>
+<p>Per-block arrival to attestable, in milliseconds:</p>
+<pre><code class="language-sql">SELECT block_root, any(slot) AS slot,
+       (toUnixTimestamp64Nano(minIf(event_date_time, stage = 'attestable'))
+      - toUnixTimestamp64Nano(minIf(event_date_time, stage = 'received'))) / 1e6 AS total_ms
+FROM block_events
+WHERE meta_client_name = 'ethlambda@&lt;host&gt;' AND event_date_time &gt; now() - INTERVAL 1 HOUR
+GROUP BY block_root
+HAVING countIf(stage = 'attestable') &gt; 0
+ORDER BY slot DESC
+LIMIT 50
+</code></pre>
+<h2 id="retention"><a class="header" href="#retention">Retention</a></h2>
+<p>The table has no TTL. Set one as an operator, e.g.
+<code>ALTER TABLE block_events MODIFY TTL toDateTime(event_date_time) + INTERVAL 14 DAY</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="checkpoint-sync"><a class="header" href="#checkpoint-sync">Checkpoint Sync</a></h1>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
 <p>Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.</p>
@@ -7123,7 +7430,7 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <p>Where <code>&lt;URL&gt;</code> is the address of a checkpoint source (see <a href="#checkpoint-sources">Checkpoint Sources</a> below).</p>
 <p>State already on disk takes precedence over both checkpoint sync and genesis: if the data directory holds a previous run’s chain state for this network, the node resumes from it. <code>--checkpoint-sync-url</code> is the fallback for when there is nothing resumable on disk, or when what is there has fallen too far behind (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>). With no resumable state and no URL, the node initializes from genesis.</p>
 <h3 id="ethlambda-beacon"><a class="header" href="#ethlambda-beacon"><code>ethlambda beacon</code></a></h3>
-<p><code>beacon</code> takes no genesis config, validator registry, or bootnode file of its own: it takes <code>--network</code> instead, naming a built-in network or a directory of published network files (see <a href="#command-line"><code>cli.md</code></a>). <code>genesis_time</code>, <code>genesis_validators_root</code>, and the bootnode list all come from whichever network <code>--network</code> resolves to; for the built-in networks (<code>mainnet</code>, the default, plus <code>sepolia</code>, <code>hoodi</code> and <code>plataberget</code>), they are built into the binary (see <code>CLAUDE.md</code>’s “Built-in networks”).</p>
+<p><code>beacon</code> takes no genesis config, validator registry, or bootnode file of its own: it takes <code>--network</code> instead, naming a built-in network or a directory of published network files (see <a href="#command-line"><code>cli.md</code></a>). <code>genesis_time</code>, <code>genesis_validators_root</code>, and the bootnode list all come from whichever network <code>--network</code> resolves to, plus, for the bootnode list, any entries <code>--bootnodes</code> adds to it (a list of ENRs and multiaddrs, not a file; see <a href="#bootnodes-on-beacon"><code>cli.md</code></a>). For the built-in networks (<code>mainnet</code>, the default, plus <code>sepolia</code>, <code>hoodi</code> and <code>plataberget</code>), the network’s own values are built into the binary (see <code>CLAUDE.md</code>’s “Built-in networks”).</p>
 <pre><code class="language-bash">ethlambda beacon --network &lt;network&gt; --checkpoint-sync-url &lt;URL&gt;
 </code></pre>
 <p>The anchor precedence is, in order: a resumable data directory, then <code>--checkpoint-sync-url</code>, then, for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The URL is therefore <strong>required</strong> on a fresh data directory only for a built-in network, unlike on <code>node</code>: this follower imports nothing past its anchor, so anchoring a built-in network at genesis would leave it parked at slot 0 while claiming to follow a live chain. A loaded network’s own genesis state is a legitimate anchor instead, since a freshly started devnet has no checkpoint provider at slot 0 and this is the only way to join one. With neither a resumable DB, a URL, nor (for a loaded network) a genesis fallback, startup aborts with <code>CheckpointSyncError::BeaconGenesisSync</code>. A data directory already anchored from a previous run resumes exactly as <code>node</code>’s does, without a URL, subject to the same resume window (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>).</p>
@@ -8510,6 +8817,12 @@ mainnet bootnode list is close to the mirror image, <code>udp</code> and no <cod
 <code>tcp</code> entry is what makes such a record statically dialable rather than a
 discv5 seed only: four of the seventeen carry one. A record missing an <code>ip</code> or
 a <code>secp256k1</code> key is dropped regardless of its transports.</p>
+<p>Dropped means skipped with a warning for an entry in <code>node</code>’s <code>--bootnodes</code>
+file or in a network’s own list, built-in or loaded. An entry given to
+<code>beacon</code>’s <code>--bootnodes</code> is held to a stricter rule: one that does not parse,
+or would be dropped here, is a startup error naming it, since the operator
+typed it to reach that peer (see
+<a href="#bootnodes-on-beacon">the CLI reference</a>).</p>
 <p>The ENR a node logs at startup is only useful to a peer if that node was
 started with a real <code>--discovery.advertise-ip</code>.
 Copying an ENR built from the default <code>0.0.0.0</code> into another node’s bootnode
@@ -8517,13 +8830,59 @@ list produces a <code>udp</code>/<code>quic</code>/<code>tcp</code> target that 
 names no reachable host. Set <code>--discovery.advertise-ip</code> before pointing other
 nodes at this one’s ENR: <code>127.0.0.1</code> on a local devnet, or the host’s public
 address otherwise.</p>
+<h3 id="multiaddrs"><a class="header" href="#multiaddrs">Multiaddrs</a></h3>
+<p><code>beacon</code>’s <code>--bootnodes</code> also takes multiaddrs, <code>/ip4/&lt;ip&gt;</code> or <code>/ip6/&lt;ip&gt;</code>
+followed by one transport and <code>/p2p/&lt;peer-id&gt;</code>. A multiaddr names a single
+transport, so it fills exactly one of the three entries above, the IP and the
+key coming from the address and the peer id:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transport</th><th>Entry it fills</th><th>The peer is</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tcp/&lt;port&gt;</code></td><td><code>tcp</code></td><td>dialed over TCP</td></tr>
+<tr><td><code>udp/&lt;port&gt;/quic-v1</code></td><td><code>quic</code></td><td>dialed over QUIC</td></tr>
+<tr><td><code>udp/&lt;port&gt;</code></td><td><code>udp</code></td><td>seeded into discv5, not dialed directly</td></tr>
+</tbody>
+</table>
+</div>
+<p>A UDP multiaddr names the peer’s discovery port, not a libp2p listener, which
+is how Lighthouse reads one too. A peer reachable more than one way takes one
+entry per transport, and the entries are merged under its peer id. An <code>/ip6</code>
+UDP multiaddr is refused: discovery binds the IPv4 wildcard, and an IPv4
+socket cannot reach an IPv6 address. The parser is handed that bind address
+and refuses only against an IPv4 one, so an IPv6 bind would accept the entry
+(<a href="https://github.com/lambdaclass/ethlambda/issues/853">#853</a>). <code>/ip6</code> with <code>tcp</code> or <code>quic-v1</code> is dialed by the
+swarm and accepted.</p>
+<p>The form follows Lighthouse’s <code>--boot-nodes</code>, with four deliberate departures:</p>
+<ul>
+<li><strong><code>/p2p/&lt;peer-id&gt;</code> is required</strong>, and the peer id must embed its public key,
+which every secp256k1 peer id does, in the key’s canonical encoding (a
+hand-built id with the key’s fields reordered is refused). Every bootnode is keyed by its peer id
+(its dial addresses are merged under it, and it is how this node skips its
+own entry and redials the others), and discv5 is seeded with that key, so an
+anonymous entry has no place to go. Lighthouse dials a TCP multiaddr with no peer id
+anonymously.</li>
+<li><strong>DNS multiaddrs are refused</strong> (<code>/dns</code>, <code>/dns4</code>, <code>/dns6</code>, <code>/dnsaddr</code>): a
+bootnode holds an address, and the swarm has no DNS transport to resolve a
+name with. Write the address as <code>/ip4</code> or <code>/ip6</code>.</li>
+<li><strong>QUIC multiaddrs are dialed.</strong> Lighthouse dials only TCP multiaddr
+bootnodes; this node prefers QUIC wherever a peer offers it (see
+<a href="#which-peers-get-dialed">Which peers get dialed</a>).</li>
+<li><strong>A UDP multiaddr seeds discv5 directly</strong>, with the key taken from the peer
+id, rather than through a discv5 ENR request. The outcome is the same:
+discovery learns the peer’s record on first contact.</li>
+</ul>
 <h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
 <h3 id="static-bootnodes-bypass-admission-and-are-redialed-indefinitely"><a class="header" href="#static-bootnodes-bypass-admission-and-are-redialed-indefinitely">Static bootnodes bypass admission and are redialed indefinitely</a></h3>
 <p>Everything under <a href="#which-peers-get-dialed">Which peers get dialed</a> applies to
 <em>discovered</em> peers. A static bootnode reaches the swarm by a different path:
 <code>parse_enr</code> reads <code>ip</code>, <code>secp256k1</code> and the three port entries and never looks at
-<code>eth2</code>, so a <code>--bootnodes</code> list is dialed as given. Now that a <code>tcp</code>-only record
-is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
+<code>eth2</code>, so a bootnode list is dialed as given: <code>node</code>’s <code>--bootnodes</code> file, or
+on <code>beacon</code> the network’s own list plus any <code>--bootnodes</code> entries, whose
+multiaddrs carry no <code>eth2</code> to look at in the first place. Now that a <code>tcp</code>-only
+record is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
 handshake to a lighthouse node succeeds: the peer occupies a
 <code>--discovery.target-peers</code> slot, contributes no attestation subnets, and is
 eventually dropped by the remote for sharing no protocols. Each drop re-arms the
@@ -8607,7 +8966,7 @@ provisioning one.</p>
 <p>Generating here removes the second pin. These keys come from the same
 <code>ethlambda-crypto</code> types the node loads them with, so the generator and the
 loader cannot disagree about the format.</p>
-<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<h2 id="flags-1"><a class="header" href="#flags-1">Flags</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -8955,6 +9314,85 @@ reports only what the request cost beyond it: building it, and the wait left
 after the transition, which is nothing when the answer was already in. The
 execution client’s own time is <code>lean_engine_new_payload_seconds</code>. A replay has
 no client, so none of this applies to its numbers.</p>
+<h3 id="where-stf-goes-the-reports-stf_phases-class-and-resource-fields"><a class="header" href="#where-stf-goes-the-reports-stf_phases-class-and-resource-fields">Where <code>stf</code> goes: the report’s <code>stf_phases</code>, <code>class</code> and resource fields</a></h3>
+<p><code>stf</code> is one number for a block’s whole state transition, and on a mainnet
+block it is most of the import. Each sample therefore also carries what it was
+made of, so a baseline says which step to attack and for which kind of block.
+The report’s <code>schema_version</code> is 2; version 1 had none of what follows, and every
+field below that a sample or the summary can lack is <strong>absent, not zero</strong>.</p>
+<p><strong><code>stf_phases</code></strong> (per sample, seconds). The steps of the beacon state
+transition, read from <code>lean_beacon_stf_phase_seconds</code> the same way <code>phases</code>
+reads the import histogram: its <code>sum</code> before and after each import. The names are
+<code>BEACON_STF_PHASES</code>, described in <a href="#beacon-state-transition-phases"><code>metrics.md</code></a>:
+<code>process_slots</code> (excluding epoch work), <code>process_epoch</code>, <code>block_signature</code>,
+<code>block_header</code>, <code>randao</code>, <code>eth1_data</code>, <code>execution_payload</code>, one per operation list
+(<code>proposer_slashings</code>, <code>attester_slashings</code>, <code>attestations</code>, <code>deposits</code>,
+<code>voluntary_exits</code>, <code>bls_to_execution_changes</code>, <code>execution_requests</code>,
+<code>payload_attestations</code>), <code>sync_aggregate</code>, <code>batch_signatures</code> (the deferred signatures
+of the block, verified together) and <code>state_root</code>. Unlike <code>phases</code>, a
+step may be observed more than once in one import (<code>process_epoch</code> once per
+boundary a long skip crosses, the gloas payload steps twice), so a value is the
+<strong>sum</strong> of that import’s observations, not a single one.</p>
+<p>Only the import path’s observations are read. The epoch precompute worker runs
+<code>process_epoch</code> on another thread while an import runs, and the histogram has a
+<code>context</code> label (<code>import</code> or <code>other</code>) so the replay reads <code>context="import"</code>
+alone; see the metrics page for what sets each. A replay runs no precompute
+worker, so for these blocks the filter changes nothing; it is what keeps the
+same reading honest on any binary that does.</p>
+<p>For the same reason an <code>epoch_boundary</code> block in a replay always pays
+<code>process_epoch</code> inline: nothing has precomputed it (the report’s
+<code>caches.epoch_precompute</code> shows the misses). On a live follower a precompute hit
+takes that cost off the import path, so the replay is the upper bound.</p>
+<p><strong><code>stf_unattributed_seconds</code></strong> is <code>stf</code> minus the sum of <code>stf_phases</code>: the part
+of the transition no step covers, such as cloning the parent’s state and
+building the epoch-boundary balances. Absent when <code>stf</code> did not run.</p>
+<p><strong><code>class</code></strong> is what the block’s <code>process_slots</code> had to do, decided from the
+block’s slot and its parent’s (<code>parent_slot</code>, also in the sample):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>class</code></th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>epoch_boundary</code></td><td>The block’s slot is in a later epoch than its parent’s, so <code>process_epoch</code> runs. Takes precedence over a skip</td></tr>
+<tr><td><code>after_skip</code></td><td>Same epoch, but the parent is more than one slot back</td></tr>
+<tr><td><code>ordinary</code></td><td>The parent is the previous slot, in the same epoch</td></tr>
+</tbody>
+</table>
+</div>
+<p>A corpus is linear (<code>fetch</code> refuses a block whose parent is not the one before
+it), so there is no class for a reorg: a block is always applied to the block
+imported just before it. The class describes the work the block asked for, not
+what a cache spared it.</p>
+<p><strong><code>cpu_seconds</code></strong> is the user plus system CPU time the whole process used during
+the import (<code>getrusage(RUSAGE_SELF)</code>, delta around the call). It is the process,
+not the importing thread: the merkle fold’s workers, the state writer and
+RocksDB’s background threads are in it, which is the point (an import whose CPU
+time is well above its wall time ran in parallel) and also the caveat (nothing
+else may run in the process). <strong><code>rss_bytes</code></strong> is the resident set size right
+after the import, read from <code>/proc/self/status</code>, so it is <strong>Linux only</strong> and
+absent elsewhere. <strong><code>peak_rss_bytes</code></strong> is the process’s high-water mark so far
+(<code>ru_maxrss</code>), present on Linux and macOS; being a running maximum it moves only
+on the block that set a new peak.</p>
+<p><strong>Summary.</strong> <code>summary</code> keeps its old paths (<code>phases</code>, <code>wall</code>) and gains
+<code>stf_phases</code>, <code>stf_unattributed</code> and <code>cpu</code>, each a distribution over the blocks
+that have the field, and <code>by_class</code>: for each class at least one block fell into
+(<code>epoch_boundary</code>, <code>after_skip</code>, <code>ordinary</code>) its <code>blocks</code> count and the same
+distributions (<code>phases</code>, <code>stf_phases</code>, <code>stf_unattributed</code>, <code>wall</code>, <code>cpu</code>)
+restricted to that class. Every distribution (<code>Stats</code>) now has <code>p95_seconds</code> and
+<code>p99_seconds</code> beside <code>p50_seconds</code> and <code>p90_seconds</code>, in both workloads’ reports.
+Percentiles are nearest-rank, so a short run reports its maximum for the tail:
+the p99 is the maximum up to 51 samples, the p95 up to 11.</p>
+<p><strong><code>caches</code></strong> (per run, not per block) is the lookups the state transition’s
+caches served during the measured blocks, as deltas of the counters in
+<a href="#metrics-2"><code>metrics.md</code></a> taken after the warm-up so each cache’s cold start is
+not counted: <code>epoch_precompute</code>, <code>committee_cache</code>, <code>total_active_balance</code> and
+<code>justified_balances</code>, each with <code>hit</code>, <code>miss</code>, <code>hit_rate</code> (<code>hit / (hit + miss)</code>,
+absent when nothing was looked up) and, for the two caches that have the outcome,
+<code>unkeyable</code> (computed for one caller and not cached, so not in the rate).</p>
+<p>The human table shows the per-block <code>phases</code>, the class, CPU and unattributed
+time, then the summaries; the per-block <code>stf_phases</code> are in the JSON only,
+since close to twenty more columns would not fit a terminal.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>

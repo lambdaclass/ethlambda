@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-55c98210.js";
+            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-dd44a827.js"></script>
+        <script src="toc-9d125e03.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -242,15 +242,16 @@ one <code>CommonOptions</code> struct flattened into each.</p>
 <tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port. <code>beacon</code> binds it too, off its own anchored store rather than an empty one; the lean-shaped <code>/lean/v0</code> routes still don’t answer for it (see <a href="#beacon-flags"><code>beacon</code> flags</a> below)</td></tr>
 <tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics and debug server port. Equal to <code>--api-port</code> merges the routers onto one listener</td></tr>
 <tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code></td><td>Hex file holding the secp256k1 key that is this node’s libp2p and discv5 identity. When omitted, the key stored in <code>--data-dir</code> as <code>node.key</code> is used, generated and stored there (mode <code>0600</code>) on the directory’s first start, so the PeerId and ENR stay the same across restarts until the directory is wiped</td></tr>
-<tr><td><code>--bootnodes</code></td><td>see below</td><td>Bootnode ENR list: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated)</td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>see below</td><td>API base URLs, tried in order until one answers. Supplies <code>node</code>’s starting state on the lean API, and <code>beacon</code>’s anchor on a standard Beacon API; required on a fresh <code>beacon</code> data directory only for a built-in network, since a loaded network anchors at its own <code>genesis.ssz</code> instead. See <a href="checkpoint_sync.html"><code>checkpoint_sync.md</code></a></td></tr>
 <tr><td><code>--discovery.port</code></td><td><code>9000</code></td><td>discv5 UDP port; must differ from <code>--gossipsub-port</code>. See <a href="./discovery.html">Peer discovery</a></td></tr>
 <tr><td><code>--discovery.advertise-ip</code></td><td>bind address</td><td>IP published in the ENR</td></tr>
 <tr><td><code>--discovery.target-peers</code></td><td><code>200</code></td><td>Connected-peer count above which discovery stops dialing</td></tr>
+<tr><td><code>--telemetry.clickhouse-url</code></td><td>off</td><td>ClickHouse HTTP endpoint for per-block <code>block_events</code> rows; also read from <code>ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL</code>, the place for a URL with a password. See <a href="./telemetry.html">Block telemetry</a></td></tr>
+<tr><td><code>--telemetry.client-name</code></td><td><code>--node-id</code> / <code>ethlambda@&lt;hostname&gt;</code></td><td><code>meta_client_name</code> on those rows; requires the URL</td></tr>
 </tbody>
 </table>
 </div>
-<p>Three of those have no clap default, because the two chains answer them
+<p>Two of those have no clap default, because the two chains answer them
 differently. A single <code>default_value</code> can only say one thing, so the flag
 carries none and each chain resolves an absent value itself:</p>
 <div class="table-wrapper">
@@ -260,11 +261,14 @@ carries none and each chain resolves an absent value itself:</p>
 </thead>
 <tbody>
 <tr><td><code>--node-key</code></td><td><code>&lt;data-dir&gt;/node.key</code>, generated on the directory’s first start</td><td>same</td></tr>
-<tr><td><code>--bootnodes</code></td><td>no bootnodes: peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed, warned about</td><td>falls back to the resolved network’s own bootnode list: a built-in network’s embedded list, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
 <tr><td><code>--checkpoint-sync-url</code></td><td>start from a resumable DB, else from genesis</td><td>start from a resumable DB, else anchor at the resolved network’s own genesis (loaded network only), else abort</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>--bootnodes</code> is taken by both too, but not with one meaning, so it is listed
+under each sub-command instead: on <code>node</code> it names a file of ENRs, and on
+<code>beacon</code> it is a list of ENRs and multiaddrs added to the network’s own
+bootnodes.</p>
 <p>Whether discv5 runs is not a common flag. <code>beacon</code> always runs it, since
 published mainnet bootnode ENRs carry no <code>quic</code> entry and so are not statically
 dialable; <code>node</code> runs it only with <code>--discovery.enable</code> (see below). Where it
@@ -288,6 +292,7 @@ is published.</p>
 <tr><td><code>--hash-sig-keys-dir</code></td><td>required</td><td>Directory of per-validator XMSS keys</td></tr>
 <tr><td><code>--node-id</code></td><td>required</td><td>The key in <code>annotated_validators.yaml</code> naming this node, e.g. <code>ethlambda_0</code></td></tr>
 <tr><td><code>--is-aggregator</code></td><td><code>false</code></td><td>Seed the runtime aggregator flag</td></tr>
+<tr><td><code>--bootnodes</code></td><td>none, warned about</td><td>Path to a bootnode ENR file: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated). An unusable entry is skipped with a warning. Without the flag the node starts with no bootnodes, since a lean network has no built-in list, and reaches peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed</td></tr>
 <tr><td><code>--discovery.enable</code></td><td><code>false</code></td><td>Run discv5 peer discovery; off, the node peers from <code>--bootnodes</code> alone. See <a href="./discovery.html">Peer discovery</a></td></tr>
 <tr><td><code>--aggregate-subnet-ids</code></td><td>this node’s subnets</td><td>Subnets to aggregate on; requires <code>--is-aggregator</code></td></tr>
 <tr><td><code>--attestation-committee-count</code></td><td>from <code>validator-config.yaml</code>, else <code>1</code></td><td>Committees per slot</td></tr>
@@ -341,7 +346,7 @@ client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
 <a href="./beacon_engine.html">the execution layer pairing</a> for what each verdict does and
 for the limitations that go with the retry ladder.</p>
-<p><code>beacon</code> takes one more flag of its own, and two common flags also mean
+<p><code>beacon</code> takes two more flags of its own, and two common flags also mean
 something specific here.</p>
 <div class="table-wrapper">
 <table>
@@ -350,6 +355,7 @@ something specific here.</p>
 </thead>
 <tbody>
 <tr><td><code>--network</code></td><td><code>mainnet</code></td><td>A built-in network name (<code>mainnet</code>, <code>sepolia</code>, <code>hoodi</code> or <code>plataberget</code>), or a path to a directory of published network files. A value containing a slash is always a path, so <code>mainnet</code> is the built-in and <code>./mainnet</code> is a directory. The directory must hold <code>config.yaml</code> and <code>genesis.ssz</code>, and may hold <code>bootstrap_nodes.yaml</code> or <code>bootstrap_nodes.txt</code></td></tr>
+<tr><td><code>--bootnodes</code></td><td>none: the network’s own list alone</td><td>Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network’s own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a></td></tr>
 </tbody>
 </table>
 </div>
@@ -373,8 +379,10 @@ the same way, so a wrong constant fails at startup rather than following the
 wrong chain.</p>
 <p><code>beacon</code> therefore takes no genesis config, validator registry, or bootnode file
 of its own the way <code>node</code> does: those are read off the resolved network instead
-of being separate operator input. A <code>config.yaml</code> (a directory’s, or a built-in
-network’s embedded one) is read permissively: absent keys fall back to mainnet’s values,
+of being separate operator input, and <code>beacon</code>’s <code>--bootnodes</code> only adds entries
+to the network’s list (see <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a>). A
+<code>config.yaml</code> (a directory’s, or a built-in network’s embedded one) is read
+permissively: absent keys fall back to mainnet’s values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its <code>PRESET_BASE</code> is checked against the
@@ -413,6 +421,62 @@ either way, the same way <code>node</code>’s does.</p>
 site serves both chains, but it picks the router by the store’s chain, so a
 <code>beacon</code> run serves the Beacon API under <code>/eth/v1</code> and <code>/eth/v2</code> and answers a
 <code>/lean/v0/...</code> path with a 404. See <a href="./rpc.html"><code>rpc.md</code></a>.</p>
+<h3 id="bootnodes-on-beacon"><a class="header" href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a></h3>
+<p><code>beacon</code>’s <code>--bootnodes</code> is a list, not a file, modeled on Lighthouse’s
+<code>--boot-nodes</code>. Entries are comma-separated and the flag may be repeated, all
+of its values combined; each entry is trimmed, and an empty one is ignored. An
+entry is either an ENR, written with or without its <code>enr:</code> prefix, or a
+multiaddr, which starts with <code>/</code>:</p>
+<pre><code class="language-sh">ethlambda beacon --network hoodi --checkpoint-sync-url &lt;URL&gt; \
+  --bootnodes enr:-Iq4Q…,/ip4/203.0.113.7/tcp/9000/p2p/16Uiu2HAm… \
+  --bootnodes /ip4/203.0.113.8/udp/9000/p2p/16Uiu2HAk…
+</code></pre>
+<p>A multiaddr is <code>/ip4/&lt;ip&gt;</code> or <code>/ip6/&lt;ip&gt;</code>, then one transport, then
+<code>/p2p/&lt;peer-id&gt;</code>. The transport decides what the entry is used for:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transport</th><th>The peer is</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tcp/&lt;port&gt;</code></td><td>dialed over TCP</td></tr>
+<tr><td><code>udp/&lt;port&gt;/quic-v1</code></td><td>dialed over QUIC</td></tr>
+<tr><td><code>udp/&lt;port&gt;</code></td><td>not dialed directly: the port is the peer’s discv5 port, so the entry seeds discovery, which is how Lighthouse reads a UDP multiaddr too</td></tr>
+</tbody>
+</table>
+</div>
+<p>QUIC is <code>quic-v1</code> only; the older draft <code>/quic</code> is refused. The
+<code>/p2p/&lt;peer-id&gt;</code> is required, and DNS multiaddrs (<code>/dns</code>, <code>/dns4</code>, <code>/dns6</code>,
+<code>/dnsaddr</code>) are refused, so write the address as <code>/ip4</code> or <code>/ip6</code>. Those two are
+departures from Lighthouse; <a href="./discovery.html#multiaddrs">Peer discovery</a> lists
+them with the rest.</p>
+<p>The entries are added to the resolved network’s own list (a built-in network’s
+embedded one, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code>), never put
+in its place, which is Lighthouse’s behavior too. Giving the flag used to
+replace that list; now the network’s bootnodes are always used, and the flag
+only adds to them. Nothing turns them off: each one with a QUIC or TCP port is
+dialed at startup and redialed 12 seconds after every failed dial or
+disconnect, even on a host that cannot reach it. To run on other bootnodes
+alone, load the network from a directory whose <code>bootstrap_nodes.yaml</code> lists
+only those.</p>
+<p>An IPv6 entry is dialed like an IPv4 one, but discv5 binds the IPv4 wildcard
+and an IPv4 socket cannot reach an IPv6 address, so an IPv6 entry that is only
+a discv5 contact (<code>/ip6/&lt;ip&gt;/udp/&lt;port&gt;</code>, or an ENR whose only address is <code>ip6</code>
+and whose only port is <code>udp</code>) is refused. The check reads the address discovery
+binds rather than assuming IPv4, so it lifts on its own once discovery binds
+IPv6 (<a href="https://github.com/lambdaclass/ethlambda/issues/853">#853</a>).</p>
+<p>Every entry is checked at startup. One that does not parse, or that is
+unusable (an ENR with no <code>quic</code>, <code>tcp</code> or <code>udp</code> port, a port of <code>0</code>, and so
+on), is a startup error naming the entry: an operator who typed it meant to
+reach that peer, and skipping it would leave the node running on a list it was
+not given. The network’s own list keeps the old rule, a bad entry there being
+skipped with a warning, as <code>node</code> skips one in its file.</p>
+<p><strong>A file path is no longer accepted.</strong> Startup fails on one, with a hint that
+<code>--bootnodes</code> now takes a list; so does a missing path ending in <code>.yaml</code>,
+<code>.yml</code> or <code>.txt</code>. A launch script that passed <code>beacon</code> a bootnode file must
+pass the records it lists joined with commas instead (without a YAML list’s
+<code>- </code> markers or any comments), or, for a network loaded from a directory, list
+them in that directory’s <code>bootstrap_nodes.yaml</code>.</p>
 <h2 id="what-ethlambda-beacon-does-today"><a class="header" href="#what-ethlambda-beacon-does-today">What <code>ethlambda beacon</code> does today</a></h2>
 <p>It follows the resolved network as a non-validating follower. It anchors a
 RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, joins
@@ -436,7 +500,7 @@ not chain-specific, branches once, and shares the shutdown:</p>
 <tr><td>raise <code>RLIMIT_NOFILE</code></td><td>shared</td><td>shared</td></tr>
 <tr><td><code>HIVE_LEAN_TEST_DRIVER</code> early return</td><td>yes</td><td>no: those endpoints are lean’s</td></tr>
 <tr><td>resolve <code>--network</code> into a <code>NetworkSource</code></td><td>n/a: lean has no <code>--network</code></td><td>classify the value (built-in name vs. directory); parse the <code>config.yaml</code> (embedded, or the directory’s) and check <code>PRESET_BASE</code> against the compiled preset and the constant-backed keys against their constants; for a directory, then decode <code>genesis.ssz</code></td></tr>
-<tr><td>read <code>--bootnodes</code> (falls back to the chain’s default list; see the table above)</td><td>shared</td><td>shared</td></tr>
+<tr><td>read <code>--bootnodes</code></td><td>a file of ENRs; absent means no bootnodes, warned about</td><td>a comma-separated list of ENRs and multiaddrs, added to the resolved network’s own list; a bad entry is a startup error (see <a href="#bootnodes-on-beacon">Bootnodes on <code>beacon</code></a>)</td></tr>
 <tr><td>build the aggregator, sync-status and event handles</td><td>shared</td><td>shared</td></tr>
 <tr><td>open <code>--data-dir</code>’s RocksDB backend</td><td>shared</td><td>shared</td></tr>
 <tr><td>resolve <code>--node-key</code>, else load <code>&lt;data-dir&gt;/node.key</code>, generating it on first start (after the open, so RocksDB’s lock covers the write)</td><td>shared</td><td>shared</td></tr>

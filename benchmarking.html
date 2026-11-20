@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-55c98210.js";
+            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-dd44a827.js"></script>
+        <script src="toc-9d125e03.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -451,6 +451,85 @@ reports only what the request cost beyond it: building it, and the wait left
 after the transition, which is nothing when the answer was already in. The
 execution client’s own time is <code>lean_engine_new_payload_seconds</code>. A replay has
 no client, so none of this applies to its numbers.</p>
+<h3 id="where-stf-goes-the-reports-stf_phases-class-and-resource-fields"><a class="header" href="#where-stf-goes-the-reports-stf_phases-class-and-resource-fields">Where <code>stf</code> goes: the report’s <code>stf_phases</code>, <code>class</code> and resource fields</a></h3>
+<p><code>stf</code> is one number for a block’s whole state transition, and on a mainnet
+block it is most of the import. Each sample therefore also carries what it was
+made of, so a baseline says which step to attack and for which kind of block.
+The report’s <code>schema_version</code> is 2; version 1 had none of what follows, and every
+field below that a sample or the summary can lack is <strong>absent, not zero</strong>.</p>
+<p><strong><code>stf_phases</code></strong> (per sample, seconds). The steps of the beacon state
+transition, read from <code>lean_beacon_stf_phase_seconds</code> the same way <code>phases</code>
+reads the import histogram: its <code>sum</code> before and after each import. The names are
+<code>BEACON_STF_PHASES</code>, described in <a href="metrics.html#beacon-state-transition-phases"><code>metrics.md</code></a>:
+<code>process_slots</code> (excluding epoch work), <code>process_epoch</code>, <code>block_signature</code>,
+<code>block_header</code>, <code>randao</code>, <code>eth1_data</code>, <code>execution_payload</code>, one per operation list
+(<code>proposer_slashings</code>, <code>attester_slashings</code>, <code>attestations</code>, <code>deposits</code>,
+<code>voluntary_exits</code>, <code>bls_to_execution_changes</code>, <code>execution_requests</code>,
+<code>payload_attestations</code>), <code>sync_aggregate</code>, <code>batch_signatures</code> (the deferred signatures
+of the block, verified together) and <code>state_root</code>. Unlike <code>phases</code>, a
+step may be observed more than once in one import (<code>process_epoch</code> once per
+boundary a long skip crosses, the gloas payload steps twice), so a value is the
+<strong>sum</strong> of that import’s observations, not a single one.</p>
+<p>Only the import path’s observations are read. The epoch precompute worker runs
+<code>process_epoch</code> on another thread while an import runs, and the histogram has a
+<code>context</code> label (<code>import</code> or <code>other</code>) so the replay reads <code>context="import"</code>
+alone; see the metrics page for what sets each. A replay runs no precompute
+worker, so for these blocks the filter changes nothing; it is what keeps the
+same reading honest on any binary that does.</p>
+<p>For the same reason an <code>epoch_boundary</code> block in a replay always pays
+<code>process_epoch</code> inline: nothing has precomputed it (the report’s
+<code>caches.epoch_precompute</code> shows the misses). On a live follower a precompute hit
+takes that cost off the import path, so the replay is the upper bound.</p>
+<p><strong><code>stf_unattributed_seconds</code></strong> is <code>stf</code> minus the sum of <code>stf_phases</code>: the part
+of the transition no step covers, such as cloning the parent’s state and
+building the epoch-boundary balances. Absent when <code>stf</code> did not run.</p>
+<p><strong><code>class</code></strong> is what the block’s <code>process_slots</code> had to do, decided from the
+block’s slot and its parent’s (<code>parent_slot</code>, also in the sample):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>class</code></th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>epoch_boundary</code></td><td>The block’s slot is in a later epoch than its parent’s, so <code>process_epoch</code> runs. Takes precedence over a skip</td></tr>
+<tr><td><code>after_skip</code></td><td>Same epoch, but the parent is more than one slot back</td></tr>
+<tr><td><code>ordinary</code></td><td>The parent is the previous slot, in the same epoch</td></tr>
+</tbody>
+</table>
+</div>
+<p>A corpus is linear (<code>fetch</code> refuses a block whose parent is not the one before
+it), so there is no class for a reorg: a block is always applied to the block
+imported just before it. The class describes the work the block asked for, not
+what a cache spared it.</p>
+<p><strong><code>cpu_seconds</code></strong> is the user plus system CPU time the whole process used during
+the import (<code>getrusage(RUSAGE_SELF)</code>, delta around the call). It is the process,
+not the importing thread: the merkle fold’s workers, the state writer and
+RocksDB’s background threads are in it, which is the point (an import whose CPU
+time is well above its wall time ran in parallel) and also the caveat (nothing
+else may run in the process). <strong><code>rss_bytes</code></strong> is the resident set size right
+after the import, read from <code>/proc/self/status</code>, so it is <strong>Linux only</strong> and
+absent elsewhere. <strong><code>peak_rss_bytes</code></strong> is the process’s high-water mark so far
+(<code>ru_maxrss</code>), present on Linux and macOS; being a running maximum it moves only
+on the block that set a new peak.</p>
+<p><strong>Summary.</strong> <code>summary</code> keeps its old paths (<code>phases</code>, <code>wall</code>) and gains
+<code>stf_phases</code>, <code>stf_unattributed</code> and <code>cpu</code>, each a distribution over the blocks
+that have the field, and <code>by_class</code>: for each class at least one block fell into
+(<code>epoch_boundary</code>, <code>after_skip</code>, <code>ordinary</code>) its <code>blocks</code> count and the same
+distributions (<code>phases</code>, <code>stf_phases</code>, <code>stf_unattributed</code>, <code>wall</code>, <code>cpu</code>)
+restricted to that class. Every distribution (<code>Stats</code>) now has <code>p95_seconds</code> and
+<code>p99_seconds</code> beside <code>p50_seconds</code> and <code>p90_seconds</code>, in both workloads’ reports.
+Percentiles are nearest-rank, so a short run reports its maximum for the tail:
+the p99 is the maximum up to 51 samples, the p95 up to 11.</p>
+<p><strong><code>caches</code></strong> (per run, not per block) is the lookups the state transition’s
+caches served during the measured blocks, as deltas of the counters in
+<a href="metrics.html"><code>metrics.md</code></a> taken after the warm-up so each cache’s cold start is
+not counted: <code>epoch_precompute</code>, <code>committee_cache</code>, <code>total_active_balance</code> and
+<code>justified_balances</code>, each with <code>hit</code>, <code>miss</code>, <code>hit_rate</code> (<code>hit / (hit + miss)</code>,
+absent when nothing was looked up) and, for the two caches that have the outcome,
+<code>unkeyable</code> (computed for one caller and not cached, so not in the rate).</p>
+<p>The human table shows the per-block <code>phases</code>, the class, CPU and unattributed
+time, then the summaries; the per-block <code>stf_phases</code> are in the JSON only,
+since close to twenty more columns would not fit a terminal.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>

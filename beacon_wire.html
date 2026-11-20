@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-55c98210.js";
+            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-dd44a827.js"></script>
+        <script src="toc-9d125e03.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1132,7 +1132,9 @@ subnets</a>).</p>
 sync committee messages, blocks with their columns, operations), plus relayed
 validated gossip.</p>
 <p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
+ENR was skipped with a warning. That holds for a run without <code>--bootnodes</code>,
+whose entries are counted on top (in <code>seeds</code> only when they carry a discv5
+port). <code>topics=17</code> proves the subscription set: the 7
 global topics, the 8 column subnets this run’s (randomly generated) node id
 selected, and the 2 attestation subnets the same id selected; <code>columns=8</code> and
 <code>attestation_subnets=[…]</code> confirm the two families directly.</p>

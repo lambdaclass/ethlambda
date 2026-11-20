@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-55c98210.js";
+            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-dd44a827.js"></script>
+        <script src="toc-9d125e03.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -365,6 +365,12 @@ mainnet bootnode list is close to the mirror image, <code>udp</code> and no <cod
 <code>tcp</code> entry is what makes such a record statically dialable rather than a
 discv5 seed only: four of the seventeen carry one. A record missing an <code>ip</code> or
 a <code>secp256k1</code> key is dropped regardless of its transports.</p>
+<p>Dropped means skipped with a warning for an entry in <code>node</code>’s <code>--bootnodes</code>
+file or in a network’s own list, built-in or loaded. An entry given to
+<code>beacon</code>’s <code>--bootnodes</code> is held to a stricter rule: one that does not parse,
+or would be dropped here, is a startup error naming it, since the operator
+typed it to reach that peer (see
+<a href="./cli.html#bootnodes-on-beacon">the CLI reference</a>).</p>
 <p>The ENR a node logs at startup is only useful to a peer if that node was
 started with a real <code>--discovery.advertise-ip</code>.
 Copying an ENR built from the default <code>0.0.0.0</code> into another node’s bootnode
@@ -372,13 +378,59 @@ list produces a <code>udp</code>/<code>quic</code>/<code>tcp</code> target that 
 names no reachable host. Set <code>--discovery.advertise-ip</code> before pointing other
 nodes at this one’s ENR: <code>127.0.0.1</code> on a local devnet, or the host’s public
 address otherwise.</p>
+<h3 id="multiaddrs"><a class="header" href="#multiaddrs">Multiaddrs</a></h3>
+<p><code>beacon</code>’s <code>--bootnodes</code> also takes multiaddrs, <code>/ip4/&lt;ip&gt;</code> or <code>/ip6/&lt;ip&gt;</code>
+followed by one transport and <code>/p2p/&lt;peer-id&gt;</code>. A multiaddr names a single
+transport, so it fills exactly one of the three entries above, the IP and the
+key coming from the address and the peer id:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transport</th><th>Entry it fills</th><th>The peer is</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tcp/&lt;port&gt;</code></td><td><code>tcp</code></td><td>dialed over TCP</td></tr>
+<tr><td><code>udp/&lt;port&gt;/quic-v1</code></td><td><code>quic</code></td><td>dialed over QUIC</td></tr>
+<tr><td><code>udp/&lt;port&gt;</code></td><td><code>udp</code></td><td>seeded into discv5, not dialed directly</td></tr>
+</tbody>
+</table>
+</div>
+<p>A UDP multiaddr names the peer’s discovery port, not a libp2p listener, which
+is how Lighthouse reads one too. A peer reachable more than one way takes one
+entry per transport, and the entries are merged under its peer id. An <code>/ip6</code>
+UDP multiaddr is refused: discovery binds the IPv4 wildcard, and an IPv4
+socket cannot reach an IPv6 address. The parser is handed that bind address
+and refuses only against an IPv4 one, so an IPv6 bind would accept the entry
+(<a href="https://github.com/lambdaclass/ethlambda/issues/853">#853</a>). <code>/ip6</code> with <code>tcp</code> or <code>quic-v1</code> is dialed by the
+swarm and accepted.</p>
+<p>The form follows Lighthouse’s <code>--boot-nodes</code>, with four deliberate departures:</p>
+<ul>
+<li><strong><code>/p2p/&lt;peer-id&gt;</code> is required</strong>, and the peer id must embed its public key,
+which every secp256k1 peer id does, in the key’s canonical encoding (a
+hand-built id with the key’s fields reordered is refused). Every bootnode is keyed by its peer id
+(its dial addresses are merged under it, and it is how this node skips its
+own entry and redials the others), and discv5 is seeded with that key, so an
+anonymous entry has no place to go. Lighthouse dials a TCP multiaddr with no peer id
+anonymously.</li>
+<li><strong>DNS multiaddrs are refused</strong> (<code>/dns</code>, <code>/dns4</code>, <code>/dns6</code>, <code>/dnsaddr</code>): a
+bootnode holds an address, and the swarm has no DNS transport to resolve a
+name with. Write the address as <code>/ip4</code> or <code>/ip6</code>.</li>
+<li><strong>QUIC multiaddrs are dialed.</strong> Lighthouse dials only TCP multiaddr
+bootnodes; this node prefers QUIC wherever a peer offers it (see
+<a href="#which-peers-get-dialed">Which peers get dialed</a>).</li>
+<li><strong>A UDP multiaddr seeds discv5 directly</strong>, with the key taken from the peer
+id, rather than through a discv5 ENR request. The outcome is the same:
+discovery learns the peer’s record on first contact.</li>
+</ul>
 <h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
 <h3 id="static-bootnodes-bypass-admission-and-are-redialed-indefinitely"><a class="header" href="#static-bootnodes-bypass-admission-and-are-redialed-indefinitely">Static bootnodes bypass admission and are redialed indefinitely</a></h3>
 <p>Everything under <a href="#which-peers-get-dialed">Which peers get dialed</a> applies to
 <em>discovered</em> peers. A static bootnode reaches the swarm by a different path:
 <code>parse_enr</code> reads <code>ip</code>, <code>secp256k1</code> and the three port entries and never looks at
-<code>eth2</code>, so a <code>--bootnodes</code> list is dialed as given. Now that a <code>tcp</code>-only record
-is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
+<code>eth2</code>, so a bootnode list is dialed as given: <code>node</code>’s <code>--bootnodes</code> file, or
+on <code>beacon</code> the network’s own list plus any <code>--bootnodes</code> entries, whose
+multiaddrs carry no <code>eth2</code> to look at in the first place. Now that a <code>tcp</code>-only
+record is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
 handshake to a lighthouse node succeeds: the peer occupies a
 <code>--discovery.target-peers</code> slot, contributes no attestation subnets, and is
 eventually dropped by the remote for sharing no protocols. Each drop re-arms the
