@@ -38,7 +38,8 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    ConnectedPeer, FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
+    PeerDirection, PeerTableController,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -108,7 +109,7 @@ use crate::{
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
         fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
-        handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
+        handlers::{ColumnReport, columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
 };
@@ -169,6 +170,12 @@ const BACKOFF_MULTIPLIER: u64 = 2;
 /// backoffs sum to a few seconds, plus each attempt's round trips) and shorter
 /// than a mainnet slot, so a re-drive arriving on the next tick finds either a
 /// live lookup or no entry at all.
+///
+/// Shorter than the request-response timeout (libp2p's default 10 s), so a
+/// replaced lookup's requests can still report back after the new one has
+/// started. Each request carries its lookup's id
+/// ([`PendingRequestKind::Columns`]), so such a report delivers its columns
+/// but settles nothing of the new lookup's.
 const STALE_COLUMN_LOOKUP: Duration = Duration::from_secs(8);
 
 /// How many peers of unknown custody one `DataColumnsByRange` prefetch may
@@ -230,11 +237,16 @@ const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 /// `lean_beacon_gossip_validation_seconds` has data from a follower.
 const GOSSIP_VALIDATION_PERMITS: usize = 128;
 
-/// How many data column sidecars may be in the chain checks at once (see
-/// [`beacon::column_checks`]). A separate pool from
+/// How many blocking threads the chain checks of fetched and parked data
+/// column sidecars, and of fetched execution payload envelopes, may occupy at
+/// once (see [`beacon::column_checks`] and [`beacon::envelope_checks`]). A
+/// permit covers one block's column prechecks and first KZG sub-batch, one
+/// further KZG sub-batch of at most 16 columns, or one envelope: not one
+/// sidecar, as it once did, nor all of a block's proofs. A separate pool from
 /// [`GOSSIP_VALIDATION_PERMITS`], so a range batch's hundreds of sidecars
-/// cannot take every permit and leave gossip reporting `Overloaded`. A sidecar
-/// arriving with none free waits for one. Revisit with data, as for gossip.
+/// cannot take every permit and leave gossip reporting `Overloaded`. Work
+/// arriving with none free waits for one, in arrival order. Revisit with data,
+/// as for gossip.
 const COLUMN_CHECK_PERMITS: usize = 16;
 
 /// How many `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}`
@@ -359,26 +371,80 @@ pub(crate) struct PendingRequest {
 
 /// A block-root fetch's counterpart for a column lookup: the same
 /// attempt/failed-peer bookkeeping [`PendingRequest`] carries, plus what
-/// [`PendingRequest`] never needed to. `columns` is the request body a retry
-/// resends, since (unlike a block-root fetch, whose body is the root already
-/// keying this map) a column request also names which columns.
+/// [`PendingRequest`] never needed to, since (unlike a block-root fetch, whose
+/// body is the root already keying this map) a column request also names
+/// which columns, and one lookup is split across several peers.
 pub(crate) struct PendingColumnRequest {
+    /// The columns still missing: asked and not yet answered, or waiting to be
+    /// asked. A column leaves once a sidecar for it has passed the checks, or
+    /// once the store has it when a retry is about to ask.
     pub(crate) columns: Vec<u64>,
+    /// This lookup's own id, which each of its requests carries
+    /// ([`PendingRequestKind::Columns`]). A request from a lookup this one
+    /// replaced (see [`STALE_COLUMN_LOOKUP`]) can still report back, and must
+    /// not settle this one's requests or spend its attempts.
+    pub(crate) lookup: u64,
+    /// Rounds spent on a request that left out a column it was asked for. A
+    /// request that delivered everything it asked for spends nothing.
     pub(crate) attempts: u32,
+    /// Peers not asked again in this lookup: a request to them failed, or
+    /// they sent a sidecar the checks refused. A peer that answered without a
+    /// column is not here: at the tip it may simply not have it yet.
     pub(crate) failed_peers: HashSet<PeerId>,
-    /// Requests sent for this root and not yet answered or failed.
+    /// `(peer, column)` pairs asked in this lookup that did not deliver. While
+    /// the block is at the tip a retry prefers another peer for that column
+    /// and comes back to this one only when there is none; past the tip it
+    /// does not come back (see `plan_column_requests`).
+    pub(crate) missed: HashSet<(PeerId, u64)>,
+    /// Whether this lookup has asked a peer for columns outside its known
+    /// custody, which it does once at most (see `plan_column_requests`).
+    pub(crate) asked_beyond_custody: bool,
+    /// The columns on the wire, each with the peer asked for it.
     ///
-    /// One attempt now fans out across the peers that custody the columns, so
-    /// a single lookup can have several requests open at once. Without this
-    /// count each of their failures would schedule its own retry, and each
-    /// retry would fan out again: one unanswered lookup against eight
-    /// custodians becomes eight retries, then sixty-four. A retry is scheduled
-    /// only when the last outstanding request of the round reports back, so an
-    /// attempt still costs exactly one retry however wide it was.
-    pub(crate) in_flight: usize,
+    /// One lookup fans out across the peers that custody its columns, so it
+    /// can have several requests open at once, and they ask disjoint sets: a
+    /// column is asked again only once the request that asked for it has
+    /// reported back. That is what lets a request's leftover be asked at once
+    /// without waiting for its siblings, and why their failures cannot
+    /// multiply into one fan-out each: a retry asks only what is not on the
+    /// wire. A request is "on the wire" until its answer has been through the
+    /// checks, so a column being verified is not asked again meanwhile.
+    pub(crate) asked: HashMap<u64, PeerId>,
+    /// A retry is scheduled. Whatever another request leaves out meanwhile
+    /// rides on it rather than spending an attempt of its own.
+    pub(crate) retry_due: bool,
     /// When this lookup last put requests on the wire, for
     /// [`STALE_COLUMN_LOOKUP`] to measure against.
     pub(crate) last_asked: Instant,
+    /// The block's slot, the other half of the store's column key, read once
+    /// when a retry first checks the store.
+    pub(crate) slot: Option<u64>,
+}
+
+impl PendingColumnRequest {
+    pub(crate) fn new(columns: Vec<u64>, lookup: u64) -> Self {
+        Self {
+            columns,
+            lookup,
+            attempts: 1,
+            failed_peers: HashSet::new(),
+            missed: HashSet::new(),
+            asked_beyond_custody: false,
+            asked: HashMap::new(),
+            retry_due: false,
+            last_asked: Instant::now(),
+            slot: None,
+        }
+    }
+
+    /// The columns still missing that no open request asks for.
+    pub(crate) fn unasked(&self) -> Vec<u64> {
+        self.columns
+            .iter()
+            .copied()
+            .filter(|column| !self.asked.contains_key(column))
+            .collect()
+    }
 }
 
 pub(crate) enum PendingRequestKind {
@@ -387,13 +453,19 @@ pub(crate) enum PendingRequestKind {
         start_slot: u64,
         end_slot: u64,
     },
-    /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
-    /// the root and the columns this one request asked its peer for: the
-    /// attempts and failed-peer set live in `pending_column_requests`, keyed
-    /// by the root, but one lookup fans out across peers with a subset each and
-    /// retires its entry on the first answer, so what a later answer may
-    /// contain has to travel with the request itself.
-    Columns(H256, Vec<u64>),
+    /// A `DataColumnsByRoot` request of one lookup for this block's missing
+    /// columns. The lookup's bookkeeping lives in `pending_column_requests`,
+    /// keyed by the root, but one lookup fans out across peers with a subset
+    /// each, and an answer is judged against its own request's subset
+    /// (whether its peer left anything out), so the subset travels with the
+    /// request. So does the lookup's id: a lookup can be replaced while its
+    /// requests are still open, and their reports must not be taken for the
+    /// new one's.
+    Columns {
+        block_root: H256,
+        columns: Vec<u64>,
+        lookup: u64,
+    },
     /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
     /// slots the matching `BlocksByRange` asked for.
     ///
@@ -1157,6 +1229,9 @@ pub struct P2P {
     /// The beacon `MetaData` this node answers peers with, for the same
     /// endpoint. `None` on a lean wire, which has no `MetaData`.
     local_metadata: Option<MetaDataController>,
+    /// The peers this node is connected to, for the Beacon API's
+    /// `/eth/v1/node/peers`.
+    peer_table: PeerTableController,
 }
 
 impl P2P {
@@ -1215,6 +1290,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
+        let peer_table = PeerTableController::default();
 
         let server = P2PServer {
             swarm_handle,
@@ -1222,6 +1298,7 @@ impl P2P {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: peer_table.clone(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
@@ -1306,6 +1383,7 @@ impl P2P {
             handle,
             local_enr,
             local_metadata,
+            peer_table,
         })
     }
 
@@ -1324,6 +1402,12 @@ impl P2P {
     /// updated whenever it changes. `None` on a lean wire.
     pub fn local_metadata(&self) -> Option<MetaDataController> {
         self.local_metadata.clone()
+    }
+
+    /// A live view of the peers this node is connected to. Written only by
+    /// the P2P actor.
+    pub fn peer_table(&self) -> PeerTableController {
+        self.peer_table.clone()
     }
 }
 
@@ -1353,6 +1437,9 @@ pub struct P2PServer {
     /// direction is the first connection's, which is the one that decides
     /// whether this peer was our choice or the network's.
     pub(crate) connected_peers: HashMap<PeerId, ConnectionDirection>,
+    /// [`Self::connected_peers`] plus what the Beacon API reports about each
+    /// peer, shared with the RPC layer. This actor is its only writer.
+    pub(crate) peer_table: PeerTableController,
     /// The columns each peer custodies, as computed from its own node id and
     /// its advertised custody group count.
     ///
@@ -1377,7 +1464,9 @@ pub struct P2PServer {
     /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
-    /// `handle_column_fetch_failure` is the only place an entry is retired.
+    /// `retire_column_lookup` is the only place an entry is retired, once its
+    /// columns have all arrived, its ladder has run out, or nobody is left to
+    /// ask (`fetch_missing_columns` also drops a stale one to replace it).
     pub(crate) pending_column_requests: HashMap<H256, PendingColumnRequest>,
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
@@ -1505,6 +1594,44 @@ impl P2PServer {
         self.refresh_custody_column_metrics();
     }
 
+    /// Record a peer's first connection, in [`Self::connected_peers`] and in
+    /// the table the Beacon API reads. The two are written only here and in
+    /// [`Self::remove_connected_peer`], so they cannot drift apart.
+    ///
+    /// `remote` is the address of the connection that made the peer connected,
+    /// normalized by [`peer_p2p_address`] to end in `/p2p/<peer id>`. For an
+    /// inbound peer that is the remote's ephemeral source port, not a dialable
+    /// address, as in Lighthouse; it is not updated when later connections
+    /// open. The ENR is whatever the dial loop kept from discovery for this
+    /// peer id, whichever side opened the first connection, so it is absent
+    /// only when discovery never supplied one: a peer that found us first, or
+    /// a bootnode dialed from `--bootnodes`.
+    fn add_connected_peer(
+        &mut self,
+        peer_id: PeerId,
+        direction: ConnectionDirection,
+        remote: &Multiaddr,
+    ) {
+        self.connected_peers.insert(peer_id, direction);
+        self.peer_table.insert(ConnectedPeer {
+            peer_id: peer_id.to_string(),
+            direction: direction.into(),
+            last_seen_p2p_address: peer_p2p_address(remote, peer_id).to_string(),
+            enr: self
+                .discovery
+                .as_ref()
+                .and_then(|discovery| discovery.enr_of(&peer_id)),
+        });
+    }
+
+    /// Drop a peer whose last connection closed, from [`Self::connected_peers`]
+    /// and the Beacon API's table together. Returns the direction it was
+    /// counted under, if it was connected.
+    fn remove_connected_peer(&mut self, peer_id: &PeerId) -> Option<ConnectionDirection> {
+        self.peer_table.remove(&peer_id.to_string());
+        self.connected_peers.remove(peer_id)
+    }
+
     /// Publish, per column this node samples, how many connected peers are
     /// known to custody it.
     ///
@@ -1544,7 +1671,11 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
-    fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    fn retry_data_column_fetch(&self, block_root: H256, lookup: u64) -> Result<(), ActorError>;
+    /// A `DataColumnsByRoot` answer has been through the chain checks: settle
+    /// its lookup on what passed.
+    #[allow(dead_code)] // sent by the column checks' completion callback
+    fn column_answer_checked(&self, report: ColumnReport) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -1623,21 +1754,16 @@ impl P2PServer {
         msg: p2p_protocol::RetryDataColumnFetch,
         _ctx: &Context<Self>,
     ) {
-        let block_root = msg.block_root;
-        // Same "might have completed during backoff" guard as
-        // `handle_retry_block_fetch`, and the same reason for it: the reissued
-        // request must ask for what is still missing, which
-        // `pending_column_requests` is the only place that remembers.
-        let Some(pending) = self.pending_column_requests.get(&block_root) else {
-            trace!(%block_root, "Data column fetch completed during backoff, skipping retry");
-            return;
-        };
-        let columns = pending.columns.clone();
+        req_resp::handlers::retry_column_lookup(self, msg.block_root, msg.lookup).await;
+    }
 
-        if !fetch_data_columns_from_peer(self, block_root, columns).await {
-            tracing::error!(%block_root, "Failed to retry data column fetch, giving up");
-            self.pending_column_requests.remove(&block_root);
-        }
+    #[send_handler]
+    async fn handle_column_answer_checked(
+        &mut self,
+        msg: p2p_protocol::ColumnAnswerChecked,
+        ctx: &Context<Self>,
+    ) {
+        req_resp::handlers::settle_column_request(self, msg.report, ctx);
     }
 
     #[send_handler]
@@ -1913,14 +2039,12 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
     // in flight with a wider column set than the first ask named, as
     // columns trickle in, and dropping the difference would rest on an
     // unenforced invariant that a re-ask is always a subset of what is
-    // already pending. A column added this way misses the request
-    // already on the wire, which cannot be widened after it was sent;
-    // it rides the next event for this root instead — a retry of this
-    // lookup, which resends whatever `columns` now holds, or, once this
-    // lookup resolves and the entry is gone, a fresh `FetchRequest`
-    // from a caller that rechecks what is still missing.
+    // already pending. The requests already on the wire cannot be widened
+    // after they were sent, so whatever none of them covers is asked for at
+    // once, in a request of its own, unless a retry is already due to ask
+    // for it. A column one of them does cover is left to that request.
     //
-    // "In flight" has to mean it, though: an entry whose round never
+    // "In flight" has to mean it, though: an entry whose requests never
     // reported back would otherwise deduplicate this root against a lookup
     // that will never ask anything again. Past `STALE_COLUMN_LOOKUP` the
     // entry is dropped and this ask starts a lookup of its own.
@@ -1931,6 +2055,9 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
                     trace!(%block_root, column, "Merging a new column into an in-flight data column fetch");
                     pending.columns.push(column);
                 }
+            }
+            if !pending.retry_due {
+                req_resp::handlers::ask_unasked_columns(server, block_root).await;
             }
             return;
         }
@@ -1972,7 +2099,7 @@ async fn handle_swarm_event(
             let transport = transport_label(endpoint.get_remote_address());
             metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
-                server.connected_peers.insert(peer_id, direction);
+                server.add_connected_peer(peer_id, direction, endpoint.get_remote_address());
                 server.refresh_peer_metrics();
                 report_peer_connected(server, &peer_id);
                 let peer_count = server.connected_peers.len();
@@ -2071,8 +2198,7 @@ async fn handle_swarm_event(
                 // counters drift apart, and those counters are exactly what a
                 // "peers held" figure gets derived from.
                 let direction = server
-                    .connected_peers
-                    .remove(&peer_id)
+                    .remove_connected_peer(&peer_id)
                     .unwrap_or(closed_direction);
                 report_peer_disconnected(server, &peer_id);
                 forget_discovered_peer(server, &peer_id);
@@ -2561,6 +2687,37 @@ pub enum ConnectionDirection {
     Outbound,
 }
 
+/// `remote` ending in `/p2p/<peer_id>`, the form the Beacon API's
+/// `last_seen_p2p_address` takes.
+///
+/// Only the last component counts: an address can name another peer earlier
+/// on (a relay, in `/p2p/<relay>/p2p-circuit`), so a `/p2p` somewhere in it
+/// does not mean it already names this one. A trailing `/p2p` naming a
+/// different peer is replaced, since the address is reported as this peer's.
+fn peer_p2p_address(remote: &Multiaddr, peer_id: PeerId) -> Multiaddr {
+    let mut address = remote.clone();
+    let tail = address.iter().last();
+    let names_this_peer = matches!(tail, Some(Protocol::P2p(id)) if id == peer_id);
+    let names_another = matches!(tail, Some(Protocol::P2p(_)));
+    if names_this_peer {
+        return address;
+    }
+    if names_another {
+        address.pop();
+    }
+    address.push(Protocol::P2p(peer_id));
+    address
+}
+
+impl From<ConnectionDirection> for PeerDirection {
+    fn from(direction: ConnectionDirection) -> Self {
+        match direction {
+            ConnectionDirection::Inbound => Self::Inbound,
+            ConnectionDirection::Outbound => Self::Outbound,
+        }
+    }
+}
+
 impl ConnectionDirection {
     /// The label this direction carries in metrics and logs.
     ///
@@ -3039,6 +3196,7 @@ pub(crate) mod test_support {
             blockchain: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
+            peer_table: ethlambda_network_api::PeerTableController::default(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
@@ -3154,6 +3312,74 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    #[test]
+    fn a_peer_address_ends_in_that_peers_own_p2p_component() {
+        let peer = random_peer();
+        let other = random_peer();
+        let suffixed = |base: &str| format!("{base}/p2p/{peer}");
+
+        // A bare transport address gets the peer's id appended.
+        let tcp: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+        assert_eq!(
+            peer_p2p_address(&tcp, peer).to_string(),
+            suffixed("/ip4/10.0.0.1/tcp/9000")
+        );
+
+        // One that already ends in it is left alone.
+        let named: Multiaddr = suffixed("/ip4/10.0.0.1/tcp/9000").parse().unwrap();
+        assert_eq!(peer_p2p_address(&named, peer), named);
+
+        // A relayed address names the relay earlier on; the peer still goes on
+        // the end.
+        let relayed = format!("/ip4/10.0.0.2/tcp/9000/p2p/{other}/p2p-circuit");
+        let relayed_addr: Multiaddr = relayed.parse().unwrap();
+        assert_eq!(
+            peer_p2p_address(&relayed_addr, peer).to_string(),
+            suffixed(&relayed)
+        );
+
+        // A trailing id naming someone else is replaced, not kept.
+        let wrong: Multiaddr = format!("/ip4/10.0.0.1/tcp/9000/p2p/{other}")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            peer_p2p_address(&wrong, peer).to_string(),
+            suffixed("/ip4/10.0.0.1/tcp/9000")
+        );
+    }
+
+    /// `connected_peers` and the Beacon API's peer table are written together,
+    /// on a peer's first connection and when its last one closes, so the table
+    /// never holds a peer that is gone.
+    #[tokio::test]
+    async fn the_peer_table_follows_a_peer_from_first_connection_to_last() {
+        let config = ethlambda_types::beacon::config::Config::mainnet();
+        let mut server = test_support::unconnected_beacon_server(config, 0).await;
+        let peer = random_peer();
+        let remote: Multiaddr = "/ip4/10.0.0.1/tcp/9000".parse().unwrap();
+
+        server.add_connected_peer(peer, ConnectionDirection::Inbound, &remote);
+        let entry = server
+            .peer_table
+            .get(&peer.to_string())
+            .expect("published on the first connection");
+        assert_eq!(entry.direction, PeerDirection::Inbound);
+        assert_eq!(
+            entry.last_seen_p2p_address,
+            format!("/ip4/10.0.0.1/tcp/9000/p2p/{peer}")
+        );
+        assert!(entry.enr.is_none(), "discovery supplied no record");
+        assert_eq!(server.peer_table.len(), server.connected_peers.len());
+
+        assert_eq!(
+            server.remove_connected_peer(&peer),
+            Some(ConnectionDirection::Inbound)
+        );
+        assert!(server.peer_table.get(&peer.to_string()).is_none());
+        assert!(server.connected_peers.is_empty());
+        assert_eq!(server.peer_table.len(), 0);
     }
 
     /// Zero backbone subnets (a lean node, or a beacon node that backbones
@@ -4277,5 +4503,63 @@ mod tests {
             !blocks_by_range.is_connected(&peer),
             "a request/response field still holds the connection the limits refused"
         );
+    }
+
+    /// A beacon server with a custodian of column 1 and a peer that has said
+    /// nothing about its custody.
+    async fn column_server() -> (P2PServer, PeerId, PeerId) {
+        let mut server = test_support::unconnected_beacon_server(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            0,
+        )
+        .await;
+        let holder = random_peer();
+        let silent = random_peer();
+        for peer in [holder, silent] {
+            server
+                .connected_peers
+                .insert(peer, ConnectionDirection::Inbound);
+        }
+        server.peer_custody.insert(holder, vec![1]);
+        (server, holder, silent)
+    }
+
+    #[tokio::test]
+    async fn a_re_ask_that_merges_a_column_asks_for_it_at_once() {
+        // It used to be left for the lookup's next retry, which a hung
+        // request could hold back for its whole timeout.
+        let (mut server, holder, silent) = column_server().await;
+        let root = H256::repeat_byte(0x61);
+
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+        let lookup = server.pending_column_requests[&root].lookup;
+        fetch_missing_columns(&mut server, root, vec![1, 2]).await;
+
+        let pending = &server.pending_column_requests[&root];
+        assert_eq!(pending.lookup, lookup, "merged, not replaced");
+        assert_eq!(pending.asked, HashMap::from([(1, holder), (2, silent)]));
+        assert_eq!(server.outbound_requests.len(), 2, "1 is not asked twice");
+    }
+
+    #[tokio::test]
+    async fn a_re_ask_replaces_a_lookup_that_stopped_asking() {
+        let (mut server, _, _) = column_server().await;
+        let root = H256::repeat_byte(0x62);
+
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+        let pending = server
+            .pending_column_requests
+            .get_mut(&root)
+            .expect("a lookup");
+        let stale = pending.lookup;
+        pending.last_asked = Instant::now()
+            .checked_sub(STALE_COLUMN_LOOKUP + Duration::from_secs(1))
+            .expect("the clock is past the stale window");
+        fetch_missing_columns(&mut server, root, vec![1]).await;
+
+        // A new id, so the stale lookup's requests, still open, settle nothing
+        // of this one's.
+        assert_ne!(server.pending_column_requests[&root].lookup, stale);
+        assert_eq!(server.outbound_requests.len(), 2);
     }
 }

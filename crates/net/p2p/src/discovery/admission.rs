@@ -70,6 +70,10 @@ pub(crate) struct DiscoveredPeer {
     /// `P2PServer::record_peer_custody`), and this only fills the gap until
     /// that answer arrives. Lighthouse splits the two the same way.
     pub(crate) custody_group_count: Option<u64>,
+    /// The record admission accepted, kept for the Beacon API's peer list.
+    /// Encoded to its `enr:` text only when the dial loop dials this peer, not
+    /// for every candidate admitted and then never dialed.
+    pub(crate) record: NodeRecord,
 }
 
 /// What the filter admitted, keyed by the node id discovery will name it with.
@@ -325,6 +329,7 @@ fn admit(
         addrs: dial_addrs(ip, quic_port, tcp_port, peer_id),
         subnets,
         custody_group_count,
+        record: record.clone(),
     })
 }
 
@@ -504,6 +509,7 @@ mod tests {
                 addrs: vec![Multiaddr::empty()],
                 subnets,
                 custody_group_count: None,
+                record: NodeRecord::default(),
             }
         }
     }
@@ -935,6 +941,7 @@ mod tests {
             addrs: vec![Multiaddr::empty()],
             subnets: vec![],
             custody_group_count: Some(custody_group_count),
+            record: NodeRecord::default(),
         }
     }
 

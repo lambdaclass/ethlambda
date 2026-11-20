@@ -18,8 +18,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
-use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
+use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_types::beacon::preset;
@@ -52,8 +51,7 @@ pub(super) struct Replay<'a> {
     config: &'a Config,
     engine: ExecutionEngine,
     /// One for the whole run, as the node holds one across its imports.
-    committees: CommitteeCache,
-    active_balances: ActiveBalanceCache,
+    caches: OwnedBlockCaches,
     max_blocks: Option<u64>,
     carried: Option<Carried>,
 }
@@ -64,8 +62,7 @@ impl<'a> Replay<'a> {
             network,
             config,
             engine: ExecutionEngine::valid(),
-            committees: CommitteeCache::default(),
-            active_balances: ActiveBalanceCache::default(),
+            caches: OwnedBlockCaches::default(),
             max_blocks,
             carried: None,
         }
@@ -167,8 +164,7 @@ impl<'a> Replay<'a> {
                 true,
                 self.config,
                 &self.engine,
-                &self.committees,
-                &self.active_balances,
+                self.caches.caches(),
             )
             .map_err(|err| {
                 eyre!(

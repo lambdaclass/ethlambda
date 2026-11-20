@@ -262,6 +262,10 @@ pub struct BeaconIdentity {
     /// since its sequence number and `syncnets` change at runtime. `None`
     /// without a beacon p2p layer, which leaves `metadata` all-zero.
     pub metadata: Option<ethlambda_network_api::MetaDataController>,
+    /// The peers the p2p layer is connected to, read per request by
+    /// `/eth/v1/node/peers`. `None` without a p2p layer, which leaves the list
+    /// empty.
+    pub peers: Option<ethlambda_network_api::PeerTableController>,
 }
 
 /// Where `/eth/v1/node/identity` reads the node's ENR from.
