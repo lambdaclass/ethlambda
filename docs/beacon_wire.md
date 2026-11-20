@@ -767,11 +767,19 @@ hits this on every held block, and without it such a follower imported
 roughly one block per slot, waiting out the redrive below for a request
 gossip was never going to answer. Either way, `redrive_held_blocks` runs on
 every slot tick: for each block still held it sends the same request for
-exactly the columns still missing, with
-`MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`, a
-peer that has already failed this lookup excluded until the whole pool is
-exhausted. A lookup that runs out of peers or
-retries stops asking until the next tick asks again; see
+exactly the columns still missing. One lookup is split across peers, and each
+request settles on its own once its answer has been through the chain checks:
+what passed leaves the lookup, and what the peer left out is asked again at
+once, without waiting for the lookup's other requests, with
+`MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`.
+Only a request that left something out spends an attempt. A peer whose request
+failed, or that sent a sidecar the checks refused, is not asked again in that
+lookup. A peer that answered without a column is asked for it again only
+while the block is at the tip (it may not have received the column yet), and
+then after every other candidate; past the tip it is not. Before a
+retry asks, the columns the store already holds (gossip often delivers them
+meanwhile) are taken off. A lookup that runs out of retries, or has nobody
+left to ask, stops asking until the next tick asks again; see
 `lean_data_column_fetch_failures_total` in [metrics.md](./metrics.md). The
 block is released the moment its last missing column arrives, and dropped
 along with any pending descendants once finality passes its slot, whichever
@@ -786,8 +794,12 @@ the spec's own observation that "due to the deterministic custody functions, a
 node knows exactly what a peer should be able to respond to". The count comes
 from `metadata/3`, requested once per connection right behind `Status`, and is
 seeded from the ENR `cgc` for a peer this node dialed; a peer that has supplied
-neither is not assumed to custody anything, and the by-root path falls back to
-asking one at random for whatever no known custodian covers. At mainnet's
+neither is not assumed to custody anything, and both paths send whatever no
+known custodian covers to such a peer rather than to one that has said what it
+keeps. The by-root path gives as many of those columns as it can to one such
+peer at a time; only a column none of them can be asked for goes to a peer of
+known custody, once per lookup, since such a peer may hold more than it
+custodies. At mainnet's
 `CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so this is the difference
 between a request that can be answered and one that usually cannot.
 

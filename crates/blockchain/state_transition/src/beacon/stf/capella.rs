@@ -60,7 +60,7 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{H256, HashTreeRoot as _};
 use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -79,8 +79,7 @@ pub fn process_block(
     block: &capella::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
@@ -104,14 +103,15 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
+        caches.active_balances,
+        caches.pubkey_indices,
         signatures,
     )?;
     Ok(())

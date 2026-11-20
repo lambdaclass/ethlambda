@@ -132,7 +132,7 @@ use ethlambda_state_transition::beacon::containers::{
     BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index,
+    ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
 };
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
 use ethlambda_state_transition::beacon::stf::altair as altair_stf;
@@ -210,6 +210,7 @@ fn run(
     // is nothing for the cache to share between calls.
     let committees = CommitteeCache::default();
     let active_balances = ActiveBalanceCache::default();
+    let pubkey_indices = PubkeyIndexCache::default();
     let outcome = match handler {
         // Every fork's own `BeaconBlock` carries a different concrete body
         // (altair's adds a sync aggregate, bellatrix's an execution payload,
@@ -397,7 +398,13 @@ fn run(
             | ForkName::Capella
             | ForkName::Deneb => {
                 let slashing: phase0::AttesterSlashing = case.ssz("attester_slashing");
-                operations::process_attester_slashing(state, &slashing, config, signatures)
+                operations::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Electra's container widens the same way `Attestation`'s does
             // (see the `attestation` arm above); the function itself is not
@@ -405,14 +412,26 @@ fn run(
             // Fulu's specification changes neither.
             ForkName::Electra | ForkName::Fulu => {
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
-                electra_stf::process_attester_slashing(state, &slashing, config, signatures)
+                electra_stf::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
             ForkName::Gloas => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
-                gloas_stf::process_attester_slashing(state, &slashing, config, signatures)
+                gloas_stf::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
@@ -431,12 +450,20 @@ fn run(
                 | ForkName::Capella
                 | ForkName::Deneb
                 | ForkName::Electra
-                | ForkName::Fulu => {
-                    operations::process_proposer_slashing(state, &slashing, config, signatures)
-                }
-                ForkName::Gloas => {
-                    gloas_stf::process_proposer_slashing(state, &slashing, config, signatures)
-                }
+                | ForkName::Fulu => operations::process_proposer_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                ),
+                ForkName::Gloas => gloas_stf::process_proposer_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                ),
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }
@@ -500,7 +527,13 @@ fn run(
             // `process_voluntary_exit`; see that function's own doc).
             ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                electra_stf::process_voluntary_exit(state, &exit, config, signatures)
+                electra_stf::process_voluntary_exit(
+                    state,
+                    &exit,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
@@ -508,7 +541,13 @@ fn run(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances, signatures)
+            altair_stf::process_sync_aggregate(
+                state,
+                &sync_aggregate,
+                &active_balances,
+                &pubkey_indices,
+                signatures,
+            )
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body
@@ -641,7 +680,13 @@ fn run(
         // `BeaconBlock`, named `block` like `block_header`'s.
         "parent_execution_payload" => {
             let block: gloas::BeaconBlock = case.ssz("block");
-            gloas_stf::process_parent_execution_payload(state, &block, config)
+            gloas_stf::process_parent_execution_payload(
+                state,
+                &block,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // `consolidation_request` and `withdrawal_request` are new in
         // electra, alongside `withdrawals`; neither fulu's nor gloas's own
@@ -654,7 +699,13 @@ fn run(
         // match is needed for either the type or the call.
         "consolidation_request" => {
             let request: electra::ConsolidationRequest = case.ssz("consolidation_request");
-            electra_stf::process_consolidation_request(state, &request, config)
+            electra_stf::process_consolidation_request(
+                state,
+                &request,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // `deposit_request` is new in electra too, but fulu's specification
         // does list a modified version (`beacon-chain.md`'s "Modified
@@ -687,7 +738,13 @@ fn run(
         },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");
-            electra_stf::process_withdrawal_request(state, &request, config)
+            electra_stf::process_withdrawal_request(
+                state,
+                &request,
+                config,
+                &active_balances,
+                &pubkey_indices,
+            )
         }
         // New in gloas (EIP-8282): the builder registry's own onboarding and
         // exit requests, applied by `apply_parent_execution_payload` the same
