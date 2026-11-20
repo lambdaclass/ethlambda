@@ -6128,7 +6128,9 @@ mod tests {
         ExecutionPayloadEvent, HEAD_EVENT_RECENCY_SLOTS, Versioned,
     };
     use ethlambda_storage::ForkCheckpoints;
-    use ethlambda_types::beacon::fork_choice::{PayloadStatus, PayloadStatusEnum};
+    use ethlambda_types::beacon::fork_choice::{
+        BlockPayloadLink, PayloadStatus, PayloadStatusEnum,
+    };
     use tokio::sync::broadcast;
 
     const G: H256 = H256::repeat_byte(0x10);
@@ -6368,6 +6370,88 @@ mod tests {
         events.publish_beacon_changes(&store, 2);
 
         assert!(as_head(&drain(&mut rx)[0]).execution_optimistic);
+    }
+
+    /// Records A and B as gloas blocks: A on its pre-gloas parent, B on A's
+    /// payload (`b_parent`). The fixture's bodies are phase0, but the
+    /// optimistic rule reads the recorded link before it would decode one.
+    fn as_gloas_chain(store: &Store, b_parent: PayloadStatus) {
+        let link = |parent_status| BlockPayloadLink::Gloas {
+            parent_status: Some(parent_status),
+        };
+        store.set_payload_link(A, 1, link(PayloadStatus::Full));
+        store.set_payload_link(B, 2, link(b_parent));
+    }
+
+    /// A gloas head is optimistic iff the payload it builds on is not `VALID`.
+    /// A gloas block never enters the optimistic set, so reading only that set
+    /// reported every gloas head as validated, `head_v2` included.
+    #[test]
+    fn a_gloas_head_on_an_unvalidated_payload_says_so_in_head_and_head_v2() {
+        for (verdict, optimistic) in [
+            (PayloadStatusEnum::Syncing, true),
+            (PayloadStatusEnum::Accepted, true),
+            (PayloadStatusEnum::Valid, false),
+        ] {
+            let (mut store, mut events, mut rx) = fork_fixture(A);
+            as_gloas_chain(&store, PayloadStatus::Full);
+            store.insert_beacon_block_payload_status(A, 1, verdict);
+            assert!(!store.is_beacon_optimistic(B), "never in the set");
+
+            set_head(&mut store, B);
+            events.publish_beacon_changes(&store, 2);
+
+            let emitted = drain_all(&mut rx);
+            assert_eq!(emitted.len(), 2, "{emitted:?}");
+            assert_eq!(
+                as_head(&emitted[0]).execution_optimistic,
+                optimistic,
+                "{verdict:?}"
+            );
+            let v2 = &as_head_v2(&emitted[1]).data;
+            assert_eq!(v2.execution_optimistic, optimistic, "{verdict:?}");
+        }
+    }
+
+    /// A head that skipped its parent's payload rests on the one before it:
+    /// A's unvalidated payload does not make B optimistic when B built on A's
+    /// EMPTY branch and A on a validated pre-gloas parent.
+    #[test]
+    fn a_gloas_head_that_skipped_its_parents_payload_reads_the_one_before() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        as_gloas_chain(&store, PayloadStatus::Empty);
+        store.insert_beacon_block_payload_status(A, 1, PayloadStatusEnum::Syncing);
+
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+        assert!(!as_head(&drain(&mut rx)[0]).execution_optimistic);
+
+        // The pre-gloas block the chain rests on is itself optimistic.
+        store.insert_beacon_optimistic_root(G, 0);
+        set_head(&mut store, A);
+        events.publish_beacon_changes(&store, 2);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+        let emitted = drain(&mut rx);
+        assert!(as_head(emitted.last().unwrap()).execution_optimistic);
+    }
+
+    /// The second `head_v2`, sent when the head's payload arrives, carries the
+    /// flag of the payload the head builds on, as the first one does.
+    #[test]
+    fn the_head_v2_for_an_arrived_payload_reads_the_payload_the_head_builds_on() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        as_gloas_chain(&store, PayloadStatus::Full);
+        store.insert_beacon_block_payload_status(A, 1, PayloadStatusEnum::Syncing);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        assert!(as_head_v2(&emitted[0]).data.execution_optimistic);
     }
 
     /// Two finality steps between diffs coalesce into one event naming the

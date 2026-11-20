@@ -4770,6 +4770,12 @@ impl Store {
 
     /// Whether `root` was imported on a `NOT_VALIDATED` answer and has not
     /// since been resolved.
+    ///
+    /// Only a pre-gloas block can be: a gloas block's import asks the
+    /// execution layer nothing, so this is `false` for every gloas root. The
+    /// `execution_optimistic` flag a response or event carries is
+    /// [`Store::is_beacon_block_optimistic`], which reads a gloas block's
+    /// payload verdicts too.
     pub fn is_beacon_optimistic(&self, root: H256) -> bool {
         self.beacon
             .lock()

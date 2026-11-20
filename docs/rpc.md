@@ -941,9 +941,15 @@ object that may arrive late or never, and two rules share the flag:
   the optimistic set. The block's own payload does not count, so a withheld
   payload does not make the chain look unverified.
 
-Pre-gloas responses are unchanged. One helper implements both rules
-(`shared/optimistic.rs`) and every response that carries the flag goes through
-it.
+Pre-gloas responses are unchanged. `Store::is_beacon_block_optimistic` and
+`Store::is_beacon_payload_optimistic` (`ethlambda-storage`'s
+`execution_optimistic` module) implement the two rules, and every response
+that carries the flag goes through them, as do `/eth/v1/events`'s `head`,
+`head_v2` (both emissions), `chain_reorg`, `block` and `finalized_checkpoint`,
+which take the block rule. `execution_payload` applies the envelope rule to the
+verdict its envelope was just imported on. The store's own
+optimistic set alone would read `false` for every gloas block, since a gloas
+block's import asks the execution layer nothing.
 
 ### `GET /eth/v1/config/fork_schedule`
 

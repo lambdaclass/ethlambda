@@ -803,7 +803,7 @@ impl ChainEvents {
             Chain::Beacon => ChainEvent::BeaconBlock(BeaconBlockEvent {
                 slot,
                 block,
-                execution_optimistic: store.is_beacon_optimistic(block),
+                execution_optimistic: store.is_beacon_block_optimistic(block),
                 builder_index: bid.map(|(builder_index, _)| builder_index),
                 block_hash: bid.map(|(_, block_hash)| block_hash),
             }),
@@ -1159,7 +1159,9 @@ fn publish_beacon_head_change(
         root: head,
         slot: new_slot,
     };
-    let execution_optimistic = store.is_beacon_optimistic(head);
+    // From gloas on, whether the payload the head builds on is validated: a
+    // gloas block never enters the optimistic set `is_beacon_optimistic` reads.
+    let execution_optimistic = store.is_beacon_block_optimistic(head);
 
     if !new_chain.contains(previous.head, old_slot) {
         let ancestor_slot = common_ancestor_slot(store, &new_chain, previous);
@@ -1246,7 +1248,7 @@ fn publish_beacon_payload_arrived(
         state_root,
         Some(PayloadStatus::Full),
         false,
-        store.is_beacon_optimistic(head),
+        store.is_beacon_block_optimistic(head),
     ));
 }
 
@@ -1310,7 +1312,7 @@ fn publish_beacon_finalized_checkpoint(store: &Store, events: &EventBus, finaliz
             state,
             // A beacon checkpoint is stored as its epoch's start slot.
             epoch: compute_epoch_at_slot(finalized.slot),
-            execution_optimistic: store.is_beacon_optimistic(finalized.root),
+            execution_optimistic: store.is_beacon_block_optimistic(finalized.root),
         },
     ));
 }
