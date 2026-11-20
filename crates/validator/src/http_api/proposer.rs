@@ -313,7 +313,8 @@ pub async fn set_fee_recipient(
     info!(
         pubkey = %encode_hex(&pubkey.0),
         fee_recipient = %encode_hex(&address.0),
-        "Fee recipient set; registered with the beacon node at the next epoch"
+        "Fee recipient set; sent to the beacon node with the next proposer preparation that \
+         includes this validator"
     );
     Ok(StatusCode::ACCEPTED)
 }

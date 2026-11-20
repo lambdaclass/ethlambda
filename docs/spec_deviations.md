@@ -500,8 +500,9 @@ Three places in the gloas head read something the specification would abort on,
 because a live node holds gaps a fixture tree never has. Each is marked
 "Implementation choice, not spec text" at its definition. The head the node
 runs is `walk_head` (through `get_head_node`) over the weights of
-`compute_node_weights`; the spec-literal references carry the same tolerances so
-that the tests compare like with like.
+`cached_node_weights`, the store's cached vote weights, which the tests hold
+equal to `compute_node_weights`; the spec-literal references carry the same
+tolerances so that the tests compare like with like.
 
 - **Pruned votes** (`compute_node_weights`; in the references,
   `get_attestation_score`, and through it `is_head_weak` and
@@ -839,4 +840,7 @@ signature, whichever way the node answered. Three departures:
   node holds them in memory only
   and gossip does not replay them, so a node that restarts would otherwise
   self-build without them, and ignore builders' bids, until the next dependent
-  root. Same cadence as `prepare_beacon_proposer`, which a restart loses too.
+  root. `prepare_beacon_proposer`, which a restart loses too, is re-sent every
+  slot instead: it is one request for every validator, where the kept
+  preferences are one request each, since a node answers a call carrying
+  several with one status for all of them.
