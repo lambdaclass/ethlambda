@@ -635,7 +635,27 @@ pub enum DataAvailability {
         proofs: Vec<KzgProof>,
     },
     /// Fulu's shape: the column sidecars sampled for this block.
+    ///
+    /// [`is_data_available_columns`] runs the specification's full check on
+    /// every one of them, KZG batch included. This is what the fixture suites
+    /// supply, so they keep exercising the real check.
     Columns(Vec<fulu::DataColumnSidecar>),
+    /// Fulu's shape, when the caller has already verified every sampled column
+    /// for this block and holds no sidecars to show for it.
+    ///
+    /// Constructing this is a promise: each sidecar this node samples for the
+    /// block passed [`verify_data_column_sidecar`], the inclusion proof and
+    /// [`verify_data_column_sidecar_kzg_proofs`], and was stored under the
+    /// block's own root. Only a caller that gates every write of those
+    /// sidecars on those checks may make it (the chain actor does, by storing
+    /// only what the p2p layer's column checks accepted and its own proposal's
+    /// columns, which [`crate::beacon::data_columns::verified_sidecars`]
+    /// checked before they were published), since
+    /// [`is_data_available_columns`] takes it on trust and runs nothing. It
+    /// exists so import does not decode every stored sidecar and repeat the
+    /// KZG batch the sidecar already paid for on arrival; a caller with
+    /// unchecked sidecars must pass [`Self::Columns`] instead.
+    ColumnsVerified,
 }
 
 /// What an execution client said about the payload of the block being imported
@@ -1061,11 +1081,14 @@ pub fn advance_to_epoch_start(
 /// the precomputed epoch-boundary state when the block crosses into an epoch
 /// and one is cached.
 ///
-/// Returns the copy with the transition's outcome, since a failed transition
-/// still leaves the caller a state to inspect. Both starting points reach the
-/// same post-state: the precomputed one is what `process_slots` would produce
-/// from the parent. Either way the copy is independent, so a failing block
-/// cannot corrupt a cached entry.
+/// Returns the post-state, or the error and no state: a failed transition
+/// leaves its copy partly applied (the operations before the failing check,
+/// and the attestations and sync aggregate whose signatures were deferred to
+/// the end of the block; see `stf::signatures`), and dropping it here is what
+/// keeps any caller from reading one. Both starting points reach the same
+/// post-state: the precomputed one is what `process_slots` would produce from
+/// the parent. Either way the copy is independent, so a failing block cannot
+/// corrupt a cached entry.
 ///
 /// This is also where the epoch-boundary balances of a crossing block are
 /// built (see [`cache_boundary_balances`]): a block with empty slots between
@@ -1088,7 +1111,7 @@ fn transition_block(
     engine: &stf::ExecutionEngine,
     caches: stf::BlockCaches<'_>,
     options: stf::block::BlockProcessingOptions,
-) -> (BeaconState, Result<()>) {
+) -> Result<BeaconState> {
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -1106,7 +1129,7 @@ fn transition_block(
     else {
         let mut state = parent_state.clone();
         if !crosses_with_empty_slots {
-            let outcome = stf::state_transition_with_options(
+            stf::state_transition_with_options(
                 &mut state,
                 signed_block,
                 validate_result,
@@ -1114,40 +1137,14 @@ fn transition_block(
                 engine,
                 caches,
                 options,
-            );
-            return (state, outcome);
+            )?;
+            return Ok(state);
         }
         // The same `process_slots` steps `state_transition` would run, split
         // at the epoch start so the boundary state can be read in between.
-        let outcome = stf::process_slots(&mut state, epoch_start, config)
-            .inspect(|()| cache_boundary_balances(store, boundary, &state))
-            .and_then(|()| stf::process_slots(&mut state, block_slot, config))
-            .and_then(|()| {
-                stf::apply_block_with_options(
-                    &mut state,
-                    signed_block,
-                    validate_result,
-                    config,
-                    engine,
-                    caches,
-                    options,
-                )
-            });
-        return (state, outcome);
-    };
-
-    if crosses_with_empty_slots {
-        cache_boundary_balances(store, boundary, &precomputed);
-    }
-    let mut state = (*precomputed).clone();
-    // Only the slots skipped past the boundary are left to advance; none when
-    // the block sits on the boundary itself.
-    let outcome = if state.slot() < block_slot {
-        stf::process_slots(&mut state, block_slot, config)
-    } else {
-        Ok(())
-    }
-    .and_then(|()| {
+        stf::process_slots(&mut state, epoch_start, config)?;
+        cache_boundary_balances(store, boundary, &state);
+        stf::process_slots(&mut state, block_slot, config)?;
         stf::apply_block_with_options(
             &mut state,
             signed_block,
@@ -1156,9 +1153,29 @@ fn transition_block(
             engine,
             caches,
             options,
-        )
-    });
-    (state, outcome)
+        )?;
+        return Ok(state);
+    };
+
+    if crosses_with_empty_slots {
+        cache_boundary_balances(store, boundary, &precomputed);
+    }
+    let mut state = (*precomputed).clone();
+    // Only the slots skipped past the boundary are left to advance; none when
+    // the block sits on the boundary itself.
+    if state.slot() < block_slot {
+        stf::process_slots(&mut state, block_slot, config)?;
+    }
+    stf::apply_block_with_options(
+        &mut state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        options,
+    )?;
+    Ok(state)
 }
 
 /// The precomputed epoch-boundary state an import can resume from, if any.
@@ -4289,7 +4306,7 @@ pub fn is_data_available_blobs(
     let (blobs, proofs) = match evidence {
         DataAvailability::Blobs { blobs, proofs } => (blobs.as_slice(), proofs.as_slice()),
         DataAvailability::NotRequired => (&[][..], &[][..]),
-        DataAvailability::Columns(_) => {
+        DataAvailability::Columns(_) | DataAvailability::ColumnsVerified => {
             return Err(Error::SpecAssert(
                 "a deneb or electra block's data availability is judged on blobs",
             ));
@@ -4504,10 +4521,13 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
+///
+/// [`DataAvailability::ColumnsVerified`] is accepted without running anything:
+/// its constructor promised the same checks already ran on each sidecar.
 pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
-        DataAvailability::NotRequired => return Ok(true),
+        DataAvailability::NotRequired | DataAvailability::ColumnsVerified => return Ok(true),
         DataAvailability::Blobs { .. } => {
             return Err(Error::SpecAssert(
                 "a fulu block's data availability is judged on column sidecars",
@@ -5189,8 +5209,8 @@ pub struct SpeculativeTransition {
     /// [`Self::stands_in_for`] compares it with the one `on_block` would pick
     /// rather than restating which verdicts that is.
     engine: stf::ExecutionEngine,
-    state: BeaconState,
-    outcome: Result<()>,
+    /// What [`transition_block`] returned: the post-state, or the error alone.
+    transition: Result<BeaconState>,
     /// What the transition's attestations added to the unslashed target
     /// balances, which the import reads after the transition to extend the
     /// parent's cached totals (see `helpers::target_balances`). A used
@@ -5230,24 +5250,20 @@ impl SpeculativeTransition {
     ///
     /// Outcomes are compared through their `Debug` rendering, since the error
     /// type carries no `PartialEq`, and roots and deltas only on success, since
-    /// a failed transition's partial state is never used. Debug builds only: it
-    /// doubles the transition, which is the cost the speculation exists to hide.
+    /// a failed transition has no state. Debug builds only: it doubles the
+    /// transition, which is the cost the speculation exists to hide.
     #[cfg(debug_assertions)]
-    fn assert_agrees_with(
-        &self,
-        fresh: &(BeaconState, Result<()>),
-        fresh_delta: &TargetBalanceDelta,
-    ) {
-        let (fresh_state, fresh_outcome) = fresh;
+    fn assert_agrees_with(&self, fresh: &Result<BeaconState>, fresh_delta: &TargetBalanceDelta) {
+        let outcome = |transition: &Result<BeaconState>| format!("{:?}", transition.as_ref().err());
         assert_eq!(
-            format!("{:?}", self.outcome),
-            format!("{fresh_outcome:?}"),
+            outcome(&self.transition),
+            outcome(fresh),
             "the speculative transition disagrees with on_block's own on the outcome"
         );
-        if self.outcome.is_ok() {
+        if let (Ok(speculated), Ok(fresh)) = (&self.transition, fresh) {
             assert_eq!(
-                self.state.hash_tree_root(),
-                fresh_state.hash_tree_root(),
+                speculated.hash_tree_root(),
+                fresh.hash_tree_root(),
                 "the speculative transition disagrees with on_block's own on the post-state root"
             );
             assert_eq!(
@@ -5366,7 +5382,7 @@ pub fn speculate_transition(
     // Collected as `on_block_speculative`'s own transition would, since the
     // import reads it after the transition whichever one ran.
     let target_delta = TargetBalanceDelta::default();
-    let (state, outcome) = transition_block(
+    let transition = transition_block(
         store,
         &parent_state,
         parent_root,
@@ -5384,8 +5400,7 @@ pub fn speculate_transition(
         block_root,
         parent_root,
         engine,
-        state,
-        outcome,
+        transition,
         target_delta,
     })
 }
@@ -5586,23 +5601,19 @@ pub fn on_block_speculative(
         )
     };
     // A used speculation brings the delta its own transition collected.
-    let (mut state, transition, target_delta) = match usable {
+    let (transition, target_delta) = match usable {
         Some(speculation) => {
             #[cfg(debug_assertions)]
             {
                 let fresh_delta = TargetBalanceDelta::default();
                 speculation.assert_agrees_with(&fresh_transition(&fresh_delta), &fresh_delta);
             }
-            (
-                speculation.state,
-                speculation.outcome,
-                speculation.target_delta,
-            )
+            (speculation.transition, speculation.target_delta)
         }
         None => {
             let target_delta = TargetBalanceDelta::default();
-            let (state, transition) = fresh_transition(&target_delta);
-            (state, transition, target_delta)
+            let transition = fresh_transition(&target_delta);
+            (transition, target_delta)
         }
     };
 
@@ -5646,7 +5657,7 @@ pub fn on_block_speculative(
         )));
     }
 
-    transition?;
+    let mut state = transition?;
 
     // The block's target balances when its parent's are cached for this epoch
     // and the block slashes no one. Read before `signed_block` moves into the
@@ -6059,11 +6070,47 @@ pub fn on_execution_payload_envelope(
 /// `engine` argument still answers the engine's part of
 /// `verify_execution_payload_envelope`; such a caller passes
 /// [`stf::ExecutionEngine::valid`] and consults the real engine itself.
+///
+/// The chain actor is such a caller, but holds no sidecars to pass: the
+/// sampled columns it stores were verified before they were stored, so it
+/// calls [`check_execution_payload_envelope_columns_verified`] instead. This
+/// one is for a caller with sidecars nothing has checked yet, which is what
+/// the fixture runner hands [`on_execution_payload_envelope`].
 pub fn check_execution_payload_envelope(
     store: &Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
     config: &Config,
     sidecars: &[gloas::DataColumnSidecar],
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    check_envelope(store, signed_envelope, config, Some(sidecars), engine)
+}
+
+/// [`check_execution_payload_envelope`] for a caller that has already verified
+/// every sampled column of the block, and so holds no sidecars to pass.
+///
+/// The caller promises what [`DataAvailability::ColumnsVerified`] promises,
+/// against the commitments of this block's bid: each sampled sidecar passed
+/// the gloas structural check and the KZG batch, and is stored under the
+/// block's own root. Everything else is checked exactly as in
+/// [`check_execution_payload_envelope`]; only the data-availability step is
+/// taken on trust, so the KZG batch is not repeated on every envelope.
+pub fn check_execution_payload_envelope_columns_verified(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    check_envelope(store, signed_envelope, config, None, engine)
+}
+
+/// The body of both public checks. `sidecars` is `None` when the caller has
+/// vouched for every sampled column, which skips only the availability step.
+fn check_envelope(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: Option<&[gloas::DataColumnSidecar]>,
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
     let envelope = &signed_envelope.message;
@@ -6085,11 +6132,13 @@ pub fn check_execution_payload_envelope(
         .ok_or(Error::SpecAssert(
             "envelope.beacon_block_root in store.blocks",
         ))?;
-    let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
-    verify(
-        is_data_available_gloas_columns(sidecars, kzg_commitments)?,
-        "is_data_available(envelope.beacon_block_root)",
-    )?;
+    if let Some(sidecars) = sidecars {
+        let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
+        verify(
+            is_data_available_gloas_columns(sidecars, kzg_commitments)?,
+            "is_data_available(envelope.beacon_block_root)",
+        )?;
+    }
 
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
@@ -6101,8 +6150,9 @@ pub fn check_execution_payload_envelope(
 /// envelope to the store. Persisted, so a restarted follower keeps the full
 /// branch of this block.
 ///
-/// The caller must have run [`check_execution_payload_envelope`] on the same
-/// envelope; a block the store does not hold is the only case this refuses.
+/// The caller must have run [`check_execution_payload_envelope`] or
+/// [`check_execution_payload_envelope_columns_verified`] on the same envelope;
+/// a block the store does not hold is the only case this refuses.
 pub fn accept_execution_payload_envelope(
     store: &mut Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
@@ -6953,7 +7003,7 @@ mod tests {
         let (signed, _) = block_on(&parent, first_slot);
 
         let mut store = empty_store();
-        let (mut post, outcome) = transition_block(
+        let mut post = transition_block(
             &store,
             &parent,
             parent_root,
@@ -6963,8 +7013,8 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             stf::OwnedBlockCaches::default().caches(),
             Default::default(),
-        );
-        outcome.expect("applies");
+        )
+        .expect("applies");
         post.apply_pending_mutations();
         assert!(
             store
@@ -8018,7 +8068,7 @@ mod tests {
         config: &Config,
     ) -> Option<SpeculativeTransition> {
         let mut speculation = honest_speculation(store, block, config)?;
-        speculation.outcome = Err(Error::SpecAssert(POISON));
+        speculation.transition = Err(Error::SpecAssert(POISON));
         Some(speculation)
     }
 
@@ -8065,10 +8115,11 @@ mod tests {
             import_valid_child(&PayloadValidity::Validated, |store, block, config| {
                 let mut speculation = honest_speculation(store, block, config)?;
                 speculation
-                    .outcome
-                    .as_ref()
-                    .expect("the transition succeeds");
-                speculation.state.latest_block_header_mut().body_root = Root::repeat_byte(0xab);
+                    .transition
+                    .as_mut()
+                    .expect("the transition succeeds")
+                    .latest_block_header_mut()
+                    .body_root = Root::repeat_byte(0xab);
                 Some(speculation)
             });
         result.expect("the import takes the speculation's outcome");
@@ -11814,7 +11865,7 @@ mod tests {
         parent_root: Root,
         block: &SignedBeaconBlock,
     ) -> Root {
-        let (mut state, outcome) = transition_block(
+        let mut state = transition_block(
             store,
             parent,
             parent_root,
@@ -11824,8 +11875,8 @@ mod tests {
             &stf::ExecutionEngine::valid(),
             stf::OwnedBlockCaches::default().caches(),
             Default::default(),
-        );
-        outcome.expect("the block applies");
+        )
+        .expect("the block applies");
         state.apply_pending_mutations();
         state.hash_tree_root()
     }

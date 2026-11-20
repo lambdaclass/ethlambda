@@ -51,6 +51,7 @@ use super::helpers::fulu::fulu_state;
 use super::helpers::misc::compute_signing_root;
 use super::helpers::predicates::is_slashable_validator;
 use super::lean_boundary::lean_state_unreachable;
+use super::stf::signatures::SignatureBatch;
 use super::stf::{self, BlockCaches, ExecutionEngine, OwnedBlockCaches};
 use ethlambda_storage::pools::single_committee;
 
@@ -390,8 +391,14 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         candidates.proposer_slashings,
         preset::MAX_PROPOSER_SLASHINGS,
         config,
-        |state, slashing, config| {
-            stf::operations::process_proposer_slashing(state, slashing, config, &active_balances)
+        |state, slashing, config, signatures| {
+            stf::operations::process_proposer_slashing(
+                state,
+                slashing,
+                config,
+                &active_balances,
+                signatures,
+            )
         },
     );
 
@@ -409,8 +416,14 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         ranked.into_iter().map(|(_, slashing)| slashing).collect(),
         preset::MAX_ATTESTER_SLASHINGS_ELECTRA,
         config,
-        |state, slashing, config| {
-            stf::electra::process_attester_slashing(state, slashing, config, &active_balances)
+        |state, slashing, config, signatures| {
+            stf::electra::process_attester_slashing(
+                state,
+                slashing,
+                config,
+                &active_balances,
+                signatures,
+            )
         },
     );
 
@@ -419,8 +432,8 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         candidates.voluntary_exits,
         preset::MAX_VOLUNTARY_EXITS,
         config,
-        |state, exit, config| {
-            stf::electra::process_voluntary_exit(state, exit, config, &active_balances)
+        |state, exit, config, signatures| {
+            stf::electra::process_voluntary_exit(state, exit, config, &active_balances, signatures)
         },
     );
     let bls_to_execution_changes = pack_each(
@@ -456,7 +469,7 @@ fn pack_each<T>(
     candidates: Vec<T>,
     max: usize,
     config: &Config,
-    apply: impl Fn(&mut BeaconState, &T, &Config) -> Result<()>,
+    apply: impl Fn(&mut BeaconState, &T, &Config, &mut SignatureBatch) -> Result<()>,
 ) -> Vec<T> {
     let mut packed = Vec::new();
     // Bounds the work if the pool is full of stale entries.
@@ -464,7 +477,11 @@ fn pack_each<T>(
         if packed.len() == max {
             break;
         }
-        if apply(scratch, &candidate, config).is_ok() {
+        // An immediate batch, so a bad signature rejects the candidate before
+        // it writes, which is what lets a rejected candidate leave `scratch`
+        // untouched (see above); a deferred batch would only fail at the end.
+        let mut signatures = SignatureBatch::immediate();
+        if apply(scratch, &candidate, config, &mut signatures).is_ok() {
             packed.push(candidate);
         }
     }
