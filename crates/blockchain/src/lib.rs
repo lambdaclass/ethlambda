@@ -62,6 +62,7 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 mod beacon_aggregates;
+mod beacon_blobs;
 mod beacon_columns;
 pub mod beacon_engine;
 mod beacon_envelope;
@@ -429,6 +430,7 @@ impl BlockChain {
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
             custody_columns,
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
@@ -547,6 +549,10 @@ pub struct BlockChainServer {
     /// The columns this node samples, computed once at startup from its node
     /// id (see `das::custody_columns`). Empty on lean.
     custody_columns: Vec<u64>,
+
+    /// Admission limits on asking the execution client for a held block's
+    /// blobs (see `beacon_blobs::AskBudget`).
+    blob_asks: beacon_blobs::AskBudget,
 
     /// The execution client this follower validates payloads against, when one
     /// is configured. `None` is `--execution-endpoint` absent, in which case
@@ -2233,6 +2239,7 @@ impl BlockChainServer {
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
             custody_columns: Vec::new(),
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine,
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
@@ -3584,6 +3591,16 @@ impl BlockChainServer {
     /// arrives in; leaving it to the redrive cadence instead made a follower
     /// recovering from a checkpoint sync import roughly one such block per
     /// slot.
+    ///
+    /// The execution client is asked for the block's blobs once, on the first
+    /// hold of a fulu block that commits to any, is at most
+    /// [`beacon_blobs::MAX_ASK_AGE_SLOTS`] behind `current_slot`, and whose
+    /// proposer signature verifies against its parent's state (see
+    /// [`beacon_blobs`]). Unlike the peer ask, that one is made at the tip:
+    /// it asks no peer, so it burns no lookup attempt, and a hit hands the
+    /// custody columns back through the same path gossip uses, so it just
+    /// races gossip to complete the block. A block further behind (range
+    /// sync's) is not asked about; its peer ask starts at once below.
     fn hold_block_for_columns(
         &mut self,
         block: SignedBeaconBlock,
@@ -3610,6 +3627,35 @@ impl BlockChainServer {
             missing = ?missing,
             "Holding block: its custody columns have not all arrived yet"
         );
+
+        // Before the block is moved into the store. Only the first hold asks:
+        // a redelivery of a held root must not re-query the execution client.
+        // Only a recent block does, checked before the signature so range
+        // sync pays for neither. Only within the ask budget (per block slot
+        // and in flight, see `beacon_blobs::AskBudget`), spent before the
+        // signature so a flood of distinct roots for one recent slot cannot
+        // buy unbounded BLS work here. Only a block whose proposer signature
+        // verifies does: the built columns go through every chain check
+        // before they leave `beacon_blobs`, but a block that already fails
+        // here is not worth an engine call and a cell computation.
+        if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
+            (&self.engine, &self.p2p, &block)
+            && !inner.message.body.blob_kzg_commitments.is_empty()
+            && !self.blocks_awaiting_columns.contains_key(&block_root)
+            && beacon_blobs::recent_enough_to_ask(slot, current_slot)
+            && let Some(permit) = self.blob_asks.admit(slot, current_slot)
+            && beacon_blobs::signed_by_its_proposer(&self.store, &block, block_root)
+        {
+            beacon_blobs::spawn_fetch(
+                engine.clone(),
+                p2p.clone(),
+                self.store.clone(),
+                inner.clone(),
+                block_root,
+                self.custody_columns.clone(),
+                permit,
+            );
+        }
 
         // Written the same way a parent-missing block is (see
         // `process_or_pend_block`): no `LiveChain` entry, so it stays
@@ -4964,6 +5010,7 @@ mod tests {
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
             custody_columns: Vec::new(),
+            blob_asks: beacon_blobs::AskBudget::default(),
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,
@@ -5144,6 +5191,8 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct RecordingP2P {
         pub(crate) checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
+        /// The origin each entry of `checks` was handed over with, in order.
+        pub(crate) check_origins: std::sync::Mutex<Vec<ethlambda_network_api::SidecarOrigin>>,
         pub(crate) fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
@@ -5176,7 +5225,10 @@ mod tests {
         fn check_data_column_sidecars(
             &self,
             sidecars: Vec<DataColumnSidecar>,
+            origin: ethlambda_network_api::SidecarOrigin,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            // Origin first: a test waits on `checks`, then reads the origin.
+            self.check_origins.lock().unwrap().push(origin);
             self.checks.lock().unwrap().push(sidecars);
             Ok(())
         }

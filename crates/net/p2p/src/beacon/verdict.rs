@@ -604,6 +604,27 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
     }
 }
 
+/// [`settle`] for the gossip message delivered as `message_id`.
+///
+/// An accepted column the execution-layer path published under the same id
+/// keeps its `Accept` without being recorded: the key is taken by that very
+/// column, and that publish sent nothing, so this copy is the only one
+/// gossipsub can relay. See [`crate::beacon::engine_columns`]'s module doc.
+pub(crate) fn settle_message(
+    server: &mut P2PServer,
+    message_id: &MessageId,
+    outcome: Outcome,
+    object: &Validated,
+) -> Outcome {
+    if outcome == Outcome::Accept
+        && matches!(object, Validated::Column(_))
+        && server.engine_published_columns.take(message_id)
+    {
+        return Outcome::Accept;
+    }
+    settle(server, outcome, object)
+}
+
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict {
@@ -611,7 +632,7 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
+        let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
         if report(self, id, outcome) {
             object.forward(self, received_at, outcome);

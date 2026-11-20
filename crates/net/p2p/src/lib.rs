@@ -42,7 +42,7 @@ use std::{
 use either::Either;
 use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
-    P2PToBlockChainRef, PeerDirection, PeerTableController,
+    P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1602,6 +1602,9 @@ impl P2P {
             discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            engine_published_columns: beacon::engine_columns::PublishedColumns::new(
+                SEEN_COLUMNS_CAPACITY,
+            ),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
             seen_payload_attestations: SeenPayloadAttestations::new(
@@ -1798,6 +1801,10 @@ pub struct P2PServer {
     /// The first valid sidecar per `(slot, proposer, index)` accepted from
     /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
     pub(crate) seen_columns: SeenColumns,
+    /// Gossipsub message ids of the columns the execution-layer path
+    /// published, so a gossip copy of one that was still in validation keeps
+    /// its `Accept`. See [`beacon::engine_columns::PublishedColumns`].
+    pub(crate) engine_published_columns: beacon::engine_columns::PublishedColumns,
     /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
     /// per `(block root, index)`, since a gloas sidecar names no proposer.
     pub(crate) seen_block_columns: SeenBlockColumns,
@@ -2326,11 +2333,18 @@ impl Handler<FetchBlock> for P2PServer {
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
     async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
-        beacon::column_checks::check_and_forward(
-            self,
-            msg.sidecars,
-            beacon::column_checks::ColumnArrival::Recheck,
-        );
+        match msg.origin {
+            // Parked sidecars handed back once their block imported: their
+            // arrival was recorded when they were parked.
+            SidecarOrigin::Parked => beacon::column_checks::check_and_forward(
+                self,
+                msg.sidecars,
+                beacon::column_checks::ColumnArrival::Recheck,
+            ),
+            SidecarOrigin::ExecutionLayer => {
+                beacon::engine_columns::publish_and_forward(self, msg.sidecars)
+            }
+        }
     }
 }
 
@@ -3751,14 +3765,30 @@ pub const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 pub const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
-    let mut hasher = sha2::Sha256::new();
     let decompressed = gossipsub::decompress_message(&message.data).ok();
+    match decompressed.as_deref() {
+        Some(data) => message_id(MESSAGE_DOMAIN_VALID_SNAPPY, &message.topic, data),
+        None => message_id(MESSAGE_DOMAIN_INVALID_SNAPPY, &message.topic, &message.data),
+    }
+}
 
-    let (domain, data) = match decompressed.as_deref() {
-        Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
-        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
-    };
-    let topic = message.topic.as_str().as_bytes();
+/// The id gossipsub gives a message this node publishes on `topic`, given its
+/// uncompressed payload: [`compute_message_id`] of what `publish` sends, which
+/// is always valid snappy.
+pub(crate) fn published_message_id(
+    topic: &libp2p::gossipsub::TopicHash,
+    uncompressed: &[u8],
+) -> libp2p::gossipsub::MessageId {
+    message_id(MESSAGE_DOMAIN_VALID_SNAPPY, topic, uncompressed)
+}
+
+fn message_id(
+    domain: [u8; 4],
+    topic: &libp2p::gossipsub::TopicHash,
+    data: &[u8],
+) -> libp2p::gossipsub::MessageId {
+    let mut hasher = sha2::Sha256::new();
+    let topic = topic.as_str().as_bytes();
     let topic_len = (topic.len() as u64).to_le_bytes();
     hasher.update(domain);
     hasher.update(topic_len);
@@ -3822,6 +3852,9 @@ pub(crate) mod test_support {
                 Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
             )>,
         >,
+        /// Each `new_data_column_sidecars` batch, in arrival order.
+        pub(crate) sidecar_batches:
+            std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
     }
 
     impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
@@ -3849,8 +3882,9 @@ pub(crate) mod test_support {
         }
         fn new_data_column_sidecars(
             &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sidecar_batches.lock().unwrap().push(sidecars);
             Ok(())
         }
         fn data_column_sidecars_awaiting_parent(
@@ -4038,6 +4072,9 @@ pub(crate) mod test_support {
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            engine_published_columns: crate::beacon::engine_columns::PublishedColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
