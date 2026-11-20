@@ -1,28 +1,39 @@
-# A PQ-at-genesis devnet where ethlambda validates too: Lighthouse (pq) with 48
-# validators (75%, enough to finalize alone), an ethlambda beacon node and
-# validator client with 16. See README.md.
+# A PQ-at-genesis devnet where ethlambda validates too: Lighthouse
+# (pq-devnet-0) with 48 validators (75%, enough to finalize alone), an
+# ethlambda beacon node and validator client with 16. The ethlambda image
+# needs tooling/pq-devnet/vrf-4595f0fc.patch. See README.md.
 participants:
   - el_type: geth
     cl_type: lighthouse
-    cl_image: ethdreamer/lighthouse:pq
-    vc_image: ethdreamer/lighthouse:pq
+    cl_image: ethpandaops/lighthouse:pq-devnet-0
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
     validator_count: 48
     supernode: true
   - el_type: geth
     cl_type: ethlambda
     cl_image: ethlambda:pq-local
+    cl_log_level: info
     # The sidecar proves aggregates and merges block proofs; two threads keep
-    # it next to Lighthouse's in Docker Desktop's default 8 GB VM.
+    # it next to Lighthouse's in the Docker VM.
     cl_extra_env_vars:
       LEANVM_THREADS: "2"
     vc_type: ethlambda
     vc_image: ethlambda:pq-local
-    vc_extra_params: ["--init-slashing-protection"]
+    vc_extra_params:
+      - --init-slashing-protection
+      # ethereum-package's published VRF tree states (the launcher passes
+      # vrf_state_url to other clients' validator clients only), served from
+      # the host: see README.md. Without them each tree is hashed, minutes a
+      # key.
+      - --vrf-state-url=http://host.docker.internal:8642/b9dec4e1daa17dfe.vrf
     validator_count: 16
 network_params:
   preset: mainnet
   fulu_fork_epoch: 0
   gloas_fork_epoch: 0
   pq_fork_epoch: 0
+  # The validator clients derive their leanXMSS keys at startup (about a
+  # minute for ethlambda's 16, two for Lighthouse's 48); genesis waits.
+  genesis_delay: 300
 additional_services:
   - dora

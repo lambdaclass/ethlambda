@@ -8,25 +8,29 @@ behind ethlambda's own validator client. See
 [`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda implements
 of the fork.
 
-> **With Lighthouse, not runnable at this pin yet.** `b5d422b2` changed the
-> VRF tree (each leaf now commits to its slot's secret, and the tree is hashed
-> with Keccak-256 over all `2^31` leaves). No published genesis generator or
-> Lighthouse build registers roots under that rule, so every proposal splits
-> the chain: see [Known limits](#known-limits). The Lighthouse steps below are
-> the ones last run, at `a4d16c5b`. An ethlambda-only devnet runs at this pin
-> on key files ethlambda writes itself: see [ethlambda alone](#ethlambda-alone).
+> **With Lighthouse, on a local VRF patch.** `b5d422b2` changed the VRF tree
+> (each leaf now commits to its slot's secret). Lighthouse's `pq-devnet-0`
+> image, ethPandaOps' genesis generator and ethereum-package's published VRF
+> states still follow the rule before it (consensus-specs `pq` at
+> `4595f0fc`), so the Lighthouse devnets below need ethlambda built with
+> [`vrf-4595f0fc.patch`](vrf-4595f0fc.patch), which this branch does not
+> carry: see [Known limits](#known-limits). An ethlambda-only devnet runs at
+> this pin unpatched, on key files ethlambda writes itself: see
+> [ethlambda alone](#ethlambda-alone).
 
 ## What runs
 
-- **Genesis**: `ethpandaops/ethereum-genesis-generator:pq` (eth-beacon-genesis
-  `284025a0`). Fulu, gloas and PQ at epoch 0, mainnet preset, 12 s slots.
-  Every validator's leanXMSS key is `KeyGen(sha256("leanxmss-seed" || sk))`
-  and its VRF seed `sha256("vrf-seed" || sk)`, `sk` its EIP-2333 signing key;
-  ethereum-package ships the first 1000 keys of its default mnemonic. That
-  generator's VRF tree is the one before `b5d422b2` (see Known limits). The
-  EIP-7002, EIP-7251 and EIP-8282 request contracts are inert stubs.
-- **Lighthouse**: `ethdreamer/lighthouse:pq`, which proves attestation
-  aggregates with leanVM through a `leanvm-sidecar` (`lighthouse-pq-bn`).
+- **Genesis**: `ethpandaops/ethereum-genesis-generator:pq`. Fulu, gloas and
+  PQ at epoch 0, mainnet preset, 12 s slots. Every validator's leanXMSS key
+  is `KeyGen(sha256("leanxmss-seed" || sk))` and its VRF seed
+  `sha256("vrf-seed" || sk)`, `sk` its EIP-2333 signing key; ethereum-package
+  publishes the keys, VRF roots and VRF tree states of its default
+  mnemonic's first 10000 validators, and the generator must log `0 derived`.
+  Those roots follow `4595f0fc`'s VRF rule (see Known limits). The EIP-7002,
+  EIP-7251 and EIP-8282 request contracts are inert stubs.
+- **Lighthouse**: `ethpandaops/lighthouse:pq-devnet-0` (last run at
+  `sha256:f571048f`), which proves attestation aggregates with leanVM through
+  a `leanvm-sidecar` (`lighthouse-pq-bn`).
 - **ethlambda**: this repository's image with `leanvm-sidecar` added, started
   through `ethlambda-pq` (`bin/ethlambda/pq/ethlambda-pq`), which starts the
   sidecar and passes its socket as `--pq-prover-socket`. Without the sidecar
@@ -38,7 +42,9 @@ of the fork.
 ## Run it
 
 ```sh
-# 1. The image, from the repository root (about 15 minutes).
+# 1. The image, from the repository root (about 15 minutes), with
+#    Lighthouse's VRF rule. Undo the patch afterwards (git apply -R).
+git apply tooling/pq-devnet/vrf-4595f0fc.patch
 docker build -f tooling/pq-devnet/Dockerfile -t ethlambda:pq-local .
 
 # 2. The package: lambdaclass/ethereum-package's `add-ethlambda` (the
@@ -48,12 +54,17 @@ git clone https://github.com/lambdaclass/ethereum-package.git ethereum-package
 cd ethereum-package
 git checkout 8159202d71cca5a1de086d8152d512c5b95465ca      # add-ethlambda
 git fetch https://github.com/ethpandaops/ethereum-package.git \
-  7fafe056d997b07ec70656b16e54389fa02ec506                  # pq
+  87788250ac957609e4826705421d59ea924ba69f                  # pq
 git merge --no-edit FETCH_HEAD
 git apply <ethlambda>/tooling/pq-devnet/ethlambda-launcher.patch
 cd ..
 
-# 3. The devnet. kurtosis wants the package as an absolute path.
+# 3. For network_params_validators.yaml: the package's published VRF tree
+#    states, where ethlambda's validator client reaches the host.
+(cd ethereum-package/static_files/xmss-keys \
+  && python3 -m http.server 8642 --bind 127.0.0.1) &
+
+# 4. The devnet. kurtosis wants the package as an absolute path.
 kurtosis run --enclave pq "$PWD/ethereum-package" \
   --args-file <ethlambda>/tooling/pq-devnet/network_params.yaml
 ```
@@ -64,9 +75,12 @@ are missed. Lighthouse needs a supernode or 128 validators for PeerDAS, which
 the params give it.
 
 With `network_params_validators.yaml`, ethlambda's validator client derives
-its 16 keys in under a minute. Lighthouse keeps 48 (75%), enough to finalize
+its 16 keys in about a minute and must log `Every validator's VRF tree is
+ready ... loaded=16 hashed=0`. Lighthouse keeps 48 (75%), enough to finalize
 alone, so a fault on ethlambda's side shows as missed duties rather than a
-stalled chain.
+stalled chain: judge ethlambda from Lighthouse's side (its blocks canonical,
+`gossipsub_rejected_messages_per_topic_total` empty, validators 48 to 63
+participating).
 
 ## ethlambda alone
 
@@ -85,7 +99,11 @@ ethlambda pq-keys --count 32 --output-dir keys   --mnemonic "giant issue aisle s
 # 2. Serve them where the enclave reaches the host.
 (cd keys && python3 -m http.server 8641 --bind 127.0.0.1) &
 
-# 3. The image and the package as above, then the devnet.
+# 3. The image as above but without the VRF patch (this devnet is at
+#    b5d422b2), the package as above, then the devnet. The plain image
+#    (`make docker-build`) and a package without the launcher patch run it
+#    too, the nodes then checking each other's proofs in the specification's
+#    reference encoding.
 kurtosis run --enclave pq "$PWD/ethereum-package"   --args-file <ethlambda>/tooling/pq-devnet/network_params_ethlambda.yaml
 ```
 
@@ -116,25 +134,22 @@ kurtosis run --enclave pq "$PWD/ethereum-package"   --args-file <ethlambda>/tool
 - **The VRF tree changed under every other client.** At `b5d422b2` a VRF
   leaf is `keccak256("VRF_LEAF" || secret || le64(slot))` over the secret
   `keccak256("VRF_SECRET" || vrf_seed || le64(slot))`, and a reveal is the
-  secret, not the leaf. When this was written:
-  - `ethpandaops/eth-beacon-genesis`'s `pq` branch (`ff42fce0`, the
-    `pq-full-vrf` image ethereum-package now defaults to) hashes all `2^31`
-    leaves with Keccak-256, but each leaf is `keccak256(vrf_seed ||
-    le64(slot))` itself, the rule `b5d422b2` replaced;
-  - Lighthouse's PQ branch (`ethdreamer/lighthouse:pq` at `0c76c6e1`) uses the
-    same leaf with only the first `2^20` leaves populated and the rest zero.
-
-  A root either registers fails ethlambda's `is_valid_vrf_proof`, and
-  ethlambda's reveals fail theirs, so the first block of either side is
-  invalid to the other. The image at `284025a0` this devnet was last run with
-  is older still (SHA-256). Until both move, run ethlambda alone against a
-  genesis whose VRF roots are `compute_vrf_root` of each validator's seed,
-  which `ethlambda_crypto::vrf::VrfTree::build` computes.
-- **A validator's first start hashes its VRF trees.** About 100 seconds a key
-  on an Apple M4 Max's 14 cores, one key after another, in the background:
-  attestations start at once, proposals before a key's tree is ready are
-  missed. The trees are kept under `<validators-dir>/pq_vrf_trees/`, so a
-  restart reads them back.
+  secret, not the leaf. Lighthouse's `pq-devnet-0` image, ethPandaOps'
+  generator (`pq`) and ethereum-package's published VRF states still use
+  `4595f0fc`'s leaf, `keccak256(vrf_seed || le64(slot))`, revealed as it is.
+  A root either side registers fails the other's `is_valid_vrf_proof`, so
+  the first block of either side would be invalid to the other.
+  [`vrf-4595f0fc.patch`](vrf-4595f0fc.patch) switches ethlambda's
+  `ethlambda_crypto::vrf` to the older leaf for a devnet with them; the
+  state transition and the validator client follow from it. Without the
+  patch, run ethlambda alone (above).
+- **Without VRF tree states, a validator's first start hashes its trees.**
+  Minutes a key on all cores, one key after another, in a pool of their own
+  so attestations, aggregates and PTC votes are signed meanwhile; a proposal
+  before its key's tree is ready is missed. `--vrf-state-url` (the package's
+  published file, or the `.vrf` file `ethlambda pq-keys` writes) avoids it,
+  and the trees are kept under `<validators-dir>/pq_vrf_trees/`, so a restart
+  reads them back.
 - **Lighthouse does not serve PQ envelopes over req/resp.** Its `pq` branch
   answers `execution_payload_envelopes_by_{range,root}` with a gloas-shaped
   envelope under the PQ digest ("Pq payload envelope RPC decoding is not

@@ -1,10 +1,11 @@
-# A PQ-at-genesis devnet: Lighthouse (pq) proposes and validates, the ethlambda
-# beacon node follows. See README.md.
+# A PQ-at-genesis devnet: Lighthouse (pq-devnet-0) proposes and validates, the
+# ethlambda beacon node follows. The ethlambda image needs
+# tooling/pq-devnet/vrf-4595f0fc.patch. See README.md.
 participants:
   - el_type: geth
     cl_type: lighthouse
-    cl_image: ethdreamer/lighthouse:pq
-    vc_image: ethdreamer/lighthouse:pq
+    cl_image: ethpandaops/lighthouse:pq-devnet-0
+    vc_image: ethpandaops/lighthouse:pq-devnet-0
     validator_count: 64
     supernode: true
   - el_type: geth
