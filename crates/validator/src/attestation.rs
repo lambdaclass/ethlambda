@@ -112,10 +112,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             });
         }
 
-        // The fork of the slot, by this client's own schedule, tells the node
-        // which form of the query to answer: from gloas the `committee_index`
-        // is omitted and the answer's `index` is the payload signal. It is
-        // signed as received, never reset to zero.
+        // The fork of the slot, by this client's own schedule, decides which
+        // `index` the answer may carry: from gloas it is the payload signal.
+        // It is signed as received, never reset to zero.
         let slot_fork = self
             .context
             .config
@@ -960,8 +959,8 @@ mod tests {
         );
     }
 
-    /// Slots before gloas are asked about under their own fork, so the HTTP
-    /// client keeps sending `committee_index=0` there.
+    /// Slots before gloas are asked about under their own fork, so the answer
+    /// is held to that fork's `index` rule (0 only), not gloas's.
     #[tokio::test]
     async fn a_pre_gloas_slot_is_asked_about_under_its_own_fork() {
         use ethlambda_types::beacon::fork::ForkName;

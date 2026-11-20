@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 // Re-exported at this old path (`crate::beacon::helpers::accessors::CommitteeCache`,
 // and so on), so every existing import of the type this module used to define
 // is unaffected by its move to `ethlambda-storage`; see [`CommitteeCacheExt`]
@@ -15,6 +17,7 @@ pub use ethlambda_storage::{
     ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, PubkeyIndexCache, ShufflingKey,
 };
 
+use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
@@ -278,6 +281,66 @@ pub trait CommitteeCacheExt {
     /// the previous head pinned stays resident until an insertion evicts it
     /// on epoch like any other entry.
     fn update_head(&self, head_root: Root, head_state: &BeaconState);
+
+    /// `epoch`'s committee key sums as `state` names them, if they have been
+    /// warmed.
+    ///
+    /// Lookup only, and it never builds: building costs a pass over every
+    /// active validator's key, which is more than the sums save for
+    /// committees attested once, so block import must never be the one to pay
+    /// it. `None` (cold, evicted, or an epoch `state` cannot key) means the
+    /// caller sums its attesters directly. Warmed by [`Self::warm_key_sums`].
+    ///
+    /// # Why the sums can be shared on the shuffling's key
+    ///
+    /// The sums are filed under the same [`ShufflingKey`] as the committees,
+    /// so two states with one key must agree on every member's *public key* as
+    /// well as on who the members are. They do, for three reasons, each
+    /// checked against this crate's spec code:
+    ///
+    /// - A validator's index and public key are fixed when it is appended to
+    ///   the registry and never change after: the registry only grows
+    ///   (`process_deposit`, and electra's pending-deposit path through
+    ///   `add_validator_to_registry`, push; nothing removes or reorders), and
+    ///   no code assigns `validator.pubkey` after construction.
+    /// - A new validator is appended with `activation_epoch` at
+    ///   `FAR_FUTURE_EPOCH`. The only writer that gives it a real one is
+    ///   `process_registry_updates`, running in epoch `N`'s epoch processing,
+    ///   and it writes `compute_activation_exit_epoch(N)`, which is
+    ///   `N + 1 + MAX_SEED_LOOKAHEAD`. (Genesis validators are active from
+    ///   `GENESIS_EPOCH` and are in every state's history.)
+    /// - A validator in `epoch`'s committees is active there, so its
+    ///   `activation_epoch <= epoch`, so it was activated by epoch processing
+    ///   at some `N <= epoch - 1 - MAX_SEED_LOOKAHEAD`, and appended no later
+    ///   than that. That is before the end of `epoch - 2`, so the block the
+    ///   [`ShufflingKey`] names as the decision root already has it in its
+    ///   registry, at that index, with that key. Every state descending from
+    ///   that block inherits it.
+    ///
+    /// So the member list and each member's key are functions of the key,
+    /// and so is their sum. This is a stronger claim than the committees'
+    /// own (which need only the activation and exit epochs to be fixed), but
+    /// it follows from the same lookahead and from the registry being
+    /// append-only.
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>>;
+
+    /// Builds `epoch`'s committee key sums as `state` names them, unless they
+    /// are already there. Meant for a background task: it derives the
+    /// committees if they are not resident, then spends one pass over the
+    /// registry and one key sum per committee, parallel across committees.
+    ///
+    /// A committee with a member whose key fails validation gets no sum
+    /// (`None` in its slot), so lookups of it fall back to the direct path
+    /// rather than to a sum that omits the member. Does nothing for an epoch
+    /// `state` cannot key, since there is nowhere to file the result, nor
+    /// before electra, whose attestations never read the sums. Idempotent, so
+    /// a caller unsure whether an epoch is warm can just ask again.
+    ///
+    /// Deriving the committees, when they are not resident yet, is part of a
+    /// warm-up's cost, but `lean_beacon_committee_key_sums_warm_seconds`
+    /// times the sums alone: the committees are the shuffling every
+    /// attestation of the epoch needs anyway, warm or not.
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch);
 }
 
 impl CommitteeCacheExt for CommitteeCache {
@@ -303,6 +366,81 @@ impl CommitteeCacheExt for CommitteeCache {
         let keys = epochs.map(|epoch| shuffling_key(head_state, epoch));
         self.pin_head(head_root, keys);
     }
+
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>> {
+        self.resident_key_sums(shuffling_key(state, epoch)?)
+    }
+
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch) {
+        if state.fork_name() < ForkName::Electra {
+            return;
+        }
+        let Some(key) = shuffling_key(state, epoch) else {
+            return;
+        };
+        if self.resident_key_sums(key).is_some() {
+            return;
+        }
+        // Resident before the sums are filed into it; a no-op when the import
+        // path already built them.
+        let committees = self.committees(state, epoch);
+        self.get_or_init_key_sums(key, || {
+            // The sums alone: not the committees above, nor a lookup that
+            // found the work already done.
+            let _timing = crate::metrics::time_key_sums_warm();
+            build_committee_key_sums(state, &committees, epoch)
+        });
+    }
+}
+
+/// Every committee of `committees`' epoch summed, indexed by committee number.
+///
+/// One `state.iter_validators()` pass copies each validator's key bytes into a
+/// flat list (a per-index `state.validator(i)` is a tree descent, and the
+/// whole active set is read), then committees are summed in parallel. An entry
+/// is `None` for a committee with a member whose key fails validation or whose
+/// index is outside the registry, and for an empty committee.
+///
+/// The flat key list is transient, about 48 MB on a mainnet-sized registry.
+/// The parallel sums run on rayon's global pool, which block import's key
+/// validation also uses (blst's pairings and leanVM's prover have pools of
+/// their own). A warm-up is short, about 70 ms per epoch measured on a mainnet
+/// node, and runs once or twice an epoch, so it delays import's key work only
+/// briefly when the two coincide.
+fn build_committee_key_sums(
+    state: &BeaconState,
+    committees: &EpochCommittees,
+    epoch: Epoch,
+) -> CommitteeKeySums {
+    let pubkeys: Vec<BlsPubkey> = state.iter_validators().map(|v| v.pubkey).collect();
+    let per_slot = committees.committees_per_slot();
+    let first_slot = compute_start_slot_at_epoch(epoch);
+
+    let members: Vec<&[ValidatorIndex]> = (0..preset::slots_per_epoch())
+        .flat_map(|offset| (0..per_slot).map(move |index| (first_slot + offset, index)))
+        .map(|(slot, index)| {
+            committees
+                .committee(slot, index)
+                .expect("slot is in the epoch and index is below the committee count")
+        })
+        .collect();
+
+    let sums = members
+        .par_iter()
+        .map(|committee| {
+            // The index is attached per committee rather than stored in the
+            // flat list, which spans the whole registry.
+            let keys: Option<Vec<IndexedPubkey>> = committee
+                .iter()
+                .map(|&index| {
+                    let pubkey = *pubkeys.get(index as usize)?;
+                    Some(IndexedPubkey { index, pubkey })
+                })
+                .collect();
+            AggregatePubkey::sum(&keys?)
+        })
+        .collect();
+    CommitteeKeySums::new(sums)
 }
 
 /// The key `state`'s total active balance is cached under, or `None` if

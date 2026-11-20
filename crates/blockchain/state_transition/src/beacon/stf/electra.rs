@@ -44,7 +44,7 @@
 
 use libssz::SszEncode as _;
 
-use crate::beacon::bls::{self, SignatureSet};
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{
@@ -61,7 +61,7 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::capella::withdrawal_address;
 use crate::beacon::helpers::electra::{
-    compute_exit_epoch_and_update_churn, get_committee_indices,
+    compute_exit_epoch_and_update_churn, electra_attestation_signature_set, get_committee_indices,
     get_consolidation_churn_limit_for_fork, get_indexed_attestation, get_max_effective_balance,
     get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
     has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
@@ -83,6 +83,8 @@ use crate::beacon::primitives::{
     WithdrawalIndex,
 };
 use crate::beacon::stf::signatures::SignatureBatch;
+
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
 use super::{BlockCaches, ExecutionEngine};
 
@@ -534,7 +536,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
@@ -735,7 +740,7 @@ pub fn process_attestation(
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     signatures.push(
-        indexed_attestation_signature_set(state, &indexed_attestation),
+        electra_attestation_signature_set(state, attestation, &indexed_attestation, committees),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -1848,60 +1853,70 @@ pub fn process_operations(
         verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
     }
 
-    for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(
-            state,
-            proposer_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
-    for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(
-            state,
-            attester_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        body.proposer_slashings.iter(),
+        |slashing| {
+            super::operations::process_proposer_slashing(
+                state,
+                slashing,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        body.attester_slashings.iter(),
+        |slashing| process_attester_slashing(state, slashing, config, active_balances, signatures),
+    )?;
     // [Modified in Electra:EIP7549]
     //
-    // One proposer lookup for the list, not one per attestation: see the same
-    // loop in `super::operations::process_operations`.
+    // One proposer lookup for the list, not one per attestation, timed with
+    // the attestations it serves: see the same loop in
+    // `super::operations::process_operations`.
     if !body.attestations.is_empty() {
-        let proposer_index = get_beacon_proposer_index(state)?;
-        for attestation in body.attestations.iter() {
-            process_attestation(
-                state,
-                attestation,
-                proposer_index,
-                committees,
-                active_balances,
-                target_delta,
-                signatures,
-            )?;
-        }
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in body.attestations.iter() {
+                process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                    target_delta,
+                    signatures,
+                )?;
+            }
+            Ok(())
+        })?;
     }
-    for deposit in body.deposits.iter() {
-        process_deposit(state, deposit, config)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, body.deposits.iter(), |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
     // [Modified in Electra:EIP7251]
-    for voluntary_exit in body.voluntary_exits.iter() {
-        process_voluntary_exit(state, voluntary_exit, config, active_balances, signatures)?;
-    }
-    for signed_change in body.bls_to_execution_changes.iter() {
-        process_bls_to_execution_change(state, signed_change, config, signatures)?;
-    }
-    // [New in Electra:EIP6110:EIP7002:EIP7251]
-    process_execution_requests(
-        state,
-        &body.execution_requests,
-        config,
-        active_balances,
-        pubkey_indices,
+    try_for_each_timed(
+        StfPhase::VoluntaryExits,
+        body.voluntary_exits.iter(),
+        |exit| process_voluntary_exit(state, exit, config, active_balances, signatures),
     )?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        body.bls_to_execution_changes.iter(),
+        |signed_change| process_bls_to_execution_change(state, signed_change, config, signatures),
+    )?;
+    // [New in Electra:EIP6110:EIP7002:EIP7251]
+    timed(StfPhase::ExecutionRequests, || {
+        process_execution_requests(
+            state,
+            &body.execution_requests,
+            config,
+            active_balances,
+            pubkey_indices,
+        )
+    })?;
 
     Ok(())
 }
@@ -1933,15 +1948,21 @@ pub fn process_block(
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body, config, engine)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body, config, engine)
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
@@ -2590,5 +2611,102 @@ mod tests {
         // Each element is longer than its type byte alone.
         assert!(list[0].len() > 1);
         assert!(list[1].len() > 1);
+    }
+
+    // -- process_attestation with warmed committee key sums -------------------
+
+    const ATTESTATION_LABEL: &str =
+        "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))";
+
+    /// An attestation for slot `SLOTS_PER_EPOCH - 1` of a state one epoch in,
+    /// signed by every member of its committee but the first two, so that the
+    /// majority rule subtracts when the sums are warm. `signed_message` is the
+    /// root the committee actually signs; a root other than the attestation's
+    /// own makes the signature bad.
+    fn attestation_for_the_last_slot_of_epoch_zero(
+        state: &BeaconState,
+        signed_message: Option<crate::beacon::primitives::Root>,
+    ) -> electra::Attestation {
+        use crate::beacon::helpers::accessors::{get_beacon_committee, get_domain};
+        use crate::beacon::helpers::misc::compute_signing_root;
+        use crate::beacon::helpers::test_state::sign_for;
+
+        let slot = preset::slots_per_epoch() - 1;
+        let committee = get_beacon_committee(state, slot, 0).unwrap();
+        let data = AttestationData {
+            slot,
+            ..Default::default()
+        };
+        let domain = get_domain(state, constants::DOMAIN_BEACON_ATTESTER, Some(0));
+        let root =
+            signed_message.unwrap_or_else(|| compute_signing_root(data.hash_tree_root(), domain));
+
+        let mut aggregation_bits = electra::AggregationBits::with_length(committee.len()).unwrap();
+        let mut signatures = Vec::new();
+        for (position, member) in committee.iter().enumerate().skip(2) {
+            aggregation_bits.set(position, true).unwrap();
+            signatures.push(sign_for(*member as usize, root));
+        }
+        let mut committee_bits = electra::CommitteeBits::default();
+        committee_bits.set(0, true).unwrap();
+        electra::Attestation {
+            aggregation_bits,
+            data,
+            signature: bls::aggregate(&signatures).unwrap(),
+            committee_bits,
+        }
+    }
+
+    fn run_attestation(
+        mut state: BeaconState,
+        attestation: &electra::Attestation,
+        committees: &CommitteeCache,
+    ) -> Result<BeaconState> {
+        let mut signatures = SignatureBatch::new();
+        // Looked up here as a block's `process_operations` does once for all
+        // its attestations.
+        let proposer_index = crate::beacon::helpers::accessors::get_beacon_proposer_index(&state)?;
+        process_attestation(
+            &mut state,
+            attestation,
+            proposer_index,
+            committees,
+            &ActiveBalanceCache::default(),
+            None,
+            &mut signatures,
+        )?;
+        signatures.verify()?;
+        state.apply_pending_mutations();
+        Ok(state)
+    }
+
+    /// A good attestation reaches the same post-state whether the key sums are
+    /// cold or warm, and a bad signature is refused under the attestation's
+    /// own label either way, so the warm path rejects what the cold one does.
+    #[test]
+    fn warm_key_sums_change_no_verdict_and_no_post_state() {
+        let state =
+            crate::beacon::helpers::test_state::with_signing_validators_at(ForkName::Electra, 1024);
+        let epoch = get_previous_epoch(&state);
+        let warm = CommitteeCache::default();
+        warm.warm_key_sums(&state, epoch);
+        assert!(warm.key_sums(&state, epoch).is_some(), "sums are warm");
+        let cold = CommitteeCache::default();
+
+        let good = attestation_for_the_last_slot_of_epoch_zero(&state, None);
+        let cold_state = run_attestation(state.clone(), &good, &cold).unwrap();
+        let warm_state = run_attestation(state.clone(), &good, &warm).unwrap();
+        assert_eq!(cold_state.hash_tree_root(), warm_state.hash_tree_root());
+        assert_ne!(cold_state.hash_tree_root(), state.hash_tree_root());
+
+        let wrong_root = crate::beacon::primitives::Root::repeat_byte(0x5a);
+        let bad = attestation_for_the_last_slot_of_epoch_zero(&state, Some(wrong_root));
+        for committees in [&cold, &warm] {
+            let err = run_attestation(state.clone(), &bad, committees).unwrap_err();
+            assert!(
+                format!("{err:?}").contains(ATTESTATION_LABEL),
+                "unexpected rejection {err:?}"
+            );
+        }
     }
 }

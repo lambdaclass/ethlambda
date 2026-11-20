@@ -336,10 +336,30 @@ pub fn process_attestation(
 ///
 /// Takes no [`crate::beacon::config::Config`]: [`constants::DOMAIN_SYNC_COMMITTEE`]
 /// and the weight constants are fixed, and [`preset::SYNC_COMMITTEE_SIZE`],
-/// [`preset::EFFECTIVE_BALANCE_INCREMENT`], and [`preset::SLOTS_PER_EPOCH`]
+/// [`preset::EFFECTIVE_BALANCE_INCREMENT`], and [`preset::slots_per_epoch()`]
 /// are preset values; the specification lists none of them under a network's
 /// "Configuration" table.
 pub fn process_sync_aggregate(
+    state: &mut BeaconState,
+    sync_aggregate: &altair::SyncAggregate,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
+    // Timed here, not at the six forks' call sites, since every fork from
+    // altair on reaches this one function.
+    crate::metrics::timed(crate::metrics::StfPhase::SyncAggregate, || {
+        apply_sync_aggregate(
+            state,
+            sync_aggregate,
+            active_balances,
+            pubkey_indices,
+            signatures,
+        )
+    })
+}
+
+fn apply_sync_aggregate(
     state: &mut BeaconState,
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,

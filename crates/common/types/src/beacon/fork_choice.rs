@@ -209,6 +209,46 @@ pub struct PayloadStatusV1 {
     pub validation_error: Option<String>,
 }
 
+/// The variables the Fast Confirmation Rule carries between slots: every field
+/// of consensus-specs' `FastConfirmationStore` except its read-only `store`.
+///
+/// Held in the `ethlambda_storage::Store` (beside the rest of the beacon
+/// fork-choice scratch), hence here rather than in `ethlambda-state-transition`,
+/// which owns the algorithm and builds a `FastConfirmationStore` around one of
+/// these for each run. `ethlambda-storage` cannot depend on that crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastConfirmationVariables {
+    /// Root of the most recent confirmed block.
+    pub confirmed_root: Root,
+    /// A justified checkpoint observed by all honest nodes at the beginning of
+    /// the previous epoch, assuming synchrony.
+    pub previous_epoch_observed_justified_checkpoint: Checkpoint,
+    /// The same, at the beginning of the current epoch.
+    pub current_epoch_observed_justified_checkpoint: Checkpoint,
+    /// The greatest unrealized justified checkpoint at the start of the last
+    /// slot of the previous epoch, in the local view.
+    pub previous_epoch_greatest_unrealized_checkpoint: Checkpoint,
+    /// The head at the start of the previous slot.
+    pub previous_slot_head: Root,
+    /// The head at the start of the current slot.
+    pub current_slot_head: Root,
+}
+
+impl FastConfirmationVariables {
+    /// `get_fast_confirmation_store`'s values: conservatively the finalized
+    /// checkpoint for every variable.
+    pub fn at_finalized(finalized: Checkpoint) -> Self {
+        Self {
+            confirmed_root: finalized.root,
+            previous_epoch_observed_justified_checkpoint: finalized,
+            current_epoch_observed_justified_checkpoint: finalized,
+            previous_epoch_greatest_unrealized_checkpoint: finalized,
+            previous_slot_head: finalized.root,
+            current_slot_head: finalized.root,
+        }
+    }
+}
+
 /// The justified checkpoint state's balances, flattened for the fork-choice
 /// vote loop: `store.checkpoint_states[checkpoint]` as `get_weight` and
 /// `get_proposer_score` read it.
@@ -221,6 +261,12 @@ pub struct PayloadStatusV1 {
 ///
 /// Held in the store, hence here rather than in `ethlambda-state-transition`;
 /// the builder lives there, next to the state accessors.
+///
+/// Despite the name, any epoch-boundary checkpoint's balances take this shape:
+/// the Fast Confirmation Rule reads its balance sources (the observed justified
+/// checkpoints and the current target) through the same per-checkpoint cache,
+/// which is why it also carries the active-set figures that rule's committee
+/// weights need ([`Self::active_balance`], [`Self::total_active_balance`]).
 #[derive(Debug, PartialEq, Eq)]
 pub struct JustifiedBalances {
     checkpoint: Checkpoint,
@@ -243,22 +289,62 @@ pub struct JustifiedBalances {
     /// effective balance of every equivocating validator in the head slot's
     /// committees, and an equivocator is often slashed.
     effective_increments: Box<[u16]>,
+    /// The validators active at `checkpoint.epoch` that are slashed, in
+    /// ascending order: the ones `balances` zeroes although the active set
+    /// still counts them. Few, since slashings are rare and a slashed validator
+    /// is on its way out.
+    active_slashed: Box<[ValidatorIndex]>,
+    /// The effective balance of every validator active at `checkpoint.epoch`,
+    /// slashed or not: `get_total_active_balance` before its floor.
+    total_active_balance: Gwei,
 }
 
 impl JustifiedBalances {
     /// Wraps already-computed values; see the field docs for what they mean.
+    /// `active_slashed` must be in ascending order.
     pub fn new(
         checkpoint: Checkpoint,
         balances: Box<[Gwei]>,
         total_balance: Gwei,
         effective_increments: Box<[u16]>,
+        active_slashed: Box<[ValidatorIndex]>,
+        total_active_balance: Gwei,
     ) -> Self {
+        debug_assert!(
+            active_slashed.is_sorted(),
+            "active_slashed is in ascending order"
+        );
         Self {
             checkpoint,
             balances,
             total_balance,
             effective_increments,
+            active_slashed,
+            total_active_balance,
         }
+    }
+
+    /// `index`'s effective balance if it is active at the checkpoint's epoch,
+    /// slashed or not; zero otherwise, and past the end. A slashed validator
+    /// still sits in its committees, so this is the weight a committee member
+    /// carries in the Fast Confirmation Rule's committee sums.
+    ///
+    /// The vote weight answers it except for an active slashed validator, the
+    /// one case that pays a search, and only through the short
+    /// `active_slashed` list.
+    pub fn active_balance(&self, index: ValidatorIndex) -> Gwei {
+        let balance = self.get(index);
+        if balance != 0 || self.active_slashed.binary_search(&index).is_err() {
+            return balance;
+        }
+        self.effective_balance(index)
+    }
+
+    /// The effective balance of the checkpoint state's active validators,
+    /// slashed or not, unfloored: the specification's
+    /// `get_total_active_balance` before its one-increment floor.
+    pub fn total_active_balance(&self) -> Gwei {
+        self.total_active_balance
     }
 
     /// `index`'s raw effective balance at the checkpoint, active and unslashed
@@ -308,6 +394,8 @@ mod tests {
             vec![7, 0, 9].into(),
             16,
             vec![1, 2, 3].into(),
+            Box::default(),
+            16,
         );
         assert_eq!(balances.get(0), 7);
         assert_eq!(balances.get(1), 0);
@@ -319,6 +407,32 @@ mod tests {
         assert_eq!(balances.effective_balance(1), 2 * increment);
         assert_eq!(balances.effective_balance(3), 0);
         assert_eq!(balances.effective_balance(u64::MAX), 0);
+    }
+
+    /// An active slashed validator weighs nothing as a voter but its full
+    /// effective balance as a member of the active set; an inactive one weighs
+    /// nothing either way.
+    #[test]
+    fn the_active_balance_counts_an_active_slashed_validator() {
+        let increment = crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT;
+        // 0 active, 1 active and slashed, 2 inactive, 3 active.
+        let balances = JustifiedBalances::new(
+            Checkpoint::default(),
+            vec![32 * increment, 0, 0, 16 * increment].into(),
+            48 * increment,
+            vec![32, 32, 32, 16].into(),
+            vec![1].into(),
+            80 * increment,
+        );
+        assert_eq!(balances.get(1), 0);
+        assert_eq!(balances.active_balance(0), 32 * increment);
+        assert_eq!(balances.active_balance(1), 32 * increment);
+        assert_eq!(balances.active_balance(2), 0);
+        assert_eq!(balances.active_balance(3), 16 * increment);
+        assert_eq!(balances.active_balance(4), 0);
+        assert_eq!(balances.active_balance(u64::MAX), 0);
+        assert_eq!(balances.total_active_balance(), 80 * increment);
+        assert_eq!(balances.total_balance(), 48 * increment);
     }
 
     #[test]

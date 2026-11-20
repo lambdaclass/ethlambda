@@ -142,9 +142,10 @@ impl NetworkDir {
 /// Read the first bootnode file present, preferring the YAML spelling.
 ///
 /// Both spellings appear: `eth-clients` publishes `bootstrap_nodes.yaml` and
-/// kurtosis ships that plus `bootstrap_nodes.txt`. The existing `--bootnodes`
-/// parser (`read_bootnode_strings`, in `main.rs`) already accepts either
-/// shape, so this only picks a file and reuses it rather than re-parsing.
+/// kurtosis ships that plus `bootstrap_nodes.txt`. The reader for `node`'s
+/// `--bootnodes` file (`read_bootnode_strings`, in `main.rs`) already accepts
+/// either shape, so this only picks a file and reuses it rather than
+/// re-parsing.
 fn read_bootnodes(base: &Path) -> Result<Vec<String>, NetworkDirError> {
     for name in [BOOTNODES_YAML, BOOTNODES_TXT] {
         let path = base.join(name);

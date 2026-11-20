@@ -1112,6 +1112,12 @@ fn transition_block(
     caches: stf::BlockCaches<'_>,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconState> {
+    // Every STF phase observed below is the import's, and none of it belongs
+    // to the epoch precompute worker, which runs `process_epoch` on its own
+    // thread at the same time and so never sees this guard. See
+    // `metrics::StfContext` for why the series is split by caller.
+    let _import_context = metrics::import_context();
+
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -1588,21 +1594,51 @@ fn cache_first_slot_balances(store: &Store, post_state: &BeaconState, block_root
     cache_boundary_balances(store, checkpoint, post_state);
 }
 
+/// The flat balances of `checkpoint`'s state, from the same per-checkpoint
+/// cache [`justified_balances`] reads, built from [`checkpoint_state`] and
+/// cached on a miss.
+///
+/// For the Fast Confirmation Rule, whose balance sources are checkpoint
+/// states too (the observed justified checkpoints and the current target):
+/// reading them here means a registry pass once per checkpoint, usually
+/// already paid at the boundary import, rather than once per run. Not counted
+/// in the justified-balances lookup metric, which is about the head's reads.
+pub fn checkpoint_balances(
+    store: &Store,
+    checkpoint: &Checkpoint,
+    config: &Config,
+) -> Result<Arc<JustifiedBalances>> {
+    if let Some(balances) = store.justified_balances(checkpoint) {
+        return Ok(balances);
+    }
+    let state = checkpoint_state(store, checkpoint, config)?;
+    let balances = Arc::new(build_justified_balances(*checkpoint, &state));
+    store.insert_justified_balances(Arc::clone(&balances));
+    Ok(balances)
+}
+
 /// One in-order pass over `state`'s registry: each validator's vote weight
 /// (zero if inactive or slashed), its raw effective balance in increments, and,
 /// in the same pass, the sum of the vote weights, which is the total
 /// [`calculate_committee_fraction`] divides (saturating, floored at one
-/// increment).
-fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> JustifiedBalances {
+/// increment), plus the active set's own figures: the active validators the
+/// vote weight zeroes for being slashed, and the total active balance.
+pub(crate) fn build_justified_balances(
+    checkpoint: Checkpoint,
+    state: &BeaconState,
+) -> JustifiedBalances {
     let _timing = metrics::time_justified_balances_build();
     // Activity at the state's own epoch, as `get_weight` reads it; not asserted
     // equal to `checkpoint.epoch`, which the unit-test stores do not keep.
     let epoch = get_current_epoch(state);
     let mut total: Gwei = 0;
+    let mut total_active: Gwei = 0;
+    let mut active_slashed: Vec<ValidatorIndex> = Vec::new();
     let mut increments: Vec<u16> = Vec::new();
     let balances = state
         .iter_validators()
-        .map(|validator| {
+        .enumerate()
+        .map(|(index, validator)| {
             // An effective balance is a whole number of increments no larger
             // than `MAX_EFFECTIVE_BALANCE_ELECTRA`; the snapshot's exactness
             // depends on it.
@@ -1615,6 +1651,12 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
                 u16::try_from(validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT)
                     .expect("effective balance fits u16 increments"),
             );
+            if is_active_validator(validator, epoch) {
+                total_active = total_active.saturating_add(validator.effective_balance);
+                if validator.slashed {
+                    active_slashed.push(index as ValidatorIndex);
+                }
+            }
             let balance = vote_balance(validator, epoch);
             total = total.saturating_add(balance);
             balance
@@ -1625,6 +1667,8 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
         balances,
         total.max(preset::EFFECTIVE_BALANCE_INCREMENT),
         increments.into(),
+        active_slashed.into(),
+        total_active,
     )
 }
 
@@ -2341,7 +2385,11 @@ fn boost_reaches_the_descent(
 /// blocks, which weighs everything. Why each term is there, and why the least
 /// is the finalized block's slot on a live node, is argued once, in
 /// [`compute_node_weights`]'s `# The bound` section.
-fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
+///
+/// The Fast Confirmation Rule reads the cached weights over the same window,
+/// which holds every block it scores (all at or above the finalized one), and
+/// which the head's own read has just shown readable.
+pub(crate) fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
     let slot_of = |root: Root| index.get(&root).map_or(0, |&(slot, _)| slot);
     let mut bound = slot_of(store.beacon_finalized_checkpoint().root)
         .min(slot_of(store.beacon_justified_checkpoint().root));
@@ -2809,11 +2857,22 @@ fn walk_head(
 /// the committees of a weak parent's slot, and this runs every slot, so a
 /// cache of its own would recompute every committee on every call.
 pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
+    get_head_node_with_index(store, config, &store.block_index())
+}
+
+/// [`get_head_node`] over an `index` the caller built
+/// ([`Store::block_index`]), so a caller that needs the index again afterwards
+/// (the Fast Confirmation Rule, run right after the head) scans `LiveChain`
+/// once.
+pub fn get_head_node_with_index(
+    store: &Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<ForkChoiceNode> {
     let current_slot = get_current_slot(store, config);
     let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
-    let index = store.block_index();
     let committees = store.committee_cache();
-    walk_head(store, &index, config, &committees, rules)
+    walk_head(store, index, config, &committees, rules)
 }
 
 /// [`get_head_node`], recorded as the store's own head.
@@ -2835,7 +2894,18 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// that is empty whenever the head did not move, set against a whole weighted
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
-    let head = get_head_node(store, config)?;
+    let index = store.block_index();
+    get_head_with_index(store, config, &index)
+}
+
+/// [`get_head`] over an `index` the caller built; see
+/// [`get_head_node_with_index`].
+pub fn get_head_with_index(
+    store: &mut Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<Root> {
+    let head = get_head_node_with_index(store, config, index)?;
     // Recorded with its root, so a reader can tell which head the status is
     // for whichever of the two writes it sees first.
     store.set_head_payload_status(head.root, head.payload_status);
@@ -3657,19 +3727,29 @@ pub fn get_supported_node(store: &Store, message: LatestMessage) -> Result<ForkC
         .get_signed_block(&message.root)
         .expect("get")
         .ok_or(Error::SpecAssert("message.root in store.blocks"))?;
-    let payload_status = if block.slot() < message.slot {
-        if is_pre_gloas(&block) || message.payload_present {
+    Ok(ForkChoiceNode {
+        root: message.root,
+        payload_status: supported_payload_status(block.slot(), is_pre_gloas(&block), &message),
+    })
+}
+
+/// [`get_supported_node`]'s payload status, given the voted-for block's slot
+/// and whether it is pre-gloas, for a caller that already has both and should
+/// not decode the block to get them.
+pub fn supported_payload_status(
+    block_slot: Slot,
+    block_is_pre_gloas: bool,
+    message: &LatestMessage,
+) -> PayloadStatus {
+    if block_slot < message.slot {
+        if block_is_pre_gloas || message.payload_present {
             PayloadStatus::Full
         } else {
             PayloadStatus::Empty
         }
     } else {
         PayloadStatus::Pending
-    };
-    Ok(ForkChoiceNode {
-        root: message.root,
-        payload_status,
-    })
+    }
 }
 
 /// `is_previous_slot_payload_decision` (gloas `fork-choice.md`): whether
@@ -11136,6 +11216,8 @@ mod tests {
             vec![32 * increment; VALIDATORS as usize].into(),
             VALIDATORS * 32 * increment,
             vec![32; VALIDATORS as usize].into(),
+            Box::default(),
+            VALIDATORS * 32 * increment,
         )));
         let config = Config::active();
         store

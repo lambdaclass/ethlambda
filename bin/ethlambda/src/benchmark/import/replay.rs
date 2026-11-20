@@ -16,6 +16,7 @@
 //! only thing allowed to hold post-states, and a stray clone here would pin
 //! an entry the LRU believes it evicted, raising the real ceiling silently.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +25,8 @@ use ethlambda_blockchain::metrics::{BLOCK_ARRIVAL_PHASES, BLOCK_IMPORT_PHASES};
 use ethlambda_blockchain::{BlockChainServer, ImportOutcome};
 use ethlambda_p2p::beacon::decode;
 use ethlambda_state_transition::beacon::fork_choice;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
+use ethlambda_state_transition::metrics::{BEACON_STF_PHASES, STF_CONTEXT_IMPORT};
 use ethlambda_storage::Store;
 use ethlambda_storage::backend::RocksDBBackend;
 use ethlambda_types::ShortRoot;
@@ -34,14 +37,100 @@ use ethlambda_types::primitives::H256;
 
 use super::ReplayOptions;
 use super::corpus::{ANCHOR_BLOCK_FILE, ANCHOR_STATE_FILE, Manifest, block_path, hex_root};
-use crate::benchmark::PhaseTimer;
+use super::process;
 use crate::benchmark::report::common::{Environment, format_ms};
-use crate::benchmark::report::import::{Params, Report, Sample};
+use crate::benchmark::report::import::{BlockClass, Caches, LookupCounts, Params, Report, Sample};
+use crate::benchmark::{PhaseTimer, read_counter};
 
 /// The histogram `ImportTimings` writes to, read back by [`PhaseTimer`] the
 /// same way the synthetic workload reads
 /// `lean_block_proposal_attestation_build_phase_seconds`.
 const IMPORT_PHASE_HISTOGRAM: &str = "lean_block_import_phase_seconds";
+
+/// The beacon state transition's own step histogram, read back over its
+/// `import` context only.
+///
+/// Reading every series would charge the epoch precompute worker's
+/// `process_epoch` to whichever block was importing when it finished. A replay
+/// runs no such worker, but the filter is what makes that a property of the
+/// reading rather than of how this binary happens to be wired.
+const STF_PHASE_HISTOGRAM: &str = "lean_beacon_stf_phase_seconds";
+
+/// The counters of the caches the state transition leans on, each labeled by
+/// `result`. Read around the measured blocks, so the report's hit rates cover
+/// the run and not the warm-up.
+const EPOCH_PRECOMPUTE_COUNTER: &str = "lean_beacon_epoch_precompute_lookups_total";
+const COMMITTEE_CACHE_COUNTER: &str = "lean_beacon_committee_cache_lookups_total";
+const TOTAL_ACTIVE_BALANCE_COUNTER: &str = "lean_beacon_total_active_balance_lookups_total";
+const JUSTIFIED_BALANCES_COUNTER: &str = "lean_beacon_justified_balances_lookups_total";
+
+/// The four cache counters' per-`result` values at one instant.
+struct CacheReading {
+    epoch_precompute: BTreeMap<String, u64>,
+    committee_cache: BTreeMap<String, u64>,
+    total_active_balance: BTreeMap<String, u64>,
+    justified_balances: BTreeMap<String, u64>,
+}
+
+impl CacheReading {
+    fn now() -> Self {
+        Self {
+            epoch_precompute: read_counter(EPOCH_PRECOMPUTE_COUNTER),
+            committee_cache: read_counter(COMMITTEE_CACHE_COUNTER),
+            total_active_balance: read_counter(TOTAL_ACTIVE_BALANCE_COUNTER),
+            justified_balances: read_counter(JUSTIFIED_BALANCES_COUNTER),
+        }
+    }
+
+    /// What each cache served between `self` and now.
+    fn deltas_since_start(self) -> Caches {
+        let now = Self::now();
+        Caches {
+            epoch_precompute: LookupCounts::from_results(
+                &delta(&self.epoch_precompute, &now.epoch_precompute),
+                false,
+            ),
+            committee_cache: LookupCounts::from_results(
+                &delta(&self.committee_cache, &now.committee_cache),
+                true,
+            ),
+            total_active_balance: LookupCounts::from_results(
+                &delta(&self.total_active_balance, &now.total_active_balance),
+                true,
+            ),
+            justified_balances: LookupCounts::from_results(
+                &delta(&self.justified_balances, &now.justified_balances),
+                false,
+            ),
+        }
+    }
+}
+
+/// `after - before` per result. Counters only go up, so a result missing from
+/// `before` started at zero.
+fn delta(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    after
+        .iter()
+        .map(|(result, value)| {
+            let start = before.get(result).copied().unwrap_or(0);
+            (result.clone(), value.saturating_sub(start))
+        })
+        .collect()
+}
+
+/// The seconds the `stf` import phase spent outside every STF step, or `None`
+/// when `stf` did not run.
+///
+/// The steps are nested inside `stf`, so their sum cannot exceed it; the clamp
+/// only absorbs the few microseconds two separate clock readings can disagree
+/// by, rather than reporting a negative duration.
+fn stf_unattributed(
+    phases: &BTreeMap<String, f64>,
+    stf_phases: &BTreeMap<String, f64>,
+) -> Option<f64> {
+    let stf = *phases.get("stf")?;
+    Some((stf - stf_phases.values().sum::<f64>()).max(0.0))
+}
 
 /// The phases a sample records: every per-block section, plus the
 /// per-arrival sections that do not enclose the others.
@@ -123,40 +212,86 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
         BlockChainServer::for_replay(store, None, options.safe_slots_to_import_optimistically);
 
     let mut samples = Vec::with_capacity(manifest.slots.len());
+    // The epoch of the block imported before the one in hand, for
+    // `--warm-committee-sums`.
+    let mut previous_epoch: Option<u64> = None;
+
+    // The slot of the block each import is applied to. A corpus is linear
+    // (`fetch` refuses a block whose parent is not the previous one), so that
+    // is always the block imported just before, and the first is the anchor.
+    let mut parent_slot = manifest.anchor_slot;
 
     let warmup_total = manifest.warmup_slots.len();
     for (position, &slot) in manifest.warmup_slots.iter().enumerate() {
         let (block, block_root) = load_block(dir, &config, &mut clock, slot)?;
+        if options.warm_committee_sums {
+            warm_committee_sums(&clock, &block, previous_epoch)?;
+        }
+        previous_epoch = Some(slot / preset::slots_per_epoch());
         let wall_seconds = import(&mut server, block, slot, block_root).await?;
         eprintln!(
             "warm-up {}/{warmup_total}: slot {slot} imported in {}",
             position + 1,
             format_ms(wall_seconds)
         );
+        parent_slot = slot;
         pause_between_blocks(options.block_delay).await;
     }
+
+    // Read once the warm-up is done, so a cache's warm-up misses (every cache
+    // starts cold) are not charged to the measured blocks' hit rates.
+    let caches_before = CacheReading::now();
 
     let total = manifest.slots.len();
     for (iteration, &slot) in manifest.slots.iter().enumerate() {
         let (block, block_root) = load_block(dir, &config, &mut clock, slot)?;
+        let class = BlockClass::classify(parent_slot, slot, preset::slots_per_epoch());
+        // Before the timer starts, so the warm-up is in no phase and no
+        // `wall_seconds`.
+        if options.warm_committee_sums {
+            warm_committee_sums(&clock, &block, previous_epoch)?;
+        }
+        previous_epoch = Some(slot / preset::slots_per_epoch());
 
         let timer = PhaseTimer::start(IMPORT_PHASE_HISTOGRAM);
+        let stf_timer =
+            PhaseTimer::start_filtered(STF_PHASE_HISTOGRAM, ("context", STF_CONTEXT_IMPORT));
+        let cpu_before = process::cpu_seconds();
         let wall_seconds = import(&mut server, block, slot, block_root).await?;
+        // The CPU reading and the RSS go first, before the histogram reads,
+        // which gather the whole registry and would otherwise be in the CPU
+        // delta of the block they measure.
+        let cpu_seconds = cpu_before
+            .zip(process::cpu_seconds())
+            .map(|(before, after)| (after - before).max(0.0));
+        let rss_bytes = process::rss_bytes();
+        let peak_rss_bytes = process::peak_rss_bytes();
         let phases = timer.finish_at_most_once(sampled_phases())?;
+        let stf_phases = stf_timer.finish_summed(BEACON_STF_PHASES.iter().copied());
+        let stf_unattributed_seconds = stf_unattributed(&phases, &stf_phases);
 
         eprintln!(
-            "block {}/{total}: slot {slot} imported in {}",
+            "block {}/{total}: slot {slot} ({}) imported in {}",
             iteration + 1,
+            class.label(),
             format_ms(wall_seconds)
         );
         samples.push(Sample {
             iteration: iteration as u64,
             slot,
+            parent_slot,
+            class,
             block_root: hex_root(block_root),
             wall_seconds,
             phases,
+            stf_phases,
+            stf_unattributed_seconds,
+            cpu_seconds,
+            rss_bytes,
+            peak_rss_bytes,
             outcome: "imported",
         });
+        parent_slot = slot;
         // After `finish_at_most_once` and the sample are recorded, so the
         // sleep is in no phase delta and no `wall_seconds`.
         pause_between_blocks(options.block_delay).await;
@@ -164,8 +299,14 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
 
     Ok(Report::new(
         Environment::collect(),
-        params_from(&manifest, dir, options.block_delay),
+        params_from(
+            &manifest,
+            dir,
+            options.block_delay,
+            options.warm_committee_sums,
+        ),
         samples,
+        caches_before.deltas_since_start(),
     ))
 }
 
@@ -196,6 +337,53 @@ fn load_block(
     clock.set_time_ms(slot_start_ms)?;
 
     Ok((block, block_root))
+}
+
+/// Warms the committee key sums a live node's epoch precompute worker would
+/// have warmed before `block` arrives: its epoch's, when that epoch is later
+/// than `previous_epoch`'s, and, before the first block of the replay
+/// (`previous_epoch` is `None`), the epoch before as well.
+///
+/// The worker advances the head's post-state to the epoch start and warms
+/// from that state; this does the same from the block's parent post-state, so
+/// the shuffling key it files the sums under is the one the import looks up.
+/// Nothing else the worker does is reproduced: in a replay the import
+/// already produces the epoch's state itself, inside the measured span.
+fn warm_committee_sums(
+    store: &Store,
+    block: &SignedBeaconBlock,
+    previous_epoch: Option<u64>,
+) -> eyre::Result<()> {
+    let epoch = block.slot() / preset::slots_per_epoch();
+    let epochs: Vec<u64> = match previous_epoch {
+        Some(previous) if epoch <= previous => return Ok(()),
+        // The epoch right after the last one: its predecessor was warmed when
+        // it began.
+        Some(previous) if epoch == previous + 1 => vec![epoch],
+        // The first block, or the first after a gap in the corpus: the
+        // previous epoch was never warmed here, so warm it too, as the live
+        // worker warms both on every boundary.
+        _ => epoch.checked_sub(1).into_iter().chain([epoch]).collect(),
+    };
+    let parent_root = block.parent_root();
+    let parent_state = store.get_state(&parent_root)?.ok_or_else(|| {
+        eyre::eyre!(
+            "no post-state for parent {} of the block at slot {}",
+            ShortRoot(&parent_root.0),
+            block.slot()
+        )
+    })?;
+    let config = store.config();
+    let committee_cache = store.committee_cache();
+    for epoch in epochs {
+        if parent_state.slot() < epoch * preset::slots_per_epoch() {
+            let advanced = fork_choice::advance_to_epoch_start(&parent_state, epoch, &config)?;
+            committee_cache.warm_key_sums(&advanced, epoch);
+        } else {
+            committee_cache.warm_key_sums(&parent_state, epoch);
+        }
+    }
+    Ok(())
 }
 
 /// Import one block, returning the wall time of the `import_block` call
@@ -240,7 +428,12 @@ fn read_anchor(dir: &Path, config: &Config) -> eyre::Result<(BeaconState, Signed
 
 /// The report parameters a manifest already carries, so the loop above never
 /// has to reconstruct them from samples.
-fn params_from(manifest: &Manifest, dir: &Path, block_delay_ms: u64) -> Params {
+fn params_from(
+    manifest: &Manifest,
+    dir: &Path,
+    block_delay_ms: u64,
+    warm_committee_sums: bool,
+) -> Params {
     Params {
         mode: "import",
         corpus: dir.display().to_string(),
@@ -252,6 +445,7 @@ fn params_from(manifest: &Manifest, dir: &Path, block_delay_ms: u64) -> Params {
         range_end: manifest.range_end,
         blocks: manifest.slots.len(),
         block_delay_ms,
+        warm_committee_sums,
     }
 }
 
@@ -287,4 +481,56 @@ fn prepare_data_dir(data_dir: &Path, force: bool) -> eyre::Result<()> {
     }
     std::fs::create_dir_all(data_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        entries
+            .iter()
+            .map(|(result, value)| ((*result).to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn a_counter_delta_excludes_what_was_counted_before_and_starts_new_results_at_zero() {
+        let before = map(&[("hit", 10), ("miss", 4)]);
+        let after = map(&[("hit", 15), ("miss", 4), ("unkeyable", 2)]);
+
+        let delta = delta(&before, &after);
+
+        assert_eq!(delta, map(&[("hit", 5), ("miss", 0), ("unkeyable", 2)]));
+    }
+
+    #[test]
+    fn the_unattributed_stf_time_is_what_the_steps_leave_of_the_stf_phase() {
+        let phases: BTreeMap<String, f64> = [("stf".to_string(), 1.0)].into_iter().collect();
+        let steps: BTreeMap<String, f64> = [
+            ("process_epoch".to_string(), 0.6),
+            ("state_root".to_string(), 0.3),
+        ]
+        .into_iter()
+        .collect();
+
+        let unattributed = stf_unattributed(&phases, &steps).expect("stf ran");
+        assert!((unattributed - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_block_whose_stf_did_not_run_has_no_unattributed_time() {
+        // Absent, not zero: nothing ran, so nothing was left over.
+        assert_eq!(stf_unattributed(&BTreeMap::new(), &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn steps_that_overshoot_the_stf_phase_by_clock_skew_clamp_to_zero() {
+        let phases: BTreeMap<String, f64> = [("stf".to_string(), 1.0)].into_iter().collect();
+        let steps: BTreeMap<String, f64> = [("state_root".to_string(), 1.000_001)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(stf_unattributed(&phases, &steps), Some(0.0));
+    }
 }
