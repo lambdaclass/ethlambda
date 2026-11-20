@@ -715,15 +715,34 @@ fn check_head_against_reference(store: &Store, config: &Config) -> Result<(), St
             }
         }
     };
-    if walked == reference {
-        Ok(())
-    } else {
-        Err(format!(
+    if walked != reference {
+        return Err(format!(
             "the bottom-up walk chose 0x{} ({:?}) but the reference chose 0x{} ({:?})",
             hex::encode(walked.root.0),
             walked.payload_status,
             hex::encode(reference.root.0),
             reference.payload_status,
+        ));
+    }
+    check_cached_weights(store, config, ForkRules::of(fork))
+}
+
+/// Checks that the weights the walk reads from the store's cache equal the
+/// tally they replaced ([`fork_choice::compute_node_weights`]), node for node:
+/// at every `head` check of every fixture, the cache has followed each vote,
+/// block and equivocation the fixture fed the store.
+fn check_cached_weights(store: &Store, config: &Config, rules: ForkRules) -> Result<(), String> {
+    let index = store.block_index();
+    let committees = store.committee_cache();
+    let cached = fork_choice::cached_node_weights(store, &index, config, &committees, rules)
+        .map_err(|err| format!("cached_node_weights: {err:?}"))?;
+    let tallied = fork_choice::compute_node_weights(store, &index, config, &committees, rules)
+        .map_err(|err| format!("compute_node_weights: {err:?}"))?;
+    if cached == tallied {
+        Ok(())
+    } else {
+        Err(format!(
+            "the cached weights {cached:?} differ from the tally {tallied:?}"
         ))
     }
 }

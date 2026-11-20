@@ -170,7 +170,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend};
+use ethlambda_storage::{CacheKey, ForkCheckpoints, ProtoArrayError, StorageBackend, WeightRules};
 use ethlambda_types::ShortRoot;
 use tracing::{debug, error, warn};
 
@@ -182,8 +182,7 @@ use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
-    get_current_epoch,
+    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
@@ -807,8 +806,10 @@ pub fn resolve_invalid_block(
 /// branch the execution layer has since rejected keeps pointing at a root no
 /// longer in the index, until it attests again.
 ///
-/// [`compute_node_weights`] already drops such a vote rather than raising, so
-/// [`get_head`] is unaffected. [`get_weight`] deliberately does not: it is the
+/// [`compute_node_weights`] already drops such a vote rather than raising, and
+/// so do the cached weights [`get_head`] reads (the removal makes the store
+/// rebuild them), so [`get_head`] is unaffected. [`get_weight`] deliberately
+/// does not: it is the
 /// specification's own version, and
 /// `tests::a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing` pins
 /// that divergence on purpose. Nothing on this node's paths calls it today
@@ -1078,8 +1079,7 @@ fn transition_block(
     validate_result: bool,
     config: &Config,
     engine: &stf::ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: stf::BlockCaches<'_>,
 ) -> (BeaconState, Result<()>) {
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
@@ -1104,8 +1104,7 @@ fn transition_block(
                 validate_result,
                 config,
                 engine,
-                committees,
-                active_balances,
+                caches,
             );
             return (state, outcome);
         }
@@ -1121,8 +1120,7 @@ fn transition_block(
                     validate_result,
                     config,
                     engine,
-                    committees,
-                    active_balances,
+                    caches,
                 )
             });
         return (state, outcome);
@@ -1146,8 +1144,7 @@ fn transition_block(
             validate_result,
             config,
             engine,
-            committees,
-            active_balances,
+            caches,
         )
     });
     (state, outcome)
@@ -1630,7 +1627,8 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
 /// [`is_parent_strong`] call it too, [`is_head_weak`] underneath the public
 /// [`should_apply_proposer_boost`] and [`is_parent_strong`] underneath
 /// [`get_proposer_head`]. The head walk does not: it reads the same scores
-/// from [`compute_node_weights`], which drops such a vote too.
+/// from [`cached_node_weights`], which drops such a vote too, as its reference
+/// [`compute_node_weights`] does.
 pub fn get_attestation_score(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1896,23 +1894,30 @@ pub fn get_voting_source(
 /// Walks `block_root`'s subtree, adding every block on a viable branch to
 /// `blocks`, and reporting whether `block_root` itself sits on one.
 ///
-/// *Note*: external callers must pass `store.justified_checkpoint.root` for
-/// `block_root`; only the recursive calls below pass anything else.
+/// *Note*: callers must pass `store.justified_checkpoint.root` for
+/// `block_root`, as [`get_filtered_block_tree`], the only one, does. The
+/// specification passes other roots only from its own recursive calls, which
+/// the walk below replaces.
 ///
-/// Recursive, following the specification directly rather than an explicit
-/// stack: the subtree walked here is the unfinalized suffix since the
-/// justified checkpoint, which stays shallow in ordinary operation.
+/// The specification recurses once per child. This visits the same blocks in
+/// the same order, failing at the same block, but keeps its own stack of the
+/// path from `block_root` to the block in hand. That path is as long as the
+/// chain below the justified checkpoint: short while the chain justifies, but
+/// a block longer every slot for as long as it does not, and the chain actor
+/// runs this on a thread with the default-sized stack. Recursing, the walk
+/// overflowed that stack once a stall had left a few thousand blocks below the
+/// justified one, and a stack overflow aborts the whole process.
 ///
-/// Takes `index`, [`Store::block_index`] built once by
-/// [`get_filtered_block_tree`] and threaded through every recursive call,
-/// rather than re-scanning the store's blocks at each node, and `children_of`,
-/// the parent-to-children map [`get_filtered_block_tree`] builds from `index`
-/// in one pass. The specification finds a block's children by scanning every
-/// block in the store; doing that here at every node visited made the walk
-/// quadratic in the live window, which is what a finality stall or a range
-/// catch-up grows. `blocks`' value is `index`'s own `(slot, parent_root)`
-/// shape rather than a whole [`SignedBeaconBlock`], since [`get_head`], the
-/// only reader of this function's output, never needs more than that.
+/// Takes `index`, the [`Store::block_index`] its caller already holds, read
+/// throughout the walk rather than re-scanning the store's blocks at each
+/// node, and `children_of`, the parent-to-children map
+/// [`get_filtered_block_tree`] builds from `index` in one pass. The
+/// specification finds a block's children by scanning every block in the
+/// store; doing that here at every node visited made the walk quadratic in
+/// the live window, which is what a finality stall or a range catch-up
+/// grows. `blocks`' value is `index`'s own `(slot, parent_root)` shape rather
+/// than a whole [`SignedBeaconBlock`], since [`get_head`], the only reader of
+/// this function's output, never needs more than that.
 pub fn filter_block_tree(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1921,31 +1926,76 @@ pub fn filter_block_tree(
     blocks: &mut HashMap<Root, (Slot, Root)>,
     config: &Config,
 ) -> Result<bool> {
-    let entry = *index
-        .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
-
-    let children = children_of
-        .get(&block_root)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-
-    // If any children branches contain expected finalized/justified
-    // checkpoints, add to filtered block-tree and signal viability to parent.
-    if !children.is_empty() {
-        let mut any_viable = false;
-        for &child in children {
-            if filter_block_tree(store, index, children_of, child, blocks, config)? {
-                any_viable = true;
-            }
-        }
-        if any_viable {
-            blocks.insert(block_root, entry);
-            return Ok(true);
-        }
-        return Ok(false);
+    /// A block on the path from `block_root` to the block in hand: which of
+    /// its children is next, and whether any visited so far is viable.
+    struct Frame<'a> {
+        root: Root,
+        entry: (Slot, Root),
+        children: &'a [Root],
+        next_child: usize,
+        any_viable: bool,
     }
 
+    /// Enters `root`, where the specification's recursive call would: its
+    /// `block_root in store.blocks` assertion included, which is what fails
+    /// the walk when the justified block's row is gone.
+    fn enter<'a>(
+        index: &HashMap<Root, (Slot, Root)>,
+        children_of: &'a HashMap<Root, Vec<Root>>,
+        root: Root,
+    ) -> Result<Frame<'a>> {
+        let entry = *index
+            .get(&root)
+            .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
+        let children = children_of.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+        Ok(Frame {
+            root,
+            entry,
+            children,
+            next_child: 0,
+            any_viable: false,
+        })
+    }
+
+    let mut path = vec![enter(index, children_of, block_root)?];
+    loop {
+        let top = path
+            .last_mut()
+            .expect("the walk returns once the path is empty");
+        // A block with children is viable if any child branch contains the
+        // expected finalized/justified checkpoints; a leaf, if its own do.
+        let viable = if top.children.is_empty() {
+            is_viable_leaf(store, index, top.root, config)?
+        } else if let Some(&child) = top.children.get(top.next_child) {
+            top.next_child += 1;
+            path.push(enter(index, children_of, child)?);
+            continue;
+        } else {
+            top.any_viable
+        };
+
+        // Add it to the filtered block-tree if viable, and signal viability
+        // to its parent.
+        let done = path.pop().expect("`top` was on the path");
+        if viable {
+            blocks.insert(done.root, done.entry);
+        }
+        match path.last_mut() {
+            Some(parent) => parent.any_viable |= viable,
+            None => return Ok(viable),
+        }
+    }
+}
+
+/// Whether the leaf `block_root` is viable: its voting source is the store's
+/// justified checkpoint or recent enough, and it descends from the store's
+/// finalized checkpoint. The leaf case of [`filter_block_tree`].
+fn is_viable_leaf(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    block_root: Root,
+    config: &Config,
+) -> Result<bool> {
     let current_epoch = get_current_store_epoch(store, config);
     let voting_source = get_voting_source(store, index, block_root, config)?;
 
@@ -1963,14 +2013,7 @@ pub fn filter_block_tree(
     let correct_finalized = finalized_checkpoint.epoch == constants::GENESIS_EPOCH
         || finalized_checkpoint.root == finalized_checkpoint_block;
 
-    // If expected finalized/justified, add to viable block-tree and signal
-    // viability to parent.
-    if correct_justified && correct_finalized {
-        blocks.insert(block_root, entry);
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(correct_justified && correct_finalized)
 }
 
 /// The filtered block tree: every block, from the justified checkpoint down,
@@ -2144,6 +2187,13 @@ impl PayloadTree<'_> {
 /// blocks; see the section documentation above for why this equals the
 /// specification's per-node `get_weight`.
 ///
+/// Two producers fill the same table. The head walk reads
+/// [`cached_node_weights`], whose vote weights the store keeps current as votes
+/// arrive, so a head computation costs the blocks in the window and not the
+/// voters. [`compute_node_weights`] tallies them from every latest message on
+/// each call; it is kept as the reference the cached path is tested against.
+/// The rest of this paragraph describes the tally's cost.
+///
 /// Work is proportional to the number of latest messages plus the number of
 /// indexed blocks at or above the finalized block (times two lookups each),
 /// which is the unfinalized window, not the history since the anchor (see
@@ -2162,6 +2212,26 @@ pub struct NodeWeights {
     rules: ForkRules,
     current_slot: Slot,
     weights: HashMap<ForkChoiceNode, Gwei>,
+}
+
+/// Equal when every node weighs the same under the same rules and slot: a
+/// node absent from one table and present with `0` in the other is the same
+/// weight, since [`NodeWeights::raw`] reads absence as `0`. What the tests
+/// compare [`cached_node_weights`] with [`compute_node_weights`] by.
+impl PartialEq for NodeWeights {
+    fn eq(&self, other: &Self) -> bool {
+        let nonzero = |weights: &NodeWeights| -> HashMap<ForkChoiceNode, Gwei> {
+            weights
+                .weights
+                .iter()
+                .filter(|&(_, &weight)| weight != 0)
+                .map(|(&node, &weight)| (node, weight))
+                .collect()
+        };
+        self.rules == other.rules
+            && self.current_slot == other.current_slot
+            && nonzero(self) == nonzero(other)
+    }
 }
 
 impl NodeWeights {
@@ -2257,6 +2327,13 @@ fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
 }
 
 /// [`NodeWeights`] for `rules`, on the block tree `index`.
+///
+/// **A reference, not the node's head computation.** [`walk_head`] reads
+/// [`cached_node_weights`], which gives the same table from the store's cached
+/// vote weights instead of this pass over every latest message. This tally is
+/// kept, public, as what that cache is tested against: on random trees, as
+/// votes, blocks and equivocations arrive, and at every `head` check of every
+/// fork-choice fixture.
 ///
 /// `rules` selects the two fork-dependent rules: how a block's payload
 /// dimension is read (see [`PayloadTree`]) and whether the proposer boost is
@@ -2404,11 +2481,45 @@ pub fn compute_node_weights(
         }
     }
 
-    // The boost. Gloas asks `should_apply_proposer_boost`, fed the parent's
-    // score from the table just built; before gloas it applies whenever a boost
-    // root is set and still indexed, the tolerance `compute_weights` documents.
-    // Neither runs for a boosted block outside the justified subtree, which no
-    // node the descent compares would gain from.
+    add_proposer_boost(
+        store,
+        index,
+        config,
+        committees,
+        rules,
+        &balances,
+        bound,
+        &mut weights,
+    )?;
+    Ok(weights)
+}
+
+/// The proposer boost, added to `weights` that hold the vote weights alone:
+/// the last step of [`compute_node_weights`], shared with
+/// [`cached_node_weights`], which reads the vote weights from the store's
+/// cache instead of tallying them. The boost depends on the clock (it moves
+/// every slot) and, under gloas, on the boosted block's parent's score, so it
+/// is never cached.
+///
+/// Gloas asks `should_apply_proposer_boost`, fed the parent's score from
+/// `weights`; before gloas the boost applies whenever a boost root is set and
+/// still indexed, the tolerance `compute_weights` documents. Neither runs for a
+/// boosted block outside the justified subtree, which no node the descent
+/// compares would gain from. The chain stops at `bound`, for the reasons
+/// [`compute_node_weights`]' `# The bound` section gives.
+#[allow(clippy::too_many_arguments)]
+fn add_proposer_boost(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+    committees: &CommitteeCache,
+    rules: ForkRules,
+    balances: &JustifiedBalances,
+    bound: Slot,
+    weights: &mut NodeWeights,
+) -> Result<()> {
+    let tree = PayloadTree { store, rules };
+    let in_window = |root: &Root| index.get(root).is_some_and(|&(slot, _)| slot >= bound);
     let boost_root = store.proposer_boost_root();
     let justified_root = store.beacon_justified_checkpoint().root;
     let boost_applies = boost_reaches_the_descent(index, justified_root, boost_root)
@@ -2419,7 +2530,7 @@ pub fn compute_node_weights(
                 config,
                 committees,
                 index,
-                &balances,
+                balances,
                 |parent| {
                     Ok(weights.raw(ForkChoiceNode {
                         root: parent,
@@ -2450,7 +2561,75 @@ pub fn compute_node_weights(
             root = parent_root;
         }
     }
+    Ok(())
+}
 
+/// [`compute_node_weights`]' answer, with the vote weights read from the
+/// store's cached fork-choice weights ([`Store::proto_array_weights`]) instead
+/// of tallied from every latest message: the head walk's weights.
+///
+/// The cache moves a validator's weight when its vote arrives
+/// ([`update_latest_messages`] is one batch), so a head computation no longer
+/// pays a pass over every voter. What depends on the clock stays here: the
+/// boost ([`add_proposer_boost`], the same code the reference runs) and the
+/// previous-slot rule ([`NodeWeights::weight`]). The tests hold this equal to
+/// [`compute_node_weights`] on random trees, on every fork-choice fixture's
+/// `head` check, and as votes, blocks and equivocations arrive.
+///
+/// Under the gloas rules the cache places votes and weight by each block's
+/// payload link, so the links of the blocks at or above the bound are
+/// recorded first (decoding a block only after a restart lost its link, as
+/// the tally did on first use). A block whose link cannot be derived fails the
+/// computation only where the tally would: when something at or above the
+/// bound needs that link, and then with the derivation's own error.
+pub fn cached_node_weights(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+    committees: &CommitteeCache,
+    rules: ForkRules,
+) -> Result<NodeWeights> {
+    let balances = justified_balances(store, config)?;
+    let bound = walk_bound(store, index);
+    let mut link_errors: HashMap<Root, Error> = HashMap::new();
+    let weight_rules = match rules {
+        ForkRules::PreGloas => WeightRules::PreGloas,
+        ForkRules::Gloas => {
+            for (&root, &(slot, _)) in index {
+                if slot >= bound
+                    && let Err(err) = ensure_payload_link(store, root)
+                {
+                    link_errors.insert(root, err);
+                }
+            }
+            WeightRules::Gloas
+        }
+    };
+    let weights = store
+        .proto_array_weights(index, &balances, bound, weight_rules)
+        .map_err(|err| match err {
+            ProtoArrayError::MissingLink(root) => link_errors
+                .remove(&root)
+                .unwrap_or(Error::SpecAssert("root in store.blocks")),
+            ProtoArrayError::MissingParentStatus(_) => {
+                Error::SpecAssert("block.parent_root in store.blocks")
+            }
+        })?;
+    let mut weights = NodeWeights {
+        rules,
+        current_slot: get_current_slot(store, config),
+        weights,
+    };
+    add_proposer_boost(
+        store,
+        index,
+        config,
+        committees,
+        rules,
+        &balances,
+        bound,
+        &mut weights,
+    )?;
     Ok(weights)
 }
 
@@ -2496,7 +2675,7 @@ fn walk_children(
 
 /// The LMD GHOST head as a [`ForkChoiceNode`], for `rules`: the descent from
 /// the justified checkpoint that both [`compute_head`] and [`gloas_get_head`]
-/// perform, over the one weight table of [`compute_node_weights`].
+/// perform, over the one weight table of [`cached_node_weights`].
 ///
 /// At every step the heaviest child wins, ties going to the higher root and
 /// then to [`get_payload_status_tiebreaker`], the key gloas's `get_head` sorts
@@ -2515,7 +2694,7 @@ fn walk_head(
 ) -> Result<ForkChoiceNode> {
     let tree = PayloadTree { store, rules };
     let blocks = get_filtered_block_tree(store, index, config)?;
-    let weights = compute_node_weights(store, index, config, committees, rules)?;
+    let weights = cached_node_weights(store, index, config, committees, rules)?;
     let current_slot = get_current_slot(store, config);
 
     let mut children_of: HashMap<Root, Vec<Root>> = HashMap::new();
@@ -2562,7 +2741,7 @@ fn walk_head(
 }
 
 /// The LMD GHOST head as a full [`ForkChoiceNode`] rather than just a root,
-/// from the one bottom-up walk ([`compute_node_weights`] and the descent over
+/// from the one bottom-up walk ([`cached_node_weights`] and the descent over
 /// it) that serves every fork.
 ///
 /// The current slot's own fork, via [`Config::fork_at_epoch`], not the head's
@@ -3366,10 +3545,12 @@ pub fn is_parent_node_full(store: &Store, block: &SignedBeaconBlock) -> Result<b
 /// `get_checkpoint_block`, which is this walk from a `Pending` node keeping
 /// only `.root`, has no gloas function here: it answers what the pre-gloas,
 /// index-only [`get_checkpoint_block`] does on any chain both could answer.
-/// [`filter_block_tree`] (the only caller of [`get_checkpoint_block`] in this
-/// file; [`get_voting_source`] never calls it) therefore keeps calling the
-/// pre-gloas version, which is what lets [`get_filtered_block_tree`] serve
-/// [`gloas_get_head`] with no per-block fetch.
+/// Every caller of [`get_checkpoint_block`] in this file
+/// ([`filter_block_tree`]'s leaf check, `validate_on_attestation_indexed` and
+/// [`on_block`]; [`get_voting_source`] never calls it) therefore keeps calling
+/// the pre-gloas version, and the leaf check doing so is what lets
+/// [`get_filtered_block_tree`] serve [`gloas_get_head`] with no per-block
+/// fetch.
 pub fn gloas_get_ancestor(
     store: &Store,
     node: ForkChoiceNode,
@@ -4770,6 +4951,11 @@ fn validate_on_attestation_indexed(
 /// Takes `attesting_indices` and `data` rather than an [`Attestation`]: by
 /// the time [`on_attestation`] calls this, [`Attestation::verified_attesting_indices`]
 /// has already resolved the one fork-specific fact this needed out of it.
+///
+/// One attestation is one vote batch for the store's cached fork-choice
+/// weights: [`Store::record_latest_messages`] records every attester's message
+/// and moves their weight under one lock, which is what keeps
+/// [`get_head`] from tallying every latest message again.
 pub fn update_latest_messages(
     store: &mut Store,
     attesting_indices: &[ValidatorIndex],
@@ -4777,42 +4963,16 @@ pub fn update_latest_messages(
     rules: ForkRules,
 ) {
     let target = data.target;
-    let beacon_block_root = data.beacon_block_root;
-    let payload_present = rules == ForkRules::Gloas && data.index == 1;
-
-    // One reservation for the whole batch. `set_latest_message` grows the
-    // table exactly (plus a fixed headroom) rather than by doubling, and an
-    // indexed attestation's indices are sorted, so without this the table
-    // would be copied every time an ascending index passed the headroom.
-    // Equivocators skipped below count towards the highest index on purpose:
-    // they are in the registry, so the table reaches them anyway, and leaving
-    // them out would cost a pass over the equivocation set for at most one
-    // headroom of capacity. `max` rather than `last`, so an unsorted list
-    // still reserves enough.
-    if let Some(&highest) = attesting_indices.iter().max() {
-        store.reserve_latest_messages(highest);
-    }
-    for &index in attesting_indices {
-        if store.is_equivocating(index) {
-            continue;
-        }
-        let should_update = match (store.latest_message(index), rules) {
-            (None, _) => true,
-            (Some(existing), ForkRules::PreGloas) => target.epoch > existing.epoch,
-            (Some(existing), ForkRules::Gloas) => data.slot > existing.slot,
-        };
-        if should_update {
-            store.set_latest_message(
-                index,
-                LatestMessage {
-                    epoch: target.epoch,
-                    slot: data.slot,
-                    root: beacon_block_root,
-                    payload_present,
-                },
-            );
-        }
-    }
+    let message = LatestMessage {
+        epoch: target.epoch,
+        slot: data.slot,
+        root: data.beacon_block_root,
+        payload_present: rules == ForkRules::Gloas && data.index == 1,
+    };
+    store.record_latest_messages(attesting_indices, message, |existing| match rules {
+        ForkRules::PreGloas => target.epoch > existing.epoch,
+        ForkRules::Gloas => data.slot > existing.slot,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -5084,7 +5244,14 @@ pub fn speculate_transition(
     let index = store.get_live_chain().ok()?;
     check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
         .ok()?;
+    // The store's own tables, as `on_block_speculative` passes them.
     let active_balances = store.active_balance_cache();
+    let pubkey_indices = store.pubkey_index_cache();
+    let caches = stf::BlockCaches {
+        committees,
+        active_balances: &active_balances,
+        pubkey_indices: &pubkey_indices,
+    };
     let engine = stf::ExecutionEngine::valid();
     let (state, outcome) = transition_block(
         store,
@@ -5094,8 +5261,7 @@ pub fn speculate_transition(
         true,
         config,
         &engine,
-        committees,
-        &active_balances,
+        caches,
     );
     Some(SpeculativeTransition {
         block_root,
@@ -5269,9 +5435,17 @@ pub fn on_block_speculative(
     // applies, after `process_slots`, so no second parent state exists).
     // Either way `state` is an independent clone, so a failing block cannot
     // corrupt a cached entry.
-    // The store's own cache, so every block of this chain shares one entry per
-    // epoch; see `ActiveBalanceCacheExt`.
+    // The store's own tables: every block of this chain shares one total
+    // active balance per epoch (see `ActiveBalanceCacheExt`), and one pubkey
+    // table, shared across forks since every hit is verified against the state
+    // in hand (see `PubkeyIndexCacheExt`).
     let active_balances = store.active_balance_cache();
+    let pubkey_indices = store.pubkey_index_cache();
+    let caches = stf::BlockCaches {
+        committees,
+        active_balances: &active_balances,
+        pubkey_indices: &pubkey_indices,
+    };
     let usable = speculation
         .filter(|speculation| speculation.stands_in_for(block_root, parent_root, payload_validity));
     let fresh_transition = || {
@@ -5283,8 +5457,7 @@ pub fn on_block_speculative(
             true,
             config,
             &engine,
-            committees,
-            &active_balances,
+            caches,
         )
     };
     let (mut state, transition) = match usable {
@@ -5382,8 +5555,7 @@ pub fn on_block_speculative(
     // head>`; the first two conditions are cheap and already decide most
     // blocks, especially every block a follower receives while syncing, which
     // is never timely. Computing that head (`walk_head`: a filtered-tree walk
-    // and a pass over every latest message and every block; see
-    // `compute_weights` for why the votes matter at scale) is not
+    // over every block, reading vote weights the store keeps cached) is not
     // worth paying for on a block the shuffling check could not change the
     // answer for anyway.
     //
@@ -5418,8 +5590,11 @@ pub fn on_block_speculative(
     }
 
     // Add new block to the store, and the new state for this block to the
-    // store.
+    // store. Its node in the cached fork-choice weights goes in first, so a
+    // head computation on another thread never finds the block's index row
+    // without one (which would cost it a full rebuild).
     let signed_block_el_hash = signed_block.execution_block_hash_if_execution_block();
+    store.insert_fork_choice_node(block_root, block_slot, parent_root, payload_link);
     store
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
@@ -5969,7 +6144,7 @@ mod tests {
     use super::*;
     use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
-    use crate::beacon::helpers::accessors::{self, ActiveBalanceCache};
+    use crate::beacon::helpers::accessors;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
@@ -6639,8 +6814,7 @@ mod tests {
             false,
             &config,
             &stf::ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         );
         outcome.expect("applies");
         post.apply_pending_mutations();
@@ -6827,7 +7001,7 @@ mod tests {
     /// finalized checkpoint names epoch 1, whose start slot nobody built a
     /// block for, so the finalized block itself sits at the slot before. Once
     /// finalization advances (a real `update_checkpoints` call, which prunes
-    /// `LiveChain` as a side effect), `filter_block_tree`'s own
+    /// `LiveChain` as a side effect), the leaf check's (`is_viable_leaf`)
     /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
     /// rather than fail: `on_block` and `get_head` both call it on every
     /// leaf, and either one erroring here is `get_head` freezing on a live
@@ -7491,15 +7665,13 @@ mod tests {
         // the transition once, unvalidated, the way a proposer decides
         // everything but the signature and the state root before signing.
         let mut trial_state = anchor_state.clone();
-        let trial_committees = CommitteeCache::default();
         stf::state_transition(
             &mut trial_state,
             &draft,
             false,
             &config,
             &stf::ExecutionEngine::valid(),
-            &trial_committees,
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         )
         .expect("the drafted block must transition cleanly");
         let state_root = trial_state.hash_tree_root();
@@ -10335,6 +10507,7 @@ mod tests {
         previous_slot_decisions: usize,
         pre_fork_weights: usize,
         branches_filtered_out: usize,
+        cached_weight_tables: usize,
     }
 
     /// Whether `root` is `justified` or a block below it in `index`. A root
@@ -10382,6 +10555,20 @@ mod tests {
         let index = store.block_index();
         let walked = get_head_node(store, &config)
             .unwrap_or_else(|err| panic!("seed {seed} slot {current_slot}: walk failed: {err:?}"));
+
+        // The cached weights the walk just read, against the tally they replace,
+        // node for node and under the rules the walk used.
+        let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
+        let cached = cached_node_weights(store, &index, &config, &committees, rules)
+            .unwrap_or_else(|err| panic!("seed {seed} slot {current_slot}: cached: {err:?}"));
+        let tallied = compute_node_weights(store, &index, &config, &committees, rules)
+            .unwrap_or_else(|err| panic!("seed {seed} slot {current_slot}: tally: {err:?}"));
+        assert_eq!(
+            cached, tallied,
+            "seed {seed} slot {current_slot}: cached weights differ from the tally"
+        );
+        stats.cached_weight_tables += 1;
+
         let justified = store.beacon_justified_checkpoint().root;
         let bound = walk_bound(store, &index);
         let justified_subtree = tree
@@ -10534,14 +10721,310 @@ mod tests {
             stats.branches_filtered_out > 0,
             "the block filter never dropped a branch: {stats:?}"
         );
+        assert!(
+            stats.cached_weight_tables > 0,
+            "the cached weights were never compared: {stats:?}"
+        );
     }
 
-    /// The specification's `filter_block_tree` finds a block's children by
-    /// scanning every block in the store. The node's version looks them up in
-    /// a parent-to-children map built once per call, so this keeps the scan
-    /// as the reference and checks the two agree on every random tree, at
-    /// current slots where the filter keeps everything and where it drops a
-    /// branch.
+    /// What [`the_cached_weights_follow_votes_blocks_and_equivocations`] did,
+    /// so it can insist it was not vacuous.
+    #[derive(Default, Debug)]
+    struct FollowStats {
+        vote_batches: usize,
+        blocks: usize,
+        equivocations: usize,
+        weighted_tables: usize,
+        gloas_steps: usize,
+        pre_gloas_steps: usize,
+    }
+
+    /// The cached weights follow the store as the node changes it, without a
+    /// rebuild: after every vote batch (`update_latest_messages`), block import
+    /// (`on_block`'s own insertion sequence) and equivocation
+    /// (`insert_equivocating_index`), the cache equals a rebuild from the same
+    /// inputs node by node and vote by vote, its weights equal the tally they
+    /// replace, and the walk over them still names the spec-literal head. Under
+    /// the pre-gloas rules first, then the gloas ones, which the cache switches
+    /// to with one rebuild.
+    #[test]
+    fn the_cached_weights_follow_votes_blocks_and_equivocations() {
+        let mut stats = FollowStats::default();
+        let gloas_state = test_state::with_validators_at(ForkName::Gloas, TREE_VALIDATORS);
+        for seed in 0..150 {
+            let mut tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
+            let mut rng = TestRng(seed.wrapping_mul(0x5DEE_CE66D) ^ 0xA5A5);
+            let config = tree.config.clone();
+            let latest = tree
+                .slots
+                .iter()
+                .copied()
+                .max()
+                .unwrap()
+                .max(tree.first_gloas_slot);
+            for current_slot in [tree.first_gloas_slot - 1, latest + 1] {
+                tree.store
+                    .set_time_ms(current_slot * config.slot_duration_ms)
+                    .unwrap();
+                let rules =
+                    ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
+                // The first read builds the cache for these rules; every check
+                // below then sees only what the steps changed incrementally.
+                get_head_node(&tree.store, &config)
+                    .unwrap_or_else(|err| panic!("seed {seed} slot {current_slot}: {err:?}"));
+
+                for step in 0..10u8 {
+                    let action = rng.below(4);
+                    if action == 3 && rules == ForkRules::Gloas {
+                        // A block, as `on_block` stores one: node, block, state,
+                        // link, then the per-block records the walk reads.
+                        let parents: Vec<usize> = (0..tree.roots.len())
+                            .filter(|&i| tree.slots[i] < current_slot)
+                            .collect();
+                        let parent = parents[rng.below(parents.len() as u64) as usize];
+                        let parent_root = tree.roots[parent];
+                        let slot = (tree.slots[parent] + 1 + rng.below(2))
+                            .min(current_slot)
+                            .max(tree.first_gloas_slot);
+                        let parent_hash = match tree.store.get_signed_block(&parent_root).unwrap() {
+                            Some(SignedBeaconBlock::Gloas(inner)) if rng.chance(1, 2) => {
+                                inner
+                                    .message
+                                    .body
+                                    .signed_execution_payload_bid
+                                    .message
+                                    .block_hash
+                            }
+                            _ => ExecutionBlockHash::repeat_byte(0xe0 + rng.below(8) as u8),
+                        };
+                        let root = rng.root();
+                        let block = gloas_block(
+                            slot,
+                            parent_root,
+                            parent_hash,
+                            ExecutionBlockHash::repeat_byte(0x40 + step),
+                        );
+                        let link = derive_payload_link(&tree.store, &block).unwrap();
+                        tree.store
+                            .insert_fork_choice_node(root, slot, parent_root, link);
+                        tree.store.insert_signed_block(root, block).unwrap();
+                        tree.store.insert_state(root, gloas_state.clone()).unwrap();
+                        tree.store.set_payload_link(root, slot, link);
+                        tree.store
+                            .set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
+                        tree.store
+                            .set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+                        tree.store
+                            .set_unrealized_justification(root, slot, Checkpoint::default());
+                        if rng.chance(1, 2) {
+                            verify_payload(&mut tree.store, root);
+                        }
+                        tree.roots.push(root);
+                        tree.slots.push(slot);
+                        stats.blocks += 1;
+                    } else if action == 2 {
+                        let validator = rng.below(TREE_VALIDATORS as u64);
+                        tree.store.insert_equivocating_index(validator);
+                        stats.equivocations += 1;
+                    } else {
+                        let pick = rng.below(tree.roots.len() as u64) as usize;
+                        let (root, block_slot) = (tree.roots[pick], tree.slots[pick]);
+                        let vote_slot = block_slot + rng.below(3);
+                        let validators: Vec<ValidatorIndex> = (0..TREE_VALIDATORS as u64)
+                            .filter(|_| rng.chance(1, 2))
+                            .collect();
+                        let data = AttestationData {
+                            slot: vote_slot,
+                            index: rng.below(2),
+                            beacon_block_root: root,
+                            source: Checkpoint::default(),
+                            target: Checkpoint {
+                                epoch: compute_epoch_at_slot(vote_slot),
+                                root,
+                            },
+                        };
+                        update_latest_messages(&mut tree.store, &validators, data, rules);
+                        stats.vote_batches += 1;
+                    }
+
+                    let store = &tree.store;
+                    let context = format!("seed {seed} slot {current_slot} step {step}");
+                    let index = store.block_index();
+                    store
+                        .proto_array_diff_against_rebuild(&index)
+                        .unwrap_or_else(|err| panic!("{context}: {err}"));
+                    let committees = store.committee_cache();
+                    let cached = cached_node_weights(store, &index, &config, &committees, rules)
+                        .unwrap_or_else(|err| panic!("{context}: cached: {err:?}"));
+                    let tallied = compute_node_weights(store, &index, &config, &committees, rules)
+                        .unwrap_or_else(|err| panic!("{context}: tally: {err:?}"));
+                    assert_eq!(cached, tallied, "{context}: cached weights differ");
+                    if cached.weights.values().any(|&weight| weight != 0) {
+                        stats.weighted_tables += 1;
+                    }
+
+                    let walked = get_head_node(store, &config)
+                        .unwrap_or_else(|err| panic!("{context}: walk: {err:?}"));
+                    let reference = match rules {
+                        ForkRules::Gloas => gloas_get_head(store, &config, &committees)
+                            .unwrap_or_else(|err| panic!("{context}: reference: {err:?}")),
+                        ForkRules::PreGloas => ForkChoiceNode {
+                            root: compute_head(store, &index, &config)
+                                .unwrap_or_else(|err| panic!("{context}: reference: {err:?}")),
+                            payload_status: PayloadStatus::Full,
+                        },
+                    };
+                    assert_eq!(walked, reference, "{context}: head differs");
+                    match rules {
+                        ForkRules::Gloas => stats.gloas_steps += 1,
+                        ForkRules::PreGloas => stats.pre_gloas_steps += 1,
+                    }
+                }
+            }
+        }
+        assert!(stats.vote_batches > 0, "no vote batch: {stats:?}");
+        assert!(stats.blocks > 0, "no block import: {stats:?}");
+        assert!(stats.equivocations > 0, "no equivocation: {stats:?}");
+        assert!(
+            stats.weighted_tables > 0,
+            "every table was empty: {stats:?}"
+        );
+        assert!(
+            stats.gloas_steps > 0 && stats.pre_gloas_steps > 0,
+            "{stats:?}"
+        );
+    }
+
+    /// Mainnet-sized timing of the head computation's weights: the tally
+    /// (`compute_node_weights`) against the cache (`cached_node_weights`) cold
+    /// (a rebuild), warm, and after one committee-sized vote batch. Ignored: a
+    /// measurement, not a check. Run with
+    /// `cargo test -p ethlambda-state-transition --profile release-fast --lib
+    /// -- --ignored --nocapture cached_weights_timing`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn cached_weights_timing() {
+        const VALIDATORS: u64 = 1_000_000;
+        const CHAIN: u64 = 64;
+        const RUNS: u32 = 20;
+        use std::time::Instant;
+
+        let root_of = |n: u64| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            Root::from_slice(&bytes)
+        };
+        let anchor = Root::repeat_byte(0xaa);
+        let mut store = store_anchored_at(anchor);
+        store.insert_live_chain_entry(0, anchor, Root::ZERO);
+        let mut chain = vec![anchor];
+        for slot in 1..=CHAIN {
+            let root = root_of(slot);
+            store.insert_live_chain_entry(slot, root, chain[slot as usize - 1]);
+            chain.push(root);
+            // A one-block fork off every eighth block.
+            if slot % 8 == 0 {
+                let fork = root_of(10_000 + slot);
+                store.insert_live_chain_entry(slot, fork, chain[slot as usize - 1]);
+            }
+        }
+        let checkpoint = store.beacon_justified_checkpoint();
+        let increment = preset::EFFECTIVE_BALANCE_INCREMENT;
+        store.insert_justified_balances(Arc::new(JustifiedBalances::new(
+            checkpoint,
+            vec![32 * increment; VALIDATORS as usize].into(),
+            VALIDATORS * 32 * increment,
+            vec![32; VALIDATORS as usize].into(),
+        )));
+        let config = Config::active();
+        store
+            .set_time_ms((CHAIN + 1) * config.slot_duration_ms)
+            .unwrap();
+
+        // Every validator attests once over the last two epochs, committee by
+        // committee: one batch per slot, each slot's validators voting for
+        // that slot's block.
+        let batch = |slot: u64| -> (Vec<ValidatorIndex>, LatestMessage) {
+            let validators = (0..VALIDATORS).filter(|v| v % CHAIN == slot - 1).collect();
+            let message = LatestMessage {
+                epoch: compute_epoch_at_slot(slot),
+                slot,
+                root: chain[slot as usize],
+                payload_present: false,
+            };
+            (validators, message)
+        };
+        for slot in 1..=CHAIN {
+            let (validators, message) = batch(slot);
+            store.record_latest_messages(&validators, message, |existing| {
+                message.epoch > existing.epoch
+            });
+        }
+
+        let index = store.block_index();
+        let committees = store.committee_cache();
+        let rules = ForkRules::PreGloas;
+        let mean = |f: &mut dyn FnMut()| {
+            let start = Instant::now();
+            for _ in 0..RUNS {
+                f();
+            }
+            start.elapsed() / RUNS
+        };
+
+        let tally = mean(&mut || {
+            compute_node_weights(&store, &index, &config, &committees, rules).unwrap();
+        });
+        let start = Instant::now();
+        let cold = cached_node_weights(&store, &index, &config, &committees, rules).unwrap();
+        let rebuild = start.elapsed();
+        assert_eq!(
+            cold,
+            compute_node_weights(&store, &index, &config, &committees, rules).unwrap()
+        );
+        let warm = mean(&mut || {
+            cached_node_weights(&store, &index, &config, &committees, rules).unwrap();
+        });
+
+        // The next slot's committee moves its votes from the oldest block to
+        // the newest: one batch, then the read that refreshes the totals.
+        let (validators, mut message) = batch(1);
+        message.epoch += 10;
+        message.root = chain[CHAIN as usize];
+        let start = Instant::now();
+        store.record_latest_messages(&validators, message, |existing| {
+            message.epoch > existing.epoch
+        });
+        let write = start.elapsed();
+        let start = Instant::now();
+        let after = cached_node_weights(&store, &index, &config, &committees, rules).unwrap();
+        let refreshed = start.elapsed();
+        assert_eq!(
+            after,
+            compute_node_weights(&store, &index, &config, &committees, rules).unwrap()
+        );
+
+        eprintln!(
+            "validators {VALIDATORS}, blocks {}, batch {} votes\n\
+             tally (compute_node_weights) mean   {tally:?}\n\
+             cached, rebuild (first read, one run) {rebuild:?}\n\
+             cached, warm read mean              {warm:?}\n\
+             one vote batch (record_latest_messages) {write:?}\n\
+             cached read after the batch         {refreshed:?}",
+            index.len(),
+            validators.len(),
+        );
+    }
+
+    /// The specification's `filter_block_tree`, recursing once per child and
+    /// finding a block's children by scanning every block in the store. The
+    /// node's version walks an explicit stack and looks the children up in a
+    /// parent-to-children map built once per call, so this keeps the
+    /// recursive scan as the reference and checks the two agree on every
+    /// random tree, at current slots where the filter keeps everything and
+    /// where it drops a branch. A leaf's viability is the same question
+    /// either way, so the reference asks [`is_viable_leaf`] for it and shares
+    /// nothing else with the walk.
     fn filter_block_tree_by_scan(
         store: &Store,
         index: &HashMap<Root, (Slot, Root)>,
@@ -10549,28 +11032,29 @@ mod tests {
         blocks: &mut HashMap<Root, (Slot, Root)>,
         config: &Config,
     ) -> Result<bool> {
+        let entry = *index
+            .get(&block_root)
+            .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
         let children: Vec<Root> = index
             .iter()
             .filter(|&(_, &(_, parent_root))| parent_root == block_root)
             .map(|(&root, _)| root)
             .collect();
-        if children.is_empty() {
-            // A leaf's viability is the same question either way, so the
-            // reference asks the node's own code for it: an empty child map
-            // makes `filter_block_tree` take its leaf branch.
-            let no_children = HashMap::new();
-            return filter_block_tree(store, index, &no_children, block_root, blocks, config);
-        }
-        let mut any_viable = false;
-        for child in children {
-            if filter_block_tree_by_scan(store, index, child, blocks, config)? {
-                any_viable = true;
+        let viable = if children.is_empty() {
+            is_viable_leaf(store, index, block_root, config)?
+        } else {
+            let mut any_viable = false;
+            for child in children {
+                if filter_block_tree_by_scan(store, index, child, blocks, config)? {
+                    any_viable = true;
+                }
             }
+            any_viable
+        };
+        if viable {
+            blocks.insert(block_root, entry);
         }
-        if any_viable {
-            blocks.insert(block_root, index[&block_root]);
-        }
-        Ok(any_viable)
+        Ok(viable)
     }
 
     #[test]
@@ -10614,6 +11098,114 @@ mod tests {
         assert!(
             branches_filtered_out > 0,
             "the filter never dropped a branch, so the comparison covered only full trees"
+        );
+    }
+
+    /// The head walk over a chain as deep as a long finality stall leaves
+    /// below the justified block, on a thread with the stack
+    /// `std::thread::spawn` gives by default, which is what the chain actor's
+    /// thread runs on.
+    ///
+    /// A filter that recursed once per block overflowed that stack long before
+    /// this depth. A stack overflow aborts the whole test binary rather than
+    /// failing this test alone, so a run that loses every test at once points
+    /// here.
+    #[test]
+    fn the_head_walk_does_not_overflow_a_default_stack_on_a_stall_deep_chain() {
+        const DEPTH: u64 = 20_000;
+        // `std::thread`'s documented default, unless `RUST_MIN_STACK` says
+        // otherwise. Set explicitly so the environment cannot hide a
+        // regression.
+        const DEFAULT_THREAD_STACK: usize = 2 * 1024 * 1024;
+
+        let walk = std::thread::Builder::new()
+            .name("deep-chain-head-walk".into())
+            .stack_size(DEFAULT_THREAD_STACK)
+            .spawn(|| {
+                let config = Config::active();
+                let mut rng = TestRng(DEPTH);
+                let anchor_root = rng.root();
+                let mut store = store_anchored_at(anchor_root);
+                store
+                    .insert_signed_block(anchor_root, fulu_block(0, Root::ZERO))
+                    .unwrap();
+                let anchor_state = test_state::with_validators_at(ForkName::Fulu, TREE_VALIDATORS);
+                store.insert_state(anchor_root, anchor_state).unwrap();
+                store.set_unrealized_justification(anchor_root, 0, Checkpoint::default());
+
+                // One chain, nothing justified or finalized past the anchor:
+                // the justified block is the anchor, so the filter walks the
+                // whole chain.
+                let mut tip = anchor_root;
+                for slot in 1..=DEPTH {
+                    let root = rng.root();
+                    store
+                        .insert_signed_block(root, fulu_block(slot, tip))
+                        .unwrap();
+                    store.set_unrealized_justification(root, slot, Checkpoint::default());
+                    tip = root;
+                }
+                for validator_index in 0..TREE_VALIDATORS as u64 {
+                    let vote = LatestMessage {
+                        epoch: 0,
+                        slot: DEPTH,
+                        root: tip,
+                        payload_present: false,
+                    };
+                    store.set_latest_message(validator_index, vote);
+                }
+                // Past every block's epoch, so the leaf reads its stored
+                // unrealized justification rather than a state.
+                let current_slot = DEPTH + 2 * preset::SLOTS_PER_EPOCH;
+                store
+                    .set_time_ms(current_slot * config.slot_duration_ms)
+                    .unwrap();
+
+                let index = store.block_index();
+                let filtered = get_filtered_block_tree(&store, &index, &config).unwrap();
+                assert_eq!(
+                    filtered.len(),
+                    index.len(),
+                    "with nothing justified past the anchor, every block is viable"
+                );
+                assert_eq!(get_head_node(&store, &config).unwrap().root, tip);
+            })
+            .unwrap();
+        walk.join().unwrap();
+    }
+
+    /// A justified block whose `LiveChain` row is gone, which is what
+    /// invalidating it leaves behind, fails the walk on entry with the
+    /// specification's `block_root in store.blocks` assertion: the error
+    /// `update_head_from_fork_choice` logs before keeping the head it has.
+    ///
+    /// The child is what makes the entry check the only possible source of
+    /// that message. With no child the walk would ask the justified block
+    /// itself, as a leaf, whether it is viable, and `get_voting_source`
+    /// asserts the same words; with one, skipping the entry check would reach
+    /// the child and fail its leaf check on a different assertion instead
+    /// (`block_root in store.block_states`, since this store holds no
+    /// states).
+    #[test]
+    fn the_filter_fails_on_entry_when_the_justified_block_is_gone() {
+        let config = Config::active();
+        let justified_root = Root::repeat_byte(1);
+        let child_root = Root::repeat_byte(2);
+        let mut store = store_anchored_at(justified_root);
+        store
+            .insert_signed_block(justified_root, block(0, Root::ZERO))
+            .unwrap();
+        store
+            .insert_signed_block(child_root, block(1, justified_root))
+            .unwrap();
+        store.delete_live_chain_entries(&[(0, justified_root)]);
+
+        let index = store.block_index();
+        assert!(!index.contains_key(&justified_root));
+        assert_eq!(index[&child_root], (1, justified_root));
+        assert_eq!(
+            failed_assertion(get_filtered_block_tree(&store, &index, &config)),
+            Some("block_root in store.blocks"),
         );
     }
 
@@ -10997,7 +11589,9 @@ mod tests {
         BlockInputs, advance_to_slot, assemble_block, empty_sync_aggregate, payload_inputs,
     };
     use crate::beacon::containers::electra;
-    use crate::beacon::helpers::accessors::{get_beacon_proposer_index, get_domain};
+    use crate::beacon::helpers::accessors::{
+        PubkeyIndexCache, get_beacon_proposer_index, get_domain,
+    };
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
     use crate::beacon::primitives::Bytes32;
     use ethlambda_types::beacon::containers::deneb::ExecutionPayload;
@@ -11054,6 +11648,7 @@ mod tests {
             &advanced,
             inputs,
             &config,
+            &PubkeyIndexCache::default(),
             crate::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .expect("assemble");
@@ -11079,8 +11674,7 @@ mod tests {
             false,
             &Config::mainnet(),
             &stf::ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            stf::OwnedBlockCaches::default().caches(),
         );
         outcome.expect("the block applies");
         state.apply_pending_mutations();
