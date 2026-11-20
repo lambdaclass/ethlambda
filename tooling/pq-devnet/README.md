@@ -8,15 +8,15 @@ behind ethlambda's own validator client. See
 [`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda implements
 of the fork.
 
-> **With Lighthouse, on a local VRF patch.** `b5d422b2` changed the VRF tree
-> (each leaf now commits to its slot's secret). Lighthouse's `pq-devnet-0`
-> image, ethPandaOps' genesis generator and ethereum-package's published VRF
-> states still follow the rule before it (consensus-specs `pq` at
-> `4595f0fc`), so the Lighthouse devnets below need ethlambda built with
-> [`vrf-4595f0fc.patch`](vrf-4595f0fc.patch), which this branch does not
-> carry: see [Known limits](#known-limits). An ethlambda-only devnet runs at
-> this pin unpatched, on key files ethlambda writes itself: see
-> [ethlambda alone](#ethlambda-alone).
+> **With Lighthouse, not runnable at this pin yet.** `b5d422b2` changed the
+> VRF tree (each leaf now commits to its slot's secret). Lighthouse's
+> `pq-devnet-0` image, ethPandaOps' genesis generator and ethereum-package's
+> published VRF states still follow the rule before it (consensus-specs `pq`
+> at `4595f0fc`), so every proposal splits the chain until they move: see
+> [Known limits](#known-limits). The Lighthouse steps below are the ones that
+> ran on 2026-11-20 with ethlambda's two VRF functions switched locally to
+> the older rule. An ethlambda-only devnet runs at this pin on key files
+> ethlambda writes itself: see [ethlambda alone](#ethlambda-alone).
 
 ## What runs
 
@@ -42,9 +42,7 @@ of the fork.
 ## Run it
 
 ```sh
-# 1. The image, from the repository root (about 15 minutes), with
-#    Lighthouse's VRF rule. Undo the patch afterwards (git apply -R).
-git apply tooling/pq-devnet/vrf-4595f0fc.patch
+# 1. The image, from the repository root (about 15 minutes).
 docker build -f tooling/pq-devnet/Dockerfile -t ethlambda:pq-local .
 
 # 2. The package: lambdaclass/ethereum-package's `add-ethlambda` (the
@@ -99,8 +97,7 @@ ethlambda pq-keys --count 32 --output-dir keys   --mnemonic "giant issue aisle s
 # 2. Serve them where the enclave reaches the host.
 (cd keys && python3 -m http.server 8641 --bind 127.0.0.1) &
 
-# 3. The image as above but without the VRF patch (this devnet is at
-#    b5d422b2), the package as above, then the devnet. The plain image
+# 3. The image and the package as above, then the devnet. The plain image
 #    (`make docker-build`) and a package without the launcher patch run it
 #    too, the nodes then checking each other's proofs in the specification's
 #    reference encoding.
@@ -138,11 +135,11 @@ kurtosis run --enclave pq "$PWD/ethereum-package"   --args-file <ethlambda>/tool
   generator (`pq`) and ethereum-package's published VRF states still use
   `4595f0fc`'s leaf, `keccak256(vrf_seed || le64(slot))`, revealed as it is.
   A root either side registers fails the other's `is_valid_vrf_proof`, so
-  the first block of either side would be invalid to the other.
-  [`vrf-4595f0fc.patch`](vrf-4595f0fc.patch) switches ethlambda's
-  `ethlambda_crypto::vrf` to the older leaf for a devnet with them; the
-  state transition and the validator client follow from it. Without the
-  patch, run ethlambda alone (above).
+  the first block of either side is invalid to the other. Until they move
+  to `b5d422b2`, run ethlambda alone (above). For a local check against
+  them in the meantime, `compute_vrf_secret` in `ethlambda_crypto::vrf` can
+  return the older leaf and `compute_vrf_leaf` pass its input through; the
+  state transition and the validator client follow from those two.
 - **Without VRF tree states, a validator's first start hashes its trees.**
   Minutes a key on all cores, one key after another, in a pool of their own
   so attestations, aggregates and PTC votes are signed meanwhile; a proposal
