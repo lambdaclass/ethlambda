@@ -45,7 +45,7 @@ pub const MAX_CHILDREN_PER_AGGREGATE: usize = 16;
 
 /// The leanVM revision the workspace's sidecar client is pinned to, which the
 /// `leanvm-sidecar` binary must be built from.
-pub const LEANVM_REV: &str = "283686575c4e81790591d2c6e3ed21c69c0e3bbe";
+pub const LEANVM_REV: &str = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

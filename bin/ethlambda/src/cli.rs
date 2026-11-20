@@ -421,7 +421,7 @@ pub(crate) struct MainnetOptions {
     pub(crate) bootnodes: Vec<String>,
 
     /// The Unix socket of a `leanvm-sidecar` (built from leanVM
-    /// `283686575c4e81790591d2c6e3ed21c69c0e3bbe`), which makes and checks
+    /// `c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764`, bindings v0.15.0), which makes and checks
     /// the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ
     /// devnet's clients use.
     ///

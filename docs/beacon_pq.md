@@ -146,8 +146,10 @@ proofs through one of two backends, chosen once per process:
   specification's fixtures use it.
 - **Sidecar** (`--pq-prover-socket`, `stark::install_sidecar`): real leanVM
   proofs, made and checked by a `leanvm-sidecar` process over a Unix socket,
-  through leanVM's own client crate at `283686575c` (`sidecar::LEANVM_REV`),
-  the revision Lighthouse's PQ branch pins. A statement list maps to leanVM
+  through leanVM's own client crate at `c5ee9d239` (bindings v0.15.0,
+  `sidecar::LEANVM_REV`), the release pq-devnet-0 runs for its signer,
+  prover, verifier and sidecar: a proof from another revision does not
+  verify. A statement list maps to leanVM
   claims as Lighthouse maps it: the sorted, deduplicated
   `(public key, message)` pairs, the empty proof for no claims, and merges
   folded sixteen children at a time. `bin/ethlambda/pq/ethlambda-pq` starts a

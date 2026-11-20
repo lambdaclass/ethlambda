@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "claims"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 dependencies = [
  "lean_sphincs",
  "lean_xmss",
@@ -3832,7 +3832,7 @@ dependencies = [
 [[package]]
 name = "keccak256"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 
 [[package]]
 name = "konst"
@@ -3908,7 +3908,7 @@ dependencies = [
 [[package]]
 name = "lean_sphincs"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 dependencies = [
  "keccak256",
 ]
@@ -3930,7 +3930,7 @@ dependencies = [
 [[package]]
 name = "lean_xmss"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 dependencies = [
  "keccak256",
 ]
@@ -6524,7 +6524,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "sidecar"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 dependencies = [
  "claims",
  "lean_sphincs",
@@ -7411,7 +7411,7 @@ dependencies = [
 [[package]]
 name = "verifier"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=283686575c4e81790591d2c6e3ed21c69c0e3bbe#283686575c4e81790591d2c6e3ed21c69c0e3bbe"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 
 [[package]]
 name = "version_check"

@@ -9,11 +9,11 @@
 # Release LTO is off, so the image builds in minutes; do not use
 # `release-fast`, which enables debug assertions.
 
-# leanVM's sidecar, from the revision ethlambda's client crate and
-# Lighthouse's PQ branch pin (`ethlambda_crypto::stark::sidecar::LEANVM_REV`):
-# a proof only verifies with a compatible verifier.
+# leanVM's sidecar, from the revision ethlambda's client crate pins
+# (`ethlambda_crypto::stark::sidecar::LEANVM_REV`, bindings v0.15.0, the
+# release pq-devnet-0 runs): a proof only verifies with the same verifier.
 FROM rust:1.97-bookworm AS sidecar
-ARG LEANVM_REV=283686575c4e81790591d2c6e3ed21c69c0e3bbe
+ARG LEANVM_REV=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764
 RUN git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
     && cd /leanVM \
     && git checkout -q ${LEANVM_REV} \
