@@ -793,9 +793,9 @@ mod tests {
         let (mut state, secret_keys) = altair_state_with_keypairs(64);
         // Slot after the first slot of epoch 1: both the previous epoch's last
         // slot and the current epoch's first slot are attestable.
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH + 1;
-        let previous_slot = preset::SLOTS_PER_EPOCH - 1;
-        let current_slot = preset::SLOTS_PER_EPOCH;
+        *state.slot_mut() = preset::slots_per_epoch() + 1;
+        let previous_slot = preset::slots_per_epoch() - 1;
+        let current_slot = preset::slots_per_epoch();
 
         let previous_committee = get_beacon_committee(&state, previous_slot, 0).unwrap();
         state.validator_mut(previous_committee[0]).unwrap().slashed = true;

@@ -2254,7 +2254,7 @@ impl Store {
                     // An entry below the finalized epoch is never read again:
                     // a block consults its parent's only within one epoch.
                     self.target_balance_cache
-                        .prune_below(finalized.slot / SLOTS_PER_EPOCH);
+                        .prune_below(finalized.slot / slots_per_epoch());
                     // `finalized.slot` is the finalized *epoch's* start slot
                     // (`Store::beacon_checkpoint_as_stored`), which can name a
                     // slot nobody ever built a block for. Pruning to it
