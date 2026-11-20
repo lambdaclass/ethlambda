@@ -1134,17 +1134,41 @@ fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
                 );
             }
             let to_hash = pending.len();
-            for (done, pubkey) in pending.iter().enumerate() {
-                let key_started = std::time::Instant::now();
-                if pq::prepare_vrf_tree(pubkey, &validators_dir) == Some(pq::VrfTreeSource::Hashed)
-                {
-                    info!(
-                        pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
-                        hashed = done + 1,
-                        count = to_hash,
-                        elapsed_ms = key_started.elapsed().as_millis() as u64,
-                        "Hashed a validator's VRF tree"
-                    );
+            let hash_all = || {
+                for (done, pubkey) in pending.iter().enumerate() {
+                    let key_started = std::time::Instant::now();
+                    if pq::prepare_vrf_tree(pubkey, &validators_dir)
+                        == Some(pq::VrfTreeSource::Hashed)
+                    {
+                        info!(
+                            pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
+                            hashed = done + 1,
+                            count = to_hash,
+                            elapsed_ms = key_started.elapsed().as_millis() as u64,
+                            "Hashed a validator's VRF tree"
+                        );
+                    }
+                }
+            };
+            if to_hash > 0 {
+                // In a pool of its own, never rayon's global one. leanXMSS
+                // signing parallelizes on the global pool, and rayon runs a
+                // job injected from outside a pool only once a worker's own
+                // queue is empty: a tree hashed there keeps every queue full
+                // for minutes, and every attestation, aggregate and PTC vote
+                // signature waits behind it. One core is left to the rest.
+                let threads = std::thread::available_parallelism()
+                    .map_or(1, |cores| cores.get().saturating_sub(1).max(1));
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("pq-vrf-hash-{index}"))
+                    .build();
+                match pool {
+                    Ok(pool) => pool.install(hash_all),
+                    Err(err) => {
+                        warn!(%err, "Could not start the VRF hashing pool; hashing on the shared one, which delays every PQ signature until it is done");
+                        hash_all();
+                    }
                 }
             }
             info!(
