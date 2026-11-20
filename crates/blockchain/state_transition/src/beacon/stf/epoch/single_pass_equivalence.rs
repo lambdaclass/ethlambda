@@ -119,14 +119,14 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
         _ => 3 + rng.below(40),
     };
     let offset = if rng.chance(90) {
-        1 + rng.below(preset::SLOTS_PER_EPOCH - 1)
+        1 + rng.below(preset::slots_per_epoch() - 1)
     } else {
         0
     };
-    *state.slot_mut() = epoch * preset::SLOTS_PER_EPOCH + offset;
+    *state.slot_mut() = epoch * preset::slots_per_epoch() + offset;
     let next_epoch = epoch + 1;
 
-    let slashings_offset = (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+    let slashings_offset = (preset::epochs_per_slashings_vector() / 2) as Epoch;
     let hysteresis_down =
         INCREMENT / preset::HYSTERESIS_QUOTIENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
     let hysteresis_up =
@@ -260,7 +260,7 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
     // The slashings vector.
     if rng.chance(60) {
         for _ in 0..rng.below(12) {
-            let at = rng.below(preset::EPOCHS_PER_SLASHINGS_VECTOR as u64) as usize;
+            let at = rng.below(preset::epochs_per_slashings_vector() as u64) as usize;
             state.slashings_mut()[at] = rng.below(400 * ETH);
         }
         if rng.chance(3) {

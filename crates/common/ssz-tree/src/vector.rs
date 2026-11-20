@@ -1,6 +1,7 @@
 //! [`Vector`]: an SSZ `Vector[T, N]` kept in a persistent Merkle tree.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 use libssz::{DecodeError, SszDecode, SszEncode};
@@ -11,31 +12,45 @@ use crate::cursor::{ElemCow, IterCow};
 use crate::interface::Interface;
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
-use crate::{Hash256, Value, tree_depth};
+use crate::{Const, Hash256, Length, Value, tree_depth};
 
 /// An SSZ vector of exactly `N` elements, kept in a persistent Merkle tree.
 ///
 /// The fixed-length counterpart of [`List`](crate::List): the same tree,
 /// buffered writes and O(1) clone, with no `push` and no length mix-in in the
 /// root. Stands in for `libssz_types::SszVector<T, N>` in a derived container.
-#[derive(Clone)]
-pub struct Vector<T, const N: usize, U = VecMap<T>> {
+pub struct VectorOf<T, L, U = VecMap<T>> {
     interface: Interface<T, U>,
+    length: PhantomData<fn() -> L>,
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Vector<T, N, U> {
+/// A [`VectorOf`] whose length bound is the compile-time constant `N`.
+pub type Vector<T, const N: usize, U = VecMap<T>> = VectorOf<T, Const<N>, U>;
+
+/// By hand rather than derived, since a derive would require `L: Clone`
+/// of a marker type that is never instantiated.
+impl<T: Clone, L, U: Clone> Clone for VectorOf<T, L, U> {
+    fn clone(&self) -> Self {
+        Self {
+            interface: self.interface.clone(),
+            length: PhantomData,
+        }
+    }
+}
+
+impl<T: Value, L: Length, U: UpdateMap<T>> VectorOf<T, L, U> {
     fn depth() -> usize {
-        tree_depth::<T>(N)
+        tree_depth::<T>(L::get())
     }
 
     /// The number of elements: always `N`.
     pub fn len(&self) -> usize {
-        N
+        L::get()
     }
 
     /// Whether `N` is zero.
     pub fn is_empty(&self) -> bool {
-        N == 0
+        L::get() == 0
     }
 
     /// The element at `index`, or `None` past the end.
@@ -108,74 +123,84 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> crate::Buffered for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> crate::Buffered for VectorOf<T, L, U> {
     fn apply_updates(&mut self) {
-        Vector::apply_updates(self);
+        VectorOf::apply_updates(self);
     }
 
     fn has_pending_updates(&self) -> bool {
-        Vector::has_pending_updates(self)
+        VectorOf::has_pending_updates(self)
     }
 }
 
-impl<T: Value + Default, const N: usize, U: UpdateMap<T>> Default for Vector<T, N, U> {
+impl<T: Value + Default, L: Length, U: UpdateMap<T>> Default for VectorOf<T, L, U> {
     /// A vector of `N` default-valued elements.
     fn default() -> Self {
-        let values = std::iter::repeat_with(T::default).take(N);
+        let values = std::iter::repeat_with(T::default).take(L::get());
         Self {
             interface: Interface::from_values(values, Self::depth()),
+            length: PhantomData,
         }
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> TryFrom<Vec<T>> for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> TryFrom<Vec<T>> for VectorOf<T, L, U> {
     type Error = TypeError;
 
     fn try_from(values: Vec<T>) -> Result<Self, TypeError> {
-        if values.len() != N {
+        if values.len() != L::get() {
             return Err(TypeError::InvalidLength {
-                expected: N,
+                expected: L::get(),
                 got: values.len(),
             });
         }
         Ok(Self {
             interface: Interface::from_values(values, Self::depth()),
+            length: PhantomData,
         })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Index<usize> for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> Index<usize> for VectorOf<T, L, U> {
     type Output = T;
 
     fn index(&self, index: usize) -> &T {
-        self.get(index)
-            .unwrap_or_else(|| panic!("index {index} out of bounds for a vector of length {N}"))
+        self.get(index).unwrap_or_else(|| {
+            panic!(
+                "index {index} out of bounds for a vector of length {}",
+                L::get()
+            )
+        })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> IndexMut<usize> for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> IndexMut<usize> for VectorOf<T, L, U> {
     fn index_mut(&mut self, index: usize) -> &mut T {
-        self.get_mut(index)
-            .unwrap_or_else(|| panic!("index {index} out of bounds for a vector of length {N}"))
+        self.get_mut(index).unwrap_or_else(|| {
+            panic!(
+                "index {index} out of bounds for a vector of length {}",
+                L::get()
+            )
+        })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> PartialEq for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> PartialEq for VectorOf<T, L, U> {
     fn eq(&self, other: &Self) -> bool {
         let nothing_pending = !self.has_pending_updates() && !other.has_pending_updates();
         (nothing_pending && self.ptr_eq(other)) || self.iter().eq(other.iter())
     }
 }
 
-impl<T: Value + Eq, const N: usize, U: UpdateMap<T>> Eq for Vector<T, N, U> {}
+impl<T: Value + Eq, L: Length, U: UpdateMap<T>> Eq for VectorOf<T, L, U> {}
 
-impl<T: Value + fmt::Debug, const N: usize, U: UpdateMap<T>> fmt::Debug for Vector<T, N, U> {
+impl<T: Value + fmt::Debug, L: Length, U: UpdateMap<T>> fmt::Debug for VectorOf<T, L, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a Vector<T, N, U> {
+impl<'a, T: Value, L: Length, U: UpdateMap<T>> IntoIterator for &'a VectorOf<T, L, U> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T, U>;
 
@@ -184,14 +209,14 @@ impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a Vector<
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszEncode for VectorOf<T, L, U> {
     fn is_fixed_size() -> bool {
         <T as SszEncode>::is_fixed_size()
     }
 
     fn fixed_size() -> usize {
         if <T as SszEncode>::is_fixed_size() {
-            <T as SszEncode>::fixed_size() * N
+            <T as SszEncode>::fixed_size() * L::get()
         } else {
             0
         }
@@ -206,14 +231,14 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for Vector<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszDecode for VectorOf<T, L, U> {
     fn is_fixed_size() -> bool {
         <T as SszDecode>::is_fixed_size()
     }
 
     fn fixed_size() -> usize {
         if <T as SszDecode>::is_fixed_size() {
-            <T as SszDecode>::fixed_size() * N
+            <T as SszDecode>::fixed_size() * L::get()
         } else {
             0
         }
@@ -232,26 +257,29 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for Vector<T, N, U> {
             let size = <T as SszDecode>::fixed_size();
             if size != 0 && bytes.len().is_multiple_of(size) {
                 let count = bytes.len() / size;
-                if count != N {
+                if count != L::get() {
                     return Err(DecodeError::InvalidFixedLength {
-                        expected: N,
+                        expected: L::get(),
                         got: count,
                     });
                 }
             }
         }
-        let interface = Interface::from_ssz_bytes(bytes, N, Self::depth())?;
-        if interface.len() != N {
+        let interface = Interface::from_ssz_bytes(bytes, L::get(), Self::depth())?;
+        if interface.len() != L::get() {
             return Err(DecodeError::InvalidFixedLength {
-                expected: N,
+                expected: L::get(),
                 got: interface.len(),
             });
         }
-        Ok(Self { interface })
+        Ok(Self {
+            interface,
+            length: PhantomData,
+        })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> HashTreeRoot for Vector<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> HashTreeRoot for VectorOf<T, L, U> {
     /// Ignores `hasher` and uses SHA-256: see the crate docs.
     fn hash_tree_root(&self, _hasher: &impl Sha256Hasher) -> Hash256 {
         self.interface.root()

@@ -68,10 +68,10 @@ pub fn get_previous_epoch(state: &BeaconState) -> Epoch {
 /// rather than a miss.
 pub fn get_block_root_at_slot(state: &BeaconState, slot: Slot) -> Result<Root> {
     crate::beacon::verify(
-        slot < state.slot() && state.slot() <= slot + preset::SLOTS_PER_HISTORICAL_ROOT as u64,
+        slot < state.slot() && state.slot() <= slot + preset::slots_per_historical_root() as u64,
         "slot < state.slot <= slot + SLOTS_PER_HISTORICAL_ROOT",
     )?;
-    Ok(state.block_roots()[slot as usize % preset::SLOTS_PER_HISTORICAL_ROOT])
+    Ok(state.block_roots()[slot as usize % preset::slots_per_historical_root()])
 }
 
 /// The block root at the start of a recent epoch, which is what a checkpoint
@@ -116,7 +116,7 @@ pub fn get_validator_churn_limit(state: &BeaconState, config: &Config) -> u64 {
 /// genesis, and this keeps that form.
 pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> Bytes32 {
     let lookback =
-        epoch + preset::EPOCHS_PER_HISTORICAL_VECTOR as u64 - preset::MIN_SEED_LOOKAHEAD - 1;
+        epoch + preset::epochs_per_historical_vector() as u64 - preset::MIN_SEED_LOOKAHEAD - 1;
     let mix = get_randao_mix(state, lookback);
 
     let mut input = Vec::with_capacity(4 + 8 + 32);
@@ -138,8 +138,8 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
 /// for p2p's gossipsub scoring, which sizes expected aggregate traffic from
 /// a validator count rather than from a state.
 pub fn committee_count_per_slot(active_count: u64) -> u64 {
-    let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
-    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+    let ideal = active_count / preset::slots_per_epoch() / preset::target_committee_size();
+    ideal.clamp(1, preset::max_committees_per_slot() as u64)
 }
 
 /// How many committees each slot of `epoch` has.
@@ -416,7 +416,7 @@ fn build_committee_key_sums(
     let per_slot = committees.committees_per_slot();
     let first_slot = compute_start_slot_at_epoch(epoch);
 
-    let members: Vec<&[ValidatorIndex]> = (0..preset::SLOTS_PER_EPOCH)
+    let members: Vec<&[ValidatorIndex]> = (0..preset::slots_per_epoch())
         .flat_map(|offset| (0..per_slot).map(move |index| (first_slot + offset, index)))
         .map(|(slot, index)| {
             committees
@@ -660,7 +660,7 @@ pub fn get_beacon_committee(
         &active_indices,
         get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER),
         committee_number(slot, committees_per_slot, index)?,
-        committees_per_slot * preset::SLOTS_PER_EPOCH,
+        committees_per_slot * preset::slots_per_epoch(),
     )
 }
 
@@ -843,7 +843,7 @@ mod tests {
         *state.slot_mut() = 0;
         assert_eq!(get_previous_epoch(&state), constants::GENESIS_EPOCH);
 
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * 3;
+        *state.slot_mut() = preset::slots_per_epoch() * 3;
         assert_eq!(get_previous_epoch(&state), 2);
     }
 
@@ -866,7 +866,7 @@ mod tests {
         let per_slot = get_committee_count_per_slot(&state, epoch);
 
         let mut all = Vec::new();
-        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+        for slot_offset in 0..preset::slots_per_epoch() {
             let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
             for index in 0..per_slot {
                 all.extend(get_beacon_committee(&state, slot, index).unwrap());
@@ -890,7 +890,7 @@ mod tests {
     /// those boundary computations untested.
     #[test]
     fn sliced_committees_match_the_per_member_derivation() {
-        let several_per_slot = preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2 + 1;
+        let several_per_slot = preset::slots_per_epoch() * preset::target_committee_size() * 2 + 1;
 
         for count in [100, several_per_slot as usize] {
             let state = with_validators(count);
@@ -905,7 +905,7 @@ mod tests {
             }
 
             let mut lengths = Vec::new();
-            for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+            for slot_offset in 0..preset::slots_per_epoch() {
                 let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
                 for index in 0..per_slot {
                     let sliced = committees.committee(slot, index).unwrap();
@@ -936,7 +936,7 @@ mod tests {
         // the genesis state cannot key its own epochs, which
         // `an_unkeyable_epoch_is_not_cached` covers separately.
         let mut state = with_validators(64);
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * 4;
+        *state.slot_mut() = preset::slots_per_epoch() * 4;
         let epoch = get_current_epoch(&state);
         let cache = CommitteeCache::default();
 
@@ -1007,7 +1007,7 @@ mod tests {
     fn state_on_branch(branch: u8, epoch: Epoch) -> BeaconState {
         let mut state = with_validators(64);
         *state.slot_mut() = compute_start_slot_at_epoch(epoch);
-        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+        for slot in 0..preset::slots_per_historical_root() {
             state.block_roots_mut()[slot] = Root::repeat_byte(branch);
         }
         state
@@ -1142,7 +1142,7 @@ mod tests {
     fn state_at_epoch_with_root(epoch: Epoch, root: u8) -> BeaconState {
         let mut state = with_validators(16);
         *state.slot_mut() = compute_start_slot_at_epoch(epoch);
-        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+        for slot in 0..preset::slots_per_historical_root() {
             state.block_roots_mut()[slot] = Root::repeat_byte(root);
         }
         state
@@ -1197,7 +1197,7 @@ mod tests {
         state.apply_pending_mutations();
         *state.slot_mut() = compute_start_slot_at_epoch(4);
         let last_slot =
-            (compute_start_slot_at_epoch(4) - 1) as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+            (compute_start_slot_at_epoch(4) - 1) as usize % preset::slots_per_historical_root();
         state.block_roots_mut()[last_slot] = Root::repeat_byte(9);
 
         let new_key = active_balance_key(&state).unwrap();

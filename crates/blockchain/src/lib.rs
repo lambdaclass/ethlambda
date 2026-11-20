@@ -364,7 +364,7 @@ impl BlockChain {
 
         Self::start_actor(
             store,
-            SyncStatusTracker::new(false, SyncThresholds::BEACON),
+            SyncStatusTracker::new(false, SyncThresholds::beacon()),
             sync_status_controller,
             events,
             ChainDuties::Beacon,
@@ -820,8 +820,8 @@ enum NoVerdict {
 /// Mirrors lighthouse's `da_check_required_for_epoch`, which asks the same
 /// question of the same boundary.
 fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Config) -> bool {
-    let block_epoch = block_slot / preset::SLOTS_PER_EPOCH;
-    let current_epoch = current_slot / preset::SLOTS_PER_EPOCH;
+    let block_epoch = block_slot / preset::slots_per_epoch();
+    let current_epoch = current_slot / preset::slots_per_epoch();
     let boundary = current_epoch
         .saturating_sub(constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS)
         .max(config.fulu_fork_epoch);
@@ -2245,7 +2245,7 @@ impl BlockChainServer {
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
             key_sums_warming: Default::default(),
-            sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
+            sync_status: SyncStatusTracker::new(false, SyncThresholds::beacon()),
             sync_status_controller: SyncStatusController::default(),
             events: ChainEvents::new(EventBus::default(), &store),
             duties: ChainDuties::Beacon,
@@ -5016,7 +5016,7 @@ mod tests {
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
             key_sums_warming: Default::default(),
-            sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
+            sync_status: SyncStatusTracker::new(false, SyncThresholds::beacon()),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
         }
@@ -5095,16 +5095,16 @@ mod tests {
     /// plain snapshot, rather than trying to diff against a parent state
     /// this helper never creates.
     pub(crate) fn bare_state() -> BeaconState {
-        let block_roots = vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        let block_roots = vec![H256::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("exactly the preset length");
-        let state_roots = vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        let state_roots = vec![H256::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("exactly the preset length");
-        let randao_mixes = vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+        let randao_mixes = vec![H256::ZERO; preset::epochs_per_historical_vector()]
             .try_into()
             .expect("exactly the preset length");
-        let slashings = vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+        let slashings = vec![0u64; preset::epochs_per_slashings_vector()]
             .try_into()
             .expect("exactly the preset length");
         BeaconState::Phase0(phase0::BeaconState {
@@ -5138,12 +5138,12 @@ mod tests {
     #[test]
     fn the_availability_gate_stops_at_the_window_peers_must_serve() {
         let config = Config::mainnet();
-        let fulu_start = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let fulu_start = config.fulu_fork_epoch * preset::slots_per_epoch();
         // Far enough past fulu that the retention window, not the fork, is
         // what sets the boundary.
         let current_epoch =
             config.fulu_fork_epoch + constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS + 100;
-        let current_slot = current_epoch * preset::SLOTS_PER_EPOCH;
+        let current_slot = current_epoch * preset::slots_per_epoch();
         let boundary_epoch =
             current_epoch - constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS;
 
@@ -5155,7 +5155,7 @@ mod tests {
             &config
         ));
         assert!(da_check_required_for_slot(
-            boundary_epoch * preset::SLOTS_PER_EPOCH,
+            boundary_epoch * preset::slots_per_epoch(),
             current_slot,
             &config
         ));
@@ -5164,7 +5164,7 @@ mod tests {
         // a block there would stall the chain against data the network is
         // entitled to have dropped.
         assert!(!da_check_required_for_slot(
-            (boundary_epoch - 1) * preset::SLOTS_PER_EPOCH,
+            (boundary_epoch - 1) * preset::slots_per_epoch(),
             current_slot,
             &config
         ));
@@ -5172,7 +5172,7 @@ mod tests {
         // Before fulu there is no column matrix to be available at all, and
         // the boundary must not walk below the fork even when the retention
         // window reaches past it.
-        let just_after_fork = fulu_start + preset::SLOTS_PER_EPOCH;
+        let just_after_fork = fulu_start + preset::slots_per_epoch();
         assert!(da_check_required_for_slot(
             just_after_fork,
             just_after_fork,
@@ -5829,7 +5829,9 @@ mod tests {
 
     /// Three epochs in: past the beacon tracker's two-epoch clock tolerance
     /// with the head still at the anchor (slot 0).
-    const THREE_EPOCHS: u64 = 3 * preset::SLOTS_PER_EPOCH;
+    fn three_epochs() -> u64 {
+        3 * preset::slots_per_epoch()
+    }
 
     #[test]
     fn the_clock_reaching_a_followed_fork_does_not_force_syncing() {
@@ -5838,7 +5840,7 @@ mod tests {
         // synced, the same as when no fork is scheduled.
         let mut server = syncing_server(Some(1));
         server.store.set_network_head(Some(0));
-        server.update_sync_status(THREE_EPOCHS);
+        server.update_sync_status(three_epochs());
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Synced
@@ -5851,7 +5853,7 @@ mod tests {
         // the tracker deliberately reports as synced.
         let mut server = syncing_server(None);
         server.store.set_network_head(Some(0));
-        server.update_sync_status(THREE_EPOCHS);
+        server.update_sync_status(three_epochs());
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Synced
@@ -5865,8 +5867,8 @@ mod tests {
         // used to read synced, since the freshest block it knew of was its own
         // head.
         let mut server = syncing_server(None);
-        server.store.set_network_head(Some(THREE_EPOCHS));
-        server.update_sync_status(THREE_EPOCHS);
+        server.store.set_network_head(Some(three_epochs()));
+        server.update_sync_status(three_epochs());
         assert_eq!(
             server.sync_status_controller.get(),
             crate::metrics::SyncStatus::Syncing
@@ -5928,7 +5930,7 @@ mod tests {
     fn the_clock_rule_never_holds_while_every_fork_is_followed() {
         // The rule is a guard for a fork the node cannot follow; with gloas
         // followed there is none, whatever the clock and head say.
-        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        let first_gloas_slot = preset::slots_per_epoch();
         for (current_slot, head_slot) in [
             (first_gloas_slot + 8, 0),
             (first_gloas_slot - 1, 0),
@@ -6989,7 +6991,7 @@ mod tests {
                 .filter(|(ancestor_slot, _)| *ancestor_slot <= below)
                 .max_by_key(|(ancestor_slot, _)| *ancestor_slot)
                 .map_or(H256::ZERO, |(_, root)| *root);
-            inner.block_roots[below as usize % preset::SLOTS_PER_HISTORICAL_ROOT] = latest;
+            inner.block_roots[below as usize % preset::slots_per_historical_root()] = latest;
         }
         store.insert_state(root, state).expect("insert");
     }

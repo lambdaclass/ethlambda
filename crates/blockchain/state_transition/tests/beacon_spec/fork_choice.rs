@@ -137,7 +137,7 @@ use libssz::SszDecode;
 use libssz_types::SszList;
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{Case, collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 // ---------------------------------------------------------------------------
 // `steps.yaml` deserialization
@@ -698,7 +698,7 @@ fn check_head_against_reference(store: &Store, config: &Config) -> Result<(), St
     let walked = fork_choice::get_head_node(store, config)
         .map_err(|err| format!("get_head_node: {err:?}"))?;
     let current_slot = fork_choice::get_current_slot(store, config);
-    let fork = config.fork_at_epoch(current_slot / preset::SLOTS_PER_EPOCH);
+    let fork = config.fork_at_epoch(current_slot / preset::slots_per_epoch());
     let reference = match ForkRules::of(fork) {
         ForkRules::Gloas => {
             let committees = store.committee_cache();
@@ -1014,7 +1014,7 @@ fn check_node_weights_against_the_spec(
     committees: &CommitteeCache,
 ) -> Result<(), String> {
     let current_slot = fork_choice::get_current_slot(store, config);
-    let fork = config.fork_at_epoch(current_slot / preset::SLOTS_PER_EPOCH);
+    let fork = config.fork_at_epoch(current_slot / preset::slots_per_epoch());
     if ForkRules::of(fork) != ForkRules::Gloas {
         return Ok(());
     }
@@ -1146,7 +1146,7 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
 /// case in this suite runs through [`run_case`] the same way regardless of
 /// which handler it came from, unlike `ssz_static`, which dispatches on it.
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "fork_choice");
+    let cases = collect_all_handlers(preset(), "fork_choice");
     let mut trials = vec![super::discovery_trial("fork_choice", cases.len())];
 
     for (_handler, case) in cases {

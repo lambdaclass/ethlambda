@@ -271,7 +271,7 @@ mod tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::checkpoint::Checkpoint;
 
     fn wire() -> BeaconWire {
@@ -315,7 +315,7 @@ mod tests {
     /// from it. Returns the store alongside the anchor's slot and root, which
     /// `init_beacon` also seeds as the finalized (and justified) checkpoint.
     fn anchored_store() -> (Store, u64, Root) {
-        let anchor_slot = 2 * SLOTS_PER_EPOCH;
+        let anchor_slot = 2 * slots_per_epoch();
         let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot: anchor_slot,
@@ -384,7 +384,7 @@ mod tests {
         // `init_beacon` seeds the finalized checkpoint with the anchor itself,
         // and nothing in this test advances finality past it.
         assert_eq!(status.finalized_root, anchor_root);
-        assert_eq!(status.finalized_epoch, anchor_slot / SLOTS_PER_EPOCH);
+        assert_eq!(status.finalized_epoch, anchor_slot / slots_per_epoch());
         // The anchor's own slot: the oldest block this directory can serve,
         // not genesis.
         assert_eq!(status.earliest_available_slot, anchor_slot);

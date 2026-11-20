@@ -1442,7 +1442,7 @@ async fn preferences_with_a_bad_header_type_body_or_count_are_refused() {
 
     // One over the list bound is refused before any entry is looked at.
     let many =
-        vec![signed; ethlambda_state_transition::beacon::preset::PROPOSER_LOOKAHEAD_LENGTH + 1];
+        vec![signed; ethlambda_state_transition::beacon::preset::proposer_lookahead_length() + 1];
     let reply = send(&app, preferences_request(&many, Some("gloas"))).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert!(

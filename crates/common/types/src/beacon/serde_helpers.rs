@@ -179,14 +179,15 @@ pub mod quoted_u64_seq {
         seq.end()
     }
 
-    /// The inverse, into an `SszList<u64, N>`: each element is read quoted or
-    /// bare, and a sequence past the list's bound fails as soon as the extra
-    /// element arrives rather than after buffering all of it.
-    pub fn deserialize<'de, D, const N: usize>(
-        deserializer: D,
-    ) -> Result<libssz_types::SszList<u64, N>, D::Error>
+    /// The inverse, into an `SszList<u64, N>` or a
+    /// [`PresetList`](crate::beacon::preset_sized::PresetList): each element
+    /// is read quoted or bare, and a sequence past the list's bound fails as
+    /// soon as the extra element arrives rather than after buffering all of
+    /// it.
+    pub fn deserialize<'de, D, C>(deserializer: D) -> Result<C, D::Error>
     where
         D: serde::Deserializer<'de>,
+        C: BoundedList<u64>,
     {
         /// One element, accepted as a bare integer or a decimal string.
         struct Element(u64);
@@ -218,22 +219,22 @@ pub mod quoted_u64_seq {
             }
         }
 
-        struct ListVisitor<const N: usize>;
+        struct ListVisitor<C>(std::marker::PhantomData<C>);
 
-        impl<'de, const N: usize> serde::de::Visitor<'de> for ListVisitor<N> {
-            type Value = libssz_types::SszList<u64, N>;
+        impl<'de, C: BoundedList<u64>> serde::de::Visitor<'de> for ListVisitor<C> {
+            type Value = C;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                write!(f, "a sequence of at most {N} unsigned integers")
+                write!(f, "a sequence of at most {} unsigned integers", C::bound())
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut list = libssz_types::SszList::new();
+                let mut list = C::default();
                 while let Some(Element(value)) = seq.next_element()? {
-                    list.push(value).map_err(|err| {
+                    list.push_bounded(value).map_err(|err| {
                         serde::de::Error::custom(format!("sequence exceeds its bound: {err:?}"))
                     })?;
                 }
@@ -241,7 +242,40 @@ pub mod quoted_u64_seq {
             }
         }
 
-        deserializer.deserialize_seq(ListVisitor::<N>)
+        deserializer.deserialize_seq(ListVisitor::<C>(std::marker::PhantomData))
+    }
+
+    /// A list [`deserialize`] can fill one element at a time: libssz's
+    /// const-bounded `SszList` and the preset-bounded
+    /// [`PresetList`](crate::beacon::preset_sized::PresetList).
+    pub trait BoundedList<T>: Default {
+        /// The most elements the list holds.
+        fn bound() -> usize;
+
+        /// Appends `value`, failing when the list is full.
+        fn push_bounded(&mut self, value: T) -> Result<(), libssz_types::TypeError>;
+    }
+
+    impl<T, const N: usize> BoundedList<T> for libssz_types::SszList<T, N> {
+        fn bound() -> usize {
+            N
+        }
+
+        fn push_bounded(&mut self, value: T) -> Result<(), libssz_types::TypeError> {
+            self.push(value)
+        }
+    }
+
+    impl<T, L: crate::beacon::preset::Length> BoundedList<T>
+        for crate::beacon::preset_sized::PresetList<T, L>
+    {
+        fn bound() -> usize {
+            L::get()
+        }
+
+        fn push_bounded(&mut self, value: T) -> Result<(), libssz_types::TypeError> {
+            self.push(value)
+        }
     }
 
     /// The same read into a `ProgressiveList<u64>`, which has no bound to

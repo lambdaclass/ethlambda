@@ -185,7 +185,7 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
     // anchor mid-epoch, and would otherwise fail on its first block with an
     // assertion that names neither the anchor nor the fix.
     eyre::ensure!(
-        anchor_state.slot() % preset::SLOTS_PER_EPOCH == 0,
+        anchor_state.slot() % preset::slots_per_epoch() == 0,
         "the corpus's anchor state is at slot {}, which is not the first slot of an epoch, \
          so fork choice cannot anchor on it; re-fetch the corpus with this build",
         anchor_state.slot()
@@ -227,7 +227,7 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
         if options.warm_committee_sums {
             warm_committee_sums(&clock, &block, previous_epoch)?;
         }
-        previous_epoch = Some(slot / preset::SLOTS_PER_EPOCH);
+        previous_epoch = Some(slot / preset::slots_per_epoch());
         let wall_seconds = import(&mut server, block, slot, block_root).await?;
         eprintln!(
             "warm-up {}/{warmup_total}: slot {slot} imported in {}",
@@ -245,13 +245,13 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
     let total = manifest.slots.len();
     for (iteration, &slot) in manifest.slots.iter().enumerate() {
         let (block, block_root) = load_block(dir, &config, &mut clock, slot)?;
-        let class = BlockClass::classify(parent_slot, slot, preset::SLOTS_PER_EPOCH);
+        let class = BlockClass::classify(parent_slot, slot, preset::slots_per_epoch());
         // Before the timer starts, so the warm-up is in no phase and no
         // `wall_seconds`.
         if options.warm_committee_sums {
             warm_committee_sums(&clock, &block, previous_epoch)?;
         }
-        previous_epoch = Some(slot / preset::SLOTS_PER_EPOCH);
+        previous_epoch = Some(slot / preset::slots_per_epoch());
 
         let timer = PhaseTimer::start(IMPORT_PHASE_HISTOGRAM);
         let stf_timer =
@@ -354,7 +354,7 @@ fn warm_committee_sums(
     block: &SignedBeaconBlock,
     previous_epoch: Option<u64>,
 ) -> eyre::Result<()> {
-    let epoch = block.slot() / preset::SLOTS_PER_EPOCH;
+    let epoch = block.slot() / preset::slots_per_epoch();
     let epochs: Vec<u64> = match previous_epoch {
         Some(previous) if epoch <= previous => return Ok(()),
         // The epoch right after the last one: its predecessor was warmed when
@@ -376,7 +376,7 @@ fn warm_committee_sums(
     let config = store.config();
     let committee_cache = store.committee_cache();
     for epoch in epochs {
-        if parent_state.slot() < epoch * preset::SLOTS_PER_EPOCH {
+        if parent_state.slot() < epoch * preset::slots_per_epoch() {
             let advanced = fork_choice::advance_to_epoch_start(&parent_state, epoch, &config)?;
             committee_cache.warm_key_sums(&advanced, epoch);
         } else {

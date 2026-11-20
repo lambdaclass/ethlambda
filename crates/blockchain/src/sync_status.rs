@@ -414,12 +414,14 @@ impl SyncStatusTracker {
 
 #[cfg(test)]
 mod tests {
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
 
     use super::*;
 
     const LEAN: SyncThresholds = SyncThresholds::LEAN;
-    const BEACON: SyncThresholds = SyncThresholds::BEACON;
+    fn beacon_thresholds() -> SyncThresholds {
+        SyncThresholds::beacon()
+    }
 
     /// A tracker that has judged once, at genesis with every peer there too.
     fn steady(thresholds: SyncThresholds) -> SyncStatusTracker {
@@ -594,14 +596,14 @@ mod tests {
         // epochs after startup, its head flat all along. The window the head
         // has to start moving in runs from that report, not from startup, or
         // the first range batch would get no time at all.
-        let mut tracker = SyncStatusTracker::new(true, BEACON);
+        let mut tracker = SyncStatusTracker::new(true, beacon_thresholds());
         let start = 1_000;
         let head = start - 100;
-        let first_report = start + 2 * BEACON.stall_window;
+        let first_report = start + 2 * beacon_thresholds().stall_window;
         for current in start..first_report {
             assert_eq!(tracker.update(current, head, None), SyncStatus::Synced);
         }
-        let window_end = first_report + BEACON.stall_window;
+        let window_end = first_report + beacon_thresholds().stall_window;
         for current in first_report..=window_end {
             assert_eq!(
                 tracker.update(current, head, Some(current)),
@@ -622,7 +624,7 @@ mod tests {
         // suspend) gave up on its peers at the first judgment after the
         // resume, before range sync could move its head, and read as synced
         // on its stale head.
-        for thresholds in [LEAN, BEACON] {
+        for thresholds in [LEAN, beacon_thresholds()] {
             let window = thresholds.stall_window;
             let mut tracker = SyncStatusTracker::new(true, thresholds);
             let head = 50;
@@ -657,7 +659,7 @@ mod tests {
         // count until the clock passed the old reading again, holding a node
         // behind out of its duties for as long as the step on top of the
         // window.
-        for thresholds in [LEAN, BEACON] {
+        for thresholds in [LEAN, beacon_thresholds()] {
             let window = thresholds.stall_window;
             let half = window / 2;
             let mut tracker = SyncStatusTracker::new(true, thresholds);
@@ -925,10 +927,10 @@ mod tests {
 
         // Beacon is judged about once a slot: a claim made every other slot
         // stretches the window to twice its length, no more.
-        let mut tracker = steady(BEACON);
+        let mut tracker = steady(beacon_thresholds());
         assert_eq!(tracker.update(1_000, 900, Some(1_000)), SyncStatus::Syncing);
         let mut gave_up_at = None;
-        for current in 1_001..=1_000 + 3 * BEACON.stall_window {
+        for current in 1_001..=1_000 + 3 * beacon_thresholds().stall_window {
             let claim = (current % 2 == 1).then_some(current);
             let status = tracker.update(current, 900, claim.or(Some(900)));
             if claim.is_some() && status == SyncStatus::Synced {
@@ -937,7 +939,7 @@ mod tests {
         }
         let gave_up_at = gave_up_at.expect("the window ran out");
         assert!(
-            gave_up_at <= 1_002 + 2 * BEACON.stall_window,
+            gave_up_at <= 1_002 + 2 * beacon_thresholds().stall_window,
             "{gave_up_at}"
         );
     }
@@ -995,7 +997,7 @@ mod tests {
         // and across slots, gets the node to read syncing in at most two
         // windows' worth of slots (the first, and one renewal after a long
         // lapse), give or take a slot of rounding at each.
-        for thresholds in [LEAN, BEACON] {
+        for thresholds in [LEAN, beacon_thresholds()] {
             let window = thresholds.stall_window;
             for seed in 1..=300u64 {
                 let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1039,7 +1041,7 @@ mod tests {
         // way back up, and once more for one deeper cut. A wander over
         // `depth` slots therefore idles the node for at most `2 * depth + 3`
         // windows, however long it goes on.
-        for thresholds in [LEAN, BEACON] {
+        for thresholds in [LEAN, beacon_thresholds()] {
             let window = thresholds.stall_window;
             for seed in 1..=300u64 {
                 let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1142,9 +1144,9 @@ mod tests {
         // Two slots ahead is still a lead.
         assert_eq!(tracker.update(16, 10, Some(12)), SyncStatus::Syncing);
         // The beacon band is unaffected: 32 - 4 slots of lead keep it syncing.
-        let mut beacon = steady(BEACON);
+        let mut beacon = steady(beacon_thresholds());
         assert_eq!(beacon.update(1_000, 900, Some(1_000)), SyncStatus::Syncing);
-        let lead = BEACON.peer_lead - BEACON.hysteresis + 1;
+        let lead = beacon_thresholds().peer_lead - beacon_thresholds().hysteresis + 1;
         assert_eq!(
             beacon.update(1_000, 900, Some(900 + lead)),
             SyncStatus::Syncing
@@ -1163,20 +1165,20 @@ mod tests {
 
     #[test]
     fn the_beacon_thresholds_are_lighthouses() {
-        let epoch = SLOTS_PER_EPOCH;
+        let epoch = slots_per_epoch();
         // A checkpoint-synced follower 100 slots back with peers at the clock.
         assert_eq!(
-            steady(BEACON).update(1_000, 900, Some(1_000)),
+            steady(beacon_thresholds()).update(1_000, 900, Some(1_000)),
             SyncStatus::Syncing
         );
         // Within two epochs of the clock, Lighthouse serves duties.
         assert_eq!(
-            steady(BEACON).update(1_000, 1_000 - 2 * epoch, Some(1_000)),
+            steady(beacon_thresholds()).update(1_000, 1_000 - 2 * epoch, Some(1_000)),
             SyncStatus::Synced
         );
         // Peers within an epoch of us are not `Advanced`.
         assert_eq!(
-            steady(BEACON).update(1_000, 900, Some(900 + epoch)),
+            steady(beacon_thresholds()).update(1_000, 900, Some(900 + epoch)),
             SyncStatus::Synced
         );
     }
@@ -1186,8 +1188,8 @@ mod tests {
         // Finding: importing about a block a slot right at the two-epoch
         // boundary, the lag alternates between just over and just at the
         // threshold, once per tick and once per arrival.
-        let mut tracker = steady(BEACON);
-        let boundary = BEACON.clock_lag;
+        let mut tracker = steady(beacon_thresholds());
+        let boundary = beacon_thresholds().clock_lag;
         let mut head = 1_000 - boundary - 1;
         assert_eq!(
             tracker.update(1_000, head, Some(1_000)),
@@ -1211,7 +1213,7 @@ mod tests {
         }
         // Gaining on the clock by the band releases it.
         let current = 1_100;
-        let caught_up = current - (boundary - BEACON.hysteresis);
+        let caught_up = current - (boundary - beacon_thresholds().hysteresis);
         assert_eq!(
             tracker.update(current, caught_up, Some(current)),
             SyncStatus::Synced

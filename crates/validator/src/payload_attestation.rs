@@ -217,7 +217,7 @@ mod tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::{BlsPubkey, Root};
 
     const GLOAS_EPOCH: u64 = 10;
@@ -243,7 +243,7 @@ mod tests {
     }
 
     fn slot() -> Slot {
-        GLOAS_EPOCH * SLOTS_PER_EPOCH + 4
+        GLOAS_EPOCH * slots_per_epoch() + 4
     }
 
     fn data(slot: Slot) -> PayloadAttestationData {

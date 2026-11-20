@@ -1364,7 +1364,7 @@ mod tests {
     ) -> (SyncAggregate, Root) {
         use crate::beacon::sync_committee_pool::SyncCommitteePool;
         use ethlambda_types::beacon::containers::altair::{
-            SYNC_SUBCOMMITTEE_SIZE, SyncCommitteeMessage,
+            SyncCommitteeMessage, sync_subcommittee_size,
         };
 
         let previous_slot = state.slot() - 1;
@@ -1390,8 +1390,8 @@ mod tests {
                 signature: sign_for(index as usize, signing_root),
             };
             let seats = [(
-                (position / SYNC_SUBCOMMITTEE_SIZE) as u64,
-                position % SYNC_SUBCOMMITTEE_SIZE,
+                (position / sync_subcommittee_size()) as u64,
+                position % sync_subcommittee_size(),
             )];
             pool.insert_message(&message, &seats);
         }

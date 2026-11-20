@@ -23,7 +23,7 @@ use std::{
 use ethlambda_types::beacon::{
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
     containers::altair::{
-        SYNC_SUBCOMMITTEE_SIZE, SyncAggregate, SyncCommitteeContribution, SyncCommitteeMessage,
+        SyncAggregate, SyncCommitteeContribution, SyncCommitteeMessage, sync_subcommittee_size,
     },
     primitives::{BlsSignature, Root, Slot},
 };
@@ -69,13 +69,13 @@ impl SyncCommitteePool {
         let mut inserted = false;
         for &(subcommittee, position) in seats {
             if subcommittee >= SYNC_COMMITTEE_SUBNET_COUNT as u64
-                || position >= SYNC_SUBCOMMITTEE_SIZE
+                || position >= sync_subcommittee_size()
             {
                 continue;
             }
             let signatures = by_key
                 .entry((message.beacon_block_root, subcommittee))
-                .or_insert_with(|| vec![None; SYNC_SUBCOMMITTEE_SIZE]);
+                .or_insert_with(|| vec![None; sync_subcommittee_size()]);
             if signatures[position].is_none() {
                 signatures[position] = Some(message.signature);
                 inserted = true;
@@ -176,10 +176,10 @@ impl SyncCommitteePool {
                 continue;
             };
             let mut any = false;
-            for position in 0..SYNC_SUBCOMMITTEE_SIZE {
+            for position in 0..sync_subcommittee_size() {
                 if contribution.aggregation_bits.get(position).unwrap_or(false) {
                     bits.set(
-                        subcommittee as usize * SYNC_SUBCOMMITTEE_SIZE + position,
+                        subcommittee as usize * sync_subcommittee_size() + position,
                         true,
                     )
                     .expect("the position is below the committee size");
@@ -256,15 +256,15 @@ mod tests {
         bits: &ethlambda_types::beacon::containers::altair::SyncSubcommitteeBits,
     ) -> Vec<BlsPubkey> {
         let committee = sync_committee_for_slot(state, SLOT).unwrap();
-        (0..SYNC_SUBCOMMITTEE_SIZE)
+        (0..sync_subcommittee_size())
             .filter(|&i| bits.get(i).unwrap())
-            .map(|i| committee.pubkeys[subcommittee as usize * SYNC_SUBCOMMITTEE_SIZE + i])
+            .map(|i| committee.pubkeys[subcommittee as usize * sync_subcommittee_size() + i])
             .collect()
     }
 
     #[test]
     fn a_position_keeps_its_first_signature() {
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let mut pool = SyncCommitteePool::default();
         let (message, seats) = message_for(&state, 3, root());
         assert!(pool.insert_message(&message, &seats));
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_contribution_with_more_participants_is_kept() {
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let (first, seats_first) = message_for(&state, 0, root());
         let (second, seats_second) = message_for(&state, 1, root());
         let subcommittee = seats_first[0].0;
@@ -339,7 +339,7 @@ mod tests {
     fn a_contribution_is_extended_by_messages_at_uncovered_positions() {
         // Committee of 512 seats drawn from 512 validators: validator v holds
         // position v, so subcommittee 0 holds validators 0..128.
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let (a, seats_a) = message_for(&state, 0, root());
         let (b, seats_b) = message_for(&state, 1, root());
         let (c, seats_c) = message_for(&state, 2, root());
@@ -376,19 +376,20 @@ mod tests {
     }
 
     /// The committee size of the preset the tests build, as a validator count.
-    const SYNC_COMMITTEE_SIZE_FOR_TESTS: usize =
-        ethlambda_types::beacon::preset::SYNC_COMMITTEE_SIZE;
+    fn sync_committee_size_for_tests() -> usize {
+        ethlambda_types::beacon::preset::sync_committee_size()
+    }
 
     #[test]
     fn the_aggregate_offsets_bits_per_subcommittee_and_verifies() {
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let mut pool = SyncCommitteePool::default();
         // One member of each subcommittee: validator `s * SIZE` sits at the
         // subcommittee's first position.
         for subcommittee in 0..SYNC_COMMITTEE_SUBNET_COUNT {
             let (message, seats) = message_for(
                 &state,
-                (subcommittee * SYNC_SUBCOMMITTEE_SIZE) as u64,
+                (subcommittee * sync_subcommittee_size()) as u64,
                 root(),
             );
             assert!(pool.insert_message(&message, &seats));
@@ -401,7 +402,7 @@ mod tests {
         let committee = sync_committee_for_slot(&state, SLOT).unwrap();
         let mut pubkeys = Vec::new();
         for subcommittee in 0..SYNC_COMMITTEE_SUBNET_COUNT {
-            let position = subcommittee * SYNC_SUBCOMMITTEE_SIZE;
+            let position = subcommittee * sync_subcommittee_size();
             assert!(aggregate.sync_committee_bits.get(position).unwrap());
             pubkeys.push(committee.pubkeys[position]);
         }
@@ -420,7 +421,7 @@ mod tests {
 
     #[test]
     fn different_roots_stay_separate_and_an_empty_pool_has_no_aggregate() {
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let mut pool = SyncCommitteePool::default();
         assert!(pool.sync_aggregate(SLOT, root()).is_none());
         let (message, seats) = message_for(&state, 0, root());
@@ -433,7 +434,7 @@ mod tests {
 
     #[test]
     fn pruning_drops_older_slots_and_inserts_prune_themselves() {
-        let state = state_with_committees(SYNC_COMMITTEE_SIZE_FOR_TESTS);
+        let state = state_with_committees(sync_committee_size_for_tests());
         let mut pool = SyncCommitteePool::default();
         let (message, seats) = message_for(&state, 0, root());
         pool.insert_message(&message, &seats);

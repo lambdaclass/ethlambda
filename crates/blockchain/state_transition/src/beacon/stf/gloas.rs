@@ -219,7 +219,7 @@ pub fn get_builder_withdrawals(
     mut withdrawal_index: WithdrawalIndex,
     prior_withdrawals: &[capella::Withdrawal],
 ) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
-    let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1;
+    let withdrawals_limit = preset::max_withdrawals_per_payload() - 1;
     verify(
         prior_withdrawals.len() <= withdrawals_limit,
         "get_builder_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
@@ -264,8 +264,8 @@ pub fn get_builders_sweep_withdrawals(
     let epoch = get_current_epoch(state);
     let inner = gloas_state_ref(state, "get_builders_sweep_withdrawals")?;
     let builders_len = inner.builders.len() as u64;
-    let builders_limit = builders_len.min(preset::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP);
-    let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1;
+    let builders_limit = builders_len.min(preset::max_builders_per_withdrawals_sweep());
+    let withdrawals_limit = preset::max_withdrawals_per_payload() - 1;
     verify(
         prior_withdrawals.len() <= withdrawals_limit,
         "get_builders_sweep_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
@@ -509,7 +509,7 @@ fn update_next_withdrawal_validator_index(
         validator_count > 0,
         "update_next_withdrawal_validator_index: len(state.validators) > 0",
     )?;
-    let next_validator_index = if withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD {
+    let next_validator_index = if withdrawals.len() == preset::max_withdrawals_per_payload() {
         let latest = withdrawals
             .last()
             .expect("MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty");
@@ -523,7 +523,7 @@ fn update_next_withdrawal_validator_index(
     } else {
         let (_, current_cursor) = state.withdrawal_cursor()?;
         current_cursor
-            .checked_add(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
+            .checked_add(preset::max_validators_per_withdrawals_sweep())
             .ok_or(Error::ArithmeticOverflow(
                 "update_next_withdrawal_validator_index: next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
             ))?
@@ -937,8 +937,8 @@ pub fn process_execution_payload_bid(
             },
             proposer_index,
         };
-        let index = preset::SLOTS_PER_EPOCH
-            .checked_add(bid.slot % preset::SLOTS_PER_EPOCH)
+        let index = preset::slots_per_epoch()
+            .checked_add(bid.slot % preset::slots_per_epoch())
             .ok_or(Error::ArithmeticOverflow(
                 "process_execution_payload_bid: SLOTS_PER_EPOCH + bid.slot % SLOTS_PER_EPOCH",
             ))? as usize;
@@ -1039,8 +1039,8 @@ pub fn apply_parent_execution_payload(
     // Settle the builder payment.
     let current_epoch = get_current_epoch(state);
     if parent_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(parent_slot % preset::SLOTS_PER_EPOCH)
+        let payment_index = preset::slots_per_epoch()
+            .checked_add(parent_slot % preset::slots_per_epoch())
             .ok_or(Error::ArithmeticOverflow(
                 "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
             ))?;
@@ -1049,7 +1049,7 @@ pub fn apply_parent_execution_payload(
             payment_index,
         )?;
     } else if parent_epoch == get_previous_epoch(state) {
-        let payment_index = parent_slot % preset::SLOTS_PER_EPOCH;
+        let payment_index = parent_slot % preset::slots_per_epoch();
         settle_builder_payment(
             gloas_state(state, "apply_parent_execution_payload")?,
             payment_index,
@@ -1068,7 +1068,7 @@ pub fn apply_parent_execution_payload(
     }
 
     // Update parent payload availability and latest block hash.
-    let slot_index = (parent_slot as usize) % preset::SLOTS_PER_HISTORICAL_ROOT;
+    let slot_index = (parent_slot as usize) % preset::slots_per_historical_root();
     let inner = gloas_state(state, "apply_parent_execution_payload")?;
     inner
         .execution_payload_availability
@@ -1283,14 +1283,14 @@ pub fn process_proposer_slashing(
     let slot = proposer_slashing.signed_header_1.message.slot;
     let proposal_epoch = compute_epoch_at_slot(slot);
     if proposal_epoch == current_epoch {
-        let payment_index = preset::SLOTS_PER_EPOCH
-            .checked_add(slot % preset::SLOTS_PER_EPOCH)
+        let payment_index = preset::slots_per_epoch()
+            .checked_add(slot % preset::slots_per_epoch())
             .ok_or(Error::ArithmeticOverflow(
                 "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
             ))? as usize;
         clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
     } else if proposal_epoch == get_previous_epoch(state) {
-        let payment_index = (slot % preset::SLOTS_PER_EPOCH) as usize;
+        let payment_index = (slot % preset::slots_per_epoch()) as usize;
         clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
     }
 
@@ -1465,13 +1465,13 @@ pub fn process_attestation(
 
     let current_epoch_target = data.target.epoch == current_epoch;
     let payment_index = if current_epoch_target {
-        preset::SLOTS_PER_EPOCH
-            .checked_add(data.slot % preset::SLOTS_PER_EPOCH)
+        preset::slots_per_epoch()
+            .checked_add(data.slot % preset::slots_per_epoch())
             .ok_or(Error::ArithmeticOverflow(
                 "process_attestation: SLOTS_PER_EPOCH + data.slot % SLOTS_PER_EPOCH",
             ))? as usize
     } else {
-        (data.slot % preset::SLOTS_PER_EPOCH) as usize
+        (data.slot % preset::slots_per_epoch()) as usize
     };
     let mut payment = {
         let inner = gloas_state_ref(state, "process_attestation")?;
