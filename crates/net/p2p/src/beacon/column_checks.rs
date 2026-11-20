@@ -37,9 +37,11 @@
 //! [`KZG_BATCH_COLUMNS`], not by how many columns the block has. The
 //! prechecks' share is not bounded that way: they take the group's sidecars in
 //! turn, one header judgment (a state read, and past the lookahead a state
-//! advance) plus a check per sidecar, and how long that holds a permit on a
-//! live node is unmeasured. Nothing awaits a permit while it holds one, so
-//! groups and sub-batches cannot deadlock the pool between them. The pool is
+//! advance) plus a check per sidecar. Both stages' blocking tasks are timed as
+//! `kind="column_check"` (`lean_beacon_validation_run_seconds`), so the
+//! prechecks' hold is measured only together with the KZG sub-batches', not on
+//! its own. Nothing awaits a permit while it holds one, so groups and
+//! sub-batches cannot deadlock the pool between them. The pool is
 //! shared with the envelope checks (`envelope_checks.rs`, one permit per
 //! envelope), and tokio serves waiting requests in arrival order, so an
 //! envelope waits behind only the requests queued before it.
@@ -288,6 +290,31 @@ const KZG_BATCH_COLUMNS: usize = 16;
 /// are checked against.
 type Pending = (DataColumnSidecar, PendingKzg);
 
+/// A [`P2PServer::column_check_permits`] permit, counted in
+/// `lean_beacon_validation_permits_in_use{pool="column_check"}` for as long as
+/// it is held. One value, so the gauge falls wherever the permit is released:
+/// at the end of the sub-batch it moved into, or with the group task holding
+/// it when nothing was left to verify or a precheck panic cut the group short.
+struct HeldPermit {
+    _permit: OwnedSemaphorePermit,
+    _in_use: metrics::PoolInUse,
+}
+
+/// Wait for a [`P2PServer::column_check_permits`] permit, the wait observed
+/// under `lean_beacon_column_check_permit_wait_seconds{kind="column_check"}`.
+/// Both a group (its prechecks and first KZG sub-batch) and each further
+/// sub-batch take theirs here. `None` only once the semaphore is closed, which
+/// it never is.
+async fn acquire_permit(permits: &Arc<Semaphore>) -> Option<HeldPermit> {
+    let waiting_since = Instant::now();
+    let permit = permits.clone().acquire_owned().await.ok()?;
+    metrics::observe_column_check_permit_wait("column_check", waiting_since.elapsed());
+    Some(HeldPermit {
+        _permit: permit,
+        _in_use: metrics::PoolInUse::new("column_check"),
+    })
+}
+
 /// What some of one block's sidecars came to: the ones to store, the ones to
 /// park, and the reason for each one dropped.
 #[derive(Default)]
@@ -451,14 +478,17 @@ async fn check_group(
     blockchain: P2PToBlockChainRef,
     permits: Arc<Semaphore>,
     group: Vec<DataColumnSidecar>,
-    permit: OwnedSemaphorePermit,
+    permit: HeldPermit,
     arrival: ColumnArrival,
     shared: SharedVerdicts,
 ) {
     let group_size = group.len();
-    let prechecked =
-        tokio::task::spawn_blocking(move || precheck_group(&store, group, unix_now_ms(), arrival))
-            .await;
+    let task = metrics::BlockingTask::new("column_check");
+    let prechecked = tokio::task::spawn_blocking(move || {
+        let _run = task.start();
+        precheck_group(&store, group, unix_now_ms(), arrival)
+    })
+    .await;
     let (settled, pending) = match prechecked {
         Ok(prechecked) => prechecked,
         // Tokio has already caught the panic. A sidecar's own checks catch
@@ -484,12 +514,12 @@ async fn check_group(
         // waits, the first having moved into its batch.
         let permit = match own_permit.take() {
             Some(permit) => permit,
-            None => match permits.clone().acquire_owned().await {
-                Ok(permit) => permit,
+            None => match acquire_permit(&permits).await {
+                Some(permit) => permit,
                 // The semaphore is never closed, so this does not happen
                 // today. Should it ever, the sidecars not yet sent to a batch
                 // are lost, and say so rather than vanish.
-                Err(_) => {
+                None => {
                     let lost =
                         batch.len() + remaining.by_ref().map(|rest| rest.len()).sum::<usize>();
                     error!(
@@ -502,8 +532,10 @@ async fn check_group(
             },
         };
         let size = batch.len();
+        let task = metrics::BlockingTask::new("column_check");
         let verified = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _run = task.start();
             verify_batch(batch, arrival)
         });
         batches.push((size, verified));
@@ -615,7 +647,7 @@ pub(crate) fn check_and_forward_then(
         for group in groups {
             // The semaphore is never closed, so this only returns once a
             // permit is free.
-            let Ok(permit) = permits.clone().acquire_owned().await else {
+            let Some(permit) = acquire_permit(&permits).await else {
                 return;
             };
             tokio::spawn(check_group(

@@ -16,7 +16,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
-use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
+use ethlambda_network_api::{
+    AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, GossipEvent,
+};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
@@ -269,6 +271,7 @@ impl Validated {
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
         if outcome == Outcome::Accept {
             record_liveness(server, &self);
+            publish_gossip_event(server, &self);
         }
         if let Self::Aggregate { aggregate, .. } = &self
             && outcome == Outcome::Accept
@@ -406,8 +409,7 @@ impl Validated {
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
-            // The SSE `execution_payload_bid` and `proposer_preferences` events
-            // hook in here once the events endpoint lands.
+            // Their events went out above, in `publish_gossip_event`.
             | Self::ExecutionPayloadBid { .. }
             | Self::ProposerPreferences(_)
             | Self::PayloadAttestation(_)
@@ -416,6 +418,40 @@ impl Validated {
             | Self::SyncContribution(_) => {}
         }
     }
+}
+
+/// Report an accepted gloas object on the Beacon API's event stream, for the
+/// four topics whose objects never reach the chain actor that publishes the
+/// rest (bids and preferences stop here, and a payload attestation message
+/// only ever feeds fork choice).
+///
+/// Only on `Accept`, since each event names objects that passed the topic's
+/// rules. A queued envelope has not, so `execution_payload_gossip` waits for
+/// the copy that does. Behind the subscriber check, because a bid is cloned
+/// into the event.
+fn publish_gossip_event(server: &P2PServer, object: &Validated) {
+    let Some(sink) = &server.gossip_events else {
+        return;
+    };
+    let event = match object {
+        Validated::Envelope(envelope) => GossipEvent::ExecutionPayloadGossip {
+            slot: envelope.message.payload.slot_number,
+            builder_index: envelope.message.builder_index,
+            block_hash: envelope.message.payload.block_hash,
+            block_root: envelope.message.beacon_block_root,
+        },
+        Validated::ExecutionPayloadBid { bid, .. } if sink.has_subscribers() => {
+            GossipEvent::ExecutionPayloadBid(bid.clone())
+        }
+        Validated::ProposerPreferences(preferences) if sink.has_subscribers() => {
+            GossipEvent::ProposerPreferences(preferences.clone())
+        }
+        Validated::PayloadAttestation(message) if sink.has_subscribers() => {
+            GossipEvent::PayloadAttestationMessage(message.clone())
+        }
+        _ => return,
+    };
+    sink.emit(event);
 }
 
 /// Mark the validators an accepted aggregate or subnet attestation names as
@@ -616,20 +652,26 @@ fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
 ) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
+    match pool_of(object) {
+        "gossip" => &server.gossip_validation_permits,
+        "attestation" => &server.attestation_validation_permits,
+        "builder" => &server.builder_validation_permits,
+        _ => &server.sync_validation_permits,
+    }
+}
+
+/// The label (see [`metrics::VALIDATION_POOLS`]) of the permit pool
+/// [`permits_for`] draws `object`'s permit from. The one `match` on the
+/// object kind, so the pool metrics and the pool actually used cannot differ.
+fn pool_of(object: &Validated) -> &'static str {
     match object {
-        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
-            &server.gossip_validation_permits
-        }
+        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => "gossip",
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
-        | Validated::Operation(_) => &server.attestation_validation_permits,
-        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
-            &server.builder_validation_permits
-        }
-        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
-            &server.sync_validation_permits
-        }
+        | Validated::Operation(_) => "attestation",
+        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => "builder",
+        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => "sync",
     }
 }
 
@@ -658,7 +700,9 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
+    let pool = pool_of(&object);
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
+        metrics::inc_validation_permit_exhausted(pool);
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -667,8 +711,12 @@ pub(crate) fn spawn_stateful_checks(
     };
     let store = server.store.clone();
     let actor = ctx.actor_ref();
+    let in_use = metrics::PoolInUse::new(pool);
+    let task = metrics::BlockingTask::new(id.kind);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _in_use = in_use;
+        let _run = task.start();
         let mut object = object;
         let outcome = guarded(|| object.stateful_checks(&store));
         let _ = actor

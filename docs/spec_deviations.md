@@ -641,8 +641,9 @@ newer than the release the fixtures are pinned to.
 
 `verify_execution_payload_envelope` asks the execution engine last, as part of
 one boolean function. The follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability),
-then asks the engine with `engine_newPayloadV5` only about an envelope that
+(`check_execution_payload_envelope_columns_verified`: signature, bid, state;
+data availability is every sampled column being stored, since a column is
+verified before it is stored), then asks the engine with `engine_newPayloadV5` only about an envelope that
 passed them, and records it with `accept_execution_payload_envelope`. The
 engine's part is answered "valid" inside the checks because its answer has
 three outcomes and the specification's `ExecutionEngine` has two.
@@ -844,3 +845,23 @@ signature, whichever way the node answered. Three departures:
   slot instead: it is one request for every validator, where the kept
   preferences are one request each, since a node answers a call carrying
   several with one status for all of them.
+
+## The validator client sends `committee_index=0` at gloas slots
+
+- **Beacon API:** `GET /eth/v1/validator/attestation_data` marks
+  `committee_index` deprecated and optional: "For slots in Electra and later,
+  this parameter MAY always be set to 0. For slots in Gloas and later, this
+  parameter SHOULD be omitted."
+- **ethlambda:** the validator client sends `committee_index=0` at every fork,
+  gloas included (`HttpBeaconNode::attestation_data_path`).
+- **Why:** Lighthouse (v8.3.3, and `unstable`) still declares the parameter
+  required and answers a query without it with a `400`, so omitting it would
+  miss every gloas attestation against a Lighthouse beacon node. The value
+  changes nothing: Lighthouse's handler produces the data for committee 0
+  whatever the query names, ethlambda's own beacon node ignores the
+  parameter, and the answer's `index` is the payload signal whatever was
+  asked. ethlambda's beacon node still answers a query that omits it, as
+  spec-following validator clients send.
+- **Until:** Lighthouse's `ValidatorAttestationDataQuery` makes
+  `committee_index` optional. The gloas query can then omit it again, as the
+  Beacon API asks.
