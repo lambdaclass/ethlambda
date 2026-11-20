@@ -687,6 +687,25 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
+## Columns built from the execution client's blobs are verified
+
+- **The specification:** fulu `p2p-interface.md`, "Distributed blob publishing
+  using blobs retrieved from local execution-layer client": a client that
+  builds data column sidecars from `engine_getBlobsV2`'s answer SHOULD skip
+  verifying them, and MUST then treat them as received on gossip.
+- **ethlambda:** the built sidecars go through every chain check a fetched
+  column gets, KZG proofs included, before they are published, recorded seen
+  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`). Columns
+  that fail are dropped and counted in `lean_engine_blob_columns_refused_total`.
+- **Why:** a stored column keeps every later copy of it out (`AlreadyStored`),
+  and block import trusts the stored columns, so a wrong blob or proof taken
+  on trust from a faulty execution client would either stop its block for
+  good or import it on data nobody verified. The same checks also catch a
+  block from the wrong proposer past its parent state's lookahead, which the
+  proposer precheck made before the call cannot.
+- **Consequence:** one KZG batch over the custody columns per `getBlobsV2`
+  hit, on the blocking pool, between the answer and publication.
+
 ## `forkchoiceUpdated` for a gloas head
 
 - The head hash follows the head node: `bid.block_hash` for a FULL head,

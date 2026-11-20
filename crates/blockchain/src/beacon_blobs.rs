@@ -16,7 +16,8 @@
 //!     every blob   -> spawn_blocking:
 //!                       block imported meanwhile?  -> stop
 //!                       custody columns still missing, none? -> stop
-//!                       cells + sidecars (no KZG verification)
+//!                       cells + sidecars
+//!                       the chain checks, KZG included (check_built)
 //!                     check_data_column_sidecars(.., ExecutionLayer)
 //!   p2p: records the columns as seen, publishes the new ones on their
 //!        subnets, forwards them to the chain actor, which stores them and
@@ -52,10 +53,19 @@
 //! - **V2, not V3.** V3 answers partially, but a column needs one cell from
 //!   every blob, so a partial blob set builds no complete column and this node
 //!   has no partial-column assembly.
-//! - **No KZG verification.** The specification lets a node skip verifying
-//!   blobs from its own execution client, so the proofs are trusted as given
-//!   and the build is [`data_columns::unverified_sidecars`]. A mismatch with
-//!   the block still fails the shape checks there.
+//! - **Checked like a fetched column.** The specification lets a node skip
+//!   verifying blobs from its own execution client, but this node does not:
+//!   the built sidecars go through the same chain checks a fetched column does
+//!   ([`check_built`]), KZG proofs included, before anything is published or
+//!   stored. Two things depend on it. The proposer precheck below cannot name
+//!   the expected proposer for a slot past its parent's lookahead, while the
+//!   chain checks advance the parent's state to find out. And every row in
+//!   `DataColumns` is one this node verified: a column stored here keeps every
+//!   other copy of it out (`AlreadyStored`), and block import trusts the stored
+//!   columns, so a wrong blob or proof taken on trust would either stop the
+//!   block for good or import it on data nobody checked. The cost is one KZG
+//!   batch over the custody columns, on the blocking pool. See
+//!   `docs/spec_deviations.md`.
 //! - **Not gloas.** From gloas on, data availability moves from the block to
 //!   the payload envelope, so a held gloas block has no columns to fill this
 //!   way.
@@ -69,6 +79,8 @@ use std::time::Instant;
 use ethlambda_engine::EngineClient;
 use ethlambda_network_api::{BlockChainToP2PRef, SidecarOrigin};
 use ethlambda_state_transition::beacon::data_columns;
+use ethlambda_state_transition::beacon::gossip::column::{self, ChainPrechecks, ChainVerdict};
+use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::precheck::{Reference, precheck_block};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_storage::Store;
@@ -77,6 +89,7 @@ use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, 
 use ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB;
 use ethlambda_types::beacon::primitives::KzgProof;
 use ethlambda_types::primitives::H256;
+use ethlambda_types::time::unix_now_ms;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics;
@@ -106,15 +119,18 @@ pub(crate) fn recent_enough_to_ask(slot: u64, current_slot: u64) -> bool {
 /// client's blobs: its proposer signature, and the rest of
 /// [`precheck_block`]'s rules, hold against its parent's post-state.
 ///
-/// The columns built here carry the block's own signed header and skip every
-/// check on their way out (see `SidecarOrigin::ExecutionLayer`): p2p records
-/// them in the seen cache under `(slot, proposer, index)` and publishes them.
-/// A block can reach its hold unverified, since range sync and by-root
-/// answers never pass gossip validation and the import checks the signature
-/// only after data availability. Without this, a peer serving a forged copy
-/// whose commitments name blobs in the local pool would have this node publish
-/// columns its peers reject, and take the seen-cache key of the real block's
-/// columns from the same proposer and slot.
+/// A filter, not the guard: [`check_built`] runs every chain check on the
+/// built columns before they leave this module, and is what keeps a forged
+/// header out of p2p's seen cache and off the wire. This only saves asking the
+/// execution client, and computing cells, for a block whose signature already
+/// fails here. A block can reach its hold unverified, since range sync and
+/// by-root answers never pass gossip validation and the import checks the
+/// signature only after data availability.
+///
+/// It cannot catch everything [`check_built`] does: past the parent state's
+/// proposer lookahead, [`precheck_block`] checks the signature against the
+/// key of whichever validator the block names, not that this validator is the
+/// slot's proposer.
 ///
 /// The parent has a post-state whenever the import reaches a hold; a hold
 /// without one is not asked about.
@@ -257,7 +273,8 @@ async fn fetch_and_publish(
             }
         };
         metrics::observe_engine_blobs_to_columns(converted.elapsed());
-        Some(sidecars)
+        let sidecars = sidecars.into_iter().map(DataColumnSidecar::Fulu).collect();
+        Some(check_built(&store, slot, block_root, sidecars))
     })
     .await;
 
@@ -271,8 +288,6 @@ async fn fetch_and_publish(
     };
 
     let columns = sidecars.len();
-    let sidecars: Vec<DataColumnSidecar> =
-        sidecars.into_iter().map(DataColumnSidecar::Fulu).collect();
     if let Err(err) = p2p.check_data_column_sidecars(sidecars, SidecarOrigin::ExecutionLayer) {
         error!(%slot, %err, "Failed to hand execution-client columns to P2P");
         return;
@@ -286,6 +301,81 @@ async fn fetch_and_publish(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Built data columns from the execution client's blobs"
     );
+}
+
+/// The built `sidecars` that pass every chain check a fetched column gets
+/// ([`column::chain_checks`]'s rules, in the two stages p2p runs them for one
+/// block: [`ChainPrechecks`], then one KZG batch).
+///
+/// That is the structure, the clock and finality, `AlreadyStored`, the signed
+/// header (parent state, slot order, signature, the expected proposer, past
+/// the lookahead by advancing the parent's state), finalized ancestry, the
+/// inclusion proof, and the cells against the block's commitments. The
+/// sidecars all carry one signed header, so the header is judged once.
+///
+/// A refusal drops the column and is counted by reason
+/// (`lean_engine_blob_columns_refused_total`). `AlreadyStored` is not a
+/// refusal: gossip or a peer answer stored that column while the execution
+/// client answered, which is the race this call loses at times. Anything else
+/// is a block whose header does not hold (a forged or wrong-proposer block that
+/// got past the precheck) or an execution client whose blobs or proofs do not
+/// match the block, and none of it may reach p2p's seen cache, the wire or
+/// `DataColumns`.
+fn check_built(
+    store: &Store,
+    slot: u64,
+    block_root: H256,
+    sidecars: Vec<DataColumnSidecar>,
+) -> Vec<DataColumnSidecar> {
+    let mut prechecks = ChainPrechecks::new(store, unix_now_ms());
+    let mut refused: Vec<ChainVerdict> = Vec::new();
+    let mut pending = Vec::with_capacity(sidecars.len());
+    for sidecar in sidecars {
+        match prechecks.check(&sidecar) {
+            Ok(kzg) => pending.push((sidecar, kzg)),
+            Err(verdict) => refused.push(verdict),
+        }
+    }
+
+    let verdicts = {
+        let items: Vec<_> = pending
+            .iter()
+            .map(|(sidecar, kzg)| (sidecar, kzg))
+            .collect();
+        column::kzg_verdicts(&items)
+    };
+    let mut kept = Vec::with_capacity(pending.len());
+    for ((sidecar, _), verdict) in pending.into_iter().zip(verdicts) {
+        match verdict {
+            ChainVerdict::Keep => kept.push(sidecar),
+            verdict => refused.push(verdict),
+        }
+    }
+
+    let stored_meanwhile = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
+    for verdict in refused
+        .iter()
+        .filter(|&&verdict| verdict != stored_meanwhile)
+    {
+        let reason = match verdict {
+            ChainVerdict::Drop(outcome) => outcome.labels().1,
+            // The parent has a post-state whenever a block is held, so this
+            // is not expected; counted rather than asserted.
+            ChainVerdict::AwaitParent | ChainVerdict::Keep => "await_parent",
+        };
+        metrics::inc_engine_blob_columns_refused(reason);
+    }
+    if let Some(verdict) = refused.iter().find(|&&verdict| verdict != stored_meanwhile) {
+        warn!(
+            %slot,
+            block_root = %ShortRoot(&block_root.0),
+            ?verdict,
+            refused = refused.len(),
+            kept = kept.len(),
+            "The chain checks refused columns built from the execution client's blobs; not publishing them"
+        );
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -320,20 +410,34 @@ mod tests {
     /// signed block passes the precheck a hold runs before it asks the
     /// execution client.
     fn store_with_keyed_parent() -> Store {
-        let keyed = test_state::with_signing_validators_at(ForkName::Phase0, 1);
-        let validator = keyed.validator(0).expect("one validator").clone();
-        let mut state = bare_state();
-        state
-            .push_validator(validator, preset::MAX_EFFECTIVE_BALANCE)
-            .expect("one validator fits the registry");
-        state.apply_pending_mutations();
+        store_with_keyed_parent_of(1)
+    }
 
+    /// [`store_with_keyed_parent`] with `count` validators, each registered
+    /// under the key [`sign`] uses for its index.
+    fn store_with_keyed_parent_of(count: usize) -> Store {
         let mut store = beacon_store(0, 0);
         store
             .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
             .expect("insert");
-        store.insert_state(H256::ZERO, state).expect("insert");
         store
+            .insert_state(H256::ZERO, keyed_parent_state(count))
+            .expect("insert");
+        store
+    }
+
+    /// `bare_state` with `count` validators keyed as [`sign`] signs.
+    fn keyed_parent_state(count: usize) -> ethlambda_types::beacon::containers::BeaconState {
+        let keyed = test_state::with_signing_validators_at(ForkName::Phase0, count);
+        let mut state = bare_state();
+        for index in 0..count {
+            let validator = keyed.validator(index as u64).expect("keyed").clone();
+            state
+                .push_validator(validator, preset::MAX_EFFECTIVE_BALANCE)
+                .expect("the validators fit the registry");
+        }
+        state.apply_pending_mutations();
+        state
     }
 
     /// `block` signed by validator 0, its proposer, under the mainnet fork
@@ -366,10 +470,18 @@ mod tests {
     /// The `result` of an `engine_getBlobsV2` answer for `blobs`, with real
     /// cell proofs.
     fn answer_for(blobs: &[Vec<u8>]) -> String {
+        answer_with_proofs_of(blobs, blobs)
+    }
+
+    /// An answer carrying `blobs`, each with the cell proofs of the blob at the
+    /// same position in `proofs_from`: [`answer_for`] when the two are equal,
+    /// a well-shaped answer with wrong proofs otherwise.
+    fn answer_with_proofs_of(blobs: &[Vec<u8>], proofs_from: &[Vec<u8>]) -> String {
         let entries: Vec<String> = blobs
             .iter()
-            .map(|blob| {
-                let (_, proofs) = kzg::compute_cells_and_kzg_proofs(blob).unwrap();
+            .zip(proofs_from)
+            .map(|(blob, proof_blob)| {
+                let (_, proofs) = kzg::compute_cells_and_kzg_proofs(proof_blob).unwrap();
                 let proofs: Vec<String> = proofs
                     .iter()
                     .map(|proof| format!("\"0x{}\"", hex::encode(proof.0)))
@@ -451,6 +563,11 @@ mod tests {
     /// A fulu block at slot 1 committing to each of `blobs`, signed by its
     /// proposer.
     fn block_committing_to(blobs: &[Vec<u8>]) -> SignedBeaconBlock {
+        block_by(0, blobs)
+    }
+
+    /// [`block_committing_to`], naming `proposer` and signed by its key.
+    fn block_by(proposer: u64, blobs: &[Vec<u8>]) -> SignedBeaconBlock {
         let mut block = fulu_block(H256::ZERO, 1, 0);
         let commitments: Vec<KzgCommitment> = blobs
             .iter()
@@ -459,6 +576,7 @@ mod tests {
         let SignedBeaconBlock::Fulu(inner) = &mut block else {
             unreachable!("fulu_block builds a fulu block");
         };
+        inner.message.proposer_index = proposer;
         inner.message.body.blob_kzg_commitments = SszList::try_from(commitments).unwrap();
         sign(block)
     }
@@ -653,6 +771,98 @@ mod tests {
             1,
             "only the block at the edge of the window was asked about"
         );
+    }
+
+    /// An execution client whose proofs do not match its blobs (here, each
+    /// blob answered with another blob's proofs): the answer has the right
+    /// shape and the precheck passes, but the KZG batch refuses every built
+    /// column, so nothing reaches p2p's seen cache, the wire or `DataColumns`.
+    #[tokio::test]
+    async fn columns_with_wrong_proofs_are_not_handed_over() {
+        let blobs = vec![blob_bytes(11), blob_bytes(12)];
+        let block = block_committing_to(&blobs);
+        // Not another `blob_bytes`: two of those differ by the same constant
+        // in every field element, and a cell proof does not change when a
+        // constant is added to the polynomial, so their proofs coincide.
+        let scrambled = |seed: u8| -> Vec<u8> {
+            let mut bytes = blob_bytes(seed);
+            for element in bytes.chunks_mut(32) {
+                element[2] = element[2].wrapping_mul(7);
+            }
+            bytes
+        };
+        let wrong = answer_with_proofs_of(&blobs, &[scrambled(11), scrambled(12)]);
+        assert_ne!(wrong, answer_for(&blobs), "the proofs differ");
+        let (engine, requests) = mock_engine(wrong).await;
+        let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent());
+        server.engine = Some(engine);
+        server.custody_columns = CUSTODY.to_vec();
+
+        server.hold_block_for_columns(block, 1, ImportTimings::default());
+        for _ in 0..40 {
+            if requests.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the engine was asked");
+        assert!(p2p.checks.lock().unwrap().is_empty());
+    }
+
+    /// A block past its parent state's proposer lookahead (a phase0 parent has
+    /// none), naming a validator that is not the slot's proposer and signed by
+    /// that validator's own key. The precheck can only check the signature
+    /// there, so it passes and the execution client is asked; the chain checks
+    /// advance the parent's state, find the real proposer, and refuse every
+    /// column. The slot's real proposer's block, from the same blobs, is
+    /// handed over.
+    #[tokio::test]
+    async fn a_block_from_the_wrong_proposer_past_the_lookahead_is_not_handed_over() {
+        let config = Config::mainnet();
+        let mut advanced = keyed_parent_state(2);
+        ethlambda_state_transition::beacon::stf::process_slots(&mut advanced, 1, &config)
+            .expect("advance to slot 1");
+        let proposer =
+            ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(
+                &advanced,
+            )
+            .expect("a proposer for slot 1");
+        let impostor = 1 - proposer;
+
+        for (named, handed_over) in [(impostor, false), (proposer, true)] {
+            let blobs = vec![blob_bytes(15)];
+            let block = block_by(named, &blobs);
+            let (engine, requests) = mock_engine(answer_for(&blobs)).await;
+            let (mut server, p2p) = beacon_server_recording(store_with_keyed_parent_of(2));
+            server.engine = Some(engine);
+            server.custody_columns = CUSTODY.to_vec();
+
+            server.hold_block_for_columns(block, 1, ImportTimings::default());
+            if handed_over {
+                wait_for_hand_over(&p2p).await;
+            } else {
+                for _ in 0..40 {
+                    if requests.load(Ordering::SeqCst) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "the precheck let validator {named}'s block through to the engine"
+            );
+            assert_eq!(
+                !p2p.checks.lock().unwrap().is_empty(),
+                handed_over,
+                "validator {named}'s columns handed over"
+            );
+        }
     }
 
     /// An altered copy of a block (its body changed after signing, the

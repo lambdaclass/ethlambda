@@ -3319,8 +3319,9 @@ impl BlockChainServer {
         // a redelivery of a held root must not re-query the execution client.
         // Only a recent block does, checked before the signature so range
         // sync pays for neither. Only a block whose proposer signature
-        // verifies does, since the columns built from its blobs carry its
-        // header unchecked.
+        // verifies does: the built columns go through every chain check
+        // before they leave `beacon_blobs`, but a block that already fails
+        // here is not worth an engine call and a cell computation.
         if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
             (&self.engine, &self.p2p, &block)
             && !inner.message.body.blob_kzg_commitments.is_empty()

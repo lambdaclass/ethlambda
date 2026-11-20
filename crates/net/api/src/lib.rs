@@ -63,11 +63,13 @@ pub enum SidecarOrigin {
     /// Built by this node from the blobs its own execution client returned
     /// for a held block (`engine_getBlobsV2`).
     ///
-    /// Not checked: the fulu `p2p-interface.md` says a client "SHOULD skip
-    /// verification" of blobs from its local execution layer. But it "MUST
-    /// behave as if the `data_column_sidecar` had been received via gossip":
-    /// publish each on its subnet if and only if this node is subscribed to
-    /// it, and record it in the anti-equivocation (seen) cache.
+    /// Already checked: the chain actor runs every chain check on them, KZG
+    /// proofs included, before handing them over, though the fulu
+    /// `p2p-interface.md` lets a client skip verifying blobs from its local
+    /// execution layer. What is left is what it "MUST" do "as if the
+    /// `data_column_sidecar` had been received via gossip": publish each on
+    /// its subnet if and only if this node is subscribed to it, and record it
+    /// in the anti-equivocation (seen) cache.
     ExecutionLayer,
 }
 

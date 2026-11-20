@@ -341,13 +341,14 @@ calls and cell computations. Such a block's columns are asked of peers as soon
 as it is held, so it does not wait for a redrive either way. How often the
 execution client would still hold an older block's blobs is not measured.
 
-The precheck is there because the built columns carry the block's own signed
-header and skip every check on their way out (see the hand-over below). Range
-sync and by-root answers never pass gossip validation, and the import checks
-the signature only after data availability, so without it a peer serving a
-forged copy of a block, whose commitments name blobs in this node's pool, would
-have this node publish columns its peers reject, and take the seen-cache key of
-the real block's columns from the same proposer and slot. It costs one BLS
+The precheck is a filter, not the guard: the built columns go through every
+chain check before they are published (see the build below). It saves an engine
+call and a cell computation for a block whose signature already fails, which
+range sync and by-root answers can deliver, since they never pass gossip
+validation and the import checks the signature only after data availability.
+It cannot catch everything: past the parent state's proposer lookahead,
+`precheck_block` checks the signature against whichever validator the block
+names, not that this validator is the slot's proposer. It costs one BLS
 verification per first hold of a block that would be asked about.
 
 **The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
@@ -365,12 +366,17 @@ partial-column assembly.
 **The build.** On a full answer, a blocking task first re-checks that the block
 was not imported meanwhile and which custody columns are still missing from the
 store, then builds only those (cells and sidecars) off the async runtime and off
-the chain actor. It does **not** verify the KZG proofs: the spec says a node
-SHOULD skip verifying blobs from its own execution client.
+the chain actor. Still in that task, the sidecars then go through the chain
+checks a fetched column gets (`ChainPrechecks`, then one `kzg_verdicts` batch):
+the signed header, including the expected proposer past the lookahead,
+finalized ancestry, the inclusion proof, and the KZG proofs. Only the ones that
+pass go on. The spec says a node SHOULD skip verifying blobs from its own
+execution client; this one does not (see `docs/spec_deviations.md`).
 
 **The hand-over.** The sidecars go to p2p through the existing
-`check_data_column_sidecars`, with `SidecarOrigin::ExecutionLayer`. That origin
-runs no checks. p2p records each column in the gossip seen cache first (so a
+`check_data_column_sidecars`, with `SidecarOrigin::ExecutionLayer`. p2p runs no
+checks of its own on that origin, since the chain actor's task ran them. p2p
+records each column in the gossip seen cache first (so a
 copy gossip delivers later is ignored, and a column gossip already accepted is
 not published twice), publishes the newly recorded ones on their subnet topics
 if and only if this node is subscribed to them, which here means its custody
@@ -382,6 +388,8 @@ hold (1st, recent) -> engine_getBlobsV2       1 s, one attempt
                        |-- null / error  -> count; gossip and peer asks carry on
                        '-- every blob    -> build missing custody columns
                                             (block imported meanwhile? stop)
+                                            chain checks, KZG included
+                                            (refused -> count, drop)
                                                   |
                          check_data_column_sidecars(ExecutionLayer)
                                                   |
@@ -390,13 +398,17 @@ hold (1st, recent) -> engine_getBlobsV2       1 s, one attempt
    chain actor: store columns -> release the held block
 ```
 
-**Trust.** The blobs and proofs are taken as the execution client gives them;
-nothing checks a blob against the block's commitment either. One that returns
-wrong blobs or proofs makes this node store and publish columns its peers'
-gossip validation rejects, which costs this node peer score, and release the
-held block as if its data were available. Debug builds re-run the chain checks
-on everything `new_data_column_sidecars` delivers and would catch it; release
-builds do not.
+**Trust.** Nothing the execution client returns is taken on trust. A blob that
+is not the one a commitment names, or a wrong proof, fails the KZG batch, and
+the columns built from it are counted in
+`lean_engine_blob_columns_refused_total` and dropped: never published, never
+recorded seen, never stored. That matters beyond peer score. A stored column
+keeps every other copy of it out (gossip and the fetch checks answer
+`AlreadyStored`), and block import trusts what is stored, so a column taken on
+trust would either stop its block for good or import it on data nobody
+verified. The block then waits for gossip and the peer asks, as on a miss. The
+price is one KZG batch over the custody columns per hit, on the blocking pool,
+before the columns are published.
 
 **Not done.**
 
@@ -412,6 +424,7 @@ builds do not.
 | `lean_engine_get_blobs_total{outcome}` | Attempts: `hit`, `miss`, `error` |
 | `lean_engine_get_blobs_duration_seconds` | One round trip, whatever the outcome |
 | `lean_engine_blobs_to_columns_seconds` | Cell computation plus sidecar build |
+| `lean_engine_blob_columns_refused_total{reason}` | Built columns the chain checks refused, by rule (`kzg`, `wrong_proposer`, ...); any of these points at the execution client or a forged block |
 | `lean_data_columns_from_execution_layer_total{result}` | What p2p did with each column: `published`, `no_digest`, `already_seen`, `not_custody` |
 
 A high `miss` rate means the execution client's pool does not have the blobs.

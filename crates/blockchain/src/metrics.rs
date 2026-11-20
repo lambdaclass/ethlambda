@@ -1767,3 +1767,22 @@ pub fn observe_engine_blobs_to_columns(duration: Duration) {
         });
     LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS.observe(duration.as_secs_f64());
 }
+
+/// One column built from the execution client's blobs that the chain checks
+/// refused, so it was neither published nor stored. `reason` is the refusing
+/// rule's label (`kzg`, `wrong_proposer`, `inclusion_proof`, ...); a column
+/// stored meanwhile by another route is not counted.
+pub fn inc_engine_blob_columns_refused(reason: &str) {
+    static LEAN_ENGINE_BLOB_COLUMNS_REFUSED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_blob_columns_refused_total",
+                "Data columns built from execution-client blobs that the chain checks refused, by reason",
+                &["reason"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_BLOB_COLUMNS_REFUSED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}

@@ -263,11 +263,11 @@ pub fn verified_sidecars(
 /// this node's own execution client returned (`engine_getBlobsV2`), without
 /// verifying the proofs.
 ///
-/// Fulu `p2p-interface.md` ("Distributed blob publishing using blobs
-/// retrieved from local execution-layer client") says a client SHOULD skip
-/// verification of blobs it got from its own execution layer, which is why
-/// this is not [`verified_sidecars`]. The caller is the chain actor's
-/// `beacon_blobs` module; blobs from any other source must go through
+/// Not [`verified_sidecars`], which verifies every cell of every blob and
+/// builds all `NUMBER_OF_COLUMNS` columns. The caller, the chain actor's
+/// `beacon_blobs` module, needs only its custody columns, and runs the chain
+/// checks on what this returns (KZG proofs included) before anything is
+/// published or stored. Blobs from any other source must go through
 /// [`verified_sidecars`].
 ///
 /// The shape checks are the same as [`verified_sidecars`]. Only the requested

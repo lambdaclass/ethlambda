@@ -639,6 +639,7 @@ spec.
 | `lean_engine_get_blobs_total` | Counter | `engine_getBlobsV2` attempts for held fulu blocks, by outcome | On each answer of the one attempt made at a block's first hold | outcome=hit,miss,error | |
 | `lean_engine_get_blobs_duration_seconds` | Histogram | Time for one `engine_getBlobsV2` round trip | On each attempt, whatever its outcome | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_engine_blobs_to_columns_seconds` | Histogram | Time to build custody data column sidecars from execution-client blobs | On each build that reaches the cell computation, off the actor thread | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0 |
+| `lean_engine_blob_columns_refused_total` | Counter | Data columns built from execution-client blobs that the chain checks refused, so neither published nor stored | On each built column refused, once; a column another route stored meanwhile is not counted | reason=kzg,wrong_proposer,inclusion_proof,... (the refusing rule's label) | |
 | `lean_data_columns_from_execution_layer_total` | Counter | Data column sidecars built from the execution client's blobs, by what p2p did with them | On each hand-over, once per result, incremented by the column count | result=published,no_digest,already_seen,not_custody | |
 
 `lean_engine_get_blobs_total` and its siblings cover the execution-client path

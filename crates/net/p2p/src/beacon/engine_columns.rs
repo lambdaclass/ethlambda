@@ -3,17 +3,17 @@
 //! `SidecarOrigin::ExecutionLayer`.
 //!
 //! The fulu p2p spec says a client that takes blobs from its local execution
-//! layer SHOULD skip verifying them, and MUST then behave as if the sidecar had
-//! arrived by gossip. In particular it MUST publish the sidecar on its
-//! `data_column_sidecar_{subnet_id}` topic if and only if it is subscribed to
-//! that topic, and MUST update the gossip rule data structures (the
-//! anti-equivocation cache, here [`P2PServer::seen_columns`]).
+//! layer MUST behave as if the sidecar had arrived by gossip. In particular it
+//! MUST publish the sidecar on its `data_column_sidecar_{subnet_id}` topic if
+//! and only if it is subscribed to that topic, and MUST update the gossip rule
+//! data structures (the anti-equivocation cache, here
+//! [`P2PServer::seen_columns`]).
 //!
-//! That is all this module does, which is why no checks run: the sidecars are
-//! built from the block the chain actor already holds, with proofs the
-//! execution client vouched for, so the chain checks `beacon::column_checks`
-//! runs (header signature, inclusion proof, KZG) have nothing to add. Debug
-//! builds still re-run them in the chain actor.
+//! That is all this module does, and why no checks run here: the chain actor
+//! already ran every chain check on these sidecars, KZG proofs included,
+//! before handing them over (`ethlambda_blockchain`'s `beacon_blobs`, the same
+//! rules `beacon::column_checks` runs on a fetched column). Debug builds re-run
+//! them in the chain actor.
 //!
 //! Recording comes before publishing on purpose. A copy of the same column that
 //! gossip delivers afterwards then finds its key taken and is ignored rather
