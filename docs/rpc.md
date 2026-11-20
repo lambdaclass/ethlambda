@@ -1117,7 +1117,8 @@ How head and finality events behave:
   moving it back to an ancestor). Lighthouse reports only the `chain_reorg` for
   those; Prysm reports both, as this node does.
 - **Stale heads are not reported.** A head more than 32 slots behind the wall
-  clock (catch-up) sends no `head`; `block` events still show progress.
+  clock (catch-up) sends no `head` and no `head_v2`, nor the second `head_v2`
+  when its payload arrives; `block` events still show progress.
   `chain_reorg` and `finalized_checkpoint` are not gated.
 - **Order:** each `block` as it imports, then `chain_reorg`, `head`, `head_v2`,
   `finalized_checkpoint`.

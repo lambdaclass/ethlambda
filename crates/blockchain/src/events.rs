@@ -749,9 +749,9 @@ impl ChainEvents {
     /// again when the head's payload status went from empty to full.
     ///
     /// Called at the end of `recompute_beacon_head`, where every beacon head
-    /// and finality move ends. Only `head` is gated, against
-    /// [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`; beacon has no
-    /// justified-checkpoint topic.
+    /// and finality move ends. Only `head` and both `head_v2` emissions are
+    /// gated, against [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`;
+    /// beacon has no justified-checkpoint topic.
     pub(crate) fn publish_beacon_changes(&mut self, store: &Store, wall_clock_slot: u64) {
         let Some(previous) = self.advance_view(store) else {
             return;
