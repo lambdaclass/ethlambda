@@ -572,7 +572,7 @@ mod tests {
         store.insert_live_chain_entry(0, Root::ZERO, Root::ZERO);
 
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         assert_eq!(precheck::fixed_proposer(&parent, beyond), None);
 
         let SignedBeaconBlock::Fulu(mut inner) = fulu_block(beyond, proposer, 0) else {

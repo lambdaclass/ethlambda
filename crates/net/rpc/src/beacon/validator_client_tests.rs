@@ -417,7 +417,7 @@ async fn the_validator_client_can_attest_through_this_node() {
     let indices: Vec<u64> = entries.iter().map(|entry| entry.index).collect();
 
     let proposers = client.proposer_duties(epoch).await.unwrap();
-    assert_eq!(proposers.duties.len(), preset::SLOTS_PER_EPOCH as usize);
+    assert_eq!(proposers.duties.len(), preset::slots_per_epoch() as usize);
 
     let attesters = client.attester_duties(epoch, &indices).await.unwrap();
     assert_eq!(
@@ -1149,12 +1149,12 @@ async fn sync_committee_slot(
         .collect();
     assert_eq!(
         seats,
-        (0..preset::SYNC_COMMITTEE_SIZE as u64).collect(),
+        (0..preset::sync_committee_size() as u64).collect(),
         "every seat belongs to a member of the registry"
     );
     let all_subnets: BTreeSet<u64> = (0..SYNC_COMMITTEE_SUBNET_COUNT as u64).collect();
 
-    let period = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+    let period = preset::epochs_per_sync_committee_period();
     let until_epoch = (epoch / period + 1) * period;
     let subscriptions: Vec<SyncCommitteeSubscriptionDto> = duties
         .iter()
@@ -1220,7 +1220,7 @@ async fn sync_committee_slot(
     let contributions = network.sync_contributions.lock().unwrap().clone();
     assert_eq!(contributions.len(), count);
     let (committee, _) = state.sync_committees().unwrap();
-    let per_subnet = preset::SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
+    let per_subnet = preset::sync_committee_size() / SYNC_COMMITTEE_SUBNET_COUNT;
     for signed in &contributions {
         let contribution = &signed.message.contribution;
         assert_eq!(contribution.slot, slot);
@@ -1246,12 +1246,12 @@ fn assert_full_sync_aggregate(
     advanced: &BeaconState,
     aggregate: &ethlambda_types::beacon::containers::altair::SyncAggregate,
 ) {
-    let set = (0..preset::SYNC_COMMITTEE_SIZE)
+    let set = (0..preset::sync_committee_size())
         .filter(|&position| aggregate.sync_committee_bits.get(position).unwrap_or(false))
         .count();
     assert_eq!(
         set,
-        preset::SYNC_COMMITTEE_SIZE,
+        preset::sync_committee_size(),
         "every member signed the parent"
     );
     let mut state = advanced.clone();
@@ -1364,7 +1364,7 @@ mod gloas {
         let first_slot = compute_start_slot_at_epoch(epoch - 1);
         let cache =
             ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache::default();
-        let window: Vec<_> = (first_slot..first_slot + preset::PTC_WINDOW_LENGTH as u64)
+        let window: Vec<_> = (first_slot..first_slot + preset::ptc_window_length() as u64)
             .map(|slot| compute_ptc(&state, slot, &cache).unwrap())
             .collect();
         let BeaconState::Gloas(inner) = &mut state else {

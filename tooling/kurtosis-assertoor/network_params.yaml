@@ -35,7 +35,9 @@ participants:
     vc_image: ghcr.io/lambdaclass/ethlambda:unstable
     vc_extra_params: ["--init-slashing-protection"]
 network_params:
-  # ethlambda only supports the mainnet preset: 32-slot epochs of 12 s.
+  # The mainnet preset: 32-slot epochs of 12 s. ethlambda runs `minimal` from
+  # the same image too (it selects the preset from PRESET_BASE), which would
+  # cut this battery's wait for finality by more than half.
   preset: mainnet
   # Fulu is the last fork ethlambda processes; gloas stays unscheduled.
   electra_fork_epoch: 0

@@ -52,7 +52,7 @@ use ethlambda_network_api::{
         SubscribeSyncCommitteeSubnets,
     },
 };
-use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::aggregate::max_aggregates_per_slot;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlockColumns, SeenBlocks, SeenColumns,
     aggregate::SeenAggregates,
@@ -67,7 +67,7 @@ use ethlambda_state_transition::beacon::{
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
-use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
+use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, slots_per_epoch};
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -324,8 +324,10 @@ const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096)
 /// never asked about again; sizing for two epochs of that per-slot bound is
 /// generous headroom rather than a tight derivation, in the same spirit
 /// [`SEEN_BLOCKS_CAPACITY`] and [`SEEN_COLUMNS_CAPACITY`] are sized in.
-const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
-    NonZeroUsize::new((MAX_AGGREGATES_PER_SLOT * SLOTS_PER_EPOCH * 2) as usize).expect("non-zero");
+fn seen_aggregates_capacity() -> NonZeroUsize {
+    NonZeroUsize::new((max_aggregates_per_slot() * slots_per_epoch() * 2) as usize)
+        .expect("non-zero")
+}
 
 /// Capacity of the accepted-attestation cache, keyed by `(target_epoch,
 /// attester_index)`, for a node relaying `backbone_subnets` attestation
@@ -357,7 +359,7 @@ const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
 /// so this bound costs memory only under that load.
 fn seen_attestations_capacity(backbone_subnets: usize) -> NonZeroUsize {
     let subnets = backbone_subnets.max(1);
-    let capacity = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
+    let capacity = 2 * slots_per_epoch() as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
     NonZeroUsize::new(capacity).expect("positive factors give a positive capacity")
 }
 
@@ -1314,8 +1316,8 @@ impl P2P {
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
             ),
             seen_aggregates: SeenAggregates::new(
-                SEEN_AGGREGATES_CAPACITY,
-                SEEN_AGGREGATES_CAPACITY,
+                seen_aggregates_capacity(),
+                seen_aggregates_capacity(),
             ),
             seen_attestations: SeenAttestations::new(seen_attestations_capacity(
                 backbone_attestation_subnets,
@@ -3224,8 +3226,8 @@ pub(crate) mod test_support {
                 ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
-                    crate::SEEN_AGGREGATES_CAPACITY,
-                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::seen_aggregates_capacity(),
+                    crate::seen_aggregates_capacity(),
                 ),
             seen_attestations:
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
@@ -3383,7 +3385,7 @@ mod tests {
     /// additional subnet scales it by the same per-subnet, per-epoch bound.
     #[test]
     fn seen_attestations_capacity_floors_at_one_subnet_and_scales_with_more() {
-        let per_subnet = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE;
+        let per_subnet = 2 * slots_per_epoch() as usize * MAX_VALIDATORS_PER_COMMITTEE;
         assert_eq!(seen_attestations_capacity(0).get(), per_subnet);
         assert_eq!(seen_attestations_capacity(1).get(), per_subnet);
         assert_eq!(seen_attestations_capacity(3).get(), per_subnet * 3);

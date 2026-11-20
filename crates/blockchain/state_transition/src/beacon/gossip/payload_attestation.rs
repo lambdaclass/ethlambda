@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn a_vote_outside_the_head_states_committee_window_is_ignored_with_its_own_reason() {
         let mut store = gloas_store();
-        let slot = 10 * preset::SLOTS_PER_EPOCH;
+        let slot = 10 * preset::slots_per_epoch();
         store
             .insert_pending_block(BLOCK_ROOT, fulu_block(slot))
             .expect("insert the block");

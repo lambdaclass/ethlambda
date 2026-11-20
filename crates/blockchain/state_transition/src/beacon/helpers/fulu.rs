@@ -91,8 +91,8 @@ pub fn compute_proposer_indices(
 ) -> Result<Vec<ValidatorIndex>> {
     let start_slot = compute_start_slot_at_epoch(epoch);
 
-    let mut proposer_indices = Vec::with_capacity(preset::SLOTS_PER_EPOCH as usize);
-    for offset in 0..preset::SLOTS_PER_EPOCH {
+    let mut proposer_indices = Vec::with_capacity(preset::slots_per_epoch() as usize);
+    for offset in 0..preset::slots_per_epoch() {
         let mut input = Vec::with_capacity(32 + 8);
         input.extend_from_slice(&seed.0);
         input.extend_from_slice(&(start_slot + offset).to_le_bytes());
@@ -180,7 +180,7 @@ pub(crate) fn proposer_lookahead_mut<'a>(
 /// both `Fulu` and `Gloas` here rather than gloas carrying a copy of its own.
 pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> {
     let lookahead = proposer_lookahead(state, "get_beacon_proposer_index")?;
-    let index = (state.slot() % preset::SLOTS_PER_EPOCH) as usize;
+    let index = (state.slot() % preset::slots_per_epoch()) as usize;
     lookahead
         .get(index)
         .copied()
@@ -208,7 +208,7 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
 pub fn initialize_proposer_lookahead(state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
     let current_epoch = get_current_epoch(state);
 
-    let mut lookahead = Vec::with_capacity(preset::PROPOSER_LOOKAHEAD_LENGTH);
+    let mut lookahead = Vec::with_capacity(preset::proposer_lookahead_length());
     for offset in 0..=preset::MIN_SEED_LOOKAHEAD {
         lookahead.extend(get_beacon_proposer_indices(state, current_epoch + offset)?);
     }
@@ -286,7 +286,7 @@ mod tests {
     fn initialize_proposer_lookahead_fills_the_whole_window() {
         let state = fulu_state_with_validators(32);
         let lookahead = initialize_proposer_lookahead(&state).unwrap();
-        assert_eq!(lookahead.len(), preset::PROPOSER_LOOKAHEAD_LENGTH);
+        assert_eq!(lookahead.len(), preset::proposer_lookahead_length());
         assert!(lookahead.iter().all(|index| *index < 32));
     }
 
@@ -310,7 +310,7 @@ mod tests {
     fn get_beacon_proposer_index_reads_the_current_slot_out_of_the_lookahead() {
         let state = fulu_state_with_validators(32);
         let expected = if let BeaconState::Fulu(fulu_state) = &state {
-            fulu_state.proposer_lookahead[(state.slot() % preset::SLOTS_PER_EPOCH) as usize]
+            fulu_state.proposer_lookahead[(state.slot() % preset::slots_per_epoch()) as usize]
         } else {
             unreachable!()
         };

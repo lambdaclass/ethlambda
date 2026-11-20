@@ -53,7 +53,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 use libtest_mimic::Trial;
 
-use super::{PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// One component's reward and penalty per validator, as the fixtures encode it.
 ///
@@ -174,7 +174,7 @@ fn components(
 
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect_all_handlers(PRESET, "rewards");
+    let cases = collect_all_handlers(preset(), "rewards");
     let mut trials = vec![super::discovery_trial("rewards", cases.len())];
 
     for (_handler, case) in cases {

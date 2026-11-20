@@ -34,7 +34,7 @@ use ethlambda_types::{
             BlockPayloadLink, ForkChoiceNode, JustifiedBalances, LatestMessage, PayloadStatus,
             PayloadStatusEnum, PayloadStatusV1, PowBlock,
         },
-        preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
+        preset::{Preset, ptc_size, slots_per_epoch},
         primitives::ExecutionBlockHash,
     },
     block::{
@@ -139,18 +139,18 @@ const KEY_DB_VERSION: &[u8] = b"db_version";
 /// [`Chain::selector`] byte, not SSZ: it predates being able to decode
 /// anything else in the directory.
 const KEY_CHAIN: &[u8] = b"chain";
-/// Key for which SSZ preset the build that wrote this directory used. Its
-/// value is a single [`Preset::selector`] byte, raw for the same reason
-/// [`KEY_CHAIN`] is, and more sharply: the preset is what *decides* the shape
-/// of the containers in `States`, so it has to be readable before anything in
-/// the directory is decoded, including by a build that would decode them into
-/// the wrong shape.
+/// Key for which SSZ preset the process that wrote this directory ran
+/// ([`Preset::active`]). Its value is a single [`Preset::selector`] byte, raw
+/// for the same reason [`KEY_CHAIN`] is, and more sharply: the preset is what
+/// *decides* the shape of the containers in `States`, so it has to be readable
+/// before anything in the directory is decoded, including by a process that
+/// would decode them into the wrong shape.
 ///
 /// Written beside [`KEY_CONFIG`] by both bootstrap paths and checked by
-/// [`Store::from_db_state`]. Unlike [`KEY_DB_VERSION`], a mismatch here is not
-/// something this build could fix by migrating: the other preset's states are
-/// a different protocol's states (see this crate's `preset` module), so the
-/// only answer is to refuse.
+/// [`Store::from_db_state`] against the preset the network selected. Unlike
+/// [`KEY_DB_VERSION`], a mismatch here is not something this build could fix
+/// by migrating: the other preset's states are a different protocol's states
+/// (see `ethlambda_types::beacon::preset`), so the only answer is to refuse.
 const KEY_PRESET: &[u8] = b"preset";
 /// Key for the beacon store's unrealized justified checkpoint.
 ///
@@ -1390,19 +1390,19 @@ impl Store {
             }
 
             // Before the config decode below and well before any state read:
-            // the preset fixes every SSZ container bound in the directory, so
-            // a build holding the other one would not be reading the same
-            // shapes back. The version check above cannot stand in for this,
+            // the preset fixes every preset-sized container bound in the
+            // directory, so a process running the other one would not be
+            // reading the same shapes back. The version check above cannot stand in for this,
             // since both presets write the same *layout* at the same version.
             let found_preset = view
                 .read_with(Table::Metadata, KEY_PRESET, |bytes| bytes.first().copied())
                 .expect("read preset")
                 .flatten()
                 .and_then(Preset::from_selector);
-            if found_preset != Some(Preset::ACTIVE) {
+            if found_preset != Some(Preset::active()) {
                 return Err(Error::PresetMismatch {
                     found: found_preset.map(Preset::name),
-                    expected: Preset::ACTIVE.name(),
+                    expected: Preset::active().name(),
                 });
             }
 
@@ -1723,7 +1723,7 @@ impl Store {
             let metadata_entries = vec![
                 (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
                 (KEY_CHAIN.to_vec(), vec![Chain::Lean.selector()]),
-                (KEY_PRESET.to_vec(), vec![Preset::ACTIVE.selector()]),
+                (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
                 // Genesis, not zero: `KEY_TIME` is an absolute UNIX
                 // millisecond, so the value that means "the clock has not
                 // advanced past genesis" is genesis itself.
@@ -1837,7 +1837,7 @@ impl Store {
         let metadata_entries = vec![
             (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
             (KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()]),
-            (KEY_PRESET.to_vec(), vec![Preset::ACTIVE.selector()]),
+            (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
             // Genesis rather than zero, for the reason `init_store` gives.
             // `get_forkchoice_store` overwrites this immediately with the
             // anchor's own time; the seed matters only for the window before
@@ -2715,7 +2715,7 @@ impl Store {
     fn snapshot_interval_at(&self, slot: u64) -> u64 {
         let fork = match self.chain {
             Chain::Lean => ForkName::Lean,
-            Chain::Beacon => self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH),
+            Chain::Beacon => self.config.fork_at_epoch(slot / slots_per_epoch()),
         };
         fork.snapshot_interval()
     }
@@ -2890,7 +2890,7 @@ impl Store {
     /// A stored, slot-denominated [`Checkpoint`] read as a beacon one.
     fn as_beacon_checkpoint(checkpoint: Checkpoint) -> BeaconCheckpoint {
         BeaconCheckpoint {
-            epoch: checkpoint.slot / SLOTS_PER_EPOCH,
+            epoch: checkpoint.slot / slots_per_epoch(),
             root: checkpoint.root,
         }
     }
@@ -2904,7 +2904,7 @@ impl Store {
     pub fn beacon_checkpoint_as_stored(checkpoint: BeaconCheckpoint) -> Checkpoint {
         Checkpoint {
             root: checkpoint.root,
-            slot: checkpoint.epoch * SLOTS_PER_EPOCH,
+            slot: checkpoint.epoch * slots_per_epoch(),
         }
     }
 
@@ -4291,10 +4291,10 @@ impl Store {
         for root in gloas_roots {
             scratch
                 .payload_timeliness_vote
-                .insert(root, vec![None; PTC_SIZE]);
+                .insert(root, vec![None; ptc_size()]);
             scratch
                 .payload_data_availability_vote
-                .insert(root, vec![None; PTC_SIZE]);
+                .insert(root, vec![None; ptc_size()]);
         }
     }
 
@@ -5154,7 +5154,7 @@ impl Store {
         slot: u64,
         encoded: &[u8],
     ) -> Result<DataColumnSidecar, Error> {
-        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        let fork = self.config.fork_at_epoch(slot / slots_per_epoch());
         DataColumnSidecar::from_ssz(fork, encoded)
             .map_err(|_| Error::UndecodableDataColumn { slot, fork })
     }
@@ -5921,7 +5921,7 @@ mod tests {
             .expect("preset written at bootstrap");
         assert_eq!(
             preset.first().copied().and_then(Preset::from_selector),
-            Some(Preset::ACTIVE)
+            Some(Preset::active())
         );
     }
 
@@ -5938,7 +5938,7 @@ mod tests {
         // one that is depends on the feature this crate was compiled with, and
         // the check must hold either way round, so the value is derived rather
         // than written as a literal.
-        let other = match Preset::ACTIVE {
+        let other = match Preset::active() {
             Preset::Mainnet => Preset::Minimal,
             Preset::Minimal => Preset::Mainnet,
         };
@@ -5956,7 +5956,7 @@ mod tests {
             panic!("expected a preset mismatch, got {err}");
         };
         assert_eq!(found, Some(other.name()));
-        assert_eq!(expected, Preset::ACTIVE.name());
+        assert_eq!(expected, Preset::active().name());
     }
 
     #[test]
@@ -7376,10 +7376,10 @@ mod tests {
                 slot,
                 ..Default::default()
             },
-            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             historical_roots: Default::default(),
@@ -7388,10 +7388,10 @@ mod tests {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![H256::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_attestations: Default::default(),
@@ -9177,10 +9177,10 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
-        store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
-        store.insert_beacon_el_block_hash(root, SLOTS_PER_EPOCH, H256::from([9u8; 32]));
+        store.insert_verified_payload(slots_per_epoch(), &test_envelope(root));
+        store.insert_beacon_el_block_hash(root, slots_per_epoch(), H256::from([9u8; 32]));
 
         assert!(store.remove_verified_payload(&root));
         assert_eq!(store.beacon_el_block_hash(root), None);
@@ -9197,10 +9197,10 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         let envelope = test_envelope(root);
-        store.insert_verified_payload(SLOTS_PER_EPOCH, &envelope);
+        store.insert_verified_payload(slots_per_epoch(), &envelope);
         assert!(store.has_verified_payload(&root));
 
         let reopened = reopen(backend);
@@ -9220,7 +9220,7 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store.set_gloas_block_timeliness(root, [true, false]);
 
@@ -9235,7 +9235,7 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, beacon_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, beacon_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store.set_block_timeliness(root, [true, true]);
 
@@ -9251,18 +9251,18 @@ mod tests {
         let backend = beacon_backend_finalized_at(gloas_root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(gloas_root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(gloas_root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store
             .insert_signed_block(
                 phase0_root,
-                beacon_test_block(SLOTS_PER_EPOCH + 1, gloas_root),
+                beacon_test_block(slots_per_epoch() + 1, gloas_root),
             )
             .expect("insert block");
 
         let reopened = reopen(backend);
 
-        let empty = vec![None; PTC_SIZE];
+        let empty = vec![None; ptc_size()];
         assert_eq!(
             reopened.payload_timeliness_vote(&gloas_root),
             Some(empty.clone())
@@ -9304,11 +9304,11 @@ mod tests {
         let backend = beacon_backend_finalized_at(finalized);
         let mut store = reopen(backend.clone());
         let rows = [
-            (old, SLOTS_PER_EPOCH - 3, H256::ZERO, 0xa1),
-            (finalized, SLOTS_PER_EPOCH - 2, old, 0xa2),
-            (child, SLOTS_PER_EPOCH - 1, finalized, 0xa3),
+            (old, slots_per_epoch() - 3, H256::ZERO, 0xa1),
+            (finalized, slots_per_epoch() - 2, old, 0xa2),
+            (child, slots_per_epoch() - 1, finalized, 0xa3),
             // A zero payload hash is a pre-merge shape: no entry.
-            (premerge, SLOTS_PER_EPOCH, child, 0),
+            (premerge, slots_per_epoch(), child, 0),
         ];
         for (root, slot, parent, byte) in rows {
             let hash = ExecutionBlockHash::repeat_byte(byte);
@@ -9342,9 +9342,9 @@ mod tests {
         let backend = beacon_backend_finalized_at(finalized);
         let mut store = reopen(backend.clone());
         let slots = [
-            (old, SLOTS_PER_EPOCH - 3, H256::ZERO),
-            (finalized, SLOTS_PER_EPOCH - 2, old),
-            (child, SLOTS_PER_EPOCH - 1, finalized),
+            (old, slots_per_epoch() - 3, H256::ZERO),
+            (finalized, slots_per_epoch() - 2, old),
+            (child, slots_per_epoch() - 1, finalized),
         ];
         for (root, slot, parent) in slots {
             store
@@ -9417,7 +9417,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = |epoch| LatestMessage {
             epoch,
-            slot: epoch * SLOTS_PER_EPOCH,
+            slot: epoch * slots_per_epoch(),
             root: H256::from([epoch as u8; 32]),
             payload_present: false,
         };
@@ -9444,7 +9444,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
-            slot: SLOTS_PER_EPOCH,
+            slot: slots_per_epoch(),
             root: H256::from([1u8; 32]),
             payload_present: false,
         };
@@ -9482,7 +9482,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
-            slot: SLOTS_PER_EPOCH,
+            slot: slots_per_epoch(),
             root: H256::from([1u8; 32]),
             payload_present: false,
         };
@@ -9881,7 +9881,7 @@ mod tests {
             root: H256::from([7u8; 32]),
         };
         let stored = Store::beacon_checkpoint_as_stored(cp);
-        assert_eq!(stored.slot, 3 * SLOTS_PER_EPOCH);
+        assert_eq!(stored.slot, 3 * slots_per_epoch());
         store
             .update_checkpoints(ForkCheckpoints::new(anchor_root, Some(stored), None))
             .expect("advance justified");
@@ -10146,7 +10146,7 @@ mod tests {
     fn a_gloas_sidecar_round_trips_through_both_column_tables() {
         let store = gloas_scheduled_store();
         let root = H256::repeat_byte(7);
-        let slot = 2 * SLOTS_PER_EPOCH + 3;
+        let slot = 2 * slots_per_epoch() + 3;
         let sidecar = gloas_sidecar_at(slot, 4, root);
 
         store.put_data_column(&sidecar).unwrap();
@@ -10173,16 +10173,16 @@ mod tests {
     #[test]
     fn a_row_decodes_as_the_fork_its_slot_names() {
         let store = gloas_scheduled_store();
-        let fulu = fulu_sidecar_at(SLOTS_PER_EPOCH, 1);
+        let fulu = fulu_sidecar_at(slots_per_epoch(), 1);
         let root = fulu.block_root();
         store.put_data_column(&fulu).unwrap();
         assert_eq!(
-            store.get_data_column(SLOTS_PER_EPOCH, &root, 1).unwrap(),
+            store.get_data_column(slots_per_epoch(), &root, 1).unwrap(),
             Some(fulu)
         );
 
         // The same bytes filed under a gloas slot are not a gloas sidecar.
-        let gloas_slot = 2 * SLOTS_PER_EPOCH;
+        let gloas_slot = 2 * slots_per_epoch();
         let encoded = fulu_sidecar_at(gloas_slot, 1).to_ssz();
         assert!(matches!(
             store.decode_data_column_sidecar(gloas_slot, &encoded),

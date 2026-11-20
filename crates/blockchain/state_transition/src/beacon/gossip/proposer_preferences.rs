@@ -274,17 +274,21 @@ mod tests {
     use crate::beacon::gossip::test_support::builder_scene::*;
     use crate::beacon::gossip::test_support::{slot_start_ms, store};
     use crate::beacon::helpers::test_state::{secret_key_for, with_signing_validators_at};
-    use crate::beacon::preset::SLOTS_PER_EPOCH;
+    use crate::beacon::preset::slots_per_epoch;
     use crate::beacon::primitives::ValidatorIndex;
     use crate::beacon::stf;
 
     /// The epoch-2 slot the scene's proposer preferences name, and the block
     /// that fixed its proposer: the genesis-slot block, an ancestor of the
     /// head (`PARENT_SLOT`) whose `block_roots` entry covers `DEPENDENT_SLOT`.
-    const PROPOSAL_SLOT: Slot = 2 * SLOTS_PER_EPOCH;
+    fn proposal_slot() -> Slot {
+        2 * slots_per_epoch()
+    }
     const DEPENDENT: Root = Root::repeat_byte(0x31);
     /// `PROPOSAL_SLOT`'s shuffling dependent slot: the last of epoch 0.
-    const DEPENDENT_SLOT: Slot = PARENT_SLOT - 1;
+    fn dependent_slot() -> Slot {
+        scene_parent_slot() - 1
+    }
 
     fn ignore(reason: IgnoreReason) -> Outcome {
         Outcome::Ignore(reason)
@@ -297,7 +301,8 @@ mod tests {
     /// The builder scene, with the parent's `block_roots` naming `DEPENDENT` at
     /// `DEPENDENT_SLOT`, and `DEPENDENT` stored (block and state) as the head's parent.
     fn dependent_scene() -> Scene {
-        let mut scene = scene_with(|state| state.block_roots[DEPENDENT_SLOT as usize] = DEPENDENT);
+        let mut scene =
+            scene_with(|state| state.block_roots[dependent_slot() as usize] = DEPENDENT);
         scene
             .store
             .insert_pending_block(DEPENDENT, block_at(0))
@@ -306,7 +311,7 @@ mod tests {
         // that a dependent block is possible reads the live chain.
         scene
             .store
-            .insert_signed_block(PARENT, block_with_parent(PARENT_SLOT, DEPENDENT))
+            .insert_signed_block(PARENT, block_with_parent(scene_parent_slot(), DEPENDENT))
             .expect("link the head to the dependent block");
         let mut dependent_state = scene.state.clone();
         *dependent_state.slot_mut() = 0;
@@ -329,7 +334,7 @@ mod tests {
             &scene.state,
             gloas::ProposerPreferences {
                 dependent_root,
-                proposal_slot: PROPOSAL_SLOT,
+                proposal_slot: proposal_slot(),
                 validator_index: proposer,
                 fee_recipient: fee_recipient(),
                 target_gas_limit: 30_000_000,
@@ -340,7 +345,7 @@ mod tests {
     /// Valid preferences from the head's lookahead.
     fn valid_preferences(scene: &Scene) -> gloas::SignedProposerPreferences {
         let proposer =
-            crate::beacon::precheck::fixed_proposer(&scene.state, PROPOSAL_SLOT).expect("window");
+            crate::beacon::precheck::fixed_proposer(&scene.state, proposal_slot()).expect("window");
         preferences_for(scene, DEPENDENT, proposer)
     }
 
@@ -371,7 +376,7 @@ mod tests {
         assert!(
             scene
                 .market
-                .record_preferences(preferences.clone(), PARENT_SLOT + 1)
+                .record_preferences(preferences.clone(), scene_parent_slot() + 1)
         );
         assert_eq!(
             cheap_checks(&scene.market, &scene.store, &preferences, now_ms(&scene)),
@@ -394,7 +399,7 @@ mod tests {
     fn preferences_are_late_once_the_slot_began_by_more_than_the_disparity() {
         let scene = dependent_scene();
         let preferences = valid_preferences(&scene);
-        let started = slot_start_ms(&scene.store, PROPOSAL_SLOT);
+        let started = slot_start_ms(&scene.store, proposal_slot());
         let check = |now| cheap_checks(&scene.market, &scene.store, &preferences, now);
         assert_eq!(check(started + 500), Ok(()));
         assert_eq!(check(started + 501), Err(ignore(IgnoreReason::SlotStarted)));
@@ -405,8 +410,8 @@ mod tests {
         let scene = dependent_scene();
         let mut preferences = valid_preferences(&scene);
         // Epoch 3's lookahead opens with epoch 2's first slot.
-        preferences.message.proposal_slot = 3 * SLOTS_PER_EPOCH;
-        let opens = slot_start_ms(&scene.store, 2 * SLOTS_PER_EPOCH);
+        preferences.message.proposal_slot = 3 * slots_per_epoch();
+        let opens = slot_start_ms(&scene.store, 2 * slots_per_epoch());
         let check = |now| cheap_checks(&scene.market, &scene.store, &preferences, now);
         assert_eq!(check(opens - 500), Ok(()));
         assert_eq!(
@@ -433,7 +438,7 @@ mod tests {
         let stateless = Root::repeat_byte(0x62);
         scene
             .store
-            .insert_pending_block(stateless, block_at(DEPENDENT_SLOT - 1))
+            .insert_pending_block(stateless, block_at(dependent_slot() - 1))
             .expect("insert the block");
         let preferences = preferences_for(&scene, stateless, 0);
         assert_eq!(
@@ -459,7 +464,7 @@ mod tests {
         let stray = Root::repeat_byte(0x63);
         scene
             .store
-            .insert_pending_block(stray, block_at(DEPENDENT_SLOT - 1))
+            .insert_pending_block(stray, block_at(dependent_slot() - 1))
             .expect("insert the block");
         scene
             .store
@@ -473,12 +478,12 @@ mod tests {
         assert!(!is_valid_dependent_root(
             &scene.store,
             stray,
-            DEPENDENT_SLOT
+            dependent_slot()
         ));
         assert!(is_valid_dependent_root(
             &scene.store,
             PARENT,
-            DEPENDENT_SLOT
+            dependent_slot()
         ));
     }
 
@@ -486,7 +491,7 @@ mod tests {
     fn a_validator_that_is_not_the_proposer_is_rejected() {
         let scene = dependent_scene();
         let proposer =
-            crate::beacon::precheck::fixed_proposer(&scene.state, PROPOSAL_SLOT).expect("window");
+            crate::beacon::precheck::fixed_proposer(&scene.state, proposal_slot()).expect("window");
         let other = (proposer + 1) % 8;
         let preferences = preferences_for(&scene, DEPENDENT, other);
         assert_eq!(
@@ -520,10 +525,11 @@ mod tests {
             .cached_state(CacheKey::BlockState(DEPENDENT))
             .expect("stored");
         let mut owned = (*advanced).clone();
-        stf::process_slots(&mut owned, PARENT_SLOT, &scene.store.config()).expect("advance");
+        stf::process_slots(&mut owned, scene_parent_slot(), &scene.store.config())
+            .expect("advance");
         advanced = std::sync::Arc::new(owned);
         let proposer =
-            crate::beacon::precheck::fixed_proposer(&advanced, PROPOSAL_SLOT).expect("window");
+            crate::beacon::precheck::fixed_proposer(&advanced, proposal_slot()).expect("window");
         let preferences = preferences_for(&scene, DEPENDENT, proposer);
         let key = CacheKey::CheckpointState {
             epoch: 1,
@@ -572,7 +578,7 @@ mod tests {
     fn the_dependent_root_is_the_ancestor_at_the_shuffling_dependent_slot() {
         let scene = dependent_scene();
         assert_eq!(
-            dependent_root_at(&scene.state, PARENT, PROPOSAL_SLOT),
+            dependent_root_at(&scene.state, PARENT, proposal_slot()),
             Some(DEPENDENT)
         );
         // At genesis the slot saturates to the state's own block.
@@ -612,7 +618,7 @@ mod tests {
 
         // A signature under either verifies; one under neither does not.
         let preferences = gloas::ProposerPreferences {
-            proposal_slot: 2 * SLOTS_PER_EPOCH,
+            proposal_slot: 2 * slots_per_epoch(),
             ..Default::default()
         };
         let message_root = preferences.hash_tree_root();

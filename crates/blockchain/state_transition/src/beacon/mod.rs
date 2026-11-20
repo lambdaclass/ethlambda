@@ -60,9 +60,9 @@
 //!
 //! # Presets
 //!
-//! Container bounds are compile-time constants, so the preset is a compile-time
-//! choice: mainnet by default, minimal with the `preset-minimal` feature. See
-//! [`crate::beacon::preset`]. Values that only affect fork *scheduling* are runtime
+//! The preset is selected once per process at runtime, from the network's
+//! `PRESET_BASE`, and every container bound the two presets disagree on reads
+//! it. See [`crate::beacon::preset`]. Values that only affect fork *scheduling* are runtime
 //! configuration instead, in [`crate::beacon::config`], because the `transition` fixture suite
 //! sets fork epochs per case.
 //!

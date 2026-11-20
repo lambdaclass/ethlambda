@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_ssz_tree::{List, ProgressiveList as TreeProgressiveList, Vector};
+use ethlambda_ssz_tree::{List, ListOf, ProgressiveList as TreeProgressiveList, VectorOf};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
@@ -34,11 +34,11 @@ use crate::beacon::primitives::{
 /// state shares nearly all of the buffer with its parent and rehashes only the
 /// leaf it touched. Writes are buffered in a `BTreeMap`, since they are a
 /// handful per flush, until `BeaconState::apply_pending_mutations`.
-pub type BlockRoots = Vector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }, BTreeMap<usize, Root>>;
+pub type BlockRoots = VectorOf<Root, preset::SlotsPerHistoricalRoot, BTreeMap<usize, Root>>;
 
 /// The rolling window of recent state roots, indexed the same way as
 /// [`BlockRoots`].
-pub type StateRoots = Vector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }, BTreeMap<usize, Root>>;
+pub type StateRoots = VectorOf<Root, preset::SlotsPerHistoricalRoot, BTreeMap<usize, Root>>;
 
 /// Accumulated roots of [`HistoricalBatch`], one appended per historical batch,
 /// which is how the chain keeps a commitment to history older than the rolling
@@ -51,7 +51,7 @@ pub type HistoricalRoots = List<Root, { preset::HISTORICAL_ROOTS_LIMIT }, BTreeM
 ///
 /// Tree-backed like [`BlockRoots`].
 pub type Eth1DataVotes =
-    List<Eth1Data, { preset::SLOTS_PER_ETH1_VOTING_PERIOD }, BTreeMap<usize, Eth1Data>>;
+    ListOf<Eth1Data, preset::SlotsPerEth1VotingPeriod, BTreeMap<usize, Eth1Data>>;
 
 /// The validator registry. Append-only: a validator is never removed, only
 /// exited, since indices are referenced by attestations and must stay stable.
@@ -79,7 +79,7 @@ pub type Balances = List<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }>;
 ///
 /// Tree-backed like [`BlockRoots`].
 pub type RandaoMixes =
-    Vector<Bytes32, { preset::EPOCHS_PER_HISTORICAL_VECTOR }, BTreeMap<usize, Bytes32>>;
+    VectorOf<Bytes32, preset::EpochsPerHistoricalVector, BTreeMap<usize, Bytes32>>;
 
 /// Slashed balance totals per epoch, indexed by epoch modulo the vector length.
 /// Epoch processing reads the whole vector to size the proportional slashing
@@ -87,7 +87,7 @@ pub type RandaoMixes =
 /// ones.
 ///
 /// Tree-backed like [`BlockRoots`].
-pub type Slashings = Vector<Gwei, { preset::EPOCHS_PER_SLASHINGS_VECTOR }, BTreeMap<usize, Gwei>>;
+pub type Slashings = VectorOf<Gwei, preset::EpochsPerSlashingsVector, BTreeMap<usize, Gwei>>;
 
 /// One bit per recent epoch recording whether it was justified, which is the
 /// state that lets finalization look back over several epochs at once.

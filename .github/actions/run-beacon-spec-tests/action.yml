@@ -12,13 +12,13 @@ inputs:
 runs:
   using: "composite"
   steps:
-    # Keyed per preset. The preset fixes the beacon containers' SSZ bounds,
-    # which are const-generic arguments, so the two jobs share no artifacts at
-    # all; on one key they would evict each other on every single run.
+    # One key for both presets: the preset is selected at runtime
+    # (`BEACON_SPEC_PRESET`), so the two jobs build the same spec binary, and
+    # the minimal job's build is a subset of the mainnet job's.
     - name: Setup Rust
       uses: $/.github/actions/setup-rust
       with:
-        cache-key: beacon-${{ inputs.preset }}
+        cache-key: beacon-spec
 
     # Deliberately not cached. The trees expand to several GiB, which against a
     # repository-wide 10 GiB cache budget would evict the Rust build caches

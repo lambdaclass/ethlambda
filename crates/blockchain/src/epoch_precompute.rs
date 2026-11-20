@@ -79,7 +79,7 @@ pub(crate) struct DecisionInputs {
 }
 
 fn is_last_slot_of_epoch(slot: u64) -> bool {
-    (slot + 1).is_multiple_of(preset::SLOTS_PER_EPOCH)
+    (slot + 1).is_multiple_of(preset::slots_per_epoch())
 }
 
 /// Whether to start a precompute, and for which key.
@@ -104,7 +104,7 @@ pub(crate) fn decide(inputs: &DecisionInputs) -> Option<PrecomputeKey> {
             {
                 return None;
             }
-            inputs.head_slot / preset::SLOTS_PER_EPOCH + 1
+            inputs.head_slot / preset::slots_per_epoch() + 1
         }
         Trigger::Timer { slot } => {
             // A head past the slot would be a stale message racing a newer
@@ -112,7 +112,7 @@ pub(crate) fn decide(inputs: &DecisionInputs) -> Option<PrecomputeKey> {
             // A head before the slot's own epoch is a stalled chain: advancing
             // it would replay every epoch it missed, and each later timer would
             // replay them again under a new key from the same head.
-            let slot_epoch = slot / preset::SLOTS_PER_EPOCH;
+            let slot_epoch = slot / preset::slots_per_epoch();
             if !is_last_slot_of_epoch(slot)
                 || inputs.head_slot > slot
                 || inputs.head_slot < compute_start_slot_at_epoch(slot_epoch)
@@ -179,8 +179,8 @@ impl BlockChainServer {
             return;
         };
         let candidate_epoch = match trigger {
-            Trigger::Head => head_slot / preset::SLOTS_PER_EPOCH + 1,
-            Trigger::Timer { slot } => slot / preset::SLOTS_PER_EPOCH + 1,
+            Trigger::Head => head_slot / preset::slots_per_epoch() + 1,
+            Trigger::Timer { slot } => slot / preset::slots_per_epoch() + 1,
         };
         let already_cached = self
             .store
@@ -271,7 +271,9 @@ impl Handler<EpochPrecomputed> for BlockChainServer {
 mod tests {
     use super::*;
 
-    const SPE: u64 = preset::SLOTS_PER_EPOCH;
+    fn spe() -> u64 {
+        preset::slots_per_epoch()
+    }
 
     fn inputs(trigger: Trigger, head_slot: u64) -> DecisionInputs {
         DecisionInputs {
@@ -287,34 +289,34 @@ mod tests {
 
     #[test]
     fn a_last_slot_head_precomputes_the_next_epoch() {
-        let key = decide(&inputs(Trigger::Head, 2 * SPE - 1)).expect("starts");
+        let key = decide(&inputs(Trigger::Head, 2 * spe() - 1)).expect("starts");
         assert_eq!(key.epoch, 2);
         assert_eq!(key.root, H256([7; 32]));
     }
 
     #[test]
     fn a_head_elsewhere_in_the_epoch_starts_nothing() {
-        assert!(decide(&inputs(Trigger::Head, SPE)).is_none());
-        assert!(decide(&inputs(Trigger::Head, 2 * SPE - 2)).is_none());
+        assert!(decide(&inputs(Trigger::Head, spe())).is_none());
+        assert!(decide(&inputs(Trigger::Head, 2 * spe() - 2)).is_none());
     }
 
     #[test]
     fn a_syncing_node_starts_nothing() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
         i.syncing = true;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn a_stale_head_trigger_starts_nothing() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
-        i.current_slot = 2 * SPE + 5;
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
+        i.current_slot = 2 * spe() + 5;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn a_running_worker_blocks_a_second_one() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
         i.in_flight = Some(PrecomputeKey {
             epoch: 2,
             root: H256([7; 32]),
@@ -324,21 +326,37 @@ mod tests {
 
     #[test]
     fn a_state_already_cached_is_not_recomputed() {
-        let mut i = inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE - 3);
+        let mut i = inputs(
+            Trigger::Timer {
+                slot: 2 * spe() - 1,
+            },
+            2 * spe() - 3,
+        );
         i.already_cached = true;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn the_timer_covers_a_skipped_last_slot() {
-        let key =
-            decide(&inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE - 3)).expect("starts");
+        let key = decide(&inputs(
+            Trigger::Timer {
+                slot: 2 * spe() - 1,
+            },
+            2 * spe() - 3,
+        ))
+        .expect("starts");
         assert_eq!(key.epoch, 2);
     }
 
     #[test]
     fn the_timer_covers_an_epoch_whose_only_block_is_its_first() {
-        let key = decide(&inputs(Trigger::Timer { slot: 3 * SPE - 1 }, 2 * SPE)).expect("starts");
+        let key = decide(&inputs(
+            Trigger::Timer {
+                slot: 3 * spe() - 1,
+            },
+            2 * spe(),
+        ))
+        .expect("starts");
         assert_eq!(key.epoch, 3);
     }
 
@@ -346,19 +364,43 @@ mod tests {
     fn a_stale_timer_trigger_starts_nothing() {
         // The timer's epoch holds no block: the head is the previous epoch's
         // last slot.
-        assert!(decide(&inputs(Trigger::Timer { slot: 3 * SPE - 1 }, 2 * SPE - 1)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 3 * spe() - 1
+                },
+                2 * spe() - 1
+            ))
+            .is_none()
+        );
         // A stall several epochs long.
-        assert!(decide(&inputs(Trigger::Timer { slot: 6 * SPE - 1 }, 2 * SPE - 5)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 6 * spe() - 1
+                },
+                2 * spe() - 5
+            ))
+            .is_none()
+        );
     }
 
     #[test]
     fn the_timer_ignores_slots_that_are_not_the_last() {
-        assert!(decide(&inputs(Trigger::Timer { slot: SPE }, SPE - 1)).is_none());
+        assert!(decide(&inputs(Trigger::Timer { slot: spe() }, spe() - 1)).is_none());
     }
 
     #[test]
     fn the_timer_skips_a_head_already_at_the_boundary() {
-        assert!(decide(&inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 2 * spe() - 1
+                },
+                2 * spe()
+            ))
+            .is_none()
+        );
     }
 
     #[test]

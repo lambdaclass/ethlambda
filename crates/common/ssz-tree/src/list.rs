@@ -1,6 +1,7 @@
 //! [`List`]: an SSZ `List[T, N]` kept in a persistent Merkle tree.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 use libssz::{DecodeError, SszDecode, SszEncode};
@@ -11,7 +12,7 @@ use crate::cursor::{ElemCow, IterCow};
 use crate::interface::Interface;
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
-use crate::{Hash256, Value, tree_depth};
+use crate::{Const, Hash256, Length, Value, tree_depth};
 
 /// An SSZ list of at most `N` elements, kept in a persistent Merkle tree.
 ///
@@ -22,20 +23,35 @@ use crate::{Hash256, Value, tree_depth};
 ///
 /// A clone is O(1) and shares the whole tree. Writes are buffered in `U` (see
 /// [`UpdateMap`]) until [`List::apply_updates`].
-#[derive(Clone)]
-pub struct List<T, const N: usize, U = VecMap<T>> {
+pub struct ListOf<T, L, U = VecMap<T>> {
     interface: Interface<T, U>,
+    length: PhantomData<fn() -> L>,
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
+/// A [`ListOf`] whose length bound is the compile-time constant `N`.
+pub type List<T, const N: usize, U = VecMap<T>> = ListOf<T, Const<N>, U>;
+
+/// By hand rather than derived, since a derive would require `L: Clone`
+/// of a marker type that is never instantiated.
+impl<T: Clone, L, U: Clone> Clone for ListOf<T, L, U> {
+    fn clone(&self) -> Self {
+        Self {
+            interface: self.interface.clone(),
+            length: PhantomData,
+        }
+    }
+}
+
+impl<T: Value, L: Length, U: UpdateMap<T>> ListOf<T, L, U> {
     fn depth() -> usize {
-        tree_depth::<T>(N)
+        tree_depth::<T>(L::get())
     }
 
     /// An empty list.
     pub fn empty() -> Self {
         Self {
             interface: Interface::from_values(std::iter::empty(), Self::depth()),
+            length: PhantomData,
         }
     }
 
@@ -51,7 +67,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
 
     /// The type's element limit, `N`.
     pub fn max_capacity(&self) -> usize {
-        N
+        L::get()
     }
 
     /// The element at `index`, or `None` past the end.
@@ -67,9 +83,9 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
 
     /// Appends `value`, buffered until [`List::apply_updates`].
     pub fn push(&mut self, value: T) -> Result<(), TypeError> {
-        if self.len() >= N {
+        if self.len() >= L::get() {
             return Err(TypeError::OverCapacity {
-                max: N,
+                max: L::get(),
                 got: self.len() + 1,
             });
         }
@@ -137,39 +153,40 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> crate::Buffered for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> crate::Buffered for ListOf<T, L, U> {
     fn apply_updates(&mut self) {
-        List::apply_updates(self);
+        ListOf::apply_updates(self);
     }
 
     fn has_pending_updates(&self) -> bool {
-        List::has_pending_updates(self)
+        ListOf::has_pending_updates(self)
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Default for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> Default for ListOf<T, L, U> {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> TryFrom<Vec<T>> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> TryFrom<Vec<T>> for ListOf<T, L, U> {
     type Error = TypeError;
 
     fn try_from(values: Vec<T>) -> Result<Self, TypeError> {
-        if values.len() > N {
+        if values.len() > L::get() {
             return Err(TypeError::OverCapacity {
-                max: N,
+                max: L::get(),
                 got: values.len(),
             });
         }
         Ok(Self {
             interface: Interface::from_values(values, Self::depth()),
+            length: PhantomData,
         })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Index<usize> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> Index<usize> for ListOf<T, L, U> {
     type Output = T;
 
     fn index(&self, index: usize) -> &T {
@@ -179,7 +196,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> Index<usize> for List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> IndexMut<usize> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> IndexMut<usize> for ListOf<T, L, U> {
     fn index_mut(&mut self, index: usize) -> &mut T {
         let len = self.len();
         self.get_mut(index)
@@ -187,7 +204,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> IndexMut<usize> for List<T, N, U
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> PartialEq for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> PartialEq for ListOf<T, L, U> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
             return false;
@@ -197,15 +214,15 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> PartialEq for List<T, N, U> {
     }
 }
 
-impl<T: Value + Eq, const N: usize, U: UpdateMap<T>> Eq for List<T, N, U> {}
+impl<T: Value + Eq, L: Length, U: UpdateMap<T>> Eq for ListOf<T, L, U> {}
 
-impl<T: Value + fmt::Debug, const N: usize, U: UpdateMap<T>> fmt::Debug for List<T, N, U> {
+impl<T: Value + fmt::Debug, L: Length, U: UpdateMap<T>> fmt::Debug for ListOf<T, L, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a List<T, N, U> {
+impl<'a, T: Value, L: Length, U: UpdateMap<T>> IntoIterator for &'a ListOf<T, L, U> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T, U>;
 
@@ -214,7 +231,7 @@ impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a List<T,
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszEncode for ListOf<T, L, U> {
     fn is_fixed_size() -> bool {
         false
     }
@@ -232,7 +249,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszDecode for ListOf<T, L, U> {
     fn is_fixed_size() -> bool {
         false
     }
@@ -243,12 +260,13 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for List<T, N, U> {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         Ok(Self {
-            interface: Interface::from_ssz_bytes(bytes, N, Self::depth())?,
+            interface: Interface::from_ssz_bytes(bytes, L::get(), Self::depth())?,
+            length: PhantomData,
         })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> HashTreeRoot for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> HashTreeRoot for ListOf<T, L, U> {
     /// Ignores `hasher` and uses SHA-256: see the crate docs.
     fn hash_tree_root(&self, _hasher: &impl Sha256Hasher) -> Hash256 {
         mix_in_length(&Sha2Hasher, &self.interface.root(), self.len())

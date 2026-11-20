@@ -2077,12 +2077,12 @@ mod tests {
             })
             .collect();
         let zero_root_vector = || -> BlockRoots {
-            vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            vec![Root::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length")
         };
         let empty_sync_committee = || altair::SyncCommittee {
-            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+            pubkeys: vec![Default::default(); preset::sync_committee_size()]
                 .try_into()
                 .expect("built at exactly SYNC_COMMITTEE_SIZE"),
             aggregate_pubkey: Default::default(),
@@ -2091,7 +2091,7 @@ mod tests {
         BeaconState::Fulu(fulu::BeaconState {
             genesis_time: 0,
             genesis_validators_root: Root::ZERO,
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             fork: Default::default(),
             latest_block_header: Default::default(),
             block_roots: zero_root_vector(),
@@ -2106,10 +2106,10 @@ mod tests {
             balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
                 .try_into()
                 .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_participation: vec![0; count]
@@ -2160,7 +2160,7 @@ mod tests {
             pending_deposits: Default::default(),
             pending_partial_withdrawals: Default::default(),
             pending_consolidations: Default::default(),
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+            proposer_lookahead: vec![0; preset::proposer_lookahead_length()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
         })
@@ -2184,24 +2184,24 @@ mod tests {
             })
             .collect();
         let zero_root_vector = || -> BlockRoots {
-            vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            vec![Root::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length")
         };
         let empty_sync_committee = || altair::SyncCommittee {
-            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+            pubkeys: vec![Default::default(); preset::sync_committee_size()]
                 .try_into()
                 .expect("built at exactly SYNC_COMMITTEE_SIZE"),
             aggregate_pubkey: Default::default(),
         };
-        let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::PTC_SIZE]
+        let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::ptc_size()]
             .try_into()
             .expect("built at exactly PTC_SIZE");
 
         BeaconState::Gloas(gloas::BeaconState {
             genesis_time: 0,
             genesis_validators_root: Root::ZERO,
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             fork: Default::default(),
             latest_block_header: Default::default(),
             block_roots: zero_root_vector(),
@@ -2212,10 +2212,10 @@ mod tests {
             eth1_deposit_index: 0,
             validators: validators.into(),
             balances: vec![preset::MAX_EFFECTIVE_BALANCE; count].into(),
-            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_participation: vec![0; count].into(),
@@ -2240,7 +2240,7 @@ mod tests {
             pending_deposits: Default::default(),
             pending_partial_withdrawals: Default::default(),
             pending_consolidations: Default::default(),
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+            proposer_lookahead: vec![0; preset::proposer_lookahead_length()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             builders: Default::default(),
@@ -2248,14 +2248,14 @@ mod tests {
             execution_payload_availability: Default::default(),
             builder_pending_payments: vec![
                 gloas::BuilderPendingPayment::default();
-                preset::BUILDER_PENDING_PAYMENTS_LENGTH
+                preset::builder_pending_payments_length()
             ]
             .try_into()
             .expect("the vector is built at its exact length"),
             builder_pending_withdrawals: Default::default(),
             latest_execution_payload_bid: Default::default(),
             payload_expected_withdrawals: Default::default(),
-            ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
+            ptc_window: vec![empty_ptc; preset::ptc_window_length()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
         })

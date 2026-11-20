@@ -143,7 +143,7 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<Vec<capella::With
     let (mut withdrawal_index, mut validator_index) = state.withdrawal_cursor()?;
 
     let validator_count = state.validator_count() as u64;
-    let bound = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
+    let bound = validator_count.min(preset::max_validators_per_withdrawals_sweep());
 
     let mut withdrawals = Vec::new();
     for _ in 0..bound {
@@ -182,7 +182,7 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<Vec<capella::With
 
         // First early stop: a full payload's worth of withdrawals, regardless
         // of how much of the sweep bound is left to visit.
-        if withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD {
+        if withdrawals.len() == preset::max_withdrawals_per_payload() {
             break;
         }
         validator_index = validator_index
@@ -244,33 +244,33 @@ pub fn process_withdrawals(
     // agree on where "next" is once the registry is smaller than
     // MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP.
     let validator_count = state.validator_count() as u64;
-    let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
-    {
-        // A full payload: the next sweep resumes right after the last
-        // validator this block actually paid.
-        let latest_withdrawal = expected_withdrawals
-            .last()
-            .expect("MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty");
-        latest_withdrawal
-            .validator_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "latest_withdrawal.validator_index + 1",
-            ))?
-            % validator_count
-    } else {
-        // Not a full payload: advance the sweep by its own maximum length,
-        // from the cursor as it stood before this call, not from wherever the
-        // (already-exhausted) sweep loop ended up.
-        let current_cursor =
-            capella_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
-        current_cursor
-            .checked_add(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
-            .ok_or(Error::ArithmeticOverflow(
-                "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
-            ))?
-            % validator_count
-    };
+    let next_validator_index =
+        if expected_withdrawals.len() == preset::max_withdrawals_per_payload() {
+            // A full payload: the next sweep resumes right after the last
+            // validator this block actually paid.
+            let latest_withdrawal = expected_withdrawals.last().expect(
+                "MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty",
+            );
+            latest_withdrawal
+                .validator_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow(
+                    "latest_withdrawal.validator_index + 1",
+                ))?
+                % validator_count
+        } else {
+            // Not a full payload: advance the sweep by its own maximum length,
+            // from the cursor as it stood before this call, not from wherever the
+            // (already-exhausted) sweep loop ended up.
+            let current_cursor =
+                capella_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
+            current_cursor
+                .checked_add(preset::max_validators_per_withdrawals_sweep())
+                .ok_or(Error::ArithmeticOverflow(
+                    "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
+                ))?
+                % validator_count
+        };
     capella_state(state, "process_withdrawals")?.next_withdrawal_validator_index =
         next_validator_index;
 
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn the_sweep_stops_once_a_full_payload_is_collected() {
-        let count = preset::MAX_WITHDRAWALS_PER_PAYLOAD + 5;
+        let count = preset::max_withdrawals_per_payload() + 5;
         let mut state = capella_state_with_validators(count);
         for index in 0..count as u64 {
             make_fully_withdrawable(&mut state, index, preset::MAX_EFFECTIVE_BALANCE);
@@ -601,7 +601,7 @@ mod tests {
         let withdrawals = get_expected_withdrawals(&state).unwrap();
         assert_eq!(
             withdrawals.len(),
-            preset::MAX_WITHDRAWALS_PER_PAYLOAD,
+            preset::max_withdrawals_per_payload(),
             "the sweep must stop the moment a full payload is collected, even though \
              every remaining validator in the bound is also withdrawable"
         );
@@ -614,7 +614,7 @@ mod tests {
         // it, the bound would not be doing anything. Every validator here
         // keeps its all-default (non-real) pubkey, which is what makes a
         // registry this large cheap to build.
-        let bound = preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP as usize;
+        let bound = preset::max_validators_per_withdrawals_sweep() as usize;
         let count = bound + 1;
         let mut state = capella_state_with_validators(count);
         make_fully_withdrawable(
@@ -636,14 +636,14 @@ mod tests {
 
     #[test]
     fn a_full_payload_resumes_the_cursor_right_after_the_last_withdrawal_paid() {
-        let count = preset::MAX_WITHDRAWALS_PER_PAYLOAD + 2;
+        let count = preset::max_withdrawals_per_payload() + 2;
         let mut state = capella_state_with_validators(count);
         for index in 0..count as u64 {
             make_fully_withdrawable(&mut state, index, preset::MAX_EFFECTIVE_BALANCE);
         }
 
         let expected = get_expected_withdrawals(&state).unwrap();
-        assert_eq!(expected.len(), preset::MAX_WITHDRAWALS_PER_PAYLOAD);
+        assert_eq!(expected.len(), preset::max_withdrawals_per_payload());
         let last = expected.last().unwrap().clone();
 
         let payload = capella::ExecutionPayload {
@@ -686,7 +686,7 @@ mod tests {
         process_withdrawals(&mut state, &payload).unwrap();
 
         let inner = capella_state_ref(&state, "test assertion").unwrap();
-        let expected_next = (2 + preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP) % count as u64;
+        let expected_next = (2 + preset::max_validators_per_withdrawals_sweep()) % count as u64;
         assert_eq!(inner.next_withdrawal_validator_index, expected_next);
     }
 

@@ -846,8 +846,8 @@ mod tests {
         let store = RwLock::new(store);
 
         let altair_fork_epoch = Config::mainnet().altair_fork_epoch;
-        let last_phase0_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH - 1;
-        let first_altair_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let last_phase0_slot = altair_fork_epoch * preset::slots_per_epoch() - 1;
+        let first_altair_slot = altair_fork_epoch * preset::slots_per_epoch();
 
         let phase0_node = Arc::new(MockBeaconNode::new().with_attestation_data(last_phase0_slot));
         AttestationService::new(
@@ -907,7 +907,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 10 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 10 * preset::slots_per_epoch() + 3;
         let node = Arc::new(
             MockBeaconNode::new()
                 .with_attestation_data(slot)
@@ -971,7 +971,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 9 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 9 * preset::slots_per_epoch() + 3;
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(slot));
         AttestationService::new(
             node.clone(),

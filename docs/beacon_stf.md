@@ -101,7 +101,8 @@ for is the fixture tree, not the code.
 
 | Module | Holds |
 |--------|-------|
-| `preset` | Compile-time constants, mainnet or minimal |
+| `preset` | Preset values, mainnet or minimal, selected once per process |
+| `preset_sized` | SSZ lists, vectors and bitfields bounded by a preset value |
 | `config` | Runtime configuration: fork schedule, churn limits, blob schedule |
 | `constants` | Values the spec fixes outright: domain types, flag weights, sentinels |
 | `fork` | `ForkName`, ordered oldest to newest |
@@ -116,7 +117,7 @@ for is the fixture tree, not the code.
 | `fork_choice` | The LMD GHOST store |
 | `lean_boundary` | The two `#[track_caller]` panics for the `Lean` arm of the shared enums |
 
-The first five come from `ethlambda_types::beacon` and are re-exported by
+The first six come from `ethlambda_types::beacon` and are re-exported by
 `beacon/mod.rs`; the rest are defined here.
 
 ## Three kinds of parameter
@@ -124,12 +125,29 @@ The first five come from `ethlambda_types::beacon` and are re-exported by
 The specification distinguishes constants, presets, and configuration, and so
 does this module, because they have genuinely different lifetimes.
 
-**Presets** (`preset`) set container sizes, so they must be compile-time
-constants: `SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>`. The preset
-therefore cannot be a runtime value or a type parameter. Stable Rust cannot take a
-const-generic argument from a trait's associated const, so the preset is selected
-by Cargo feature: mainnet by default, minimal with `preset-minimal`. The test
-target builds the crate twice and each run walks only its own fixture tree.
+**Presets** (`preset`) set container sizes, and they are selected once per
+process at runtime, from the network's `PRESET_BASE`: one binary runs mainnet
+and a minimal-preset devnet alike, as Lighthouse and Teku do.
+
+Lighthouse gets there by making every container generic over its preset
+(`BeaconState<E: EthSpec>`). That is not available here: stable Rust cannot
+take a const-generic argument from a trait's associated const, and libssz's
+collections take their bound as a const generic. So the preset is a
+process-wide value instead (`Preset::select`, frozen by the first read), and
+only what the two presets disagree on reads it:
+
+- A value both presets share stays a constant (`preset::MAX_ATTESTATIONS`),
+  compile-asserted equal in both, and keeps bounding its containers as a
+  const generic (`SszList<Attestation, { preset::MAX_ATTESTATIONS }>`).
+- A value they disagree on is a function, `preset::slots_per_epoch()`.
+- A container bounded by such a value takes a `Length` marker whose `get()`
+  reads the active preset: `VectorOf<Root, preset::SlotsPerHistoricalRoot>`
+  for the state's tree-backed vectors, and `preset_sized`'s `PresetList`,
+  `PresetVector`, `PresetBitlist` and `PresetBitvector` (libssz's four with
+  `N` read at runtime) for the rest.
+
+The test target is built once; `BEACON_SPEC_PRESET` picks which fixture tree a
+run walks.
 
 **Configuration** (`config`) is runtime, because the `transition` fixture suite
 moves a fork's activation epoch per test case. That is the concrete reason fork
@@ -719,8 +737,8 @@ a timing measurement, not a fixture.
 
 Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
-The release ships no mainnet `genesis` fixtures, so that whole runner is gated
-behind the `preset-minimal` feature (`tests/beacon_spec/genesis.rs`).
+The release ships no mainnet `genesis` fixtures, so that whole runner is added
+to minimal runs only (`tests/beacon_spec/genesis.rs`).
 
 The gossip validation vectors this crate's `gossip.rs` runner covers come from
 the same tree as every other suite. The node validates four topics under fulu's

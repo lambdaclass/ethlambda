@@ -19,7 +19,7 @@ use ethlambda_state_transition::beacon::das::{
 use libtest_mimic::Trial;
 use num_bigint::BigUint;
 
-use super::{Case, PRESET, collect_all_handlers};
+use super::{Case, collect_all_handlers, preset};
 
 #[derive(serde::Deserialize)]
 struct CustodyGroupsMeta {
@@ -114,7 +114,7 @@ pub fn trials() -> Vec<Trial> {
     // `gossip_*` handlers live under this same runner directory but are
     // `super::gossip`'s to collect and run; without this filter every one of
     // their cases would also reach `run`'s `other` arm below and fail.
-    let cases: Vec<_> = collect_all_handlers(PRESET, "networking")
+    let cases: Vec<_> = collect_all_handlers(preset(), "networking")
         .into_iter()
         .filter(|(handler, _)| !handler.starts_with("gossip_"))
         .collect();

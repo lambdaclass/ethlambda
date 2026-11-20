@@ -39,7 +39,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::error::{Error, Result};
@@ -94,7 +94,9 @@ pub struct SigningContext {
 /// schedule holds the current epoch and the next, so a proof computed for a
 /// subscription at the start of an epoch is still wanted by the aggregation
 /// up to two epochs later.
-const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
+fn selection_proof_retention_slots() -> Slot {
+    3 * slots_per_epoch()
+}
 
 /// How long one duty's batch of signatures may take, from when it is asked
 /// for.
@@ -619,7 +621,7 @@ impl SigningContext {
             )
             .await?;
         let mut proofs = self.selection_proofs();
-        proofs.retain(|(_, held), _| held + SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
         proofs.insert((*pubkey, slot), proof);
         Ok(proof)
     }
@@ -1102,7 +1104,7 @@ mod tests {
         // number, since `domain()` only changes with the epoch insofar as the
         // epoch selects a different fork version.
         let mut data = attestation_data(context.config.altair_fork_epoch + 1);
-        data.slot = 3 * preset::SLOTS_PER_EPOCH;
+        data.slot = 3 * preset::slots_per_epoch();
 
         let from_target = compute_signing_root(
             data.hash_tree_root(),
@@ -1280,7 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+        let slot = gloas_epoch * preset::slots_per_epoch() + 2;
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1293,7 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+        let slot = (gloas_epoch + 1) * preset::slots_per_epoch();
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1369,7 +1371,7 @@ mod tests {
         let context = context();
         let epoch: Epoch = 100;
         let object = epoch.hash_tree_root();
-        let slot = epoch * preset::SLOTS_PER_EPOCH;
+        let slot = epoch * preset::slots_per_epoch();
 
         let roots = [
             compute_signing_root(object, context.domain(DOMAIN_BEACON_ATTESTER, epoch)),
@@ -1416,7 +1418,7 @@ mod tests {
     #[test]
     fn a_blocks_domain_comes_from_its_own_slots_epoch() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config.altair_fork_epoch * preset::slots_per_epoch();
         let before = after - 1;
 
         assert_ne!(
@@ -1513,7 +1515,7 @@ mod tests {
     #[test]
     fn a_sync_message_domain_follows_the_fork_schedule_at_its_slot() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config.altair_fork_epoch * preset::slots_per_epoch();
         assert_ne!(
             context.sync_committee_message_signing_root(after - 1, Root::ZERO),
             context.sync_committee_message_signing_root(after, Root::ZERO),
@@ -1995,7 +1997,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.electra_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config.electra_fork_epoch * preset::slots_per_epoch();
             let header = header(slot);
 
             context
@@ -2110,7 +2112,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let (context, gloas_epoch) = gloas_scheduled_context();
-            let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+            let slot = gloas_epoch * preset::slots_per_epoch() + 2;
             let preferences = preferences_for(slot);
 
             let signature = context
@@ -2189,7 +2191,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config.altair_fork_epoch * preset::slots_per_epoch();
 
             let err = context
                 .sign_block(&store, &pubkey, &header(slot))

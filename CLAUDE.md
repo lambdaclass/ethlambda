@@ -529,10 +529,12 @@ A loaded network decodes its own `genesis.ssz` instead, at whatever fork its
 own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, goes
 through two checks as soon as it parses, and a failure is a hard startup
 error. For a directory they run before its `genesis.ssz` is decoded, since
-the compiled preset sets that state's container bounds and a mismatch would
-otherwise surface as an SSZ error:
+the preset sets that state's container bounds:
 
-- `check_preset`: `PRESET_BASE` must name the compiled preset.
+- `select_preset`: `PRESET_BASE` (`mainnet` or `minimal`) becomes the
+  process's preset (`Preset::select`, see "Beacon Chain types"). Missing or
+  unknown is refused, and so is a preset other than one something already
+  read, which would be a startup-ordering bug.
 - `check_constants`: every key the node runs on a compile-time constant for
   instead of reading `Config` (the custody counts, subnet counts,
   `MAX_REQUEST_*`, `MAX_PAYLOAD_SIZE`, the snappy message domains,
@@ -544,9 +546,10 @@ otherwise surface as an SSZ error:
 Two consequences, on the built-in arm. `beacon` takes **no genesis**
 configuration of its own the way `node` does: `genesis_time` and
 `genesis_validators_root` need nothing from the command line beyond
-`--network`. And a build with `ethlambda-types/preset-minimal` on refuses every
-built-in network, since each declares `PRESET_BASE: mainnet`; nothing enables
-that feature for this binary, and failing is the right answer if anything does.
+`--network`. And every built-in network runs the mainnet preset, since each
+declares `PRESET_BASE: mainnet`; a minimal-preset network (an
+ethereum-package devnet with `preset: minimal`) is always a loaded directory,
+and runs on the same binary and image.
 
 `--checkpoint-sync-url` is no longer merely accepted-but-unused on `beacon`:
 the anchor work has landed, and this flag is now how `beacon` fetches its
@@ -635,12 +638,36 @@ existing once per chain.
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
-- Preset is a **compile-time** choice (`preset-minimal` feature on this crate)
-  because SSZ container bounds are const-generic arguments; fork scheduling is
-  runtime (`beacon::config`) instead. Every lean crate depends on
-  `ethlambda-types`, so enabling the feature rebuilds it for the whole graph;
-  lean code reads none of the beacon preset constants, so it cannot change lean
-  behavior.
+- **The preset is a runtime choice, one per process** (`beacon::preset`), like
+  Lighthouse's or Teku's: one binary and one image run mainnet and a
+  minimal-preset devnet alike. `ethlambda beacon` selects its network's
+  `PRESET_BASE` in `select_preset` (network resolution, before any decode);
+  `ethlambda validator` and `voluntary-exit` adopt their beacon node's
+  (`adopt_preset`, right after `/eth/v1/config/spec`). `Preset::select`
+  stores it in a process-wide atomic, and **the first read freezes it**: a
+  later select of the other preset fails rather than mixing container shapes,
+  so a startup path that reads a preset value before selecting fails loudly.
+  - Values both presets share stay constants (`preset::MAX_ATTESTATIONS`),
+    each compile-asserted equal in both (`shared!`). The 29 they disagree on
+    are functions (`preset::slots_per_epoch()`, `per_preset!`); `mainnet::`
+    and `minimal::` keep every literal. A value that starts to differ in a
+    spec release breaks the build at its `shared!` assertion and has to move.
+  - A container bound the presets disagree on cannot be a const generic. It is
+    a `Length` marker type (`preset::SyncCommitteeSize`, whose `get()` reads
+    the active preset), on `beacon::preset_sized::{PresetList, PresetVector,
+    PresetBitlist, PresetBitvector}` (libssz's four, with `N` read at runtime;
+    no serde of their own, like libssz's) or on `ethlambda_ssz_tree`'s
+    `ListOf`/`VectorOf` (`List<T, N>`/`Vector<T, N>` are aliases over
+    `Const<N>`). The spec suites' `ssz_static` cases are what check their
+    encodings and roots against the specification's, under both presets.
+  - Because a const-context value cannot read the preset, anything derived
+    from a differing value is a function too (`max_aggregates_per_slot()`,
+    `sync_subcommittee_size()`, ...).
+  - The `preset-minimal` feature only changes `Preset::DEFAULT`, the preset of
+    a process that never selects one, which is a unit-test binary: it is how
+    CI runs the `--lib` tests under minimal. The binary never enables it.
+  - Lean code reads none of the beacon preset, so the choice cannot change
+    lean behavior; a lean data directory records the default (mainnet).
 - Per-fork containers are plain structs behind an enum, so SSZ stays derived:
   two of phase0's fields are *replaced* in altair, one field changes type in
   five separate forks, and the state's merkle tree gains a level at electra.
@@ -734,15 +761,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   own subnet-selection math is neither, so it lives with the wire code it
   serves, in `ethlambda-p2p`'s
   `beacon::subnets`.
-- Tests: `make test-beacon` (builds once per preset), or `test-beacon-mainnet` /
-  `test-beacon-minimal` for one. CI runs the two as a job each, so they build and
-  run concurrently. `make test` covers the whole
+- Tests: `make test-beacon` (one build, run once per preset: the spec binary
+  selects `BEACON_SPEC_PRESET` at startup), or `test-beacon-mainnet` /
+  `test-beacon-minimal` for one. CI runs the two as a job each, so they run
+  concurrently. `make test` covers the whole
   workspace, in two halves, and still needs no fixture download: the
   `beacon_spec_tests` target declares `required-features = ["beacon-spec-tests"]`
   so `cargo test` skips it, and the BLS and KZG fixture vectors, which are unit
   tests inside the module, are `#[cfg_attr(not(feature = ...), ignore)]` so they
   report as ignored rather than silently absent. Turning the feature on is what
-  `make test-beacon` does, and it runs `--lib` too so those 15 are not missed.
+  `make test-beacon-mainnet` does, and it runs `--lib` too so those 15 are not
+  missed.
   `ethlambda-blockchain` has its own `beacon-spec-tests` feature gating the
   fixture-driven chain-actor tests (the gloas envelope cases in its `--lib`
   target, which read `consensus-spec-tests`); `make test-beacon-mainnet` runs
@@ -765,9 +794,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   release: consensus-specs shipped them itself, under a `general` config,
   through v1.7.0-alpha.12, but v1.7.0-alpha.13 (consensus-specs #5398) moved
   them out.
-- Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
-  container bounds are const-generic arguments; fork scheduling is runtime
-  because the `transition` suite moves fork epochs per case.
+- The preset is selected once per process at runtime (see "Beacon Chain
+  types"), and fork scheduling is runtime configuration because the
+  `transition` suite moves fork epochs per case.
 - Per-fork containers are plain structs behind an enum, so SSZ stays derived. See
   [`docs/beacon_stf.md`](docs/beacon_stf.md) for why, including the fork-by-fork
   field counts and the merkle depth change at electra.

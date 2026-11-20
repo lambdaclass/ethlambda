@@ -3348,8 +3348,8 @@ pub(crate) mod tests {
                 ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
-                    crate::SEEN_AGGREGATES_CAPACITY,
-                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::seen_aggregates_capacity(),
+                    crate::seen_aggregates_capacity(),
                 ),
             seen_attestations:
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
@@ -3531,7 +3531,7 @@ pub(crate) mod tests {
     fn only_a_range_reaching_fulu_waits_for_column_custodians() {
         let config = Config::mainnet();
         let first_fulu_slot =
-            config.fulu_fork_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+            config.fulu_fork_epoch * ethlambda_types::beacon::preset::slots_per_epoch();
         let custody = [4, 5];
 
         // Every slot before fulu: no columns exist, so nothing to wait for.

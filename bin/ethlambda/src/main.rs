@@ -1744,8 +1744,8 @@ fn first_config_difference(
     // `persisted`/`supplied` directly); it exists purely to force that
     // choice.
     let Config {
-        // Identity. `preset_base` is compared below: `check_preset` and the
-        // directory's preset byte already pin the compiled preset, and this
+        // Identity. `preset_base` is compared below: `select_preset` and the
+        // directory's preset byte already pin the active preset, and this
         // also pins the stored string, which `/eth/v1/config/spec` reports, to
         // the file's. `config_name` is only a label with no consensus effect,
         // so the caller warns about a changed one rather than refusing it:

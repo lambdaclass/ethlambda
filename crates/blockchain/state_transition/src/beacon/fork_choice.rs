@@ -1339,8 +1339,8 @@ pub fn get_forkchoice_store(
     match anchor_rules {
         ForkRules::Gloas => {
             store.set_gloas_block_timeliness(anchor_root, [true, true]);
-            store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(anchor_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(anchor_root, vec![None; preset::ptc_size()]);
         }
         ForkRules::PreGloas => {}
     }
@@ -1463,7 +1463,7 @@ pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64)
 /// The arithmetic of [`calculate_committee_fraction`], for a caller that
 /// already holds the total (the [`JustifiedBalances`] snapshot's own).
 pub fn committee_fraction(total_balance: Gwei, committee_percent: u64) -> Gwei {
-    let committee_weight = total_balance / preset::SLOTS_PER_EPOCH;
+    let committee_weight = total_balance / preset::slots_per_epoch();
     committee_weight.saturating_mul(committee_percent) / 100
 }
 
@@ -2935,7 +2935,7 @@ pub fn is_head_late(store: &Store, head_root: Root) -> Result<bool> {
 /// Whether `slot` is not the first slot of its epoch, i.e. the proposer
 /// shuffling in effect for it cannot change from reorging one slot.
 pub fn is_shuffling_stable(slot: Slot) -> bool {
-    !slot.is_multiple_of(preset::SLOTS_PER_EPOCH)
+    !slot.is_multiple_of(preset::slots_per_epoch())
 }
 
 /// Whether `head_root` and `parent_root` would cast the same FFG vote if
@@ -3453,7 +3453,7 @@ pub fn payload_timeliness(store: &Store, root: Root, timely: bool) -> Result<boo
 
     let votes: Vec<bool> = vote.into_iter().flatten().collect();
     let matching = votes.iter().filter(|&&v| v == timely).count() as u64;
-    Ok(matching > preset::PAYLOAD_TIMELY_THRESHOLD)
+    Ok(matching > preset::payload_timely_threshold())
 }
 
 /// `payload_data_availability` (gloas `fork-choice.md`): whether `root`'s
@@ -3480,7 +3480,7 @@ pub fn payload_data_availability(store: &Store, root: Root, available: bool) -> 
 
     let votes: Vec<bool> = vote.into_iter().flatten().collect();
     let matching = votes.iter().filter(|&&v| v == available).count() as u64;
-    Ok(matching > preset::DATA_AVAILABILITY_TIMELY_THRESHOLD)
+    Ok(matching > preset::data_availability_timely_threshold())
 }
 
 /// `get_parent_payload_status` (gloas `fork-choice.md`): whether `block`
@@ -5604,8 +5604,8 @@ pub fn on_block_speculative(
     // block, for each of the two questions it votes on.
     match rules {
         ForkRules::Gloas => {
-            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::ptc_size()]);
         }
         ForkRules::PreGloas => {}
     }
@@ -6689,8 +6689,8 @@ mod tests {
     #[test]
     fn a_slashed_equivocator_still_counts_toward_head_weakness_from_the_snapshot() {
         let config = Config::active();
-        let mut state = test_state::with_validators(preset::SLOTS_PER_EPOCH as usize);
-        for index in 0..preset::SLOTS_PER_EPOCH {
+        let mut state = test_state::with_validators(preset::slots_per_epoch() as usize);
+        for index in 0..preset::slots_per_epoch() {
             state.validator_mut(index).expect("registered").slashed = true;
         }
         state.apply_pending_mutations();
@@ -7067,8 +7067,8 @@ mod tests {
         assert_eq!(compute_slots_since_epoch_start(epoch_start), 0);
         assert_eq!(compute_slots_since_epoch_start(epoch_start + 1), 1);
         assert_eq!(
-            compute_slots_since_epoch_start(epoch_start + preset::SLOTS_PER_EPOCH - 1),
-            preset::SLOTS_PER_EPOCH - 1
+            compute_slots_since_epoch_start(epoch_start + preset::slots_per_epoch() - 1),
+            preset::slots_per_epoch() - 1
         );
     }
 
@@ -7164,7 +7164,7 @@ mod tests {
         // committee 0, so which index the shuffle picks does not matter to
         // this test: it asks the same cache `is_head_weak` will.
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         assert!(
@@ -7257,7 +7257,7 @@ mod tests {
         // post-state directly.
         store
             .set_time_ms(seconds_to_milliseconds(
-                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+                config.seconds_per_slot * preset::slots_per_epoch() * 2,
             ))
             .unwrap();
 
@@ -7306,7 +7306,7 @@ mod tests {
         // takes the same `current_epoch > block_epoch` branch.
         store
             .set_time_ms(seconds_to_milliseconds(
-                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+                config.seconds_per_slot * preset::slots_per_epoch() * 2,
             ))
             .unwrap();
 
@@ -7404,7 +7404,7 @@ mod tests {
     /// The store clock two epochs past the anchor's, the first tick a node
     /// restarted into a later epoch runs.
     fn two_epochs_past(anchor_slot: Slot, config: &Config) -> u64 {
-        (anchor_slot + 2 * preset::SLOTS_PER_EPOCH) * config.seconds_per_slot
+        (anchor_slot + 2 * preset::slots_per_epoch()) * config.seconds_per_slot
     }
 
     /// Reproduces the unrealized-justification loss on resume: the
@@ -8656,7 +8656,7 @@ mod tests {
         );
 
         verify_payload(&mut store, a_root);
-        let strong_votes = vec![Some(true); preset::PTC_SIZE];
+        let strong_votes = vec![Some(true); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
 
@@ -8686,7 +8686,7 @@ mod tests {
             .unwrap();
         verify_payload(&mut store, a_root);
 
-        let exactly_threshold = vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize];
+        let exactly_threshold = vec![Some(true); preset::payload_timely_threshold() as usize];
         store.set_payload_timeliness_vote(a_root, exactly_threshold.clone());
         assert!(
             !payload_timeliness(&store, a_root, true).unwrap(),
@@ -8694,7 +8694,7 @@ mod tests {
         );
         store.set_payload_timeliness_vote(
             a_root,
-            vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize + 1],
+            vec![Some(true); preset::payload_timely_threshold() as usize + 1],
         );
         assert!(
             payload_timeliness(&store, a_root, true).unwrap(),
@@ -8708,7 +8708,7 @@ mod tests {
         );
         store.set_payload_data_availability_vote(
             a_root,
-            vec![Some(true); preset::DATA_AVAILABILITY_TIMELY_THRESHOLD as usize + 1],
+            vec![Some(true); preset::data_availability_timely_threshold() as usize + 1],
         );
         assert!(payload_data_availability(&store, a_root, true).unwrap());
     }
@@ -8754,7 +8754,7 @@ mod tests {
         );
 
         verify_payload(&mut store, a_root);
-        let weak_votes = vec![Some(false); preset::PTC_SIZE];
+        let weak_votes = vec![Some(false); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, weak_votes.clone());
         store.set_payload_data_availability_vote(a_root, weak_votes);
         assert!(
@@ -8765,14 +8765,14 @@ mod tests {
 
         // Timely but not available: both conditions are required (`&&`, not
         // `||`), so this must not extend either.
-        store.set_payload_timeliness_vote(a_root, vec![Some(true); preset::PTC_SIZE]);
-        store.set_payload_data_availability_vote(a_root, vec![Some(false); preset::PTC_SIZE]);
+        store.set_payload_timeliness_vote(a_root, vec![Some(true); preset::ptc_size()]);
+        store.set_payload_data_availability_vote(a_root, vec![Some(false); preset::ptc_size()]);
         assert!(
             !should_extend_payload(&store, a_root, &config).unwrap(),
             "timely alone, without availability, must not extend"
         );
 
-        let strong_votes = vec![Some(true); preset::PTC_SIZE];
+        let strong_votes = vec![Some(true); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
         assert!(
@@ -9272,7 +9272,7 @@ mod tests {
     fn should_apply_proposer_boost_applies_when_the_parent_is_not_weak() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let b_root = Root::repeat_byte(0xb0);
@@ -9535,7 +9535,7 @@ mod tests {
     fn is_head_weak_succeeds_with_a_pruned_vote() {
         let config = Config::active();
         let (mut store, anchor_root, _anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         // A vote for a root the store never indexed at all (pruned below
@@ -9563,7 +9563,7 @@ mod tests {
     fn is_head_weak_succeeds_when_a_vote_walks_onto_a_pruned_parent() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let orphan_root = Root::repeat_byte(0xd1);
@@ -9597,7 +9597,7 @@ mod tests {
     fn gloas_get_weight_tolerates_a_pruned_vote_reached_through_should_apply_proposer_boost() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let b_root = Root::repeat_byte(0xb0);
@@ -9607,7 +9607,7 @@ mod tests {
         store
             .insert_state(
                 b_root,
-                test_state::with_validators(preset::SLOTS_PER_EPOCH as usize),
+                test_state::with_validators(preset::slots_per_epoch() as usize),
             )
             .unwrap();
         store.set_unrealized_justification(b_root, anchor_slot + 1, Checkpoint::default());
@@ -9647,7 +9647,7 @@ mod tests {
     fn a_boost_outside_the_justified_subtree_is_skipped_without_its_gate() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         // anchor ─┬─ justified (anchor + 1)
@@ -9920,14 +9920,14 @@ mod tests {
             unreachable!("with_validators_at(Gloas) builds a gloas state");
         };
         inner.slot = 1;
-        let mut committee = vec![0; preset::PTC_SIZE];
+        let mut committee = vec![0; preset::ptc_size()];
         committee[2] = 3;
         committee[7] = 3;
-        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        let window_index = (preset::slots_per_epoch() + 1) as usize;
         inner.ptc_window[window_index] = committee.try_into().unwrap();
         store.insert_state(root, state).unwrap();
-        store.set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
-        store.set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+        store.set_payload_timeliness_vote(root, vec![None; preset::ptc_size()]);
+        store.set_payload_data_availability_vote(root, vec![None; preset::ptc_size()]);
         store
     }
 
@@ -10108,16 +10108,16 @@ mod tests {
         inner.slot = 1;
         // The state is keyed by its block's slot, which is the header's.
         inner.latest_block_header.slot = 1;
-        let mut committee = vec![0; preset::PTC_SIZE];
+        let mut committee = vec![0; preset::ptc_size()];
         committee[2] = 3;
-        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        let window_index = (preset::slots_per_epoch() + 1) as usize;
         inner.ptc_window[window_index] = committee.try_into().unwrap();
         store.insert_state(root, state).unwrap();
         // What `on_block` records for each gloas block, then the envelope.
         for block_root in [anchor_root, root] {
             store.set_gloas_block_timeliness(block_root, [true, true]);
-            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::ptc_size()]);
         }
         verify_payload(&mut store, root);
         // Dropping the last handle lets the state writer finish its queue.
@@ -10190,11 +10190,11 @@ mod tests {
         assert_eq!(store.block_timeliness(&anchor_root), Some([true, true]));
         assert_eq!(
             store.payload_timeliness_vote(&anchor_root),
-            Some(vec![None; preset::PTC_SIZE])
+            Some(vec![None; preset::ptc_size()])
         );
         assert_eq!(
             store.payload_data_availability_vote(&anchor_root),
-            Some(vec![None; preset::PTC_SIZE])
+            Some(vec![None; preset::ptc_size()])
         );
         assert!(!store.has_verified_payload(&anchor_root));
         // A gloas block carries a bid, not a payload: nothing to cache.
@@ -10317,7 +10317,7 @@ mod tests {
         let mut rng = TestRng(seed);
         let config = Config::active().with_fork_epoch(ForkName::Gloas, 1);
         let first_gloas_slot = compute_start_slot_at_epoch(1);
-        let slot_cap = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let slot_cap = 2 * preset::slots_per_epoch() - 1;
         // The anchor stays at slot 0, the finalized slot every walk stops at;
         // the first block after it jumps to just before the fork epoch, so a
         // short chain crosses the boundary.
@@ -10380,10 +10380,10 @@ mod tests {
                 }
                 for timely_votes in [true, false] {
                     let votes = match rng.below(4) {
-                        0 => vec![None; preset::PTC_SIZE],
-                        1 => vec![Some(true); preset::PTC_SIZE],
-                        2 => vec![Some(false); preset::PTC_SIZE],
-                        _ => (0..preset::PTC_SIZE)
+                        0 => vec![None; preset::ptc_size()],
+                        1 => vec![Some(true); preset::ptc_size()],
+                        2 => vec![Some(false); preset::ptc_size()],
+                        _ => (0..preset::ptc_size())
                             .map(|_| rng.chance(2, 3).then(|| rng.chance(1, 2)))
                             .collect(),
                     };
@@ -10693,7 +10693,7 @@ mod tests {
             if tree.justified_moved {
                 // Far enough past every block that a branch whose voting
                 // source is stale is dropped from the filtered tree.
-                current_slots.push(first + 3 * preset::SLOTS_PER_EPOCH);
+                current_slots.push(first + 3 * preset::slots_per_epoch());
             }
             for current_slot in current_slots {
                 check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
@@ -10811,9 +10811,11 @@ mod tests {
                         tree.store.insert_state(root, gloas_state.clone()).unwrap();
                         tree.store.set_payload_link(root, slot, link);
                         tree.store
-                            .set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
-                        tree.store
-                            .set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+                            .set_payload_timeliness_vote(root, vec![None; preset::ptc_size()]);
+                        tree.store.set_payload_data_availability_vote(
+                            root,
+                            vec![None; preset::ptc_size()],
+                        );
                         tree.store
                             .set_unrealized_justification(root, slot, Checkpoint::default());
                         if rng.chance(1, 2) {
@@ -11066,7 +11068,7 @@ mod tests {
             let max_slot = tree.slots.iter().copied().max().unwrap();
             let mut current_slots = vec![max_slot + 1];
             if tree.justified_moved {
-                current_slots.push(tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH);
+                current_slots.push(tree.first_gloas_slot + 3 * preset::slots_per_epoch());
             }
             for current_slot in current_slots {
                 tree.store
@@ -11156,7 +11158,7 @@ mod tests {
                 }
                 // Past every block's epoch, so the leaf reads its stored
                 // unrealized justification rather than a state.
-                let current_slot = DEPTH + 2 * preset::SLOTS_PER_EPOCH;
+                let current_slot = DEPTH + 2 * preset::slots_per_epoch();
                 store
                     .set_time_ms(current_slot * config.slot_duration_ms)
                     .unwrap();
@@ -11377,7 +11379,7 @@ mod tests {
         let justified = tree.store.beacon_justified_checkpoint();
         let (justified_slot, _) = tree.store.block_index()[&justified.root];
         let finalized = Checkpoint {
-            epoch: justified_slot.div_ceil(preset::SLOTS_PER_EPOCH),
+            epoch: justified_slot.div_ceil(preset::slots_per_epoch()),
             root: justified.root,
         };
         let before = tree.store.beacon_finalized_checkpoint();
@@ -11415,7 +11417,7 @@ mod tests {
             tree.first_gloas_slot - 1,
             latest + 1,
             latest + 2,
-            tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH,
+            tree.first_gloas_slot + 3 * preset::slots_per_epoch(),
         ]
     }
 
@@ -11611,7 +11613,7 @@ mod tests {
         inner.proposer_lookahead = lookahead.try_into().expect("lookahead length");
         inner.current_sync_committee = sync_committee.clone();
         inner.next_sync_committee = sync_committee;
-        let last_slot = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let last_slot = 2 * preset::slots_per_epoch() - 1;
         advance_to_slot(&state, last_slot, &Config::mainnet()).expect("advance")
     }
 
@@ -11766,7 +11768,7 @@ mod tests {
     /// epoch-crossing cases below.
     fn gloas_last_slot_parent() -> BeaconState {
         let state = test_state::with_validators_at(crate::beacon::ForkName::Gloas, 64);
-        let last_slot = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let last_slot = 2 * preset::slots_per_epoch() - 1;
         advance_to_slot(&state, last_slot, &Config::mainnet()).expect("advance")
     }
 

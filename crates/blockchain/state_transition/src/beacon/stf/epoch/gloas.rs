@@ -170,7 +170,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
     let quorum = get_builder_payment_quorum_threshold(state)?;
     let inner = gloas_state(state, "process_builder_pending_payments")?;
-    let epoch_len = preset::SLOTS_PER_EPOCH as usize;
+    let epoch_len = preset::slots_per_epoch() as usize;
 
     for payment in &inner.builder_pending_payments[..epoch_len] {
         if payment.weight >= quorum {
@@ -207,11 +207,11 @@ pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
 pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
     let start_slot = compute_start_slot_at_epoch(next_epoch);
-    let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+    let slots_per_epoch = preset::slots_per_epoch() as usize;
 
     let committees = CommitteeCache::default();
     let mut new_slice = Vec::with_capacity(slots_per_epoch);
-    for offset in 0..preset::SLOTS_PER_EPOCH {
+    for offset in 0..preset::slots_per_epoch() {
         let slot = start_slot
             .checked_add(offset)
             .ok_or(Error::ArithmeticOverflow(
@@ -221,7 +221,7 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
     }
 
     let inner = gloas_state(state, "process_ptc_window")?;
-    let mut window = Vec::with_capacity(preset::PTC_WINDOW_LENGTH);
+    let mut window = Vec::with_capacity(preset::ptc_window_length());
     window.extend_from_slice(&inner.ptc_window[slots_per_epoch..]);
     window.extend(new_slice);
     inner.ptc_window = window.try_into().expect(
@@ -605,7 +605,7 @@ mod tests {
     fn process_builder_pending_payments_shifts_the_second_epoch_into_the_first_and_zeroes_the_rest()
     {
         let mut state = gloas_state_with_validators(4);
-        let epoch_len = preset::SLOTS_PER_EPOCH as usize;
+        let epoch_len = preset::slots_per_epoch() as usize;
 
         {
             let inner = gloas_inner_mut(&mut state);
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn process_proposer_lookahead_shifts_the_window_and_excludes_a_slashed_validator() {
         let mut state = gloas_state_with_validators(64);
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
 
         // Distinct values in the existing window, so a shift that dropped or
         // reordered the carried-over slice (rather than moving it down by
@@ -674,7 +674,7 @@ mod tests {
         let inner = gloas_inner(&state);
         assert_eq!(
             inner.proposer_lookahead.len(),
-            preset::PROPOSER_LOOKAHEAD_LENGTH
+            preset::proposer_lookahead_length()
         );
         assert_eq!(
             inner.proposer_lookahead[..inner.proposer_lookahead.len() - slots_per_epoch],
@@ -697,8 +697,8 @@ mod tests {
     #[test]
     fn process_ptc_window_shifts_and_fills_a_fresh_lookahead_slice() {
         let mut state = gloas_state_with_validators(64);
-        let window_len = preset::PTC_WINDOW_LENGTH;
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let window_len = preset::ptc_window_length();
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
 
         // Distinct values per window index, so a shift that scrambled order
         // (rather than moving each slice down by exactly one epoch) would be
@@ -708,7 +708,7 @@ mod tests {
         {
             let inner = gloas_inner_mut(&mut state);
             for window_index in 0..window_len {
-                inner.ptc_window[window_index] = vec![window_index as u64; preset::PTC_SIZE]
+                inner.ptc_window[window_index] = vec![window_index as u64; preset::ptc_size()]
                     .try_into()
                     .expect("built at exactly PTC_SIZE");
             }
@@ -731,7 +731,7 @@ mod tests {
         let next_epoch = epoch_before + preset::MIN_SEED_LOOKAHEAD + 1;
         let start_slot = compute_start_slot_at_epoch(next_epoch);
         let committees = CommitteeCache::default();
-        for offset in 0..preset::SLOTS_PER_EPOCH {
+        for offset in 0..preset::slots_per_epoch() {
             let slot = start_slot + offset;
             let expected = compute_ptc(&state, slot, &committees).unwrap();
             let actual = &inner.ptc_window[window_len - slots_per_epoch + offset as usize];
@@ -755,7 +755,7 @@ mod tests {
         // what turns the slice this call just filled
         // (`epoch_before + MIN_SEED_LOOKAHEAD + 1`) into the new
         // `state_epoch + MIN_SEED_LOOKAHEAD` boundary.
-        *state.slot_mut() += preset::SLOTS_PER_EPOCH;
+        *state.slot_mut() += preset::slots_per_epoch();
 
         let next_epoch = epoch_before + preset::MIN_SEED_LOOKAHEAD + 1;
         let slot = compute_start_slot_at_epoch(next_epoch);

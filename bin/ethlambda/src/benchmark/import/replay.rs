@@ -96,7 +96,7 @@ pub(crate) async fn replay_corpus(dir: &Path, options: &ReplayOptions) -> eyre::
     // anchor mid-epoch, and would otherwise fail on its first block with an
     // assertion that names neither the anchor nor the fix.
     eyre::ensure!(
-        anchor_state.slot() % preset::SLOTS_PER_EPOCH == 0,
+        anchor_state.slot() % preset::slots_per_epoch() == 0,
         "the corpus's anchor state is at slot {}, which is not the first slot of an epoch, \
          so fork choice cannot anchor on it; re-fetch the corpus with this build",
         anchor_state.slot()

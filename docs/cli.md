@@ -178,9 +178,11 @@ of being separate operator input. A `config.yaml` (a directory's, or a built-in
 network's embedded one) is read permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
-with one warning line naming each. Its `PRESET_BASE` is checked against the
-compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it. Sepolia's config schedules gloas, which this build follows, so
+with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
+selects the preset the process runs, before anything is decoded against it; a
+missing or unknown one is a hard startup error. The validator client has no
+`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
+reports. Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
@@ -240,7 +242,7 @@ not chain-specific, branches once, and shares the shutdown:
 | register metrics, print the banner, log the version | shared | shared |
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
-| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's) and check `PRESET_BASE` against the compiled preset and the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
+| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's), select the preset its `PRESET_BASE` names, and check the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
 | read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |

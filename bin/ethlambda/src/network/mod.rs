@@ -12,6 +12,7 @@ pub(crate) mod dir;
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::preset::{Preset, PresetAlreadyActive};
 
 pub(crate) use built_in::BuiltInNetwork;
 
@@ -55,64 +56,53 @@ impl NetworkSpec {
     }
 }
 
-/// The preset this binary's containers were compiled against.
-///
-/// Read from `ethlambda-types`, never re-derived here with a local
-/// `cfg!(feature = "preset-minimal")`. That feature belongs to
-/// `ethlambda-types`; `bin/ethlambda` does not declare it, so a `cfg!` in this
-/// crate is **always false** and would report "mainnet" even in a minimal
-/// build. The check would then wave through exactly the configuration it
-/// exists to refuse.
-pub(crate) fn compiled_preset() -> &'static str {
-    ethlambda_types::beacon::preset::Preset::ACTIVE.name()
-}
-
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "this build serves the {compiled} preset, but the network config declares \
-         PRESET_BASE: {declared}. Rebuild with --features ethlambda-types/preset-{declared} \
-         to follow this network."
-)]
-pub(crate) struct PresetMismatch {
-    compiled: &'static str,
-    declared: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum PresetCheckError {
+pub(crate) enum PresetSelectError {
     /// `Config::preset_base` defaults to an empty name when `PRESET_BASE` is
-    /// absent, precisely so this can fail closed rather
-    /// than assume "mainnet". Reported on its own, distinctly from
-    /// [`PresetMismatch`]: with no declared preset, `{declared}` in that
-    /// error's message would render as an empty string, reading as "declares
-    /// PRESET_BASE: " with no indication anything is actually missing.
-    #[error(
-        "the network config does not declare PRESET_BASE, so this build cannot check its \
-         preset against the network's"
-    )]
+    /// absent, precisely so this can fail closed rather than assume
+    /// "mainnet". Reported on its own, distinctly from
+    /// [`PresetSelectError::Unsupported`]: with no declared preset, the name
+    /// in that error's message would render as an empty string, reading as
+    /// "PRESET_BASE: " with no indication anything is actually missing.
+    #[error("the network config does not declare PRESET_BASE, so its preset is unknown")]
     Missing,
+    /// A preset the specification does not define, or one (such as `gnosis`)
+    /// whose values this node does not carry.
+    #[error(
+        "the network config declares PRESET_BASE: {declared}, which this node has no values \
+         for; it runs mainnet or minimal"
+    )]
+    Unsupported { declared: String },
+    /// Something in this process read a preset value before the network was
+    /// resolved, and froze another preset. A startup ordering bug, not an
+    /// operator error.
     #[error(transparent)]
-    Mismatch(#[from] PresetMismatch),
+    AlreadyActive(#[from] PresetAlreadyActive),
 }
 
-/// Refuse a configuration whose preset this build cannot serve.
+/// Run this process on the preset a network's config declares.
 ///
-/// A hard error rather than a warning. The preset sets SSZ container bounds, so
-/// running anyway would produce a chain that is not spec compliant while
-/// looking healthy: Prysm's equivalent check half-works for exactly this
-/// reason, changing its timing constants but not its container shapes.
-pub(crate) fn check_preset(declared: &str) -> Result<(), PresetCheckError> {
+/// Called as soon as a `config.yaml` parses, before anything is decoded
+/// against it: for a loaded directory, before its `genesis.ssz`, whose
+/// container bounds come from the preset. Every beacon container checks its
+/// lengths, decodes and merkleizes against the preset selected here, and the
+/// first read freezes it, so nothing on this path may read a preset value
+/// before this call.
+///
+/// A missing or unknown `PRESET_BASE` is a hard error rather than a fallback
+/// to mainnet. The preset sets SSZ container bounds, so a node on the wrong
+/// one would produce a chain that is not spec compliant while looking
+/// healthy: Prysm's equivalent check half-works for exactly this reason,
+/// changing its timing constants but not its container shapes.
+pub(crate) fn select_preset(declared: &str) -> Result<Preset, PresetSelectError> {
     if declared.is_empty() {
-        return Err(PresetCheckError::Missing);
+        return Err(PresetSelectError::Missing);
     }
-    if declared == compiled_preset() {
-        return Ok(());
-    }
-    Err(PresetMismatch {
-        compiled: compiled_preset(),
+    let preset = Preset::from_name(declared).ok_or_else(|| PresetSelectError::Unsupported {
         declared: declared.to_string(),
-    }
-    .into())
+    })?;
+    Preset::select(preset)?;
+    Ok(preset)
 }
 
 /// One `config.yaml` key that the node runs on a compile-time constant for,
@@ -160,7 +150,7 @@ impl std::error::Error for ConstantsMismatch {}
 /// `ATTESTATION_SUBNET_COUNT` bits). Refusing the mismatch at startup is what
 /// keeps the endpoint truthful: every `Config` that reaches the store equals
 /// the constants on these keys. It is a hard error rather than a warning for
-/// the reason [`check_preset`] is one. A node that disagrees with its peers
+/// the reason [`select_preset`] is one. A node that disagrees with its peers
 /// about custody or subnet counts would still look healthy while failing to
 /// serve or verify what they expect.
 ///
@@ -285,15 +275,22 @@ impl NetworkSource {
     pub(crate) fn resolve(spec: &NetworkSpec) -> eyre::Result<Self> {
         match spec {
             NetworkSpec::BuiltIn(network) => {
-                tracing::info!(network = network.name(), "Using the built-in network");
-                Ok(Self::BuiltIn(Box::new(network.resolve()?)))
+                let resolved = network.resolve()?;
+                tracing::info!(
+                    network = network.name(),
+                    preset = %Preset::active(),
+                    "Using the built-in network"
+                );
+                Ok(Self::BuiltIn(Box::new(resolved)))
             }
             NetworkSpec::Directory(path) => {
-                // `load` checks the preset and the constants itself, before it
-                // decodes `genesis.ssz`, whose container bounds the preset sets.
+                // `load` selects the preset and checks the constants itself,
+                // before it decodes `genesis.ssz`, whose container bounds the
+                // preset sets.
                 let loaded = dir::NetworkDir::load(path)?;
                 tracing::info!(
                     network = %loaded.config.config_name,
+                    preset = %Preset::active(),
                     path = %path.display(),
                     "Loaded network from directory"
                 );
@@ -416,21 +413,35 @@ mod tests {
         ));
     }
 
+    /// The tests share one process, so whichever preset froze first (another
+    /// test's read, or the read below) is the one a config may select; the
+    /// other is refused as already superseded rather than silently mixed in.
     #[test]
-    fn the_compiled_preset_is_what_a_config_must_declare() {
-        assert!(check_preset(compiled_preset()).is_ok());
+    fn a_config_selects_its_preset_once() {
+        let active = Preset::active();
+        assert_eq!(select_preset(active.name()).unwrap(), active);
 
-        let other = if compiled_preset() == "mainnet" {
-            "minimal"
-        } else {
-            "mainnet"
+        let other = match active {
+            Preset::Mainnet => Preset::Minimal,
+            Preset::Minimal => Preset::Mainnet,
         };
-        let err = check_preset(other).unwrap_err().to_string();
-        assert!(err.contains(other), "got {err}");
+        let err = select_preset(other.name()).unwrap_err();
         assert!(
-            err.contains("preset-minimal") || err.contains("preset-mainnet"),
-            "name the cargo feature: {err}"
+            matches!(err, PresetSelectError::AlreadyActive(_)),
+            "got {err}"
         );
+        assert!(err.to_string().contains(other.name()), "got {err}");
+        assert_eq!(Preset::active(), active);
+    }
+
+    #[test]
+    fn a_preset_without_values_is_refused_by_name() {
+        let err = select_preset("gnosis").unwrap_err();
+        assert!(
+            matches!(err, PresetSelectError::Unsupported { .. }),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("gnosis"), "got {err}");
     }
 
     /// The specification's own configs must pass, or every built-in network
@@ -468,13 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_preset_base_is_a_distinct_error_from_a_mismatch() {
+    fn an_absent_preset_base_is_a_distinct_error_from_an_unknown_one() {
         // `Config::preset_base` defaults an absent PRESET_BASE to "".
-        let err = check_preset("").unwrap_err().to_string();
-        assert!(err.contains("PRESET_BASE"), "got {err}");
-        assert!(
-            !err.contains("Rebuild with --features"),
-            "a missing PRESET_BASE must not read as a preset mismatch: {err}"
-        );
+        let err = select_preset("").unwrap_err();
+        assert!(matches!(err, PresetSelectError::Missing), "got {err}");
+        assert!(err.to_string().contains("PRESET_BASE"), "got {err}");
     }
 }

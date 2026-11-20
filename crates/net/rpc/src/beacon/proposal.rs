@@ -2390,7 +2390,7 @@ mod tests {
 
         let (mut store, head_slot) = fulu_store();
         let (head_root, head_state) = super::super::validator::head(&store).unwrap();
-        let next_epoch_start = head_slot + preset::SLOTS_PER_EPOCH;
+        let next_epoch_start = head_slot + preset::slots_per_epoch();
         let finalized = Checkpoint {
             root: head_root,
             slot: next_epoch_start,

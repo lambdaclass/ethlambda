@@ -143,7 +143,7 @@ pub fn is_valid_indexed_attestation_with_domain(
 ) -> bool {
     let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
     if indices.is_empty()
-        || indices.len() > preset::MAX_VALIDATORS_PER_SLOT
+        || indices.len() > preset::max_validators_per_slot()
         || !are_indices_sorted_and_unique(indices)
     {
         return false;
@@ -473,8 +473,8 @@ pub fn compute_proposer_indices(
 ) -> Result<Vec<ValidatorIndex>> {
     let start_slot = compute_start_slot_at_epoch(epoch);
 
-    let mut proposer_indices = Vec::with_capacity(preset::SLOTS_PER_EPOCH as usize);
-    for offset in 0..preset::SLOTS_PER_EPOCH {
+    let mut proposer_indices = Vec::with_capacity(preset::slots_per_epoch() as usize);
+    for offset in 0..preset::slots_per_epoch() {
         let slot = start_slot
             .checked_add(offset)
             .ok_or(Error::ArithmeticOverflow(
@@ -531,8 +531,13 @@ pub fn compute_ptc(
         indices.extend(epoch_committees.committee(slot, committee_index)?);
     }
 
-    let selected =
-        compute_balance_weighted_selection(state, &indices, seed, preset::PTC_SIZE as u64, false)?;
+    let selected = compute_balance_weighted_selection(
+        state,
+        &indices,
+        seed,
+        preset::ptc_size() as u64,
+        false,
+    )?;
     Ok(selected.try_into()?)
 }
 
@@ -578,7 +583,7 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
         state,
         &indices,
         seed,
-        preset::SYNC_COMMITTEE_SIZE as u64,
+        preset::sync_committee_size() as u64,
         true,
     )
 }
@@ -629,7 +634,7 @@ pub fn get_attestation_participation_flag_indices(
         true
     } else {
         let inner = gloas_state_ref(state, "get_attestation_participation_flag_indices")?;
-        let slot_index = (parent_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+        let slot_index = (parent_slot % preset::slots_per_historical_root() as u64) as usize;
         let payload_index = inner.execution_payload_availability.get(slot_index).ok_or(
             Error::IndexOutOfBounds {
                 index: slot_index,
@@ -650,7 +655,7 @@ pub fn get_attestation_participation_flag_indices(
     )?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
     if is_matching_target {
@@ -693,7 +698,7 @@ pub fn get_ptc(
                 next_epoch == state_epoch,
                 "get_ptc: epoch + 1 == state_epoch",
             )?;
-            (slot % preset::SLOTS_PER_EPOCH) as usize
+            (slot % preset::slots_per_epoch()) as usize
         } else {
             let lookahead_bound = state_epoch.checked_add(preset::MIN_SEED_LOOKAHEAD).ok_or(
                 Error::ArithmeticOverflow("get_ptc: state_epoch + MIN_SEED_LOOKAHEAD"),
@@ -708,14 +713,12 @@ pub fn get_ptc(
                 .ok_or(Error::ArithmeticOverflow(
                     "get_ptc: epoch - state_epoch + 1",
                 ))?;
-            let offset = epoch_offset.checked_mul(preset::SLOTS_PER_EPOCH).ok_or(
+            let offset = epoch_offset.checked_mul(preset::slots_per_epoch()).ok_or(
                 Error::ArithmeticOverflow("get_ptc: (epoch - state_epoch + 1) * SLOTS_PER_EPOCH"),
             )?;
-            offset
-                .checked_add(slot % preset::SLOTS_PER_EPOCH)
-                .ok_or(Error::ArithmeticOverflow(
-                    "get_ptc: offset + slot % SLOTS_PER_EPOCH",
-                ))? as usize
+            offset.checked_add(slot % preset::slots_per_epoch()).ok_or(
+                Error::ArithmeticOverflow("get_ptc: offset + slot % SLOTS_PER_EPOCH"),
+            )? as usize
         };
 
     inner
@@ -744,7 +747,7 @@ pub fn get_ptc_assignments(
 ) -> Result<std::collections::HashMap<ValidatorIndex, Slot>> {
     let mut assignments = std::collections::HashMap::new();
     let first_slot = compute_start_slot_at_epoch(epoch);
-    for slot in first_slot..first_slot + preset::SLOTS_PER_EPOCH {
+    for slot in first_slot..first_slot + preset::slots_per_epoch() {
         for validator_index in get_ptc(state, slot, config)? {
             if validators.contains(&validator_index) {
                 assignments.entry(validator_index).or_insert(slot);
@@ -787,7 +790,7 @@ pub fn get_indexed_payload_attestation(
 /// `/` [`constants::BUILDER_PAYMENT_THRESHOLD_DENOMINATOR`] of one slot's
 /// share of the total active balance.
 pub fn get_builder_payment_quorum_threshold(state: &BeaconState) -> Result<Gwei> {
-    let per_slot_balance = get_total_active_balance(state)? / preset::SLOTS_PER_EPOCH;
+    let per_slot_balance = get_total_active_balance(state)? / preset::slots_per_epoch();
     let quorum = per_slot_balance
         .checked_mul(constants::BUILDER_PAYMENT_THRESHOLD_NUMERATOR)
         .ok_or(Error::ArithmeticOverflow(
@@ -1066,7 +1069,7 @@ mod tests {
         let first = compute_ptc(&state, slot, &committees).unwrap();
         let second = compute_ptc(&state, slot, &committees).unwrap();
 
-        assert_eq!(first.len(), preset::PTC_SIZE);
+        assert_eq!(first.len(), preset::ptc_size());
         assert_eq!(&first[..], &second[..]);
         assert!(first.iter().all(|index| (*index as usize) < count));
     }
@@ -1160,7 +1163,7 @@ mod tests {
         let committee = get_ptc(&state, current_epoch_slot, &config).unwrap();
         assert_eq!(
             committee[0],
-            preset::SLOTS_PER_EPOCH,
+            preset::slots_per_epoch(),
             "window index SLOTS_PER_EPOCH starts the current-epoch slice"
         );
     }
@@ -1172,8 +1175,8 @@ mod tests {
         let BeaconState::Gloas(inner) = state else {
             unreachable!("built as Gloas");
         };
-        for window_index in 0..preset::PTC_WINDOW_LENGTH {
-            inner.ptc_window[window_index] = vec![window_index as u64; preset::PTC_SIZE]
+        for window_index in 0..preset::ptc_window_length() {
+            inner.ptc_window[window_index] = vec![window_index as u64; preset::ptc_size()]
                 .try_into()
                 .expect("built at exactly PTC_SIZE");
         }

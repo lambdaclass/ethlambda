@@ -333,7 +333,7 @@ decodes anything else, and the two tags are raw bytes rather than SSZ for that
 reason: they have to be readable by a build that would decode the rest of the
 directory into the wrong shape. `db_version` catches a layout change this build
 knows about; `chain` catches lean rows being opened as beacon or the reverse;
-`preset` catches a `preset-minimal` build opening a mainnet directory, which
+`preset` catches a minimal-preset network reusing a mainnet directory, which
 the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.

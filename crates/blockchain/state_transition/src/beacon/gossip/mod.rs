@@ -1056,7 +1056,7 @@ mod tests {
         // which would widen this to three epochs instead of the two this
         // test means to pin down.
         let now_ms = slot_start_ms(&config, compute_start_slot_at_epoch(epoch))
-            + preset::SLOTS_PER_EPOCH / 2 * config.slot_duration_ms;
+            + preset::slots_per_epoch() / 2 * config.slot_duration_ms;
 
         assert!(is_current_or_previous_epoch(&config, epoch, now_ms));
         assert!(is_current_or_previous_epoch(&config, epoch - 1, now_ms));
@@ -1072,7 +1072,7 @@ mod tests {
         let at_block_root = Root::repeat_byte(0xaa);
         let historical_slot = state.slot() - 1;
         let historical_root = Root::repeat_byte(0x11);
-        state.block_roots_mut()[historical_slot as usize % preset::SLOTS_PER_HISTORICAL_ROOT] =
+        state.block_roots_mut()[historical_slot as usize % preset::slots_per_historical_root()] =
             historical_root;
 
         // Strictly before the state's own slot: reads `block_roots`.
@@ -1092,7 +1092,7 @@ mod tests {
 
         // Older than the state's `SLOTS_PER_HISTORICAL_ROOT` window: this
         // state cannot answer, so the ancestor is unknown rather than absent.
-        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot + 10;
+        *state.slot_mut() = preset::slots_per_historical_root() as Slot + 10;
         assert_eq!(ancestor_at(&state, at_block_root, 0), None);
     }
 }

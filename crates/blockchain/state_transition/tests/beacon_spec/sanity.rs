@@ -18,7 +18,7 @@ use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBl
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect};
+use super::{Case, collect, preset};
 
 #[derive(serde::Deserialize)]
 struct BlocksMeta {
@@ -77,7 +77,7 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
 
 /// Builds one runner and handler pair's trials, since all four share this shape.
 fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
-    let cases = collect(PRESET, runner, handler);
+    let cases = collect(preset(), runner, handler);
     let mut trials = vec![super::discovery_trial(runner, cases.len())];
 
     for case in cases {
