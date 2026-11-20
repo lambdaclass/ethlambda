@@ -8,12 +8,13 @@ behind ethlambda's own validator client. See
 [`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda implements
 of the fork.
 
-> **Not runnable at this pin yet.** `b5d422b2` changed the VRF tree (each leaf
-> now commits to its slot's secret, and the tree is hashed with Keccak-256
-> over all `2^31` leaves). No published genesis generator or Lighthouse build
-> registers roots under that rule, so every proposal splits the chain: see
-> [Known limits](#known-limits). The steps below are the ones last run, at
-> `a4d16c5b`, and need a matching generator and Lighthouse to work again.
+> **With Lighthouse, not runnable at this pin yet.** `b5d422b2` changed the
+> VRF tree (each leaf now commits to its slot's secret, and the tree is hashed
+> with Keccak-256 over all `2^31` leaves). No published genesis generator or
+> Lighthouse build registers roots under that rule, so every proposal splits
+> the chain: see [Known limits](#known-limits). The Lighthouse steps below are
+> the ones last run, at `a4d16c5b`. An ethlambda-only devnet runs at this pin
+> on key files ethlambda writes itself: see [ethlambda alone](#ethlambda-alone).
 
 ## What runs
 
@@ -66,6 +67,49 @@ With `network_params_validators.yaml`, ethlambda's validator client derives
 its 16 keys in under a minute. Lighthouse keeps 48 (75%), enough to finalize
 alone, so a fault on ethlambda's side shows as missed duties rather than a
 stalled chain.
+
+## ethlambda alone
+
+`network_params_ethlambda.yaml` runs two ethlambda beacon nodes, each with
+an ethlambda validator client and 16 of the 32 validators, on a genesis whose
+VRF roots follow `b5d422b2`. Lighthouse cannot join it (see Known limits).
+
+```sh
+# 1. The genesis key material, for the package's default mnemonic: each
+#    validator's leanXMSS key and VRF root (<name>.bin, what the genesis
+#    generator reads) and its VRF tree state (<name>.vrf, what validator
+#    clients read). Every root hashes the whole tree: about 2.5 minutes a
+#    validator on an 11-core Apple M3 Pro, one after another. Resumable.
+ethlambda pq-keys --count 32 --output-dir keys   --mnemonic "giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
+
+# 2. Serve them where the enclave reaches the host.
+(cd keys && python3 -m http.server 8641 --bind 127.0.0.1) &
+
+# 3. The image and the package as above, then the devnet.
+kurtosis run --enclave pq "$PWD/ethereum-package"   --args-file <ethlambda>/tooling/pq-devnet/network_params_ethlambda.yaml
+```
+
+- The generator must log `leanXMSS keys: 0 from cache, 32 fetched, 0
+  derived`. A record the file lacks is derived under the generator's own,
+  older VRF rule, and that validator's proposals then fail.
+- Each validator client must log `Every validator's VRF tree is ready ...
+  loaded=16 hashed=0`: `--vrf-state-url` gave every key its tree.
+- **At least 32 validators** on the mainnet preset: gloas's `compute_ptc`
+  asserts that every slot has an attester, so with fewer, epoch processing
+  fails at the first epoch boundary (`compute_balance_weighted_selection:
+  total > 0`) and the chain stops. The specification does the same.
+- Deriving the leanXMSS keys takes a validator client about 40 seconds for
+  16 keys, on every start, so the first slots after genesis can be missed.
+  If more than four are, the beacon nodes call themselves syncing and refuse
+  duties until no block has been seen for eight slots (the sync gate's stall
+  rule). Raise `genesis_delay` (20 seconds by default) for more keys per
+  client.
+- Blobs: add a blob spammer on the enclave's network, for example
+  `docker run -d --network kt-pq ethpandaops/spamoor:master blobs --privkey
+  bcdf20249abf0ed6d944c0288fad489e33f66b3960d9e6229c1cd214ed3bbe31 -h
+  http://el-1-geth-ethlambda:8545 --throughput 1 --sidecars 2`, and look for
+  `Published data column sidecars ... columns=128` beside `Produced a PQ
+  block`.
 
 ## Known limits
 
