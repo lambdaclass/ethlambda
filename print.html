@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-777beda6.js";
+            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -391,12 +391,31 @@ configured node healthy: with duty subnets {0, 2} at committee count 4, nothing 
 in an odd slot, and with the fallback off that merge level is dropped for the slot. Leave the
 flag unset on a placement that does not cover every subnet.</p>
 <h3 id="sync-gate"><a class="header" href="#sync-gate">Sync gate</a></h3>
-<p><code>sync_status.rs</code> tracks how far the local head lags the slot clock. Past the threshold the
-node reports itself syncing and stops attesting and proposing, since a head derived from a
-partial view is not worth voting for. A hysteresis band stops the state from flapping at the
-boundary, and a network-wide stall (nobody else is ahead either) leaves the node synced so
-its validators can help the chain recover. The same status feeds the <code>lean_node_sync_status</code>
-metric and, through a shared controller, the <code>/lean/v0/node/syncing</code> endpoint.
+<p><code>sync_status.rs</code> decides whether the node is behind. It is syncing, and stops attesting
+and proposing, when its head trails the slot clock <strong>and</strong> the head its peers report is
+ahead of its own, since a head derived from a partial view is not worth voting for. The
+peers’ head is the highest of each connected peer’s latest <code>Status</code>, re-requested every few
+slots per peer (spread over the interval, so a node with hundreds of peers never asks them
+all at once), not counting a head the node has already imported, nor a report older than
+four refresh intervals, which p2p publishes on <code>Store::network_head</code>
+(<code>crates/net/p2p/src/peer_heads.rs</code>). The thresholds, and the refresh
+cadence they depend on, are <code>SyncThresholds</code> in <code>crates/net/api/src/sync.rs</code>, shared by both
+actors. A hysteresis band stops the state from flapping at the boundary, and a network-wide
+stall (nobody else is ahead either) leaves the node synced so its validators can help the
+chain recover. So does starting up before any peer has reported, as in Lighthouse: assuming
+the network is at the clock would idle every node at once whenever all of them are behind it.
+A lead the head does not advance towards for a whole stall window reads as a
+stall too, so a peer claiming a head it never serves cannot idle the node for longer than
+that at one head (two windows around an outage). This departs from leanSpec’s rule; see <code>docs/spec_deviations.md</code>. The gate is judged
+on every tick and again whenever the head can move between ticks (every lean block arrival,
+every beacon head recompute, <code>INVALID</code> <code>forkchoiceUpdated</code> verdicts included): on a
+catch-up, range sync puts the whole span into the actor’s mailbox at once and the tick
+waits behind all of it, so a gate judged only on the tick kept reading synced until the
+catch-up was over. An import cascade that runs into a new wall-clock slot is judged between
+its blocks as well, beacon running fork choice for it, since each judgment also publishes the
+head slot p2p’s range watermark reads (<code>Store::judged_head_slot</code>) and a long cascade would
+otherwise look like a flat head there. The same status feeds the <code>lean_node_sync_status</code> metric and, through a
+shared controller, the <code>/lean/v0/node/syncing</code> endpoint.
 <code>--disable-duty-sync-gate</code> reduces the gate to observe-only.</p>
 <h3 id="missing-parents"><a class="header" href="#missing-parents">Missing parents</a></h3>
 <p>The actor cannot import a block whose parent is unknown, so it parks the block in
@@ -3011,10 +3030,12 @@ while the head lags the wall clock by more than
 <code>MESH_DELIVERY_MAX_HEAD_LAG</code> slots, and back on only after an epoch within
 that lag, so the counters have refilled. While P3 is off its threshold and
 weight are zero but its cap is not, so the counters keep counting to their
-real ceiling. <code>SyncStatus</code> cannot serve as this gate: on the mainnet
-follower it reported <code>synced</code> through a 10-minute catch-up up to 98 slots
-behind, since its network-stall rule reads a lagging freshest-known block
-as a stalled network.</li>
+real ceiling. <code>SyncStatus</code> is not this gate: it reports syncing only past
+two epochs of lag, and only once peers report a head ahead, where P3 must
+be off from <code>MESH_DELIVERY_MAX_HEAD_LAG</code> slots. (It also used to read a
+lagging freshest-known block as a stalled network, and reported <code>synced</code>
+through a 10-minute catch-up up to 98 slots behind on the mainnet
+follower.)</li>
 <li><strong>Leaving a topic waits out the peers’ backoff.</strong> Gossipsub’s default
 backoff after unsubscribing (10 s) is shorter than its prune backoff
 (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
@@ -3536,7 +3557,7 @@ node cannot put a lean-framed <code>BlocksByRoot</code> on its beacon streams.</
 <p>Both paths now import. A fetched block reaches the chain actor as
 <code>BlockSource::Sync</code>, keeping every per-block range and root check on the way in,
 and the by-root path is what resolves a gossiped block’s missing parent.</p>
-<p>Range sync is paced by <code>P2PServer::beacon_fetched_through</code>, the highest slot
+<p>Range sync is paced by <code>P2PServer::range_fetched_through</code>, the highest slot
 handed to the actor, not by the store’s head. Delivery is a message and import
 is work, so the store trails a delivered batch by the whole actor mailbox.
 Driven off the head, every resync tick re-requested the part still draining,
@@ -3548,8 +3569,43 @@ follower that had caught up and then imported from gossip kept it at its last
 range batch, and every peer that connected later was asked again for every block
 since: 748 blocks in 66 bursts on one follower. A <code>Status</code> answer is
 therefore measured against the higher of the watermark and the store’s head
-(<code>beacon_sync_target</code>). The head is a safe floor, since a head block’s whole
-ancestry is already imported.</p>
+(<code>range_sync_target</code>). The head is a safe floor, since a head block’s whole
+ancestry is already imported. Lean range sync reads the same watermark, for
+the same reason. A watermark the head stays below, unmoved, for longer than
+the stall window is dropped back to the head
+(<code>P2PServer::expire_range_watermark</code>): blocks handed over that never imported
+(an invalid answer, a fork the head did not follow) would otherwise never be
+asked for again. The count starts at the first tick that sees blocks handed
+over since the head last moved, so a batch gets a whole window to import, and
+later deliveries do not restart it: a whole window of them that has not moved
+the head is not importing. A drop ends the running session, cancels its
+requests in flight, and makes the senders of the lowest batch the head never
+reached suspects (<code>PeerHeads::suspects</code>): not synced towards and not counted
+towards the network head until the head passes what they handed over, or for
+4 stall windows at most. Batches above that one could not connect without
+it, so their senders are not held to them. A batch is judged by the end it
+was asked for, not the last block it handed over, unless the next batch’s
+first block sits past that end and names that last block as its parent,
+which shows the slots between empty on that chain. A gap between the
+once-a-slot ticks counts as two slots at most, so a process that was paused
+does not find the window spent at its first tick after the resume, and a wall
+clock stepped back (one that ran ahead, corrected) counts nothing rather than
+stopping the count until it passes its old reading again. Each drop
+at the same head doubles the wait before the next. A peer that fails a range request is not
+synced towards again for a refresh interval, since its own <code>Status</code> requests
+are not rate limited and the highest head gets the next batch.</p>
+<p>Each peer is also re-asked for its <code>Status</code> every half epoch, so the head it
+reported at the handshake does not go stale for the sync gate (see
+<code>crates/net/p2p/src/peer_heads.rs</code>). An answer to that refresh starts a range
+sync only when it leads the same floor by more than an epoch
+(<code>status_sync_target</code>): a node keeping up with gossip sees peers a slot ahead
+all the time, and a one-block range request would only race gossip. A peer’s
+own <code>Status</code> request is held to the same lead and can start one too, as in
+Lighthouse, where requests and answers both go through <code>process_status</code>: a
+request postpones this node’s refresh to that peer, so a peer that always asks
+first would otherwise never be synced from. A <code>Status</code> naming a head this node
+has already imported, a head past the clock, or coming from a peer no longer
+connected starts nothing.</p>
 <p><code>Status</code> is store-derived: head from <code>Store::beacon_head</code>, the finalized
 checkpoint from <code>Store::beacon_finalized_checkpoint</code>, and
 <code>earliest_available_slot</code> from the anchor’s own slot rather than
@@ -3609,7 +3665,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code> / <code>unsupported_fork</code></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="#beacon-gossip-validation">metrics.md</a></td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
-<tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Handshakes seen from another fork digest</td></tr>
+<tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Peers whose <code>Status</code> moved onto another fork digest, once per move (not per refresh)</td></tr>
 <tr><td><code>lean_beacon_fork_digest{digest}</code></td><td>The digest computed at startup, as a label</td></tr>
 <tr><td><code>lean_beacon_aggregate_decode_seconds</code></td><td>Time spent decoding one aggregate off the wire</td></tr>
 <tr><td><code>lean_beacon_aggregate_mailbox_wait_seconds</code></td><td>How long an aggregate sat in the chain actor’s mailbox</td></tr>
@@ -3695,7 +3751,7 @@ Beacon aggregate attestation decoded  slot=… aggregator=… attesters=… targ
 reached its first decoded block 16 seconds after start and its first aggregate
 at 24 seconds, then took a block every slot. <code>bytes</code> on mainnet is typically
 100 KB to 310 KB for a block and about 500 for an aggregate, and <code>attesters</code>
-sits in the low hundreds. Peer lifecycle lines (<code>Peer connected</code>, <code>Beacon handshake complete</code>) are at <code>trace</code>: at mainnet peer counts they are what
+sits in the low hundreds. Peer lifecycle lines (<code>Peer connected</code>, <code>Beacon Status answered</code>) are at <code>trace</code>: at mainnet peer counts they are what
 drowned the log, so raise the level to see them.</p>
 <p>What each failure looks like:</p>
 <div class="table-wrapper">
@@ -3706,8 +3762,8 @@ drowned the log, so raise the level to see them.</p>
 <tbody>
 <tr><td><code>Peer said goodbye reason=129</code> right after a connection</td><td>nothing local: 129 is lighthouse’s <code>TooManyPeers</code></td></tr>
 <tr><td><code>fork_digest</code> is not what a live crawl reports</td><td>the blob-schedule branch, or the schedule itself</td></tr>
-<tr><td>connections but no <code>Beacon handshake complete</code></td><td>the <code>Status</code> encoding, or answering the wrong version</td></tr>
-<tr><td><code>Handshake answered from another fork digest</code></td><td>the digest</td></tr>
+<tr><td>connections but no <code>Beacon Status answered</code></td><td>the <code>Status</code> encoding, or answering the wrong version</td></tr>
+<tr><td><code>Status answered from another fork digest</code></td><td>the digest</td></tr>
 <tr><td><code>Beacon gossip decode failed</code> for <code>beacon_block</code></td><td>the fork selection or the slot offset</td></tr>
 <tr><td>the same for <code>beacon_aggregate_and_proof</code> alone</td><td>the electra boundary in <code>decode_gossip</code>; the block path is fine</td></tr>
 <tr><td>connected peers above zero, no gossip at all</td><td>the topic hash: almost always the digest’s hex formatting or <code>compute_message_id</code></td></tr>
@@ -5221,7 +5277,7 @@ data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 <h3 id="get-leanv0nodesyncing"><a class="header" href="#get-leanv0nodesyncing"><code>GET /lean/v0/node/syncing</code></a></h3>
 <pre><code class="language-json">{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
 </code></pre>
-<p><code>is_syncing</code> is the node’s own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the <code>lean_node_sync_status</code> metric, so the endpoint, the gate, and the metric always agree.</p>
+<p><code>is_syncing</code> is the node’s own stateful sync decision, updated each tick and after each block arrival: true while the head trails the wall clock and the head the node’s peers report in <code>Status</code> is ahead of it, with hysteresis. With no peer ahead (a stalled network, or no peers, including right after startup before any peer has reported) it is false. It is also false once peers have claimed a lead for a whole stall window in all (<code>SyncThresholds::LEAN.stall_window</code>, 16 slots) while the head stayed flat, until the head next advances, and a peer that has just failed to serve a range request does not count towards the lead while it cools down. It is the same signal that gates validator duties and drives the <code>lean_node_sync_status</code> metric, so the endpoint, the gate, and the metric always agree.</p>
 <p><code>sync_distance</code> is the raw number of slots between the node’s current head and the current wall-clock slot, computed per request. Because <code>is_syncing</code> carries hysteresis and stall handling and is not recomputed from <code>sync_distance</code>, the two can point different ways near the threshold or during a network-wide stall.</p>
 <h3 id="get--post-leanv0adminaggregator"><a class="header" href="#get--post-leanv0adminaggregator"><code>GET</code> / <code>POST /lean/v0/admin/aggregator</code></a></h3>
 <p>Toggle the aggregator role at runtime without restarting the node (hot-standby model, ported from leanSpec PR #636).</p>
@@ -6478,6 +6534,7 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>lean_peers_by_direction</code></td><td>Gauge</td><td>Connected peers by the direction the connection was opened in</td><td>On every connection established and closed</td><td>direction=inbound,outbound</td></tr>
 <tr><td><code>lean_swarm_established_connections</code></td><td>Gauge</td><td>Established connections as libp2p itself counts them</td><td>On the swarm’s own metric tick</td><td>direction=inbound,outbound</td></tr>
 <tr><td><code>lean_custody_column_peers</code></td><td>Gauge</td><td>Connected peers known to custody each data column this node samples</td><td>On every connection established and closed, and whenever a peer’s custody is recorded from its <code>metadata/3</code> answer or its ENR <code>cgc</code></td><td>column=<code>&lt;index&gt;</code></td></tr>
+<tr><td><code>lean_sync_peers_held_back</code></td><td>Gauge</td><td>Peers whose <code>Status</code> head does not count towards the sync gate’s network head: suspects (range blocks that never imported, or range requests that kept failing) peers cooling down from a failed range request, and connected peers whose latest <code>Status</code> head sat past the wall clock (each peer under one reason). Suspects and cooling peers include peers since disconnected, whose history outlives the connection. A count that keeps climbing while the node reads as syncing is fresh identities claiming a lead; <code>future</code> for most connected peers points at this node’s own clock running slow</td><td>On every publish of the network head, at least once a slot</td><td>reason=suspect,cooling,future</td></tr>
 </tbody>
 </table>
 </div>
@@ -9676,6 +9733,112 @@ interval, and stops early once it runs out of time.</p>
 <li><strong>leanSpec:</strong> <code>aggregate()</code> is called inline and synchronously from <code>tick_interval</code>, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.</li>
 <li><strong>Equivalence:</strong> on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.</li>
 </ul>
+<h2 id="the-duty-sync-gate-compares-the-head-with-peers-heads-not-with-imported-blocks"><a class="header" href="#the-duty-sync-gate-compares-the-head-with-peers-heads-not-with-imported-blocks">The duty sync gate compares the head with peers’ heads, not with imported blocks</a></h2>
+<p>A node reports itself syncing, and stops proposing and attesting, only when its
+head trails the wall clock <strong>and</strong> its peers report a head ahead of it.</p>
+<ul>
+<li><strong>leanSpec:</strong> <code>ValidatorService._is_synced_for_duties</code> (PR #708) takes the
+freshest block it knows from imported blocks only. When that block is more
+than 8 slots behind the wall clock it reads the network as stalled and allows
+duties; otherwise the node is syncing once its head is more than 4 slots
+behind the clock, with a hysteresis band of 2.
+<code>test_no_extra_blocks_treats_isolation_as_network_stall</code> pins the case of a
+node 100 slots behind with nothing newer imported, which does its duties.</li>
+<li><strong>ethlambda:</strong> the node is syncing when its head is more than 4 slots behind
+the wall clock and the head its peers report is more than 1 slot ahead of its
+own, with a band of 2 on the clock lag (the band never takes the lead’s
+threshold below 1 slot, so the lead gets none) (<code>SyncThresholds::LEAN</code>,
+<code>crates/net/api/src/sync.rs</code>, judged in
+<code>crates/blockchain/src/sync_status.rs</code>). The peers’ head comes from <code>Status</code>
+(<code>crates/net/p2p/src/peer_heads.rs</code>): the highest of each connected peer’s
+latest report, re-requested every 2 slots and counted for 8 slots after it
+arrives, with a head past the wall clock by more than a slot dropped and a
+head the node has already imported not counted (the peer is not ahead of
+it, whatever its slot). A node whose own clock runs slow therefore drops
+honest heads too, and reads as synced however far behind it is: when most
+connected peers, and at least two, report a head past its clock it warns,
+at most once a stall window, and counts them in
+<code>lean_sync_peers_held_back{reason="future"}</code>.
+The peer lead is smaller
+than the clock lag because a report is up to 2 slots old: a node 5 slots
+behind a producing network sees its peers’ 2-slot-old heads 2 slots ahead.
+With no report at all the node cannot be behind anyone and reads as synced,
+from the first judgment on: a node resuming a stale database does its duties
+on its stale head until a peer reports a lead, as a Lighthouse node does in
+its initial <code>Stalled</code> state. Assuming the network is at the clock instead
+would idle every node at once whenever all of them are behind it (a slow
+start, a restart after an outage), and a network where nobody proposes stays
+stalled.</li>
+<li><strong>Stall window:</strong> a lead that does not turn into progress is given up on. A
+node that has read as syncing on its peers’ word for 16 slots in all
+(<code>SyncThresholds::stall_window</code>) with its head flat throughout treats the
+network as stalled and does its duties, until its head next advances. The
+slots are added up rather than counted from when the node last fell behind:
+each slot spent behind counts once, and a lead that lapses for less than the
+window pauses the count rather than restarting it. One judgment counts at
+most half a window: judgments come at least once a slot, so a longer gap is
+the process not running (a <code>docker pause</code>, a host suspend), and a resume
+must not find the window spent before range sync has had a chance. A
+judgment older than the last by up to that much is judged at the last, so
+no slot counts twice; one further back is the wall clock stepping back (a
+clock that ran ahead, corrected), and the count’s slots move back with it
+rather than the count stopping until the clock passes its old reading. A
+lead absent for longer
+than that (an outage) ends the count once per head position, and the next
+claim gets a whole window, unless the node already gave up on a lead at
+that head. A peer that claims a head it does not serve (an empty answer,
+invalid blocks, no answer at all) therefore costs at most that window at
+each head the node reaches (two around an outage), not the rest of a
+network stall. A peer that has just failed to serve a range request, or
+whose range blocks left the head where it was for a whole window, does
+not count towards the lead for a while either. An empty range answer
+counts as such a failure even over a span an honest chain skipped every slot
+of (a long run of missed proposals): it cannot be told from a peer claiming
+a head it does not serve, and excused, that peer would take a range batch
+on every <code>Status</code> it sends. Range sync does not step past a span a whole
+batch long with no block either way (its cursor moves only on delivered
+blocks): the parent lookups of newer blocks fill it, and the peers serving
+it stop counting for a while, so the node can read as synced meanwhile. The cost: if the node’s own
+import stalls for a window (an execution client down), the honest peers
+that delivered the lowest batch stop counting too, and the node reads as synced on its stale head
+until the head passes what they handed over, or for 4 stall windows at
+most. The same happens to an honest peer whose batch ends short (its last
+slots were missed) when the peer serving the batch above lies: the short
+batch is held only to its last block when the next batch’s first block
+names that block as its parent, and the upper sender chooses that parent
+(<code>HeadWatch::note_delivery</code>). These bounds hold per peer identity: a fresh identity starts with
+none of the history (claims, cooldowns, suspicion) its predecessor
+earned, so an adversary with many identities is bounded by how many it
+can connect, as for any client. The window is sized above what can legitimately hold a
+catching-up head still.</li>
+<li><strong>Why:</strong> imported blocks cannot tell “the network is stalled” from “this node
+is behind”. A node catching up has imported nothing recent either, so the
+specification’s rule reports it synced for the whole catch-up and it proposes
+and attests on a stale head (lambdaclass/ethlambda#559). Lighthouse and Prysm
+decide against what their peers report, and require the head to trail the
+clock too, so no peer’s claim can idle a node that is current. Comparing with
+peers also keeps a run of missed proposals (leanSpec #1194) from closing the
+gate on every honest node, since none of them is more than propagation behind
+another.</li>
+<li><strong>Equivalence:</strong> the two agree whenever no peer is further ahead of the node
+than its newest imported block. They differ for a node behind its peers with
+nothing newer imported, which the specification lets do its duties and this
+node does not, until its head has been flat for the stall window.</li>
+</ul>
+<p>The beacon node runs the same rule with Lighthouse’s numbers (two epochs of
+clock lag, one epoch of peer lead), a band of 4 slots that neither Lighthouse
+nor Prysm has (this node re-judges on every block arrival, and would otherwise
+flip twice a slot at the boundary), an epoch of stall window, and Prysm’s
+<code>Status</code> refresh, every half epoch (Lighthouse refreshes every 300 s). The
+stall window has no counterpart in either client. A follower more than two
+epochs behind the clock whose head stays flat for an epoch while peers report
+a lead (columns that never arrive, an execution client that is down) does its
+duties on a stale head, and its votes are penalized as wrong or missed, never
+slashed. Without the window, a peer claiming a head it does not serve keeps
+such a node from doing any duty for as long as it keeps claiming, which costs
+those votes and the proposals with them.
+consensus-specs has no sync gate, and the Beacon API leaves <code>is_syncing</code> to the
+client.</p>
 <h2 id="attestation-scoring-on-block-building"><a class="header" href="#attestation-scoring-on-block-building">Attestation scoring on block building</a></h2>
 <p>Attestations are scored and selected when packing a block, rather than taken in
 target-slot order as they are scanned.</p>

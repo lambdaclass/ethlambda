@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-777beda6.js";
+            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -333,12 +333,31 @@ configured node healthy: with duty subnets {0, 2} at committee count 4, nothing 
 in an odd slot, and with the fallback off that merge level is dropped for the slot. Leave the
 flag unset on a placement that does not cover every subnet.</p>
 <h3 id="sync-gate"><a class="header" href="#sync-gate">Sync gate</a></h3>
-<p><code>sync_status.rs</code> tracks how far the local head lags the slot clock. Past the threshold the
-node reports itself syncing and stops attesting and proposing, since a head derived from a
-partial view is not worth voting for. A hysteresis band stops the state from flapping at the
-boundary, and a network-wide stall (nobody else is ahead either) leaves the node synced so
-its validators can help the chain recover. The same status feeds the <code>lean_node_sync_status</code>
-metric and, through a shared controller, the <code>/lean/v0/node/syncing</code> endpoint.
+<p><code>sync_status.rs</code> decides whether the node is behind. It is syncing, and stops attesting
+and proposing, when its head trails the slot clock <strong>and</strong> the head its peers report is
+ahead of its own, since a head derived from a partial view is not worth voting for. The
+peers’ head is the highest of each connected peer’s latest <code>Status</code>, re-requested every few
+slots per peer (spread over the interval, so a node with hundreds of peers never asks them
+all at once), not counting a head the node has already imported, nor a report older than
+four refresh intervals, which p2p publishes on <code>Store::network_head</code>
+(<code>crates/net/p2p/src/peer_heads.rs</code>). The thresholds, and the refresh
+cadence they depend on, are <code>SyncThresholds</code> in <code>crates/net/api/src/sync.rs</code>, shared by both
+actors. A hysteresis band stops the state from flapping at the boundary, and a network-wide
+stall (nobody else is ahead either) leaves the node synced so its validators can help the
+chain recover. So does starting up before any peer has reported, as in Lighthouse: assuming
+the network is at the clock would idle every node at once whenever all of them are behind it.
+A lead the head does not advance towards for a whole stall window reads as a
+stall too, so a peer claiming a head it never serves cannot idle the node for longer than
+that at one head (two windows around an outage). This departs from leanSpec’s rule; see <code>docs/spec_deviations.md</code>. The gate is judged
+on every tick and again whenever the head can move between ticks (every lean block arrival,
+every beacon head recompute, <code>INVALID</code> <code>forkchoiceUpdated</code> verdicts included): on a
+catch-up, range sync puts the whole span into the actor’s mailbox at once and the tick
+waits behind all of it, so a gate judged only on the tick kept reading synced until the
+catch-up was over. An import cascade that runs into a new wall-clock slot is judged between
+its blocks as well, beacon running fork choice for it, since each judgment also publishes the
+head slot p2p’s range watermark reads (<code>Store::judged_head_slot</code>) and a long cascade would
+otherwise look like a flat head there. The same status feeds the <code>lean_node_sync_status</code> metric and, through a
+shared controller, the <code>/lean/v0/node/syncing</code> endpoint.
 <code>--disable-duty-sync-gate</code> reduces the gate to observe-only.</p>
 <h3 id="missing-parents"><a class="header" href="#missing-parents">Missing parents</a></h3>
 <p>The actor cannot import a block whose parent is unknown, so it parks the block in

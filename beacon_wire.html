@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-777beda6.js";
+            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -463,10 +463,12 @@ while the head lags the wall clock by more than
 <code>MESH_DELIVERY_MAX_HEAD_LAG</code> slots, and back on only after an epoch within
 that lag, so the counters have refilled. While P3 is off its threshold and
 weight are zero but its cap is not, so the counters keep counting to their
-real ceiling. <code>SyncStatus</code> cannot serve as this gate: on the mainnet
-follower it reported <code>synced</code> through a 10-minute catch-up up to 98 slots
-behind, since its network-stall rule reads a lagging freshest-known block
-as a stalled network.</li>
+real ceiling. <code>SyncStatus</code> is not this gate: it reports syncing only past
+two epochs of lag, and only once peers report a head ahead, where P3 must
+be off from <code>MESH_DELIVERY_MAX_HEAD_LAG</code> slots. (It also used to read a
+lagging freshest-known block as a stalled network, and reported <code>synced</code>
+through a 10-minute catch-up up to 98 slots behind on the mainnet
+follower.)</li>
 <li><strong>Leaving a topic waits out the peers’ backoff.</strong> Gossipsub’s default
 backoff after unsubscribing (10 s) is shorter than its prune backoff
 (60 s), and a rust-libp2p peer that sees a mesh peer unsubscribe backs off
@@ -988,7 +990,7 @@ node cannot put a lean-framed <code>BlocksByRoot</code> on its beacon streams.</
 <p>Both paths now import. A fetched block reaches the chain actor as
 <code>BlockSource::Sync</code>, keeping every per-block range and root check on the way in,
 and the by-root path is what resolves a gossiped block’s missing parent.</p>
-<p>Range sync is paced by <code>P2PServer::beacon_fetched_through</code>, the highest slot
+<p>Range sync is paced by <code>P2PServer::range_fetched_through</code>, the highest slot
 handed to the actor, not by the store’s head. Delivery is a message and import
 is work, so the store trails a delivered batch by the whole actor mailbox.
 Driven off the head, every resync tick re-requested the part still draining,
@@ -1000,8 +1002,43 @@ follower that had caught up and then imported from gossip kept it at its last
 range batch, and every peer that connected later was asked again for every block
 since: 748 blocks in 66 bursts on one follower. A <code>Status</code> answer is
 therefore measured against the higher of the watermark and the store’s head
-(<code>beacon_sync_target</code>). The head is a safe floor, since a head block’s whole
-ancestry is already imported.</p>
+(<code>range_sync_target</code>). The head is a safe floor, since a head block’s whole
+ancestry is already imported. Lean range sync reads the same watermark, for
+the same reason. A watermark the head stays below, unmoved, for longer than
+the stall window is dropped back to the head
+(<code>P2PServer::expire_range_watermark</code>): blocks handed over that never imported
+(an invalid answer, a fork the head did not follow) would otherwise never be
+asked for again. The count starts at the first tick that sees blocks handed
+over since the head last moved, so a batch gets a whole window to import, and
+later deliveries do not restart it: a whole window of them that has not moved
+the head is not importing. A drop ends the running session, cancels its
+requests in flight, and makes the senders of the lowest batch the head never
+reached suspects (<code>PeerHeads::suspects</code>): not synced towards and not counted
+towards the network head until the head passes what they handed over, or for
+4 stall windows at most. Batches above that one could not connect without
+it, so their senders are not held to them. A batch is judged by the end it
+was asked for, not the last block it handed over, unless the next batch’s
+first block sits past that end and names that last block as its parent,
+which shows the slots between empty on that chain. A gap between the
+once-a-slot ticks counts as two slots at most, so a process that was paused
+does not find the window spent at its first tick after the resume, and a wall
+clock stepped back (one that ran ahead, corrected) counts nothing rather than
+stopping the count until it passes its old reading again. Each drop
+at the same head doubles the wait before the next. A peer that fails a range request is not
+synced towards again for a refresh interval, since its own <code>Status</code> requests
+are not rate limited and the highest head gets the next batch.</p>
+<p>Each peer is also re-asked for its <code>Status</code> every half epoch, so the head it
+reported at the handshake does not go stale for the sync gate (see
+<code>crates/net/p2p/src/peer_heads.rs</code>). An answer to that refresh starts a range
+sync only when it leads the same floor by more than an epoch
+(<code>status_sync_target</code>): a node keeping up with gossip sees peers a slot ahead
+all the time, and a one-block range request would only race gossip. A peer’s
+own <code>Status</code> request is held to the same lead and can start one too, as in
+Lighthouse, where requests and answers both go through <code>process_status</code>: a
+request postpones this node’s refresh to that peer, so a peer that always asks
+first would otherwise never be synced from. A <code>Status</code> naming a head this node
+has already imported, a head past the clock, or coming from a peer no longer
+connected starts nothing.</p>
 <p><code>Status</code> is store-derived: head from <code>Store::beacon_head</code>, the finalized
 checkpoint from <code>Store::beacon_finalized_checkpoint</code>, and
 <code>earliest_available_slot</code> from the anchor’s own slot rather than
@@ -1061,7 +1098,7 @@ as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
 <tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code> / <code>unsupported_fork</code></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="./metrics.html#beacon-gossip-validation">metrics.md</a></td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
-<tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Handshakes seen from another fork digest</td></tr>
+<tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Peers whose <code>Status</code> moved onto another fork digest, once per move (not per refresh)</td></tr>
 <tr><td><code>lean_beacon_fork_digest{digest}</code></td><td>The digest computed at startup, as a label</td></tr>
 <tr><td><code>lean_beacon_aggregate_decode_seconds</code></td><td>Time spent decoding one aggregate off the wire</td></tr>
 <tr><td><code>lean_beacon_aggregate_mailbox_wait_seconds</code></td><td>How long an aggregate sat in the chain actor’s mailbox</td></tr>
@@ -1147,7 +1184,7 @@ Beacon aggregate attestation decoded  slot=… aggregator=… attesters=… targ
 reached its first decoded block 16 seconds after start and its first aggregate
 at 24 seconds, then took a block every slot. <code>bytes</code> on mainnet is typically
 100 KB to 310 KB for a block and about 500 for an aggregate, and <code>attesters</code>
-sits in the low hundreds. Peer lifecycle lines (<code>Peer connected</code>, <code>Beacon handshake complete</code>) are at <code>trace</code>: at mainnet peer counts they are what
+sits in the low hundreds. Peer lifecycle lines (<code>Peer connected</code>, <code>Beacon Status answered</code>) are at <code>trace</code>: at mainnet peer counts they are what
 drowned the log, so raise the level to see them.</p>
 <p>What each failure looks like:</p>
 <div class="table-wrapper">
@@ -1158,8 +1195,8 @@ drowned the log, so raise the level to see them.</p>
 <tbody>
 <tr><td><code>Peer said goodbye reason=129</code> right after a connection</td><td>nothing local: 129 is lighthouse’s <code>TooManyPeers</code></td></tr>
 <tr><td><code>fork_digest</code> is not what a live crawl reports</td><td>the blob-schedule branch, or the schedule itself</td></tr>
-<tr><td>connections but no <code>Beacon handshake complete</code></td><td>the <code>Status</code> encoding, or answering the wrong version</td></tr>
-<tr><td><code>Handshake answered from another fork digest</code></td><td>the digest</td></tr>
+<tr><td>connections but no <code>Beacon Status answered</code></td><td>the <code>Status</code> encoding, or answering the wrong version</td></tr>
+<tr><td><code>Status answered from another fork digest</code></td><td>the digest</td></tr>
 <tr><td><code>Beacon gossip decode failed</code> for <code>beacon_block</code></td><td>the fork selection or the slot offset</td></tr>
 <tr><td>the same for <code>beacon_aggregate_and_proof</code> alone</td><td>the electra boundary in <code>decode_gossip</code>; the block path is fine</td></tr>
 <tr><td>connected peers above zero, no gossip at all</td><td>the topic hash: almost always the digest’s hex formatting or <code>compute_message_id</code></td></tr>

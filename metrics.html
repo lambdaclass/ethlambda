@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-777beda6.js";
+            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -469,6 +469,7 @@ samples nothing and publishes no series here.</p>
 <tr><td><code>lean_peers_by_direction</code></td><td>Gauge</td><td>Connected peers by the direction the connection was opened in</td><td>On every connection established and closed</td><td>direction=inbound,outbound</td></tr>
 <tr><td><code>lean_swarm_established_connections</code></td><td>Gauge</td><td>Established connections as libp2p itself counts them</td><td>On the swarm’s own metric tick</td><td>direction=inbound,outbound</td></tr>
 <tr><td><code>lean_custody_column_peers</code></td><td>Gauge</td><td>Connected peers known to custody each data column this node samples</td><td>On every connection established and closed, and whenever a peer’s custody is recorded from its <code>metadata/3</code> answer or its ENR <code>cgc</code></td><td>column=<code>&lt;index&gt;</code></td></tr>
+<tr><td><code>lean_sync_peers_held_back</code></td><td>Gauge</td><td>Peers whose <code>Status</code> head does not count towards the sync gate’s network head: suspects (range blocks that never imported, or range requests that kept failing) peers cooling down from a failed range request, and connected peers whose latest <code>Status</code> head sat past the wall clock (each peer under one reason). Suspects and cooling peers include peers since disconnected, whose history outlives the connection. A count that keeps climbing while the node reads as syncing is fresh identities claiming a lead; <code>future</code> for most connected peers points at this node’s own clock running slow</td><td>On every publish of the network head, at least once a slot</td><td>reason=suspect,cooling,future</td></tr>
 </tbody>
 </table>
 </div>
