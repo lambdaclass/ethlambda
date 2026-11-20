@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-4aba02a1.js";
+            window.path_to_searchindex_js = "searchindex-5cd6789b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -802,8 +802,9 @@ before it checks the head. Remove this entry when the pin reaches
 <h2 id="the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied"><a class="header" href="#the-execution-client-judges-a-gloas-payload-before-the-envelope-is-applied">The execution client judges a gloas payload before the envelope is applied</a></h2>
 <p><code>verify_execution_payload_envelope</code> asks the execution engine last, as part of
 one boolean function. The follower runs the pure consensus checks first
-(<code>check_execution_payload_envelope</code>: signature, bid, state, data availability),
-then asks the engine with <code>engine_newPayloadV5</code> only about an envelope that
+(<code>check_execution_payload_envelope_columns_verified</code>: signature, bid, state;
+data availability is every sampled column being stored, since a column is
+verified before it is stored), then asks the engine with <code>engine_newPayloadV5</code> only about an envelope that
 passed them, and records it with <code>accept_execution_payload_envelope</code>. The
 engine’s part is answered “valid” inside the checks because its answer has
 three outcomes and the specification’s <code>ExecutionEngine</code> has two.</p>
