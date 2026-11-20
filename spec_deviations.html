@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
+            window.path_to_searchindex_js = "searchindex-ce9d15ed.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -954,6 +954,25 @@ that would repeat the ladder for every copy that arrives.</li>
 verified ancestor: a gloas block’s EL parent is the ancestor whose payload hash
 is its <code>bid.parent_block_hash</code>, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block’s is its parent. Both walks stop at finality.</p>
+<h2 id="columns-built-from-the-execution-clients-blobs-are-verified"><a class="header" href="#columns-built-from-the-execution-clients-blobs-are-verified">Columns built from the execution client’s blobs are verified</a></h2>
+<ul>
+<li><strong>The specification:</strong> fulu <code>p2p-interface.md</code>, “Distributed blob publishing
+using blobs retrieved from local execution-layer client”: a client that
+builds data column sidecars from <code>engine_getBlobsV2</code>’s answer SHOULD skip
+verifying them, and MUST then treat them as received on gossip.</li>
+<li><strong>ethlambda:</strong> the built sidecars go through every chain check a fetched
+column gets, KZG proofs included, before they are published, recorded seen
+or stored (<code>crates/blockchain/src/beacon_blobs.rs</code>, <code>check_built</code>). Columns
+that fail are dropped and counted in <code>lean_engine_blob_columns_refused_total</code>.</li>
+<li><strong>Why:</strong> a stored column keeps every later copy of it out (<code>AlreadyStored</code>),
+and block import trusts the stored columns, so a wrong blob or proof taken
+on trust from a faulty execution client would either stop its block for
+good or import it on data nobody verified. The same checks also catch a
+block from the wrong proposer past its parent state’s lookahead, which the
+proposer precheck made before the call cannot.</li>
+<li><strong>Consequence:</strong> one KZG batch over the custody columns per <code>getBlobsV2</code>
+hit, on the blocking pool, between the answer and publication.</li>
+</ul>
 <h2 id="forkchoiceupdated-for-a-gloas-head"><a class="header" href="#forkchoiceupdated-for-a-gloas-head"><code>forkchoiceUpdated</code> for a gloas head</a></h2>
 <ul>
 <li>The head hash follows the head node: <code>bid.block_hash</code> for a FULL head,

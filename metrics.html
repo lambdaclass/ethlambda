@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-cb32f3cc.js";
+            window.path_to_searchindex_js = "searchindex-ce9d15ed.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1024,9 +1024,21 @@ spec.</p>
 <tr><td><code>lean_envelopes_awaiting_block</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until their block is imported</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
 <tr><td><code>lean_envelopes_awaiting_columns</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until every sampled column is stored</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
 <tr><td><code>lean_blocks_awaiting_parent_payload</code></td><td>Gauge</td><td>Gloas blocks held until their FULL parent’s payload envelope is verified</td><td>On every hold, release, and finality eviction of the held blocks</td><td></td><td></td></tr>
+<tr><td><code>lean_engine_get_blobs_total</code></td><td>Counter</td><td><code>engine_getBlobsV2</code> attempts for held fulu blocks, by outcome</td><td>On each answer of the one attempt made at a block’s first hold</td><td>outcome=hit,miss,error</td><td></td></tr>
+<tr><td><code>lean_engine_get_blobs_skipped_total</code></td><td>Counter</td><td>Held fulu blocks not asked about because the ask budget was spent</td><td>On a hold that would otherwise ask, before its precheck</td><td>reason=slot_budget,in_flight</td><td></td></tr>
+<tr><td><code>lean_engine_get_blobs_duration_seconds</code></td><td>Histogram</td><td>Time for one <code>engine_getBlobsV2</code> round trip</td><td>On each attempt, whatever its outcome</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0</td></tr>
+<tr><td><code>lean_engine_blobs_to_columns_seconds</code></td><td>Histogram</td><td>Time to build custody data column sidecars from execution-client blobs</td><td>On each build that reaches the cell computation, off the actor thread</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0</td></tr>
+<tr><td><code>lean_engine_blob_columns_refused_total</code></td><td>Counter</td><td>Data columns built from execution-client blobs that the chain checks refused, so neither published nor stored</td><td>On each built column refused, once; a column another route stored meanwhile is not counted</td><td>reason=kzg,wrong_proposer,inclusion_proof,… (the refusing rule’s label)</td><td></td></tr>
+<tr><td><code>lean_data_columns_from_execution_layer_total</code></td><td>Counter</td><td>Data column sidecars built from the execution client’s blobs, by what p2p did with them</td><td>On each hand-over, once per result, incremented by the column count</td><td>result=published,no_digest,already_seen,not_custody</td><td></td></tr>
 </tbody>
 </table>
 </div>
+<p><code>lean_engine_get_blobs_total</code> and its siblings cover the execution-client path
+(<code>docs/beacon_engine.md</code>, “Blobs from the execution client”). A high <code>miss</code>
+share means the execution client’s blob pool lacks the blobs, which is normal
+for a syncing execution client; <code>already_seen</code> in
+<code>lean_data_columns_from_execution_layer_total</code> counts columns gossip delivered
+first.</p>
 <p><code>lean_data_columns_rejected_total</code> counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
 gossiped one reported <code>Queue</code> or <code>Ignore(Overloaded)</code>, and a parked one sent
