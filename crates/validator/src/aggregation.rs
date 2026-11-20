@@ -34,7 +34,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
@@ -50,7 +49,6 @@ use crate::beacon_node::{AggregateKind, BeaconNodeApi, SignedAggregates};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::{AggregateAndProofRef, SigningContext, sign_all};
-use crate::slot_clock::SlotClock;
 
 /// An `AggregateAndProof` of either fork, held between building it and
 /// signing it.
@@ -96,58 +94,27 @@ impl<B: BeaconNodeApi> AggregationService<B> {
     /// "Broadcast aggregate"). There is no selection proof, and the proof of
     /// the attesters' signatures is the node's: it collects them and proves
     /// ahead, since proving takes seconds.
-    ///
-    /// The aggregators are staggered by seat: the one at `position` publishes
-    /// at `get_aggregate_due_ms(position)`, so this waits for each seat's time
-    /// in turn. The node answers 404 for an aggregate one already broadcast
-    /// covers (`should_broadcast_aggregate`), which skips it here.
     pub async fn aggregate_pq(
         &self,
-        clock: &SlotClock,
         slot: Slot,
         data: &AttestationData,
         duties: &[AttesterDutyDto],
     ) -> Result<usize> {
-        let mut by_seat: BTreeMap<u64, Vec<&AttesterDutyDto>> = BTreeMap::new();
-        for duty in duties
-            .iter()
-            .filter(|duty| duty.is_aggregator == Some(true))
-        {
-            by_seat
-                .entry(duty.aggregator_position.unwrap_or(0))
-                .or_default()
-                .push(duty);
-        }
-        let mut published = 0;
-        for (position, seated) in by_seat {
-            let due = clock.pq_aggregation_time(slot, position);
-            let wait = due.duration_since(SystemTime::now()).unwrap_or_default();
-            tokio::time::sleep(wait).await;
-            match self.publish_pq_seat(slot, data, &seated).await {
-                Ok(count) => published += count,
-                Err(err) => {
-                    warn!(%slot, position, %err, "Failed to publish this seat's PQ aggregates")
-                }
-            }
-        }
-        Ok(published)
-    }
-
-    /// Fetch, sign and publish the aggregates of the aggregators `selected`,
-    /// all at one seat of their committees' aggregation committees.
-    async fn publish_pq_seat(
-        &self,
-        slot: Slot,
-        data: &AttestationData,
-        selected: &[&AttesterDutyDto],
-    ) -> Result<usize> {
         use ethlambda_types::beacon::constants::LEAF_OFFSET_AGGREGATE_AND_PROOF;
         use ethlambda_types::beacon::containers::pq;
+
+        let selected: Vec<&AttesterDutyDto> = duties
+            .iter()
+            .filter(|duty| duty.is_aggregator == Some(true))
+            .collect();
+        if selected.is_empty() {
+            return Ok(0);
+        }
 
         // One fetch per committee, as for the other forks.
         let data_root = data.hash_tree_root();
         let mut aggregates = BTreeMap::new();
-        for duty in selected {
+        for duty in &selected {
             if aggregates.contains_key(&duty.committee_index) {
                 continue;
             }
@@ -159,14 +126,13 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                 Ok(aggregate) => {
                     aggregates.insert(duty.committee_index, aggregate);
                 }
-                // A 404 also when another aggregator's broadcast already
-                // covers every attester: nothing to publish, as the
-                // specification has it. The node's message says which.
-                Err(Error::BeaconNodeStatus { status: 404, body }) => info!(
+                // The node proved nothing for the committee: no votes reached
+                // it, or the proof missed the aggregate deadline.
+                Err(Error::BeaconNodeStatus { status: 404, body }) => warn!(
                     %slot,
                     committee = duty.committee_index,
                     reason = %body,
-                    "No PQ aggregate to publish for this committee"
+                    "No PQ aggregate available for this committee"
                 ),
                 Err(err) => warn!(
                     %slot,
@@ -178,7 +144,7 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         }
 
         let mut signed = Vec::new();
-        for duty in selected {
+        for duty in &selected {
             let Some(proven) = aggregates.get(&duty.committee_index) else {
                 continue;
             };
@@ -497,7 +463,6 @@ mod tests {
             validator_committee_index: 7,
             slot,
             is_aggregator: None,
-            aggregator_position: None,
         }
     }
 

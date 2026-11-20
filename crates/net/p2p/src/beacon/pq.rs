@@ -218,11 +218,7 @@ impl PqValidated {
 }
 
 /// Hold an accepted aggregate for block production, which merges the proofs
-/// of the ones it packs (PQ `validator.md`, "Proof"), and record its
-/// attesters as broadcast, which this node's own aggregators compare theirs
-/// against before broadcasting (`should_broadcast_aggregate`). Both the
-/// aggregates gossip accepted and the ones this node published come through
-/// here.
+/// of the ones it packs (PQ `validator.md`, "Proof").
 fn pool_aggregate(
     store: &Store,
     signed: &pq::SignedAggregateAndProof,
@@ -234,9 +230,6 @@ fn pool_aggregate(
     let [committee_index] = committees[..] else {
         return;
     };
-    store
-        .pq_signature_pool()
-        .note_broadcast(&aggregate.data, committee_index, attesting_indices);
     store.pq_aggregate_pool().insert(PooledPqAggregate {
         attestation: aggregate.clone(),
         committee_index,

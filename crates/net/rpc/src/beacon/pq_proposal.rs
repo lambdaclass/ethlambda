@@ -115,8 +115,7 @@ impl PqBlobs {
 
 #[derive(Debug, Deserialize)]
 struct ProducePqBlock {
-    /// The proposer's VRF proof for the slot: the secret, then its leaf's
-    /// branch.
+    /// The proposer's VRF proof for the slot: the leaf, then its branch.
     randao_reveal: Vec<Root>,
     #[serde(default)]
     graffiti: Option<Bytes32>,

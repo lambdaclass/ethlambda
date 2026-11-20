@@ -2077,11 +2077,6 @@ fn first_config_difference(
         // Compared below: when an unregistered validator becomes withdrawable
         // at the PQ fork is a state-transition rule.
         unregistered_validator_withdrawability_delay: _,
-        // PQ's aggregation timing: when an aggregator proves and broadcasts,
-        // which changes no block's validity.
-        aggregation_cutoff_bps: _,
-        aggregate_due_bps_pq: _,
-        aggregator_delay_bps: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a

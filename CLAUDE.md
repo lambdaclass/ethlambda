@@ -887,8 +887,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`),
   with its own validators: the validator client derives each
   validator's leanXMSS key and VRF seed from its BLS key
-  (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
-  in the aggregation committee), casts PTC votes and proposes, each signature
+  (`ethlambda_crypto::pq_keys`) and attests, aggregates, casts PTC votes and
+  proposes, each signature
   at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
   `2^31` leaves, each `keccak256(vrf_seed || le64(slot))`) takes minutes of
   every core per key, so a background thread hashes it after startup (in a
@@ -1205,11 +1205,13 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 8: `Config` gained the EIP-8483 and PQ fork versions and
-  epochs, `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, PQ's aggregation
-  timing (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`,
-  `AGGREGATOR_DELAY_BPS`) and `ATTESTATION_SUBNET_COUNT_PQ`, so a version 7
-  directory's stored config decodes into the wrong fields. (7 moved `States`
+- `DB_VERSION` is 9: `Config` lost PQ's aggregation timing keys
+  (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`, `AGGREGATOR_DELAY_BPS`,
+  consensus-specs `4595f0fc`) with the move back to `2f43bc0f`, so a version
+  8 directory's stored config decodes into the wrong fields. (8 added the
+  EIP-8483 and PQ fork versions and epochs,
+  `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
+  `ATTESTATION_SUBNET_COUNT_PQ`; 7 moved `States`
   and `StateDiffs` from root keys to slot||root keys, the block's slot looked
   up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can
   range-delete finalized states; 6 was

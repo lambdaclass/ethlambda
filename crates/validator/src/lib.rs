@@ -1143,7 +1143,7 @@ async fn aggregate<B: BeaconNodeApi>(
     // PQ aggregators are the aggregation committee and publish what the node
     // proved; see `AggregationService::aggregate_pq`.
     let outcome = if data.target.epoch >= aggregation.pq_fork_epoch() {
-        tokio::time::timeout(budget, aggregation.aggregate_pq(clock, slot, data, duties)).await
+        tokio::time::timeout(budget, aggregation.aggregate_pq(slot, data, duties)).await
     } else {
         tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store)).await
     };

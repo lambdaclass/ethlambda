@@ -221,7 +221,6 @@ mod tests {
             validator_committee_index: 7,
             slot,
             is_aggregator: None,
-            aggregator_position: None,
         }
     }
 
