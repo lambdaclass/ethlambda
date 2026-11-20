@@ -492,7 +492,11 @@ the envelope is logged at error and counted, and does not fail the proposal. A
 block that commits to a builder's bid is left alone.
 
 Each epoch it also fetches the payload timeliness committee duties for the
-validators it holds, for this epoch and the next when they are gloas ones. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
+validators it holds, for this epoch and the next when they are gloas ones. The
+gloas fork epoch's are the exception: a node cannot know them before the fork,
+so they are fetched at the fork epoch's first slot rather than as the previous
+epoch's lookahead. When an epoch's schedule could not be fetched, the client
+asks again after each slot's duties until it has one. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
 slot, asks the node for the
 payload attestation data, signs it under the PTC domain and submits it. A `204`
 (the node knows no block for the slot) means no vote. So a gloas slot runs in
