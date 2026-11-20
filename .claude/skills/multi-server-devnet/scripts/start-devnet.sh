@@ -121,7 +121,8 @@ fi
 gt_delta=$((GT - $(date +%s)))
 if [ "$gt_delta" -lt -3600 ]; then
   log "WARNING: GENESIS_TIME is $(( -gt_delta / 60 ))min in the PAST with empty data dirs --"
-  log "  nodes will boot thousands of slots behind and sit in the sync gate. Stale genesis dir?"
+  log "  nodes will boot thousands of slots behind the clock. No peer is ahead of them, so"
+  log "  they read synced and do their duties that far behind. Stale genesis dir?"
 fi
 
 log "=== start-devnet NODES=$NODES SUBNETS=$SUBNETS canaries=[$*] aggregators=[$(echo $AGG_NODES)] GT=$GT (genesis in ${gt_delta}s) ==="
