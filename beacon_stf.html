@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-63fcd5d2.js";
+            window.path_to_searchindex_js = "searchindex-0a283714.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -738,6 +738,104 @@ index rather than a hash map, so the vote loop reads votes and snapshot
 balances in index order. The table grows to the highest voting index, which is
 why <code>set_latest_message</code> only takes indices from validated attestations (a
 debug assertion bounds it).</p>
+<h2 id="fast-confirmation-rule"><a class="header" href="#fast-confirmation-rule">Fast Confirmation Rule</a></h2>
+<p><code>beacon::fast_confirmation</code> implements the Fast Confirmation Rule (FCR) of
+consensus-specs’ <code>phase0</code>, <code>bellatrix</code> and <code>gloas</code> <code>fast-confirmation.md</code>, at
+<strong>consensus-specs <code>master</code>, commit <code>f993cf2</code></strong> rather than the pinned
+<code>v1.7.0-beta.2</code>. The release ships no FCR fixtures, and <code>master</code> has fixes it
+lacks (the gloas empty-slot support discount, precise committee weight, the
+restart-resilient confirmed root, the <code>support_discount &lt;= maximum_support</code>
+assertion). A later bump should diff those three files against that commit.</p>
+<ul>
+<li>
+<p><strong>Shape.</strong> One Rust function per specification function, named as the
+specification names it. <code>FastConfirmationStore</code> is the specification’s own
+store: a borrowed fork-choice <code>Store</code> plus the six variables. The variables
+live in the <code>Store</code> between runs (<code>Store::fast_confirmation</code>, beside the rest
+of the beacon fork-choice scratch), with the slot of the run that wrote
+them; only the reported confirmed root is persisted.</p>
+</li>
+<li>
+<p><strong>When it runs.</strong> Once per slot, in the beacon actor’s tick, after the clock
+advance, the deferred aggregates and the head recompute (so past slots’
+attestations are applied) and before <code>forkchoiceUpdated</code>, whose safe block it
+decides. Not on imports, which recompute the head many times a slot. A
+second run for a slot (a tick that fired while the wall clock still read the
+slot before) is not run. It is skipped, and reset, while the head is more
+than 32 slots behind the wall clock (the <code>head</code> event’s gate): the rule
+assumes synchrony from the start of the previous slot. It is skipped, too,
+when the tick is handled past the slot’s attestation deadline, which the
+specification sets for <code>update_fast_confirmation_variables</code>.</p>
+</li>
+<li>
+<p><strong>Missed slots.</strong> The variables must be updated in every slot (the observed
+checkpoints rotate only in an epoch boundary’s own slot, and
+<code>previous_slot_head</code> must be the previous slot’s head), so a run whose
+previous run was not in the slot before starts over from the finalized
+checkpoint, as the rule’s initialization does. The root last reported is
+dropped, not handed to the restart rule below: a missed slot is itself a
+sign the synchrony the rule assumes did not hold, so the safe block falls
+back to the finalized one until the rule confirms again. A failed run resets
+the rule the same way. How often that happens on a live node is not
+measured; each one is logged.</p>
+</li>
+<li>
+<p><strong>Outputs.</strong> The <code>fast_confirmation</code> Beacon API event, after every run, and
+the engine’s safe block hash (<code>get_safe_execution_block_hash</code>), which falls
+back to the finalized block while the confirmed one is off the head’s chain
+(an import can move the head between two runs).</p>
+</li>
+<li>
+<p><strong>Cost.</strong> A run reuses what the fork choice already keeps, so most runs cost
+about what the head computation does:</p>
+<ul>
+<li>Balance sources are the store’s per-checkpoint balances
+(<code>fork_choice::checkpoint_balances</code>, the cache the head’s justified
+balances come from), which also carry the active set’s figures
+(<code>JustifiedBalances::active_balance</code>, <code>total_active_balance</code>). A registry
+pass is paid once per checkpoint, at the boundary import, not per run. The
+pulled-up head state’s balances are the current target’s, exact while no
+validator was slashed in the current epoch (the head state’s
+<code>slashings[current_epoch % EPOCHS_PER_SLASHINGS_VECTOR]</code> is still zero);
+otherwise they are built from the state for that run.</li>
+<li>Attestation scores are the proto-array’s <code>PENDING</code> subtree totals
+(<code>Store::proto_array_weights</code>) when the source is the justified
+checkpoint’s, read with the head’s own snapshot, rule set and window so the
+array never rebuilds for it. Only the previous epoch’s source, at an epoch’s
+first slot, folds the latest messages (foldhash-keyed).</li>
+<li>Committee weights are per-slot sums memoized for the run; a range across an
+epoch boundary sums its earlier epoch’s slots less the members its later
+part counts, and equivocators are a bitmap collected once per slot.</li>
+<li><code>get_current_target_score</code>, reached only in an epoch’s first slots, walks
+only the roots voted for in the current epoch, once per run. Walking every
+vote’s root decoded a whole block per parent hop for votes below the live
+index, and took over a second on mainnet; a vote from another epoch never
+names the target, so skipping it changes no result.</li>
+</ul>
+<p>At a million validators (<code>fast_confirmation_timing</code>, an ignored benchmark in
+the module) a run takes about 0.5 ms mid-epoch against the head
+computation’s 0.08 ms, 2 to 3 ms in an epoch’s second and third slots, and
+about 14 ms in its first, as the head computation’s once-an-epoch
+proto-array rebuild does. <code>lean_beacon_fast_confirmation_time_seconds</code> times
+a run.</p>
+</li>
+<li>
+<p><strong>Restart.</strong> The reported confirmed root is persisted when it changes. The
+first synced run of a process holds the root the previous process
+persisted (a restart within a process, after a missed or failed run, holds
+nothing), and every run asks
+<code>get_restart_resilient_confirmed_root</code> about it until the rule’s own answer
+wins, at which point it is dropped. As in the specification, that function
+only decides what is reported (the event and the safe block); its answer is
+never written into the rule’s own <code>confirmed_root</code>, so the rule extends its
+own confirmation chain with the observed checkpoints it actually has.</p>
+</li>
+<li>
+<p><strong>Tests.</strong> No fixtures exist; the pyspec scenarios are ported as unit tests in
+the module, on a store built directly (see the comment above them for what
+they emulate and which scenarios are not ported).</p>
+</li>
+</ul>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte

@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-63fcd5d2.js";
+            window.path_to_searchindex_js = "searchindex-0a283714.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2356,6 +2356,104 @@ index rather than a hash map, so the vote loop reads votes and snapshot
 balances in index order. The table grows to the highest voting index, which is
 why <code>set_latest_message</code> only takes indices from validated attestations (a
 debug assertion bounds it).</p>
+<h2 id="fast-confirmation-rule"><a class="header" href="#fast-confirmation-rule">Fast Confirmation Rule</a></h2>
+<p><code>beacon::fast_confirmation</code> implements the Fast Confirmation Rule (FCR) of
+consensus-specs’ <code>phase0</code>, <code>bellatrix</code> and <code>gloas</code> <code>fast-confirmation.md</code>, at
+<strong>consensus-specs <code>master</code>, commit <code>f993cf2</code></strong> rather than the pinned
+<code>v1.7.0-beta.2</code>. The release ships no FCR fixtures, and <code>master</code> has fixes it
+lacks (the gloas empty-slot support discount, precise committee weight, the
+restart-resilient confirmed root, the <code>support_discount &lt;= maximum_support</code>
+assertion). A later bump should diff those three files against that commit.</p>
+<ul>
+<li>
+<p><strong>Shape.</strong> One Rust function per specification function, named as the
+specification names it. <code>FastConfirmationStore</code> is the specification’s own
+store: a borrowed fork-choice <code>Store</code> plus the six variables. The variables
+live in the <code>Store</code> between runs (<code>Store::fast_confirmation</code>, beside the rest
+of the beacon fork-choice scratch), with the slot of the run that wrote
+them; only the reported confirmed root is persisted.</p>
+</li>
+<li>
+<p><strong>When it runs.</strong> Once per slot, in the beacon actor’s tick, after the clock
+advance, the deferred aggregates and the head recompute (so past slots’
+attestations are applied) and before <code>forkchoiceUpdated</code>, whose safe block it
+decides. Not on imports, which recompute the head many times a slot. A
+second run for a slot (a tick that fired while the wall clock still read the
+slot before) is not run. It is skipped, and reset, while the head is more
+than 32 slots behind the wall clock (the <code>head</code> event’s gate): the rule
+assumes synchrony from the start of the previous slot. It is skipped, too,
+when the tick is handled past the slot’s attestation deadline, which the
+specification sets for <code>update_fast_confirmation_variables</code>.</p>
+</li>
+<li>
+<p><strong>Missed slots.</strong> The variables must be updated in every slot (the observed
+checkpoints rotate only in an epoch boundary’s own slot, and
+<code>previous_slot_head</code> must be the previous slot’s head), so a run whose
+previous run was not in the slot before starts over from the finalized
+checkpoint, as the rule’s initialization does. The root last reported is
+dropped, not handed to the restart rule below: a missed slot is itself a
+sign the synchrony the rule assumes did not hold, so the safe block falls
+back to the finalized one until the rule confirms again. A failed run resets
+the rule the same way. How often that happens on a live node is not
+measured; each one is logged.</p>
+</li>
+<li>
+<p><strong>Outputs.</strong> The <code>fast_confirmation</code> Beacon API event, after every run, and
+the engine’s safe block hash (<code>get_safe_execution_block_hash</code>), which falls
+back to the finalized block while the confirmed one is off the head’s chain
+(an import can move the head between two runs).</p>
+</li>
+<li>
+<p><strong>Cost.</strong> A run reuses what the fork choice already keeps, so most runs cost
+about what the head computation does:</p>
+<ul>
+<li>Balance sources are the store’s per-checkpoint balances
+(<code>fork_choice::checkpoint_balances</code>, the cache the head’s justified
+balances come from), which also carry the active set’s figures
+(<code>JustifiedBalances::active_balance</code>, <code>total_active_balance</code>). A registry
+pass is paid once per checkpoint, at the boundary import, not per run. The
+pulled-up head state’s balances are the current target’s, exact while no
+validator was slashed in the current epoch (the head state’s
+<code>slashings[current_epoch % EPOCHS_PER_SLASHINGS_VECTOR]</code> is still zero);
+otherwise they are built from the state for that run.</li>
+<li>Attestation scores are the proto-array’s <code>PENDING</code> subtree totals
+(<code>Store::proto_array_weights</code>) when the source is the justified
+checkpoint’s, read with the head’s own snapshot, rule set and window so the
+array never rebuilds for it. Only the previous epoch’s source, at an epoch’s
+first slot, folds the latest messages (foldhash-keyed).</li>
+<li>Committee weights are per-slot sums memoized for the run; a range across an
+epoch boundary sums its earlier epoch’s slots less the members its later
+part counts, and equivocators are a bitmap collected once per slot.</li>
+<li><code>get_current_target_score</code>, reached only in an epoch’s first slots, walks
+only the roots voted for in the current epoch, once per run. Walking every
+vote’s root decoded a whole block per parent hop for votes below the live
+index, and took over a second on mainnet; a vote from another epoch never
+names the target, so skipping it changes no result.</li>
+</ul>
+<p>At a million validators (<code>fast_confirmation_timing</code>, an ignored benchmark in
+the module) a run takes about 0.5 ms mid-epoch against the head
+computation’s 0.08 ms, 2 to 3 ms in an epoch’s second and third slots, and
+about 14 ms in its first, as the head computation’s once-an-epoch
+proto-array rebuild does. <code>lean_beacon_fast_confirmation_time_seconds</code> times
+a run.</p>
+</li>
+<li>
+<p><strong>Restart.</strong> The reported confirmed root is persisted when it changes. The
+first synced run of a process holds the root the previous process
+persisted (a restart within a process, after a missed or failed run, holds
+nothing), and every run asks
+<code>get_restart_resilient_confirmed_root</code> about it until the rule’s own answer
+wins, at which point it is dropped. As in the specification, that function
+only decides what is reported (the event and the safe block); its answer is
+never written into the rule’s own <code>confirmed_root</code>, so the rule extends its
+own confirmation chain with the observed checkpoints it actually has.</p>
+</li>
+<li>
+<p><strong>Tests.</strong> No fixtures exist; the pyspec scenarios are ported as unit tests in
+the module, on a store built directly (see the comment above them for what
+they emulate and which scenarios are not ported).</p>
+</li>
+</ul>
 <h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
 <p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
 would otherwise run to hundreds of near-identical lines: the fixed-length byte
@@ -3945,14 +4043,19 @@ dropped.</p>
 per tick, not once per block. It is sent even when nothing moved: an execution
 client doing state sync needs to keep being fed a recent head or its sync cannot
 converge.</p>
-<p>Its three hashes come from the cached execution hash of the head, the justified
-checkpoint’s root and the finalized checkpoint’s root. A root with no cached hash
-contributes the zero hash, which is a meaningful value here rather than an
-absence: EIP-3675 requires <code>finalized_block_hash</code> to be zero before a
-post-transition block is finalized, and the specification’s own
-<code>get_safe_execution_block_hash</code> returns zero when no payload is justified yet. A
-follower whose <em>head</em> has no cached hash is still sitting on its checkpoint
-anchor and sends nothing at all.</p>
+<p>Its three hashes come from the cached execution hash of the head, the root of
+the block the Fast Confirmation Rule last confirmed (see
+<a href="#fast-confirmation-rule"><code>beacon_stf.md</code></a>) and the finalized
+checkpoint’s root. The rule’s confirmed root starts at the finalized block and
+is updated once per slot, in the same tick, before this call. Between two runs
+an import can move the head off the confirmed block’s chain, and the finalized
+block is sent as safe until the head is back on it (see <code>docs/spec_deviations.md</code>,
+“<code>forkchoiceUpdated</code> for a gloas head”; the rule applies on every fork). A root with no
+cached hash contributes the zero hash, which is a meaningful value here rather
+than an absence: EIP-3675 requires <code>finalized_block_hash</code> to be zero before a
+post-transition block is finalized, and a confirmed block before the merge has
+no payload. A follower whose <em>head</em> has no cached hash is still sitting on its
+checkpoint anchor and sends nothing at all.</p>
 <p>The cache is pruned to the unfinalized window on every tick and every import,
 with the finalized checkpoint’s own root exempted by name. The slot bound alone
 does not reach it: a checkpoint is stored as its epoch’s start slot, while its
@@ -3963,9 +4066,9 @@ execution client advancing its own finalized block for the life of the process.<
 <p>For a gloas head the hashes come from bids rather than from a cached payload
 hash: the head node’s <code>bid.block_hash</code> when it is FULL and its
 <code>bid.parent_block_hash</code> when it is EMPTY, the finalized block’s
-<code>bid.parent_block_hash</code>, and the justified block’s <code>bid.parent_block_hash</code> as
-the safe hash. The last is a fallback, since the specification builds the safe
-hash on fast confirmation, which the follower does not run. The call is V4 with
+<code>bid.parent_block_hash</code>, and the confirmed block’s <code>bid.parent_block_hash</code> as
+the safe hash (the specification’s gloas <code>get_safe_execution_block_hash</code>: only
+the parent payload of a confirmed beacon block is safe). The call is V4 with
 the node’s custody columns. A head whose payload status has not been computed
 yet (the first moments after a restart) sends nothing.</p>
 <p>The response carries a <code>PayloadStatusV1</code> of its own, and that is the channel by
@@ -5900,6 +6003,7 @@ these are ever sent:</p>
 <tr><td><code>chain_reorg</code></td><td><code>{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}</code></td><td>The new head does not descend from the previous one</td></tr>
 <tr><td><code>attestation</code></td><td>the aggregate’s <code>Attestation</code></td><td>An aggregate passed the <code>beacon_aggregate_and_proof</code> rules: accepted from gossip, or submitted through <code>POST /eth/v2/validator/aggregate_and_proofs</code></td></tr>
 <tr><td><code>data_column_sidecar</code></td><td><code>{"block_root":"0x…", "index":"1", "slot":"1"}</code></td><td>A column this node custodies is stored, from any source</td></tr>
+<tr><td><code>fast_confirmation</code></td><td><code>{"block":"0x…", "slot":"1", "current_slot":"2"}</code></td><td>The Fast Confirmation Rule ran, once per slot at the slot’s tick, whether or not the confirmed block changed. <code>block</code> and <code>slot</code> are the most recent confirmed block’s (after a restart or a slot without a run, the restored one while it wins), <code>current_slot</code> the slot of the run. Not sent while the head is more than 32 slots behind the wall clock, nor for a slot whose tick ran past its attestation deadline (the rule is not run then)</td></tr>
 <tr><td><code>execution_payload</code></td><td><code>{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}</code></td><td>The chain actor imported a gloas envelope (from gossip, req/resp or <code>POST /eth/v1/beacon/execution_payload_envelopes</code>). <code>execution_optimistic</code> is the envelope rule of “<code>execution_optimistic</code> under gloas”: true when the execution client answered <code>SYNCING</code> or <code>ACCEPTED</code></td></tr>
 <tr><td><code>execution_payload_gossip</code></td><td><code>{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…"}</code></td><td>An envelope passed the <code>execution_payload</code> gossip rules, or was accepted by <code>POST /eth/v1/beacon/execution_payload_envelopes</code></td></tr>
 <tr><td><code>execution_payload_available</code></td><td><code>{"slot":"10", "block_root":"0x…"}</code></td><td>Right after <code>execution_payload</code> (see below)</td></tr>
@@ -5913,7 +6017,7 @@ these are ever sent:</p>
 never reach the chain actor), the operation topics (<code>voluntary_exit</code>,
 <code>proposer_slashing</code>, <code>attester_slashing</code>, <code>bls_to_execution_change</code>,
 <code>contribution_and_proof</code>: no operation pools), <code>payload_attributes</code>, the light
-client topics, <code>blob_sidecar</code>, and <code>fast_confirmation</code> (no producer).</p>
+client topics and <code>blob_sidecar</code>.</p>
 <p>The gloas topics are emitted by whichever part of the node accepted the object,
 since several never reach the chain actor: the actor publishes <code>execution_payload</code>
 and <code>execution_payload_available</code>; p2p publishes the gossip-accepted
@@ -9770,10 +9874,24 @@ node, and a pre-gloas block’s is its parent. Both walks stop at finality.</p>
 been computed yet is skipped.</li>
 <li><code>finalized_block_hash</code> is the finalized block’s <code>bid.parent_block_hash</code>, as
 the specification has it.</li>
-<li><code>safe_block_hash</code> is the justified block’s <code>bid.parent_block_hash</code>. The
-specification’s <code>get_safe_execution_block_hash</code> is built on fast
-confirmation, which the follower does not run, so this is the fallback. It
-can only be older than the confirmed block, which keeps it safe.</li>
+<li><code>safe_block_hash</code> is the Fast Confirmation Rule’s confirmed block’s
+<code>bid.parent_block_hash</code>, the specification’s gloas
+<code>get_safe_execution_block_hash</code>. (It used to be the justified block’s, a
+stand-in from before the rule was implemented.) Before the rule’s first run,
+or while the node is far behind the clock and the rule is not run, the
+confirmed root is the finalized block, which is what the rule’s own
+initialization sets it to.</li>
+<li><strong>One deviation, on every fork:</strong> the confirmed block is sent only while it
+is on the stored head’s chain at or above the finalized epoch’s start slot,
+and the finalized block is sent otherwise. The rule runs once a slot, while
+imports move the head (and send <code>forkchoiceUpdated</code>) many times a slot, and
+the specification’s <code>get_safe_execution_block_hash</code> names the confirmed block
+whatever the head is. An execution client answers <code>-38002 Invalid forkchoice state</code> to a safe block that is not an ancestor of the head. The confirmed
+block leaves the head’s chain only when the rule’s synchrony assumption
+broke, and the rule’s next run falls back to the finalized block then too
+(<code>get_latest_confirmed</code>), so this only answers early what the rule will
+answer at the next slot. The check is one read of the canonical <code>BlockRoots</code>
+index (<code>beacon_payloads::safe_root</code>).</li>
 <li>A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
 own payload hash.</li>
 <li>The call is V4 with the node’s custody columns when the head block is gloas,
