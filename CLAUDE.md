@@ -424,17 +424,19 @@ into one `cli::Options { common, network }`, where `network` is
 `Network::Lean(LeanOptions)` or `Network::Mainnet { mainnet, execution }`. Each
 variant carries that chain's own flags, so a flag one chain does not take is
 unreachable on the other's path by construction rather than by an `Option`
-nobody unwraps. `MainnetOptions` holds the three flags `beacon` has of its own:
-`--custody-group-count`, `--safe-slots-to-import-optimistically`, and
-`--network` (default `mainnet`). The last is carried unresolved: `run_node` is
-where a bad value is reported.
+nobody unwraps. `MainnetOptions` holds the flags `beacon` has of its own, among
+them `--custody-group-count`, `--safe-slots-to-import-optimistically`, the
+`--builder*` flags, `--bootnodes` (a list here; `LeanOptions` has `node`'s
+file), and `--network` (default `mainnet`). The last is carried unresolved:
+`run_node` is where a bad value is reported.
 
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
 it must still precede key loading), resolving `--network` into a
-`NetworkSource` (mainnet only; must precede the next step, since a loaded
-network's own bootnode list is part of its fallback), reading `--bootnodes`,
+`NetworkSource` (mainnet only; must precede the next step, since `beacon`'s
+`--bootnodes` entries are added to the network's own bootnode list), reading
+`--bootnodes` (`node`: a file of ENRs; `beacon`: an ENR/multiaddr list),
 building the aggregator, sync-status and event handles, opening `--data-dir`'s
 RocksDB backend, and `--node-key` resolution. That last one comes after the
 open because, without `--node-key`, the identity is `<data-dir>/node.key`,
@@ -447,8 +449,9 @@ It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainActor` saying what to spawn this chain's actor with (lean's validator
 keys and `BlockChainConfig`, or beacon's `Beacon` marker). The rest of the
 discv5 configuration is the node key, the ports, the bootnodes and the peer
-target, which are operator input and identical either way, so `run_node` fills
-those in once below the match rather than having each arm repeat them.
+target, which are operator input (the bootnodes resolved per chain, but above
+the match), so `run_node` fills those in once below the match rather than
+having each arm repeat them.
 Everything after that match is shared again: one `build_swarm`, one
 `P2P::spawn`, one `start_rpc_server`, and one chain actor, since `ChainActor`
 selects between `BlockChain::spawn` and `BlockChain::spawn_beacon` rather than
@@ -1002,7 +1005,7 @@ GENESIS_VALIDATORS:
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 
-**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial
+**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial. `node --bootnodes` names a file of them; `beacon --bootnodes` is instead a comma-separated, repeatable list of ENRs and `/ip4|ip6/<ip>/<transport>/p2p/<peer-id>` multiaddrs (Lighthouse's `--boot-nodes`: `tcp/<port>` and `udp/<port>/quic-v1` are dialed, a bare `udp/<port>` only seeds discv5, and is refused under `/ip6` while discovery binds IPv4, checked against the bind address `run_node` passes in). Its entries are added to the network's own list rather than replacing it, and a bad one fails startup where the network's own bad entries are skipped with a warning (see `docs/cli.md`)
 
 ## Testing
 
