@@ -338,6 +338,20 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
 | `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss (and the writer's own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero | role=led,joined |
+| `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
+| `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+
+**`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
+The beacon head computation reads vote weights the store keeps current as votes
+arrive, and rebuilds them from every latest message only when its inputs move
+under it: `balances` when the justified checkpoint moves, `prune` when finality
+prunes the block index (the two usually land together, and one rebuild covers
+both), `unbuilt` once per process. `removal` follows a payload invalidation or the
+restart head repair, `rules` the gloas fork boundary. `coverage` means a block
+reached the index without `Store::insert_fork_choice_node`: `on_block` always
+inserts one, so outside tests and bootstrap a steady rate of it is worth a look
+(an API read racing a block import can cost one now and then). `underflow` is a
+bug: the cache repaired itself, and a warning in the log names the validator.
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -535,7 +549,8 @@ not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations, sync aggregate and exit/consolidation churn | result=hit,miss,unkeyable |
+| `lean_beacon_pubkey_index_lookups_total` | Counter | Pubkey to validator-index lookups in block processing, by whether the pubkey index cache served them | Per sync committee seat, and per pubkey of a withdrawal or consolidation request; `fallback` is a registry search (also counted when the pubkey is not registered) | result=hit,fallback |
 
 Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
 genesis state asking about its own epoch, and should be zero on a
