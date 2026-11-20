@@ -259,6 +259,11 @@ stf_phases! {
     ExecutionRequests => "execution_requests",
     PayloadAttestations => "payload_attestations",
     SyncAggregate => "sync_aggregate",
+    /// The one random-weight check of every signature the block's steps
+    /// deferred (RANDAO reveal, attestations, slashings, exits, BLS changes,
+    /// sync aggregate, ...). Those steps' own phases cover building the
+    /// signature sets, not verifying them.
+    BatchSignatures => "batch_signatures",
     /// The post-state flush and `hash_tree_root` that checks
     /// `block.state_root`.
     StateRoot => "state_root",

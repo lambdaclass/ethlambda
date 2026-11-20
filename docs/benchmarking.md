@@ -300,7 +300,8 @@ reads the import histogram: its `sum` before and after each import. The names ar
 `block_header`, `randao`, `eth1_data`, `execution_payload`, one per operation list
 (`proposer_slashings`, `attester_slashings`, `attestations`, `deposits`,
 `voluntary_exits`, `bls_to_execution_changes`, `execution_requests`,
-`payload_attestations`), `sync_aggregate` and `state_root`. Unlike `phases`, a
+`payload_attestations`), `sync_aggregate`, `batch_signatures` (the deferred signatures
+of the block, verified together) and `state_root`. Unlike `phases`, a
 step may be observed more than once in one import (`process_epoch` once per
 boundary a long skip crosses, the gloas payload steps twice), so a value is the
 **sum** of that import's observations, not a single one.

@@ -613,12 +613,13 @@ says how long an import's transition took; this says which step.
 | `process_epoch` | The epoch transition, once per boundary crossed (a long skip observes it several times) |
 | `block_signature` | The proposer's signature over the block, when the caller asked for result validation |
 | `block_header` | The header check, including the hash of the block body it commits to |
-| `randao` | The reveal's verification and the mix update |
+| `randao` | The mix update and the building of the reveal's signature set; the reveal is verified in `batch_signatures` |
 | `eth1_data` | The eth1 vote |
 | `execution_payload` | Withdrawals and the execution payload; gloas: the parent payload, then the withdrawals and the bid, two observations per block |
 | `proposer_slashings`, `attester_slashings`, `attestations`, `deposits`, `voluntary_exits`, `bls_to_execution_changes`, `payload_attestations` | One observation per block for the whole list, absent when the list is empty; the fork must have the list. Through fulu, `attestations` includes the one proposer lookup the whole list shares |
 | `execution_requests` | Electra and fulu's requests of the execution layer |
 | `sync_aggregate` | The sync aggregate, altair onward |
+| `batch_signatures` | The random-weight check of every signature the block's steps deferred (RANDAO reveal, attestations, slashings, exits, BLS changes, sync aggregate). The steps' own phases cover building those signature sets, not verifying them. Observed once per check, so a gloas block, which verifies the bid and reveal before the body, can observe it more than once |
 | `state_root` | The post-state flush and `hash_tree_root` that checks `block.state_root`; only observed when the caller validates the result |
 
 **`context` keeps background work out of an import's numbers.** The epoch

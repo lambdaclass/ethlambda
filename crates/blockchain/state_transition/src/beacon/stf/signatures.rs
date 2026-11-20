@@ -79,6 +79,8 @@
 use ethlambda_crypto::bls::{SignatureSet, verify_signature_sets};
 use tracing::error;
 
+use crate::metrics::{StfPhase, timed};
+
 use crate::beacon::error::{Result, verify};
 
 /// The signatures a block's processing defers, checked together once it ends.
@@ -175,7 +177,9 @@ impl SignatureBatch {
     /// top of the batch.
     pub(crate) fn verify_pending(&mut self) -> Result<()> {
         debug_assert_eq!(self.sets.len(), self.labels.len(), "one label per set");
-        let outcome = check(&self.sets, &self.labels);
+        let outcome = timed(StfPhase::BatchSignatures, || {
+            check(&self.sets, &self.labels)
+        });
         self.sets.clear();
         self.labels.clear();
         outcome
