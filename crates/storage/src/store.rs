@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::liveness::ObservedLiveness;
 use crate::pools::{AttestationPool, OperationPool};
 use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
+use crate::pubkey_index_cache::PubkeyIndexCache;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -1279,6 +1280,11 @@ pub struct Store {
     /// `beacon::helpers::accessors::ActiveBalanceCacheExt` for the
     /// state-aware half. Always empty on lean.
     active_balance_cache: Arc<ActiveBalanceCache>,
+    /// Pubkey to validator index, shared like [`Self::active_balance_cache`].
+    /// See [`PubkeyIndexCache`], and `ethlambda-state-transition`'s
+    /// `beacon::helpers::accessors::PubkeyIndexCacheExt` for the state-aware
+    /// half. Always empty on lean.
+    pubkey_index_cache: Arc<PubkeyIndexCache>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
@@ -1926,6 +1932,7 @@ impl Store {
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
+            pubkey_index_cache: Arc::new(PubkeyIndexCache::default()),
             beacon: Default::default(),
             state_writer,
             state_handoff: Default::default(),
@@ -3406,6 +3413,13 @@ impl Store {
     /// An owned `Arc` for the same reason as [`Self::committee_cache`].
     pub fn active_balance_cache(&self) -> Arc<ActiveBalanceCache> {
         Arc::clone(&self.active_balance_cache)
+    }
+
+    /// The pubkey-index cache shared by every clone of this store.
+    ///
+    /// An owned `Arc` for the same reason as [`Self::committee_cache`].
+    pub fn pubkey_index_cache(&self) -> Arc<PubkeyIndexCache> {
+        Arc::clone(&self.pubkey_index_cache)
     }
 
     /// Returns whether a state is available for the given block root.
