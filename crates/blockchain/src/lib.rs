@@ -4101,6 +4101,7 @@ impl BlockChainServer {
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
     NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
+    NewProposerPreferences,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -4257,6 +4258,22 @@ impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
             self.on_tick(unix_now_ms(), ctx).await;
         }
         self.apply_payload_attestation_message(&msg.message, &msg.arrival);
+        // The PTC's votes on the head's payload decide whether the next
+        // proposal extends it, and they arrive after the lookahead point.
+        self.maybe_prepare_payload_attributes(ctx);
+    }
+}
+
+impl Handler<NewProposerPreferences> for BlockChainServer {
+    async fn handle(&mut self, msg: NewProposerPreferences, ctx: &Context<Self>) {
+        // Beacon-only, and only the next slot's preferences change an event:
+        // they name its fee recipient and gas target.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        if msg.proposal_slot == self.wall_clock_slot() + 1 {
+            self.maybe_prepare_payload_attributes(ctx);
+        }
     }
 }
 
@@ -4305,9 +4322,12 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 }
 
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
-    async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewDataColumnSidecars, ctx: &Context<Self>) {
         self.on_checked_data_columns(msg.sidecars).await;
         self.settle_envelopes().await;
+        // The last column a held block or a parked envelope waited for imports
+        // it, which can move the head or turn it FULL.
+        self.maybe_prepare_payload_attributes(ctx);
     }
 }
 

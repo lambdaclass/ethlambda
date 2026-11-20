@@ -3068,6 +3068,12 @@ pub(crate) mod test_support {
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
         }
+        fn new_proposer_preferences(
+            &self,
+            _proposal_slot: u64,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
     }
 
     /// A gloas envelope for `(root_byte, builder)` at slot `slot_number`

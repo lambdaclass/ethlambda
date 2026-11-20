@@ -359,7 +359,9 @@ actual_slot = finalized_slot + 1 + relative_index
     `execution_payload`, `payload_attestation_message`, `execution_payload_bid` and
     `proposer_preferences` (`BeaconTopics::for_fork`; earlier digests never carry them).
     Bids and preferences are validated in p2p against one shared `BuilderMarket`
-    (`state_transition::beacon::builder_market`) and never reach the chain actor. Gloas has its own rules for `beacon_block`,
+    (`state_transition::beacon::builder_market`) and never reach the chain actor, except that an
+    accepted preference (gossip or API) is reported to it by proposal slot alone
+    (`new_proposer_preferences`), for `payload_attributes`. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate

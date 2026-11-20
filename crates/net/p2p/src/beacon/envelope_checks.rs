@@ -238,6 +238,9 @@ pub(crate) mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_proposer_preferences(&self, _proposal_slot: u64) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {

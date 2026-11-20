@@ -613,16 +613,7 @@ pub struct DataColumnSidecarEvent {
 
 /// The Beacon API `payload_attributes` payload: `version` is the fork at
 /// `proposal_slot`, which selects the shape of `data`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct PayloadAttributesEvent {
-    #[serde(serialize_with = "fork_name")]
-    pub version: ForkName,
-    pub data: PayloadAttributesEventData,
-}
-
-fn fork_name<S: serde::Serializer>(fork: &ForkName, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(fork.as_str())
-}
+pub type PayloadAttributesEvent = Versioned<PayloadAttributesEventData>;
 
 /// `payload_attributes`'s `data`, by the `PayloadAttributesV<N>` it carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

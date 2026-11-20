@@ -8,13 +8,17 @@
 //!   gloas parent-payload choice, the fee recipient, and the
 //!   `PayloadAttributesV3`/`V4` built from them.
 //! - **The event**, published by the chain actor. A third of a slot before
-//!   each slot (Lighthouse's default `--prepare-payload-lookahead`), and again
-//!   whenever the head moves after that point, the actor computes the next
-//!   slot's attributes on a blocking worker and publishes them on the bus. It
-//!   does so only when someone is subscribed, and only for a proposer a
-//!   validator client registered through `prepare_beacon_proposer`, unless
-//!   `--always-prepare-payload` asks for every slot. External block builders
-//!   (buildoor, for one) build from this stream.
+//!   each slot (Lighthouse's default `--prepare-payload-lookahead`), the actor
+//!   computes the next slot's attributes on a blocking worker and publishes
+//!   them on the bus, then again whenever an input to them changes before the
+//!   slot: the head, on gloas the parent payload branch (the head's payload
+//!   arriving, or the PTC's votes on it) and the proposer's signed
+//!   preferences, and the fee recipient `prepare_beacon_proposer` names
+//!   ([`AttributesKey`]). It does so only when someone is subscribed, and
+//!   only for a proposer a validator client registered through
+//!   `prepare_beacon_proposer`, unless `--always-prepare-payload` asks for
+//!   every slot. External block builders (buildoor, for one) build from this
+//!   stream.
 //!
 //! Nothing is sent to the execution client ahead of `produceBlock`: the early
 //! `forkchoiceUpdated` other clients send with these attributes is not done
@@ -242,6 +246,46 @@ pub fn payload_attributes_v4(
     }
 }
 
+/// Whether a gloas proposal at `slot` on `head_root` extends the head's
+/// payload rather than building on its empty branch: [`should_build_on_full`]
+/// for the head node, whose payload status is the one fork choice recorded,
+/// or, when none is recorded for this head yet, a fresh walk's.
+pub fn parent_builds_on_full(
+    store: &Store,
+    head_root: H256,
+    slot: Slot,
+) -> Result<bool, ProposalError> {
+    let payload_status = match store.head_payload_status() {
+        Some(status) => status,
+        None => {
+            get_head_node(store, &store.config())
+                .map_err(|_| ProposalError::Internal("fork choice could not name the head"))?
+                .payload_status
+        }
+    };
+    builds_on_full(store, head_root, payload_status, slot)
+}
+
+/// [`should_build_on_full`] for the head node `(head_root, payload_status)`.
+/// Reads the PTC's votes on the head, so its answer can change while the head
+/// and its status do not.
+fn builds_on_full(
+    store: &Store,
+    head_root: H256,
+    payload_status: PayloadStatus,
+    slot: Slot,
+) -> Result<bool, ProposalError> {
+    let node = ForkChoiceNode {
+        root: head_root,
+        payload_status,
+    };
+    let build_on_full = should_build_on_full(store, node, slot).map_err(|_| {
+        ProposalError::Internal("could not decide which parent payload to build on")
+    })?;
+    debug_assert_ne!(payload_status, PayloadStatus::Pending);
+    Ok(build_on_full)
+}
+
 /// The chain-side half of a gloas proposal at `slot` on `head_root`: pick the
 /// parent payload branch, advance the head state to `slot`, and derive the
 /// payload inputs from it.
@@ -252,30 +296,28 @@ pub fn prepare_gloas_proposal(
     head_state: &BeaconState,
     slot: Slot,
 ) -> Result<GloasProposal, ProposalError> {
+    if slot <= head_state.slot() {
+        return Err(ProposalError::NotAfterHead);
+    }
+    let build_on_full = parent_builds_on_full(store, head_root, slot)?;
+    prepare_gloas_proposal_on(store, market, head_root, head_state, slot, build_on_full)
+}
+
+/// [`prepare_gloas_proposal`] with the parent payload branch already chosen,
+/// for the event, which chose it when it decided to publish.
+fn prepare_gloas_proposal_on(
+    store: &Store,
+    market: &SharedBuilderMarket,
+    head_root: H256,
+    head_state: &BeaconState,
+    slot: Slot,
+    build_on_full: bool,
+) -> Result<GloasProposal, ProposalError> {
     let config = store.config();
     let head_slot = head_state.slot();
     if slot <= head_slot {
         return Err(ProposalError::NotAfterHead);
     }
-
-    // The payload branch of the head: the one fork choice recorded, or, when
-    // it has not been recorded for this head yet, a fresh walk.
-    let payload_status = match store.head_payload_status() {
-        Some(status) => status,
-        None => {
-            get_head_node(store, &config)
-                .map_err(|_| ProposalError::Internal("fork choice could not name the head"))?
-                .payload_status
-        }
-    };
-    let node = ForkChoiceNode {
-        root: head_root,
-        payload_status,
-    };
-    let build_on_full = should_build_on_full(store, node, slot).map_err(|_| {
-        ProposalError::Internal("could not decide which parent payload to build on")
-    })?;
-    debug_assert_ne!(payload_status, PayloadStatus::Pending);
 
     let head_is_gloas = matches!(
         store.get_signed_block(&head_root),
@@ -339,14 +381,18 @@ pub fn prepare_gloas_proposal(
 /// prepares for (or the slot's fork has no block production here).
 ///
 /// The attributes are the ones `produceBlockV3`/`produceBlockV4` would send
-/// for that block, from the same preparation. Runs a state transition to the
-/// proposal slot, so it belongs on a blocking thread.
-pub fn payload_attributes_event(
+/// for that block, from the same preparation. On gloas, `build_on_full` is the
+/// parent payload branch the publication was keyed on ([`AttributesKey`]), so
+/// the event describes exactly that branch; `None` leaves the choice to
+/// [`parent_builds_on_full`]. Runs a state transition to the proposal slot,
+/// so it belongs on a blocking thread.
+pub(crate) fn payload_attributes_event(
     store: &Store,
     preparation: &PayloadPreparation,
     head_root: H256,
     head_state: &BeaconState,
     proposal_slot: Slot,
+    build_on_full: Option<bool>,
 ) -> Result<Option<PayloadAttributesEvent>, String> {
     let config = store.config();
     let fork = config.fork_at_epoch(compute_epoch_at_slot(proposal_slot));
@@ -378,12 +424,18 @@ pub fn payload_attributes_event(
             })
         }
         ForkName::Gloas => {
-            let proposal = prepare_gloas_proposal(
+            let build_on_full = match build_on_full {
+                Some(build_on_full) => build_on_full,
+                None => parent_builds_on_full(store, head_root, proposal_slot)
+                    .map_err(|err| format!("choosing the parent payload failed: {err:?}"))?,
+            };
+            let proposal = prepare_gloas_proposal_on(
                 store,
                 &preparation.builder_market,
                 head_root,
                 head_state,
                 proposal_slot,
+                build_on_full,
             )
             .map_err(|err| format!("preparing the proposal failed: {err:?}"))?;
             if !prepares_for(proposal.proposer) {
@@ -414,10 +466,7 @@ pub fn payload_attributes_event(
         | ForkName::Electra
         | ForkName::Lean => return Ok(None),
     };
-    Ok(Some(PayloadAttributesEvent {
-        version: fork,
-        data,
-    }))
+    Ok(Some(PayloadAttributesEvent::new(fork, data)))
 }
 
 /// How far into a slot the next slot's attributes are first published: a
@@ -426,25 +475,105 @@ pub(crate) fn lookahead_start(slot_duration_ms: u64) -> Duration {
     Duration::from_millis(slot_duration_ms - slot_duration_ms / 3)
 }
 
-/// What one publication is for: the proposal slot and the head it builds on.
-/// The head's payload status is part of it, since on gloas a payload arriving
-/// for the same head changes which execution block the proposal extends.
+/// Whether this moment may publish at all: someone is subscribed (nobody
+/// would hear it otherwise), the node is not syncing (its head is not the
+/// chain's), and the wall clock is past [`lookahead_start`]. Asked before
+/// anything reads the head, subscriber first, since every payload attestation
+/// asks and most nodes have no subscriber.
+pub(crate) fn may_publish(
+    has_subscribers: bool,
+    syncing: bool,
+    past_lookahead: impl FnOnce() -> bool,
+) -> bool {
+    has_subscribers && !syncing && past_lookahead()
+}
+
+/// What one publication is for: everything the event is built from that can
+/// change between the lookahead point and the proposal slot. Two moments with
+/// the same key would publish the same event, so a key is published once, and
+/// a worker's result is published only while its key is still the current one
+/// ([`attributes_key`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttributesKey {
     pub(crate) proposal_slot: Slot,
     pub(crate) head_root: H256,
-    pub(crate) payload_status: Option<PayloadStatus>,
+    /// The slot's proposer, when the head state's proposer lookahead names
+    /// it without a state transition.
+    pub(crate) proposer: Option<ValidatorIndex>,
+    /// The fee recipient `prepare_beacon_proposer` recorded for `proposer`.
+    pub(crate) fee_recipient: Option<ExecutionAddress>,
+    /// Gloas: whether the proposal extends the head's payload. It follows the
+    /// head's payload status and, for a head at the previous slot, the PTC's
+    /// votes on that payload, so either can change it. `None` before gloas,
+    /// and while no status is recorded for the head, in which case the worker
+    /// chooses.
+    pub(crate) build_on_full: Option<bool>,
+    /// Gloas: the fee recipient and gas target of the proposer's signed
+    /// preferences for the slot, once this node holds them.
+    pub(crate) preferences: Option<(ExecutionAddress, u64)>,
 }
+
+/// The key for a publication at `proposal_slot` on `head_root`, whose
+/// post-state is `head_state`. Reads no more than a few locks and the head's
+/// PTC votes, since a payload attestation asks for it hundreds of times a
+/// slot; the expensive part, the advance to the slot, is the worker's.
+pub(crate) fn attributes_key(
+    store: &Store,
+    preparation: &PayloadPreparation,
+    head_root: H256,
+    head_state: &BeaconState,
+    proposal_slot: Slot,
+) -> AttributesKey {
+    let proposer = lookahead_proposer(head_state, proposal_slot);
+    let fee_recipient =
+        proposer.and_then(|proposer| prepared_fee_recipient(&preparation.fee_recipients, proposer));
+    let fork = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(proposal_slot));
+    let (build_on_full, preferences) = if fork == ForkName::Gloas {
+        // No walk here when the status is missing (see the field).
+        let build_on_full = store
+            .head_payload_status()
+            .and_then(|status| builds_on_full(store, head_root, status, proposal_slot).ok());
+        let preferences = dependent_root_at(head_state, head_root, proposal_slot)
+            .and_then(|root| preparation.builder_market.preferences(proposal_slot, root))
+            .map(|signed| {
+                (
+                    signed.message.fee_recipient,
+                    signed.message.target_gas_limit,
+                )
+            });
+        (build_on_full, preferences)
+    } else {
+        (None, None)
+    };
+    AttributesKey {
+        proposal_slot,
+        head_root,
+        proposer,
+        fee_recipient,
+        build_on_full,
+        preferences,
+    }
+}
+
+/// How many workers may fail on one key before it is given up. A failure is
+/// retried on the next event that re-checks, not at once, so a persistent one
+/// costs this many state transitions rather than one per payload attestation.
+const MAX_ATTEMPTS: u8 = 3;
 
 /// The chain actor's publication state. Empty (and inert) on lean, which
 /// has no `PayloadPreparation`.
 #[derive(Default)]
 pub(crate) struct PayloadAttributesPublisher {
     preparation: Option<PayloadPreparation>,
-    /// The last key a worker finished for, whatever it found.
+    /// The last key whose worker finished while it was current, having
+    /// published its event or found no proposer to publish it for.
     published: Option<AttributesKey>,
     /// The key a worker is running for now. At most one runs.
     in_flight: Option<AttributesKey>,
+    /// The last key a worker failed on, and how many have.
+    failed: Option<(AttributesKey, u8)>,
 }
 
 impl PayloadAttributesPublisher {
@@ -454,36 +583,48 @@ impl PayloadAttributesPublisher {
             ..Self::default()
         }
     }
-}
 
-/// Everything [`should_prepare`] reads, gathered so the decision is a pure
-/// function.
-pub(crate) struct DecisionInputs {
-    pub(crate) has_subscribers: bool,
-    pub(crate) syncing: bool,
-    /// Whether the wall clock is past [`lookahead_start`] of the current slot.
-    pub(crate) past_lookahead: bool,
-    pub(crate) key: AttributesKey,
-    pub(crate) published: Option<AttributesKey>,
-    pub(crate) in_flight: Option<AttributesKey>,
-}
+    /// Whether to start a worker for `key`.
+    ///
+    /// Not for a key already published, nor for one [`MAX_ATTEMPTS`] workers
+    /// failed on, nor while a worker for the same proposal slot runs: that one
+    /// re-checks when it finishes, so a key that changed meanwhile is picked
+    /// up then. A worker for an earlier slot no longer blocks, so one that
+    /// never reports back costs a slot, not every slot after it.
+    pub(crate) fn wants(&self, key: AttributesKey) -> bool {
+        self.in_flight
+            .is_none_or(|running| running.proposal_slot < key.proposal_slot)
+            && self.published != Some(key)
+            && self
+                .failed
+                .is_none_or(|(failed, attempts)| failed != key || attempts < MAX_ATTEMPTS)
+    }
 
-/// Whether to start a worker for `inputs.key`.
-///
-/// Not without a subscriber (nobody would hear it), while syncing (the head
-/// is not the chain's), before the lookahead point, for a key already done,
-/// or while a worker for the same proposal slot runs: that one re-checks when
-/// it finishes, so a head that moved meanwhile is picked up then. A worker
-/// for an earlier slot no longer blocks, so one that never reports back
-/// costs a slot, not every slot after it.
-pub(crate) fn should_prepare(inputs: &DecisionInputs) -> bool {
-    inputs.has_subscribers
-        && !inputs.syncing
-        && inputs.past_lookahead
-        && inputs
-            .in_flight
-            .is_none_or(|running| running.proposal_slot < inputs.key.proposal_slot)
-        && inputs.published != Some(inputs.key)
+    /// Records that a worker for `key` finished. `current` says whether `key`
+    /// is still the one the node would publish now, `ok` whether the worker
+    /// succeeded. Returns whether to re-check at once.
+    pub(crate) fn finish(&mut self, key: AttributesKey, current: bool, ok: bool) -> bool {
+        if self.in_flight == Some(key) {
+            self.in_flight = None;
+        }
+        if ok {
+            if current {
+                self.published = Some(key);
+            }
+            if self.failed.is_some_and(|(failed, _)| failed == key) {
+                self.failed = None;
+            }
+            return true;
+        }
+        let attempts = match self.failed {
+            Some((failed, attempts)) if failed == key => attempts.saturating_add(1),
+            _ => 1,
+        };
+        self.failed = Some((key, attempts));
+        // A key that still holds is retried on the next event that re-checks,
+        // not now; one that no longer holds gives way to the current key.
+        !current
+    }
 }
 
 /// Self-message armed at a slot's start, delivered at its lookahead point.
@@ -515,13 +656,33 @@ impl BlockChainServer {
         send_after(delay, ctx.clone(), PayloadAttributesCheck);
     }
 
+    /// The current key for a publication at `proposal_slot`, with the head's
+    /// post-state it was read from.
+    fn current_attributes_key(
+        &self,
+        preparation: &PayloadPreparation,
+        proposal_slot: Slot,
+    ) -> Option<(AttributesKey, Arc<BeaconState>)> {
+        let (_, head_root) = self.store.beacon_head()?;
+        let head_state = self.store.get_state(&head_root).ok()??;
+        let key = attributes_key(
+            &self.store,
+            preparation,
+            head_root,
+            &head_state,
+            proposal_slot,
+        );
+        Some((key, head_state))
+    }
+
     /// Start a worker for the next slot's attributes on the current head, if
-    /// [`should_prepare`] allows one and the slot's proposer is one this node
-    /// prepares for.
+    /// the moment allows one, the publisher
+    /// [`wants`](PayloadAttributesPublisher::wants) the current key, and the
+    /// slot's proposer is one this node prepares for.
     ///
-    /// Called at the lookahead point and after anything that can move the
-    /// head (the tick, an import, an envelope), so a head that moves after
-    /// the lookahead point is published again.
+    /// Called at the lookahead point and after anything that can change the
+    /// key: the tick, an import (a block, an envelope, or the columns a held
+    /// one waited for), a payload attestation, and proposer preferences.
     pub(crate) fn maybe_prepare_payload_attributes(&mut self, ctx: &Context<Self>) {
         if self.store.chain() != Chain::Beacon {
             return;
@@ -529,41 +690,33 @@ impl BlockChainServer {
         let Some(preparation) = self.payload_attributes.preparation.clone() else {
             return;
         };
-        let Some((_, head_root)) = self.store.beacon_head() else {
-            return;
-        };
         let current_slot = self.wall_clock_slot();
-        let slot_duration_ms = self.store.config().slot_duration_ms;
-        let ms_into_slot = self.ms_into_slot(current_slot).max(0) as u64;
-        let key = AttributesKey {
-            proposal_slot: current_slot + 1,
-            head_root,
-            payload_status: self.store.head_payload_status(),
+        let past_lookahead = || {
+            let ms_into_slot = self.ms_into_slot(current_slot).max(0) as u64;
+            Duration::from_millis(ms_into_slot)
+                >= lookahead_start(self.store.config().slot_duration_ms)
         };
-        let inputs = DecisionInputs {
-            has_subscribers: self.events.has_subscribers(),
-            syncing: self.sync_status.is_syncing(),
-            past_lookahead: Duration::from_millis(ms_into_slot)
-                >= lookahead_start(slot_duration_ms),
-            key,
-            published: self.payload_attributes.published,
-            in_flight: self.payload_attributes.in_flight,
-        };
-        if !should_prepare(&inputs) {
+        if !may_publish(
+            self.events.has_subscribers(),
+            self.sync_status.is_syncing(),
+            past_lookahead,
+        ) {
             return;
         }
-        let Ok(Some(head_state)) = self.store.get_state(&head_root) else {
+        let Some((key, head_state)) = self.current_attributes_key(&preparation, current_slot + 1)
+        else {
             return;
         };
+        if !self.payload_attributes.wants(key) {
+            return;
+        }
         // The cheap answer first: the head state's proposer lookahead names
         // the proposer without a state transition, so a slot nobody here
         // proposes costs no worker. When it cannot (a head epochs behind, or
         // one from before fulu), the worker decides on the advanced state.
         let wanted = preparation.always_prepare
-            || match lookahead_proposer(&head_state, key.proposal_slot) {
-                Some(proposer) => {
-                    prepared_fee_recipient(&preparation.fee_recipients, proposer).is_some()
-                }
+            || match key.proposer {
+                Some(_) => key.fee_recipient.is_some(),
                 None => !preparation
                     .fee_recipients
                     .lock()
@@ -585,6 +738,7 @@ impl BlockChainServer {
                 key.head_root,
                 &head_state,
                 key.proposal_slot,
+                key.build_on_full,
             );
             let _ = actor.send(PayloadAttributesComputed { key, result });
         });
@@ -600,23 +754,18 @@ impl Handler<PayloadAttributesCheck> for BlockChainServer {
 impl Handler<PayloadAttributesComputed> for BlockChainServer {
     async fn handle(&mut self, msg: PayloadAttributesComputed, ctx: &Context<Self>) {
         let PayloadAttributesComputed { key, result } = msg;
-        // A worker from an earlier slot that reports late (see
-        // `should_prepare`) clears nothing of the one running now.
-        let publisher = &mut self.payload_attributes;
-        if publisher.in_flight == Some(key) {
-            publisher.in_flight = None;
-        }
-        if publisher
-            .published
-            .is_none_or(|published| published.proposal_slot <= key.proposal_slot)
-        {
-            publisher.published = Some(key);
-        }
-        // Published only while it still describes the next slot's block on
-        // the current head; a stale one is dropped, and the re-check below
-        // starts the current head's.
+        // Published only while its key is still the one the node would
+        // publish now: the next slot's block, on the same head, payload
+        // branch, fee recipient and preferences. Anything else is dropped,
+        // and the re-check below starts the current key's worker.
         let current = self.wall_clock_slot() + 1 == key.proposal_slot
-            && self.store.beacon_head().map(|(_, root)| root) == Some(key.head_root);
+            && self
+                .payload_attributes
+                .preparation
+                .as_ref()
+                .and_then(|preparation| self.current_attributes_key(preparation, key.proposal_slot))
+                .is_some_and(|(now, _)| now == key);
+        let recheck = self.payload_attributes.finish(key, current, result.is_ok());
         match result {
             Ok(Some(event)) if current => {
                 debug!(
@@ -634,7 +783,9 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
                 "Computing payload attributes failed"
             ),
         }
-        self.maybe_prepare_payload_attributes(ctx);
+        if recheck {
+            self.maybe_prepare_payload_attributes(ctx);
+        }
     }
 }
 
@@ -707,12 +858,18 @@ mod tests {
             .unwrap()
             .insert(proposer, fee_recipient);
 
-        let event =
-            payload_attributes_event(&store, &preparation, head_root, &head_state, proposal_slot)
-                .unwrap()
-                .expect("the proposer is registered");
+        let event = payload_attributes_event(
+            &store,
+            &preparation,
+            head_root,
+            &head_state,
+            proposal_slot,
+            None,
+        )
+        .unwrap()
+        .expect("the proposer is registered");
 
-        assert_eq!(event.version, ForkName::Fulu);
+        assert_eq!(event.version, ForkName::Fulu.as_str());
         let expected = payload_attributes_v3(&inputs, fee_recipient, head_root);
         assert_eq!(
             event.data,
@@ -738,6 +895,7 @@ mod tests {
             head_root,
             &head_state,
             proposal_slot,
+            None,
         )
         .unwrap();
         assert_eq!(event, None);
@@ -748,6 +906,7 @@ mod tests {
             head_root,
             &head_state,
             proposal_slot,
+            None,
         )
         .unwrap()
         .expect("every slot is prepared");
@@ -788,9 +947,9 @@ mod tests {
 
     #[test]
     fn the_v3_event_serializes_as_the_beacon_api_names_it() {
-        let event = ChainEvent::BeaconPayloadAttributes(Box::new(PayloadAttributesEvent {
-            version: ForkName::Fulu,
-            data: PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
+        let event = ChainEvent::BeaconPayloadAttributes(Box::new(PayloadAttributesEvent::new(
+            ForkName::Fulu,
+            PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
                 proposer_index: 123,
                 proposal_slot: 10,
                 parent_block_number: 9,
@@ -809,7 +968,7 @@ mod tests {
                     parent_beacon_block_root: H256::repeat_byte(1),
                 },
             }),
-        }));
+        )));
         assert_eq!(event.topic(), crate::Topic::PayloadAttributes);
         let hex = |byte: u8, len: usize| format!("0x{}", format!("{byte:02x}").repeat(len));
         assert_eq!(
@@ -854,9 +1013,9 @@ mod tests {
             slot_number: 10,
             target_gas_limit: 60_000_000,
         };
-        let event = PayloadAttributesEvent {
-            version: ForkName::Gloas,
-            data: PayloadAttributesEventData::V4(PayloadAttributesEventV4 {
+        let event = PayloadAttributesEvent::new(
+            ForkName::Gloas,
+            PayloadAttributesEventData::V4(PayloadAttributesEventV4 {
                 proposer_index: 123,
                 proposal_slot: 10,
                 parent_block_root: H256::repeat_byte(1),
@@ -865,7 +1024,7 @@ mod tests {
                 finalized_block_hash: H256::repeat_byte(8),
                 payload_attributes: (&attributes).into(),
             }),
-        };
+        );
         let hex = |byte: u8| format!("0x{}", format!("{byte:02x}").repeat(32));
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
@@ -892,82 +1051,190 @@ mod tests {
         );
     }
 
+    /// On a fulu slot the key names the lookahead's proposer and its prepared
+    /// fee recipient, so a registration after the lookahead point is a new
+    /// key; the gloas-only fields stay empty.
+    #[test]
+    fn a_fulu_key_follows_the_proposers_registration() {
+        let (store, head_root, head_state) = fulu_store();
+        let proposal_slot = head_state.slot() + 1;
+        let preparation = preparation(false);
+        let before = attributes_key(&store, &preparation, head_root, &head_state, proposal_slot);
+        let proposer = lookahead_proposer(&head_state, proposal_slot).expect("in the lookahead");
+        assert_eq!(
+            before,
+            AttributesKey {
+                proposal_slot,
+                head_root,
+                proposer: Some(proposer),
+                fee_recipient: None,
+                build_on_full: None,
+                preferences: None,
+            }
+        );
+
+        let fee_recipient = ExecutionAddress::repeat_byte(0xab);
+        preparation
+            .fee_recipients
+            .lock()
+            .unwrap()
+            .insert(proposer, fee_recipient);
+        let after = attributes_key(&store, &preparation, head_root, &head_state, proposal_slot);
+        assert_eq!(after.fee_recipient, Some(fee_recipient));
+        assert_ne!(after, before);
+    }
+
     fn key(proposal_slot: Slot) -> AttributesKey {
         AttributesKey {
             proposal_slot,
             head_root: H256([7; 32]),
-            payload_status: None,
+            proposer: Some(3),
+            fee_recipient: Some(ExecutionAddress::repeat_byte(1)),
+            build_on_full: Some(true),
+            preferences: None,
         }
     }
 
-    fn inputs() -> DecisionInputs {
-        DecisionInputs {
-            has_subscribers: true,
-            syncing: false,
-            past_lookahead: true,
-            key: key(10),
+    /// A publisher whose last publication was for the previous slot.
+    fn idle_publisher() -> PayloadAttributesPublisher {
+        PayloadAttributesPublisher {
             published: Some(key(9)),
-            in_flight: None,
+            ..PayloadAttributesPublisher::default()
         }
     }
 
     #[test]
-    fn a_new_key_past_the_lookahead_is_prepared() {
-        assert!(should_prepare(&inputs()));
+    fn nothing_is_published_without_a_subscriber_while_syncing_or_early() {
+        assert!(may_publish(true, false, || true));
+        assert!(!may_publish(false, false, || true));
+        assert!(!may_publish(true, true, || true));
+        assert!(!may_publish(true, false, || false));
+        // The clock is not read once the subscriber check has answered.
+        assert!(!may_publish(false, false, || unreachable!()));
     }
 
     #[test]
-    fn nothing_is_prepared_without_a_subscriber_while_syncing_or_early() {
-        let mut i = inputs();
-        i.has_subscribers = false;
-        assert!(!should_prepare(&i));
-        let mut i = inputs();
-        i.syncing = true;
-        assert!(!should_prepare(&i));
-        let mut i = inputs();
-        i.past_lookahead = false;
-        assert!(!should_prepare(&i));
+    fn a_new_key_is_wanted_and_a_published_one_is_not() {
+        let mut publisher = idle_publisher();
+        assert!(publisher.wants(key(10)));
+        publisher.published = Some(key(10));
+        assert!(!publisher.wants(key(10)));
     }
 
+    /// Every input the event is built from that can change after the
+    /// lookahead point: the head, the parent payload branch (a payload
+    /// arriving, or the PTC voting it late), the proposer's preferences and
+    /// its prepared fee recipient.
     #[test]
-    fn a_key_already_published_is_not_prepared_again() {
-        let mut i = inputs();
-        i.published = Some(i.key);
-        assert!(!should_prepare(&i));
-    }
-
-    #[test]
-    fn a_new_head_or_payload_status_is_a_new_key() {
-        let mut i = inputs();
-        i.published = Some(AttributesKey {
-            head_root: H256([8; 32]),
-            ..i.key
-        });
-        assert!(should_prepare(&i));
-        i.published = Some(AttributesKey {
-            payload_status: Some(PayloadStatus::Empty),
-            ..i.key
-        });
-        assert!(should_prepare(&i));
+    fn any_changed_input_is_a_new_key() {
+        let publisher = PayloadAttributesPublisher {
+            published: Some(key(10)),
+            ..PayloadAttributesPublisher::default()
+        };
+        let changed = [
+            AttributesKey {
+                head_root: H256([8; 32]),
+                ..key(10)
+            },
+            AttributesKey {
+                build_on_full: Some(false),
+                ..key(10)
+            },
+            AttributesKey {
+                preferences: Some((ExecutionAddress::repeat_byte(2), 60_000_000)),
+                ..key(10)
+            },
+            AttributesKey {
+                fee_recipient: Some(ExecutionAddress::repeat_byte(2)),
+                ..key(10)
+            },
+        ];
+        for key in changed {
+            assert!(publisher.wants(key), "{key:?}");
+        }
     }
 
     #[test]
     fn a_running_worker_blocks_a_second_one_for_its_slot() {
-        let mut i = inputs();
-        i.in_flight = Some(key(10));
-        assert!(!should_prepare(&i));
-        i.in_flight = Some(AttributesKey {
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(10));
+        assert!(!publisher.wants(key(10)));
+        assert!(!publisher.wants(AttributesKey {
             head_root: H256([8; 32]),
             ..key(10)
-        });
-        assert!(!should_prepare(&i));
+        }));
     }
 
     #[test]
     fn a_worker_for_an_earlier_slot_does_not_block() {
-        let mut i = inputs();
-        i.in_flight = Some(key(9));
-        assert!(should_prepare(&i));
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(9));
+        assert!(publisher.wants(key(10)));
+    }
+
+    #[test]
+    fn a_current_result_is_published_and_rechecked() {
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(10));
+        assert!(publisher.finish(key(10), true, true));
+        assert_eq!(publisher.in_flight, None);
+        assert_eq!(publisher.published, Some(key(10)));
+        assert!(!publisher.wants(key(10)));
+    }
+
+    /// A worker whose key changed while it ran (the head's payload arrived,
+    /// say) is not recorded as published, and the re-check starts the
+    /// current key's worker.
+    #[test]
+    fn a_stale_result_is_dropped_and_the_current_key_rechecked() {
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(10));
+        assert!(publisher.finish(key(10), false, true));
+        assert_eq!(publisher.published, Some(key(9)));
+        assert!(publisher.wants(AttributesKey {
+            build_on_full: Some(false),
+            ..key(10)
+        }));
+        // And should the inputs swing back, the dropped key is not mistaken
+        // for one already published.
+        assert!(publisher.wants(key(10)));
+    }
+
+    /// A failure leaves its key wanted, for the next event that re-checks
+    /// rather than straight away, until [`MAX_ATTEMPTS`] workers failed on
+    /// it; a success clears the count.
+    #[test]
+    fn a_failed_key_is_retried_later_up_to_the_cap() {
+        let mut publisher = idle_publisher();
+        for attempt in 1..=MAX_ATTEMPTS {
+            assert!(publisher.wants(key(10)), "attempt {attempt}");
+            publisher.in_flight = Some(key(10));
+            assert!(!publisher.finish(key(10), true, false));
+            assert_eq!(publisher.published, Some(key(9)));
+        }
+        assert!(!publisher.wants(key(10)));
+        // Another key is not held back by this one's failures.
+        let other = AttributesKey {
+            head_root: H256([8; 32]),
+            ..key(10)
+        };
+        assert!(publisher.wants(other));
+        assert!(publisher.finish(other, true, true));
+        assert_eq!(publisher.failed, Some((key(10), MAX_ATTEMPTS)));
+
+        let mut publisher = idle_publisher();
+        publisher.finish(key(10), true, false);
+        publisher.finish(key(10), true, true);
+        assert_eq!(publisher.failed, None);
+        assert_eq!(publisher.published, Some(key(10)));
+    }
+
+    /// A worker that failed on a key no longer current gives way to the
+    /// current key at once.
+    #[test]
+    fn a_failure_on_a_stale_key_rechecks_at_once() {
+        let mut publisher = idle_publisher();
+        assert!(publisher.finish(key(10), false, false));
     }
 
     #[test]

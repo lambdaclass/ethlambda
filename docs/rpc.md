@@ -1093,7 +1093,7 @@ these are ever sent:
 | `execution_payload_bid` | `{"version":"gloas", "data":<SignedExecutionPayloadBid>}` | A bid passed the `execution_payload_bid` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_bids` |
 | `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
 | `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
-| `payload_attributes` | `{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}`; from gloas, `parent_block_number` is gone and `safe_block_hash`/`finalized_block_hash` are added | The next slot's attributes, a third of a slot before it, for a proposer registered through `prepare_beacon_proposer` (every proposer with `--always-prepare-payload`); again when the head moves after that point |
+| `payload_attributes` | `{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}`; from gloas, `parent_block_number` is gone and `safe_block_hash`/`finalized_block_hash` are added | The next slot's attributes, a third of a slot before it, for a proposer registered through `prepare_beacon_proposer` (every proposer with `--always-prepare-payload`); again when an input to them changes after that point (see below) |
 
 Never emitted: the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
@@ -1151,14 +1151,24 @@ How `payload_attributes` behaves:
   execution client for a block at `proposal_slot` on the current head, from
   the same code: the head state advanced to the slot, the fee recipient
   (gloas: the proposer's signed preferences, else `prepare_beacon_proposer`'s,
-  else the zero address), and on gloas the parent payload the head's payload
-  status selects and the preferences' gas target. `payload_attributes` is the
-  execution API's `PayloadAttributesV3` (`V4` from gloas) in `snake_case` with
-  quoted integers.
+  else the zero address), and on gloas the parent payload fork choice selects
+  (the head's payload status, and for a head at the previous slot the PTC's
+  votes on its payload) and the preferences' gas target. `payload_attributes`
+  is the execution API's `PayloadAttributesV3` (`V4` from gloas) in
+  `snake_case` with quoted integers.
 - **When**: at two thirds of each slot (Lighthouse's default
   `--prepare-payload-lookahead` of a third of a slot), then once more each time
-  the head, or on gloas its payload status, changes before the slot ends. Not
-  while the node is syncing, and only for slots at fulu or later.
+  an input to the attributes changes before the slot ends: the head; on gloas
+  the parent payload the proposal extends (the head's payload arriving, or the
+  PTC voting it late, which happens after the lookahead point) and the
+  proposer's signed preferences (from gossip or
+  `POST /eth/v1/validator/proposer_preferences`); and the fee recipient
+  `prepare_beacon_proposer` names, once something else re-checks. An event is
+  sent only while the inputs it was computed from are still current, so a
+  change while it is being computed replaces it rather than following it. A
+  computation that fails is retried at the next re-check, up to three times
+  for the same inputs. Not while the node is syncing, and only for slots at
+  fulu or later.
 - **For whom**: proposers some validator client named through
   `prepare_beacon_proposer` or a builder registration, or every proposer with
   `beacon --always-prepare-payload`, which an external builder reading this
