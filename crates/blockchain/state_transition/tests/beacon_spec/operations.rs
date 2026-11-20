@@ -336,6 +336,7 @@ fn run(
                         proposer,
                         committees,
                         &active_balances,
+                        None,
                         signatures,
                     )
                 })
@@ -351,6 +352,7 @@ fn run(
                         proposer,
                         committees,
                         &active_balances,
+                        None,
                         signatures,
                     )
                 })
@@ -367,6 +369,7 @@ fn run(
                         proposer,
                         committees,
                         &active_balances,
+                        None,
                         signatures,
                     )
                 })
@@ -386,6 +389,7 @@ fn run(
                     meta.parent_slot,
                     committees,
                     &active_balances,
+                    None,
                     signatures,
                 )
             }

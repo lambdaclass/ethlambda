@@ -72,6 +72,7 @@ use crate::beacon::helpers::gloas::{
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
@@ -146,6 +147,7 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
@@ -1380,6 +1382,7 @@ pub fn process_attestation(
     parent_slot: Slot,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
@@ -1521,10 +1524,13 @@ pub fn process_attestation(
                     })?;
             let had_no_participation = current_flags == 0;
 
-            // The attester's validator is read at most once, on the first
-            // flag it newly earns: each read is a tree descent, and the
-            // effective balance cannot change inside this read-only phase.
-            let mut attester_effective_balance: Option<Gwei> = None;
+            // The attester's validator is read at most once, on the first flag
+            // it newly earns: each read is a tree descent, and neither the
+            // effective balance nor `slashed` can change inside this read-only
+            // phase. Its reward increments are divided out once there too, and
+            // the effective balance and `slashed` kept beside them for the
+            // target-balance delta below.
+            let mut attester: Option<(Gwei, Gwei, bool)> = None;
             let mut new_flags: ParticipationFlags = 0;
             for &flag_index in &participation_flag_indices {
                 if has_flag(current_flags, flag_index) {
@@ -1532,15 +1538,17 @@ pub fn process_attestation(
                 }
                 new_flags = add_flag(new_flags, flag_index);
                 let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-                let effective_balance = match attester_effective_balance {
-                    Some(effective_balance) => effective_balance,
+                let (increments, _, _) = match attester {
+                    Some(attester) => attester,
                     None => {
-                        let effective_balance = state.validator(index)?.effective_balance;
-                        attester_effective_balance = Some(effective_balance);
-                        effective_balance
+                        let validator = state.validator(index)?;
+                        let effective_balance = validator.effective_balance;
+                        let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                        let read = (increments, effective_balance, validator.slashed);
+                        attester = Some(read);
+                        read
                     }
                 };
-                let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
                 let base_reward = increments.checked_mul(base_reward_per_increment).ok_or(
                     Error::ArithmeticOverflow("process_attestation: get_base_reward(state, index)"),
                 )?;
@@ -1553,6 +1561,15 @@ pub fn process_attestation(
                     Error::ArithmeticOverflow("process_attestation: proposer_reward_numerator"),
                 )?;
             }
+            if let Some(delta) = target_delta
+                && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+            {
+                // Earning the target flag means the loop above reached that
+                // flag and so read the attester.
+                let (_, effective_balance, slashed) =
+                    attester.expect("a newly earned flag read the attester");
+                delta.record_new_target(current_epoch_target, effective_balance, slashed);
+            }
             let will_set_new_flag = new_flags != 0;
 
             if will_set_new_flag
@@ -1561,8 +1578,8 @@ pub fn process_attestation(
                 && payment.withdrawal.amount > 0
             {
                 // `will_set_new_flag` means the loop above read it already.
-                let effective_balance = match attester_effective_balance {
-                    Some(effective_balance) => effective_balance,
+                let effective_balance = match attester {
+                    Some((_, effective_balance, _)) => effective_balance,
                     None => state.validator(index)?.effective_balance,
                 };
                 payment.weight = payment.weight.checked_add(effective_balance).ok_or(
@@ -1671,6 +1688,7 @@ pub fn process_payload_attestation(
 /// `assert len(body.deposits) == 0` unconditionally, with no `process_deposit`
 /// call at all: like fulu, gloas has no eth1-bridge deposit path left to
 /// drain (`crate::beacon::stf::fulu::process_operations`'s own doc explains why).
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &gloas::BeaconBlockBody,
@@ -1678,6 +1696,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     verify(
@@ -1738,6 +1757,7 @@ pub fn process_operations(
             parent_slot,
             committees,
             active_balances,
+            target_delta,
             signatures,
         )?;
     }
@@ -2053,6 +2073,7 @@ mod tests {
                     &config,
                     &committees,
                     &ActiveBalanceCache::default(),
+                    None,
                     s,
                 )
             });
