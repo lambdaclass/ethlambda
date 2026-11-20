@@ -59,6 +59,20 @@ pub mod quoted_u64 {
     }
 }
 
+/// An optional quoted 64-bit integer: absent (or `null`) is `None`. Used with
+/// `#[serde(default)]` so a field older nodes do not send is simply missing.
+pub mod quoted_u64_option {
+    use serde::{Deserialize as _, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| text.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 /// A list of 64-bit integers, each quoted, as `validator_sync_committee_indices`
 /// and `sync_committee_indices` carry them.
 pub mod quoted_u64_vec {
@@ -218,6 +232,12 @@ pub struct AttesterDutyDto {
     /// before PQ, where aggregators select themselves with a BLS proof.
     #[serde(default)]
     pub is_aggregator: Option<bool>,
+    /// A PQ aggregator's index in its aggregation committee, which staggers
+    /// its broadcast (`get_aggregate_due_ms(position)`, PQ `validator.md`).
+    /// Absent from a node that does not send it, which is read as the first
+    /// seat: the earliest time, and the one gloas-style nodes assume.
+    #[serde(default, with = "quoted_u64_option")]
+    pub aggregator_position: Option<u64>,
 }
 
 /// One proposer duty, from `GET /eth/v1/validator/duties/proposer/{epoch}`.
@@ -642,6 +662,11 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
             "PAYLOAD_ATTESTATION_DUE_BPS",
             &mut config.payload_attestation_due_bps,
         ),
+        // PQ's staggered aggregators. Absent keeps the specification's
+        // defaults (4000, 6000, 500).
+        ("AGGREGATION_CUTOFF_BPS", &mut config.aggregation_cutoff_bps),
+        ("AGGREGATE_DUE_BPS_PQ", &mut config.aggregate_due_bps_pq),
+        ("AGGREGATOR_DELAY_BPS", &mut config.aggregator_delay_bps),
     ] {
         if let Some(bps) = spec_u64(value, key)? {
             *field = bps;
@@ -1107,6 +1132,44 @@ mod tests {
         assert_eq!(config.aggregate_due_bps_gloas, 5_000);
         assert_eq!(config.payload_due_bps, 5_000);
         assert_eq!(config.payload_attestation_due_bps, 7_500);
+    }
+
+    #[test]
+    fn the_pq_aggregation_offsets_are_read_and_default_to_the_specification() {
+        let response = serde_json::json!({
+            "AGGREGATION_CUTOFF_BPS": "3000",
+            "AGGREGATE_DUE_BPS_PQ": "5500",
+            "AGGREGATOR_DELAY_BPS": "400",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.aggregation_cutoff_bps, 3_000);
+        assert_eq!(config.aggregate_due_bps_pq, 5_500);
+        assert_eq!(config.aggregator_delay_bps, 400);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.aggregation_cutoff_bps, 4_000);
+        assert_eq!(config.aggregate_due_bps_pq, 6_000);
+        assert_eq!(config.aggregator_delay_bps, 500);
+    }
+
+    #[test]
+    fn an_attester_dutys_aggregator_position_is_optional() {
+        let duty = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "pubkey": "0x00", "validator_index": "1", "committee_index": "2",
+                "committee_length": "3", "committees_at_slot": "4",
+                "validator_committee_index": "0", "slot": "5",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<AttesterDutyDto>(value).unwrap()
+        };
+        assert_eq!(duty(serde_json::json!({})).aggregator_position, None);
+        let seated = duty(serde_json::json!({"is_aggregator": true, "aggregator_position": "2"}));
+        assert_eq!(seated.is_aggregator, Some(true));
+        assert_eq!(seated.aggregator_position, Some(2));
     }
 
     /// A node that has not moved to the basis-point form keeps the defaults,

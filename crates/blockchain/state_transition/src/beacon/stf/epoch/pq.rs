@@ -1,6 +1,6 @@
 //! The PQ fork's epoch processing (consensus-specs
 //! `specs/_features/pq/beacon-chain.md`, on the `pq` branch at
-//! `a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`).
+//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
 //!
 //! Gloas's driver without `process_sync_committee_updates` (sync committees are
 //! gone), with [`process_aggregation_committee_window`] and

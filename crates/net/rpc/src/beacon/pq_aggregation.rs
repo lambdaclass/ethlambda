@@ -6,10 +6,16 @@
 //! request. So, as Lighthouse's PQ branch does, the node proves ahead: the
 //! validator client names the committees it aggregates for through
 //! `beacon_committee_subscriptions`, the node collects their validated votes'
-//! signatures ([`ethlambda_storage::pools::PqSignaturePool`]), and once a slot
-//! the task here seals that slot's signatures halfway between the
-//! attestation and aggregate deadlines and proves each committee's before the
-//! aggregate deadline, largest first. The endpoint then answers with what was
+//! signatures ([`ethlambda_storage::pools::PqSignaturePool`]), and proves
+//! each committee's at its aggregator's cutoff.
+//!
+//! The aggregators of a committee are staggered by their seat in its
+//! aggregation committee (PQ `validator.md`, "Construct aggregate"): the one
+//! at `position` stops collecting at `get_aggregation_cutoff_ms(position)` and
+//! broadcasts at `get_aggregate_due_ms(position)`. The task here wakes at
+//! each seat's cutoff in turn, proves what was collected for the committees
+//! one of this node's validators holds that seat in, and ends the slot's
+//! collection after the last seat's. The endpoint then answers with what was
 //! proved, and the aggregate also goes into the pool block production packs
 //! from, since gossip never hands a node its own messages.
 
@@ -17,8 +23,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ethlambda_state_transition::beacon::{
-    fork_choice::{get_attestation_due_ms, get_slot_component_duration_ms},
-    helpers::{accessors::CommitteeCacheExt as _, pq::get_attestation_statements},
+    fork_choice::{get_aggregation_cutoff_ms, get_pq_aggregate_due_ms},
+    helpers::{
+        accessors::CommitteeCacheExt as _,
+        pq::{get_aggregation_committee, get_attestation_statements},
+    },
 };
 use ethlambda_storage::{
     Store,
@@ -26,6 +35,7 @@ use ethlambda_storage::{
 };
 use ethlambda_types::beacon::{
     config::Config,
+    constants::AGGREGATORS_PER_COMMITTEE,
     containers::{BeaconState, pq},
     fork::ForkName,
     primitives::Slot,
@@ -36,8 +46,8 @@ use tracing::{debug, info, warn};
 
 use crate::beacon::validator::head;
 
-/// Start proving PQ aggregates once a slot, if the network schedules PQ.
-/// Stops with `shutdown`.
+/// Start proving PQ aggregates at every aggregator's cutoff, if the network
+/// schedules PQ. Stops with `shutdown`.
 pub(crate) fn spawn(store: Store, shutdown: CancellationToken) {
     let config = store.config();
     if config.fork_epoch(ForkName::Pq) == u64::MAX {
@@ -46,30 +56,51 @@ pub(crate) fn spawn(store: Store, shutdown: CancellationToken) {
     tokio::spawn(async move {
         loop {
             let slot = wall_slot(&config) + 1;
-            let cutoff = collection_cutoff_ms(&config, slot);
-            let wait = Duration::from_millis(cutoff.saturating_sub(now_ms()));
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(wait) => {}
+            for position in 0..AGGREGATORS_PER_COMMITTEE {
+                let cutoff =
+                    slot_start_ms(&config, slot) + get_aggregation_cutoff_ms(position, &config);
+                let wait = Duration::from_millis(cutoff.saturating_sub(now_ms()));
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+                if config.fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Pq {
+                    prove_seat(&store, &config, slot, position).await;
+                }
             }
-            if config.fork_at_epoch(compute_epoch_at_slot(slot)) != ForkName::Pq {
-                continue;
-            }
-            prove_slot(&store, &config, slot).await;
+            // The last seat's cutoff has passed: nothing more is collected.
+            store.pq_signature_pool().seal(slot);
         }
     });
 }
 
-/// Seal `slot`'s collected signatures and prove what the time to its
-/// aggregate deadline allows.
-async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
-    let groups = store.pq_signature_pool().seal(slot);
-    if groups.is_empty() {
+/// The committees of `slot` in which one of this node's aggregators holds
+/// seat `position` of the aggregation committee, as `state` names them.
+fn committees_at_seat(store: &Store, state: &BeaconState, slot: Slot, position: u64) -> Vec<u64> {
+    // Bound first, so the pool's lock is not held while committees are read.
+    let aggregators = store.pq_signature_pool().aggregators(slot);
+    aggregators
+        .into_iter()
+        .filter(|(committee, validators)| {
+            get_aggregation_committee(state, slot, *committee).is_ok_and(|members| {
+                members
+                    .get(position as usize)
+                    .is_some_and(|member| validators.contains(member))
+            })
+        })
+        .map(|(committee, _)| committee)
+        .collect()
+}
+
+/// Prove what `slot` collected for the committees whose aggregator at
+/// `position` is this node's, before that aggregator's broadcast time.
+async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
+    if store.pq_signature_pool().aggregators(slot).is_empty() {
         return;
     }
-    let deadline_ms = slot_start_ms(config, slot) + aggregate_due_ms(config, slot);
+    let deadline_ms = slot_start_ms(config, slot) + get_pq_aggregate_due_ms(position, config);
     let Some(budget) = deadline_ms.checked_sub(now_ms()).filter(|&left| left > 0) else {
-        warn!(%slot, "No time left to prove this slot's PQ aggregates");
+        warn!(%slot, position, "No time left to prove this seat's PQ aggregates");
         return;
     };
     let deadline = Instant::now() + Duration::from_millis(budget);
@@ -79,13 +110,17 @@ async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
             Ok((_, state)) => state,
             Err(_) => return,
         };
-        let mut groups = groups;
+        let committees = committees_at_seat(&store, &state, slot, position);
+        if committees.is_empty() {
+            return;
+        }
+        let mut groups = store.pq_signature_pool().collected(slot, &committees);
         // The larger groups first, in case not every one fits before the
         // deadline.
         groups.sort_by_key(|group| std::cmp::Reverse(group.signatures.len()));
         for group in groups {
             if Instant::now() >= deadline {
-                warn!(%slot, "The PQ aggregate deadline passed with committees left to prove");
+                warn!(%slot, position, "The PQ aggregate deadline passed with committees left to prove");
                 break;
             }
             let committee = group.committee_index;
@@ -95,6 +130,7 @@ async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
                     info!(
                         %slot,
                         committee,
+                        position,
                         attesters = aggregate.attesting_indices.len(),
                         proof_bytes = aggregate.proof.len(),
                         took_ms = started.elapsed().as_millis() as u64,
@@ -104,7 +140,7 @@ async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
                     store.pq_signature_pool().insert_proven(aggregate);
                 }
                 Ok(_) => {
-                    warn!(%slot, committee, "A PQ aggregate was proved after its deadline");
+                    warn!(%slot, committee, position, "A PQ aggregate was proved after its deadline");
                     break;
                 }
                 Err(err) => debug!(%slot, committee, %err, "Could not prove a PQ aggregate"),
@@ -189,38 +225,20 @@ fn wall_slot(config: &Config) -> Slot {
         / config.slot_duration_ms.max(1)
 }
 
-/// How far into `slot` its aggregates are due.
-fn aggregate_due_ms(config: &Config, slot: Slot) -> u64 {
-    let gloas_on = config.fork_at_epoch(compute_epoch_at_slot(slot)) >= ForkName::Gloas;
-    let basis_points = if gloas_on {
-        config.aggregate_due_bps_gloas
-    } else {
-        config.aggregate_due_bps
-    };
-    get_slot_component_duration_ms(basis_points, config)
-}
-
-/// When `slot`'s signatures stop being collected: halfway from the
-/// attestation deadline to the aggregate deadline.
-fn collection_cutoff_ms(config: &Config, slot: Slot) -> u64 {
-    let attestation_due = get_attestation_due_ms(compute_epoch_at_slot(slot), config);
-    let aggregate_due = aggregate_due_ms(config, slot);
-    let window = aggregate_due.saturating_sub(attestation_due);
-    slot_start_ms(config, slot) + attestation_due + window / 2
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn signatures_are_collected_until_halfway_to_the_aggregate_deadline() {
+    fn each_seat_proves_between_its_cutoff_and_its_broadcast() {
         let mut config = Config::mainnet();
         config.genesis_time = 100;
-        config.gloas_fork_epoch = 0;
-        // Gloas timing: attestations at 25% of 12 s, aggregates at 50%.
         assert_eq!(slot_start_ms(&config, 2), 100_000 + 24_000);
-        assert_eq!(aggregate_due_ms(&config, 2), 6_000);
-        assert_eq!(collection_cutoff_ms(&config, 2), 124_000 + 3_000 + 1_500);
+        for position in 0..AGGREGATORS_PER_COMMITTEE {
+            let cutoff = get_aggregation_cutoff_ms(position, &config);
+            let due = get_pq_aggregate_due_ms(position, &config);
+            // 2.4 s to prove on a 12 s slot, whatever the seat.
+            assert_eq!(due - cutoff, 2_400);
+        }
     }
 }

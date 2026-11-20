@@ -1,6 +1,6 @@
 //! Containers whose shape is specific to the PQ fork (consensus-specs
 //! `specs/_features/pq`, on the `pq` branch at
-//! `a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`).
+//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
 //!
 //! The fork replaces BLS with leanXMSS. Every signed container trades its
 //! `BLSSignature` for an [`XmssSignature`]; [`Attestation`] loses its signature
@@ -71,8 +71,8 @@ use crate::beacon::primitives::{
 /// committees take part in an attestation.
 pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT_PQ }>;
 
-/// A leaf of the tree under a validator's VRF root, then the leaf's Merkle
-/// branch: the PQ fork's RANDAO reveal.
+/// A secret committed to by a leaf of the tree under a validator's VRF root,
+/// then the leaf's Merkle branch: the PQ fork's RANDAO reveal.
 pub type VrfProof = SszVector<Bytes32, { VRF_TREE_DEPTH + 1 }>;
 
 /// A proof of the XMSS signatures of attestations. In the specification's
@@ -117,8 +117,8 @@ pub struct Validator {
     /// Every field but `vrf_root`, with `pubkey` as
     /// [`XmssPubkey::to_request_key`] of the validator's XMSS key.
     pub record: shared::Validator,
-    /// The root of the tree of per-slot secrets the validator's RANDAO reveals
-    /// open (`is_valid_vrf_proof`).
+    /// The root of the tree whose leaves commit to the per-slot secrets the
+    /// validator's RANDAO reveals disclose (`is_valid_vrf_proof`).
     pub vrf_root: Root,
 }
 

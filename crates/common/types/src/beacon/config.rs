@@ -434,6 +434,25 @@ pub struct Config {
     /// `compute_validators`).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub unregistered_validator_withdrawability_delay: Epoch,
+    /// PQ: basis points of [`Self::slot_duration_ms`] by which the first
+    /// aggregator of an aggregation committee stops collecting attestations
+    /// and starts proving its aggregate; each later one stops
+    /// [`Self::aggregator_delay_bps`] after the one before it
+    /// (`get_aggregation_cutoff_ms`).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregation_cutoff_bps: u64,
+    /// PQ: [`Self::aggregate_due_bps_gloas`]'s replacement, the basis points
+    /// by which the first aggregator of an aggregation committee broadcasts
+    /// its aggregate; later than gloas's, to leave time to prove one
+    /// (`get_aggregate_due_ms` modified in PQ).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregate_due_bps_pq: u64,
+    /// PQ: basis points of [`Self::slot_duration_ms`] between the cutoffs,
+    /// and between the broadcasts, of two aggregators next to each other in
+    /// an aggregation committee. Staggering them lets a later aggregator
+    /// skip an aggregate an earlier one already covered.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregator_delay_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -774,6 +793,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
             unregistered_validator_withdrawability_delay: 16_384,
+            aggregation_cutoff_bps: 4_000,
+            aggregate_due_bps_pq: 6_000,
+            aggregator_delay_bps: 500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -914,6 +936,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
             unregistered_validator_withdrawability_delay: 16_384,
+            aggregation_cutoff_bps: 4_000,
+            aggregate_due_bps_pq: 6_000,
+            aggregator_delay_bps: 500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -1302,6 +1327,31 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
         assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
         assert_eq!(config.max_request_payloads, 128);
+    }
+
+    #[test]
+    fn pq_timing_keys_are_claimed_and_parse() {
+        let yaml = "UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY: 8\n\
+                    AGGREGATION_CUTOFF_BPS: 3500\nAGGREGATE_DUE_BPS_PQ: 5500\n\
+                    AGGREGATOR_DELAY_BPS: 250\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.unregistered_validator_withdrawability_delay, 8);
+        assert_eq!(config.aggregation_cutoff_bps, 3_500);
+        assert_eq!(config.aggregate_due_bps_pq, 5_500);
+        assert_eq!(config.aggregator_delay_bps, 250);
+    }
+
+    /// consensus-specs' `test_config_invariants` for PQ: an aggregator stops
+    /// collecting before it broadcasts, and the last aggregator of a full
+    /// aggregation committee still broadcasts within the slot.
+    #[test]
+    fn pq_aggregation_timing_fits_the_slot() {
+        for config in [Config::mainnet(), Config::minimal()] {
+            assert!(config.aggregation_cutoff_bps < config.aggregate_due_bps_pq);
+            let last_delay =
+                (constants::AGGREGATORS_PER_COMMITTEE - 1) * config.aggregator_delay_bps;
+            assert!(config.aggregate_due_bps_pq + last_delay <= constants::BASIS_POINTS);
+        }
     }
 
     #[test]

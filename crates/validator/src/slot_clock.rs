@@ -88,6 +88,11 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
+    /// Whether `slot` is a PQ slot.
+    pub fn is_pq(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Pq
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -154,13 +159,30 @@ impl SlotClock {
     /// After the attester offset on every network the specification ships,
     /// necessarily: an aggregator folds together votes its beacon node has
     /// collected, and before the attesters have voted there is nothing to fold.
+    ///
+    /// At a PQ slot this is the first aggregator seat's time; a later seat
+    /// waits further, until [`Self::pq_aggregation_time`] for its position.
     pub fn aggregation_time(&self, slot: Slot) -> SystemTime {
+        if self.is_pq(slot) {
+            return self.pq_aggregation_time(slot, 0);
+        }
         let bps = if self.is_gloas(slot) {
             self.config.aggregate_due_bps_gloas
         } else {
             self.config.aggregate_due_bps
         };
         self.offset_into(slot, bps)
+    }
+
+    /// When the PQ aggregator at `position` in its aggregation committee
+    /// broadcasts for `slot`: PQ's `get_aggregate_due_ms(position)`, the first
+    /// seat's offset plus `position` aggregator delays, each rounded down to
+    /// a millisecond on its own as the specification rounds them.
+    pub fn pq_aggregation_time(&self, slot: Slot, position: u64) -> SystemTime {
+        let component = |bps: u64| bps.saturating_mul(self.slot_duration_ms) / BASIS_POINTS;
+        let offset_ms = component(self.config.aggregate_due_bps_pq)
+            .saturating_add(position.saturating_mul(component(self.config.aggregator_delay_bps)));
+        self.start_of(slot) + Duration::from_millis(offset_ms)
     }
 
     /// When the sync committee message for `slot` is signed.
@@ -372,6 +394,27 @@ mod tests {
 
     fn at(offset_secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(GENESIS + offset_secs)
+    }
+
+    /// PQ `validator.md`'s 12-second example: the seats broadcast at 7.2,
+    /// 7.8, 8.4 and 9.0 s, and a PQ slot's aggregation duty wakes for the
+    /// first.
+    #[test]
+    fn pq_aggregators_broadcast_staggered_by_their_seat() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Pq, 1);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let slot = SLOTS_PER_EPOCH + 2;
+        assert!(clock.is_pq(slot) && !clock.is_pq(slot - SLOTS_PER_EPOCH));
+        for (position, offset_ms) in [(0, 7_200), (1, 7_800), (2, 8_400), (3, 9_000)] {
+            assert_eq!(
+                clock.pq_aggregation_time(slot, position),
+                clock.start_of(slot) + Duration::from_millis(offset_ms)
+            );
+        }
+        assert_eq!(
+            clock.aggregation_time(slot),
+            clock.pq_aggregation_time(slot, 0)
+        );
     }
 
     #[test]

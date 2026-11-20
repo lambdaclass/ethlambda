@@ -675,11 +675,23 @@ async fn get_aggregate_attestation(
     crate::shared::content::with_consensus_version(response, fork)
 }
 
+/// The 404 [`get_pq_aggregate`] answers for an aggregate it will not hand
+/// out to be broadcast. The validator client reads any 404 here as nothing
+/// to publish.
+const PQ_AGGREGATE_ALREADY_COVERED: &str =
+    "an aggregate already broadcast for this committee covers every attester of this one";
+
 /// [`get_aggregate_attestation`] at a PQ slot: the committee's aggregate
 /// this node proved from the votes it collected for its aggregators (see
 /// [`crate::beacon::pq_aggregation`]), with its proof. A request racing the
-/// proof waits for it until the slot's signatures are sealed and proved, for
-/// at most a few seconds; a 404 when there is none.
+/// proof waits for it, for at most a few seconds; a 404 when there is none.
+///
+/// Also a 404 when an aggregate already broadcast for the same vote and
+/// committee, by another aggregator or an earlier one of this node, includes
+/// every attester of this one: PQ `validator.md`'s
+/// `should_broadcast_aggregate` answers no, since gossip would ignore it. The
+/// validator client asks at its aggregator's own broadcast time, so the
+/// answer is the one that time calls for.
 async fn get_pq_aggregate(store: &Store, query: &AggregateQuery, headers: &HeaderMap) -> Response {
     use ethlambda_types::beacon::containers::pq;
     use libssz::SszEncode as _;
@@ -705,6 +717,15 @@ async fn get_pq_aggregate(store: &Store, query: &AggregateQuery, headers: &Heade
     };
     if let Err(err) = require_validated(store, aggregate.attestation.data.beacon_block_root) {
         return err.into_response();
+    }
+    let covered = store.pq_signature_pool().is_covered(
+        query.slot,
+        query.attestation_data_root,
+        query.committee_index,
+        &aggregate.attesting_indices,
+    );
+    if covered {
+        return ApiError::NotFound(PQ_AGGREGATE_ALREADY_COVERED).into_response();
     }
     let answer = pq::ProvenAggregate {
         aggregate: aggregate.attestation.clone(),

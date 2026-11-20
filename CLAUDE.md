@@ -871,7 +871,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
-  `a4d16c5b`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
+  `b5d422b2`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
   and PQ's gossip rules (`gossip/pq.rs`, `p2p/src/beacon/pq.rs`: a PQ digest's
@@ -883,10 +883,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (storage decodes one by its slot's fork, req/resp by the chunk's context
   bytes, the engine gets each fork's typed requests list). It was run next to
   Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`),
-  with its own validators: the validator client derives each validator's
-  leanXMSS key and VRF tree from its BLS key (`ethlambda_crypto::pq_keys`) and
-  attests, aggregates, casts PTC votes and proposes, each signature at its
-  leaf. The beacon node builds PQ blocks through `POST
+  with its own validators (before `b5d422b2` changed the VRF tree, which no
+  other client's tooling follows yet): the validator client derives each
+  validator's leanXMSS key and VRF seed from its BLS key
+  (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
+  in the aggregation committee), casts PTC votes and proposes, each signature
+  at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
+  `2^31` leaves, each committing to its slot's secret) takes about 100 s of
+  every core per key, so a background thread hashes it after startup and
+  stores its upper nodes in `<validators-dir>/pq_vrf_trees/`; a proposal
+  before its key's tree is ready is missed. The beacon node builds PQ blocks through `POST
   /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
   `pq_block_production.rs`), packing attestations from the validated
   aggregates in `Store::pq_aggregate_pool` with their proofs merged on the
@@ -1190,8 +1196,9 @@ behavior.
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
 - `DB_VERSION` is 8: `Config` gained the EIP-8483 and PQ fork versions and
-  epochs, `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
-  `ATTESTATION_SUBNET_COUNT_PQ`, so a version 7
+  epochs, `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, PQ's aggregation
+  timing (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`,
+  `AGGREGATOR_DELAY_BPS`) and `ATTESTATION_SUBNET_COUNT_PQ`, so a version 7
   directory's stored config decodes into the wrong fields. (7 moved `States`
   and `StateDiffs` from root keys to slot||root keys, the block's slot looked
   up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can

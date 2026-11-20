@@ -7,6 +7,16 @@
 //! translates between a validator's BLS key and the form the PQ registry names
 //! it by, and signs at the leaf each message is assigned.
 //!
+//! **The VRF tree.** The specification's tree has a leaf for each of `2^31`
+//! slots, and every one must be hashed to reach the root a validator
+//! registered: minutes of every core per key (`ethlambda_crypto::vrf`). Only
+//! proposing needs it, so a key is registered and attests without one, and
+//! [`prepare_vrf_tree`] hashes each tree afterwards, off the duty path. A
+//! proposal that falls before its key's tree is ready is missed. The nodes a
+//! tree keeps (1 MiB, commitments only) are written under
+//! [`VRF_TREE_DIRECTORY`] in the validators directory, so a tree is hashed
+//! once per key, not once per start.
+//!
 //! **The registry's form.** A PQ state names each validator by its 32-byte
 //! XMSS key in the 48-byte form an execution-layer request names one: 16 zero
 //! bytes, then the key. Duty responses carry that form, and no BLS key starts
@@ -25,23 +35,31 @@
 //! different message at one of those leaves.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use ethlambda_crypto::{lean_xmss, pq_keys};
+use ethlambda_crypto::{lean_xmss, pq_keys, vrf};
 use ethlambda_types::beacon::constants::{
     XMSS_ATTESTATION_LEAVES, XMSS_BUILDER_BID_LEAVES, XMSS_LEAVES_PER_SLOT, XMSS_RESERVED_LEAVES,
 };
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, XmssSignature};
+use tracing::warn;
 
 pub use ethlambda_types::beacon::constants::{
     LEAF_OFFSET_AGGREGATE_AND_PROOF, LEAF_OFFSET_BEACON_PROPOSER,
     LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE, LEAF_OFFSET_PTC_ATTESTER,
 };
 
+/// The directory under the validators directory that holds each key's VRF
+/// tree nodes, one file per validator, named by its BLS public key.
+pub const VRF_TREE_DIRECTORY: &str = "pq_vrf_trees";
+
 /// A validator's PQ key material.
 pub struct PqKey {
     xmss: lean_xmss::SecretKey,
-    vrf: pq_keys::VrfTree,
+    vrf_seed: vrf::Node,
+    /// Empty until [`prepare_vrf_tree`] has read or hashed the tree.
+    vrf: OnceLock<vrf::VrfTree>,
     /// The 48-byte form the PQ registry names the validator by.
     pub request_key: [u8; 48],
 }
@@ -65,12 +83,13 @@ fn signed_leaves() -> &'static Mutex<HashMap<(BlsPubkey, u64), Root>> {
 /// Derives and registers the PQ key of the validator whose BLS key is
 /// `pubkey` and secret key `secret` (32 bytes, big-endian, as a keystore
 /// holds it). Slow: a leanXMSS key generation (about a second and a half
-/// across cores) and a VRF tree (two million hashes), plus building the
-/// bottom trees its next attestation and per-slot signatures fall in. Run it
-/// off the async runtime.
+/// across cores), plus building the bottom trees its next attestation and
+/// per-slot signatures fall in. Run it off the async runtime.
+///
+/// The key signs from here on. Its VRF tree, which only a proposal reads, is
+/// [`prepare_vrf_tree`]'s to supply.
 pub fn derive_and_register(pubkey: BlsPubkey, secret: &[u8; 32], current_slot: Slot) {
     let xmss = pq_keys::xmss_key(secret);
-    let vrf = pq_keys::VrfTree::from_bls(secret);
     let mut request_key = [0u8; 48];
     request_key[16..].copy_from_slice(&xmss.public_key().to_bytes());
     // Warm the two bottom trees duties sign in, so the first signature of each
@@ -80,7 +99,8 @@ pub fn derive_and_register(pubkey: BlsPubkey, secret: &[u8; 32], current_slot: S
     let _ = xmss.prepare(slot_leaf(current_slot, 0) as u32);
     let key = Arc::new(PqKey {
         xmss,
-        vrf,
+        vrf_seed: pq_keys::vrf_seed(secret),
+        vrf: OnceLock::new(),
         request_key,
     });
     let mut registry = registry().write().expect("PQ key registry poisoned");
@@ -147,6 +167,83 @@ pub enum PqSignError {
     LeafUsed(u64),
     #[error("leanXMSS: {0:?}")]
     Sign(lean_xmss::SignError),
+    #[error("the VRF tree is still being hashed")]
+    VrfTreeNotReady,
+    #[error("slot {0} is past the VRF tree's last leaf")]
+    SlotPastVrfTree(Slot),
+}
+
+/// Where [`prepare_vrf_tree`] got a key's VRF tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrfTreeSource {
+    /// Already in memory.
+    Held,
+    /// Read from the key's file under [`VRF_TREE_DIRECTORY`].
+    Stored,
+    /// Hashed in full, and written for the next start.
+    Hashed,
+}
+
+fn vrf_tree_path(validators_dir: &Path, pubkey: &BlsPubkey) -> PathBuf {
+    validators_dir
+        .join(VRF_TREE_DIRECTORY)
+        .join(format!("0x{}.bin", hex::encode(pubkey.0)))
+}
+
+/// The tree stored at `path`, if the file is `vrf_seed`'s tree, whole. A
+/// missing file is the ordinary first start; any other failure is logged, and
+/// either way the caller hashes the tree.
+fn stored_vrf_tree(path: &Path, vrf_seed: vrf::Node) -> Option<vrf::VrfTree> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn!(path = %path.display(), %err, "Could not read a stored VRF tree; hashing it again");
+            return None;
+        }
+    };
+    vrf::VrfTree::from_bytes(vrf_seed, &bytes)
+        .inspect_err(|err| {
+            warn!(path = %path.display(), %err, "A stored VRF tree is unusable; hashing it again")
+        })
+        .ok()
+}
+
+/// Gives `pubkey`'s registered key its VRF tree: the one stored under
+/// `validators_dir` if there is one, else hashed in full and stored. `None`
+/// for a key that is not registered.
+///
+/// Blocking, for minutes when it hashes, on every core (rayon's pool): run it
+/// off the async runtime and one key at a time. A tree that cannot be stored
+/// is still used; it is hashed again at the next start.
+pub fn prepare_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<VrfTreeSource> {
+    let key = key(pubkey)?;
+    if key.vrf.get().is_some() {
+        return Some(VrfTreeSource::Held);
+    }
+    let path = vrf_tree_path(validators_dir, pubkey);
+    let (tree, source) = match stored_vrf_tree(&path, key.vrf_seed) {
+        Some(tree) => (tree, VrfTreeSource::Stored),
+        None => {
+            let tree = vrf::VrfTree::build(key.vrf_seed);
+            let stored = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .map_err(|err| err.to_string())
+                .and_then(|()| {
+                    crate::secure_fs::write_private_durably(&path, tree.to_bytes())
+                        .map_err(|err| err.to_string())
+                });
+            if let Err(err) = stored {
+                warn!(path = %path.display(), %err, "Could not store a VRF tree; it will be hashed again at the next start");
+            }
+            (tree, VrfTreeSource::Hashed)
+        }
+    };
+    // A concurrent call for the same key hashed the same tree: either copy
+    // serves.
+    let _ = key.vrf.set(tree);
+    Some(source)
 }
 
 /// Signs `root` at `leaf` with `pubkey`'s leanXMSS key. Refuses a leaf this
@@ -177,10 +274,14 @@ pub fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, 
     Ok(XmssSignature(bytes))
 }
 
-/// `pubkey`'s VRF proof for `slot`, its RANDAO reveal at PQ.
+/// `pubkey`'s VRF proof for `slot`, its RANDAO reveal at PQ
+/// (`compute_vrf_proof`): the slot's secret, then its leaf's branch. Blocking
+/// for the tens of milliseconds one subtree takes to hash.
 pub fn vrf_proof(pubkey: &BlsPubkey, slot: Slot) -> Result<Vec<Root>, PqSignError> {
     let key = key(pubkey).ok_or(PqSignError::UnknownValidator)?;
-    Ok(key.vrf.proof(slot).into_iter().map(Root::from).collect())
+    let tree = key.vrf.get().ok_or(PqSignError::VrfTreeNotReady)?;
+    let proof = tree.proof(slot).ok_or(PqSignError::SlotPastVrfTree(slot))?;
+    Ok(proof.into_iter().map(Root::from).collect())
 }
 
 #[cfg(test)]
@@ -220,6 +321,93 @@ mod tests {
         ));
         let public = request[16..].try_into().unwrap();
         assert!(lean_xmss::verify(&public, leaf, &[1; 32], &first.0));
-        assert_eq!(vrf_proof(&pubkey, 5).unwrap().len(), 32);
+    }
+
+    /// The bytes of a tree for `vrf_seed` that `from_bytes` accepts. A whole
+    /// tree takes minutes to hash, so the nodes past the first are arbitrary:
+    /// the file's own checks do not rehash them, and its proofs fold to the
+    /// root those nodes give.
+    fn stand_in_tree_bytes(vrf_seed: vrf::Node) -> Vec<u8> {
+        let mut nodes = vec![[7u8; 32]; 1 << 15];
+        nodes[0] = vrf::compute_vrf_node(&vrf_seed, 16, 0);
+        let mut layer = nodes.clone();
+        while layer.len() > 1 {
+            layer = layer
+                .chunks_exact(2)
+                .map(|pair| {
+                    use sha3::Digest as _;
+                    let mut hasher = sha3::Keccak256::new();
+                    hasher.update(pair[0]);
+                    hasher.update(pair[1]);
+                    hasher.finalize().into()
+                })
+                .collect();
+        }
+        let mut bytes = nodes.concat();
+        bytes.extend_from_slice(&layer[0]);
+        bytes
+    }
+
+    #[test]
+    fn a_key_signs_before_its_vrf_tree_and_proves_once_it_is_stored() {
+        let secret = [8u8; 32];
+        let pubkey = BlsPubkey([10; 48]);
+        derive_and_register(pubkey, &secret, 0);
+        // Registered and signing, with no tree yet: a proposal is refused.
+        assert!(sign(&pubkey, attestation_leaf(0), Root::from([1; 32])).is_ok());
+        assert!(matches!(
+            vrf_proof(&pubkey, 5),
+            Err(PqSignError::VrfTreeNotReady)
+        ));
+
+        // A stored tree is read back instead of hashed.
+        let directory = tempfile::tempdir().unwrap();
+        let path = vrf_tree_path(directory.path(), &pubkey);
+        let vrf_seed = pq_keys::vrf_seed(&secret);
+        let bytes = stand_in_tree_bytes(vrf_seed);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            prepare_vrf_tree(&pubkey, directory.path()),
+            Some(VrfTreeSource::Stored)
+        );
+        assert_eq!(
+            prepare_vrf_tree(&pubkey, directory.path()),
+            Some(VrfTreeSource::Held)
+        );
+
+        let proof = vrf_proof(&pubkey, 5).unwrap();
+        assert_eq!(proof.len(), 32);
+        assert_eq!(proof[0].0, vrf::compute_vrf_secret(&vrf_seed, 5));
+        let branch = proof[1..].iter().map(|node| &node.0);
+        let root: [u8; 32] = bytes[bytes.len() - 32..].try_into().unwrap();
+        assert_eq!(vrf::fold_vrf_branch(&proof[0].0, branch, 5), root);
+        assert!(matches!(
+            vrf_proof(&pubkey, 1 << 31),
+            Err(PqSignError::SlotPastVrfTree(_))
+        ));
+        assert_eq!(
+            prepare_vrf_tree(&BlsPubkey([11; 48]), directory.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stored_vrf_tree_of_another_seed_or_a_damaged_one_is_not_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tree.bin");
+        assert!(stored_vrf_tree(&path, [1; 32]).is_none());
+
+        let bytes = stand_in_tree_bytes([1; 32]);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(stored_vrf_tree(&path, [1; 32]).is_some());
+        assert!(stored_vrf_tree(&path, [2; 32]).is_none());
+
+        let mut damaged = bytes.clone();
+        damaged[40_000] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        assert!(stored_vrf_tree(&path, [1; 32]).is_none());
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(stored_vrf_tree(&path, [1; 32]).is_none());
     }
 }
