@@ -25,7 +25,7 @@
 //! caches two new blob-gas fields for EIP-4844, and [`process_voluntary_exit`]
 //! signs under a fixed fork version for EIP-7044.
 
-use crate::beacon::bls;
+use crate::beacon::bls::SignatureSet;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::capella::SignedBLSToExecutionChange;
@@ -41,7 +41,9 @@ use crate::beacon::helpers::accessors::{
     get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
-use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::beacon::helpers::attestation::{
+    get_indexed_attestation, indexed_attestation_signature_set,
+};
 use crate::beacon::helpers::math::integer_squareroot;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{
@@ -52,6 +54,7 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
 
 use super::{BlockCaches, ExecutionEngine};
 
@@ -72,6 +75,7 @@ use super::{BlockCaches, ExecutionEngine};
 /// [`super::operations::process_operations`] has no fork check of its own to
 /// hang them on. See [`process_operations`]'s own documentation for why that
 /// is a full copy of the loop rather than a smaller patch.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &deneb::BeaconBlock,
@@ -79,6 +83,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -95,7 +100,7 @@ pub fn process_block(
         config,
         engine,
     )?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -108,12 +113,14 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
         caches.active_balances,
         caches.pubkey_indices,
+        signatures,
     )?;
     Ok(())
 }
@@ -156,6 +163,7 @@ fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -175,6 +183,7 @@ fn process_operations(
             proposer_slashing,
             config,
             active_balances,
+            signatures,
         )?;
     }
     for attester_slashing in attester_slashings {
@@ -183,6 +192,7 @@ fn process_operations(
             attester_slashing,
             config,
             active_balances,
+            signatures,
         )?;
     }
     // One proposer lookup for the list, not one per attestation: see the same
@@ -196,6 +206,7 @@ fn process_operations(
                 proposer_index,
                 committees,
                 active_balances,
+                signatures,
             )?;
         }
     }
@@ -203,10 +214,10 @@ fn process_operations(
         super::operations::process_deposit(state, deposit, config)?;
     }
     for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config)?;
+        process_voluntary_exit(state, voluntary_exit, config, signatures)?;
     }
     for signed_change in bls_to_execution_changes {
-        super::capella::process_bls_to_execution_change(state, signed_change, config)?;
+        super::capella::process_bls_to_execution_change(state, signed_change, config, signatures)?;
     }
 
     Ok(())
@@ -317,6 +328,7 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -366,8 +378,8 @@ pub fn process_attestation(
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -689,6 +701,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -725,14 +738,16 @@ pub fn process_voluntary_exit(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
-    verify(
-        bls::verify(
+    signatures.push(
+        SignatureSet::single(
             &validator.pubkey,
             signing_root,
             &signed_voluntary_exit.signature,
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
     Ok(())
