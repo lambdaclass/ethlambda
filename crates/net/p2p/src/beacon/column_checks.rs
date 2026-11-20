@@ -9,9 +9,9 @@
 //! - a gossiped sidecar reported `Queue` or `Ignore(Overloaded)`, whose
 //!   stateful checks stopped early or never ran;
 //! - every `DataColumnsByRoot` and `DataColumnsByRange` answer;
-//! - sidecars the chain actor had parked, handed back once the block they
-//!   wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
-//!   sidecar's parent, a gloas sidecar's own block.
+//! - sidecars the chain actor was told to hold, handed back once the block
+//!   they wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a
+//!   fulu sidecar's parent, a gloas sidecar's own block.
 //!
 //! The sidecars of one call are grouped by the block they belong to, each
 //! `(block, index)` once ([`group_by_block`]), and each group is checked in
@@ -69,6 +69,7 @@ use ethlambda_state_transition::beacon::gossip::column::{
 };
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_storage::Store;
+use ethlambda_telemetry::BlockEvent;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::primitives::Root;
 use ethlambda_types::time::unix_now_ms;
@@ -76,6 +77,123 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
 use crate::{P2PServer, metrics};
+
+/// How a batch of sidecars reached [`check_and_forward`], for the telemetry
+/// rows (`docs/telemetry.md`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ColumnArrival {
+    /// Sidecars that just reached this node.
+    Received {
+        /// The rows' `source`: how they reached this node.
+        source: &'static str,
+        /// When they arrived. For a by-root or by-range answer this is when
+        /// the whole answer was delivered to the handler, so every sidecar in
+        /// it shares one instant.
+        at: Instant,
+    },
+    /// Sidecars judged to wait for their block, handed back once it imports:
+    /// their arrival was written then, so only their validation is new.
+    Recheck,
+}
+
+impl ColumnArrival {
+    pub(crate) fn received(source: &'static str, at: Instant) -> Self {
+        Self::Received { source, at }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            Self::Received { source, .. } => source,
+            Self::Recheck => "recheck",
+        }
+    }
+}
+
+/// One `block_events` row for `sidecar` of the block `block_root`: the one
+/// place its fields are named.
+fn column_event(
+    stage: &'static str,
+    sidecar: &DataColumnSidecar,
+    block_root: [u8; 32],
+    source: &'static str,
+    at: Instant,
+) -> BlockEvent {
+    BlockEvent {
+        stage,
+        at,
+        slot: sidecar.slot(),
+        block_root,
+        source,
+        verdict: None,
+        column_index: Some(sidecar.index()),
+    }
+}
+
+/// The rows of a sidecar that passed validation at `validated_at`: its arrival
+/// (unless it is a re-check) and its validation. Gossip-accepted columns and
+/// this node's own columns call this directly, as they need no check of their
+/// own.
+///
+/// Computes the sidecar's block root (a header hash for fulu); a caller that
+/// already knows it, or writes many columns of one block, uses
+/// [`passed_rows_under`].
+pub(crate) fn passed_rows(
+    sidecar: &DataColumnSidecar,
+    arrival: ColumnArrival,
+    validated_at: Instant,
+) -> Vec<BlockEvent> {
+    passed_rows_under(sidecar, sidecar.block_root().0, arrival, validated_at)
+}
+
+/// [`passed_rows`] for a sidecar whose block root is already known.
+pub(crate) fn passed_rows_under(
+    sidecar: &DataColumnSidecar,
+    block_root: [u8; 32],
+    arrival: ColumnArrival,
+    validated_at: Instant,
+) -> Vec<BlockEvent> {
+    let validated = column_event(
+        "column_validated",
+        sidecar,
+        block_root,
+        arrival.source(),
+        validated_at,
+    );
+    match arrival {
+        ColumnArrival::Received { at, .. } => vec![
+            BlockEvent {
+                stage: "column_recv",
+                at,
+                ..validated
+            },
+            validated,
+        ],
+        ColumnArrival::Recheck => vec![validated],
+    }
+}
+
+/// The rows one checked sidecar writes (see [`check_and_forward`]): its
+/// arrival unless already written, and its validation once kept. A dropped
+/// sidecar writes none, as Silver records a column only once it passed
+/// validation.
+pub(crate) fn column_rows(
+    sidecar: &DataColumnSidecar,
+    arrival: ColumnArrival,
+    verdict: ChainVerdict,
+    checked_at: Instant,
+) -> Vec<BlockEvent> {
+    match verdict {
+        ChainVerdict::Keep => passed_rows(sidecar, arrival, checked_at),
+        ChainVerdict::AwaitParent => match arrival {
+            ColumnArrival::Received { source, at } => {
+                let root = sidecar.block_root().0;
+                vec![column_event("column_recv", sidecar, root, source, at)]
+            }
+            ColumnArrival::Recheck => Vec::new(),
+        },
+        ChainVerdict::Drop(_) => Vec::new(),
+    }
+}
 
 /// What the checks made of one fetched sidecar, as the lookup that asked for
 /// it needs to know: whether its column is now here, and whether the peer that
@@ -315,10 +433,14 @@ fn sub_batches<T>(items: Vec<T>) -> Vec<Vec<T>> {
 /// the proofs are the last rule on the chain path, so running the other rules
 /// first and the proofs afterwards, batched, changes nothing but how the
 /// proofs are paid for.
+///
+/// Writes the `block_events` rows of each sidecar this settles
+/// ([`column_rows`]) as soon as it is judged.
 fn precheck_group(
     store: &Store,
     sidecars: Vec<DataColumnSidecar>,
     now_ms: u64,
+    arrival: ColumnArrival,
 ) -> (GroupVerdicts, Vec<Pending>) {
     let mut settled = GroupVerdicts::default();
     let mut pending = Vec::new();
@@ -332,26 +454,38 @@ fn precheck_group(
         // sidecar for it as `internal` without unwinding, remembering nothing
         // either.
         let precheck = catch_unwind(AssertUnwindSafe(|| prechecks.check(&sidecar)));
-        match precheck {
-            Ok(Ok(kzg)) => pending.push((sidecar, kzg)),
-            Ok(Err(verdict)) => settled.record(sidecar, verdict),
+        let verdict = match precheck {
+            Ok(Ok(kzg)) => {
+                pending.push((sidecar, kzg));
+                continue;
+            }
+            Ok(Err(verdict)) => verdict,
             Err(_) => {
                 error!("A data column check panicked; dropping the sidecar");
-                let internal = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal));
-                settled.record(sidecar, internal);
+                ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal))
             }
-        }
+        };
+        let checked_at = Instant::now();
+        ethlambda_telemetry::emit(|| column_rows(&sidecar, arrival, verdict, checked_at));
+        settled.record(sidecar, verdict);
     }
     (settled, pending)
 }
 
 /// The second stage, for one sub-batch: its sidecars' KZG proofs in one
 /// batch, each re-verified alone if the batch fails ([`column::kzg_verdicts`]).
-fn verify_batch(batch: Vec<Pending>) -> GroupVerdicts {
+///
+/// Writes each sidecar's `block_events` rows ([`column_rows`]), stamped with
+/// the moment the sub-batch's verdicts were in: a kept sidecar's
+/// `column_validated` is when its sub-batch finished, not when the block's
+/// last one did.
+fn verify_batch(batch: Vec<Pending>, arrival: ColumnArrival) -> GroupVerdicts {
     let items: Vec<_> = batch.iter().map(|(sidecar, kzg)| (sidecar, kzg)).collect();
     let kzg_verdicts = column::kzg_verdicts(&items);
+    let checked_at = Instant::now();
     let mut verdicts = GroupVerdicts::default();
     for ((sidecar, _), verdict) in batch.into_iter().zip(kzg_verdicts) {
+        ethlambda_telemetry::emit(|| column_rows(&sidecar, arrival, verdict, checked_at));
         verdicts.record(sidecar, verdict);
     }
     verdicts
@@ -367,13 +501,14 @@ async fn check_group(
     permits: Arc<Semaphore>,
     group: Vec<DataColumnSidecar>,
     permit: HeldPermit,
+    arrival: ColumnArrival,
     shared: SharedVerdicts,
 ) {
     let group_size = group.len();
     let task = metrics::BlockingTask::new("column_check");
     let prechecked = tokio::task::spawn_blocking(move || {
         let _run = task.start();
-        precheck_group(&store, group, unix_now_ms())
+        precheck_group(&store, group, unix_now_ms(), arrival)
     })
     .await;
     let (settled, pending) = match prechecked {
@@ -423,7 +558,7 @@ async fn check_group(
         let verified = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _run = task.start();
-            verify_batch(batch)
+            verify_batch(batch, arrival)
         });
         batches.push((size, verified));
     }
@@ -479,8 +614,21 @@ fn forward(blockchain: &P2PToBlockChainRef, verdicts: GroupVerdicts, shared: &Sh
 /// goes on handling swarm events while a range batch's KZG proofs are
 /// verified. A block's sidecars are forwarded when that block's group
 /// finishes, not when every group of the call has.
-pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSidecar>) {
-    check_and_forward_then(server, sidecars, None);
+///
+/// Each sidecar's `block_events` rows are written once its check is done, by
+/// [`column_rows`]: as the prechecks settle it, or as its KZG sub-batch
+/// finishes. After the check, so an already stored re-delivery writes none,
+/// and off the p2p actor. A sidecar repeating a `(block, index)` of the same
+/// call is dropped unjudged and writes none. A column delivered again in
+/// another call while it waits for its block, or two copies passing at once
+/// in two calls, write rows each, so rows are at least once per column and
+/// stage: a reader takes the earliest.
+pub(crate) fn check_and_forward(
+    server: &P2PServer,
+    sidecars: Vec<DataColumnSidecar>,
+    arrival: ColumnArrival,
+) {
+    check_and_forward_then(server, sidecars, arrival, None);
 }
 
 /// [`check_and_forward`], then `done` with every sidecar's verdict, once every
@@ -496,6 +644,7 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
 pub(crate) fn check_and_forward_then(
     server: &P2PServer,
     sidecars: Vec<DataColumnSidecar>,
+    arrival: ColumnArrival,
     done: Option<Done>,
 ) {
     let shared: SharedVerdicts =
@@ -529,6 +678,7 @@ pub(crate) fn check_and_forward_then(
                 permits.clone(),
                 group,
                 permit,
+                arrival,
                 shared.clone(),
             ));
         }
@@ -560,6 +710,7 @@ fn count_drops(outcome: Outcome, count: usize) {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use ethlambda_network_api::{
         AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, P2PToBlockChain,
@@ -648,7 +799,7 @@ pub(crate) mod tests {
     }
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to
-    /// be parked, and one they refuse goes nowhere: neither reaches the batch
+    /// be held for its block, and one they refuse goes nowhere: neither reaches the batch
     /// the chain actor stores unchecked.
     #[tokio::test]
     async fn only_what_passes_is_forwarded_as_checked() {
@@ -667,6 +818,7 @@ pub(crate) mod tests {
                 DataColumnSidecar::Fulu(orphan.clone()),
                 DataColumnSidecar::Fulu(malformed),
             ],
+            ColumnArrival::Recheck,
         );
 
         assert_eq!(
@@ -683,10 +835,10 @@ pub(crate) mod tests {
 
     /// A gloas sidecar is judged against its own block, not a parent: one
     /// whose block this node has not seen goes back to the chain actor to be
-    /// parked, and one from a slot that has not started is dropped, so neither
-    /// reaches the batch the chain actor stores unchecked.
+    /// held for it, and one from a slot that has not started is dropped, so
+    /// neither reaches the batch the chain actor stores unchecked.
     #[tokio::test]
-    async fn a_gloas_sidecar_for_an_unknown_block_is_parked_and_a_future_one_dropped() {
+    async fn a_gloas_sidecar_for_an_unknown_block_is_held_and_a_future_one_dropped() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let (sender, mut received) = mpsc::unbounded_channel();
         server.blockchain = Some(Arc::new(RecordingChain(sender)));
@@ -704,7 +856,11 @@ pub(crate) mod tests {
             ..Default::default()
         });
 
-        check_and_forward(&server, vec![unknown_block.clone(), future]);
+        check_and_forward(
+            &server,
+            vec![unknown_block.clone(), future],
+            ColumnArrival::Recheck,
+        );
 
         assert_eq!(
             received.recv().await,
@@ -740,6 +896,7 @@ pub(crate) mod tests {
                 a1.clone(),
                 DataColumnSidecar::Fulu(malformed),
             ],
+            ColumnArrival::Recheck,
         );
 
         let mut batches = Vec::new();
@@ -948,7 +1105,7 @@ pub(crate) mod tests {
         let mut expected = sidecars.clone();
         expected.remove(forged);
 
-        check_and_forward(&server, sidecars);
+        check_and_forward(&server, sidecars, ColumnArrival::Recheck);
 
         assert_eq!(received.recv().await, Some(Forwarded::Checked(expected)));
         drop(server);
@@ -995,7 +1152,7 @@ pub(crate) mod tests {
             DataColumnSidecar::Fulu(malformed),
             DataColumnSidecar::Fulu(orphan),
         ];
-        check_and_forward_then(&server, sidecars, Some(done));
+        check_and_forward_then(&server, sidecars, ColumnArrival::Recheck, Some(done));
 
         assert_eq!(
             verdicts_of(&mut reported).await,
@@ -1015,7 +1172,7 @@ pub(crate) mod tests {
         let (done, mut reported) = reporting();
 
         let sidecar = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 3));
-        check_and_forward_then(&server, vec![sidecar], Some(done));
+        check_and_forward_then(&server, vec![sidecar], ColumnArrival::Recheck, Some(done));
 
         assert_eq!(
             verdicts_of(&mut reported).await,
@@ -1032,7 +1189,12 @@ pub(crate) mod tests {
         let (done, mut reported) = reporting();
 
         let orphan = DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 4));
-        check_and_forward_then(&server, vec![orphan.clone(), orphan], Some(done));
+        check_and_forward_then(
+            &server,
+            vec![orphan.clone(), orphan],
+            ColumnArrival::Recheck,
+            Some(done),
+        );
 
         assert_eq!(
             verdicts_of(&mut reported).await,
@@ -1082,7 +1244,7 @@ pub(crate) mod tests {
             let sidecars = sidecars.into_iter().map(DataColumnSidecar::Gloas).collect();
             let (done, mut reported) = reporting();
 
-            check_and_forward_then(&server, sidecars, Some(done));
+            check_and_forward_then(&server, sidecars, ColumnArrival::Recheck, Some(done));
 
             let expected = if chain_alive {
                 ColumnVerdict::Delivered
@@ -1095,5 +1257,93 @@ pub(crate) mod tests {
                 "chain alive: {chain_alive}"
             );
         }
+    }
+
+    fn sidecar_48() -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 48,
+            slot: 5,
+            beacon_block_root: Root::repeat_byte(9),
+            ..Default::default()
+        })
+    }
+
+    /// Silver records a column only once it passed validation: one judged to
+    /// wait for its block writes its arrival now and its validation when the
+    /// recheck keeps it, and a dropped one (an already stored re-delivery
+    /// included) writes none.
+    #[test]
+    fn a_column_writes_rows_only_once_judged_and_validation_only_once_it_passes() {
+        let sidecar = sidecar_48();
+        let arrived = Instant::now();
+        let checked = arrived + Duration::from_millis(3);
+        let fresh = ColumnArrival::received("by_root", arrived);
+        let rows = |rows: Vec<BlockEvent>| {
+            rows.into_iter()
+                .map(|row| (row.stage, row.at))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rows(column_rows(&sidecar, fresh, ChainVerdict::Keep, checked)),
+            [("column_recv", arrived), ("column_validated", checked)]
+        );
+        let awaiting = column_rows(&sidecar, fresh, ChainVerdict::AwaitParent, checked);
+        assert_eq!(
+            awaiting,
+            [BlockEvent {
+                stage: "column_recv",
+                at: arrived,
+                slot: 5,
+                block_root: [9; 32],
+                source: "by_root",
+                verdict: None,
+                column_index: Some(48),
+            }]
+        );
+        let stored = ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
+        assert!(column_rows(&sidecar, fresh, stored, checked).is_empty());
+        assert_eq!(
+            rows(column_rows(
+                &sidecar,
+                ColumnArrival::Recheck,
+                ChainVerdict::Keep,
+                checked
+            )),
+            [("column_validated", checked)]
+        );
+    }
+
+    /// A fulu sidecar names its block by its header's root, which the row
+    /// must carry.
+    #[test]
+    fn a_fulu_column_row_names_its_header_root() {
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+
+        let fulu = valid_shaped_sidecar(5, 3);
+        let expected = fulu.signed_block_header.message.hash_tree_root();
+        let sidecar = DataColumnSidecar::Fulu(fulu);
+
+        let arrival = ColumnArrival::received("gossip", Instant::now());
+        let event = passed_rows(&sidecar, arrival, Instant::now()).remove(0);
+        assert_eq!(event.block_root, expected.0);
+        assert_eq!(event.slot, 5);
+        assert_eq!(event.column_index, Some(3));
+    }
+
+    #[test]
+    fn a_column_row_names_its_block_slot_and_index() {
+        let sidecar = sidecar_48();
+        let at = Instant::now();
+
+        let rows = passed_rows(&sidecar, ColumnArrival::received("by_root", at), at);
+        let event = rows[0];
+        assert_eq!(event.stage, "column_recv");
+        assert_eq!(event.slot, 5);
+        assert_eq!(event.block_root, [9; 32]);
+        assert_eq!(event.column_index, Some(48));
+        assert_eq!(event.source, "by_root");
+        assert_eq!(event.at, at);
+        assert_eq!(event.verdict, None);
     }
 }
