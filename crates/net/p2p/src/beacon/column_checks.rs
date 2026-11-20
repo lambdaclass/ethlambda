@@ -109,11 +109,12 @@ impl ColumnArrival {
     }
 }
 
-/// One `block_events` row for `sidecar`: the one place its fields are named,
-/// so the root (a header hash for a fulu sidecar) is computed per row built.
+/// One `block_events` row for `sidecar` of the block `block_root`: the one
+/// place its fields are named.
 fn column_event(
     stage: &'static str,
     sidecar: &DataColumnSidecar,
+    block_root: [u8; 32],
     source: &'static str,
     at: Instant,
 ) -> BlockEvent {
@@ -121,7 +122,7 @@ fn column_event(
         stage,
         at,
         slot: sidecar.slot(),
-        block_root: sidecar.block_root().0,
+        block_root,
         source,
         verdict: None,
         column_index: Some(sidecar.index()),
@@ -132,12 +133,32 @@ fn column_event(
 /// (unless it is a re-check) and its validation. Gossip-accepted columns and
 /// this node's own columns call this directly, as they need no check of their
 /// own.
+///
+/// Computes the sidecar's block root (a header hash for fulu); a caller that
+/// already knows it, or writes many columns of one block, uses
+/// [`passed_rows_under`].
 pub(crate) fn passed_rows(
     sidecar: &DataColumnSidecar,
     arrival: ColumnArrival,
     validated_at: Instant,
 ) -> Vec<BlockEvent> {
-    let validated = column_event("column_validated", sidecar, arrival.source(), validated_at);
+    passed_rows_under(sidecar, sidecar.block_root().0, arrival, validated_at)
+}
+
+/// [`passed_rows`] for a sidecar whose block root is already known.
+pub(crate) fn passed_rows_under(
+    sidecar: &DataColumnSidecar,
+    block_root: [u8; 32],
+    arrival: ColumnArrival,
+    validated_at: Instant,
+) -> Vec<BlockEvent> {
+    let validated = column_event(
+        "column_validated",
+        sidecar,
+        block_root,
+        arrival.source(),
+        validated_at,
+    );
     match arrival {
         ColumnArrival::Received { at, .. } => vec![
             BlockEvent {
@@ -165,7 +186,8 @@ pub(crate) fn column_rows(
         ChainVerdict::Keep => passed_rows(sidecar, arrival, checked_at),
         ChainVerdict::AwaitParent => match arrival {
             ColumnArrival::Received { source, at } => {
-                vec![column_event("column_recv", sidecar, source, at)]
+                let root = sidecar.block_root().0;
+                vec![column_event("column_recv", sidecar, root, source, at)]
             }
             ColumnArrival::Recheck => Vec::new(),
         },

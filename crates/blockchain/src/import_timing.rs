@@ -935,8 +935,14 @@ pub struct CascadeTelemetry {
 impl CascadeTelemetry {
     /// The arrival-scope sections, filed under the arriving block when the
     /// arriving block was imported here, and an `attestable` row at the head
-    /// recomputation's end for every block imported here.
-    pub fn events(&self, cascade: &CascadeTimings) -> Vec<BlockEvent> {
+    /// recomputation's end for every block imported here that the new head
+    /// includes (`on_head`). A block imported onto a losing branch never
+    /// became attestable, so it writes none.
+    pub fn events(
+        &self,
+        cascade: &CascadeTimings,
+        on_head: impl Fn(&H256) -> bool,
+    ) -> Vec<BlockEvent> {
         let mut events = Vec::new();
         if let (Some((slot, root)), Some(source)) = (self.arrival, cascade.source_label())
             && self
@@ -968,6 +974,7 @@ impl CascadeTelemetry {
             events.extend(
                 self.imported
                     .iter()
+                    .filter(|(_, root, _)| on_head(root))
                     .map(|&(slot, root, source)| row("attestable", head_end, slot, root, source)),
             );
         }
@@ -1703,7 +1710,7 @@ mod tests {
             imported: vec![(7, arriving, "gossip"), (8, child, "sync")],
         };
 
-        let events = telemetry.events(&arrival_cascade(base));
+        let events = telemetry.events(&arrival_cascade(base), |_| true);
         let rows: Vec<_> = events
             .iter()
             .map(|event| (event.stage, event.slot, event.block_root, event.source))
@@ -1741,7 +1748,7 @@ mod tests {
             imported: vec![(8, H256::repeat_byte(4), "gossip")],
         };
 
-        let events = telemetry.events(&arrival_cascade(base));
+        let events = telemetry.events(&arrival_cascade(base), |_| true);
         assert_eq!(
             events
                 .iter()
@@ -1749,6 +1756,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("attestable", 8)]
         );
+    }
+
+    /// A block the cascade imported onto a branch the new head does not
+    /// include never became attestable, so only the head's chain gets the row.
+    #[test]
+    fn a_block_off_the_new_head_is_not_attestable() {
+        let base = Instant::now();
+        let canonical = H256::repeat_byte(3);
+        let side_fork = H256::repeat_byte(4);
+        let telemetry = CascadeTelemetry {
+            arrival: Some((7, side_fork)),
+            imported: vec![(7, canonical, "sync"), (7, side_fork, "gossip")],
+        };
+
+        let attestable: Vec<_> = telemetry
+            .events(&arrival_cascade(base), |root| *root == canonical)
+            .into_iter()
+            .filter(|event| event.stage == "attestable")
+            .map(|event| event.block_root)
+            .collect();
+        assert_eq!(attestable, [[3; 32]]);
     }
 
     /// A head computation that failed still spent its time, so the arrival's
@@ -1766,7 +1794,7 @@ mod tests {
         };
 
         let stages: Vec<_> = telemetry
-            .events(&failed)
+            .events(&failed, |_| true)
             .iter()
             .map(|event| event.stage)
             .collect();
@@ -1793,7 +1821,7 @@ mod tests {
         };
         assert_eq!(
             telemetry
-                .events(&lean)
+                .events(&lean, |_| true)
                 .iter()
                 .map(|event| event.stage)
                 .collect::<Vec<_>>(),

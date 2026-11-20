@@ -847,6 +847,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             telemetry_client_name,
             setup.store.chain(),
             config.config_name.as_str(),
+            grid.genesis_time_ms() / 1000,
         );
         if sends_credentials_in_clear(&url) {
             warn!(
@@ -1041,18 +1042,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 /// `ethlambda@<hostname>`. The hostname is read only on that last path, so a
 /// node with telemetry off never asks. A loaded `--network` directory may have
 /// no `CONFIG_NAME`, hence the beacon fallback.
+///
+/// A lean network has no name of its own, so it is `lean-<genesis time>`:
+/// two devnets, or one devnet reset with a new genesis, writing to one table
+/// stay apart, and every node of one devnet agrees on the name.
 fn telemetry_names(
     lean_node_id: Option<&str>,
     explicit: Option<String>,
     chain: ethlambda_storage::Chain,
     config_name: &str,
+    genesis_time_secs: u64,
 ) -> (String, String) {
     let client_name = explicit.unwrap_or_else(|| match lean_node_id {
         Some(node_id) => node_id.to_owned(),
         None => format!("ethlambda@{}", hostname()),
     });
     let network_name = match chain {
-        ethlambda_storage::Chain::Lean => "lean".to_owned(),
+        ethlambda_storage::Chain::Lean => format!("lean-{genesis_time_secs}"),
         ethlambda_storage::Chain::Beacon if config_name.is_empty() => "unknown".to_owned(),
         ethlambda_storage::Chain::Beacon => config_name.to_owned(),
     };
@@ -1134,6 +1140,11 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
+/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
+/// one request's timeout plus a margin, so a reachable server gets them and an
+/// unreachable one does not hold the exit up for long.
+const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 async fn wait_for_shutdown(node: RunningNode) {
     let mut signals = ShutdownSignals::listen();
     info!("Node initialized");
@@ -1158,6 +1169,8 @@ async fn wait_for_shutdown(node: RunningNode) {
     blockchain_ref.join().await;
     p2p_ref.join().await;
     let _ = node.http.await;
+    // After the actors, which are the only emitters, have stopped.
+    ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT).await;
 
     info!("Shutdown complete");
 }
@@ -2517,21 +2530,25 @@ mod tests {
             Some("mine".to_owned()),
             ethlambda_storage::Chain::Lean,
             "",
+            1_770_407_233,
         );
-        assert_eq!((client.as_str(), network.as_str()), ("mine", "lean"));
+        assert_eq!(
+            (client.as_str(), network.as_str()),
+            ("mine", "lean-1770407233")
+        );
     }
 
     #[test]
     fn a_lean_node_is_named_by_its_node_id() {
         let (client, network) =
-            telemetry_names(Some("node-1"), None, ethlambda_storage::Chain::Lean, "");
-        assert_eq!((client.as_str(), network.as_str()), ("node-1", "lean"));
+            telemetry_names(Some("node-1"), None, ethlambda_storage::Chain::Lean, "", 7);
+        assert_eq!((client.as_str(), network.as_str()), ("node-1", "lean-7"));
     }
 
     #[test]
     fn a_beacon_node_is_named_by_host_and_config() {
         let (client, network) =
-            telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet");
+            telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet", 0);
         assert!(client.starts_with("ethlambda@"), "{client}");
         assert_eq!(network, "mainnet");
     }
@@ -2550,7 +2567,7 @@ mod tests {
 
     #[test]
     fn a_beacon_network_without_a_config_name_is_unknown() {
-        let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "");
+        let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "", 0);
         assert_eq!(network, "unknown");
     }
 

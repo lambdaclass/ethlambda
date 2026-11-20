@@ -312,7 +312,7 @@ Present only with `--telemetry.clickhouse-url`; see [Block telemetry](./telemetr
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows still pending when the writer's channel closes) | outcome=inserted,dropped |
+| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows the shutdown flush could not deliver) | outcome=inserted,dropped |
 | `lean_telemetry_insert_failures_total` | Counter | Failed ClickHouse insert attempts, refusals included | On every failed insert; a failed best-effort schema statement alone is not counted | |
 
 ### Gossip Arrival Timing

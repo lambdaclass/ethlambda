@@ -10,7 +10,7 @@ Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (13 workspace crates)
+## Codebase Structure (16 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration

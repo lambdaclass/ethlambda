@@ -1918,11 +1918,12 @@ impl BlockChainServer {
                                 // `el_verdict` rows: the `engine` pair also
                                 // spans building the request and the
                                 // transition computed meanwhile.
-                                if let Ok(validity) = &answer {
+                                if let Some(verdict) = answer.as_ref().ok().and_then(verdict_label)
+                                {
                                     timings.engine_answer = Some(EngineAnswer {
                                         sent,
                                         answered: answered_at,
-                                        verdict: verdict_label(validity),
+                                        verdict,
                                     });
                                 }
                                 (answer.map_err(NoVerdict::Engine), answered_at)
@@ -2272,8 +2273,37 @@ impl BlockChainServer {
 
         cascade.observe(blocks);
         cascade.log(blocks);
-        ethlambda_telemetry::emit(|| self.cascade_telemetry.events(&cascade));
+        ethlambda_telemetry::emit(|| {
+            let on_head = self.head_chain_since(&self.cascade_telemetry.imported);
+            self.cascade_telemetry
+                .events(&cascade, |root| on_head.contains(root))
+        });
         outcome
+    }
+
+    /// The roots on the head's chain from the head back to the lowest slot
+    /// among `imported`: the blocks of a cascade the new head includes, for
+    /// its `attestable` rows. A handful of point lookups, one per slot the
+    /// cascade spans, and none when it imported nothing.
+    fn head_chain_since(&self, imported: &[(u64, H256, &'static str)]) -> HashSet<H256> {
+        let mut on_head = HashSet::new();
+        let Some(lowest) = imported.iter().map(|&(slot, _, _)| slot).min() else {
+            return on_head;
+        };
+        let Some((mut slot, mut root)) = self.store.beacon_head() else {
+            return on_head;
+        };
+        while slot >= lowest {
+            on_head.insert(root);
+            let Some((_, parent)) = self.store.block_entry(&root) else {
+                break;
+            };
+            let Some((parent_slot, _)) = self.store.block_entry(&parent) else {
+                break;
+            };
+            (slot, root) = (parent_slot, parent);
+        }
+        on_head
     }
 
     /// Drain `queue`, importing each block and enqueuing any pending children
@@ -4373,12 +4403,17 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 }
 
 /// The `verdict` a `block_events` row records for an execution client's answer.
-fn verdict_label(validity: &fork_choice::PayloadValidity) -> &'static str {
+///
+/// `NotRequired` is never one: a block that needs no verdict is not sent, and
+/// a status the execution client returns always reads as one of the other
+/// three (see `beacon_engine::outcome_label`). It writes no `el_verdict` row
+/// rather than a value outside the documented set.
+fn verdict_label(validity: &fork_choice::PayloadValidity) -> Option<&'static str> {
     match validity {
-        fork_choice::PayloadValidity::NotRequired => "NotRequired",
-        fork_choice::PayloadValidity::Validated => "Valid",
-        fork_choice::PayloadValidity::Optimistic => "Optimistic",
-        fork_choice::PayloadValidity::Invalidated { .. } => "Invalid",
+        fork_choice::PayloadValidity::NotRequired => None,
+        fork_choice::PayloadValidity::Validated => Some("Valid"),
+        fork_choice::PayloadValidity::Optimistic => Some("Optimistic"),
+        fork_choice::PayloadValidity::Invalidated { .. } => Some("Invalid"),
     }
 }
 
@@ -5637,7 +5672,7 @@ mod tests {
         assert!(
             server
                 .cascade_telemetry
-                .events(&cascade(Instant::now()))
+                .events(&cascade(Instant::now()), |_| true)
                 .is_empty()
         );
 
@@ -5664,7 +5699,7 @@ mod tests {
         assert!(
             server
                 .cascade_telemetry
-                .events(&cascade(Instant::now()))
+                .events(&cascade(Instant::now()), |_| true)
                 .is_empty()
         );
     }

@@ -9,13 +9,18 @@
 //! tick, except a batch ClickHouse refuses as malformed (HTTP 400), which is
 //! dropped since a retry would be refused again. The buffer drops its oldest
 //! rows past a cap, so an unreachable ClickHouse costs bounded memory.
+//!
+//! On shutdown the task stops taking rows, sends what is pending in one last
+//! round of requests, and counts whatever that round could not deliver as
+//! dropped.
 
 use std::collections::VecDeque;
 use std::error::Error as _;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::{Client, RequestBuilder, Url};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
@@ -60,6 +65,12 @@ impl Limits {
     };
 }
 
+/// How often a run of refused batches is reported at `warn`. Between two
+/// reports they are only counted, so a table whose schema no row fits (one
+/// created by an older layout, say) stays visible in the logs for as long as it
+/// lasts without a line per batch.
+const REJECTION_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Longest prefix of ClickHouse's answer kept in a failure message.
 const MAX_BODY_IN_MESSAGE: usize = 512;
 
@@ -82,13 +93,15 @@ struct InFlight {
     handle: JoinHandle<Outcome>,
 }
 
-/// Run until every sender is gone. Production keeps the sender in a static,
-/// so there the task runs for the life of the process; when the channel does
-/// close, the rows still pending are counted as dropped.
+/// Run until `shutdown` is notified, then flush what is pending (see
+/// [`flush`]). Production keeps the sender in a static, so the channel never
+/// closes there; when it does (the tests), the rows still pending are counted
+/// as dropped.
 pub(crate) async fn run(
     config: TelemetryConfig,
     mut rx: mpsc::Receiver<BlockEvent>,
     limits: Limits,
+    shutdown: Arc<Notify>,
 ) {
     let client = match Client::builder().timeout(limits.request_timeout).build() {
         Ok(client) => client,
@@ -106,7 +119,7 @@ pub(crate) async fn run(
     // idempotent, and rerunning it recreates a table dropped under us.
     let mut needs_schema = true;
     let mut failing = false;
-    let mut rejecting = false;
+    let mut rejections = Rejections::default();
     let mut tick = tokio::time::interval(limits.flush_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -119,6 +132,10 @@ pub(crate) async fn run(
                 };
                 pending.push_back(encode(&event, Anchor::now(), &config));
                 drop_past_cap(&mut pending, limits.max_pending_rows);
+            }
+            () = shutdown.notified() => {
+                flush(&client, &urls, &config, &mut rx, pending, in_flight, needs_schema, limits).await;
+                return;
             }
             // Polled every period, whatever there is to send: a tick switched
             // off while idle would fire at once when switched back on, sending
@@ -135,7 +152,7 @@ pub(crate) async fn run(
                     Ok(()) => {
                         metrics::inc_rows_inserted(batch.len() as u64);
                         needs_schema = false;
-                        rejecting = false;
+                        rejections.reset();
                         if failing {
                             failing = false;
                             info!("Telemetry inserts recovered");
@@ -151,13 +168,7 @@ pub(crate) async fn run(
                     Err(Failure { message, rejected: true }) => {
                         metrics::inc_insert_failures();
                         metrics::inc_rows_dropped(batch.len() as u64);
-                        let rows = batch.len();
-                        if rejecting {
-                            debug!(rows, err = %message, "ClickHouse rejected a telemetry batch");
-                        } else {
-                            rejecting = true;
-                            warn!(rows, err = %message, "ClickHouse rejected a batch; dropping it");
-                        }
+                        rejections.record(batch.len(), &message);
                     }
                     Err(Failure { message, rejected: false }) => {
                         metrics::inc_insert_failures();
@@ -174,6 +185,108 @@ pub(crate) async fn run(
                 }
             }
         }
+    }
+}
+
+/// Batches ClickHouse refused since the last success, reported at `warn` on
+/// the first and then at most once per [`REJECTION_WARN_INTERVAL`], each
+/// report carrying what was dropped since the one before.
+#[derive(Default)]
+struct Rejections {
+    last_warned: Option<Instant>,
+    batches_since_warn: u64,
+    rows_since_warn: u64,
+}
+
+impl Rejections {
+    fn record(&mut self, rows: usize, message: &str) {
+        self.batches_since_warn += 1;
+        self.rows_since_warn += rows as u64;
+        let due = self
+            .last_warned
+            .is_none_or(|at| at.elapsed() >= REJECTION_WARN_INTERVAL);
+        if !due {
+            debug!(rows, err = %message, "ClickHouse rejected a telemetry batch");
+            return;
+        }
+        warn!(
+            batches = self.batches_since_warn,
+            rows = self.rows_since_warn,
+            err = %message,
+            "ClickHouse rejected telemetry batches; dropping them (does block_events match the expected schema?)"
+        );
+        self.last_warned = Some(Instant::now());
+        self.batches_since_warn = 0;
+        self.rows_since_warn = 0;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The shutdown flush: stop taking rows (an emit after this counts its row as
+/// dropped), take what the channel still holds, wait for the request in
+/// flight, then send the rest in bounded requests. The first failure ends the
+/// flush, and every row not delivered is counted as dropped. The caller bounds
+/// how long this may take.
+#[allow(clippy::too_many_arguments)]
+async fn flush(
+    client: &Client,
+    urls: &Urls,
+    config: &TelemetryConfig,
+    rx: &mut mpsc::Receiver<BlockEvent>,
+    mut pending: VecDeque<String>,
+    mut in_flight: Option<InFlight>,
+    mut needs_schema: bool,
+    limits: Limits,
+) {
+    rx.close();
+    while let Ok(event) = rx.try_recv() {
+        pending.push_back(encode(&event, Anchor::now(), config));
+    }
+    drop_past_cap(&mut pending, limits.max_pending_rows);
+    if in_flight.is_some() {
+        let (batch, result) = join(&mut in_flight).await;
+        match result {
+            Ok(()) => {
+                metrics::inc_rows_inserted(batch.len() as u64);
+                needs_schema = false;
+            }
+            Err(Failure { rejected: true, .. }) => {
+                metrics::inc_insert_failures();
+                metrics::inc_rows_dropped(batch.len() as u64);
+            }
+            Err(Failure {
+                rejected: false, ..
+            }) => {
+                metrics::inc_insert_failures();
+                for row in batch.into_iter().rev() {
+                    pending.push_front(row);
+                }
+            }
+        }
+    }
+    let total = pending.len();
+    while !pending.is_empty() {
+        let batch = take_batch(&mut pending, limits.max_rows_per_request);
+        let rows = batch.len() as u64;
+        match insert(client, urls, &batch, needs_schema).await {
+            Ok(()) => {
+                metrics::inc_rows_inserted(rows);
+                needs_schema = false;
+            }
+            Err(Failure { message, .. }) => {
+                metrics::inc_insert_failures();
+                let dropped = rows + pending.len() as u64;
+                metrics::inc_rows_dropped(dropped);
+                warn!(dropped, err = %message, "Telemetry flush at shutdown failed; dropping the remaining rows");
+                return;
+            }
+        }
+    }
+    if total > 0 {
+        info!(rows = total, "Flushed pending telemetry rows");
     }
 }
 
@@ -298,7 +411,12 @@ struct Urls {
 impl Urls {
     fn new(url: &Url) -> Self {
         let mut insert = url.clone();
-        insert.query_pairs_mut().append_pair("query", INSERT);
+        // A row field the table lacks (one created by an older layout) is
+        // ignored rather than refusing the whole batch.
+        insert
+            .query_pairs_mut()
+            .append_pair("query", INSERT)
+            .append_pair("input_format_skip_unknown_fields", "1");
         Self {
             schema: url.clone(),
             insert,
@@ -426,8 +544,25 @@ mod tests {
             network_name: "testnet".into(),
             clock: SlotClock::new(0, 12_000),
         };
-        tokio::spawn(run(config, rx, limits));
+        tokio::spawn(run(config, rx, limits, Arc::new(Notify::new())));
         tx
+    }
+
+    /// [`start_writer`], also returning the shutdown handle and the task.
+    fn start_stoppable_writer(
+        url: Url,
+        limits: Limits,
+    ) -> (mpsc::Sender<BlockEvent>, Arc<Notify>, JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(64);
+        let config = TelemetryConfig {
+            url,
+            client_name: "test".into(),
+            network_name: "testnet".into(),
+            clock: SlotClock::new(0, 12_000),
+        };
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(run(config, rx, limits, shutdown.clone()));
+        (tx, shutdown, task)
     }
 
     fn event(slot: u64) -> BlockEvent {
@@ -478,6 +613,56 @@ mod tests {
         );
         assert_eq!(requests[1].query, INSERT);
         assert_eq!(slots(&mock.inserted().concat()), [0, 1, 2]);
+    }
+
+    /// Rows still waiting for a tick, and rows still in the channel, both go
+    /// out on shutdown, in bounded requests, before the task ends.
+    #[tokio::test]
+    async fn shutdown_flushes_every_pending_row() {
+        let mock = Mock::default();
+        let limits = Limits {
+            flush_interval: Duration::from_secs(3600),
+            max_rows_per_request: 2,
+            ..FAST
+        };
+        let (tx, shutdown, task) = start_stoppable_writer(serve(mock.clone()).await, limits);
+        // The interval's first tick fires at once; let it pass with nothing
+        // to send, so the rows below wait for the shutdown.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for slot in 0..5 {
+            tx.send(event(slot)).await.unwrap();
+        }
+
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the flush finishes")
+            .unwrap();
+        assert!(mock.inserted().iter().all(|request| request.len() <= 2));
+        assert_eq!(slots(&mock.inserted().concat()), [0, 1, 2, 3, 4]);
+        assert!(tx.send(event(9)).await.is_err(), "the channel is closed");
+    }
+
+    /// A flush that cannot reach ClickHouse gives up after one attempt
+    /// rather than holding the exit up.
+    #[tokio::test]
+    async fn a_failed_shutdown_flush_ends_the_task() {
+        let mock = Mock::default();
+        mock.fail.store(true, Ordering::SeqCst);
+        let limits = Limits {
+            flush_interval: Duration::from_secs(3600),
+            ..FAST
+        };
+        let (tx, shutdown, task) = start_stoppable_writer(serve(mock.clone()).await, limits);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(event(0)).await.unwrap();
+
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the flush gives up")
+            .unwrap();
+        assert!(mock.inserted().is_empty());
     }
 
     #[tokio::test]
@@ -714,6 +899,13 @@ mod tests {
             .expect("an insert request");
         assert_eq!(insert.params.get("database").map(String::as_str), Some("x"));
         assert_eq!(insert.params.get("query").map(String::as_str), Some(INSERT));
+        assert_eq!(
+            insert
+                .params
+                .get("input_format_skip_unknown_fields")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     /// The schema statement is best effort: a user allowed to insert but not

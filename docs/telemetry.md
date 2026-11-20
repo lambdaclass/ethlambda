@@ -11,7 +11,16 @@ insert. A full request's worth of backlog goes out without waiting for the next
 tick. A failed request is retried on a later tick, with the backlog capped so an
 unreachable ClickHouse costs bounded memory (the oldest rows are dropped first).
 A batch ClickHouse rejects as malformed (HTTP 400) is dropped instead, since
-retrying it would block every later row.
+retrying it would block every later row. Refusals are logged at `warn` on the
+first and then at most once a minute, with the batches and rows dropped since
+the last report, so a table whose schema the rows do not fit stays visible. A
+row field the table lacks is ignored rather than refusing the batch
+(`input_format_skip_unknown_fields`), so a table created by an older layout
+still takes the columns it has.
+
+On a graceful shutdown the writer sends what is still pending before the node
+exits, waiting at most 12 seconds; rows it cannot deliver are counted as
+dropped.
 
 Delivery is at least once: a request that times out after ClickHouse committed
 it is sent again, so a query should take `min`/`any` per block, stage and client
@@ -29,7 +38,9 @@ table.
 | `--telemetry.client-name` | `--node-id` (`node`), `ethlambda@<hostname>` (`beacon`) | `meta_client_name` on every row; requires the URL |
 
 `meta_network_name` is the network's `CONFIG_NAME` on `beacon` (`unknown` when a
-loaded network directory has none) and `lean` on `node`.
+loaded network directory has none) and `lean-<genesis time>` on `node` (the
+genesis Unix time in seconds), so lean devnets sharing one table, or one devnet
+reset with a new genesis, stay apart.
 
 In a container, set `--telemetry.client-name` (or the container's hostname):
 Docker's default hostname is the container ID, so the `beacon` default would
@@ -70,7 +81,7 @@ validator client enters as `gossip`, with `received` at the hand-off and no
 | `da_available` | The data-availability check passed for a block that needed columns. A block with nothing to wait for (no blobs, or gloas, whose data gates the envelope instead) writes `da_check_end` instead |
 | `el_sent`, `el_verdict` | `engine_newPayload` sent and answered; only when an execution client answered |
 | `stf_done` | The state transition finished |
-| `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported gets the same time, and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block |
+| `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported and the new head includes gets the same time (a block imported onto a losing branch never became attestable and writes none), and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block |
 | `failed` | The import failed; `stf_done` and lean's `attestable` are then written as `stf_end` and `fc_head_end` |
 | `column_recv`, `column_validated` | A data column arrived, and passed validation. Written only for a column that passed (or, for `column_recv`, was judged to wait for its block), as Silver does, so rejected columns and re-delivered stored ones write nothing. At least once per block, column and stage: a column delivered again while it waits, or two copies passing at once in separate deliveries, write again, so take the earliest. A copy repeated within one delivery (one peer's answer, say) is dropped unchecked and writes nothing. A column that waited writes `column_validated` with source `recheck`, so join the two on block root and column index, not on source. By-root and by-range answers stamp every column with the moment the whole answer reached the handler. A gossip-accepted column's `column_validated` comes after the verdict's trip back through the p2p actor; a checked one's when its check finished, which is when the KZG sub-batch it was verified in (at most 16 of its block's columns) finished, not when its block's last one did |
 | `cascade_*`, `prune_*`, `get_head_*`, `fcu_*` | Once per arrival, filed under the arriving block, when that block was imported in that cascade |

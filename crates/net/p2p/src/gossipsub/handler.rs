@@ -34,7 +34,7 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
-use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows};
+use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows_under};
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
@@ -984,11 +984,13 @@ pub async fn publish_beacon_block(
         if !custody.is_empty() {
             let now = Instant::now();
             // This node built these columns, so they are trusted without a check.
+            // Every one is of this block, so its root is computed once.
             ethlambda_telemetry::emit(|| {
                 let arrival = ColumnArrival::received("local", now);
+                let block_root = custody[0].block_root().0;
                 custody
                     .iter()
-                    .flat_map(|sidecar| passed_rows(sidecar, arrival, now))
+                    .flat_map(|sidecar| passed_rows_under(sidecar, block_root, arrival, now))
                     .collect()
             });
             let _ = blockchain
