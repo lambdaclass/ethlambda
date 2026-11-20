@@ -226,7 +226,9 @@ const OFFSETS: [Offset; 10] = [
 /// incompatible when its epoch arrives.
 ///
 /// The duty offsets are taken from the first node, because an upgraded node
-/// may start serving the gloas offsets and they identify no chain.
+/// may start serving the gloas offsets and they identify no chain. The caller
+/// passes what each node last served, so the first node stays the first
+/// through a round it does not answer.
 ///
 /// Everything else (genesis, slot duration, past forks) stays as it is.
 pub fn merge_schedule(
@@ -319,11 +321,15 @@ pub fn merge_schedule(
     }
 }
 
-/// One round of the check: ask the nodes `scope` selects, and after a check of
-/// every node, follow the schedule the compatible ones serve.
+/// One round of the check: ask the nodes `scope` selects, then follow the
+/// schedule the compatible ones serve.
 ///
-/// The client's schedule is only ever replaced here, and only from a check of
-/// every node, so one slow answer cannot move it on its own.
+/// The schedule is merged from what every usable node last served
+/// (`FallbackBeaconNode::served_configs`), not from this round's answers
+/// alone: a node that misses one round keeps its say, so the merge neither
+/// waits an epoch for it nor flips the duty offsets to the next node's while
+/// it is away. After startup the client's schedule is only ever replaced
+/// here.
 pub async fn check_once<B: BeaconNodeApi>(
     nodes: &FallbackBeaconNode<B>,
     genesis: Genesis,
@@ -336,17 +342,19 @@ pub async fn check_once<B: BeaconNodeApi>(
         config: (*context.config()).clone(),
     };
     let answers = nodes.check_nodes(&ours, epoch, scope).await;
-    if scope != CheckScope::All {
+    // Every epoch, and whenever a node asked in between turned out to be on
+    // this chain: one that was let back in, or one that missed its last check.
+    // Its schedule may hold a fork the client has not seen, which must not
+    // wait for the next epoch, where the fork could already be active and the
+    // node refused for it.
+    let answered_compatible = answers
+        .iter()
+        .any(|(_, answer)| matches!(answer, NodeAnswer::Compatible(_)));
+    if scope != CheckScope::All && !answered_compatible {
         return;
     }
 
-    let compatible: Vec<(usize, Config)> = answers
-        .into_iter()
-        .filter_map(|(position, answer)| match answer {
-            NodeAnswer::Compatible(config) => Some((position, *config)),
-            _ => None,
-        })
-        .collect();
+    let compatible = nodes.served_configs();
     if let Some(config) = follow_schedule(&ours.config, &compatible, epoch) {
         context.replace_config(config);
     }
@@ -385,8 +393,9 @@ pub fn follow_schedule(
     Some(merge.config)
 }
 
-/// Run the check until `shutdown`: the nodes that are not usable every slot,
-/// every node at the first slot of each epoch.
+/// Run the check until `shutdown`: the nodes that are not usable, or did not
+/// answer their last check, every slot, and every node at the first slot of
+/// each epoch.
 ///
 /// The startup check already covered every node and followed the schedule
 /// they served (see `FallbackBeaconNode::establish`), so the first full one is
@@ -844,6 +853,81 @@ mod tests {
             .await;
         assert!(matches!(answers[0].1, NodeAnswer::Incompatible(_)));
         assert!(matches!(answers[1].1, NodeAnswer::Compatible(_)));
+    }
+
+    /// A node let back in between two epoch checks brings its schedule with
+    /// it at once, not at the next epoch, where its fork could be active.
+    #[tokio::test]
+    async fn a_readmitted_node_has_its_schedule_followed_in_the_same_round() {
+        let (context, clock) = context_and_clock();
+        let late = node();
+        late.failures
+            .lock()
+            .expect("lock")
+            .insert("genesis", "booting".to_string());
+        let fallback = established(vec![node(), late]).await;
+        let gloas_epoch = NOW + 1;
+
+        fallback.nodes()[1].failures.lock().expect("lock").clear();
+        fallback.nodes()[1].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
+        check_once(
+            &fallback,
+            genesis(),
+            &context,
+            NOW,
+            CheckScope::OnlyUnusable,
+        )
+        .await;
+
+        assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
+    }
+
+    /// A usable node that misses the epoch's check is asked again at the next
+    /// slot, and the schedule it serves is followed then.
+    #[tokio::test]
+    async fn a_node_that_missed_the_epoch_check_is_asked_again_the_next_slot() {
+        let (context, clock) = context_and_clock();
+        let fallback = established(vec![node()]).await;
+        let gloas_epoch = NOW + 1;
+        fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
+        fallback.nodes()[0]
+            .failures
+            .lock()
+            .expect("lock")
+            .insert("spec", "down".to_string());
+        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
+
+        fallback.nodes()[0].failures.lock().expect("lock").clear();
+        check_once(
+            &fallback,
+            genesis(),
+            &context,
+            NOW,
+            CheckScope::OnlyUnusable,
+        )
+        .await;
+
+        assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
+    }
+
+    /// The duty offsets stay the first node's through a round it does not
+    /// answer, rather than flipping to the next node's and back.
+    #[tokio::test]
+    async fn the_duty_offsets_do_not_move_when_the_first_node_misses_a_round() {
+        let (context, _) = context_and_clock();
+        let mut other = Config::mainnet();
+        other.attestation_due_bps_gloas = 2_000;
+        let fallback = established(vec![node(), node().with_spec(other)]).await;
+        fallback.nodes()[0]
+            .failures
+            .lock()
+            .expect("lock")
+            .insert("spec", "down".to_string());
+
+        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+
+        assert_eq!(*context.config(), Config::mainnet());
     }
 
     /// A node that moves a fork already active is on another chain: it is

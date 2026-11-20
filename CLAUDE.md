@@ -941,9 +941,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the first node that answers at startup, and a node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks the
-  unusable nodes every slot and every node each epoch, and that check, like the
-  startup one, follows a fork the
-  compatible nodes newly schedule (only a fork still in the future may change)
+  unusable nodes, and the ones that missed their last check, every slot and
+  every node each epoch. The startup check, the epoch check and any round that
+  finds a node compatible follow a fork the compatible nodes newly schedule,
+  merged from what each usable node last served
+  (`FallbackBeaconNode::served_configs`; only a fork still in the future may change),
   into the `SharedConfig` the slot clock and signing domains read, logging the
   change at `warn`. The spec parser requires the slot duration and every altair
   to fulu epoch and version rather than defaulting them to mainnet. A key can live

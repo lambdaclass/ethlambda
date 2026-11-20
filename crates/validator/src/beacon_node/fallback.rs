@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
@@ -62,7 +63,9 @@ pub enum CheckScope {
     /// schedule.
     All,
     /// Only the nodes not usable now, to let them back in as soon as they are
-    /// compatible again.
+    /// compatible again, and the ones that did not answer their last check,
+    /// so a schedule missed in one round is read at the next slot rather than
+    /// the next epoch.
     OnlyUnusable,
 }
 
@@ -115,6 +118,14 @@ pub struct FallbackBeaconNode<B> {
     /// so a node that stays unusable warns once per epoch rather than once per
     /// slot. `u64::MAX` is never.
     warned_at: Vec<AtomicU64>,
+    /// Whether each node, by position, failed to answer its last check. Such
+    /// a node is asked again every slot, whatever its usable flag says.
+    unanswered: Vec<AtomicBool>,
+    /// The configuration each node last served while on this client's chain,
+    /// by position: what the schedule is followed from. Kept through a check
+    /// the node does not answer, so one missed round does not drop its
+    /// schedule, and dropped when the node turns out to be on another chain.
+    served: Vec<Mutex<Option<Config>>>,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
@@ -125,15 +136,39 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
         let usable = nodes.iter().map(|_| AtomicBool::new(true)).collect();
         let warned_at = nodes.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
+        let unanswered = nodes.iter().map(|_| AtomicBool::new(false)).collect();
+        let served = nodes.iter().map(|_| Mutex::new(None)).collect();
         Self {
             nodes,
             usable,
             warned_at,
+            unanswered,
+            served,
         }
     }
 
     fn is_usable(&self, position: usize) -> bool {
         self.usable[position].load(Ordering::Relaxed)
+    }
+
+    fn set_served(&self, position: usize, config: Option<Config>) {
+        *self.served[position]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = config;
+    }
+
+    /// The configuration each usable node last served, with its position, in
+    /// list order: what [`crate::chain_check::follow_schedule`] merges. A
+    /// usable node that has never answered a check has none and is left out.
+    pub fn served_configs(&self) -> Vec<(usize, Config)> {
+        self.usable_nodes()
+            .filter_map(|(position, _)| {
+                let served = self.served[position]
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                served.clone().map(|config| (position, config))
+            })
+            .collect()
     }
 
     /// The nodes calls may go to, with their positions.
@@ -170,13 +205,17 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// out, then again at most once per epoch for as long as it stays out.
     fn record(&self, position: usize, answer: &NodeAnswer, epoch: u64) {
         let node = self.nodes[position].describe();
+        let unanswered = matches!(answer, NodeAnswer::Unreachable(_));
+        self.unanswered[position].store(unanswered, Ordering::Relaxed);
         match answer {
-            NodeAnswer::Compatible(_) => {
+            NodeAnswer::Compatible(config) => {
+                self.set_served(position, Some((**config).clone()));
                 if !self.usable[position].swap(true, Ordering::Relaxed) {
                     info!(position, %node, "Beacon node is on this client's chain; using it");
                 }
             }
             NodeAnswer::Incompatible(difference) => {
+                self.set_served(position, None);
                 let was_usable = self.usable[position].swap(false, Ordering::Relaxed);
                 let due = self.warning_due(position, epoch);
                 if was_usable || due {
@@ -257,7 +296,6 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             "Using this beacon node's chain as the reference; the others are checked against it"
         );
 
-        let mut compatible = Vec::new();
         for (position, answer) in asked.into_iter().enumerate() {
             let answer = if position == reference_at {
                 NodeAnswer::Compatible(Box::new(reference.config.clone()))
@@ -268,9 +306,6 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 self.usable[position].store(false, Ordering::Relaxed);
             }
             self.record(position, &answer, epoch);
-            if let NodeAnswer::Compatible(config) = answer {
-                compatible.push((position, *config));
-            }
         }
 
         // Follow the schedule now, not at the next epoch's check: a reference
@@ -278,7 +313,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         // a fork another node already schedules, and if that fork's epoch came
         // before the next check, the upgraded node would be the one refused.
         let mut chain = reference;
-        if let Some(config) = follow_schedule(&chain.config, &compatible, epoch) {
+        if let Some(config) = follow_schedule(&chain.config, &self.served_configs(), epoch) {
             chain.config = config;
         }
         Ok(chain)
@@ -293,8 +328,8 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// outage says nothing about the chain. A node going out is warned about
     /// with the first field that differs, then again at most once per epoch.
     ///
-    /// Returns one answer per node asked, with its position, so the caller
-    /// can follow the schedule the compatible ones serve.
+    /// Returns one answer per node asked, with its position. The schedule is
+    /// followed from [`Self::served_configs`], which this keeps current.
     pub async fn check_nodes(
         &self,
         ours: &ChainId,
@@ -305,7 +340,11 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             .nodes
             .iter()
             .enumerate()
-            .filter(|(position, _)| scope == CheckScope::All || !self.is_usable(*position))
+            .filter(|(position, _)| {
+                scope == CheckScope::All
+                    || !self.is_usable(*position)
+                    || self.unanswered[*position].load(Ordering::Relaxed)
+            })
             .collect();
         let asked =
             futures_util::future::join_all(selected.iter().map(|(_, node)| ask(*node))).await;

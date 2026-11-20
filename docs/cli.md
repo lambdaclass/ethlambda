@@ -390,9 +390,10 @@ changes and then at most once per epoch. If no node is usable, every request
 fails with an error that says no configured node is on the client's chain.
 
 A background task, separate from the duty loop, repeats the check: every slot for
-the nodes not in use, and for every node at the first slot of each epoch. After
-the startup check and each epoch check, a fork the compatible nodes schedule and
-the client does not have yet is adopted by the
+the nodes not in use and the ones that did not answer their last check, and for
+every node at the first slot of each epoch. After the startup check, each epoch
+check, and any check in between that finds a node on the client's chain, a fork
+the compatible nodes schedule and the client does not have yet is adopted by the
 slot clock and every signing domain together, and the client logs at `warn`
 which fields moved. A fork scheduled by one node and not another takes the
 lowest epoch, with a warning naming the nodes; the node without it stops being
