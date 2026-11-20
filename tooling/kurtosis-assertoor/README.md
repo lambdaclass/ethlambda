@@ -23,7 +23,7 @@ in `network_params.yaml`; bump them together.
 
 ## Run it locally
 
-Needs Docker and the kurtosis CLI (CI uses 1.20.0). From the repository root:
+Needs Docker and the kurtosis CLI (CI uses 1.23.0). From the repository root:
 
 ```bash
 git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package

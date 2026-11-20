@@ -28,7 +28,7 @@ concurrency:
 
 env:
   IMAGE_REPO: ghcr.io/lambdaclass/ethlambda
-  KURTOSIS_VERSION: "1.20.0"
+  KURTOSIS_VERSION: "1.23.0"
   # The fork of ethpandaops/ethereum-package that adds `cl_type: ethlambda` and
   # `vc_type: ethlambda`, pinned to a commit. Bump it deliberately.
   ETHEREUM_PACKAGE_REPO: https://github.com/lambdaclass/ethereum-package.git
