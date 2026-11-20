@@ -96,7 +96,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use blst::min_pk::{AggregateSignature, PublicKey, Signature};
+use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
 use blst::{BLST_ERROR, MultiPoint};
 use rayon::prelude::*;
 
@@ -264,7 +264,7 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
     points.into_iter().collect()
 }
 
-/// The sum of `points` as one public key, or `None` for an empty slice.
+/// The sum of `points` as a projective point, or `None` for an empty slice.
 ///
 /// Every point must already have passed [`PublicKey::key_validate`] (they come
 /// from [`validated_pubkeys`]), so the sum skips re-checking them. It goes
@@ -274,6 +274,11 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
 /// way folding the keys one by one through blst's `AggregatePublicKey::aggregate`
 /// does. A committee's key sum is the largest cost left in verifying an
 /// attestation once the keys are cached, so this is where the saving is.
+///
+/// The result stays projective, which is the form `add_aggregate` and
+/// `sub_aggregate` take: [`AggregatePubkey`] adds and subtracts such sums and
+/// would pay a field inversion per conversion to affine and back. Callers that
+/// need an affine key convert once, as [`sum_validated_points`] does.
 ///
 /// The batched routine handles equal points (`P + P` is a doubling, and sync
 /// committees are drawn with replacement, so one sum can name the same key
@@ -286,14 +291,22 @@ fn validated_pubkeys(pubkeys: &[BlsPubkey]) -> Option<Vec<PublicKey>> {
 /// is the same either way, so the caller needs no size check.
 ///
 /// The empty slice is guarded here because `MultiPoint::add` indexes the
-/// slice's first element and would panic on it. A single point is its own
-/// sum, so an aggregate with one signer skips the batched routine and its
+/// slice's first element and would panic on it.
+fn sum_validated_projective(points: &[PublicKey]) -> Option<AggregatePublicKey> {
+    if points.is_empty() {
+        return None;
+    }
+    Some(MultiPoint::add(points))
+}
+
+/// The sum of `points` as one affine public key, or `None` for an empty
+/// slice: [`sum_validated_projective`] converted once. A single point is its
+/// own sum, so an aggregate with one signer skips the batched routine and its
 /// conversion back to affine coordinates.
 fn sum_validated_points(points: &[PublicKey]) -> Option<PublicKey> {
     match points {
-        [] => None,
         [single] => Some(*single),
-        _ => Some(MultiPoint::add(points).to_public_key()),
+        _ => sum_validated_projective(points).map(|sum| sum.to_public_key()),
     }
 }
 
@@ -460,6 +473,9 @@ pub fn eth_fast_aggregate_verify(
 pub fn key_validate(pubkey: &BlsPubkey) -> bool {
     validated_pubkey(pubkey).is_some()
 }
+
+mod committee_sums;
+pub use committee_sums::{AggregatePubkey, CommitteeKeySums};
 
 #[cfg(test)]
 mod tests {
