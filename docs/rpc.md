@@ -1085,6 +1085,7 @@ these are ever sent:
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `fast_confirmation` | `{"block":"0x…", "slot":"1", "current_slot":"2"}` | The Fast Confirmation Rule ran, once per slot at the slot's tick, whether or not the confirmed block changed. `block` and `slot` are the most recent confirmed block's (after a restart or a slot without a run, the restored one while it wins), `current_slot` the slot of the run. Not sent while the head is more than 32 slots behind the wall clock, nor for a slot whose tick ran past its attestation deadline (the rule is not run then) |
 | `execution_payload` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}` | The chain actor imported a gloas envelope (from gossip, req/resp or `POST /eth/v1/beacon/execution_payload_envelopes`). `execution_optimistic` is the envelope rule of "`execution_optimistic` under gloas": true when the execution client answered `SYNCING` or `ACCEPTED` |
 | `execution_payload_gossip` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…"}` | An envelope passed the `execution_payload` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_envelopes` |
 | `execution_payload_available` | `{"slot":"10", "block_root":"0x…"}` | Right after `execution_payload` (see below) |
@@ -1096,7 +1097,7 @@ Never emitted: `single_attestation` (subnet votes are verified and relayed but
 never reach the chain actor), the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
 `contribution_and_proof`: no operation pools), `payload_attributes`, the light
-client topics, `blob_sidecar`, and `fast_confirmation` (no producer).
+client topics and `blob_sidecar`.
 
 The gloas topics are emitted by whichever part of the node accepted the object,
 since several never reach the chain actor: the actor publishes `execution_payload`
