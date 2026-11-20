@@ -800,10 +800,15 @@ mod tests {
         );
         assert_eq!(after.0, before.0 + delta.previous());
         assert_eq!(after.1, before.1 + delta.current());
-        let slashed_share = (previous_committee.len() as u64 - 1) * preset::MAX_EFFECTIVE_BALANCE;
+        // Every previous-slot attester's balance but the slashed one's,
+        // summed rather than assumed equal.
+        let unslashed_share = previous_committee[1..]
+            .iter()
+            .map(|&index| state.validator(index).unwrap().effective_balance)
+            .sum::<u64>();
         assert_eq!(
             delta.previous(),
-            slashed_share,
+            unslashed_share,
             "the slashed attester adds nothing"
         );
     }
