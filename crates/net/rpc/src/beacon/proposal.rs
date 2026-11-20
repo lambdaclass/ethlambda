@@ -49,7 +49,7 @@ use ethlambda_state_transition::beacon::{
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
-use ethlambda_storage::Store;
+use ethlambda_storage::{PubkeyIndexCache, Store};
 use ethlambda_types::{
     beacon::{
         builder::{BlindedBeaconBlock, BuilderBid, ValidatorRegistrationV1},
@@ -763,6 +763,9 @@ async fn produce(
         Ok(parts) => (Some(parts), None),
         Err(err) => (None, Some(err)),
     };
+    // The store's shared pubkey table: a fresh one would ingest the whole
+    // registry on the block's first lookup, every proposal.
+    let pubkey_indices = store.pubkey_index_cache();
     for source in order {
         match source {
             Source::Builder => {
@@ -772,6 +775,7 @@ async fn produce(
                 let blinded = blinded_block(
                     &state,
                     &config,
+                    &pubkey_indices,
                     message,
                     &packed,
                     randao_reveal,
@@ -807,6 +811,7 @@ async fn produce(
                     randao_reveal,
                     graffiti,
                     &config,
+                    &pubkey_indices,
                     options,
                     slot,
                 );
@@ -934,6 +939,7 @@ fn local_block(
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
     options: BlockProcessingOptions,
     slot: Slot,
 ) -> Result<(FuluBlockContents, Uint256), ApiError> {
@@ -961,6 +967,7 @@ fn local_block(
             packed.sync_aggregate.clone(),
         ),
         config,
+        pubkey_indices,
         options,
     ) {
         Ok(block) => block,
@@ -974,6 +981,7 @@ fn local_block(
                 state,
                 inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
                 config,
+                pubkey_indices,
                 options,
             )
             .map_err(|err| {
@@ -1147,6 +1155,7 @@ fn accepted_bid(
 fn blinded_block(
     state: &BeaconState,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
     message: BuilderBid,
     packed: &Packed,
     randao_reveal: BlsSignature,
@@ -1168,6 +1177,7 @@ fn blinded_block(
                 sync_aggregate,
             },
             config,
+            pubkey_indices,
             options,
         )
     };
