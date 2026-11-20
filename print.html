@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0a283714.js";
+            window.path_to_searchindex_js = "searchindex-55c98210.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -6002,6 +6002,7 @@ these are ever sent:</p>
 <tr><td><code>finalized_checkpoint</code></td><td><code>{"block":"0x…", "state":"0x…", "epoch":"2", "execution_optimistic":false}</code></td><td>The finalized checkpoint advanced</td></tr>
 <tr><td><code>chain_reorg</code></td><td><code>{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}</code></td><td>The new head does not descend from the previous one</td></tr>
 <tr><td><code>attestation</code></td><td>the aggregate’s <code>Attestation</code></td><td>An aggregate passed the <code>beacon_aggregate_and_proof</code> rules: accepted from gossip, or submitted through <code>POST /eth/v2/validator/aggregate_and_proofs</code></td></tr>
+<tr><td><code>single_attestation</code></td><td><code>{"committee_index":"1", "attester_index":"1", "data":&lt;AttestationData&gt;, "signature":"0x…"}</code></td><td>A subnet attestation passed the <code>beacon_attestation_{subnet_id}</code> gossip rules, or was accepted by <code>POST /eth/v2/beacon/pool/attestations</code>. This is the highest-rate topic (every attestation on the node’s backbone subnets). Nothing is built while no client is connected, but a client subscribed to any topic turns it on: all topics share one ring, so a client that stalls lags that much sooner</td></tr>
 <tr><td><code>data_column_sidecar</code></td><td><code>{"block_root":"0x…", "index":"1", "slot":"1"}</code></td><td>A column this node custodies is stored, from any source</td></tr>
 <tr><td><code>fast_confirmation</code></td><td><code>{"block":"0x…", "slot":"1", "current_slot":"2"}</code></td><td>The Fast Confirmation Rule ran, once per slot at the slot’s tick, whether or not the confirmed block changed. <code>block</code> and <code>slot</code> are the most recent confirmed block’s (after a restart or a slot without a run, the restored one while it wins), <code>current_slot</code> the slot of the run. Not sent while the head is more than 32 slots behind the wall clock, nor for a slot whose tick ran past its attestation deadline (the rule is not run then)</td></tr>
 <tr><td><code>execution_payload</code></td><td><code>{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}</code></td><td>The chain actor imported a gloas envelope (from gossip, req/resp or <code>POST /eth/v1/beacon/execution_payload_envelopes</code>). <code>execution_optimistic</code> is the envelope rule of “<code>execution_optimistic</code> under gloas”: true when the execution client answered <code>SYNCING</code> or <code>ACCEPTED</code></td></tr>
@@ -6013,17 +6014,17 @@ these are ever sent:</p>
 </tbody>
 </table>
 </div>
-<p>Never emitted: <code>single_attestation</code> (subnet votes are verified and relayed but
-never reach the chain actor), the operation topics (<code>voluntary_exit</code>,
+<p>Never emitted: the operation topics (<code>voluntary_exit</code>,
 <code>proposer_slashing</code>, <code>attester_slashing</code>, <code>bls_to_execution_change</code>,
 <code>contribution_and_proof</code>: no operation pools), <code>payload_attributes</code>, the light
 client topics and <code>blob_sidecar</code>.</p>
-<p>The gloas topics are emitted by whichever part of the node accepted the object,
-since several never reach the chain actor: the actor publishes <code>execution_payload</code>
-and <code>execution_payload_available</code>; p2p publishes the gossip-accepted
-<code>execution_payload_gossip</code>, <code>execution_payload_bid</code>,
-<code>payload_attestation_message</code> and <code>proposer_preferences</code>; and the API handlers
-publish what a validator client or builder submits.</p>
+<p>The gloas topics and <code>single_attestation</code> are emitted by whichever part of the
+node accepted the object, since several never reach the chain actor: the actor
+publishes <code>execution_payload</code> and <code>execution_payload_available</code>; p2p publishes
+the gossip-accepted <code>execution_payload_gossip</code>, <code>execution_payload_bid</code>,
+<code>payload_attestation_message</code>, <code>proposer_preferences</code> and <code>single_attestation</code>
+(subnet attestations are relayed, never applied); and the API handlers publish
+what a validator client or builder submits.</p>
 <p><strong><code>execution_payload_available</code> is not a separate moment.</strong> The specification
 asks for it when the payload and its blobs are verified available. The chain
 actor imports an envelope only once both hold (the payload verified, and every
