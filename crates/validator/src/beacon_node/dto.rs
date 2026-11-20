@@ -119,6 +119,16 @@ pub struct DutiesResponse<T> {
     pub data: T,
 }
 
+/// The beacon-APIs `ErrorMessage` schema, the body of a failed request.
+///
+/// Read only where a success status may carry it: behind a proxy that drops
+/// the node's status (see `HttpBeaconNode::relayed_error`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ErrorMessageDto {
+    pub code: u16,
+    pub message: String,
+}
+
 /// The beacon-APIs `IndexedErrorMessage` schema: a batch endpoint answers 400
 /// with this when some, but not necessarily all, of what was submitted was
 /// rejected. `POST /eth/v2/beacon/pool/attestations` still stores and

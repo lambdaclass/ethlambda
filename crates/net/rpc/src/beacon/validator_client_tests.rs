@@ -902,8 +902,11 @@ type Relayed = Arc<std::sync::Mutex<Vec<String>>>;
 /// it, and what it relayed.
 ///
 /// Like blobber, it rewrites `Accept` to `application/json` on
-/// `produceBlockV3` and hands the node's answer back unchanged, headers
-/// included. Every other request passes through as it came.
+/// `produceBlockV3` and hands the node's headers and body back unchanged, but
+/// not its status: blobber's `proxyHandler` never writes the upstream status,
+/// so every answer it relays there is a 200, a failure included. Every other
+/// request passes through as it came, status and all, as blobber's plain
+/// reverse proxy passes it.
 async fn blobber(node: std::net::SocketAddr) -> (HttpBeaconNode, Relayed) {
     use axum::body::{Body, Bytes};
     use axum::extract::State;
@@ -940,7 +943,11 @@ async fn blobber(node: std::net::SocketAddr) -> (HttpBeaconNode, Relayed) {
             .await
             .unwrap();
 
-        let status = answer.status();
+        let status = if produces {
+            axum::http::StatusCode::OK
+        } else {
+            answer.status()
+        };
         let mut answer_headers = answer.headers().clone();
         answer_headers.remove(header::CONTENT_LENGTH);
         answer_headers.remove(header::TRANSFER_ENCODING);
@@ -988,6 +995,29 @@ async fn the_validator_client_can_propose_through_blobber() {
         p.network.sidecars.lock().unwrap().len(),
         preset::NUMBER_OF_COLUMNS
     );
+}
+
+/// [`block_production_without_an_execution_client_is_retryable`] behind
+/// blobber: the node's 503 reaches the client as a 200 carrying the node's
+/// error message, and the client still reads it as a node to fail over from,
+/// not as a malformed block.
+#[tokio::test]
+async fn a_node_failing_block_production_behind_blobber_is_still_syncing() {
+    let (_, state, _, address, _) = serve_at(None).await;
+    let (through_blobber, relayed) = blobber(address).await;
+    let request = BlockRequest {
+        slot: state.slot() + 1,
+        fork: ForkName::Fulu,
+        proposer_index: 0,
+        randao_reveal: Default::default(),
+        graffiti: Default::default(),
+        builder_boost_factor: None,
+        builder_min_bid: 0,
+    };
+    let err = through_blobber.produce_block(&request).await.unwrap_err();
+    assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
+    assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+    assert!(err.is_retryable());
 }
 
 /// A voluntary exit in the node's pool rides in the block it produces. The

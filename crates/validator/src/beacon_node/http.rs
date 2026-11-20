@@ -40,10 +40,10 @@ use libssz::SszDecode as _;
 use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
-    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
-    ProduceBlockV3Response, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
-    SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
-    SyncingDto, ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse,
+    CommitteeSubscriptionDto, DataResponse, DutiesResponse, ErrorMessageDto, GenesisDto,
+    IndexedErrorResponse, ProduceBlockV3Response, ProposerDutyDto, ProposerPreparationDto,
+    PtcDutyDto, SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto,
+    SyncDutyDto, SyncingDto, ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse,
     config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
@@ -538,6 +538,9 @@ impl HttpBeaconNode {
     /// root that is not the block's; as an `Err` it is one failover moves past.
     /// When neither is present the answer is refused, as an SSZ answer missing
     /// the header is.
+    ///
+    /// A body that is not a block answer but the specification's error
+    /// message is the error it reports (see [`Self::relayed_error`]).
     async fn json_block_answer(url: String, response: reqwest::Response) -> Result<BlockAnswer> {
         let header_version = Self::header(&response, "eth-consensus-version");
         let header_blinded = Self::bool_header(
@@ -545,8 +548,10 @@ impl HttpBeaconNode {
             "Blinded",
         )?;
         let bytes = Self::answer_bytes(url, response).await?;
-        let answer: ProduceBlockV3Response = serde_json::from_slice(&bytes)
-            .map_err(|err| Error::Decode(format!("produceBlockV3 JSON answer: {err}")))?;
+        let answer: ProduceBlockV3Response = serde_json::from_slice(&bytes).map_err(|err| {
+            Self::relayed_error(&bytes)
+                .unwrap_or_else(|| Error::Decode(format!("produceBlockV3 JSON answer: {err}")))
+        })?;
 
         let fork = match (answer.version, header_version) {
             (Some(version), Some(header)) => {
@@ -590,6 +595,30 @@ impl HttpBeaconNode {
             fork,
             blinded,
             body: BlockBody::Json(answer.data),
+        })
+    }
+
+    /// The error a success answer's body reports, when the body is the
+    /// specification's `ErrorMessage` with a 4xx or 5xx `code`: what
+    /// [`Self::send_for_answer`] would have returned had the status said it.
+    ///
+    /// blobber (`validator_proxy/proxy.go`, `proxyHandler`) relays the node's
+    /// headers and body but never its status, so a node failing
+    /// `produceBlockV3` behind it answers `200 application/json` with the
+    /// failure in the body. Read as a block answer that is a missing `data`, a
+    /// malformed block rather than the node's own error, and a syncing node
+    /// would stop being reported as one.
+    fn relayed_error(bytes: &[u8]) -> Option<Error> {
+        let error: ErrorMessageDto = serde_json::from_slice(bytes).ok()?;
+        if !(400..600).contains(&error.code) {
+            return None;
+        }
+        if error.code == StatusCode::SERVICE_UNAVAILABLE.as_u16() {
+            return Some(Error::BeaconNodeSyncing);
+        }
+        Some(Error::BeaconNodeStatus {
+            status: error.code,
+            body: error_text(&String::from_utf8_lossy(bytes)),
         })
     }
 
@@ -2068,6 +2097,197 @@ mod tests {
             .await
             .expect_err("neither encoding asked for");
         assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    /// blobber relays a failed `produceBlockV3` under a 200: the error message
+    /// in the body is the error, as its status would have been, and a 503 in
+    /// it is still the node syncing.
+    #[tokio::test]
+    async fn an_error_message_relayed_under_a_success_is_the_error_it_reports() {
+        let headers = || vec![("content-type", "application/json")];
+        let syncing = br#"{"code":503,"message":"Beacon node is currently syncing"}"#;
+        let served = serve(200, headers(), syncing.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the node failed");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+
+        let failed = br#"{"code":500,"message":"Failed to produce block"}"#;
+        let served = serve(200, headers(), failed.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the node failed");
+        let Error::BeaconNodeStatus { status, body } = err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(status, 500);
+        assert!(body.contains("Failed to produce block"), "{body}");
+
+        // A `code` that is not a failure is no error message; the answer is
+        // a malformed block answer, as before.
+        let not_an_error = br#"{"code":200,"message":"ok"}"#;
+        let served = serve(200, headers(), not_an_error.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("no block");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// A builder-specs example vendored in `ethlambda-types` (see that
+    /// directory's README): JSON and SSZ for one object, written by neither
+    /// this client nor an ethlambda node.
+    macro_rules! builder_specs_example {
+        ($path:literal) => {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../common/types/tests/fixtures/builder_specs/",
+                $path
+            ))
+        };
+    }
+
+    /// The object an example `.json` holds under OpenAPI's `value` wrapper.
+    fn example_value(json: &[u8]) -> serde_json::Value {
+        let mut document: serde_json::Value = serde_json::from_slice(json).expect("json");
+        document["value"].take()
+    }
+
+    /// The fulu blinded block example, decoded from its SSZ, and its
+    /// `message` as JSON.
+    fn blinded_block_example() -> (
+        ethlambda_types::beacon::builder::BlindedBeaconBlock,
+        serde_json::Value,
+    ) {
+        use ethlambda_types::beacon::builder::SignedBlindedBeaconBlock;
+        use libssz::SszDecode as _;
+
+        let ssz = builder_specs_example!("fulu/signed_blinded_beacon_block.ssz");
+        let signed = SignedBlindedBeaconBlock::from_ssz_bytes(ssz).expect("the SSZ decodes");
+        let json = builder_specs_example!("fulu/signed_blinded_beacon_block.json");
+        let message = example_value(json)["message"].take();
+        (signed.message, message)
+    }
+
+    /// builder-specs' `ExecutionPayloadAndBlobsBundle` at fulu, for decoding
+    /// its example's SSZ. A module of its own because the SSZ derive names a
+    /// bare `Result`, which `use super::*` would make this crate's.
+    mod the_bundle {
+        use crate::beacon_node::block_contents::{Blobs, CellKzgProofs};
+        use ethlambda_types::beacon::containers::deneb::{ExecutionPayload, KzgCommitments};
+
+        /// `BlobsBundle` at fulu: one proof per cell.
+        #[derive(libssz_derive::SszDecode)]
+        pub struct BlobsBundle {
+            pub commitments: KzgCommitments,
+            pub proofs: CellKzgProofs,
+            pub blobs: Blobs,
+        }
+
+        #[derive(libssz_derive::SszDecode)]
+        pub struct ExecutionPayloadAndBlobsBundle {
+            pub execution_payload: ExecutionPayload,
+            pub blobs_bundle: BlobsBundle,
+        }
+    }
+
+    /// A request the example block answers: its own slot and proposer.
+    fn request_for(
+        block: &ethlambda_types::beacon::builder::BlindedBeaconBlock,
+        factor: Option<u64>,
+    ) -> BlockRequest {
+        BlockRequest {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            ..block_request(factor)
+        }
+    }
+
+    /// The JSON path checked against JSON this repository did not write: the
+    /// builder-specs blinded block, every list in its body populated, decodes
+    /// as a blinded `produceBlockV3` answer into the block its SSZ gives.
+    #[tokio::test]
+    async fn the_builder_specs_blinded_block_decodes_from_json_as_from_ssz() {
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        use libssz::SszEncode as _;
+
+        let (expected, data) = blinded_block_example();
+        let reply = json_answer(Some("fulu"), Some(true), data);
+        let served = serve(200, json_headers("fulu", "true"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&request_for(&expected, Some(100)))
+            .await
+            .expect("decodes");
+
+        let from_ssz = ProducedBlock::from_blinded_ssz(ForkName::Fulu, &expected.to_ssz())
+            .expect("the SSZ decodes");
+        assert_eq!(produced, from_ssz);
+        assert_eq!(produced.block_root(), expected.hash_tree_root());
+    }
+
+    /// `the_builder_specs_blinded_block_decodes_from_json_as_from_ssz` for a
+    /// full fulu block: the example block around the builder-specs
+    /// payload, with that example's cell proofs and blob. Each part is held to
+    /// its own example's SSZ: everything but the payload to the blinded
+    /// block's, the payload and blob material to the bundle's.
+    #[tokio::test]
+    async fn the_builder_specs_full_block_decodes_from_json_as_from_ssz() {
+        use crate::beacon_node::block_contents::Contents;
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+        use libssz::SszDecode as _;
+        use the_bundle::ExecutionPayloadAndBlobsBundle;
+
+        let (blinded, mut block) = blinded_block_example();
+        let ssz = builder_specs_example!("fulu/execution_payload_and_blobs_bundle.ssz");
+        let bundle = ExecutionPayloadAndBlobsBundle::from_ssz_bytes(ssz).expect("the SSZ decodes");
+        let json = builder_specs_example!("fulu/execution_payload_and_blobs_bundle.json");
+        let mut bundle_json = example_value(json)["data"].take();
+
+        let body = block["body"].as_object_mut().expect("a body");
+        body.remove("execution_payload_header")
+            .expect("a blinded body");
+        body.insert(
+            "execution_payload".to_string(),
+            bundle_json["execution_payload"].take(),
+        );
+        let data = serde_json::json!({
+            "block": block,
+            "kzg_proofs": bundle_json["blobs_bundle"]["proofs"].take(),
+            "blobs": bundle_json["blobs_bundle"]["blobs"].take(),
+        });
+        let reply = json_answer(Some("fulu"), Some(false), data);
+        let served = serve(200, json_headers("fulu", "false"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&request_for(&blinded, None))
+            .await
+            .expect("decodes");
+
+        let Contents::WithCellProofs {
+            block,
+            kzg_proofs,
+            blobs,
+        } = produced.contents
+        else {
+            panic!("a fulu block with cell proofs, got {:?}", produced.contents);
+        };
+        let header = blinded.body.execution_payload_header.clone();
+        assert_eq!(
+            BlindedBeaconBlock::from_parts(block.clone(), header),
+            blinded
+        );
+        assert_eq!(block.body.execution_payload, bundle.execution_payload);
+        assert_eq!(kzg_proofs, bundle.blobs_bundle.proofs);
+        assert_eq!(blobs, bundle.blobs_bundle.blobs);
+        // The two examples are independent, so the bundle's commitments are
+        // not the block's; it carries one per blob all the same.
+        assert_eq!(bundle.blobs_bundle.commitments.len(), blobs.len());
     }
 
     #[tokio::test]
