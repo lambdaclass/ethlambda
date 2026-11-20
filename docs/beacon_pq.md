@@ -301,7 +301,11 @@ it:
    milliseconds on a young chain.
 3. The whole tree, hashed. It keeps the `2^15` nodes 16 levels above the
    leaves (1 MiB, commitments only, so no secret), and a proof rebuilds one
-   `2^16`-leaf subtree, about 30 ms.
+   `2^16`-leaf subtree, about 30 ms. The hashing runs in a rayon pool of its
+   own, one thread short of the cores: leanXMSS signing parallelizes on
+   rayon's global pool, which runs a job from outside it only once a
+   worker's queue is empty, so a tree hashed there held every attestation,
+   aggregate and PTC vote signature until it was done.
 
 Whatever the source, the tree is stored for the next start. A proposal that
 falls before its key's tree is ready is missed (`the VRF tree is still being
@@ -309,9 +313,11 @@ hashed`).
 
 Each duty signs at the leaf the fork assigns it (see [Leaves](#leaves)): the
 attestation at its target epoch's, the others at the slot's own offset. The
-client refuses to sign two different roots at one leaf. That record is in
-memory; across a restart, slashing protection still guards attestations and
-proposals, the two that slashing punishes.
+client refuses to sign two different roots at one leaf, and keeps the record
+in `<validators-dir>/pq_signed_leaves.bin`, each leaf written and synced
+before its signature exists, so a restart cannot sign a leaf twice either.
+A start drops the leaves of slots more than two epochs back, which nothing
+asks for again.
 
 - **Attesting**: a `SingleAttestation` signed at the target epoch's leaf,
   published on one of PQ's 16 subnets.
