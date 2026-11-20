@@ -1337,30 +1337,39 @@ impl BeaconNodeApi for HttpBeaconNode {
             .await
     }
 
-    /// Asks this node whether it is syncing first, per the trait's contract:
-    /// the answer that clears a key must come from a node that has the
-    /// chain, and only this node's own status says whether this one does.
-    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
-        if indices.is_empty() {
-            return Ok(Vec::new());
+    /// Asks this node whether it is syncing first, once for every epoch, per
+    /// the trait's contract: the answer that clears a key must come from a
+    /// node that has the chain, and only this node's own status says whether
+    /// this one does. The epochs are then asked about at once.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        if indices.is_empty() || epochs.is_empty() {
+            return Ok(vec![Vec::new(); epochs.len()]);
         }
         if self.is_optimistic_or_syncing().await? {
             return Err(Error::BeaconNodeSyncing);
         }
         let body: Vec<String> = indices.iter().map(ValidatorIndex::to_string).collect();
-        let response: DataResponse<Vec<LivenessDto>> = self
-            .post(&format!("/eth/v1/validator/liveness/{epoch}"), &body, None)
-            .await?;
-        let answers: Vec<Liveness> = response
-            .data
-            .into_iter()
-            .map(|entry| Liveness {
-                index: entry.index,
-                is_live: entry.is_live,
-            })
-            .collect();
-        validate_liveness(indices, &answers)?;
-        Ok(answers)
+        let body = &body;
+        let queries = epochs.iter().map(|epoch| async move {
+            let response: DataResponse<Vec<LivenessDto>> = self
+                .post(&format!("/eth/v1/validator/liveness/{epoch}"), body, None)
+                .await?;
+            let answers: Vec<Liveness> = response
+                .data
+                .into_iter()
+                .map(|entry| Liveness {
+                    index: entry.index,
+                    is_live: entry.is_live,
+                })
+                .collect();
+            validate_liveness(indices, &answers)?;
+            Ok(answers)
+        });
+        futures_util::future::try_join_all(queries).await
     }
 }
 
@@ -1992,10 +2001,10 @@ mod tests {
             { "index": "3", "is_live": false },
         ]});
         let (node, seen) = serve_liveness(false, reply).await;
-        let answers = node.liveness(12, &[3, 7]).await.expect("answers");
+        let answers = node.liveness(&[12], &[3, 7]).await.expect("answers");
         assert_eq!(
             answers,
-            vec![
+            vec![vec![
                 Liveness {
                     index: 7,
                     is_live: true
@@ -2004,12 +2013,36 @@ mod tests {
                     index: 3,
                     is_live: false
                 },
-            ]
+            ]]
         );
         let seen = seen.lock().expect("lock");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, "/eth/v1/validator/liveness/12");
         assert_eq!(seen[0].1, serde_json::json!(["3", "7"]));
+    }
+
+    /// One request per epoch, each answer kept in the order the epochs
+    /// were named.
+    #[tokio::test]
+    async fn liveness_asks_about_each_epoch() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, seen) = serve_liveness(false, reply).await;
+        let answers = node.liveness(&[11, 12], &[3]).await.expect("answers");
+        assert_eq!(answers.len(), 2);
+        let mut paths: Vec<String> = seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/eth/v1/validator/liveness/11".to_string(),
+                "/eth/v1/validator/liveness/12".to_string(),
+            ]
+        );
     }
 
     /// A syncing node is not asked: its "nobody is live" would clear keys
@@ -2018,7 +2051,7 @@ mod tests {
     async fn a_syncing_node_is_not_asked_about_liveness() {
         let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
         let (node, seen) = serve_liveness(true, reply).await;
-        let err = node.liveness(12, &[3]).await.expect_err("syncing");
+        let err = node.liveness(&[12], &[3]).await.expect_err("syncing");
         assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
         assert!(seen.lock().expect("lock").is_empty());
     }
@@ -2028,14 +2061,15 @@ mod tests {
     async fn a_liveness_answer_missing_an_index_is_refused() {
         let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
         let (node, _) = serve_liveness(false, reply).await;
-        let err = node.liveness(12, &[3, 7]).await.expect_err("incomplete");
+        let err = node.liveness(&[12], &[3, 7]).await.expect_err("incomplete");
         assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn no_liveness_request_is_sent_for_no_indices() {
         let (node, seen) = serve_liveness(false, serde_json::json!({ "data": [] })).await;
-        assert!(node.liveness(12, &[]).await.expect("empty").is_empty());
+        let answers = node.liveness(&[12], &[]).await.expect("empty");
+        assert_eq!(answers, vec![Vec::new()]);
         assert!(seen.lock().expect("lock").is_empty());
     }
 }

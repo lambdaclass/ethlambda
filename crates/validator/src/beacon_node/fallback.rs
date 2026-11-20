@@ -780,11 +780,20 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     /// First answer wins. A syncing node answers `BeaconNodeSyncing` (see
-    /// the trait's contract), which `try_each` walks past like any failure,
-    /// so a node that has not caught up never clears a key while one behind
-    /// it in the list has the chain.
-    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
-        self.try_each("liveness", |node| node.liveness(epoch, indices))
+    /// the trait's contract), which the walk passes like any failure, so a
+    /// node that has not caught up never clears a key while one behind it in
+    /// the list has the chain. One walk for every epoch, so the answers that
+    /// are combined into one decision all come from the same node.
+    ///
+    /// Quiet: no duty depends on the answer, and the doppelganger check
+    /// reports its own failures, so a node without the endpoint must not
+    /// claim a missed duty every slot.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        self.try_each_quiet("liveness", |node| node.liveness(epochs, indices))
             .await
     }
 }
@@ -928,16 +937,32 @@ mod tests {
         seeing.live.lock().expect("lock").push((12, 7));
         let fallback = FallbackBeaconNode::new(vec![syncing, seeing]);
 
-        let answers = fallback.liveness(12, &[7]).await.expect("answers");
+        let answers = fallback.liveness(&[12], &[7]).await.expect("answers");
         assert_eq!(
             answers,
-            vec![Liveness {
+            vec![vec![Liveness {
                 index: 7,
                 is_live: true
-            }]
+            }]]
         );
         assert!(fallback.nodes[0].liveness_requests().is_empty());
         assert_eq!(fallback.nodes[1].liveness_requests(), vec![(12, vec![7])]);
+    }
+
+    /// Both epochs come from one node: a node that fails is walked past for
+    /// both, and the next node is asked about both.
+    #[tokio::test]
+    async fn liveness_answers_every_epoch_from_one_node() {
+        let flaky = MockBeaconNode::new().failing_call("liveness", "down");
+        let fallback = FallbackBeaconNode::new(vec![flaky, MockBeaconNode::new()]);
+
+        let answers = fallback.liveness(&[11, 12], &[7]).await.expect("answers");
+        assert_eq!(answers.len(), 2);
+        assert!(fallback.nodes[0].liveness_requests().is_empty());
+        assert_eq!(
+            fallback.nodes[1].liveness_requests(),
+            vec![(11, vec![7]), (12, vec![7])]
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,12 @@
 //! within the epoch, and counting it would stop every restart.
 //!
 //! The check runs three quarters into every slot and asks about the previous
-//! epoch and the current one. A key found live in any epoch it is watched for
+//! epoch and the current one, leaving out either when no key is watched for
+//! it yet (so nothing is asked during a key's registration epoch, and only
+//! the current epoch in the epoch after), and asks one beacon node both, so
+//! the answers it combines are one node's view. A tick that finds its slot
+//! already over asks nothing rather than ask about epochs a slot late. A key
+//! found live in any epoch it is watched for
 //! is a doppelganger, and the client stops (see [`Doppelganger::detected`]).
 //! An epoch counts as clean only from the last slot of the epoch after it:
 //! an attestation can be included up to the end of the following epoch, and
@@ -83,6 +88,7 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex};
+use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -169,11 +175,6 @@ pub struct Doppelganger {
     resolved_in: Mutex<Option<Epoch>>,
 }
 
-/// The epoch `clock` is in now; epoch 0 before genesis.
-pub fn current_epoch(clock: &SlotClock) -> Epoch {
-    clock.now().map_or(0, |slot| clock.epoch_of(slot))
-}
-
 impl Doppelganger {
     pub fn new() -> Self {
         Self::default()
@@ -184,13 +185,12 @@ impl Doppelganger {
     /// a key imported again may have been anywhere since it was last held.
     pub fn register(&self, pubkey: BlsPubkey, epoch: Epoch) {
         self.watched().insert(pubkey, Watch::registered_in(epoch));
-        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
     }
 
-    /// [`Self::register`] in the epoch `clock` is in now: what a keymanager
-    /// import does for each key it adds.
+    /// [`Self::register`] in the epoch `clock` is in now (epoch 0 before
+    /// genesis): what a keymanager import does for each key it adds.
     pub fn register_now(&self, pubkey: BlsPubkey, clock: &SlotClock) {
-        self.register(pubkey, current_epoch(clock));
+        self.register(pubkey, clock.current_epoch().unwrap_or(0));
     }
 
     /// Stop checking `pubkey`: what a keymanager delete does for each key it
@@ -200,7 +200,6 @@ impl Doppelganger {
     /// before it.
     pub fn forget(&self, pubkey: &BlsPubkey) {
         self.watched().remove(pubkey);
-        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
     }
 
     /// [`Self::register`] for every key, under one lock.
@@ -209,8 +208,6 @@ impl Doppelganger {
         for pubkey in pubkeys {
             watched.insert(*pubkey, Watch::registered_in(epoch));
         }
-        drop(watched);
-        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
     }
 
     /// Whether `pubkey` may sign an attestation, a block, a RANDAO reveal or
@@ -315,9 +312,21 @@ impl Doppelganger {
             .collect()
     }
 
+    /// The earliest epoch whose activity counts against any key still under
+    /// the check that has an index: an epoch before it has nothing to say
+    /// about any key asked about, so it is not asked about.
+    fn earliest_checked_epoch(&self) -> Option<Epoch> {
+        self.watched()
+            .values()
+            .filter(|watch| !watch.cleared() && watch.index.is_some())
+            .map(|watch| watch.first_checked_epoch)
+            .min()
+    }
+
     /// Apply one tick's answers, asked at `slot` about `asked`: the previous
-    /// epoch's (`None` in epoch 0, where there is none, or when the query
-    /// failed) and the current one's (`None` when the query failed).
+    /// epoch's (`None` in epoch 0, where there is none, when no key is
+    /// watched for it, or when the query failed) and the current one's
+    /// (`None` when the query failed).
     ///
     /// A key answered live in an epoch it is watched for is a sighting,
     /// whichever question it came from. An epoch counts as clean only for an
@@ -331,7 +340,7 @@ impl Doppelganger {
         previous: Option<&[Liveness]>,
         current: Option<&[Liveness]>,
     ) -> Applied {
-        let epoch = slot / SLOTS_PER_EPOCH;
+        let epoch = compute_epoch_at_slot(slot);
         let mut applied = Applied::default();
         let mut watched = self.watched();
 
@@ -395,21 +404,52 @@ impl Doppelganger {
         applied
     }
 
-    /// One tick of the check, for `slot`.
-    ///
-    /// Asks nothing once every key has passed, or when the keys left have no
-    /// index yet: an empty index list is never sent, since some nodes refuse
-    /// one and none has anything to say about it.
+    /// One tick of the check, for `slot`, as if it were still `slot` however
+    /// long it takes: see [`Self::check_while_in_slot`].
     pub async fn check<B: BeaconNodeApi>(
         &self,
         beacon_node: &B,
         store: &RwLock<ValidatorStore>,
         slot: Slot,
     ) {
+        self.check_while_in_slot(beacon_node, store, slot, || true)
+            .await;
+    }
+
+    /// One tick of the check, for `slot`, given up before the liveness query
+    /// if `still_in_slot` says the slot is over. Waiting for the store or the
+    /// index lookup can carry a tick past its slot, and asking from a later
+    /// slot as if it were still this one would ask about the wrong epochs:
+    /// at the last slot of an epoch, about one the node may no longer answer
+    /// for faithfully.
+    ///
+    /// Asks nothing once every key has passed, or when the keys left have no
+    /// index yet: an empty index list is never sent, since some nodes refuse
+    /// one and none has anything to say about it.
+    pub async fn check_while_in_slot<B: BeaconNodeApi>(
+        &self,
+        beacon_node: &B,
+        store: &RwLock<ValidatorStore>,
+        slot: Slot,
+        still_in_slot: impl Fn() -> bool,
+    ) {
+        self.tick(beacon_node, store, slot, still_in_slot).await;
+        // The one place the gauge is set: every change to the watched keys,
+        // a keymanager's included, shows within a slot.
+        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
+    }
+
+    async fn tick<B: BeaconNodeApi>(
+        &self,
+        beacon_node: &B,
+        store: &RwLock<ValidatorStore>,
+        slot: Slot,
+        still_in_slot: impl Fn() -> bool,
+    ) {
         if self.is_detected() {
             return;
         }
-        let epoch = slot / SLOTS_PER_EPOCH;
+        let epoch = compute_epoch_at_slot(slot);
         {
             // Under the store's read guard, so a keymanager import (which
             // registers and inserts under the write guard) cannot land
@@ -444,7 +484,6 @@ impl Doppelganger {
 
         let asked = self.checked_indices();
         let detecting = self.detecting();
-        crate::metrics::set_doppelganger_detecting(detecting as u64);
         if detecting > 0 && slot.is_multiple_of(SLOTS_PER_EPOCH) {
             info!(
                 %epoch,
@@ -453,44 +492,57 @@ impl Doppelganger {
                 "Listening for doppelgangers; these validators sign no attestation or block yet"
             );
         }
-        if asked.is_empty() {
+        // An epoch before every asked key's first checked one can neither
+        // show a doppelganger nor count as clean, so it is not asked about:
+        // nothing in a key's registration epoch, and only the current epoch
+        // in the one after. Since the previous epoch is earlier than the
+        // current one, it is asked about only when the current one is too.
+        let Some(earliest) = self.earliest_checked_epoch() else {
+            return;
+        };
+        if asked.is_empty() || epoch < earliest {
             return;
         }
+        let previous_epoch = epoch
+            .checked_sub(1)
+            .filter(|&previous| previous >= earliest);
+        let epochs: Vec<Epoch> = previous_epoch.into_iter().chain([epoch]).collect();
         let mut indices: Vec<ValidatorIndex> = asked.keys().copied().collect();
         indices.sort_unstable();
 
-        // Both at once: through `HttpBeaconNode` each is a syncing check and
-        // then the query, and the tick at an epoch's last slot, the only one
-        // that can clear a key, should be done well before the next epoch's
-        // first duties.
-        let previous_epoch = epoch.checked_sub(1);
-        let ask_previous = async {
-            match previous_epoch {
-                Some(previous) => Some(beacon_node.liveness(previous, &indices).await),
-                None => None,
-            }
-        };
-        let (previous, current) = tokio::join!(ask_previous, beacon_node.liveness(epoch, &indices));
-        let failures: Vec<String> = previous_epoch
-            .zip(previous.as_ref())
-            .into_iter()
-            .chain([(epoch, &current)])
-            .filter_map(|(asked_epoch, answer)| {
-                let err = answer.as_ref().err()?;
-                Some(format!("epoch {asked_epoch}: {err}"))
-            })
-            .collect();
-        if !failures.is_empty() {
+        if !still_in_slot() {
             warn!(
                 %slot,
-                ?failures,
-                "Doppelganger liveness query failed; this tick counts no epoch as clean"
+                "Doppelganger check ran past its slot; skipping it rather than asking about \
+                 the epochs a slot late"
             );
+            return;
         }
-        let previous = previous.and_then(Result::ok);
-        let current = current.ok();
-        let applied = self.apply(slot, &asked, previous.as_deref(), current.as_deref());
-        crate::metrics::set_doppelganger_detecting(self.detecting() as u64);
+        // One call, so one node answers about both epochs: the answers are
+        // combined into one decision below, which must be one node's view.
+        let answers = beacon_node
+            .liveness(&epochs, &indices)
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    %slot,
+                    ?epochs,
+                    %err,
+                    "Doppelganger liveness query failed; this tick counts no epoch as clean"
+                );
+                crate::metrics::inc_doppelganger_check_failures();
+            })
+            .unwrap_or_default();
+        let (previous, current) = match previous_epoch {
+            Some(_) => (answers.first(), answers.get(1)),
+            None => (None, answers.first()),
+        };
+        let applied = self.apply(
+            slot,
+            &asked,
+            previous.map(Vec::as_slice),
+            current.map(Vec::as_slice),
+        );
 
         if !applied.sightings.is_empty() {
             let indices: Vec<ValidatorIndex> = applied.sightings.iter().map(|s| s.index).collect();
@@ -512,23 +564,24 @@ impl Doppelganger {
             );
             return;
         }
-        if !applied.progressed {
-            crate::metrics::inc_doppelganger_check_failures();
-            // Said at error once an epoch, at the one tick whose failure
-            // costs something: an operator whose node never answers (one
-            // without the endpoint, say) otherwise sees only missed
-            // attestations and a warning among many.
-            if (slot + 1).is_multiple_of(SLOTS_PER_EPOCH) {
-                error!(
-                    %slot,
-                    epoch = previous_epoch,
-                    validators = self.detecting(),
-                    "Doppelganger protection could not count this epoch as clean, for want of a \
-                     liveness answer: the validators under the check stay withheld at least \
-                     another epoch. A beacon node without /eth/v1/validator/liveness never \
-                     clears them"
-                );
-            }
+        // Said at error once an epoch, at the one tick whose failure costs
+        // something: an operator whose node never answers (one without the
+        // endpoint, say) otherwise sees only missed attestations and a
+        // warning among many. Only when the previous epoch was asked about:
+        // otherwise no key could have been cleared this tick anyway.
+        if previous_epoch.is_some()
+            && !applied.progressed
+            && (slot + 1).is_multiple_of(SLOTS_PER_EPOCH)
+        {
+            error!(
+                %slot,
+                epoch = previous_epoch,
+                validators = self.detecting(),
+                "Doppelganger protection could not count this epoch as clean, for want of a \
+                 liveness answer: the validators under the check stay withheld at least \
+                 another epoch. A beacon node without /eth/v1/validator/liveness never \
+                 clears them"
+            );
         }
         if !applied.cleared.is_empty() {
             info!(
@@ -588,7 +641,10 @@ pub async fn run<B: BeaconNodeApi>(
             continue;
         };
         tokio::time::sleep(wait).await;
-        doppelganger.check(&*beacon_node, &store, slot).await;
+        let still_in_slot = || clock.slot_at(SystemTime::now()) == Some(slot);
+        doppelganger
+            .check_while_in_slot(&*beacon_node, &store, slot, still_in_slot)
+            .await;
         last = Some(slot);
     }
 }
@@ -820,8 +876,8 @@ mod tests {
     }
 
     /// The whole loop against a node, one tick per slot: resolved once,
-    /// asked about both epochs with the indices quoted, and cleared at the
-    /// end of `E + 2`.
+    /// asked nothing in the registration epoch, only about the current epoch
+    /// in the next, about both in the one after, and cleared at its end.
     #[tokio::test]
     async fn checks_against_a_quiet_node_clear_the_key_at_the_end_of_the_second_epoch() {
         let node = node_with(&[(1, 7)]);
@@ -838,15 +894,21 @@ mod tests {
         assert_eq!(node.validator_indices_call_count(), 1, "resolved once");
 
         let asked = node.liveness_requests();
-        let ticks = (last_slot(E + 2) - first_slot(E) + 1) as usize;
-        assert_eq!(asked.len(), 2 * ticks, "previous and current, every slot");
-        assert_eq!(asked[0], (E - 1, vec![7]));
-        assert_eq!(asked[1], (E, vec![7]));
+        let per_epoch = SLOTS_PER_EPOCH as usize;
+        assert_eq!(
+            asked.len(),
+            per_epoch + 2 * per_epoch,
+            "nothing in E, the current epoch through E + 1, both through E + 2"
+        );
+        assert_eq!(asked[0], (E + 1, vec![7]));
+        assert_eq!(asked[per_epoch - 1], (E + 1, vec![7]));
+        assert_eq!(asked[per_epoch], (E + 1, vec![7]));
+        assert_eq!(asked[per_epoch + 1], (E + 2, vec![7]));
 
         doppelganger.check(&node, &store, first_slot(E + 3)).await;
         assert_eq!(
             node.liveness_requests().len(),
-            2 * ticks,
+            3 * per_epoch,
             "nothing is asked once every key has passed"
         );
     }
@@ -975,6 +1037,38 @@ mod tests {
         let clock = clock();
         let before = clock.start_of(0) - Duration::from_secs(5);
         assert_eq!(next_check(&clock, None, before), None);
+    }
+
+    /// A tick that finds its slot over before asking asks nothing, and
+    /// counts nothing: the next tick asks from the slot it is really in.
+    #[tokio::test]
+    async fn a_tick_past_its_slot_asks_nothing() {
+        let node = node_with(&[(1, 7)]);
+        let store = store_holding(&[1]);
+        let doppelganger = Doppelganger::new();
+        doppelganger.register(pubkey(1), E);
+
+        doppelganger
+            .check_while_in_slot(&node, &store, last_slot(E + 2), || false)
+            .await;
+        assert!(node.liveness_requests().is_empty());
+        assert!(!doppelganger.allows_signing(&pubkey(1)));
+    }
+
+    /// Both epochs come from one call, which fails as a whole and counts
+    /// nothing; the epoch is counted at its next chance instead.
+    #[tokio::test]
+    async fn a_failed_query_counts_nothing() {
+        let node = node_with(&[(1, 7)]).failing_call("liveness", "down");
+        let store = store_holding(&[1]);
+        let doppelganger = Doppelganger::new();
+        doppelganger.register(pubkey(1), E);
+
+        doppelganger.check(&node, &store, last_slot(E + 2)).await;
+        assert!(!doppelganger.allows_signing(&pubkey(1)));
+        node.stop_failing("liveness");
+        doppelganger.check(&node, &store, last_slot(E + 3)).await;
+        assert!(doppelganger.allows_signing(&pubkey(1)));
     }
 
     /// A deleted key is not checked: the copy the operator now runs

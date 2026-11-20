@@ -217,12 +217,11 @@ pub async fn run_with<B: BeaconNodeApi + ?Sized>(
 }
 
 fn current_epoch(clock: &SlotClock) -> Result<Epoch> {
-    let slot = clock.now().ok_or_else(|| {
+    clock.current_epoch().ok_or_else(|| {
         Error::InconsistentResponse(
             "the beacon node reports a genesis in the future; check the system clock".to_string(),
         )
-    })?;
-    Ok(clock.epoch_of(slot))
+    })
 }
 
 /// The validator's registry entry, if the chain would accept an exit for it

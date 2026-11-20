@@ -839,32 +839,43 @@ pub trait BeaconNodeApi: Send + Sync {
     /// [`crate::error::Error::BeaconNodeStatus`] carrying the node's reason.
     async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()>;
 
-    /// Whether the node saw each of `indices` act in `epoch`:
-    /// `POST /eth/v1/validator/liveness/{epoch}`, which doppelganger
-    /// protection reads (see [`crate::doppelganger`]). What counts as acting
-    /// is the node's own view; nodes count attestations, aggregates and
-    /// blocks, whether seen on gossip or included on chain.
+    /// Whether the node saw each of `indices` act in each of `epochs`:
+    /// `POST /eth/v1/validator/liveness/{epoch}` once per epoch, which
+    /// doppelganger protection reads (see [`crate::doppelganger`]). What
+    /// counts as acting is the node's own view; nodes count attestations,
+    /// aggregates and blocks, whether seen on gossip or included on chain.
     ///
-    /// An empty `indices` answers empty without asking: some nodes refuse
-    /// the request.
+    /// The answer holds one list per epoch, in the order `epochs` names them.
+    /// Every epoch is answered by the same node, so a caller combining them
+    /// reads one node's view rather than two nodes' halves; a failure on any
+    /// of them fails the whole call, and failover asks the next node about
+    /// all of them.
+    ///
+    /// An empty `indices` answers an empty list per epoch without asking:
+    /// some nodes refuse the request.
     ///
     /// # Contract: a syncing node's answer is `Err(BeaconNodeSyncing)`
     ///
     /// A node that has not caught up has not seen what the network did, so
     /// its "nobody is live" would clear a key it should not. An
     /// implementation must ask the node it is about to ask this of whether
-    /// it is syncing or optimistic, and answer
-    /// [`crate::error::Error::BeaconNodeSyncing`] instead when it is, so
-    /// failover moves to a node that can answer. Asking any other node, as
-    /// [`Self::is_optimistic_or_syncing`] through failover would, says
-    /// nothing about the one that answers.
+    /// it is syncing or optimistic (once for the whole call, not once per
+    /// epoch), and answer [`crate::error::Error::BeaconNodeSyncing`] instead
+    /// when it is, so failover moves to a node that can answer. Asking any
+    /// other node, as [`Self::is_optimistic_or_syncing`] through failover
+    /// would, says nothing about the one that answers.
     ///
     /// # Contract: one answer per index asked, and no other
     ///
-    /// Checked by [`validate_liveness`] in the implementation, for the reason
-    /// [`Self::attestation_data`] states: a key the answer leaves out has not
-    /// been shown silent, and must not be read as if it had.
-    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>>;
+    /// Checked by [`validate_liveness`] in the implementation, for each
+    /// epoch, for the reason [`Self::attestation_data`] states: a key the
+    /// answer leaves out has not been shown silent, and must not be read as
+    /// if it had.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>>;
 }
 
 /// Check that `answers` names every one of `asked` exactly once and nothing

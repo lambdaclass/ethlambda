@@ -283,7 +283,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // restart within the epoch is never mistaken for a doppelganger.
     let doppelganger = config.doppelganger_protection.then(|| {
         let doppelganger = Arc::new(doppelganger::Doppelganger::new());
-        let epoch = doppelganger::current_epoch(&clock);
+        // Epoch 0 before genesis: a key registered then signs at once.
+        let epoch = clock.current_epoch().unwrap_or(0);
         doppelganger.register_all(&keys, epoch);
         let withheld = doppelganger.detecting();
         if withheld > 0 {

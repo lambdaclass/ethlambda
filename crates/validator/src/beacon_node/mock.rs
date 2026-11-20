@@ -1382,27 +1382,35 @@ impl BeaconNodeApi for MockBeaconNode {
 
     /// Honours the trait's contracts the way a real implementation does: an
     /// empty request is answered without asking, and a syncing or optimistic
-    /// node answers `BeaconNodeSyncing`.
-    async fn liveness(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<Vec<Liveness>> {
+    /// node answers `BeaconNodeSyncing`. Each epoch asked about is recorded
+    /// as its own request, as it is one on the wire.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
         // Ahead of the configured failures: an empty request never reaches
         // a node, so no node can fail it.
         if indices.is_empty() {
-            return Ok(Vec::new());
+            return Ok(vec![Vec::new(); epochs.len()]);
         }
         self.guard("liveness")?;
         if self.syncing || self.optimistic {
             return Err(Error::BeaconNodeSyncing);
         }
-        self.liveness_requests
-            .lock()
-            .expect("lock")
-            .push((epoch, indices.to_vec()));
         let live = self.live.lock().expect("lock");
-        Ok(indices
+        let mut requests = self.liveness_requests.lock().expect("lock");
+        Ok(epochs
             .iter()
-            .map(|&index| Liveness {
-                index,
-                is_live: live.contains(&(epoch, index)),
+            .map(|&epoch| {
+                requests.push((epoch, indices.to_vec()));
+                indices
+                    .iter()
+                    .map(|&index| Liveness {
+                        index,
+                        is_live: live.contains(&(epoch, index)),
+                    })
+                    .collect()
             })
             .collect())
     }
