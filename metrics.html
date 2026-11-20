@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b29916bc.js";
+            window.path_to_searchindex_js = "searchindex-84108850.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -669,7 +669,15 @@ it; of the gloas topics only <code>execution_payload</code> answers it, for an e
 whose block is not known yet (<code>block_unknown</code>), has no post-state yet
 (<code>block_not_ready</code>), or has one that is not in the cache the checks read
 (<code>state_not_cached</code>, as when the block was imported moments ago; the actor
-verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+verifies the signature itself, so the envelope is forwarded rather than dropped).
+<code>beacon_block</code> answers <code>queue</code> for an unknown parent (<code>parent_unknown</code>), a
+parent without a cached post-state (<code>parent_not_ready</code>), a slot past the parent
+state’s lookahead (<code>shuffling_unavailable</code>) and, from gloas, a block built on
+its parent’s FULL payload before the parent’s envelope is verified
+(<code>parent_payload_unverified</code>): the chain actor holds that block until the
+envelope verifies. When the execution client has found that parent’s payload
+invalid, nothing will verify it, and the block is ignored instead
+(<code>parent_payload_invalid</code>). The aggregate, attestation,
 <code>payload_attestation_message</code>, <code>execution_payload_bid</code> and <code>proposer_preferences</code>
 topics never answer <code>queue</code>, since the vote
 block’s post-state is either cached or it is not
