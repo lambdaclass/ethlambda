@@ -6,8 +6,10 @@
 //! the specification's helpers for that one question at a time reads the
 //! tree-backed registry many times over and, per active validator, once more
 //! by index (a tree descent each). Here the registry is walked once, with
-//! `validators().iter()` zipped against the participation slices, and every
-//! later step runs over flat data.
+//! `iter_validators()` in lockstep with both participation lists' iterators
+//! (through [`ParticipationRef`](crate::beacon::containers::ParticipationRef),
+//! since the lists are tree-backed), and every later step runs over flat
+//! data.
 //!
 //! The pieces, from cheapest to most complete:
 //!

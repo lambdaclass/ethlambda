@@ -13,10 +13,13 @@
 //! Being unmodified in the specification text is not the same as being
 //! callable unchanged, though. EIP-7688 makes `previous_epoch_participation`,
 //! `current_epoch_participation`, `inactivity_scores`, `pending_deposits`,
-//! and `pending_consolidations` progressive lists
-//! (`libssz_types::ProgressiveList`) on a gloas state, a different Rust type
-//! from every earlier fork's bounded `SszList`. Each step was checked against
-//! the real code rather than assumed, and falls into one of three groups:
+//! and `pending_consolidations` progressive lists on a gloas state, each a
+//! different Rust type from the same field's bounded list on every earlier
+//! fork: the two participation lists and `pending_deposits` are tree-backed
+//! `ethlambda_ssz_tree::ProgressiveList`s, `inactivity_scores` and
+//! `pending_consolidations` flat `libssz_types::ProgressiveList`s. Each step
+//! was checked against the real code rather than assumed, and falls into one
+//! of three groups:
 //!
 //! - **Registry and balance steps** ([`super::electra::process_registry_updates`],
 //!   [`super::electra::process_slashings`],
@@ -30,9 +33,10 @@
 //!   [`super::altair::process_inactivity_updates`],
 //!   [`super::altair::process_rewards_and_penalties`]) reach
 //!   `previous_epoch_participation`/`current_epoch_participation`/`inactivity_scores`
-//!   as plain slices, through [`crate::beacon::containers::BeaconState::altair_validator_lists`]
-//!   and [`crate::beacon::containers::BeaconState::inactivity_score_mut`]: both
-//!   `SszList` and `ProgressiveList` `Deref` to a plain `[T]`.
+//!   through [`crate::beacon::containers::BeaconState::altair_validator_lists`]
+//!   and [`crate::beacon::containers::BeaconState::inactivity_score_mut`],
+//!   whose `ParticipationRef` and `InactivityScoresRef` answer for either list
+//!   kind, so these call straight through too.
 //! - **[`super::electra::process_pending_consolidations`]** takes the queue
 //!   as a `Vec` and writes it back, through
 //!   [`crate::beacon::helpers::electra::PendingQueueFields::take_pending_consolidations`] and

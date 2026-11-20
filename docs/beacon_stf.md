@@ -360,8 +360,9 @@ mainnet era 1422 (deneb blocks) that took a block from about 1.7 s to about
 0.3 s. The header, RANDAO and sync-aggregate steps still look it up once each.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through `helpers::participation`. One walk of `iter_validators()`, zipped with
-the flat participation slices, produces each validator's flags, its effective
+through `helpers::participation`. One walk of `iter_validators()`, in lockstep
+with both participation lists' iterators (`ParticipationRef`, since the lists
+are tree-backed), produces each validator's flags, its effective
 balance and the balance totals (an `EpochSummary`); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
 for those three steps only, since registry updates change what it read. The

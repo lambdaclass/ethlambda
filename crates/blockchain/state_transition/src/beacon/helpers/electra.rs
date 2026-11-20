@@ -1039,19 +1039,22 @@ fn placeholder_pending_deposit(validator: &Validator, amount: Gwei) -> electra::
 /// participation and inactivity entries
 /// ([`Self::push_empty_participation_and_inactivity`]), and the
 /// three pending queues (`pending_deposits`, `pending_partial_withdrawals`,
-/// `pending_consolidations`), both as element-level slice views (`len()`,
-/// `iter()`/`get()` through the returned `&[T]`, one-at-a-time `push_*`) and
-/// as a whole (`take_*`/`set_*`, for epoch processing's own whole-queue
-/// drains).
+/// `pending_consolidations`): one-at-a-time `push_*`, the whole queue
+/// (`take_*`/`set_*`, for epoch processing's own whole-queue drains), and,
+/// for the last two, element-level slice views (`len()`, `iter()`/`get()`
+/// through the returned `&[T]`).
 ///
-/// Electra's, fulu's, and gloas's `pending_deposits` (and the other two
-/// queues) share one element type each but not one container: electra's and
-/// fulu's is the bounded `SszList` (`electra::PendingDeposits` and friends),
-/// gloas's is EIP-7688's unbounded [`libssz_types::ProgressiveList`]
-/// (`crate::beacon::containers::gloas::PendingDeposits` and friends). Both
-/// deref to `[T]` with the same element type, which is what lets the
-/// slice-view and element-`push_*` methods below serve all three forks
-/// through one match rather than needing a gloas copy of every caller.
+/// Electra's, fulu's, and gloas's queues share one element type each but not
+/// one container. `pending_deposits` is tree-backed: an
+/// `ethlambda_ssz_tree::List` on electra and fulu
+/// (`electra::PendingDeposits`), an `ethlambda_ssz_tree::ProgressiveList` on
+/// gloas (`crate::beacon::containers::gloas::PendingDeposits`). Neither has a
+/// slice, so it is reached only through `push_pending_deposit` and
+/// `take_pending_deposits`/`set_pending_deposits`. The other two are the
+/// bounded `SszList` on electra and fulu and EIP-7688's unbounded
+/// [`libssz_types::ProgressiveList`] on gloas, which both deref to `[T]`, so
+/// their slice views serve all three forks. Either way one match per method
+/// covers every fork, rather than a gloas copy of every caller.
 ///
 /// Epoch processing's whole-queue drains and the block-level request
 /// processors (`crate::beacon::stf::electra`'s `process_deposit_request`
