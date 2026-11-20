@@ -40,7 +40,7 @@ use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
-use crate::chain_check::{ChainId, first_chain_difference};
+use crate::chain_check::{ChainId, first_chain_difference, follow_schedule};
 use crate::error::{Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
@@ -214,6 +214,12 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// until a later [`Self::check_nodes`] round verifies it. Fails when no
     /// node answers, naming what each said.
     ///
+    /// The chain returned is the reference's with the schedule the compatible
+    /// nodes serve already followed
+    /// ([`crate::chain_check::follow_schedule`]): a fork still in the future
+    /// takes the lowest epoch any of them reports, exactly as at every later
+    /// epoch check.
+    ///
     /// `with_reference` runs once the reference is chosen, and gives the epoch
     /// the wall clock is in on that chain, which decides which forks are still
     /// free to differ. It is where the caller adopts the reference's preset:
@@ -251,6 +257,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             "Using this beacon node's chain as the reference; the others are checked against it"
         );
 
+        let mut compatible = Vec::new();
         for (position, answer) in asked.into_iter().enumerate() {
             let answer = if position == reference_at {
                 NodeAnswer::Compatible(Box::new(reference.config.clone()))
@@ -261,8 +268,20 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 self.usable[position].store(false, Ordering::Relaxed);
             }
             self.record(position, &answer, epoch);
+            if let NodeAnswer::Compatible(config) = answer {
+                compatible.push((position, *config));
+            }
         }
-        Ok(reference)
+
+        // Follow the schedule now, not at the next epoch's check: a reference
+        // that has not been upgraded would otherwise start the client without
+        // a fork another node already schedules, and if that fork's epoch came
+        // before the next check, the upgraded node would be the one refused.
+        let mut chain = reference;
+        if let Some(config) = follow_schedule(&chain.config, &compatible, epoch) {
+            chain.config = config;
+        }
+        Ok(chain)
     }
 
     /// Ask the nodes `scope` selects about their chain, all at once and

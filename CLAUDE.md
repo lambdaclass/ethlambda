@@ -941,7 +941,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the first node that answers at startup, and a node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks the
-  unusable nodes every slot and every node each epoch, and follows a fork the
+  unusable nodes every slot and every node each epoch, and that check, like the
+  startup one, follows a fork the
   compatible nodes newly schedule (only a fork still in the future may change)
   into the `SharedConfig` the slot clock and signing domains read, logging the
   change at `warn`. The spec parser requires the slot duration and every altair

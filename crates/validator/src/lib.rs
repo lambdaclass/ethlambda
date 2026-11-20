@@ -279,7 +279,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     // The chain the client runs on is the first node's that answers; every
     // other node is checked against it, and a node on another chain is not
-    // used. See `chain_check`.
+    // used. A fork still in the future is already the compatible nodes'
+    // here, as after every later epoch check. See `chain_check`.
     let ChainId {
         genesis,
         config: spec,

@@ -258,9 +258,17 @@ pub fn merge_schedule(
             *other_epoch != epoch || (epoch != FAR_FUTURE_EPOCH && *other_version != version)
         };
         if reports.iter().any(differs) {
+            // The version too, for a scheduled fork: two nodes can agree on the
+            // epoch and differ only there.
             let lines: Vec<String> = reports
                 .iter()
-                .map(|(position, epoch, _)| format!("node {position}: {}", epoch_text(*epoch)))
+                .map(|(position, epoch, version)| {
+                    if *epoch == FAR_FUTURE_EPOCH {
+                        format!("node {position}: unscheduled")
+                    } else {
+                        format!("node {position}: {epoch} ({})", version_text(*version))
+                    }
+                })
                 .collect();
             disagreements.push(format!(
                 "{} ({})",
@@ -339,7 +347,24 @@ pub async fn check_once<B: BeaconNodeApi>(
             _ => None,
         })
         .collect();
-    let merge = merge_schedule(&ours.config, &compatible, epoch);
+    if let Some(config) = follow_schedule(&ours.config, &compatible, epoch) {
+        context.replace_config(config);
+    }
+}
+
+/// [`merge_schedule`] with its outcome logged: the configuration to move to
+/// when the compatible `nodes` serve a schedule that differs from `current`,
+/// `None` when there is nothing to change.
+///
+/// Shared by the startup check and the per-epoch one, so the client follows a
+/// fork the same way whether a node scheduled it before the client started or
+/// after.
+pub fn follow_schedule(
+    current: &Config,
+    nodes: &[(usize, Config)],
+    epoch: Epoch,
+) -> Option<Config> {
+    let merge = merge_schedule(current, nodes, epoch);
     for disagreement in &merge.disagreements {
         warn!(
             %epoch,
@@ -348,22 +373,24 @@ pub async fn check_once<B: BeaconNodeApi>(
              being used when its epoch arrives"
         );
     }
-    if merge.config != ours.config {
-        let changes = merge.changes.join("; ");
-        context.replace_config(merge.config);
-        warn!(
-            %epoch,
-            %changes,
-            "The beacon nodes changed the fork schedule; the validator client now follows it"
-        );
+    if merge.config == *current {
+        return None;
     }
+    let changes = merge.changes.join("; ");
+    warn!(
+        %epoch,
+        %changes,
+        "The beacon nodes changed the fork schedule; the validator client now follows it"
+    );
+    Some(merge.config)
 }
 
 /// Run the check until `shutdown`: the nodes that are not usable every slot,
 /// every node at the first slot of each epoch.
 ///
-/// The startup check already covered every node, so the first full one is at
-/// the next epoch's first slot.
+/// The startup check already covered every node and followed the schedule
+/// they served (see `FallbackBeaconNode::establish`), so the first full one is
+/// at the next epoch's first slot.
 pub async fn run<B: BeaconNodeApi>(
     nodes: Arc<FallbackBeaconNode<B>>,
     genesis: Genesis,
@@ -794,6 +821,29 @@ mod tests {
                 genesis().genesis_validators_root
             )
         );
+    }
+
+    /// The reference has not been upgraded and another node already schedules
+    /// gloas: the client starts on the schedule with the fork, so the upgraded
+    /// node is still usable once the fork's epoch arrives.
+    #[tokio::test]
+    async fn a_fork_another_node_schedules_is_followed_at_startup() {
+        let gloas_epoch = NOW + 1;
+        let upgraded = node().with_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
+        let fallback = FallbackBeaconNode::new(vec![node(), upgraded]);
+
+        let chain = fallback.establish(|_| Ok(NOW)).await.expect("answers");
+
+        assert_eq!(chain.config.fork_epoch(ForkName::Gloas), gloas_epoch);
+        assert_eq!(chain.config.fork_version(ForkName::Gloas), [8, 0, 0, 0]);
+
+        // At the fork's epoch the upgraded node agrees with the client, and
+        // the one that never scheduled the fork is the one left out.
+        let answers = fallback
+            .check_nodes(&chain, gloas_epoch, CheckScope::All)
+            .await;
+        assert!(matches!(answers[0].1, NodeAnswer::Incompatible(_)));
+        assert!(matches!(answers[1].1, NodeAnswer::Compatible(_)));
     }
 
     /// A node that moves a fork already active is on another chain: it is
