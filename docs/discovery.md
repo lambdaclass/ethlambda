@@ -221,8 +221,10 @@ A UDP multiaddr names the peer's discovery port, not a libp2p listener, which
 is how Lighthouse reads one too. A peer reachable more than one way takes one
 entry per transport, and the entries are merged under its peer id. An `/ip6`
 UDP multiaddr is refused: discovery binds the IPv4 wildcard, and an IPv4
-socket cannot reach an IPv6 address. `/ip6` with `tcp` or `quic-v1` is dialed
-by the swarm and accepted.
+socket cannot reach an IPv6 address. The parser is handed that bind address
+and refuses only against an IPv4 one, so an IPv6 bind would accept the entry
+([#853](https://github.com/lambdaclass/ethlambda/issues/853)). `/ip6` with `tcp` or `quic-v1` is dialed by the
+swarm and accepted.
 
 The form follows Lighthouse's `--boot-nodes`, with four deliberate departures:
 

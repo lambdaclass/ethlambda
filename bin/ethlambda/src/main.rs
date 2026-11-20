@@ -430,6 +430,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     info!("Using system allocator");
 
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
+    // Discovery binds the swarm's address. Named once because two readers must
+    // agree on it: the discv5 socket below, and `beacon`'s bootnode parser,
+    // which refuses an entry a socket bound here could never reach.
+    let discovery_ip = p2p_socket.ip();
 
     // The network and the bootnodes, each resolved once, here, for the swarm
     // and discv5 below. The network comes first: `beacon`'s `--bootnodes`
@@ -444,7 +448,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
             let source = network::NetworkSource::resolve(&spec)?;
-            let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes())?;
+            let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes(), discovery_ip)?;
             (Some(source), bootnodes)
         }
     };
@@ -783,7 +787,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // which then peers from the bootnode list alone.
     let discovery = discovery_enabled.then(|| DiscoverySpawnConfig {
         node_key: node_p2p_key.clone(),
-        bind_ip: p2p_socket.ip(),
+        bind_ip: discovery_ip,
         discovery_port: common.discovery.port,
         // Advertised as both the `quic` and `tcp` entries: TCP and UDP are
         // separate namespaces, so `build_swarm` binds both from this one number.
@@ -1107,6 +1111,9 @@ fn lean_bootnodes(file: Option<&Path>) -> eyre::Result<Vec<Bootnode>> {
 /// skips a bad entry with a warning. Duplicates are left for `build_swarm`,
 /// which merges bootnodes by peer id.
 ///
+/// `discovery_ip` is the address discovery binds, which [`parse_bootnode`]
+/// checks each command-line entry against.
+///
 /// Logs the two counts once: the network's half can shrink silently through
 /// skipped entries, and the line is what shows how much of the list the
 /// command line contributed. Warns when the result is empty, which leaves
@@ -1114,6 +1121,7 @@ fn lean_bootnodes(file: Option<&Path>) -> eyre::Result<Vec<Bootnode>> {
 fn beacon_bootnodes(
     cli_entries: &[String],
     network_entries: Vec<String>,
+    discovery_ip: IpAddr,
 ) -> eyre::Result<Vec<Bootnode>> {
     let mut bootnodes = Vec::new();
     // A blank entry is skipped here, where `parse_bootnode` would refuse it:
@@ -1135,7 +1143,7 @@ fn beacon_bootnodes(
                 "--bootnodes was given no value: it took the flag \"{entry}\" as its value"
             );
         }
-        let bootnode = parse_bootnode(entry).map_err(|reason| {
+        let bootnode = parse_bootnode(entry, discovery_ip).map_err(|reason| {
             // `--bootnodes` named a file on `beacon` until it became a list,
             // and launch scripts still pass one. Checked only after a parse
             // failure, so no entry that parses is ever read from disk. A
@@ -3769,6 +3777,9 @@ validators:
     /// command line.
     const LOCALHOST_ENR: &str = "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
 
+    /// The address `run_node` binds discovery to.
+    const IPV4_DISCOVERY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
     fn peer_ids(bootnodes: &[Bootnode]) -> Vec<PeerId> {
         bootnodes.iter().map(Bootnode::peer_id).collect()
     }
@@ -3787,7 +3798,8 @@ validators:
     /// them.
     fn beacon_bootnodes_refusal(cli_entries: &[&str]) -> String {
         let entries: Vec<String> = cli_entries.iter().map(|entry| entry.to_string()).collect();
-        let err = beacon_bootnodes(&entries, Vec::new()).expect_err("the entries must be refused");
+        let err = beacon_bootnodes(&entries, Vec::new(), IPV4_DISCOVERY)
+            .expect_err("the entries must be refused");
         format!("{err:#}")
     }
 
@@ -3808,10 +3820,12 @@ validators:
         let network_peers = peer_ids(&parse_enrs(network_entries.clone()));
         assert!(!network_peers.is_empty());
 
-        let bootnodes =
-            beacon_bootnodes(&cli_entries, network_entries).expect("every entry is valid");
+        let bootnodes = beacon_bootnodes(&cli_entries, network_entries, IPV4_DISCOVERY)
+            .expect("every entry is valid");
 
-        let enr_peer = parse_bootnode(LOCALHOST_ENR).unwrap().peer_id();
+        let enr_peer = parse_bootnode(LOCALHOST_ENR, IPV4_DISCOVERY)
+            .unwrap()
+            .peer_id();
         let mut expected = vec![tcp_peer, enr_peer, udp_peer];
         expected.extend(network_peers);
         assert_eq!(peer_ids(&bootnodes), expected);
@@ -3829,8 +3843,8 @@ validators:
             String::new(),
         ];
 
-        let bootnodes =
-            beacon_bootnodes(&cli_entries, Vec::new()).expect("blank entries are skipped");
+        let bootnodes = beacon_bootnodes(&cli_entries, Vec::new(), IPV4_DISCOVERY)
+            .expect("blank entries are skipped");
 
         assert_eq!(peer_ids(&bootnodes), [peer]);
     }
@@ -3906,11 +3920,11 @@ validators:
             .unwrap()
             .bootnodes()
             .remove(0);
-        let good_peer = parse_bootnode(&good).unwrap().peer_id();
+        let good_peer = parse_bootnode(&good, IPV4_DISCOVERY).unwrap().peer_id();
         let network_entries = vec!["enr:not-a-record".to_string(), good];
 
-        let bootnodes =
-            beacon_bootnodes(&[], network_entries).expect("a bad network entry is not an error");
+        let bootnodes = beacon_bootnodes(&[], network_entries, IPV4_DISCOVERY)
+            .expect("a bad network entry is not an error");
 
         assert_eq!(peer_ids(&bootnodes), [good_peer]);
     }
@@ -3950,7 +3964,7 @@ validators:
         let network_entries = network::NetworkSource::built_in_mainnet()
             .unwrap()
             .bootnodes();
-        let fallback = beacon_bootnodes(&[], network_entries.clone()).unwrap();
+        let fallback = beacon_bootnodes(&[], network_entries.clone(), IPV4_DISCOVERY).unwrap();
         assert!(!fallback.is_empty());
         assert_eq!(peer_ids(&fallback), peer_ids(&parse_enrs(network_entries)));
     }

@@ -2578,10 +2578,10 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 ///
 /// `/dns*` is refused: a [`Bootnode`] holds an address, and the swarm has no
 /// DNS transport to resolve a name with. So is an IPv6 entry, of either form,
-/// that is only a discv5 contact, since discovery listens on IPv4. Unlike
-/// [`parse_enrs`], a bad entry is an error rather than a warning, since an
-/// operator typed it on the command line.
-pub fn parse_bootnode(entry: &str) -> Result<Bootnode, String> {
+/// that is only a discv5 contact when `discovery_ip`, the address the caller
+/// binds discovery to, is IPv4. Unlike [`parse_enrs`], a bad entry is an error
+/// rather than a warning, since an operator typed it on the command line.
+pub fn parse_bootnode(entry: &str, discovery_ip: IpAddr) -> Result<Bootnode, String> {
     let entry = entry.trim();
     if entry.is_empty() {
         return Err("empty bootnode entry".to_string());
@@ -2599,19 +2599,23 @@ pub fn parse_bootnode(entry: &str) -> Result<Bootnode, String> {
         })?
     };
 
-    // A discv5 contact and nothing else, at an IPv6 address, could never be
-    // reached: discovery listens on the IPv4 wildcard (`run_node` binds
-    // `0.0.0.0`), and an IPv4 socket cannot send to an IPv6 address. Refused
-    // for the reason a non-secp256k1 discv5 contact is (see
+    // A discv5 contact and nothing else, at an IPv6 address, cannot be reached
+    // from discovery bound to IPv4: an IPv4 socket cannot send to an IPv6
+    // address. Refused for the reason a non-secp256k1 discv5 contact is (see
     // `parse_bootnode_multiaddr`): nothing could use it. An IPv6 entry with a
     // QUIC or TCP port is kept, since the swarm dials it, not the discovery
-    // socket.
-    if bootnode.ip.is_ipv6() && bootnode.quic_port.is_none() && bootnode.tcp_port.is_none() {
-        return Err(
+    // socket. The other mismatch, an IPv4 contact for discovery bound to IPv6,
+    // is let through: a `::` socket is dual-stack unless the host's default
+    // says otherwise (Linux's is), and then it reaches IPv4 too.
+    if discovery_ip.is_ipv4()
+        && bootnode.ip.is_ipv6()
+        && bootnode.quic_port.is_none()
+        && bootnode.tcp_port.is_none()
+    {
+        return Err(format!(
             "an IPv6 bootnode with only a discv5 (udp) port cannot be reached: discovery \
-             listens on IPv4 only, so give its IPv4 address"
-                .to_string(),
-        );
+             is bound to IPv4 ({discovery_ip}), so give its IPv4 address"
+        ));
     }
     Ok(bootnode)
 }
@@ -3491,7 +3495,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
 
@@ -4591,9 +4595,12 @@ mod tests {
         PeerId::from_public_key(&Keypair::generate_secp256k1().public())
     }
 
+    /// The address `run_node` binds discovery to.
+    const IPV4_DISCOVERY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
     /// The reason `parse_bootnode` refuses `entry`, panicking if it accepts it.
     fn bootnode_refusal(entry: &str) -> String {
-        parse_bootnode(entry).expect_err("the entry must be refused")
+        parse_bootnode(entry, IPV4_DISCOVERY).expect_err("the entry must be refused")
     }
 
     #[test]
@@ -4601,11 +4608,11 @@ mod tests {
         // Reused from `parse_enrs_extracts_ip_port_and_public_key`.
         let enr = "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
 
-        let prefixed = parse_bootnode(enr).unwrap();
+        let prefixed = parse_bootnode(enr, IPV4_DISCOVERY).unwrap();
         assert_eq!(prefixed.ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(prefixed.quic_port, Some(9001));
 
-        let bare = parse_bootnode(enr.strip_prefix("enr:").unwrap()).unwrap();
+        let bare = parse_bootnode(enr.strip_prefix("enr:").unwrap(), IPV4_DISCOVERY).unwrap();
         assert_eq!(bare.ip, prefixed.ip);
         assert_eq!(bare.quic_port, prefixed.quic_port);
         assert_eq!(bare.tcp_port, prefixed.tcp_port);
@@ -4619,7 +4626,7 @@ mod tests {
         // Surrounding whitespace, as a comma-separated list leaves it, is trimmed.
         let entry = format!("  /ip4/1.2.3.4/tcp/9000/p2p/{peer_id} ");
 
-        let bootnode = parse_bootnode(&entry).unwrap();
+        let bootnode = parse_bootnode(&entry, IPV4_DISCOVERY).unwrap();
 
         assert_eq!(bootnode.ip, IpAddr::from(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(bootnode.tcp_port, Some(9000));
@@ -4632,7 +4639,7 @@ mod tests {
         let peer_id = secp256k1_peer_id();
         let entry = format!("/ip4/1.2.3.4/udp/9001/quic-v1/p2p/{peer_id}");
 
-        let bootnode = parse_bootnode(&entry).unwrap();
+        let bootnode = parse_bootnode(&entry, IPV4_DISCOVERY).unwrap();
 
         assert_eq!(bootnode.quic_port, Some(9001));
         assert_eq!(bootnode.tcp_port, None);
@@ -4644,7 +4651,7 @@ mod tests {
         let peer_id = secp256k1_peer_id();
         let entry = format!("/ip4/1.2.3.4/udp/9000/p2p/{peer_id}");
 
-        let bootnode = parse_bootnode(&entry).unwrap();
+        let bootnode = parse_bootnode(&entry, IPV4_DISCOVERY).unwrap();
 
         assert_eq!(bootnode.udp_port, Some(9000));
         assert_eq!(bootnode.quic_port, None);
@@ -4660,25 +4667,36 @@ mod tests {
         let peer_id = secp256k1_peer_id();
         let entry = format!("/ip6/2001:db8::1/tcp/9000/p2p/{peer_id}");
 
-        let bootnode = parse_bootnode(&entry).unwrap();
+        let bootnode = parse_bootnode(&entry, IPV4_DISCOVERY).unwrap();
 
         assert_eq!(bootnode.ip, "2001:db8::1".parse::<IpAddr>().unwrap());
         assert_eq!(bootnode.tcp_port, Some(9000));
     }
 
-    /// The swarm dials an IPv6 address, but discovery listens on IPv4 only, so
-    /// an IPv6 entry that is only a discv5 contact could never be reached.
+    /// The swarm dials an IPv6 address, but discovery bound to IPv4 cannot
+    /// reach one, so an IPv6 entry that is only a discv5 contact is refused
+    /// there and kept when discovery binds IPv6.
     #[test]
-    fn parse_bootnode_refuses_an_ip6_discv5_contact() {
+    fn parse_bootnode_refuses_an_ip6_discv5_contact_only_for_ipv4_discovery() {
         let peer_id = secp256k1_peer_id();
+        let quic_entry = format!("/ip6/2001:db8::1/udp/9001/quic-v1/p2p/{peer_id}");
+        let discv5_entry = format!("/ip6/2001:db8::1/udp/9000/p2p/{peer_id}");
 
-        let quic = parse_bootnode(&format!("/ip6/2001:db8::1/udp/9001/quic-v1/p2p/{peer_id}"))
+        let quic = parse_bootnode(&quic_entry, IPV4_DISCOVERY)
             .expect("an IPv6 QUIC entry is dialed by the swarm");
         assert_eq!(quic.quic_port, Some(9001));
 
-        let reason = bootnode_refusal(&format!("/ip6/2001:db8::1/udp/9000/p2p/{peer_id}"));
+        let reason = bootnode_refusal(&discv5_entry);
         assert!(reason.contains("IPv6"), "{reason}");
-        assert!(reason.contains("IPv4"), "{reason}");
+        assert!(reason.contains("IPv4 (0.0.0.0)"), "{reason}");
+
+        let ipv6_discovery = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let discv5 = parse_bootnode(&discv5_entry, ipv6_discovery)
+            .expect("discovery bound to IPv6 can reach an IPv6 contact");
+        assert_eq!(discv5.udp_port, Some(9000));
+        // A `::` socket is dual-stack by default, so an IPv4 contact is kept too.
+        let ipv4_entry = format!("/ip4/1.2.3.4/udp/9000/p2p/{peer_id}");
+        parse_bootnode(&ipv4_entry, ipv6_discovery).expect("an IPv4 contact is not refused");
     }
 
     #[test]
@@ -4686,7 +4704,7 @@ mod tests {
         let peer_id = secp256k1_peer_id();
         let entry = format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}");
 
-        let bootnode = parse_bootnode(&entry).unwrap();
+        let bootnode = parse_bootnode(&entry, IPV4_DISCOVERY).unwrap();
 
         assert_eq!(PeerId::from_public_key(&bootnode.public_key), peer_id);
     }
@@ -4699,9 +4717,13 @@ mod tests {
     fn a_multiaddr_and_an_enr_for_one_peer_merge_into_one_dial() {
         // Reused from `parse_enrs_extracts_ip_port_and_public_key`: localhost,
         // `quic` 9001, no `tcp`.
-        let enr = parse_bootnode("enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys").unwrap();
+        let enr = parse_bootnode("enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys", IPV4_DISCOVERY).unwrap();
         let peer_id = enr.peer_id();
-        let typed = parse_bootnode(&format!("/ip4/203.0.113.7/tcp/9000/p2p/{peer_id}")).unwrap();
+        let typed = parse_bootnode(
+            &format!("/ip4/203.0.113.7/tcp/9000/p2p/{peer_id}"),
+            IPV4_DISCOVERY,
+        )
+        .unwrap();
         assert_eq!(typed.peer_id(), peer_id);
 
         let (merged, undialable) = merge_bootnode_dial_addrs(vec![typed, enr], random_peer());
@@ -4820,7 +4842,11 @@ mod tests {
         let peer_id = PeerId::from_public_key(&Keypair::generate_ed25519().public());
 
         // Dialable transports take any key libp2p can authenticate.
-        let tcp = parse_bootnode(&format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}")).unwrap();
+        let tcp = parse_bootnode(
+            &format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}"),
+            IPV4_DISCOVERY,
+        )
+        .unwrap();
         assert_eq!(tcp.tcp_port, Some(9000));
 
         // A discv5 contact cannot: discv5 speaks secp256k1 only, so nothing

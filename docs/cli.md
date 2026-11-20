@@ -264,9 +264,12 @@ disconnect, even on a host that cannot reach it. To run on other bootnodes
 alone, load the network from a directory whose `bootstrap_nodes.yaml` lists
 only those.
 
-An IPv6 entry is dialed like an IPv4 one, but discv5 listens on IPv4 only, so
-an IPv6 entry that is only a discv5 contact (`/ip6/<ip>/udp/<port>`, or an ENR
-whose only address is `ip6` and whose only port is `udp`) is refused.
+An IPv6 entry is dialed like an IPv4 one, but discv5 binds the IPv4 wildcard
+and an IPv4 socket cannot reach an IPv6 address, so an IPv6 entry that is only
+a discv5 contact (`/ip6/<ip>/udp/<port>`, or an ENR whose only address is `ip6`
+and whose only port is `udp`) is refused. The check reads the address discovery
+binds rather than assuming IPv4, so it lifts on its own once discovery binds
+IPv6 ([#853](https://github.com/lambdaclass/ethlambda/issues/853)).
 
 Every entry is checked at startup. One that does not parse, or that is
 unusable (an ENR with no `quic`, `tcp` or `udp` port, a port of `0`, and so
