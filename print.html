@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5cd6789b.js";
+            window.path_to_searchindex_js = "searchindex-c49fb82d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -2133,8 +2133,9 @@ nothing an attestation writes is an input to it. In a <code>replay-era</code> ru
 mainnet era 1422 (deneb blocks) that took a block from about 1.7 s to about
 0.3 s. The header, RANDAO and sync-aggregate steps still look it up once each.</p>
 <p>Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through <code>helpers::participation</code>. One walk of <code>iter_validators()</code>, zipped with
-the flat participation slices, produces each validator’s flags, its effective
+through <code>helpers::participation</code>. One walk of <code>iter_validators()</code>, in lockstep
+with both participation lists’ iterators (<code>ParticipationRef</code>, since the lists
+are tree-backed), produces each validator’s flags, its effective
 balance and the balance totals (an <code>EpochSummary</code>); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
 for those three steps only, since registry updates change what it read. The
@@ -2159,6 +2160,25 @@ validator they name deferred until they are done. The genesis epoch and states
 whose registry-sized lists differ in length fall back to the step-by-step path.
 The debug oracle runs the specification-shaped steps on a clone and asserts the
 two full states hash equal.</p>
+<h3 id="participation-lists-and-pending-deposits"><a class="header" href="#participation-lists-and-pending-deposits">Participation lists and pending deposits</a></h3>
+<p>The two participation lists (one byte per validator, 2.4 MB each on mainnet)
+and <code>pending_deposits</code> are tree-backed too. As flat <code>SszList</code>s they were
+re-merkleized from scratch for every state root, which profiled at most of
+<code>BeaconState::hash_tree_root</code>; a block only flips flags for the validators it
+attests for, so the tree rehashes the leaves holding those. Writes to the
+participation lists are buffered densely (the default <code>VecMap</code>), unlike the
+registry’s <code>BTreeMap</code>: a block writes tens of thousands of scattered entries, and
+measured at mainnet size the <code>BTreeMap</code>’s inserts cost several times the hashing
+they save, while the dense buffer is an indexed write. The epoch
+rotation does not buffer: it moves <code>current</code> into <code>previous</code> and builds a fresh
+zeroed list. <code>pending_deposits</code> only grows at the end during a block and is
+rebuilt from a <code>Vec</code> once per epoch, so a <code>BTreeMap</code> buffer fits it too.</p>
+<p>Reads go through <code>BeaconState::altair_validator_lists</code>, which returns
+<code>ParticipationRef</code>s (there is no slice to hand out); a full scan walks
+<code>ParticipationRef::iter</code> in lockstep with <code>iter_validators</code>, since each <code>get</code> is
+a tree descent. Element writes go through <code>epoch_participation_mut</code>, which
+returns a <code>ParticipationMut</code>. The SSZ encoding is unchanged, so <code>DB_VERSION</code> is
+too.</p>
 <h2 id="gloas"><a class="header" href="#gloas">Gloas</a></h2>
 <p>Five of gloas’s EIPs shape this module: ePBS (EIP-7732), progressive lists and
 containers (EIP-7688), proposer selection that skips slashed validators
@@ -2247,11 +2267,12 @@ of keeping copies.</p>
 <p>EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
 chain of growing subtrees (EIP-7916), and makes the big containers progressive
 (EIP-7495); a progressive container has no fixed depth. The other progressive
-lists are libssz’s <code>ProgressiveList</code>. The registry is the exception:
-<code>validators</code> and <code>balances</code> stay tree-backed, through
+lists are libssz’s <code>ProgressiveList</code>. The exceptions stay tree-backed, through
 <code>ethlambda_ssz_tree::ProgressiveList</code>, which has the same persistent nodes,
 update buffer and rebase as the bounded <code>List</code> and the same method set, so a
-gloas state shares subtrees with its parent the way earlier ones do.</p>
+gloas state shares subtrees with its parent the way earlier ones do: <code>validators</code>
+and <code>balances</code>, the two participation lists and <code>pending_deposits</code>. (The
+inactivity scores are still a flat progressive list.)</p>
 <p>The registry therefore has two list types across the forks, and an accessor
 cannot return either one. The whole-registry accessors were replaced by
 element-level ones on <code>BeaconState</code>: <code>validator_count</code>, <code>validator</code>,
