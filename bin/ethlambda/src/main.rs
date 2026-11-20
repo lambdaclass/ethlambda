@@ -8,6 +8,7 @@ mod era;
 mod fd_limit;
 mod keygen;
 mod network;
+mod shutdown;
 mod slashing_protection;
 mod validator;
 mod version;
@@ -43,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use cli::{Execution, Network, Options};
 use command::Command;
+use shutdown::ShutdownSignals;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
@@ -159,6 +161,7 @@ fn beacon_identity(
         ],
         discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
         metadata: None,
+        peers: None,
     }
 }
 
@@ -386,6 +389,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_p2p::metrics::init();
     ethlambda_state_transition::metrics::init();
+    ethlambda_storage::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::client_version());
     ethlambda_blockchain::metrics::set_node_start_time();
 
@@ -877,6 +881,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     };
     let rpc_identity = ethlambda_rpc::BeaconIdentity {
         metadata: p2p.local_metadata(),
+        peers: Some(p2p.peer_table()),
         ..beacon_identity(
             p2p.local_enr().unwrap_or_default(),
             common.discovery.advertise_ip,
@@ -1043,10 +1048,15 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Wait for ctrl-c, then stop and join whatever is running.
+/// Wait for ctrl-c or SIGTERM, then stop and join whatever is running.
 ///
-/// A 2nd, 3rd and 4th ctrl-c escalate to `std::process::exit(1)` rather than
-/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`.
+/// A 2nd, 3rd and 4th signal, ctrl-c or SIGTERM in any mix, escalate to
+/// `std::process::exit(1)` rather than leaving shutdown stuck on an actor that
+/// hangs in `stop()`/`join()` (see [`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// Both signals are listened for before `Node initialized` is logged, so a
+/// signal sent once that line is out is never lost or fatal. One sent earlier,
+/// during startup, still has its default action: see the `shutdown` module.
 ///
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
@@ -1054,36 +1064,29 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 ///
 /// An embedded execution client that stops on its own starts the same
 /// teardown, and the node then exits with an error: it cannot validate a
-/// payload without one.
+/// payload without one. Signals sent during that teardown escalate the same
+/// way, since listening has already taken their default action away.
 async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
+    let mut signals = ShutdownSignals::listen();
     info!("Node initialized");
 
-    // 1st ctrl+c: start graceful shutdown
+    // 1st ctrl+c or SIGTERM: start graceful shutdown
     let execution_client_stopped = tokio::select! {
-        _ = tokio::signal::ctrl_c() => false,
+        signal = signals.recv() => {
+            info!(
+                signal,
+                "Shutdown signal received, stopping actors and servers..."
+            );
+            false
+        }
         () = execution_client_stopped(&node) => true,
     };
 
     if execution_client_stopped {
         error!("The embedded execution client stopped; shutting down");
-    } else {
-        info!("Shutdown signal received, stopping actors and servers...");
     }
 
-    tokio::spawn(async move {
-        // This can be turned into a loop
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        info!("Forced ungraceful shutdown...");
-        std::process::exit(1);
-    });
+    signals.force_exit_on_repeats();
 
     let blockchain_ref = node.blockchain.actor_ref().clone();
     let p2p_ref = node.p2p.actor_ref().clone();
@@ -1217,6 +1220,10 @@ fn init_shadow_cost(shadow: &cli::ShadowOptions) {
 async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
     use tokio::sync::RwLock;
 
+    // Before `Test-driver RPC ready`, so a signal sent once that line is out
+    // is never lost or fatal; `tests/shutdown.rs` relies on it.
+    let mut signals = ShutdownSignals::listen();
+
     let driver: ethlambda_rpc::test_driver::DriverState =
         Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
 
@@ -1233,8 +1240,12 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 
     info!("Test-driver RPC ready");
 
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received, stopping test-driver RPC...");
+    let signal = signals.recv().await;
+    info!(
+        signal,
+        "Shutdown signal received, stopping test-driver RPC..."
+    );
+    signals.force_exit_on_repeats();
     shutdown_token.cancel();
     let _ = rpc_handle.await;
     info!("Shutdown complete");

@@ -143,6 +143,21 @@ async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Invalid, "{status:?}");
 
+    // So is a payload whose blob transactions do not match the versioned
+    // hashes the consensus layer expects: this one carries none. ethrex checks
+    // that inside the handler the typed path calls, before it touches the
+    // chain, so the valid payload below still imports.
+    let status = engine
+        .new_payload(
+            &payload,
+            &[H256([0x01; 32])],
+            parent_beacon_block_root,
+            &built.execution_requests,
+        )
+        .await
+        .expect("an answer");
+    assert_eq!(status.status, PayloadStatusValue::Invalid, "{status:?}");
+
     let status = engine
         .new_payload(
             &payload,
