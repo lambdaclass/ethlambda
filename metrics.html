@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f9643e77.js";
+            window.path_to_searchindex_js = "searchindex-27f439f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -702,9 +702,72 @@ payload votes, and <code>builder_validation_permits</code> for bids and proposer
 preferences. They are deliberately separate: a mainnet slot’s worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or a column
-instead. Neither pool has a metric of its own yet; a permit exhausted on
-either shows up as <code>outcome="ignore",reason="overloaded"</code> on
-<code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+instead. <code>sync_validation_permits</code> (sync committee messages and contributions)
+is a fourth, and <code>column_check_permits</code> bounds the checks on fetched columns and
+envelopes, which await a permit instead of failing. A permit exhausted on a
+gossip pool shows up as <code>outcome="ignore",reason="overloaded"</code> on
+<code>lean_beacon_gossip_validation_total</code> and, per pool, on
+<code>lean_beacon_validation_permit_exhausted_total</code> below.</p>
+<h4 id="validation-contention"><a class="header" href="#validation-contention">Validation contention</a></h4>
+<p>These answer whether validation competes with block import and epoch precompute
+for CPU. They only measure: no pool size, schedule or verdict depends on them.
+ethlambda-specific, not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_validation_permits_in_use</code></td><td>Gauge</td><td>Permits held per pool: blocking tasks queued or running</td><td>A permit is acquired / released</td><td>pool=gossip,attestation,builder,sync,column_check</td><td></td></tr>
+<tr><td><code>lean_beacon_validation_permit_exhausted_total</code></td><td>Counter</td><td>Objects reported <code>Ignore(Overloaded)</code> because their pool had no free permit</td><td>On each failed <code>try_acquire</code></td><td>pool=gossip,attestation,builder,sync</td><td></td></tr>
+<tr><td><code>lean_beacon_validation_queue_seconds</code></td><td>Histogram</td><td>Time from <code>spawn_blocking</code> being called to the closure starting (tokio blocking-pool queueing)</td><td>When the closure starts</td><td>kind</td><td>0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4</td></tr>
+<tr><td><code>lean_beacon_validation_run_seconds</code></td><td>Histogram</td><td>Run time of the closure itself</td><td>When the closure ends (panic included)</td><td>kind</td><td>same as above</td></tr>
+<tr><td><code>lean_beacon_column_check_permit_wait_seconds</code></td><td>Histogram</td><td>Time a block’s fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a <code>column_check</code> permit</td><td>When the permit is granted</td><td>kind=column_check,envelope_check</td><td>same as above</td></tr>
+<tr><td><code>lean_beacon_epoch_precompute_running</code></td><td>Gauge</td><td>1 while an epoch precompute worker runs its advance</td><td>Worker start / end</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>kind</code> on the queue and run histograms is the gossip topic kind above for gossip
+validation. <code>column_check</code> and <code>envelope_check</code> are the tasks of
+<code>check_and_forward</code> (fetched and replayed columns) and of the envelope checks:
+their queue delay is measured from <code>spawn_blocking</code>, after the permit wait, which
+has its own histogram, so the two add up. <code>column_check</code> covers both stages of a
+block’s columns (see <a href="beacon_wire.html#data-column-sidecars">Data column sidecars</a>):
+its prechecks, which wait for the group’s permit, and each KZG sub-batch. The
+first sub-batch runs on the permit the prechecks held, so it has no permit wait of
+its own; each further one waits for its own. The run histogram therefore mixes
+the two stages, and the prechecks’ share of a permit hold is not measured on its
+own. The in-use gauge counts a task from its
+permit being taken, so one waiting in the blocking pool counts too; it is a count
+of admitted work, not of busy threads. A block’s columns hold one permit from
+their prechecks through their first sub-batch, so between the two the gauge counts
+a permit no thread is using. Only
+<code>lean_beacon_validation_queue_seconds</code> isolates time spent waiting for a thread.</p>
+<p><code>lean_beacon_epoch_precompute_running</code> is set when the worker’s closure starts
+and cleared when it ends, so the interval matches
+<code>lean_beacon_epoch_precompute_seconds</code> (which gives a duration, not an overlap
+with other series). At most one worker runs at a time.</p>
+<p>Block import needs no new series: <code>lean_block_import_phase_seconds{phase="queue"}</code>
+is already the wait in the chain actor’s mailbox before the import starts (see
+Block Import Timing).</p>
+<p><strong>Does validation compete with import?</strong> Plot these on one panel:</p>
+<pre><code class="language-promql"># Validation work admitted, waiting for a thread, and refused
+sum(lean_beacon_validation_permits_in_use)
+histogram_quantile(0.99, sum by (le) (rate(lean_beacon_validation_queue_seconds_bucket[5m])))
+sum by (pool) (rate(lean_beacon_validation_permit_exhausted_total[5m]))
+
+# Against import's STF phase
+histogram_quantile(0.99, sum by (le) (rate(lean_block_import_phase_seconds_bucket{phase="stf"}[5m])))
+
+# Precompute overlap: fraction of the window a worker ran
+avg_over_time(lean_beacon_epoch_precompute_running[5m])
+</code></pre>
+<p>Reading it: if STF p99 rises in the windows where queue-delay p99 or in-use
+rises, the two share threads (the tokio blocking pool, or cores). If queue delay
+stays near zero and STF p99 still moves, suspect cores instead: validation’s CPU
+share is roughly <code>sum(rate(lean_beacon_validation_run_seconds_sum[5m]))</code>, in
+cores. To see whether precompute hurts import, compare STF p99 in windows where
+<code>lean_beacon_epoch_precompute_running</code> is 1 against windows where it is 0.</p>
 <h3 id="beacon-peer-scoring"><a class="header" href="#beacon-peer-scoring">Beacon Peer Scoring</a></h3>
 <p>Gossipsub peer scoring runs on the beacon wire only; see
 <a href="./beacon_wire.html#peer-scoring">beacon_wire.md</a> for the parameters and the

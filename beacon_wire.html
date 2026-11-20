@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f9643e77.js";
+            window.path_to_searchindex_js = "searchindex-27f439f8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -346,7 +346,10 @@ once, so a burst on one family cannot starve another:
 operation topics. A
 mainnet slot carries up to <code>MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE</code> aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
-own rather than sharing the block and column one. Accept propagates the
+own rather than sharing the block and column one. Each pool’s occupancy,
+refusals and blocking-pool queue delay are metrics, with the queries that tell
+whether validation competes with block import: see “Validation contention” in
+<a href="metrics.html"><code>metrics.md</code></a>. Accept propagates the
 message; a message whose dependency is not ready yet is IGNOREd. See
 <a href="#aggregate-attestations">Aggregate attestations</a> for the two topics with
 their own section.</p>
@@ -878,7 +881,10 @@ wall-clock against 73 ms as one batch and 26 ms as separate checks, for 101 ms
 of CPU against 73 ms and 414 ms. A permit is held for one group’s prechecks
 and first sub-batch, or for one further sub-batch, so a block’s proofs never
 hold one permit from first column to last; the prechecks’ share of a hold
-runs the group’s sidecars in turn and is not measured. The envelope checks
+runs the group’s sidecars in turn and is not measured on its own:
+<code>lean_beacon_validation_run_seconds{kind="column_check"}</code> times the prechecks
+and the KZG sub-batches together (see “Validation contention” in
+<a href="metrics.html"><code>metrics.md</code></a>). The envelope checks
 that share the pool wait in arrival order behind only what was queued before
 them.</p>
 <p><em>Asking</em> happens on two paths, bulk and per block.</p>
