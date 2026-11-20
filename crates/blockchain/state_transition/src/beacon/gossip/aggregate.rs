@@ -387,12 +387,16 @@ pub fn stateful_checks(
     let Ok(aggregator) = state.validator(aggregator_index) else {
         return Err(Outcome::Reject(RejectReason::UnknownValidator));
     };
+    let aggregator_pubkey = bls::IndexedPubkey {
+        index: aggregator_index,
+        pubkey: aggregator.pubkey,
+    };
     // [REJECT] The selection proof selects the validator as an aggregator.
     let selection_proof = aggregate.selection_proof();
     let selection_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
-    if !bls::verify(&aggregator.pubkey, selection_signing_root, &selection_proof) {
+    if !bls::verify(&aggregator_pubkey, selection_signing_root, &selection_proof) {
         return Err(Outcome::Reject(RejectReason::SelectionProof));
     }
     // [REJECT] The aggregator's own signature, over the whole envelope.
@@ -401,7 +405,7 @@ pub fn stateful_checks(
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
     if !bls::verify(
-        &aggregator.pubkey,
+        &aggregator_pubkey,
         aggregator_signing_root,
         &aggregate.signature(),
     ) {
@@ -444,7 +448,7 @@ pub fn stateful_checks(
     // (cached) committees, so this costs no further shuffle.
     let attester_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
-    let attesting_indices = match aggregate {
+    let (attesting_indices, indexed_data, aggregate_signature) = match aggregate {
         SignedAggregateAndProof::Phase0(signed) => {
             let phase0_attestation = &signed.message.aggregate;
             let indexed = crate::beacon::helpers::attestation::get_indexed_attestation(
@@ -453,14 +457,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::attestation::is_valid_indexed_attestation_with_domain(
-                &state,
-                &indexed,
-                attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            (
+                indexed.attesting_indices.to_vec(),
+                indexed.data,
+                indexed.signature,
+            )
         }
         SignedAggregateAndProof::Electra(signed) => {
             let electra_attestation = &signed.message.aggregate;
@@ -470,14 +471,11 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::electra::is_valid_indexed_attestation_with_domain(
-                &state,
-                &indexed,
-                attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            (
+                indexed.attesting_indices.to_vec(),
+                indexed.data,
+                indexed.signature,
+            )
         }
         SignedAggregateAndProof::Gloas(signed) => {
             let gloas_attestation = &signed.message.aggregate;
@@ -487,16 +485,24 @@ pub fn stateful_checks(
                 &committees,
             )
             .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
-            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation_with_domain(
-                &state,
-                &indexed,
-                attester_domain,
-            ) {
-                return Err(Outcome::Reject(RejectReason::AggregateSignature));
-            }
-            indexed.attesting_indices.to_vec()
+            (
+                indexed.attesting_indices.to_vec(),
+                indexed.data,
+                indexed.signature,
+            )
         }
     };
+    // Every fork's `is_valid_indexed_attestation`, under the schedule's domain.
+    let signature_set = crate::beacon::helpers::attestation::attesters_signature_set(
+        &state,
+        &attesting_indices,
+        &indexed_data,
+        &aggregate_signature,
+        Some(attester_domain),
+    );
+    if !signature_set.is_some_and(|set| set.verify()) {
+        return Err(Outcome::Reject(RejectReason::AggregateSignature));
+    }
 
     // Ancestry, via the vote state's own history; see this function's
     // documentation for why this state can always answer both questions.

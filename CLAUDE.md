@@ -10,7 +10,7 @@ Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (13 workspace crates)
+## Codebase Structure (16 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -43,6 +43,7 @@ crates/
     ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P, plus the shared sync-gate thresholds (`sync.rs`)
@@ -423,17 +424,19 @@ into one `cli::Options { common, network }`, where `network` is
 `Network::Lean(LeanOptions)` or `Network::Mainnet { mainnet, execution }`. Each
 variant carries that chain's own flags, so a flag one chain does not take is
 unreachable on the other's path by construction rather than by an `Option`
-nobody unwraps. `MainnetOptions` holds the three flags `beacon` has of its own:
-`--custody-group-count`, `--safe-slots-to-import-optimistically`, and
-`--network` (default `mainnet`). The last is carried unresolved: `run_node` is
-where a bad value is reported.
+nobody unwraps. `MainnetOptions` holds the flags `beacon` has of its own, among
+them `--custody-group-count`, `--safe-slots-to-import-optimistically`, the
+`--builder*` flags, `--bootnodes` (a list here; `LeanOptions` has `node`'s
+file), and `--network` (default `mainnet`). The last is carried unresolved:
+`run_node` is where a bad value is reported.
 
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
 it must still precede key loading), resolving `--network` into a
-`NetworkSource` (mainnet only; must precede the next step, since a loaded
-network's own bootnode list is part of its fallback), reading `--bootnodes`,
+`NetworkSource` (mainnet only; must precede the next step, since `beacon`'s
+`--bootnodes` entries are added to the network's own bootnode list), reading
+`--bootnodes` (`node`: a file of ENRs; `beacon`: an ENR/multiaddr list),
 building the aggregator, sync-status and event handles, opening `--data-dir`'s
 RocksDB backend, and `--node-key` resolution. That last one comes after the
 open because, without `--node-key`, the identity is `<data-dir>/node.key`,
@@ -446,8 +449,9 @@ It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainActor` saying what to spawn this chain's actor with (lean's validator
 keys and `BlockChainConfig`, or beacon's `Beacon` marker). The rest of the
 discv5 configuration is the node key, the ports, the bootnodes and the peer
-target, which are operator input and identical either way, so `run_node` fills
-those in once below the match rather than having each arm repeat them.
+target, which are operator input (the bootnodes resolved per chain, but above
+the match), so `run_node` fills those in once below the match rather than
+having each arm repeat them.
 Everything after that match is shared again: one `build_swarm`, one
 `P2P::spawn`, one `start_rpc_server`, and one chain actor, since `ChainActor`
 selects between `BlockChain::spawn` and `BlockChain::spawn_beacon` rather than
@@ -615,6 +619,17 @@ under Beacon Chain STF).
 
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Block telemetry (`crates/common/telemetry`)
+
+`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
+life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
+come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
+`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
+`passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
+[`docs/telemetry.md`](docs/telemetry.md).
+
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
 `ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0
@@ -671,6 +686,7 @@ existing once per chain.
   `[patch.crates-io]` override because nothing outside this workspace depends on
   libssz, so there is no second copy to unify; that also keeps the manifest free
   of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.
+- **The participation lists and `pending_deposits` are tree-backed too** (`EpochParticipation`, `PendingDeposits`; progressive from gloas), reached through `altair_validator_lists` (`ParticipationRef`, no slice) and `epoch_participation_mut`; scan with `ParticipationRef::iter`, not `get(i)`.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s** (gloas:
   `ethlambda_ssz_tree::ProgressiveList`, same method set), persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
@@ -855,8 +871,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   payload via the execution-chain walk; an engine error keeps the envelope and
   retries once a slot, probing with the oldest), and a gloas head sends
   `engine_forkchoiceUpdatedV4` with the custody columns (head hash by the head
-  node's FULL or EMPTY status, finalized and safe from the checkpoint blocks'
-  `bid.parent_block_hash`, safe being a fallback for fast confirmation). Building
+  node's FULL or EMPTY status, finalized from the finalized block's and safe
+  from the Fast Confirmation Rule's confirmed block's `bid.parent_block_hash`).
+  Building
   a gloas payload for `produceBlockV4` uses `PayloadAttributesV4` (V3's fields
   plus `slot_number` and `target_gas_limit`, the parent bid's gas limit) through
   `forkchoice_updated_v4_with_attributes` and `get_payload_v6`
@@ -929,6 +946,22 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
   [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
+- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, consensus-specs
+  `master` @ `f993cf2`, not the pinned release): run once per slot by the beacon
+  actor's tick after the head recompute and before `forkchoiceUpdated` (not
+  past the slot's attestation deadline; a run after a slot without one starts
+  over like a restart, offering the last reported root to
+  `get_restart_resilient_confirmed_root`, whose answer is reported but never
+  written into the rule's own `confirmed_root`); its reported root is the
+  engine's safe hash while it is on the head's chain, and feeds the
+  `fast_confirmation` event. State lives in `Store` (`fast_confirmation`), per-run sums are shared
+  in a `RunContext`. It runs on the actor, so it must stay about as cheap as
+  `get_head`: it reads the fork choice's caches rather than the registry or
+  every vote (balance sources from the per-checkpoint `JustifiedBalances`,
+  attestation scores from the proto-array when the source is the justified
+  checkpoint's), and `get_current_target_score` walks only current-epoch votes
+  (an older vote's root may be below the live index, where each parent hop
+  decodes a block). See [`docs/beacon_stf.md`](docs/beacon_stf.md#fast-confirmation-rule).
 - Nothing is ignored for being unimplemented in the state transition or fork
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates
@@ -972,7 +1005,7 @@ GENESIS_VALIDATORS:
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 
-**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial
+**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial. `node --bootnodes` names a file of them; `beacon --bootnodes` is instead a comma-separated, repeatable list of ENRs and `/ip4|ip6/<ip>/<transport>/p2p/<peer-id>` multiaddrs (Lighthouse's `--boot-nodes`: `tcp/<port>` and `udp/<port>/quic-v1` are dialed, a bare `udp/<port>` only seeds discv5, and is refused under `/ip6` while discovery binds IPv4, checked against the bind address `run_node` passes in). Its entries are added to the network's own list rather than replacing it, and a bad one fails startup where the network's own bad entries are skipped with a warning (see `docs/cli.md`)
 
 ## Testing
 

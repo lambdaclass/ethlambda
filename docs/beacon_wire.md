@@ -183,7 +183,10 @@ operation topics. A
 mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
 TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
-own rather than sharing the block and column one. Accept propagates the
+own rather than sharing the block and column one. Each pool's occupancy,
+refusals and blocking-pool queue delay are metrics, with the queries that tell
+whether validation competes with block import: see "Validation contention" in
+[`metrics.md`](metrics.md). Accept propagates the
 message; a message whose dependency is not ready yet is IGNOREd. See
 [Aggregate attestations](#aggregate-attestations) for the two topics with
 their own section.
@@ -721,7 +724,10 @@ wall-clock against 73 ms as one batch and 26 ms as separate checks, for 101 ms
 of CPU against 73 ms and 414 ms. A permit is held for one group's prechecks
 and first sub-batch, or for one further sub-batch, so a block's proofs never
 hold one permit from first column to last; the prechecks' share of a hold
-runs the group's sidecars in turn and is not measured. The envelope checks
+runs the group's sidecars in turn and is not measured on its own:
+`lean_beacon_validation_run_seconds{kind="column_check"}` times the prechecks
+and the KZG sub-batches together (see "Validation contention" in
+[`metrics.md`](metrics.md)). The envelope checks
 that share the pool wait in arrival order behind only what was queued before
 them.
 
@@ -1023,7 +1029,9 @@ sync committee messages, blocks with their columns, operations), plus relayed
 validated gossip.
 
 `seeds=17` proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. `topics=17` proves the subscription set: the 7
+ENR was skipped with a warning. That holds for a run without `--bootnodes`,
+whose entries are counted on top (in `seeds` only when they carry a discv5
+port). `topics=17` proves the subscription set: the 7
 global topics, the 8 column subnets this run's (randomly generated) node id
 selected, and the 2 attestation subnets the same id selected; `columns=8` and
 `attestation_subnets=[…]` confirm the two families directly.

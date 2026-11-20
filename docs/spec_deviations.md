@@ -749,8 +749,9 @@ newer than the release the fixtures are pinned to.
 
 `verify_execution_payload_envelope` asks the execution engine last, as part of
 one boolean function. The follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability),
-then asks the engine with `engine_newPayloadV5` only about an envelope that
+(`check_execution_payload_envelope_columns_verified`: signature, bid, state;
+data availability is every sampled column being stored, since a column is
+verified before it is stored), then asks the engine with `engine_newPayloadV5` only about an envelope that
 passed them, and records it with `accept_execution_payload_envelope`. The
 engine's part is answered "valid" inside the checks because its answer has
 three outcomes and the specification's `ExecutionEngine` has two.
@@ -802,10 +803,25 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   been computed yet is skipped.
 - `finalized_block_hash` is the finalized block's `bid.parent_block_hash`, as
   the specification has it.
-- `safe_block_hash` is the justified block's `bid.parent_block_hash`. The
-  specification's `get_safe_execution_block_hash` is built on fast
-  confirmation, which the follower does not run, so this is the fallback. It
-  can only be older than the confirmed block, which keeps it safe.
+- `safe_block_hash` is the Fast Confirmation Rule's confirmed block's
+  `bid.parent_block_hash`, the specification's gloas
+  `get_safe_execution_block_hash`. (It used to be the justified block's, a
+  stand-in from before the rule was implemented.) Before the rule's first run,
+  or while the node is far behind the clock and the rule is not run, the
+  confirmed root is the finalized block, which is what the rule's own
+  initialization sets it to.
+- **One deviation, on every fork:** the confirmed block is sent only while it
+  is on the stored head's chain at or above the finalized epoch's start slot,
+  and the finalized block is sent otherwise. The rule runs once a slot, while
+  imports move the head (and send `forkchoiceUpdated`) many times a slot, and
+  the specification's `get_safe_execution_block_hash` names the confirmed block
+  whatever the head is. An execution client answers `-38002 Invalid forkchoice
+  state` to a safe block that is not an ancestor of the head. The confirmed
+  block leaves the head's chain only when the rule's synchrony assumption
+  broke, and the rule's next run falls back to the finalized block then too
+  (`get_latest_confirmed`), so this only answers early what the rule will
+  answer at the next slot. The check is one read of the canonical `BlockRoots`
+  index (`beacon_payloads::safe_root`).
 - A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
   own payload hash.
 - The call is V4 with the node's custody columns when the head block is gloas,
@@ -952,3 +968,23 @@ signature, whichever way the node answered. Three departures:
   slot instead: it is one request for every validator, where the kept
   preferences are one request each, since a node answers a call carrying
   several with one status for all of them.
+
+## The validator client sends `committee_index=0` at gloas slots
+
+- **Beacon API:** `GET /eth/v1/validator/attestation_data` marks
+  `committee_index` deprecated and optional: "For slots in Electra and later,
+  this parameter MAY always be set to 0. For slots in Gloas and later, this
+  parameter SHOULD be omitted."
+- **ethlambda:** the validator client sends `committee_index=0` at every fork,
+  gloas included (`HttpBeaconNode::attestation_data_path`).
+- **Why:** Lighthouse (v8.3.3, and `unstable`) still declares the parameter
+  required and answers a query without it with a `400`, so omitting it would
+  miss every gloas attestation against a Lighthouse beacon node. The value
+  changes nothing: Lighthouse's handler produces the data for committee 0
+  whatever the query names, ethlambda's own beacon node ignores the
+  parameter, and the answer's `index` is the payload signal whatever was
+  asked. ethlambda's beacon node still answers a query that omits it, as
+  spec-following validator clients send.
+- **Until:** Lighthouse's `ValidatorAttestationDataQuery` makes
+  `committee_index` optional. The gloas query can then omit it again, as the
+  Beacon API asks.

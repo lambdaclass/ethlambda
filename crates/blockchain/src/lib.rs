@@ -6,6 +6,7 @@ use ethlambda_network_api::{
     DeferredFrom, FetchRequest, InitP2P,
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
+use ethlambda_state_transition::beacon::fast_confirmation;
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
 use ethlambda_state_transition::is_proposer;
@@ -52,7 +53,8 @@ use crate::beacon_envelope::EnvelopeQueues;
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEvents;
 use crate::import_timing::{
-    BlockImportReport, CascadeTimings, HeadTimings, ImportTimings, SpeculationOutcome,
+    BlockImportReport, CascadeTelemetry, CascadeTimings, EngineAnswer, HeadTimings, ImportTimings,
+    SpeculationOutcome,
 };
 use crate::store::StoreError;
 
@@ -420,6 +422,7 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -430,6 +433,7 @@ impl BlockChain {
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status,
             sync_status_controller,
             events,
@@ -495,6 +499,10 @@ pub struct BlockChainServer {
     /// leave one behind.
     held_timings: HashMap<H256, ImportTimings>,
 
+    /// The running import cascade's telemetry record: reset when `on_block`
+    /// opens a cascade, read once its head is recomputed.
+    cascade_telemetry: CascadeTelemetry,
+
     /// Sidecars whose block's parent this node cannot yet transition from,
     /// keyed by that parent's root and replayed when it gains a post-state.
     ///
@@ -559,6 +567,11 @@ pub struct BlockChainServer {
     /// The epoch precompute worker running right now, if any (beacon only). At
     /// most one runs at a time; see [`epoch_precompute`].
     epoch_precompute_in_flight: Option<epoch_precompute::PrecomputeKey>,
+
+    /// Whether a warm-only key-sum task is running: one started because the
+    /// epoch's state was already cached, so no precompute worker ran to warm
+    /// the sums. At most one runs at a time; see [`epoch_precompute`].
+    key_sums_warming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
     /// validator duties while syncing, unless that gating was disabled at
@@ -783,24 +796,6 @@ enum NoVerdict {
     Task(tokio::task::JoinError),
 }
 
-/// The availability evidence for `block`, or `None` if a column this node
-/// custodies has not arrived yet.
-///
-/// `None` is not "unavailable": it means the question cannot be answered yet,
-/// which is why the caller holds the block rather than rejecting it. A partial
-/// set must never be passed on as evidence, because
-/// `is_data_available_columns` is vacuously true over an empty list and would
-/// import a block whose data nobody has.
-///
-/// Only fulu blocks reach the column shape. A deneb or electra block carrying
-/// blobs would need the blob-and-proof shape, which this node has no source
-/// for, so it is admitted with a log rather than held forever against a
-/// pipeline that does not exist.
-///
-/// `ethlambda_storage::Table::DataColumns` is never pruned today (see its own
-/// doc comment), which is what lets the sidecar-collecting `.expect()`s below
-/// assume a column confirmed present a moment ago by `custody_columns_present`
-/// is still there to decode; a future pruner has to keep that window safe too.
 /// Whether a block at `block_slot` still falls inside the window this node may
 /// insist on data availability for.
 ///
@@ -827,6 +822,31 @@ fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Confi
     block_epoch >= boundary
 }
 
+/// The availability evidence for `block`, or `None` if a column this node
+/// custodies has not arrived yet.
+///
+/// `None` is not "unavailable": it means the question cannot be answered yet,
+/// which is why the caller holds the block rather than rejecting it. A partial
+/// set must never be passed on as evidence, because
+/// `is_data_available_columns` is vacuously true over an empty list and would
+/// import a block whose data nobody has.
+///
+/// Only fulu blocks reach the column shape. A deneb or electra block carrying
+/// blobs would need the blob-and-proof shape, which this node has no source
+/// for, so it is admitted with a log rather than held forever against a
+/// pipeline that does not exist.
+///
+/// A fulu block whose custody columns are all present gets
+/// [`fork_choice::DataAvailability::ColumnsVerified`]: the sidecars are not
+/// read or decoded, because the table only ever holds ones already checked in
+/// full (structure, inclusion proof, KZG), and the spec's per-sidecar check
+/// would repeat that work on the import thread. The p2p layer checks every
+/// sidecar it receives; this node's own proposal's are checked by the Beacon
+/// API before it publishes them (`data_columns::verified_sidecars`). Debug
+/// builds keep a safety net on the write side instead, in
+/// `on_checked_data_columns`. Lighthouse skips the same work at import, with
+/// the proof carried by its verified-column types; here nothing in the type
+/// carries it, and the write gate is what makes it hold.
 fn data_availability_for(
     store: &Store,
     block: &SignedBeaconBlock,
@@ -852,7 +872,7 @@ fn data_availability_for(
 
             // An empty custody set means there is nothing outstanding, not
             // that the question is unanswerable: `custody_columns_present`
-            // below is vacuously true and the resulting `Columns(vec![])` is
+            // below is vacuously true and the resulting evidence is
             // vacuously available, which is the right answer for a caller
             // that supplied every block itself. Only the replay harness
             // (`BlockChainServer::for_replay`) is in that position. A node
@@ -864,32 +884,20 @@ fn data_availability_for(
             let block_root = block.message_hash_tree_root();
 
             // Presence first, over the full set: a column this node has not
-            // yet verified must not even be looked up, since silently
-            // dropping the missing ones would hand back a shorter-but-still-
-            // non-empty list that reads as complete evidence to the caller.
+            // yet stored must not be waved through, since evidence built from
+            // a partial set would read as complete to the caller.
             if !custody_columns_present(store, slot, &block_root, custody_columns) {
                 return None;
             }
 
-            let sidecars = custody_columns
-                .iter()
-                .map(|&index| {
-                    let sidecar = store
-                        .get_data_column(slot, &block_root, index)
-                        .expect("a sidecar this node verified before storing decodes")
-                        .expect("presence just confirmed above");
-                    match sidecar {
-                        DataColumnSidecar::Fulu(sidecar) => sidecar,
-                        // The row decodes by its slot's fork, and this arm is
-                        // the fulu block at that slot.
-                        DataColumnSidecar::Gloas(_) => {
-                            unreachable!("a fulu block's slot decodes its rows as fulu")
-                        }
-                    }
-                })
-                .collect();
-
-            Some(fork_choice::DataAvailability::Columns(sidecars))
+            // Present means verified: `DataColumns` takes only sidecars the
+            // p2p layer's column checks accepted, or this node's own
+            // proposal's, which the Beacon API verified before publishing them
+            // (see `on_checked_data_columns`), keyed by the root of the header
+            // they were checked against. So the sidecars are neither read back
+            // nor verified again here; the KZG batch they would cost is the
+            // one each already paid on arrival.
+            Some(fork_choice::DataAvailability::ColumnsVerified)
         }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
@@ -1112,7 +1120,12 @@ impl BlockChainServer {
                 // votes have to be in fork choice before the head this tick
                 // reports is chosen.
                 self.drain_deferred_aggregates();
-                self.recompute_beacon_head().await;
+                // The Fast Confirmation Rule runs inside this recompute, once
+                // per slot: after the clock advance and the deferred
+                // aggregates (so past slots' attestations are applied) and
+                // after the head, but before `forkchoiceUpdated`, whose safe
+                // block it decides.
+                self.recompute_beacon_head_with(true).await;
             }
         }
 
@@ -1776,6 +1789,10 @@ impl BlockChainServer {
         // post-state the store already holds before ever reaching here.
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
+        // Copied out before `signed_block` is moved below: the `block` event of
+        // a gloas block names its bid's builder and payload hash.
+        let bid = crate::beacon_payloads::bid_of(&signed_block)
+            .map(|bid| (bid.builder_index, bid.block_hash));
         let is_new = !self
             .store
             .has_state(&block_root)
@@ -1831,6 +1848,18 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
+                    // Only a block with data to wait for has made data
+                    // available; a gloas block or one with no commitments is
+                    // answered `NotRequired`. Exhaustive, so a new kind of
+                    // evidence has to say which it is.
+                    timings.da_columns_required = match &evidence {
+                        Some(
+                            fork_choice::DataAvailability::Columns(_)
+                            | fork_choice::DataAvailability::ColumnsVerified
+                            | fork_choice::DataAvailability::Blobs { .. },
+                        ) => true,
+                        Some(fork_choice::DataAvailability::NotRequired) | None => false,
+                    };
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -1887,6 +1916,9 @@ impl BlockChainServer {
                 // speculation as this one's.
                 (timings.stf_speculative_start, timings.stf_speculative_end) = (None, None);
                 timings.speculation = None;
+                // Likewise the `el_sent` and `el_verdict` rows: only this
+                // pass's answer, if it got one.
+                timings.engine_answer = None;
                 let parent_root = beacon_block.parent_root();
                 let mut speculation: Option<fork_choice::SpeculativeTransition> = None;
                 let request = self.engine.as_ref().and_then(|client| {
@@ -1902,8 +1934,9 @@ impl BlockChainServer {
                         // the rest of its retry ladder with nobody to read
                         // the answer.
                         let task = AbortOnDropHandle::new(tokio::spawn(async move {
+                            let sent = Instant::now();
                             let answer = beacon_engine::ask_request(&client, request).await;
-                            (answer, Instant::now())
+                            (answer, sent, Instant::now())
                         }));
                         let speculative_start = Instant::now();
                         let computed = fork_choice::speculate_transition(
@@ -1921,7 +1954,20 @@ impl BlockChainServer {
                         }
                         speculation = computed;
                         let (answer, answered_at) = match task.await {
-                            Ok((answer, answered_at)) => {
+                            Ok((answer, sent, answered_at)) => {
+                                // The request's own instants, taken on the
+                                // task that sent it, for the `el_sent` and
+                                // `el_verdict` rows: the `engine` pair also
+                                // spans building the request and the
+                                // transition computed meanwhile.
+                                if let Some(verdict) = answer.as_ref().ok().and_then(verdict_label)
+                                {
+                                    timings.engine_answer = Some(EngineAnswer {
+                                        sent,
+                                        answered: answered_at,
+                                        verdict,
+                                    });
+                                }
                                 (answer.map_err(NoVerdict::Engine), answered_at)
                             }
                             Err(err) => (Err(NoVerdict::Task(err)), Instant::now()),
@@ -2114,7 +2160,8 @@ impl BlockChainServer {
         // `block` goes out first so subscribers see it ahead of the
         // justified/head/finalized moves its import triggers.
         if is_new {
-            self.events.publish_block(&self.store, slot, block_root);
+            self.events
+                .publish_block(&self.store, slot, block_root, bid);
         }
         // Lean only: a beacon import moves no head of its own, and the
         // cascade's head recompute publishes beacon's events once it runs.
@@ -2181,6 +2228,7 @@ impl BlockChainServer {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -2189,6 +2237,7 @@ impl BlockChainServer {
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
             sync_status_controller: SyncStatusController::default(),
             events: ChainEvents::new(EventBus::default(), &store),
@@ -2251,6 +2300,7 @@ impl BlockChainServer {
         };
         let mut queue = VecDeque::new();
         queue.push_back((signed_block, timings));
+        self.cascade_telemetry = CascadeTelemetry::default();
         let (outcome, blocks) = self.run_import_cascade(queue, &mut cascade).await;
 
         if self.store.chain() == Chain::Beacon {
@@ -2275,7 +2325,37 @@ impl BlockChainServer {
 
         cascade.observe(blocks);
         cascade.log(blocks);
+        ethlambda_telemetry::emit(|| {
+            let on_head = self.head_chain_since(&self.cascade_telemetry.imported);
+            self.cascade_telemetry
+                .events(&cascade, |root| on_head.contains(root))
+        });
         outcome
+    }
+
+    /// The roots on the head's chain from the head back to the lowest slot
+    /// among `imported`: the blocks of a cascade the new head includes, for
+    /// its `attestable` rows. A handful of point lookups, one per slot the
+    /// cascade spans, and none when it imported nothing.
+    fn head_chain_since(&self, imported: &[(u64, H256, &'static str)]) -> HashSet<H256> {
+        let mut on_head = HashSet::new();
+        let Some(lowest) = imported.iter().map(|&(slot, _, _)| slot).min() else {
+            return on_head;
+        };
+        let Some((mut slot, mut root)) = self.store.beacon_head() else {
+            return on_head;
+        };
+        while slot >= lowest {
+            on_head.insert(root);
+            let Some((_, parent)) = self.store.block_entry(&root) else {
+                break;
+            };
+            let Some((parent_slot, _)) = self.store.block_entry(&parent) else {
+                break;
+            };
+            (slot, root) = (parent_slot, parent);
+        }
+        on_head
     }
 
     /// Drain `queue`, importing each block and enqueuing any pending children
@@ -2433,7 +2513,7 @@ impl BlockChainServer {
     /// any of them is subtracted from another. `outcome` is borrowed rather
     /// than taken because the caller still has to act on it.
     fn log_import_report(
-        &self,
+        &mut self,
         slot: u64,
         block_root: H256,
         attestations: usize,
@@ -2453,6 +2533,17 @@ impl BlockChainServer {
             timings,
         };
         report.observe();
+        ethlambda_telemetry::emit(|| report.telemetry_events());
+        // `process_and_publish_block` also reaches here outside any
+        // `on_block`; harmless, since a locally built block has no source
+        // label and so is never recorded.
+        if report.imported_here()
+            && let Some(source) = report.timings.source_label()
+        {
+            self.cascade_telemetry
+                .imported
+                .push((report.slot, report.block_root, source));
+        }
         report.log();
     }
 
@@ -2537,7 +2628,19 @@ impl BlockChainServer {
     /// not delay it by one more engine call) and again whenever an `INVALID`
     /// verdict moves the head inside that call.
     async fn recompute_beacon_head(&mut self) -> HeadTimings {
-        let mut timings = self.update_head_from_fork_choice();
+        self.recompute_beacon_head_with(false).await
+    }
+
+    /// [`Self::recompute_beacon_head`], optionally running the Fast
+    /// Confirmation Rule between the head computation and the
+    /// `forkchoiceUpdated` that carries its confirmed block as the safe one.
+    /// Only the per-slot tick passes `true`: the rule must run exactly once per
+    /// slot, and imports recompute the head many times a slot.
+    async fn recompute_beacon_head_with(&mut self, run_fast_confirmation: bool) -> HeadTimings {
+        let (mut timings, index) = self.update_head_keeping_index();
+        if run_fast_confirmation && !timings.head_failed {
+            self.run_fast_confirmation(index);
+        }
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
             timings.fcu_end = Some(end);
@@ -2727,13 +2830,22 @@ impl BlockChainServer {
     /// the head read here rather than reading it again: on beacon that read is
     /// a whole-block decode.
     pub(crate) fn update_head_from_fork_choice(&mut self) -> HeadTimings {
+        self.update_head_keeping_index().0
+    }
+
+    /// [`Self::update_head_from_fork_choice`], also handing back the
+    /// [`ethlambda_storage::Store::block_index`] the head computation walked,
+    /// so the Fast Confirmation Rule run right after it does not scan
+    /// `LiveChain` again.
+    fn update_head_keeping_index(&mut self) -> (HeadTimings, HashMap<H256, (u64, H256)>) {
         let _timing = metrics::time_beacon_head_compute();
         let mut timings = HeadTimings {
             head_start: Some(Instant::now()),
             ..HeadTimings::default()
         };
         let config = self.store.config();
-        if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
+        let index = self.store.block_index();
+        if let Err(err) = fork_choice::get_head_with_index(&mut self.store, &config, &index) {
             // An invalidated justified checkpoint reaches here:
             // `filter_block_tree` fails its `block_root in store.blocks` assert
             // once the justified root's row is gone. `optimistic-sync.md`
@@ -2741,6 +2853,7 @@ impl BlockChainServer {
             // what this does: the head simply does not move.
             warn!(%err, "Failed to compute beacon head");
             timings.head_end = Some(Instant::now());
+            timings.head_failed = true;
             // The head did not move, but the clock did. Judged on the head
             // slot judged last, which takes no decode of the head block.
             let head_slot = self
@@ -2748,16 +2861,94 @@ impl BlockChainServer {
                 .judged_head_slot()
                 .or_else(|| self.known_head_slot());
             self.judge_sync_status(self.wall_clock_slot(), head_slot);
-            return timings;
+            return (timings, index);
         }
         timings.head_end = Some(Instant::now());
+        timings.head_ok = true;
         let head = self.store.beacon_head();
         if let Some((head_slot, _)) = head {
             metrics::update_head_slot(head_slot);
         }
         self.pin_head_shufflings(head);
         self.judge_sync_status(self.wall_clock_slot(), head.map(|(slot, _)| slot));
-        timings
+        (timings, index)
+    }
+
+    /// Run the Fast Confirmation Rule once and publish its `fast_confirmation`
+    /// event, from the head fork choice just recorded.
+    ///
+    /// Skipped, and the rule reset ([`Store::reset_fast_confirmation`]), while
+    /// the head is more than [`events::HEAD_EVENT_RECENCY_SLOTS`] behind the
+    /// wall clock: the rule assumes synchrony from the start of the previous
+    /// slot, a catching-up node has none, and its stored heads would be stale
+    /// (and eventually pruned). Same staleness gate as the `head` event.
+    ///
+    /// Also skipped once the slot's attestation deadline has passed (a tick
+    /// held up behind a long import, say): the specification requires
+    /// `update_fast_confirmation_variables` to run before
+    /// `get_attestation_due_ms` into the slot. The slot then has no run, and
+    /// the next one starts over (see `fast_confirmation::run_fast_confirmation`,
+    /// which also logs that). A failed run is logged and the event withheld,
+    /// and the rule is reset.
+    ///
+    /// `index` is the [`ethlambda_storage::Store::block_index`] the head
+    /// computation just walked, handed on so the run does not scan again.
+    fn run_fast_confirmation(&mut self, index: HashMap<H256, (u64, H256)>) {
+        let Some((head_slot, head_root)) = self.store.beacon_head() else {
+            return;
+        };
+        if head_slot + events::HEAD_EVENT_RECENCY_SLOTS < self.wall_clock_slot() {
+            self.store.reset_fast_confirmation();
+            return;
+        }
+        let config = self.store.config();
+        // Read now, after the head computation, rather than at the tick: the
+        // variables are updated by the run below.
+        let slot = fork_choice::get_current_slot(&self.store, &config);
+        // This slot already had its run (a tick that fired while the store
+        // clock still read the slot before). Checked before the deadline,
+        // which for that earlier slot has long passed and would be reported
+        // as a late run.
+        if self.store.fast_confirmation_slot() == Some(slot) {
+            return;
+        }
+        let deadline_ms = config
+            .genesis_time_ms()
+            .saturating_add(slot.saturating_mul(config.slot_duration_ms))
+            .saturating_add(fork_choice::get_attestation_due_ms(
+                compute_epoch_at_slot(slot),
+                &config,
+            ));
+        let now_ms = unix_now_ms();
+        if now_ms >= deadline_ms {
+            warn!(
+                %slot,
+                late_ms = now_ms - deadline_ms,
+                "Skipping this slot's fast confirmation run: past the attestation deadline; \
+                 the next slot's run starts over"
+            );
+            return;
+        }
+        let result = {
+            let _timing = metrics::time_beacon_fast_confirmation();
+            fast_confirmation::run_fast_confirmation_with_index(
+                &self.store,
+                &config,
+                head_root,
+                index,
+            )
+        };
+        match result {
+            Ok(Some(confirmation)) => self.events.publish_fast_confirmation(
+                confirmation.block,
+                confirmation.slot,
+                confirmation.current_slot,
+            ),
+            // Already answered above; the run checks again for its other
+            // callers.
+            Ok(None) => {}
+            Err(err) => warn!(%err, "Fast confirmation run failed; falling back to finalized"),
+        }
     }
 
     /// Point the committee cache's eviction at the head fork choice just
@@ -2924,6 +3115,10 @@ impl BlockChainServer {
     ) -> Option<ImportOutcome> {
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
+        // The first block a cascade processes is the one that arrived.
+        self.cascade_telemetry
+            .arrival
+            .get_or_insert((slot, block_root));
         let parent_root = signed_block.parent_root();
         let proposer = signed_block.proposer_index();
         timings.guards_start = Some(Instant::now());
@@ -3629,6 +3824,11 @@ impl BlockChainServer {
     /// (`ethlambda_state_transition::beacon::gossip::column::chain_checks`)
     /// for any other. Those cost a KZG batch and a BLS verification per
     /// sidecar, which on this thread delayed every block import behind them.
+    /// The one batch that skips the p2p checks, this node's own proposal's
+    /// custody columns, was verified by the Beacon API before it was published
+    /// (`ethlambda_state_transition::beacon::data_columns::verified_sidecars`).
+    /// Block import counts on all of this: it takes a stored column as
+    /// verified and does not check it again.
     ///
     /// Debug builds run the chain checks once more, so a p2p path that
     /// forwards a sidecar it never checked fails a test instead of reaching
@@ -4425,6 +4625,21 @@ impl Handler<AggregationDeadline> for BlockChainServer {
     }
 }
 
+/// The `verdict` a `block_events` row records for an execution client's answer.
+///
+/// `NotRequired` is never one: a block that needs no verdict is not sent, and
+/// a status the execution client returns always reads as one of the other
+/// three (see `beacon_engine::outcome_label`). It writes no `el_verdict` row
+/// rather than a value outside the documented set.
+fn verdict_label(validity: &fork_choice::PayloadValidity) -> Option<&'static str> {
+    match validity {
+        fork_choice::PayloadValidity::NotRequired => None,
+        fork_choice::PayloadValidity::Validated => Some("Valid"),
+        fork_choice::PayloadValidity::Optimistic => Some("Optimistic"),
+        fork_choice::PayloadValidity::Invalidated { .. } => Some("Invalid"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -4742,6 +4957,7 @@ mod tests {
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
+            cascade_telemetry: CascadeTelemetry::default(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
@@ -4752,6 +4968,7 @@ mod tests {
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status: SyncStatusTracker::new(false, SyncThresholds::BEACON),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
@@ -5332,7 +5549,26 @@ mod tests {
         }
         assert!(matches!(
             data_availability_for(&store, &block, &CUSTODY).unwrap(),
-            fork_choice::DataAvailability::Columns(sidecars) if sidecars.len() == 2
+            fork_choice::DataAvailability::ColumnsVerified
+        ));
+    }
+
+    #[test]
+    fn complete_columns_are_vouched_for_without_being_read() {
+        // The rows are bytes no sidecar decodes from, so any read of them
+        // would fail: presence alone is what the evidence rests on, since the
+        // table holds only sidecars the p2p layer already checked.
+        let store = beacon_store_fulu_at_genesis(0, 0);
+        let block = fulu_block_with_commitments(&store, 2);
+        let root = block.message_hash_tree_root();
+        for index in CUSTODY {
+            store
+                .put_data_column_sidecar(block.slot(), &root, index, vec![0xff])
+                .unwrap();
+        }
+        assert!(matches!(
+            data_availability_for(&store, &block, &CUSTODY),
+            Some(fork_choice::DataAvailability::ColumnsVerified)
         ));
     }
 
@@ -5344,7 +5580,7 @@ mod tests {
         // where a node is configured, not re-derived per block.
         //
         // With no column to require, `custody_columns_present` is vacuously
-        // true and the collected evidence is `Columns(vec![])` rather than
+        // true and the evidence is `ColumnsVerified` rather than
         // `NotRequired`: the commitments are still there, so this is "nothing
         // outstanding", not "no check needed", but the two are equally
         // admissible to `is_data_available_columns`.
@@ -5356,7 +5592,7 @@ mod tests {
         assert!(
             matches!(
                 evidence,
-                Some(fork_choice::DataAvailability::Columns(sidecars)) if sidecars.is_empty()
+                Some(fork_choice::DataAvailability::ColumnsVerified)
             ),
             "an empty custody set has nothing outstanding, so the block is admissible"
         );
@@ -5685,6 +5921,214 @@ mod tests {
             .process_or_pend_block(block, ImportTimings::default(), &mut queue)
             .await;
         assert_eq!(outcome, None);
+    }
+
+    /// The arriving block is recorded whatever becomes of it, but only a
+    /// block whose own state transition ran counts as imported: a held one
+    /// does not, and neither does a re-delivery of a stored one, so neither
+    /// gets arrival rows filed under it.
+    #[tokio::test]
+    async fn only_a_block_imported_here_gets_arrival_rows() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let gossip = || ImportTimings {
+            source: Some(BlockSource::Gossip),
+            ..ImportTimings::starting_now()
+        };
+        let cascade = |base: Instant| CascadeTimings {
+            source: Some(BlockSource::Gossip),
+            cascade_start: Some(base),
+            cascade_end: Some(base),
+            head_start: Some(base),
+            head_end: Some(base),
+            head_ok: true,
+            ..CascadeTimings::default()
+        };
+
+        // Held for its columns: recorded as the arrival, not imported.
+        let held = fulu_block_with_commitments(&server.store, 2);
+        let held_root = held.message_hash_tree_root();
+        server.on_block(held.clone(), gossip()).await;
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((held.slot(), held_root))
+        );
+        assert!(server.cascade_telemetry.imported.is_empty());
+        assert!(
+            server
+                .cascade_telemetry
+                .events(&cascade(Instant::now()), |_| true)
+                .is_empty()
+        );
+
+        // A re-delivery of a stored beacon block returns early at the
+        // `has_state` check, before any report is logged: it files no arrival
+        // rows. (`imported_here` itself is pinned by import_timing's
+        // `a_block_already_imported_writes_nothing`.)
+        let stored = fulu_block(H256::ZERO, 1, 0);
+        let stored_root = stored.message_hash_tree_root();
+        server
+            .store
+            .insert_signed_block(stored_root, stored.clone())
+            .expect("insert");
+        server
+            .store
+            .insert_state(stored_root, bare_state())
+            .expect("insert");
+        server.on_block(stored.clone(), gossip()).await;
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((stored.slot(), stored_root))
+        );
+        assert!(server.cascade_telemetry.imported.is_empty());
+        assert!(
+            server
+                .cascade_telemetry
+                .events(&cascade(Instant::now()), |_| true)
+                .is_empty()
+        );
+    }
+
+    /// The arrival is the cascade's first block, not the latest one processed:
+    /// later blocks of the same cascade must not overwrite it.
+    #[tokio::test]
+    async fn the_arrival_is_the_first_block_a_cascade_processes() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        let first_slot = first.slot();
+        let child = fulu_block(first_root, first_slot + 1, 0);
+
+        server.cascade_telemetry = CascadeTelemetry::default();
+        for block in [first, child] {
+            let mut queue = VecDeque::new();
+            server
+                .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+                .await;
+        }
+
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((first_slot, first_root))
+        );
+    }
+
+    /// Through `on_block`: the arrival is the block that arrived, even though
+    /// the cascade then processes a stored ancestor the walk queued behind it,
+    /// and the record is reset once per arrival, not once per block.
+    #[tokio::test]
+    async fn the_arrival_is_the_block_on_block_was_called_with() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        // Stored as pending from an earlier session: the child's walk finds
+        // it, its parent has a state, and it is queued behind the child. It is
+        // then held for its columns, so no state transition is needed.
+        let first = fulu_block_with_commitments(&server.store, 2);
+        let first_root = first.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(first_root, first.clone())
+            .expect("insert");
+        let child = fulu_block(first_root, first.slot() + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        let child_slot = child.slot();
+
+        server
+            .on_block(
+                child,
+                ImportTimings {
+                    source: Some(BlockSource::Gossip),
+                    ..ImportTimings::starting_now()
+                },
+            )
+            .await;
+
+        assert!(
+            server.blocks_awaiting_columns.contains_key(&first_root),
+            "the walk queued the stored ancestor, which then held"
+        );
+        assert_eq!(
+            server.cascade_telemetry.arrival,
+            Some((child_slot, child_root))
+        );
+    }
+
+    /// `da_columns_required` says the check found columns to require, not
+    /// merely that it ran.
+    #[tokio::test]
+    async fn the_columns_required_flag_follows_the_commitments() {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let bare = fulu_block_with_commitments(&server.store, 0);
+        let (timings, _) = server.process_block(bare, ImportTimings::default()).await;
+        assert!(timings.da_check_end.is_some(), "inside the window");
+        assert!(!timings.da_columns_required, "nothing to make available");
+
+        let with_columns = fulu_block_with_commitments(&server.store, 2);
+        let root = with_columns.message_hash_tree_root();
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&with_columns, index);
+            server
+                .store
+                .put_data_column_sidecar(with_columns.slot(), &root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        let (timings, _) = server
+            .process_block(with_columns, ImportTimings::default())
+            .await;
+        assert!(timings.da_columns_required, "columns were required");
     }
 
     #[tokio::test]
@@ -6427,9 +6871,13 @@ mod tests {
 
     use crate::events::{
         BeaconAttestationEvent, BeaconChainReorgEvent, BeaconFinalizedCheckpointEvent,
-        BeaconHeadEvent, DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
+        BeaconHeadEvent, BeaconHeadV2Event, DataColumnSidecarEvent, ExecutionPayloadAvailableEvent,
+        ExecutionPayloadEvent, HEAD_EVENT_RECENCY_SLOTS, Versioned,
     };
     use ethlambda_storage::ForkCheckpoints;
+    use ethlambda_types::beacon::fork_choice::{
+        BlockPayloadLink, PayloadStatus, PayloadStatusEnum,
+    };
     use tokio::sync::broadcast;
 
     const G: H256 = H256::repeat_byte(0x10);
@@ -6500,8 +6948,12 @@ mod tests {
             .expect("update head");
     }
 
+    /// What is on the channel but `head_v2`, which rides every `head` and is
+    /// tested apart (see [`drain_all`]).
     fn drain(rx: &mut broadcast::Receiver<ChainEvent>) -> Vec<ChainEvent> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| !matches!(event, ChainEvent::BeaconHeadV2(_)))
+            .collect()
     }
 
     fn as_head(event: &ChainEvent) -> &BeaconHeadEvent {
@@ -6638,11 +7090,12 @@ mod tests {
         let (mut store, mut events, mut rx) = fork_fixture(A);
         set_head(&mut store, B);
         events.publish_beacon_changes(&store, 2 + HEAD_EVENT_RECENCY_SLOTS + 1);
-        assert!(drain(&mut rx).is_empty());
+        // Neither `head` nor `head_v2`.
+        assert!(drain_all(&mut rx).is_empty());
 
         // The move was recorded: a recent diff now has nothing to report.
         events.publish_beacon_changes(&store, 2);
-        assert!(drain(&mut rx).is_empty());
+        assert!(drain_all(&mut rx).is_empty());
     }
 
     #[test]
@@ -6664,6 +7117,88 @@ mod tests {
         events.publish_beacon_changes(&store, 2);
 
         assert!(as_head(&drain(&mut rx)[0]).execution_optimistic);
+    }
+
+    /// Records A and B as gloas blocks: A on its pre-gloas parent, B on A's
+    /// payload (`b_parent`). The fixture's bodies are phase0, but the
+    /// optimistic rule reads the recorded link before it would decode one.
+    fn as_gloas_chain(store: &Store, b_parent: PayloadStatus) {
+        let link = |parent_status| BlockPayloadLink::Gloas {
+            parent_status: Some(parent_status),
+        };
+        store.set_payload_link(A, 1, link(PayloadStatus::Full));
+        store.set_payload_link(B, 2, link(b_parent));
+    }
+
+    /// A gloas head is optimistic iff the payload it builds on is not `VALID`.
+    /// A gloas block never enters the optimistic set, so reading only that set
+    /// reported every gloas head as validated, `head_v2` included.
+    #[test]
+    fn a_gloas_head_on_an_unvalidated_payload_says_so_in_head_and_head_v2() {
+        for (verdict, optimistic) in [
+            (PayloadStatusEnum::Syncing, true),
+            (PayloadStatusEnum::Accepted, true),
+            (PayloadStatusEnum::Valid, false),
+        ] {
+            let (mut store, mut events, mut rx) = fork_fixture(A);
+            as_gloas_chain(&store, PayloadStatus::Full);
+            store.insert_beacon_block_payload_status(A, 1, verdict);
+            assert!(!store.is_beacon_optimistic(B), "never in the set");
+
+            set_head(&mut store, B);
+            events.publish_beacon_changes(&store, 2);
+
+            let emitted = drain_all(&mut rx);
+            assert_eq!(emitted.len(), 2, "{emitted:?}");
+            assert_eq!(
+                as_head(&emitted[0]).execution_optimistic,
+                optimistic,
+                "{verdict:?}"
+            );
+            let v2 = &as_head_v2(&emitted[1]).data;
+            assert_eq!(v2.execution_optimistic, optimistic, "{verdict:?}");
+        }
+    }
+
+    /// A head that skipped its parent's payload rests on the one before it:
+    /// A's unvalidated payload does not make B optimistic when B built on A's
+    /// EMPTY branch and A on a validated pre-gloas parent.
+    #[test]
+    fn a_gloas_head_that_skipped_its_parents_payload_reads_the_one_before() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        as_gloas_chain(&store, PayloadStatus::Empty);
+        store.insert_beacon_block_payload_status(A, 1, PayloadStatusEnum::Syncing);
+
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+        assert!(!as_head(&drain(&mut rx)[0]).execution_optimistic);
+
+        // The pre-gloas block the chain rests on is itself optimistic.
+        store.insert_beacon_optimistic_root(G, 0);
+        set_head(&mut store, A);
+        events.publish_beacon_changes(&store, 2);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+        let emitted = drain(&mut rx);
+        assert!(as_head(emitted.last().unwrap()).execution_optimistic);
+    }
+
+    /// The second `head_v2`, sent when the head's payload arrives, carries the
+    /// flag of the payload the head builds on, as the first one does.
+    #[test]
+    fn the_head_v2_for_an_arrived_payload_reads_the_payload_the_head_builds_on() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        as_gloas_chain(&store, PayloadStatus::Full);
+        store.insert_beacon_block_payload_status(A, 1, PayloadStatusEnum::Syncing);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        assert!(as_head_v2(&emitted[0]).data.execution_optimistic);
     }
 
     /// Two finality steps between diffs coalesce into one event naming the
@@ -6833,5 +7368,233 @@ mod tests {
             panic!("expected block_gossip, got {:?}", emitted[0]);
         };
         assert_eq!((gossip.slot, gossip.block), (4, root));
+    }
+
+    // -----------------------------------------------------------------
+    // `head_v2`
+    // -----------------------------------------------------------------
+
+    /// Everything on the channel, `head_v2` included. [`drain`] leaves it
+    /// out, so the tests of `head` and `chain_reorg` keep reading the
+    /// events they name.
+    fn drain_all(rx: &mut broadcast::Receiver<ChainEvent>) -> Vec<ChainEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn as_head_v2(event: &ChainEvent) -> &Versioned<BeaconHeadV2Event> {
+        match event {
+            ChainEvent::BeaconHeadV2(head) => head,
+            other => panic!("expected a head_v2 event, got {other:?}"),
+        }
+    }
+
+    /// Every head move announces `head`, then `head_v2` for the same block,
+    /// and a pre-gloas head is `full`.
+    #[test]
+    fn a_head_move_emits_head_v2_right_after_head_and_it_is_full_before_gloas() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        assert_eq!(as_head(&emitted[0]).block, B);
+        let v2 = as_head_v2(&emitted[1]);
+        assert_eq!(v2.version, "phase0");
+        assert_eq!(
+            v2.data,
+            BeaconHeadV2Event {
+                slot: 2,
+                block: B,
+                state: post_state_root(B),
+                payload_status: "full",
+                epoch_transition: false,
+                // Epoch 0: both dependent roots underflow to genesis.
+                current_epoch_dependent_root: G,
+                next_epoch_dependent_root: G,
+                execution_optimistic: false,
+            }
+        );
+    }
+
+    /// `head_v2`'s roots are `head`'s shifted one epoch: current is the root
+    /// at `start_slot(epoch - 1) - 1`, next the root at `start_slot(epoch) - 1`,
+    /// both the genesis block's on underflow.
+    #[test]
+    fn head_v2_dependent_roots_follow_the_epoch_and_underflow_to_genesis() {
+        let x = H256::repeat_byte(0x21);
+        let y = H256::repeat_byte(0x22);
+        let z = H256::repeat_byte(0x23);
+        let mut store = event_store(GENESIS_TIME);
+        insert_event_block(&mut store, x, 31, G, &[(0, G)]);
+        insert_event_block(&mut store, y, 32, x, &[(0, G), (31, x)]);
+        insert_event_block(&mut store, z, 65, y, &[(0, G), (31, x), (32, y)]);
+        set_head(&mut store, x);
+        let mut events = ChainEvents::new(EventBus::new(16), &store);
+        let mut rx = events.subscribe();
+
+        set_head(&mut store, y);
+        events.publish_beacon_changes(&store, 32);
+        let emitted = drain_all(&mut rx);
+        let head = &as_head_v2(&emitted[1]).data;
+        assert!(head.epoch_transition);
+        // Epoch 1 (slot 32): `start_slot(0) - 1` underflows, `start_slot(1) - 1`
+        // is slot 31.
+        assert_eq!(head.current_epoch_dependent_root, G);
+        assert_eq!(head.next_epoch_dependent_root, x);
+
+        set_head(&mut store, z);
+        events.publish_beacon_changes(&store, 65);
+        let emitted = drain_all(&mut rx);
+        let head = &as_head_v2(&emitted[1]).data;
+        assert!(head.epoch_transition);
+        // Epoch 2 (slot 65): slots 31 and 63.
+        assert_eq!(head.current_epoch_dependent_root, x);
+        assert_eq!(head.next_epoch_dependent_root, y);
+    }
+
+    /// A head whose payload arrives gets `head_v2` a second time, for the same
+    /// block and with no epoch transition; nothing else moves.
+    #[test]
+    fn a_head_whose_payload_arrives_gets_head_v2_again() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        // The view starts from the empty head, as after the head's own move.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let v2 = &as_head_v2(&emitted[0]).data;
+        assert_eq!((v2.slot, v2.block), (2, B));
+        assert!(!v2.epoch_transition);
+
+        // Reported once: the view now holds FULL.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    /// The second `head_v2` keeps the recency gate the first one has: a
+    /// payload arriving for a head too old to announce is not announced
+    /// either, and the view still records it.
+    #[test]
+    fn a_stale_heads_payload_arrival_is_gated_but_the_view_still_moves() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2 + HEAD_EVENT_RECENCY_SLOTS + 1);
+        assert!(drain_all(&mut rx).is_empty());
+
+        // The arrival was recorded: a recent diff now has nothing to report.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    /// Other transitions are optional in the specification and left out here:
+    /// full to empty, and an empty head that stays empty.
+    #[test]
+    fn only_empty_to_full_repeats_head_v2() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Envelope import events
+    // -----------------------------------------------------------------
+
+    /// An envelope the chain actor imports publishes `execution_payload` and
+    /// `execution_payload_available`, in that order.
+    #[test]
+    fn an_imported_envelope_publishes_execution_payload_then_available() {
+        let (_store, events, mut rx) = fork_fixture(B);
+
+        events.publish_envelope_imported(
+            2,
+            42,
+            H256::repeat_byte(0x77),
+            B,
+            PayloadStatusEnum::Valid,
+        );
+
+        let emitted = drain_all(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        match &emitted[0] {
+            ChainEvent::ExecutionPayload(payload) => assert_eq!(
+                payload,
+                &ExecutionPayloadEvent {
+                    slot: 2,
+                    builder_index: 42,
+                    block_hash: H256::repeat_byte(0x77),
+                    block_root: B,
+                    execution_optimistic: false,
+                }
+            ),
+            other => panic!("expected execution_payload first, got {other:?}"),
+        }
+        match &emitted[1] {
+            ChainEvent::ExecutionPayloadAvailable(available) => assert_eq!(
+                available,
+                &ExecutionPayloadAvailableEvent {
+                    slot: 2,
+                    block_root: B
+                }
+            ),
+            other => panic!("expected execution_payload_available second, got {other:?}"),
+        }
+    }
+
+    /// An envelope imported on a verdict short of `VALID` is reported
+    /// optimistic, whatever the store's optimistic set says: a gloas root never
+    /// enters that set.
+    #[test]
+    fn an_envelope_imported_on_syncing_or_accepted_is_optimistic() {
+        let (store, events, mut rx) = fork_fixture(B);
+        assert!(!store.is_beacon_optimistic(B));
+
+        for verdict in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            events.publish_envelope_imported(2, 42, H256::repeat_byte(0x77), B, verdict);
+            match drain_all(&mut rx).as_slice() {
+                [
+                    ChainEvent::ExecutionPayload(payload),
+                    ChainEvent::ExecutionPayloadAvailable(_),
+                ] => {
+                    assert!(payload.execution_optimistic, "{verdict:?}")
+                }
+                other => panic!("expected execution_payload then available, got {other:?}"),
+            }
+        }
+    }
+
+    /// A gloas block's `block` event names its bid's builder and payload
+    /// hash; an earlier block's carries neither.
+    #[test]
+    fn the_block_event_carries_the_bid_of_a_gloas_block_only() {
+        let (store, events, mut rx) = fork_fixture(B);
+
+        events.publish_block(&store, 2, B, Some((42, H256::repeat_byte(0x77))));
+        events.publish_block(&store, 2, B, None);
+
+        let emitted = drain_all(&mut rx);
+        let json: Vec<_> = emitted
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+        assert_eq!(json[0]["builder_index"], "42");
+        assert_eq!(
+            json[0]["block_hash"],
+            format!("0x{}", "77".repeat(32)).as_str()
+        );
+        assert!(json[1].get("builder_index").is_none());
+        assert!(json[1].get("block_hash").is_none());
     }
 }

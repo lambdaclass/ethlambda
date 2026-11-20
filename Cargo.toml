@@ -9,6 +9,7 @@ members = [
     "crates/common/crypto",
     "crates/common/ssz-tree",
     "crates/common/metrics",
+    "crates/common/telemetry",
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
@@ -72,6 +73,7 @@ ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
 ethlambda-ssz-tree = { path = "crates/common/ssz-tree" }
 ethlambda-metrics = { path = "crates/common/metrics" }
+ethlambda-telemetry = { path = "crates/common/telemetry" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }

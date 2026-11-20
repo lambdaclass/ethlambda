@@ -262,6 +262,8 @@ mod tests {
         assert_eq!(options.lean.node_id, "ethlambda_0");
         assert_eq!(options.common.gossipsub_port, 9001);
         assert!(options.lean.is_aggregator);
+        // Still one file path: only `beacon`'s `--bootnodes` became a list.
+        assert_eq!(options.lean.bootnodes, Some(PathBuf::from("nodes.yaml")));
     }
 
     #[test]

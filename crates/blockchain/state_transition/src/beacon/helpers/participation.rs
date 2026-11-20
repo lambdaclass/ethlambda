@@ -6,8 +6,10 @@
 //! the specification's helpers for that one question at a time reads the
 //! tree-backed registry many times over and, per active validator, once more
 //! by index (a tree descent each). Here the registry is walked once, with
-//! `validators().iter()` zipped against the participation slices, and every
-//! later step runs over flat data.
+//! `iter_validators()` in lockstep with both participation lists' iterators
+//! (through [`ParticipationRef`](crate::beacon::containers::ParticipationRef),
+//! since the lists are tree-backed), and every later step runs over flat
+//! data.
 //!
 //! The pieces, from cheapest to most complete:
 //!
@@ -99,10 +101,46 @@ impl ParticipationTotals {
     pub fn compute(state: &BeaconState) -> Result<Self> {
         scan(state, true, |_, _, _| {})
     }
+
+    /// The unslashed timely-target balances of the previous and current epoch
+    /// as raw sums (no one-increment floor), in one scan.
+    ///
+    /// What [`crate::beacon::helpers::target_balances`] caches per block: a
+    /// floored total cannot be extended by a later block's additions. Fails
+    /// like [`Self::compute`].
+    pub fn compute_raw_target(state: &BeaconState) -> Result<(Gwei, Gwei)> {
+        let raw = scan_raw(state, true, |_, _, _| {})?;
+        Ok((
+            raw.previous_flags[constants::TIMELY_TARGET_FLAG_INDEX],
+            raw.current_target,
+        ))
+    }
+}
+
+/// [`ParticipationTotals`] before the one-increment floor.
+struct RawTotals {
+    total_active: Gwei,
+    previous_flags: [Gwei; FLAG_COUNT],
+    current_target: Gwei,
+}
+
+/// [`scan_raw`] with the specification's one-increment floor applied.
+fn scan(
+    state: &BeaconState,
+    current_target: bool,
+    each: impl FnMut(usize, EpochFlags, Gwei),
+) -> Result<ParticipationTotals> {
+    let raw = scan_raw(state, current_target, each)?;
+    let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
+    Ok(ParticipationTotals {
+        total_active_balance: floor(raw.total_active),
+        previous_epoch_flags: raw.previous_flags.map(floor),
+        current_epoch_target: floor(raw.current_target),
+    })
 }
 
 /// Walks the registry once, calling `each(index, flags, effective_balance)` per
-/// validator, and returns the totals.
+/// validator, and returns the raw totals.
 ///
 /// The only place the membership predicates live. `current_target` says
 /// whether the current epoch's list is read at all: the specification's
@@ -112,11 +150,11 @@ impl ParticipationTotals {
 /// At the genesis epoch "previous" and "current" coincide and the
 /// specification reads the CURRENT list for both, so the previous epoch's
 /// list aliases it there.
-fn scan(
+fn scan_raw(
     state: &BeaconState,
     current_target: bool,
     mut each: impl FnMut(usize, EpochFlags, Gwei),
-) -> Result<ParticipationTotals> {
+) -> Result<RawTotals> {
     let (previous_list, current_list, _) = state.altair_validator_lists()?;
     let current_epoch = get_current_epoch(state);
     let previous_epoch = get_previous_epoch(state);
@@ -134,7 +172,16 @@ fn scan(
     let mut previous_error = None;
     let mut current_error = None;
 
+    // Walked in lockstep with the registry, not indexed per validator: each
+    // `get` on a tree-backed list is a descent, which at mainnet size was the
+    // largest cost of this pass. A list shorter than the registry yields
+    // `None` from the index it runs out at, the same as `get` did.
+    let mut previous_flags_iter = previous_list.iter();
+    let mut current_flags_iter = current_list.iter();
+
     for (index, validator) in state.iter_validators().enumerate() {
+        let previous_entry = previous_flags_iter.next();
+        let current_entry = current_flags_iter.next();
         let effective_balance = validator.effective_balance;
         let active_now = is_active_validator(validator, current_epoch);
         let active_before = is_active_validator(validator, previous_epoch);
@@ -145,7 +192,7 @@ fn scan(
 
         let mut bits = 0u8;
         if active_before {
-            match previous_list.get(index) {
+            match previous_entry {
                 Some(&participation) => {
                     if !validator.slashed {
                         for (flag_index, total) in previous_flags.iter_mut().enumerate() {
@@ -172,7 +219,7 @@ fn scan(
         }
 
         if current_target && active_now {
-            match current_list.get(index) {
+            match current_entry {
                 Some(&participation) => {
                     if has_flag(participation, constants::TIMELY_TARGET_FLAG_INDEX)
                         && !validator.slashed
@@ -197,11 +244,10 @@ fn scan(
         return Err(error);
     }
 
-    let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
-    Ok(ParticipationTotals {
-        total_active_balance: floor(total_active),
-        previous_epoch_flags: previous_flags.map(floor),
-        current_epoch_target: floor(current_target_balance),
+    Ok(RawTotals {
+        total_active,
+        previous_flags,
+        current_target: current_target_balance,
     })
 }
 

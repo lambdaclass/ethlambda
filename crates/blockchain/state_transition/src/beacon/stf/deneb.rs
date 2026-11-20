@@ -25,7 +25,7 @@
 //! caches two new blob-gas fields for EIP-4844, and [`process_voluntary_exit`]
 //! signs under a fixed fork version for EIP-7044.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::capella::SignedBLSToExecutionChange;
@@ -41,17 +41,23 @@ use crate::beacon::helpers::accessors::{
     get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
-use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::beacon::helpers::attestation::{
+    get_indexed_attestation, indexed_attestation_signature_set,
+};
 use crate::beacon::helpers::math::integer_squareroot;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{
     decrease_balance, increase_balance, initiate_validator_exit,
 };
 use crate::beacon::helpers::predicates::is_active_validator;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, Gwei, H256, HashTreeRoot as _, KzgCommitment, ParticipationFlags, ValidatorIndex,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
+
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
 use super::{BlockCaches, ExecutionEngine};
 
@@ -72,6 +78,7 @@ use super::{BlockCaches, ExecutionEngine};
 /// [`super::operations::process_operations`] has no fork check of its own to
 /// hang them on. See [`process_operations`]'s own documentation for why that
 /// is a full copy of the loop rather than a smaller patch.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &deneb::BeaconBlock,
@@ -79,23 +86,30 @@ pub fn process_block(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(
-        state,
-        &block.body.execution_payload,
-        &block.body.blob_kzg_commitments,
-        config,
-        engine,
-    )?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(
+            state,
+            &block.body.execution_payload,
+            &block.body.blob_kzg_commitments,
+            config,
+            engine,
+        )
+    })?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -108,12 +122,15 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        options.target_delta,
+        signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
         caches.active_balances,
         caches.pubkey_indices,
+        signatures,
     )?;
     Ok(())
 }
@@ -156,6 +173,8 @@ fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -169,45 +188,70 @@ fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(
-            state,
-            proposer_slashing,
-            config,
-            active_balances,
-        )?;
-    }
-    for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(
-            state,
-            attester_slashing,
-            config,
-            active_balances,
-        )?;
-    }
-    // One proposer lookup for the list, not one per attestation: see the same
-    // loop in `super::operations::process_operations`.
-    if !attestations.is_empty() {
-        let proposer_index = get_beacon_proposer_index(state)?;
-        for attestation in attestations {
-            process_attestation(
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| {
+            super::operations::process_proposer_slashing(
                 state,
-                attestation,
-                proposer_index,
-                committees,
+                slashing,
+                config,
                 active_balances,
-            )?;
-        }
+                signatures,
+            )
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| {
+            super::operations::process_attester_slashing(
+                state,
+                slashing,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
+    )?;
+    // One proposer lookup for the list, not one per attestation, timed with
+    // the attestations it serves: see the same loop in
+    // `super::operations::process_operations`.
+    if !attestations.is_empty() {
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in attestations {
+                process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                    target_delta,
+                    signatures,
+                )?;
+            }
+            Ok(())
+        })?;
     }
-    for deposit in deposits {
-        super::operations::process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config)?;
-    }
-    for signed_change in bls_to_execution_changes {
-        super::capella::process_bls_to_execution_change(state, signed_change, config)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        super::operations::process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config, signatures)
+    })?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        bls_to_execution_changes,
+        |signed_change| {
+            super::capella::process_bls_to_execution_change(
+                state,
+                signed_change,
+                config,
+                signatures,
+            )
+        },
+    )?;
 
     Ok(())
 }
@@ -317,6 +361,8 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -366,8 +412,8 @@ pub fn process_attestation(
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -397,21 +443,27 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `is_valid_indexed_attestation` above refused any `attesting_indices` that
+    // is not strictly ascending, so the reader walks each leaf once rather than
+    // descending the tree for every attester.
+    let mut reader = epoch_participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            epoch_participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: epoch_participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: epoch_participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -423,13 +475,15 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (increments, _, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
             let reward = (increments * base_reward_per_increment)
@@ -441,8 +495,17 @@ pub fn process_attestation(
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (_, effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
+        }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -454,14 +517,20 @@ pub fn process_attestation(
         previous_participation
     };
     let epoch_participation_len = epoch_participation.len();
-    for (index, new_flags) in updates {
-        let flags = epoch_participation
-            .get_mut(index as usize)
-            .ok_or(Error::IndexOutOfBounds {
+    // A blind write of `current_flags | new_flags`, which the read phase
+    // stored, rather than `|=` on the stored value. That is exact:
+    // `is_valid_indexed_attestation` above refused a repeated index, so each
+    // index is written once, and nothing writes this list between the read
+    // phase and here, so the stored value is still `current_flags`. It saves
+    // the tree descent `get_mut` makes to copy the old value into the write
+    // buffer.
+    for (index, flags) in updates {
+        if !epoch_participation.set(index as usize, flags) {
+            return Err(Error::IndexOutOfBounds {
                 index: index as usize,
                 len: epoch_participation_len,
-            })?;
-        *flags |= new_flags;
+            });
+        }
     }
 
     const NON_PROPOSER_WEIGHT: u64 = constants::WEIGHT_DENOMINATOR - constants::PROPOSER_WEIGHT;
@@ -689,6 +758,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -725,14 +795,19 @@ pub fn process_voluntary_exit(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
-    verify(
-        bls::verify(
-            &validator.pubkey,
+    signatures.push(
+        SignatureSet::single(
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
     Ok(())
