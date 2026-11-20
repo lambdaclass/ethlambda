@@ -25,7 +25,8 @@
 //! next, replaced when the `dependent_root` changes. They are narrowed to this
 //! client's indices on arrival, and are not part of subnet subscriptions
 //! either. Whether an epoch is a gloas one is the caller's to decide, since
-//! this service holds no fork schedule.
+//! this service holds no fork schedule, and so is holding off the gloas fork
+//! epoch's until the fork, before which a node cannot know them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -224,7 +225,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// changed.
     ///
     /// Only to be called for a gloas epoch: an earlier one answers with no
-    /// duties, which is harmless but a request wasted every epoch.
+    /// duties, which is harmless but a request wasted every epoch. Nor for the
+    /// gloas fork epoch before it has begun, which a node refuses.
     pub async fn refresh_ptc(&mut self, epoch: Epoch) -> Result<()> {
         if self.indices.is_empty() {
             return Ok(());
@@ -310,6 +312,12 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// Forget sync committee duties of periods before `period`.
     pub fn prune_sync_before(&mut self, period: u64) {
         self.sync.retain(|held, _| *held >= period);
+    }
+
+    /// Whether a payload timeliness committee schedule is held for `epoch`,
+    /// an empty one included: a fetch that found no duties still answered.
+    pub fn holds_ptc(&self, epoch: Epoch) -> bool {
+        self.ptc.contains_key(&epoch)
     }
 
     /// Forget payload timeliness committee duties for epochs before `epoch`.
