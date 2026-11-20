@@ -24,6 +24,8 @@
 //! needs no merging; a block `process_stark` refuses is built again without
 //! attestations, so the block goes out rather than not at all.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -49,7 +51,7 @@ use ethlambda_types::beacon::{
     containers::{BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope, pq},
     fork::ForkName,
     preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
-    primitives::{Bytes32, ExecutionAddress, Root, Slot},
+    primitives::{Bytes32, ExecutionAddress, HashTreeRoot as _, KzgProof, Root, Slot},
     signing::compute_epoch_at_slot,
 };
 use libssz::SszEncode as _;
@@ -74,6 +76,43 @@ pub(crate) fn routes() -> Router<Store> {
     )
 }
 
+/// The blobs and cell proofs of the PQ payloads this node built, by
+/// `(slot, block root)`, for the current and previous slot.
+///
+/// This endpoint hands the validator client the block and the unsigned
+/// envelope only, and the client publishes the signed envelope through
+/// `publishExecutionPayloadEnvelope` without blobs, so that endpoint builds
+/// the envelope's data columns from what is kept here (gloas's
+/// `Eth-Blob-Data-Included: false` path, which reads `produceBlockV4`'s own
+/// cache). Shared through an extension both routers carry.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PqBlobs(Arc<Mutex<BTreeMap<(Slot, Root), PqPayloadBlobs>>>);
+
+/// One PQ payload's blobs and their cell proofs, as the execution client
+/// returned them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PqPayloadBlobs {
+    pub(crate) blobs: Vec<Vec<u8>>,
+    pub(crate) cell_proofs: Vec<KzgProof>,
+}
+
+impl PqBlobs {
+    fn insert(&self, slot: Slot, block_root: Root, blobs: PqPayloadBlobs) {
+        let mut entries = self.0.lock().expect("PQ blob cache lock poisoned");
+        entries.insert((slot, block_root), blobs);
+        let keep_from = slot.saturating_sub(1);
+        entries.retain(|(held, _), _| *held >= keep_from);
+    }
+
+    pub(crate) fn get(&self, slot: Slot, block_root: Root) -> Option<PqPayloadBlobs> {
+        self.0
+            .lock()
+            .expect("PQ blob cache lock poisoned")
+            .get(&(slot, block_root))
+            .cloned()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProducePqBlock {
     /// The proposer's VRF proof for the slot: the secret, then its leaf's
@@ -92,6 +131,7 @@ async fn post_produce_pq_block(
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
+    blob_cache: Option<Extension<PqBlobs>>,
     Json(request): Json<ProducePqBlock>,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -128,7 +168,18 @@ async fn post_produce_pq_block(
     )
     .await
     {
-        Ok(contents) => with_consensus_version(ssz_response(contents.to_ssz()), ForkName::Pq),
+        Ok((contents, blobs)) => {
+            if !blobs.blobs.is_empty() {
+                // Without the cache the envelope cannot carry its columns, so
+                // a block committing to blobs must not go out.
+                let Some(Extension(cache)) = blob_cache else {
+                    return ApiError::Internal("no blob cache to publish the payload's blobs from")
+                        .into_response();
+                };
+                cache.insert(slot, contents.block.hash_tree_root(), blobs);
+            }
+            with_consensus_version(ssz_response(contents.to_ssz()), ForkName::Pq)
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -143,7 +194,7 @@ async fn produce(
     slot: Slot,
     randao_reveal: pq::VrfProof,
     graffiti: Bytes32,
-) -> Result<pq::BlockContents, ApiError> {
+) -> Result<(pq::BlockContents, PqPayloadBlobs), ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
     if slot <= head_state.slot() {
@@ -212,14 +263,22 @@ async fn produce(
     );
     let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     let built = built?;
-    if !built.blobs_bundle.blobs.is_empty() {
-        // The envelope's column sidecars are not built for PQ yet: a payload
-        // with blobs would reveal data no node could sample.
-        warn!(%slot, blobs = built.blobs_bundle.blobs.len(), "Refusing a PQ build with blobs");
+    let bundle = &built.blobs_bundle;
+    if bundle.commitments.len() != bundle.blobs.len()
+        || bundle.proofs.len()
+            != bundle.blobs.len() * ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB
+    {
+        warn!(%slot, "The execution client's blobs bundle is inconsistent");
         return Err(ApiError::ServiceUnavailable(
-            "PQ block production does not carry blobs yet",
+            "the execution client returned an inconsistent blobs bundle",
         ));
     }
+    // Kept for the envelope endpoint, which builds the data columns from
+    // them (see [`PqBlobs`]).
+    let blobs = PqPayloadBlobs {
+        blobs: built.blobs_bundle.blobs.clone(),
+        cell_proofs: built.blobs_bundle.proofs.clone(),
+    };
     let execution_requests = parse_pq_execution_requests(&built.execution_requests)
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     let inputs = PqBlockInputs {
@@ -257,10 +316,11 @@ async fn produce(
     let attestations = produced.block.body.attestations.len();
     let graffiti = graffiti::display(&produced.block.body.graffiti);
     info!(%slot, proposer, build_on_full, attestations, %graffiti, "Produced a PQ block");
-    Ok(pq::BlockContents {
+    let contents = pq::BlockContents {
         block: produced.block,
         execution_payload_envelope: produced.envelope,
-    })
+    };
+    Ok((contents, blobs))
 }
 
 /// One merge at a time: the sidecar proves one request after another, so a
