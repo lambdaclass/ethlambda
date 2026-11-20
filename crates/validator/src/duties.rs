@@ -314,6 +314,12 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         self.sync.retain(|held, _| *held >= period);
     }
 
+    /// Whether a payload timeliness committee schedule is held for `epoch`,
+    /// an empty one included: a fetch that found no duties still answered.
+    pub fn holds_ptc(&self, epoch: Epoch) -> bool {
+        self.ptc.contains_key(&epoch)
+    }
+
     /// Forget payload timeliness committee duties for epochs before `epoch`.
     pub fn prune_ptc_before(&mut self, epoch: Epoch) {
         self.ptc.retain(|held, _| *held >= epoch);
