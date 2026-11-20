@@ -32,8 +32,8 @@ use ethlambda_types::{
         },
         fork::ForkName,
         fork_choice::{
-            BlockPayloadLink, ForkChoiceNode, JustifiedBalances, LatestMessage, PayloadStatus,
-            PayloadStatusEnum, PayloadStatusV1, PowBlock,
+            BlockPayloadLink, FastConfirmationVariables, ForkChoiceNode, JustifiedBalances,
+            LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1, PowBlock,
         },
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
@@ -172,6 +172,16 @@ const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
 /// [`KEY_LATEST_FINALIZED`] is seeded to the anchor too, but moves with the
 /// chain, so after the first finalization nothing else on disk can answer this.
 const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
+/// The root the Fast Confirmation Rule last reported as confirmed, the one
+/// piece of its state worth keeping across a restart. Its value has type
+/// [`H256`] and it's SSZ-encoded; absent means no run has confirmed anything
+/// yet.
+///
+/// Read once per process, by [`Store::fast_confirmation_restart_root`], for the
+/// specification's `get_restart_resilient_confirmed_root`; rewritten whenever
+/// a run reports a different root. Adding it did not bump [`DB_VERSION`]: an
+/// older directory simply has no row.
+const KEY_BEACON_FAST_CONFIRMED_ROOT: &[u8] = b"beacon_fast_confirmed_root";
 /// The exclusive upper bound of every slot [`Store::prune_finalized_states`]
 /// has already deleted from `States` and `StateDiffs`, which is also the start
 /// of the next range it will delete. Its value has type [`u64`] and it's
@@ -781,6 +791,19 @@ impl JustifiedBalancesCache {
     }
 }
 
+/// Where [`BeaconScratch::fast_confirmation_restart_root`] stands.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartRoot {
+    /// Not asked for yet: the previous process's persisted root, if any, is
+    /// still to be read.
+    #[default]
+    Unread,
+    /// A root the rule may restore.
+    Held(H256),
+    /// Nothing to restore: none was persisted, or the held one was dropped.
+    Gone,
+}
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
 /// chain history: apart from the entries named below, nothing here
 /// survives a restart, and nothing else here is worth the write
@@ -860,6 +883,23 @@ pub(crate) struct BeaconScratch {
     /// from `checkpoint_states`, so nothing needs to persist it.
     pub(crate) justified_balances: JustifiedBalancesCache,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
+    /// The Fast Confirmation Rule's variables and the slot of the run that
+    /// wrote them. `None` until the first run of this process, and again after
+    /// [`Store::reset_fast_confirmation`]; the next run then starts from
+    /// `get_fast_confirmation_store`'s conservative values. Not persisted: the
+    /// variables are rebuilt within an epoch, as the specification intends for
+    /// a restarted node.
+    pub(crate) fast_confirmation: Option<(u64, FastConfirmationVariables)>,
+    /// The root the last run reported as confirmed (see
+    /// `fast_confirmation::run_fast_confirmation`), which `forkchoiceUpdated`'s
+    /// safe block reads and [`KEY_BEACON_FAST_CONFIRMED_ROOT`] persists. Not
+    /// always the variables' `confirmed_root`: while a restored root wins, it
+    /// is that one. Kept as `(slot, root)`, so the safe block's on-chain check
+    /// reads the slot without decoding the block.
+    pub(crate) fast_confirmed_root: Option<(u64, H256)>,
+    /// The root the previous process reported last, which
+    /// `get_restart_resilient_confirmed_root` may restore.
+    pub(crate) fast_confirmation_restart_root: RestartRoot,
     /// In-memory half of `Table::BeaconUnrealizedJustifications`; see this
     /// struct's own documentation for why this map, unlike its neighbours,
     /// has a persisted backing table.
@@ -4787,6 +4827,12 @@ impl Store {
 
     /// Whether `root` was imported on a `NOT_VALIDATED` answer and has not
     /// since been resolved.
+    ///
+    /// Only a pre-gloas block can be: a gloas block's import asks the
+    /// execution layer nothing, so this is `false` for every gloas root. The
+    /// `execution_optimistic` flag a response or event carries is
+    /// [`Store::is_beacon_block_optimistic`], which reads a gloas block's
+    /// payload verdicts too.
     pub fn is_beacon_optimistic(&self, root: H256) -> bool {
         self.beacon
             .lock()
@@ -4919,6 +4965,118 @@ impl Store {
             .unwrap()
             .envelope_seen_ms
             .retain(|_, (slot, _)| *slot >= finalized_slot);
+    }
+
+    // ============ Fast Confirmation Rule ============
+
+    /// The Fast Confirmation Rule's variables, or `None` before this process
+    /// has run it (or after a reset).
+    pub fn fast_confirmation(&self) -> Option<FastConfirmationVariables> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .fast_confirmation
+            .map(|(_, variables)| variables)
+    }
+
+    /// The slot of the run that wrote [`Self::fast_confirmation`]'s variables.
+    pub fn fast_confirmation_slot(&self) -> Option<u64> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .fast_confirmation
+            .map(|(slot, _)| slot)
+    }
+
+    /// The root the last run reported as confirmed, or `None` before the
+    /// first run (and after a reset).
+    ///
+    /// What `forkchoiceUpdated`'s safe block is read from: callers fall back
+    /// to the finalized root, which is where the rule's own initialization
+    /// puts `confirmed_root`.
+    pub fn fast_confirmed_root(&self) -> Option<H256> {
+        self.fast_confirmed_block().map(|(_, root)| root)
+    }
+
+    /// [`Self::fast_confirmed_root`] with its block's slot.
+    pub fn fast_confirmed_block(&self) -> Option<(u64, H256)> {
+        self.beacon.lock().unwrap().fast_confirmed_root
+    }
+
+    /// Records a run for `slot`: the rule's `variables` and the block it
+    /// reported (`confirmed_slot`, `confirmed_root`), persisting that root when
+    /// it differs from the last one.
+    pub fn set_fast_confirmation(
+        &self,
+        slot: u64,
+        variables: FastConfirmationVariables,
+        confirmed_slot: u64,
+        confirmed_root: H256,
+    ) {
+        let previous = {
+            let mut scratch = self.beacon.lock().unwrap();
+            scratch.fast_confirmation = Some((slot, variables));
+            scratch
+                .fast_confirmed_root
+                .replace((confirmed_slot, confirmed_root))
+        };
+        if previous.map(|(_, root)| root) != Some(confirmed_root) {
+            self.set_metadata(KEY_BEACON_FAST_CONFIRMED_ROOT, &confirmed_root);
+        }
+    }
+
+    /// Forgets the rule's variables and the root it reported, so the safe
+    /// block falls back to the finalized one and the next run starts from the
+    /// finalized checkpoint, as the rule's initialization does.
+    ///
+    /// For a run that cannot follow on from the previous one: a slot went by
+    /// without a run, a run failed, or the node is too far behind the clock to
+    /// run at all (its stored heads would be stale then, and may be pruned).
+    /// Each of those breaks the synchrony the rule assumes, so the root
+    /// reported before it is *not* offered to
+    /// `get_restart_resilient_confirmed_root`: the specification restores a
+    /// root only across a node restart, and only the previous process's
+    /// persisted root is that ([`Self::fast_confirmation_restart_root`]).
+    pub fn reset_fast_confirmation(&self) {
+        let mut scratch = self.beacon.lock().unwrap();
+        scratch.fast_confirmation = None;
+        scratch.fast_confirmed_root = None;
+    }
+
+    /// The root the previous process reported last, read on the first ask of
+    /// this process. Held until [`Self::drop_fast_confirmation_restart_root`].
+    ///
+    /// The specification's implementation-defined
+    /// `get_root_confirmed_before_restart`.
+    pub fn fast_confirmation_restart_root(&self) -> Option<H256> {
+        let mut scratch = self.beacon.lock().unwrap();
+        if scratch.fast_confirmation_restart_root == RestartRoot::Unread {
+            let view = self.backend.begin_read().expect("read view");
+            let persisted = view
+                .read_with(Table::Metadata, KEY_BEACON_FAST_CONFIRMED_ROOT, |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid encoding")
+                })
+                .expect("read");
+            scratch.fast_confirmation_restart_root =
+                persisted.map_or(RestartRoot::Gone, RestartRoot::Held);
+        }
+        match scratch.fast_confirmation_restart_root {
+            RestartRoot::Held(root) => Some(root),
+            RestartRoot::Unread | RestartRoot::Gone => None,
+        }
+    }
+
+    /// Lets go of the restart root, once the rule no longer needs it.
+    pub fn drop_fast_confirmation_restart_root(&self) {
+        self.beacon.lock().unwrap().fast_confirmation_restart_root = RestartRoot::Gone;
+    }
+
+    /// Every validator index observed equivocating, as one snapshot.
+    ///
+    /// For a reader that needs the whole set and would otherwise take this
+    /// store's lock once per validator through [`Store::is_equivocating`].
+    pub fn equivocating_indices(&self) -> HashSet<u64> {
+        self.beacon.lock().unwrap().equivocating_indices.clone()
     }
 
     /// Returns `root`'s unrealized justification, if this store has computed
@@ -9570,6 +9728,41 @@ mod tests {
         );
     }
 
+    /// The restart root is the persisted row, read on the first ask and held,
+    /// not taken, until it is dropped; a reset forgets the run and the root it
+    /// reported, and does not make that root a restart root.
+    #[test]
+    fn the_fast_confirmation_restart_root_is_held_until_dropped() {
+        let store = Store::test_store();
+        let variables = FastConfirmationVariables::at_finalized(BeaconCheckpoint::default());
+        let (first, second) = (H256::repeat_byte(1), H256::repeat_byte(2));
+
+        // The row an earlier process left, read on the first ask.
+        store.set_fast_confirmation(5, variables, 4, first);
+        assert_eq!(store.fast_confirmed_root(), Some(first));
+        assert_eq!(store.fast_confirmed_block(), Some((4, first)));
+        assert_eq!(store.fast_confirmation_slot(), Some(5));
+        assert_eq!(store.fast_confirmation_restart_root(), Some(first));
+        assert_eq!(store.fast_confirmation_restart_root(), Some(first), "held");
+        store.drop_fast_confirmation_restart_root();
+        assert_eq!(
+            store.fast_confirmation_restart_root(),
+            None,
+            "not read again"
+        );
+
+        store.set_fast_confirmation(6, variables, 5, second);
+        store.reset_fast_confirmation();
+        assert_eq!(store.fast_confirmation(), None);
+        assert_eq!(store.fast_confirmation_slot(), None);
+        assert_eq!(store.fast_confirmed_root(), None);
+        assert_eq!(
+            store.fast_confirmation_restart_root(),
+            None,
+            "a reset within a process restores nothing"
+        );
+    }
+
     #[test]
     fn optimistic_roots_round_trip_and_clear() {
         let mut store = Store::test_store();
@@ -10841,6 +11034,8 @@ mod tests {
             vec![1].into(),
             1,
             vec![1].into(),
+            Box::default(),
+            1,
         ))
     }
 

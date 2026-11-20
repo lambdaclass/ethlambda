@@ -468,9 +468,75 @@ payload votes, and `builder_validation_permits` for bids and proposer
 preferences. They are deliberately separate: a mainnet slot's worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer `Ignore(Overloaded)` for a block or a column
-instead. Neither pool has a metric of its own yet; a permit exhausted on
-either shows up as `outcome="ignore",reason="overloaded"` on
-`lean_beacon_gossip_validation_total`, for the topics that draw from it.
+instead. `sync_validation_permits` (sync committee messages and contributions)
+is a fourth, and `column_check_permits` bounds the checks on fetched columns and
+envelopes, which await a permit instead of failing. A permit exhausted on a
+gossip pool shows up as `outcome="ignore",reason="overloaded"` on
+`lean_beacon_gossip_validation_total` and, per pool, on
+`lean_beacon_validation_permit_exhausted_total` below.
+
+#### Validation contention
+
+These answer whether validation competes with block import and epoch precompute
+for CPU. They only measure: no pool size, schedule or verdict depends on them.
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
+| `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
+| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
+| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a block's fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
+| `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
+
+`kind` on the queue and run histograms is the gossip topic kind above for gossip
+validation. `column_check` and `envelope_check` are the tasks of
+`check_and_forward` (fetched and replayed columns) and of the envelope checks:
+their queue delay is measured from `spawn_blocking`, after the permit wait, which
+has its own histogram, so the two add up. `column_check` covers both stages of a
+block's columns (see [Data column sidecars](beacon_wire.md#data-column-sidecars)):
+its prechecks, which wait for the group's permit, and each KZG sub-batch. The
+first sub-batch runs on the permit the prechecks held, so it has no permit wait of
+its own; each further one waits for its own. The run histogram therefore mixes
+the two stages, and the prechecks' share of a permit hold is not measured on its
+own. The in-use gauge counts a task from its
+permit being taken, so one waiting in the blocking pool counts too; it is a count
+of admitted work, not of busy threads. A block's columns hold one permit from
+their prechecks through their first sub-batch, so between the two the gauge counts
+a permit no thread is using. Only
+`lean_beacon_validation_queue_seconds` isolates time spent waiting for a thread.
+
+`lean_beacon_epoch_precompute_running` is set when the worker's closure starts
+and cleared when it ends, so the interval matches
+`lean_beacon_epoch_precompute_seconds` (which gives a duration, not an overlap
+with other series). At most one worker runs at a time.
+
+Block import needs no new series: `lean_block_import_phase_seconds{phase="queue"}`
+is already the wait in the chain actor's mailbox before the import starts (see
+Block Import Timing).
+
+**Does validation compete with import?** Plot these on one panel:
+
+```promql
+# Validation work admitted, waiting for a thread, and refused
+sum(lean_beacon_validation_permits_in_use)
+histogram_quantile(0.99, sum by (le) (rate(lean_beacon_validation_queue_seconds_bucket[5m])))
+sum by (pool) (rate(lean_beacon_validation_permit_exhausted_total[5m]))
+
+# Against import's STF phase
+histogram_quantile(0.99, sum by (le) (rate(lean_block_import_phase_seconds_bucket{phase="stf"}[5m])))
+
+# Precompute overlap: fraction of the window a worker ran
+avg_over_time(lean_beacon_epoch_precompute_running[5m])
+```
+
+Reading it: if STF p99 rises in the windows where queue-delay p99 or in-use
+rises, the two share threads (the tokio blocking pool, or cores). If queue delay
+stays near zero and STF p99 still moves, suspect cores instead: validation's CPU
+share is roughly `sum(rate(lean_beacon_validation_run_seconds_sum[5m]))`, in
+cores. To see whether precompute hurts import, compare STF p99 in windows where
+`lean_beacon_epoch_precompute_running` is 1 against windows where it is 0.
 
 ### Beacon Peer Scoring
 
@@ -588,6 +654,7 @@ leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing block transitions, by whether a precomputed boundary state was cached | On each state transition of a block whose parent is before the block's epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the `engine_newPayload` round trip and then discarded for an `INVALIDATED` verdict, or re-checked in a debug build), and once for a block held after its speculation ran | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_committee_key_sums_warm_seconds` | Histogram | Worker time to sum one epoch's committee keys, off the import path: the sums alone, not the committees they are built from | When a warm-up that built sums finishes; a warm-up that finds them resident records nothing | | 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
 **Read the hit ratio against epochs.** On a synced follower nearly every
@@ -600,21 +667,25 @@ A `timer` start with no matching `head` start means the last slot was skipped.
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
 gossip validation) resolves its signers' compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See `PubkeyCache` in `crates/common/crypto/src/bls.rs`. This is
 ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs `sum(lean_beacon_pubkey_cache_entries)` now | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. `entries` is also the cache's memory
-footprint, roughly a decompressed point plus its compressed key per entry.
+cached and pay the full check every time. `entries{structure="map"}` is the
+map's memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table's is `index_chunks` times a chunk's size, since a chunk is
+allocated whole and a registry's exited validators leave slots in it empty.
 
 ### Data Column Sidecars (Fulu DAS)
 

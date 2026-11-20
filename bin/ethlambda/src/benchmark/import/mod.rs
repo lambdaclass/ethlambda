@@ -91,6 +91,12 @@ pub(crate) struct ReplayOptions {
     /// sleep is outside every measured span. 0 feeds blocks back to back.
     #[arg(long, value_name = "MILLISECONDS", default_value_t = 0)]
     pub block_delay: u64,
+    /// Warm each epoch's committee key sums before its first block is
+    /// imported, outside every measured span. A live node does this on a
+    /// worker between slots (the epoch precompute); a replay has no tick
+    /// loop, so without this flag part of the import never sees warm sums.
+    #[arg(long)]
+    pub warm_committee_sums: bool,
     /// Report format printed to stdout. Logs go to stderr, so JSON output can
     /// be piped directly (e.g. into jq).
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -192,6 +198,12 @@ mod tests {
         Harness::try_parse_from(base.iter().chain(extra))
             .expect("replay flags parse")
             .replay
+    }
+
+    #[test]
+    fn warm_committee_sums_is_off_unless_asked_for() {
+        assert!(!parse(&[]).warm_committee_sums);
+        assert!(parse(&["--warm-committee-sums"]).warm_committee_sums);
     }
 
     #[test]

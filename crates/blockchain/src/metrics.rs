@@ -118,6 +118,35 @@ impl SlotPosition {
 
 // --- Gauges ---
 
+static LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_beacon_epoch_precompute_running",
+            "1 while an epoch precompute worker is running its advance, 0 otherwise"
+        )
+        .unwrap()
+    });
+
+/// Marks an epoch precompute worker as running in
+/// `lean_beacon_epoch_precompute_running` until dropped. A guard rather than a
+/// set/unset pair so a panicking worker still clears the gauge. At most one
+/// worker runs at a time (`epoch_precompute_in_flight`), so a plain 0/1 gauge
+/// is exact.
+pub struct EpochPrecomputeRunning;
+
+impl EpochPrecomputeRunning {
+    pub fn start() -> Self {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(1);
+        Self
+    }
+}
+
+impl Drop for EpochPrecomputeRunning {
+    fn drop(&mut self) {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(0);
+    }
+}
+
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     register_int_gauge!("lean_head_slot", "Latest slot of the lean chain").unwrap()
 });
@@ -402,6 +431,25 @@ static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         register_histogram!(
             "lean_beacon_head_compute_time_seconds",
             "Duration of one beacon fork-choice head computation",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
+/// One `on_fast_confirmation` run of the beacon Fast Confirmation Rule: the
+/// balance and score reads (from the fork choice's caches, a fold on an
+/// epoch's first slot), the per-block safety checks and the variable
+/// bookkeeping, excluding the head computation that precedes it.
+///
+/// Buckets reach a whole mainnet slot, since a run that costs seconds is one
+/// the chain actor cannot afford at the start of a slot.
+static LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_fast_confirmation_time_seconds",
+            "Duration of one beacon Fast Confirmation Rule run",
             vec![
                 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
             ]
@@ -1186,6 +1234,12 @@ pub fn time_attestation_validation() -> TimingGuard {
 /// fails still spent the time, and the failing one was the expensive one.
 pub fn time_beacon_head_compute() -> TimingGuard {
     TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
+}
+
+/// Start timing one beacon Fast Confirmation Rule run. Records when the guard
+/// is dropped, including on the error path, like [`time_beacon_head_compute`].
+pub fn time_beacon_fast_confirmation() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS)
 }
 
 /// Increment the PQ aggregated signatures counter.
