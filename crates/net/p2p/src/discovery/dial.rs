@@ -51,6 +51,10 @@ pub(crate) struct DiscoveryState {
     hunt: SubnetHunt,
     /// Subnets advertised by peers we dialed from discovery.
     peer_attnets: HashMap<PeerId, Vec<u64>>,
+    /// The ENR of each peer we dialed from discovery, until its connection
+    /// ends or its dial fails. Read once, when the connection is established,
+    /// for the Beacon API's peer list.
+    peer_enrs: HashMap<PeerId, String>,
     /// Our own peer ID, so the loop never dials itself.
     local_peer_id: PeerId,
     /// Connected-peer count above which the loop stops dialing.
@@ -78,6 +82,7 @@ impl DiscoveryState {
             handle: spawned.handle,
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
+            peer_enrs: HashMap::new(),
             local_peer_id,
             target_peers: spawned.target_peers,
             filter: spawned.filter,
@@ -98,6 +103,11 @@ impl DiscoveryState {
     /// Connected-peer count above which the loop stops dialing.
     pub(crate) fn target_peers(&self) -> usize {
         self.target_peers
+    }
+
+    /// The ENR discovery supplied for a peer we dialed, if any.
+    pub(crate) fn enr_of(&self, peer_id: &PeerId) -> Option<String> {
+        self.peer_enrs.get(peer_id).cloned()
     }
 }
 
@@ -154,6 +164,7 @@ const CONTACT_POLL_IDLE: Duration = Duration::from_millis(250);
 pub(crate) fn forget_discovered_peer(server: &mut P2PServer, peer_id: &PeerId) {
     if let Some(discovery) = server.discovery.as_mut() {
         discovery.peer_attnets.remove(peer_id);
+        discovery.peer_enrs.remove(peer_id);
     }
     // Custody is keyed by peer id and a peer id is a public key, so a returning
     // peer recomputes to the same set. Dropped anyway: the map is only ever
@@ -396,6 +407,11 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
             discovery
                 .peer_attnets
                 .insert(candidate.peer_id, candidate.subnets);
+            // Encoded here, for a peer actually dialed, rather than at
+            // admission for every candidate.
+            if let Ok(enr) = candidate.record.enr_url() {
+                discovery.peer_enrs.insert(candidate.peer_id, enr);
+            }
         }
     }
     dialed

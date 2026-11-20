@@ -59,15 +59,16 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, 
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::aggregation::AggregationService;
 use crate::attestation::AttestationService;
-use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
+use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
 use crate::duties::DutiesService;
+use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
 use crate::preferences::PreferencesService;
@@ -298,6 +299,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     .with_clock(clock.clone())
     .with_builder_min_bid(config.builder_min_bid)
     .with_preferences(preferences.clone());
+    // The proposer preparations' per-slot re-send. The epoch's own send is
+    // `refresh_epoch`'s.
+    let preparations = Arc::new(Preparations::new(beacon_node.clone(), settings.clone()));
     let registration = config.builder.map(|builder| {
         info!(
             boost_factor = builder.boost_factor,
@@ -363,6 +367,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The slot whose duties were last attempted, so an overrunning slot does
         // not cost the next one as well. See `SlotClock::next_slot_to_serve`.
         let mut served: Option<u64> = None;
+        // The validators the last refresh resolved, whose proposer
+        // preparations are re-sent every slot (see `Preparations`).
+        let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
 
         loop {
             // One wake per slot, at the slot boundary, rather than one at the
@@ -412,10 +419,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     &context,
                 );
                 match refreshed.await {
-                    Ok(Refreshed { moved, registrable }) => {
+                    Ok(Refreshed {
+                        moved,
+                        registrable,
+                        resolved: refreshed_entries,
+                    }) => {
                         last_epoch = Some(epoch);
                         resubscribe = moved;
                         to_register = Some(registrable);
+                        resolved = Arc::new(refreshed_entries);
                     }
                     // A beacon node that is down, syncing or answering badly will
                     // likely answer next epoch, so keep the schedule already held
@@ -530,6 +542,16 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             if let Some(registration) = &registration {
                 tokio::spawn(registration.clone().register_changed(epoch, store.clone()));
             }
+
+            // The proposer preparations again, for a beacon node that restarted
+            // since the refresh sent them and so builds for the zero address
+            // until it hears from this client. Once the slot's duties are done,
+            // so they reach the node ahead of the next slot's proposal rather
+            // than racing this one's: a third of the way in on a slot with no
+            // duties, after the aggregation or the payload vote on one with
+            // them. Off the slot loop like the sends above. The refresh's slot
+            // too, although its refresh sent them: see `Preparations`.
+            preparations.after_slot(slot, &resolved, &store);
         }
     };
 
@@ -954,6 +976,10 @@ struct Refreshed {
     /// node resolved to an index whose validator is pending or active (see
     /// [`is_registrable`]).
     registrable: Vec<BlsPubkey>,
+    /// Every validator the beacon node resolved to an index, which the duty
+    /// loop re-sends the proposer preparations of each slot until the next
+    /// refresh (see [`Preparations`]).
+    resolved: Vec<ValidatorEntry>,
 }
 
 /// Resolve any newly activated validators and refresh the duty schedule.
@@ -1000,41 +1026,23 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     metrics::set_validators_resolved(indices.len() as u64);
     duties.set_indices(indices);
 
-    // Re-sent every epoch, not once at startup, because the node forgets.
-    //
-    // A preparation is kept for the epoch it arrived in and two more, and is
-    // lost entirely when the node restarts. A client that sent this once would
-    // stop being registered a few minutes later with nothing reporting it, and
-    // would find out only by proposing a block that paid someone else.
+    // Sent here, ahead of the epoch's duties, and then again every slot by the
+    // duty loop (see `Preparations`).
     //
     // A failure is logged rather than propagated. The consequence is a payload
     // built for the wrong address, which the check before signing catches; the
     // consequence of returning here would be losing this epoch's attester
-    // duties, which is worse and unrelated.
-    //
-    // Each validator is registered with its own address, and one with none,
-    // neither its own nor the default, is left out: there is nothing to tell
-    // the node, which then picks one itself, as the startup warning says.
-    let preparations: Vec<ProposerPreparationDto> = entries
-        .iter()
-        .filter_map(|entry| {
-            let fee_recipient = settings.fee_recipient(&entry.pubkey)?;
-            Some(ProposerPreparationDto {
-                validator_index: entry.index,
-                fee_recipient: crate::beacon_node::dto::encode_hex(&fee_recipient.0),
-            })
-        })
-        .collect();
-    if !preparations.is_empty()
-        && let Err(err) = beacon_node.prepare_beacon_proposer(&preparations).await
-    {
+    // duties, which is worse and unrelated. The duty loop sends again once
+    // this slot's duties are done.
+    let sent = prepare_proposers(beacon_node.as_ref(), &entries, settings).await;
+    let _ = sent.inspect_err(|err| {
         warn!(
             %epoch,
             %err,
-            "Failed to register this client's fee recipients; blocks proposed this epoch may \
-             pay somewhere else"
+            "Failed to register this client's fee recipients; a block proposed before the \
+             re-send after this slot's duties may pay somewhere else"
         );
-    }
+    });
 
     let changed = duties.refresh_around(epoch).await?;
     refresh_ptc(duties, epoch, context).await;
@@ -1045,7 +1053,179 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     Ok(Refreshed {
         moved: changed,
         registrable: registrable.map(|entry| entry.pubkey).collect(),
+        resolved: entries,
     })
+}
+
+/// Tell the beacon node the address each of `entries`' blocks pays: one
+/// `prepare_beacon_proposer` call, or none when no validator has an address.
+/// The epoch refresh's send; the duty loop's per-slot one is [`Preparations`].
+async fn prepare_proposers<B: BeaconNodeApi>(
+    beacon_node: &B,
+    entries: &[ValidatorEntry],
+    settings: &ProposerSettings,
+) -> Result<()> {
+    let preparations = preparations(entries, settings);
+    if preparations.is_empty() {
+        return Ok(());
+    }
+    beacon_node.prepare_beacon_proposer(&preparations).await
+}
+
+/// One preparation for each of `entries` that has an address, its own or the
+/// default, as `settings` names it now.
+///
+/// A validator with neither is left out: there is nothing to tell the node,
+/// which then picks an address itself, as the startup warning says.
+fn preparations<'a>(
+    entries: impl IntoIterator<Item = &'a ValidatorEntry>,
+    settings: &ProposerSettings,
+) -> Vec<ProposerPreparationDto> {
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let fee_recipient = settings.fee_recipient(&entry.pubkey)?;
+            Some(ProposerPreparationDto {
+                validator_index: entry.index,
+                fee_recipient: crate::beacon_node::dto::encode_hex(&fee_recipient.0),
+            })
+        })
+        .collect()
+}
+
+/// The proposer preparations, sent again once every slot's duties are done.
+///
+/// # Every slot, not once an epoch
+///
+/// As Lighthouse's validator client does. A node keeps a preparation for the
+/// epoch it arrived in and two more, and loses all of them when it restarts;
+/// until the next one arrives it builds its own payloads for the zero address.
+/// Sent only by the epoch refresh, a restart mid-epoch cost the rest of that
+/// epoch's local blocks their execution-layer rewards: six blocks on a devnet,
+/// from a beacon node killed 14 slots into its epoch. Sent every slot, a
+/// restart costs at most a proposal that comes before the first re-send the
+/// node is back up for, which is within a slot of its return.
+///
+/// # What is sent
+///
+/// The validators the last refresh resolved that the store still holds, each
+/// with the address [`ProposerSettings`] gives it at the send, so a
+/// keymanager change to a fee recipient reaches the node after the duties of
+/// the slot it is made in, or the next slot's while a slow node still holds
+/// the last send (see below). Three cases that does not cover:
+///
+/// - **A key deleted through the keymanager** (`DELETE /eth/v1/keystores` or
+///   `/remotekeys`) is not sent again. Its overrides are forgotten with it, so
+///   it would otherwise go out with `--suggested-fee-recipient`, overwriting
+///   the preparation of a client the key moved to on the same node. The node
+///   keeps the address it was last given until it expires it or restarts.
+///   Imported again before the next refresh, the key is sent again, with the
+///   defaults a key starts on once its overrides are forgotten.
+/// - **A `DELETE` of a validator's fee recipient that leaves it no address**
+///   (no `--suggested-fee-recipient` either) sends nothing for it, so the node
+///   keeps the address it was last given, the same way.
+/// - **A key imported mid-epoch** is not sent until the next refresh resolves
+///   its index. Nothing is lost: that refresh is also what fetches its
+///   proposer duties (they are narrowed to the indices it resolves, see
+///   [`DutiesService::set_indices`]), so this client proposes no block for it
+///   before the refresh that prepares it.
+///
+/// # One send at a time
+///
+/// Each send reads the settings, then waits on every node. Against a slow
+/// node a send can outlive the next slot's, and two in flight could land in
+/// either order, reverting a fee recipient changed in between. So a send that
+/// finds the last one still running skips, and the slot after it sends what
+/// is current then (see [`crate::in_flight`]). A node that never answers is
+/// cut off by the HTTP client's request timeout, 8 s, so a hung node costs
+/// the healthy ones only the re-sends that come due while a send waits on it:
+/// at most every other one on 12 s slots, more on shorter ones, never all of
+/// them.
+///
+/// The epoch refresh's send does not take part. It runs on the duty loop
+/// ahead of the epoch's first proposal, where skipping would cost that
+/// proposal its preparation, and waiting on a hung node would cost it up to
+/// that timeout. A re-send still in flight from the slot before can then land
+/// after it, which is why the refresh's slot re-sends too, once its duties are
+/// done, although its refresh just sent the same: the late send can then cost
+/// at most the epoch's first proposal. If it is still running at that point,
+/// that re-send skips and the next slot's puts the current address back.
+///
+/// # Quiet on failure
+///
+/// A node that is down, restarting or refusing costs a `debug!` line, here
+/// and per node (see [`BeaconNodeApi::prepare_beacon_proposer_quietly`]): the
+/// slot's duties already report a node that is down, and the next slot tries
+/// again. The refresh's send still warns.
+struct Preparations<B> {
+    beacon_node: Arc<B>,
+    settings: Arc<ProposerSettings>,
+    /// The re-send, while it runs.
+    in_flight: InFlight,
+}
+
+impl<B: BeaconNodeApi + 'static> Preparations<B> {
+    fn new(beacon_node: Arc<B>, settings: Arc<ProposerSettings>) -> Self {
+        Self {
+            beacon_node,
+            settings,
+            in_flight: InFlight::default(),
+        }
+    }
+
+    /// The duty loop's gate, once every slot's duties are done, the
+    /// refresh's slot included: spawn the re-send of `resolved`'s
+    /// preparations, unless there is nobody to prepare. Returns the spawned
+    /// task's handle so a test can await it; the duty loop drops it, as it
+    /// does its other sends' handles.
+    fn after_slot(
+        self: &Arc<Self>,
+        slot: u64,
+        resolved: &Arc<Vec<ValidatorEntry>>,
+        store: &Arc<RwLock<ValidatorStore>>,
+    ) -> Option<JoinHandle<()>> {
+        if resolved.is_empty() {
+            return None;
+        }
+        let resend = self.clone().resend(slot, resolved.clone(), store.clone());
+        Some(tokio::spawn(resend))
+    }
+
+    async fn resend(
+        self: Arc<Self>,
+        slot: u64,
+        resolved: Arc<Vec<ValidatorEntry>>,
+        store: Arc<RwLock<ValidatorStore>>,
+    ) {
+        // Before the settings are read, so the sends reach the nodes in the
+        // order they read them.
+        let Some(_running) = self.in_flight.enter() else {
+            debug!(
+                %slot,
+                "The last fee recipient re-send is still running; skipping this slot's"
+            );
+            return;
+        };
+        // Built under the store's read guard, which is released before the
+        // send, so a keymanager write waits on no node.
+        let preparations = {
+            let store = store.read().await;
+            let held = resolved
+                .iter()
+                .filter(|entry| store.contains(&entry.pubkey));
+            preparations(held, &self.settings)
+        };
+        if preparations.is_empty() {
+            return;
+        }
+        let sent = self
+            .beacon_node
+            .prepare_beacon_proposer_quietly(&preparations)
+            .await;
+        let _ = sent.inspect_err(|err| {
+            debug!(%slot, %err, "Failed to re-send this client's fee recipients");
+        });
+    }
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
@@ -1206,10 +1386,12 @@ mod tests {
             .expect("refreshes");
     }
 
-    /// One preparation per resolved validator, every epoch. The node keeps a
-    /// preparation for three epochs and forgets all of them on restart, so a
-    /// client that sent this once at startup would quietly stop being
-    /// registered.
+    /// One preparation per resolved validator from every refresh, ahead of
+    /// the epoch's duties. The node keeps a preparation for three epochs and
+    /// forgets all of them on restart, so a client that sent this once at
+    /// startup would quietly stop being registered; the duty loop also sends
+    /// them again after every slot's duties (see
+    /// `the_preparations_go_out_again_after_every_slot_the_refreshs_included`).
     #[tokio::test]
     async fn every_resolved_validator_is_registered_for_its_fee_recipient() {
         let node = Arc::new(node());
@@ -1233,6 +1415,147 @@ mod tests {
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         assert_eq!(node.preparations().len(), 4);
+    }
+
+    /// A store holding `keys`, behind a signer nothing calls: these tests ask
+    /// the store which keys it holds, never for a signature.
+    fn store_holding(keys: &[BlsPubkey]) -> Arc<RwLock<ValidatorStore>> {
+        let mut store = ValidatorStore::new();
+        for key in keys {
+            store
+                .insert_remote(*key, "http://127.0.0.1:9000")
+                .expect("inserts");
+        }
+        Arc::new(RwLock::new(store))
+    }
+
+    /// Every preparation `node` was sent, as (index, address), in order.
+    fn sent(node: &MockBeaconNode) -> Vec<(u64, String)> {
+        node.preparations()
+            .into_iter()
+            .map(|entry| (entry.validator_index, entry.fee_recipient))
+            .collect()
+    }
+
+    /// The address whose twenty bytes are all `byte`, as a preparation
+    /// carries it.
+    fn address(byte: u8) -> String {
+        crate::beacon_node::dto::encode_hex(&[byte; 20])
+    }
+
+    /// The duty loop's gate: after every slot's duties, the refresh's
+    /// included, the refresh's validators again, with the addresses the
+    /// settings name by then. That re-send is what a beacon node restarted
+    /// mid-epoch hears from first: sent only by the refresh, its local blocks
+    /// paid the zero address for the rest of the epoch.
+    ///
+    /// On the refresh's own slot it puts the current address back when the
+    /// refresh's send was overtaken, here by the previous slot's re-send
+    /// landing late with the address a keymanager change replaced. Skipped
+    /// there, that address would stand until after the next slot's duties,
+    /// past the next proposal.
+    #[tokio::test]
+    async fn the_preparations_go_out_again_after_every_slot_the_refreshs_included() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let settings = Arc::new(settings(Some(H160([0xab; 20]))));
+        settings.set_fee_recipient(&pubkey(2), H160([0xcd; 20]));
+        let keys = [pubkey(1), pubkey(2)];
+        let store = store_holding(&keys);
+        let preparations = Arc::new(Preparations::new(node.clone(), settings.clone()));
+
+        let Refreshed { resolved, .. } =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context())
+                .await
+                .expect("refreshes");
+        assert_eq!(sent(&node), [(11, address(0xab)), (22, address(0xcd))]);
+        // The previous slot's re-send, which read validator 22's address
+        // before the change, reaching the node after the refresh's send.
+        let late = ProposerPreparationDto {
+            validator_index: 22,
+            fee_recipient: address(0xab),
+        };
+        node.preparations.lock().expect("lock").push(late);
+
+        let resolved = Arc::new(resolved);
+        preparations
+            .after_slot(96, &resolved, &store)
+            .expect("the refresh's slot re-sends too")
+            .await
+            .expect("the re-send ends");
+        assert_eq!(sent(&node)[3..], [(11, address(0xab)), (22, address(0xcd))]);
+
+        settings.set_fee_recipient(&pubkey(2), H160([0xef; 20]));
+        preparations
+            .after_slot(97, &resolved, &store)
+            .expect("and so does every slot after it")
+            .await
+            .expect("the re-send ends");
+        assert_eq!(sent(&node)[5..], [(11, address(0xab)), (22, address(0xef))]);
+    }
+
+    /// A key the keymanager deleted after the refresh is not prepared again.
+    /// Its overrides went with it, so it would otherwise go out every slot
+    /// with the default address, overwriting the preparation of a client the
+    /// key moved to on the same node.
+    #[tokio::test]
+    async fn a_key_deleted_since_the_refresh_is_not_prepared_again() {
+        let node = Arc::new(node());
+        let settings = Arc::new(settings(Some(H160([0xab; 20]))));
+        settings.set_fee_recipient(&pubkey(2), H160([0xcd; 20]));
+        let store = store_holding(&[pubkey(1), pubkey(2)]);
+        let preparations = Arc::new(Preparations::new(node.clone(), settings.clone()));
+        let resolved = Arc::new(node.validators.clone());
+
+        // What a keystore or remote key `DELETE` does to the two.
+        store.write().await.remove(&pubkey(2));
+        settings.forget(&pubkey(2));
+        preparations
+            .after_slot(97, &resolved, &store)
+            .expect("due")
+            .await
+            .expect("the re-send ends");
+
+        assert_eq!(sent(&node), [(11, address(0xab))]);
+    }
+
+    /// One re-send at a time. A slot whose re-send finds the last one still
+    /// waiting on a node skips, so a send that read an older fee recipient
+    /// cannot land after one that read the newer; the slot after sends what
+    /// is current then.
+    #[tokio::test]
+    async fn a_re_send_still_waiting_on_a_node_makes_the_next_slot_skip() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let node = Arc::new(node().with_preparation_gate(gate.clone()));
+        let settings = Arc::new(settings(Some(H160([0xab; 20]))));
+        let store = store_holding(&[pubkey(1), pubkey(2)]);
+        let preparations = Arc::new(Preparations::new(node.clone(), settings.clone()));
+        let resolved = Arc::new(node.validators.clone());
+
+        let slow = preparations.after_slot(97, &resolved, &store).expect("due");
+        node.preparation_entered.notified().await;
+        settings.set_fee_recipient(&pubkey(1), H160([0xcd; 20]));
+        let skipped = preparations.after_slot(98, &resolved, &store).expect("due");
+        tokio::time::timeout(std::time::Duration::from_secs(5), skipped)
+            .await
+            .expect("a skipped re-send does not wait on the node")
+            .expect("the skipped re-send ends");
+        assert!(
+            node.preparations().is_empty(),
+            "the slow re-send is still parked at the gate, and the skipped one sent nothing"
+        );
+
+        gate.add_permits(1);
+        slow.await.expect("the slow re-send ends");
+        assert_eq!(sent(&node), [(11, address(0xab)), (22, address(0xab))]);
+
+        gate.add_permits(1);
+        preparations
+            .after_slot(99, &resolved, &store)
+            .expect("due")
+            .await
+            .expect("the re-send ends");
+        assert_eq!(sent(&node)[2..], [(11, address(0xcd)), (22, address(0xab))]);
     }
 
     /// The refresh says when the attester schedule moved, which is what owes
