@@ -128,6 +128,19 @@ use crate::CustodyColumns as NodeCustodyColumns;
 const BLOCK_WAIT: Duration = Duration::from_secs(4);
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long [`build_payload`] lets the execution client build between
+/// `forkchoiceUpdated` (which starts the build) and `getPayload` (which ends
+/// it).
+///
+/// The node asks for a payload only when its block is requested, with no
+/// payload prepared ahead of the slot. Geth answers a `getPayload` that
+/// follows the update at once with the empty payload it starts from, before
+/// its first build with transactions finishes, so without a window every
+/// self-built block carried no transactions and no blobs, whatever the
+/// mempool held. Half a second covers a devnet mempool many times over; it
+/// overlaps the attestation packing that runs beside the build.
+const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
+
 /// What `produceBlockV4` built for one block, kept for the envelope endpoints.
 #[derive(Debug, Clone)]
 struct CachedPayload {
@@ -801,6 +814,7 @@ pub(crate) async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW).await;
     engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
