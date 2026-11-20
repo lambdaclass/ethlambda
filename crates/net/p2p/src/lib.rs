@@ -1559,6 +1559,7 @@ impl P2P {
         discovery: Option<DiscoverySpawnConfig>,
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
+        pq_builder_market: SharedPqBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
         gossip_events: Option<Arc<dyn GossipEventSink>>,
     ) -> Result<P2P, DiscoveryError> {
@@ -1649,7 +1650,7 @@ impl P2P {
             )),
             payload_attestation_pool,
             builder_market,
-            pq_builder_market: Default::default(),
+            pq_builder_market,
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 BUILDER_VALIDATION_PERMITS,
             )),

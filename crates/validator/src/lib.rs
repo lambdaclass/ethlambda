@@ -114,7 +114,6 @@ use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
-use ethlambda_types::beacon::fork::ForkName;
 
 /// Everything the client is configured with at startup.
 #[derive(Debug, Clone)]
@@ -158,11 +157,11 @@ pub struct ValidatorConfig {
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
+    pub init_slashing_protection: bool,
     /// Where precomputed VRF tree states are read from on a network that
     /// schedules PQ (an HTTP(S) URL or a file path), so a key's tree need
     /// not be hashed in full. See [`pq::fetch_vrf_state`].
     pub vrf_state_url: Option<String>,
-    pub init_slashing_protection: bool,
     /// Withhold every key's attestations and blocks until the beacon network
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
@@ -620,11 +619,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // should not compete with it producing this slot's block. Off the slot
             // loop, since it is single-flight and a slow node must not delay this
             // slot's duties.
-            // PQ preferences are signed with leanXMSS, which this client's
-            // preferences service does not do yet: a PQ proposal self-builds.
-            if clock_fork(&context, slot) != ForkName::Pq {
-                tokio::spawn(preferences.clone().poll(slot, store.clone()));
-            }
+            // At PQ the service signs with leanXMSS, once per slot.
+            tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
             // The subscriptions the refresh above left owing, sent from a task
             // of their own and only now, after the block.
@@ -1608,11 +1604,11 @@ async fn resolve_indices<B: BeaconNodeApi>(
             }
             Err(err) => {
                 warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
-    std::collections::HashMap::new()
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
         }
     }
+    std::collections::HashMap::new()
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
@@ -1754,15 +1750,6 @@ async fn refresh_sync<B: BeaconNodeApi>(
             warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
         }
     }
-}
-
-/// The fork of `slot` by the client's own schedule.
-fn clock_fork(context: &SigningContext, slot: u64) -> ForkName {
-    context
-        .config
-        .fork_at_epoch(ethlambda_types::beacon::signing::compute_epoch_at_slot(
-            slot,
-        ))
 }
 
 #[cfg(test)]

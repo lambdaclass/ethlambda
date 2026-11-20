@@ -7,7 +7,8 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::{SharedBuilderMarket, SharedPqBuilderMarket},
+    payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -279,6 +280,9 @@ pub struct BeaconApiHandles {
     /// Bids, proposer preferences and known payloads: filled by the bid and
     /// preferences endpoints and by gossip, read by block production.
     pub builder_market: SharedBuilderMarket,
+    /// The PQ fork's bids and proposer preferences, shared with gossip
+    /// validation: filled by the preferences endpoint and by gossip.
+    pub pq_builder_market: SharedPqBuilderMarket,
     /// Filled by gossip and the sync committee endpoints, read by block
     /// production and the contribution endpoint.
     pub sync_committee_pool: SharedSyncCommitteePool,
@@ -340,6 +344,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.payload_attestation_pool))
         .layer(Extension(handles.builder_market))
+        .layer(Extension(handles.pq_builder_market))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(handles.fee_recipients))

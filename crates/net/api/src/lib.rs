@@ -13,6 +13,7 @@ use ethlambda_types::{
         pq::{
             PayloadAttestationMessage as PqPayloadAttestationMessage,
             SignedAggregateAndProof as PqSignedAggregateAndProof,
+            SignedProposerPreferences as PqSignedProposerPreferences,
             SingleAttestation as PqSingleAttestation,
         },
     },
@@ -448,6 +449,9 @@ pub enum PqGossipObject {
     },
     /// For `payload_attestation_message`.
     PayloadAttestation(Box<PqPayloadAttestationMessage>),
+    /// For `proposer_preferences`, already recorded in the node's PQ builder
+    /// market.
+    ProposerPreferences(Box<PqSignedProposerPreferences>),
 }
 
 #[protocol]

@@ -632,6 +632,13 @@ pub trait BeaconNodeApi: Send + Sync {
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<Delivery>;
 
+    /// The PQ fork's [`Self::submit_proposer_preferences`]: leanXMSS-signed
+    /// preferences, under the `pq` header, with the same delivery contract.
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery>;
+
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.
     ///

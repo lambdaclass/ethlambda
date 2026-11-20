@@ -76,6 +76,10 @@ pub struct MockBeaconNode {
     /// Every proposer preferences batch `submit_proposer_preferences`
     /// received, with the fork it was sent under, in call order.
     pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
+    /// Every PQ proposer preference `submit_pq_proposer_preferences`
+    /// received, in call order.
+    pub submitted_pq_preferences:
+        Mutex<Vec<ethlambda_types::beacon::containers::pq::SignedProposerPreferences>>,
     /// Proposal slots whose preference the mock refuses, as a node does one it
     /// holds with other content: a call carrying any of them is an `Err` and
     /// records nothing, like the node's 400 for the whole call.
@@ -1174,6 +1178,18 @@ impl BeaconNodeApi for MockBeaconNode {
         _aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
     ) -> Result<()> {
         self.guard("publish_pq_aggregates")
+    }
+
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        self.guard("submit_pq_proposer_preferences")?;
+        self.submitted_pq_preferences
+            .lock()
+            .expect("lock")
+            .extend(preferences.iter().cloned());
+        Ok(Delivery::Everywhere)
     }
 
     async fn submit_pq_payload_attestations(
