@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ce9d15ed.js";
+            window.path_to_searchindex_js = "searchindex-b29916bc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -491,7 +491,7 @@ decodes anything else, and the two tags are raw bytes rather than SSZ for that
 reason: they have to be readable by a build that would decode the rest of the
 directory into the wrong shape. <code>db_version</code> catches a layout change this build
 knows about; <code>chain</code> catches lean rows being opened as beacon or the reverse;
-<code>preset</code> catches a <code>preset-minimal</code> build opening a mainnet directory, which
+<code>preset</code> catches a minimal-preset network reusing a mainnet directory, which
 the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.</p>

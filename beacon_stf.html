@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ce9d15ed.js";
+            window.path_to_searchindex_js = "searchindex-b29916bc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -269,7 +269,8 @@ for is the fixture tree, not the code.</p>
 <tr><th>Module</th><th>Holds</th></tr>
 </thead>
 <tbody>
-<tr><td><code>preset</code></td><td>Compile-time constants, mainnet or minimal</td></tr>
+<tr><td><code>preset</code></td><td>Preset values, mainnet or minimal, selected once per process</td></tr>
+<tr><td><code>preset_sized</code></td><td>SSZ lists, vectors and bitfields bounded by a preset value</td></tr>
 <tr><td><code>config</code></td><td>Runtime configuration: fork schedule, churn limits, blob schedule</td></tr>
 <tr><td><code>constants</code></td><td>Values the spec fixes outright: domain types, flag weights, sentinels</td></tr>
 <tr><td><code>fork</code></td><td><code>ForkName</code>, ordered oldest to newest</td></tr>
@@ -286,17 +287,33 @@ for is the fixture tree, not the code.</p>
 </tbody>
 </table>
 </div>
-<p>The first five come from <code>ethlambda_types::beacon</code> and are re-exported by
+<p>The first six come from <code>ethlambda_types::beacon</code> and are re-exported by
 <code>beacon/mod.rs</code>; the rest are defined here.</p>
 <h2 id="three-kinds-of-parameter"><a class="header" href="#three-kinds-of-parameter">Three kinds of parameter</a></h2>
 <p>The specification distinguishes constants, presets, and configuration, and so
 does this module, because they have genuinely different lifetimes.</p>
-<p><strong>Presets</strong> (<code>preset</code>) set container sizes, so they must be compile-time
-constants: <code>SszVector&lt;Root, { preset::SLOTS_PER_HISTORICAL_ROOT }&gt;</code>. The preset
-therefore cannot be a runtime value or a type parameter. Stable Rust cannot take a
-const-generic argument from a trait’s associated const, so the preset is selected
-by Cargo feature: mainnet by default, minimal with <code>preset-minimal</code>. The test
-target builds the crate twice and each run walks only its own fixture tree.</p>
+<p><strong>Presets</strong> (<code>preset</code>) set container sizes, and they are selected once per
+process at runtime, from the network’s <code>PRESET_BASE</code>: one binary runs mainnet
+and a minimal-preset devnet alike, as Lighthouse and Teku do.</p>
+<p>Lighthouse gets there by making every container generic over its preset
+(<code>BeaconState&lt;E: EthSpec&gt;</code>). That is not available here: stable Rust cannot
+take a const-generic argument from a trait’s associated const, and libssz’s
+collections take their bound as a const generic. So the preset is a
+process-wide value instead (<code>Preset::select</code>, frozen by the first read), and
+only what the two presets disagree on reads it:</p>
+<ul>
+<li>A value both presets share stays a constant (<code>preset::MAX_ATTESTATIONS</code>),
+compile-asserted equal in both, and keeps bounding its containers as a
+const generic (<code>SszList&lt;Attestation, { preset::MAX_ATTESTATIONS }&gt;</code>).</li>
+<li>A value they disagree on is a function, <code>preset::slots_per_epoch()</code>.</li>
+<li>A container bounded by such a value takes a <code>Length</code> marker whose <code>get()</code>
+reads the active preset: <code>VectorOf&lt;Root, preset::SlotsPerHistoricalRoot&gt;</code>
+for the state’s tree-backed vectors, and <code>preset_sized</code>’s <code>PresetList</code>,
+<code>PresetVector</code>, <code>PresetBitlist</code> and <code>PresetBitvector</code> (libssz’s four with
+<code>N</code> read at runtime) for the rest.</li>
+</ul>
+<p>The test target is built once; <code>BEACON_SPEC_PRESET</code> picks which fixture tree a
+run walks.</p>
 <p><strong>Configuration</strong> (<code>config</code>) is runtime, because the <code>transition</code> fixture suite
 moves a fork’s activation epoch per test case. That is the concrete reason fork
 scheduling is not a preset.</p>
@@ -975,8 +992,8 @@ tests, since the two chains share one lib target. The one ignored lib test is
 a timing measurement, not a fixture.</p>
 <p>Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: <code>genesis</code>’s <code>initialization</code> and <code>validity</code>.
-The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is gated
-behind the <code>preset-minimal</code> feature (<code>tests/beacon_spec/genesis.rs</code>).</p>
+The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is added
+to minimal runs only (<code>tests/beacon_spec/genesis.rs</code>).</p>
 <p>The gossip validation vectors this crate’s <code>gossip.rs</code> runner covers come from
 the same tree as every other suite. The node validates four topics under fulu’s
 rules; every other case is ignored by name rather than left unmatched.</p>

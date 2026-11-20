@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ce9d15ed.js";
+            window.path_to_searchindex_js = "searchindex-b29916bc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1147,7 +1147,7 @@ values, the 7 domain types, <code>SECONDS_PER_SLOT</code> (or <code>SLOT_DURATIO
 this node does not report) and every fork’s <code>*_FORK_VERSION</code> and <code>*_FORK_EPOCH</code>,
 with altair scheduled. All are served (a unit test pins the list).</p>
 <h3 id="get-ethv1configspec"><a class="header" href="#get-ethv1configspec"><code>GET /eth/v1/config/spec</code></a></h3>
-<p>One flat object holding the network’s configuration, the compiled preset, and
+<p>One flat object holding the network’s configuration, the active preset’s values, and
 the specification’s constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse’s refuses a beacon node whose <code>PRESET_BASE</code> does not match
 its own, and treats an absent key as a mismatch.</p>
