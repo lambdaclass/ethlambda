@@ -325,8 +325,10 @@ static SIGNING_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_signing_duration_seconds",
         "Time a duty waited for its batch of signatures, remote signer round trips included",
+        // The seconds are for PQ, where one leanXMSS signature builds a bottom
+        // tree (about a second and a half) unless the batch shares one.
         vec![
-            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
         ]
     )
     .unwrap()
