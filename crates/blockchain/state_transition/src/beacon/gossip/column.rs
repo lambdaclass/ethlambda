@@ -768,9 +768,19 @@ fn gloas_block(store: &Store, root: &Root) -> Result<GloasBlock, Outcome> {
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => Err(Outcome::Reject(RejectReason::BlockNotGloas)),
-        // Not followed (`ForkName::is_followed`): no column of theirs is
+        // PQ keeps gloas's sidecar and its bid's commitments
+        // (`pq/p2p-interface.md` leaves `data_column_sidecar_{subnet_id}`
+        // unmodified).
+        SignedBeaconBlock::Pq(block) => Ok(block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments
+            .to_vec()),
+        // Not followed (`ForkName::is_followed`): no column of its blocks is
         // judged here.
-        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => {
+        SignedBeaconBlock::Eip8483(_) => {
             Err(Outcome::Ignore(IgnoreReason::UnsupportedFork))
         }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::gloas_block"),
@@ -1758,6 +1768,54 @@ mod tests {
             stateful_checks_gloas(&store, &card),
             Outcome::Reject(RejectReason::BlockNotGloas)
         );
+    }
+
+    /// PQ keeps gloas's sidecar and the bid's commitments, so a column naming
+    /// a PQ block is judged against that bid (an empty column against one
+    /// commitment is malformed) rather than ignored. EIP-8483's blocks, not
+    /// followed, still are.
+    #[test]
+    fn a_gloas_sidecar_is_judged_against_a_pq_blocks_bid() {
+        use crate::beacon::containers::{eip8483, pq};
+
+        let card = gloas_sidecar(5, 0);
+        let mut body = pq::BeaconBlockBody::empty();
+        body.signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments = vec![Default::default()].try_into().expect("one commitment");
+        let pq_block = SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+            message: pq::BeaconBlock {
+                slot: 5,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        }));
+        let eip8483_block = SignedBeaconBlock::Eip8483(eip8483::SignedBeaconBlock {
+            message: eip8483::BeaconBlock {
+                slot: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for (block, expected) in [
+            (pq_block, Outcome::Reject(RejectReason::Malformed)),
+            (
+                eip8483_block,
+                Outcome::Ignore(IgnoreReason::UnsupportedFork),
+            ),
+        ] {
+            let mut store = store(0);
+            store
+                .insert_pending_block(card.beacon_block_root, block)
+                .expect("insert the block");
+            store
+                .insert_state(card.beacon_block_root, fulu_parent(3))
+                .expect("insert the state");
+            assert_eq!(stateful_checks_gloas(&store, &card), expected);
+        }
     }
 
     fn parkable_config() -> Config {
