@@ -468,9 +468,75 @@ payload votes, and `builder_validation_permits` for bids and proposer
 preferences. They are deliberately separate: a mainnet slot's worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer `Ignore(Overloaded)` for a block or a column
-instead. Neither pool has a metric of its own yet; a permit exhausted on
-either shows up as `outcome="ignore",reason="overloaded"` on
-`lean_beacon_gossip_validation_total`, for the topics that draw from it.
+instead. `sync_validation_permits` (sync committee messages and contributions)
+is a fourth, and `column_check_permits` bounds the checks on fetched columns and
+envelopes, which await a permit instead of failing. A permit exhausted on a
+gossip pool shows up as `outcome="ignore",reason="overloaded"` on
+`lean_beacon_gossip_validation_total` and, per pool, on
+`lean_beacon_validation_permit_exhausted_total` below.
+
+#### Validation contention
+
+These answer whether validation competes with block import and epoch precompute
+for CPU. They only measure: no pool size, schedule or verdict depends on them.
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
+| `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
+| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
+| `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a block's fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
+| `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
+
+`kind` on the queue and run histograms is the gossip topic kind above for gossip
+validation. `column_check` and `envelope_check` are the tasks of
+`check_and_forward` (fetched and replayed columns) and of the envelope checks:
+their queue delay is measured from `spawn_blocking`, after the permit wait, which
+has its own histogram, so the two add up. `column_check` covers both stages of a
+block's columns (see [Data column sidecars](beacon_wire.md#data-column-sidecars)):
+its prechecks, which wait for the group's permit, and each KZG sub-batch. The
+first sub-batch runs on the permit the prechecks held, so it has no permit wait of
+its own; each further one waits for its own. The run histogram therefore mixes
+the two stages, and the prechecks' share of a permit hold is not measured on its
+own. The in-use gauge counts a task from its
+permit being taken, so one waiting in the blocking pool counts too; it is a count
+of admitted work, not of busy threads. A block's columns hold one permit from
+their prechecks through their first sub-batch, so between the two the gauge counts
+a permit no thread is using. Only
+`lean_beacon_validation_queue_seconds` isolates time spent waiting for a thread.
+
+`lean_beacon_epoch_precompute_running` is set when the worker's closure starts
+and cleared when it ends, so the interval matches
+`lean_beacon_epoch_precompute_seconds` (which gives a duration, not an overlap
+with other series). At most one worker runs at a time.
+
+Block import needs no new series: `lean_block_import_phase_seconds{phase="queue"}`
+is already the wait in the chain actor's mailbox before the import starts (see
+Block Import Timing).
+
+**Does validation compete with import?** Plot these on one panel:
+
+```promql
+# Validation work admitted, waiting for a thread, and refused
+sum(lean_beacon_validation_permits_in_use)
+histogram_quantile(0.99, sum by (le) (rate(lean_beacon_validation_queue_seconds_bucket[5m])))
+sum by (pool) (rate(lean_beacon_validation_permit_exhausted_total[5m]))
+
+# Against import's STF phase
+histogram_quantile(0.99, sum by (le) (rate(lean_block_import_phase_seconds_bucket{phase="stf"}[5m])))
+
+# Precompute overlap: fraction of the window a worker ran
+avg_over_time(lean_beacon_epoch_precompute_running[5m])
+```
+
+Reading it: if STF p99 rises in the windows where queue-delay p99 or in-use
+rises, the two share threads (the tokio blocking pool, or cores). If queue delay
+stays near zero and STF p99 still moves, suspect cores instead: validation's CPU
+share is roughly `sum(rate(lean_beacon_validation_run_seconds_sum[5m]))`, in
+cores. To see whether precompute hurts import, compare STF p99 in windows where
+`lean_beacon_epoch_precompute_running` is 1 against windows where it is 0.
 
 ### Beacon Peer Scoring
 
@@ -529,6 +595,7 @@ leanMetrics spec.
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCacheExt::committees` call: the state transition's, fork choice's and p2p's gossip validation's attestation processing | result=hit,miss,unkeyable |
+| `lean_beacon_signature_batch_disagreements_total` | Counter | Signature batches that failed although the set the search for the failing one narrowed to verifies on its own: a bug in the batch check. The block is rejected anyway, so any non-zero value means valid blocks may be refused | When a block's deferred signature batch fails and the set its bisection lands on passes alone | |
 
 **Read the miss rate against the epoch rate, not the hit rate.** A follower on
 one chain misses about once per epoch, when the first block of a new epoch asks

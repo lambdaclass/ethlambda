@@ -576,7 +576,10 @@ async fn get_block(
         query.builder_boost_factor.unwrap_or(DEFAULT_BOOST_FACTOR),
         slot,
         query.randao_reveal,
-        BlockProcessingOptions { randao },
+        BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
         graffiti,
     )
     .await;
@@ -693,7 +696,7 @@ async fn produce(
     boost_factor: u64,
     slot: Slot,
     randao_reveal: BlsSignature,
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
     graffiti: Bytes32,
 ) -> Result<(Produced, String, ForkName), ApiError> {
     let config = store.config();
