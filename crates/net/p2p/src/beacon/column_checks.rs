@@ -324,10 +324,13 @@ fn precheck_group(
     let mut pending = Vec::new();
     let mut prechecks = ChainPrechecks::new(store, now_ms);
     for sidecar in sidecars {
-        // A panic inside the checks (a `Store` read's `.expect()` on a DB
-        // error, say) costs that one sidecar, dropped and counted as
-        // `internal`. `ChainPrechecks` keeps an answer only once it is
-        // complete, so the next sidecar works it out again.
+        // A panic inside the checks (one of the `Store` reads that still
+        // `.expect()` on a DB error, say) costs that one sidecar, dropped and
+        // counted as `internal`. `ChainPrechecks` keeps an answer only once it
+        // is complete, so the next sidecar works it out again. The
+        // parent-state read returns its error instead, and the checks drop the
+        // sidecar for it as `internal` without unwinding, remembering nothing
+        // either.
         let precheck = catch_unwind(AssertUnwindSafe(|| prechecks.check(&sidecar)));
         match precheck {
             Ok(Ok(kzg)) => pending.push((sidecar, kzg)),
