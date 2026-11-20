@@ -123,11 +123,13 @@ pub(crate) fn get_safe_execution_block_hash(store: &Store) -> ExecutionBlockHash
 /// (`get_latest_confirmed`'s canonical check). Checked against the canonical
 /// `BlockRoots` index, which `update_checkpoints` keeps on the stored head's
 /// chain: one point read, where walking the head's ancestry would decode a
-/// block per hop. A slot the index cannot answer counts as off the chain.
-/// This clamp is not in the specification; see `docs/spec_deviations.md`.
+/// block per hop. The confirmed block's slot is the one the run recorded with
+/// it, so this decodes nothing either. A slot the index cannot answer counts
+/// as off the chain. This clamp is not in the specification; see
+/// `docs/spec_deviations.md`.
 fn safe_root(store: &Store) -> H256 {
     let finalized = store.beacon_finalized_checkpoint();
-    let Some(confirmed) = store.fast_confirmed_root() else {
+    let Some((slot, confirmed)) = store.fast_confirmed_block() else {
         return finalized.root;
     };
     if confirmed == finalized.root {
@@ -136,10 +138,8 @@ fn safe_root(store: &Store) -> H256 {
     // Every canonical block at or after the finalized epoch's start slot other
     // than the finalized block itself descends from it, so this also keeps a
     // confirmed block that finality has overtaken out.
-    let on_head_chain = store.block_entry(&confirmed).is_some_and(|(slot, _)| {
-        slot >= compute_start_slot_at_epoch(finalized.epoch)
-            && store.canonical_root_at_slot(slot).ok().flatten() == Some(confirmed)
-    });
+    let on_head_chain = slot >= compute_start_slot_at_epoch(finalized.epoch)
+        && store.canonical_root_at_slot(slot).ok().flatten() == Some(confirmed);
     if on_head_chain {
         confirmed
     } else {
@@ -503,7 +503,9 @@ mod tests {
 
     fn confirm(store: &Store, root: H256) {
         let checkpoint = ethlambda_types::beacon::containers::Checkpoint { epoch: 0, root };
-        store.set_fast_confirmation(0, FastConfirmationVariables::at_finalized(checkpoint), root);
+        let variables = FastConfirmationVariables::at_finalized(checkpoint);
+        let slot = store.block_entry(&root).map_or(0, |(slot, _)| slot);
+        store.set_fast_confirmation(0, variables, slot, root);
     }
 
     fn gloas_block(

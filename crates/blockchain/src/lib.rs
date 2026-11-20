@@ -2457,9 +2457,9 @@ impl BlockChainServer {
     /// Only the per-slot tick passes `true`: the rule must run exactly once per
     /// slot, and imports recompute the head many times a slot.
     async fn recompute_beacon_head_with(&mut self, run_fast_confirmation: bool) -> HeadTimings {
-        let mut timings = self.update_head_from_fork_choice();
+        let (mut timings, index) = self.update_head_keeping_index();
         if run_fast_confirmation && !timings.head_failed {
-            self.run_fast_confirmation();
+            self.run_fast_confirmation(index);
         }
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
@@ -2642,13 +2642,22 @@ impl BlockChainServer {
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
     pub(crate) fn update_head_from_fork_choice(&mut self) -> HeadTimings {
+        self.update_head_keeping_index().0
+    }
+
+    /// [`Self::update_head_from_fork_choice`], also handing back the
+    /// [`ethlambda_storage::Store::block_index`] the head computation walked,
+    /// so the Fast Confirmation Rule run right after it does not scan
+    /// `LiveChain` again.
+    fn update_head_keeping_index(&mut self) -> (HeadTimings, HashMap<H256, (u64, H256)>) {
         let _timing = metrics::time_beacon_head_compute();
         let mut timings = HeadTimings {
             head_start: Some(Instant::now()),
             ..HeadTimings::default()
         };
         let config = self.store.config();
-        if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
+        let index = self.store.block_index();
+        if let Err(err) = fork_choice::get_head_with_index(&mut self.store, &config, &index) {
             // An invalidated justified checkpoint reaches here:
             // `filter_block_tree` fails its `block_root in store.blocks` assert
             // once the justified root's row is gone. `optimistic-sync.md`
@@ -2657,14 +2666,14 @@ impl BlockChainServer {
             warn!(%err, "Failed to compute beacon head");
             timings.head_end = Some(Instant::now());
             timings.head_failed = true;
-            return timings;
+            return (timings, index);
         }
         timings.head_end = Some(Instant::now());
         if let Some((head_slot, _)) = self.store.beacon_head() {
             metrics::update_head_slot(head_slot);
         }
         self.pin_head_shufflings();
-        timings
+        (timings, index)
     }
 
     /// Run the Fast Confirmation Rule once and publish its `fast_confirmation`
@@ -2680,9 +2689,13 @@ impl BlockChainServer {
     /// held up behind a long import, say): the specification requires
     /// `update_fast_confirmation_variables` to run before
     /// `get_attestation_due_ms` into the slot. The slot then has no run, and
-    /// the next one starts over (see `fast_confirmation::run_fast_confirmation`).
-    /// A failed run is logged and the event withheld, with the same effect.
-    fn run_fast_confirmation(&mut self) {
+    /// the next one starts over (see `fast_confirmation::run_fast_confirmation`,
+    /// which also logs that). A failed run is logged and the event withheld,
+    /// and the rule is reset.
+    ///
+    /// `index` is the [`ethlambda_storage::Store::block_index`] the head
+    /// computation just walked, handed on so the run does not scan again.
+    fn run_fast_confirmation(&mut self, index: HashMap<H256, (u64, H256)>) {
         let Some((head_slot, head_root)) = self.store.beacon_head() else {
             return;
         };
@@ -2694,6 +2707,13 @@ impl BlockChainServer {
         // Read now, after the head computation, rather than at the tick: the
         // variables are updated by the run below.
         let slot = fork_choice::get_current_slot(&self.store, &config);
+        // This slot already had its run (a tick that fired while the store
+        // clock still read the slot before). Checked before the deadline,
+        // which for that earlier slot has long passed and would be reported
+        // as a late run.
+        if self.store.fast_confirmation_slot() == Some(slot) {
+            return;
+        }
         let deadline_ms = config
             .genesis_time_ms()
             .saturating_add(slot.saturating_mul(config.slot_duration_ms))
@@ -2711,18 +2731,14 @@ impl BlockChainServer {
             );
             return;
         }
-        if let Some(last_slot) = self.store.fast_confirmation_slot()
-            && last_slot + 1 < slot
-        {
-            info!(
-                %slot,
-                last_slot,
-                "Fast confirmation starts over: a slot went by without a run"
-            );
-        }
         let result = {
             let _timing = metrics::time_beacon_fast_confirmation();
-            fast_confirmation::run_fast_confirmation(&self.store, &config, head_root)
+            fast_confirmation::run_fast_confirmation_with_index(
+                &self.store,
+                &config,
+                head_root,
+                index,
+            )
         };
         match result {
             Ok(Some(confirmation)) => self.events.publish_fast_confirmation(
@@ -2730,10 +2746,10 @@ impl BlockChainServer {
                 confirmation.slot,
                 confirmation.current_slot,
             ),
-            // This slot already had its run (a tick that fired while the wall
-            // clock still read the slot before).
+            // Already answered above; the run checks again for its other
+            // callers.
             Ok(None) => {}
-            Err(err) => warn!(%err, "Fast confirmation run failed"),
+            Err(err) => warn!(%err, "Fast confirmation run failed; falling back to finalized"),
         }
     }
 

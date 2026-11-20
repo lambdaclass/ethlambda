@@ -76,8 +76,9 @@
 //! - A validator index past a balance source's registry counts as inactive
 //!   there, where Python would raise `IndexError`.
 //! - `get_root_confirmed_before_restart` is the root the previous process
-//!   persisted, or this one's last report before the rule started over after
-//!   a slot without a run ([`Store::fast_confirmation_restart_root`]). Like
+//!   persisted ([`Store::fast_confirmation_restart_root`]). A rule that starts
+//!   over within a process (a slot without a run, a failed run) restores
+//!   nothing, since the gap itself means synchrony did not hold. Like
 //!   the specification's function, [`get_restart_resilient_confirmed_root`]
 //!   only decides what a run reports; its answer is never written back into
 //!   `confirmed_root` (see [`run_fast_confirmation`]).
@@ -89,6 +90,7 @@ use std::sync::Arc;
 use ethlambda_storage::{Store, WeightRules};
 pub use ethlambda_types::beacon::fork_choice::FastConfirmationVariables;
 use ethlambda_types::beacon::fork_choice::JustifiedBalances;
+use tracing::info;
 
 use crate::beacon::committees::EpochCommittees;
 use crate::beacon::config::Config;
@@ -137,6 +139,19 @@ impl<'a> FastConfirmationStore<'a> {
         variables: FastConfirmationVariables,
         head: Root,
     ) -> Self {
+        Self::with_index(store, config, variables, head, store.block_index())
+    }
+
+    /// [`Self::new`], over the [`Store::block_index`] the caller's head
+    /// computation already built, so a run does not scan `LiveChain` a second
+    /// time in the same tick.
+    pub fn with_index(
+        store: &'a Store,
+        config: &'a Config,
+        variables: FastConfirmationVariables,
+        head: Root,
+        index: HashMap<Root, (Slot, Root)>,
+    ) -> Self {
         Self {
             store,
             config,
@@ -149,7 +164,7 @@ impl<'a> FastConfirmationStore<'a> {
                 .previous_epoch_greatest_unrealized_checkpoint,
             previous_slot_head: variables.previous_slot_head,
             current_slot_head: variables.current_slot_head,
-            run: RunContext::new(store, config, head),
+            run: RunContext::new(store, config, head, index),
         }
     }
 
@@ -284,7 +299,7 @@ struct RunContext {
 }
 
 impl RunContext {
-    fn new(store: &Store, config: &Config, head: Root) -> Self {
+    fn new(store: &Store, config: &Config, head: Root, index: HashMap<Root, (Slot, Root)>) -> Self {
         let current_slot = fork_choice::get_current_slot(store, config);
         let current_epoch = compute_epoch_at_slot(current_slot);
         Self {
@@ -292,7 +307,7 @@ impl RunContext {
             current_slot,
             current_epoch,
             rules: ForkRules::of(config.fork_at_epoch(current_epoch)),
-            index: store.block_index(),
+            index,
             equivocating: store.equivocating_indices().into_iter().collect(),
             head_state: OnceCell::new(),
             pulled_up_head_state: OnceCell::new(),
@@ -699,6 +714,12 @@ fn previous_slot(fcr_store: &FastConfirmationStore) -> Result<Slot> {
 /// Before gloas a node is a bare root. Under gloas the root is compared first,
 /// which settles all but the votes for the block itself, and only those pay
 /// for `get_supported_node`'s payload branch.
+///
+/// The voted-for block's slot comes from the run's index, and its fork from
+/// that slot, rather than from [`fork_choice::get_supported_node`]'s block
+/// decode: this runs once per matching committee member, about a slot's worth
+/// of validators per empty slot in [`compute_empty_slot_support_discount`],
+/// almost all voting for the same block.
 fn supports_node(
     fcr_store: &FastConfirmationStore,
     message: LatestMessage,
@@ -709,7 +730,16 @@ fn supports_node(
     }
     match fcr_store.run.rules {
         ForkRules::PreGloas => Ok(true),
-        ForkRules::Gloas => Ok(fork_choice::get_supported_node(fcr_store.store, message)? == node),
+        ForkRules::Gloas => {
+            let block_slot = get_block_slot(fcr_store, message.root)?;
+            let block_fork = fcr_store
+                .config
+                .fork_at_epoch(compute_epoch_at_slot(block_slot));
+            let block_is_pre_gloas = ForkRules::of(block_fork) == ForkRules::PreGloas;
+            let payload_status =
+                fork_choice::supported_payload_status(block_slot, block_is_pre_gloas, &message);
+            Ok(payload_status == node.payload_status)
+        }
     }
 }
 
@@ -1727,28 +1757,61 @@ pub struct FastConfirmation {
 /// - a second run for a slot is not run, and answers `None`;
 /// - a run that does not follow on from the previous slot's (a late tick, a
 ///   failed head computation or a failed run left a slot without one) starts
-///   over from [`get_fast_confirmation_store`] the way a restarted node does,
-///   with the root last reported offered to the restart rule
-///   ([`Store::reset_fast_confirmation`]). The first run of a process starts
-///   there too, with the root the previous process persisted.
+///   over from [`get_fast_confirmation_store`]'s values
+///   ([`Store::reset_fast_confirmation`]). The root reported before the gap is
+///   not restored: a missed slot is itself a sign the synchrony the rule
+///   assumes did not hold. The first run of a process starts there too, and
+///   that one is offered the root the previous process persisted.
 ///
 /// `head` is `get_head(store).root`, which the caller has just computed. On an
-/// error nothing is written, so the next slot's run starts over.
+/// error the rule is reset, so the safe block falls back to the finalized one
+/// instead of keeping a root this slot's run could not re-check, and the next
+/// slot's run starts over.
 pub fn run_fast_confirmation(
     store: &Store,
     config: &Config,
     head: Root,
 ) -> Result<Option<FastConfirmation>> {
+    run_fast_confirmation_with_index(store, config, head, store.block_index())
+}
+
+/// [`run_fast_confirmation`] over the [`Store::block_index`] the caller's head
+/// computation already built (see [`FastConfirmationStore::with_index`]).
+pub fn run_fast_confirmation_with_index(
+    store: &Store,
+    config: &Config,
+    head: Root,
+    index: HashMap<Root, (Slot, Root)>,
+) -> Result<Option<FastConfirmation>> {
     let current_slot = fork_choice::get_current_slot(store, config);
     match store.fast_confirmation_slot() {
         Some(slot) if slot == current_slot => return Ok(None),
-        Some(slot) if slot + 1 != current_slot => store.reset_fast_confirmation(),
+        Some(last_slot) if last_slot + 1 != current_slot => {
+            info!(
+                slot = current_slot,
+                last_slot, "Fast confirmation starts over: a slot went by without a run"
+            );
+            store.reset_fast_confirmation();
+        }
         Some(_) | None => {}
     }
-    let mut fcr_store = match store.fast_confirmation() {
-        Some(variables) => FastConfirmationStore::new(store, config, variables, head),
-        None => get_fast_confirmation_store(store, config, head),
-    };
+    run_once(store, config, head, index, current_slot)
+        .inspect_err(|_| store.reset_fast_confirmation())
+        .map(Some)
+}
+
+/// [`run_fast_confirmation_with_index`]'s run, once it has decided to run.
+fn run_once(
+    store: &Store,
+    config: &Config,
+    head: Root,
+    index: HashMap<Root, (Slot, Root)>,
+    current_slot: Slot,
+) -> Result<FastConfirmation> {
+    let variables = store.fast_confirmation().unwrap_or_else(|| {
+        FastConfirmationVariables::at_finalized(store.beacon_finalized_checkpoint())
+    });
+    let mut fcr_store = FastConfirmationStore::with_index(store, config, variables, head, index);
     on_fast_confirmation(&mut fcr_store)?;
 
     let confirmed_root = reported_root(&fcr_store)?;
@@ -1757,14 +1820,19 @@ pub fn run_fast_confirmation(
         slot: get_block_slot(&fcr_store, confirmed_root)?,
         current_slot: fcr_store.run.current_slot,
     };
-    store.set_fast_confirmation(current_slot, fcr_store.variables(), confirmed_root);
-    Ok(Some(confirmed))
+    store.set_fast_confirmation(
+        current_slot,
+        fcr_store.variables(),
+        confirmed.slot,
+        confirmed_root,
+    );
+    Ok(confirmed)
 }
 
 /// The root a run reports as confirmed:
-/// [`get_restart_resilient_confirmed_root`] while the store holds a root an
-/// earlier run reported before the rule started over, and the rule's own
-/// `confirmed_root` otherwise.
+/// [`get_restart_resilient_confirmed_root`] while the store holds the root the
+/// previous process reported last, and the rule's own `confirmed_root`
+/// otherwise.
 ///
 /// The specification's function only reads `fcr_store` and returns a root;
 /// nothing writes its answer back into `confirmed_root`. So the rule keeps
@@ -3095,10 +3163,13 @@ mod tests {
         assert!(block_should_be_finalized(&fcr, block).unwrap());
     }
 
-    /// A root reported before the rule started over (here through a reset, as
-    /// a restarted process's persisted one would be) is reported while it is
+    /// A root the previous process reported is reported while it is
     /// canonical, recent and ahead of what the rule itself confirms, and is
     /// never written into the rule's own `confirmed_root`.
+    ///
+    /// The restart is the persisted row plus a store whose scratch is empty:
+    /// nothing in this process has asked for the restart root yet, so the
+    /// first run reads the row, as a freshly started process does.
     #[test]
     fn a_restored_root_is_reported_while_it_wins_and_never_becomes_the_rules_own() {
         let mut chain = Chain::new();
@@ -3112,14 +3183,18 @@ mod tests {
         let before_restart = parent;
         assert_ne!(before_restart, chain.anchor_root);
 
-        // What an earlier run reported
+        // What the previous process reported last
         let variables = FastConfirmationVariables::at_finalized(Checkpoint {
             epoch: 0,
             root: before_restart,
         });
-        chain
-            .store
-            .set_fast_confirmation(chain.current_slot() - 1, variables, before_restart);
+        let before_restart_slot = chain.slot_of(before_restart);
+        chain.store.set_fast_confirmation(
+            chain.current_slot() - 1,
+            variables,
+            before_restart_slot,
+            before_restart,
+        );
         chain.store.reset_fast_confirmation();
 
         let confirmation = chain.run_fcr();
@@ -3154,10 +3229,12 @@ mod tests {
     /// A run after a slot without one cannot follow on from the variables the
     /// last run left (`previous_slot_head` would be two slots old, and a
     /// boundary's rotation may have been missed). It starts over from the
-    /// finalized checkpoint, as a restarted node does, and the root the last
-    /// run reported is offered to the restart rule.
+    /// finalized checkpoint, as the rule's initialization does, and the root
+    /// the last run reported is not restored: the missed slot is itself a sign
+    /// of asynchrony, and the specification restores a root only across a
+    /// restart.
     #[test]
-    fn a_run_after_a_missed_slot_starts_over_and_restores_the_last_report() {
+    fn a_run_after_a_missed_slot_starts_over_without_restoring_the_last_report() {
         let mut chain = Chain::new();
         for _ in 0..SPE / 2 {
             chain.next_slot_with_block_on(None, 0);
@@ -3167,17 +3244,23 @@ mod tests {
         assert_ne!(parent, chain.anchor_root);
         let finalized = chain.store.beacon_finalized_checkpoint();
 
+        // This process's first run already settled the previous process's
+        // root, as every process's first run does.
+        assert_eq!(chain.store.fast_confirmation_restart_root(), None);
+
         // A run two slots ago that reported `parent`, with heads a fresh start
         // would not have.
         let mut variables = FastConfirmationVariables::at_finalized(finalized);
         variables.previous_slot_head = parent;
         variables.current_slot_head = parent;
+        let parent_slot = chain.slot_of(parent);
         chain
             .store
-            .set_fast_confirmation(chain.current_slot() - 2, variables, parent);
+            .set_fast_confirmation(chain.current_slot() - 2, variables, parent_slot, parent);
 
         let confirmation = chain.run_fcr();
-        assert_eq!(confirmation.block, parent, "the last report, restored");
+        assert_eq!(confirmation.block, chain.anchor_root, "not restored");
+        assert_eq!(chain.store.fast_confirmed_root(), Some(chain.anchor_root));
         let after = chain.store.fast_confirmation().unwrap();
         assert_eq!(after.previous_slot_head, finalized.root, "started over");
         assert_eq!(after.current_slot_head, chain.head());

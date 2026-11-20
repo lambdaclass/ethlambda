@@ -606,8 +606,11 @@ assertion). A later bump should diff those three files against that commit.
   checkpoints rotate only in an epoch boundary's own slot, and
   `previous_slot_head` must be the previous slot's head), so a run whose
   previous run was not in the slot before starts over from the finalized
-  checkpoint, the way a restarted node does, and the root last reported goes
-  to the restart rule below. How often that happens on a live node is not
+  checkpoint, as the rule's initialization does. The root last reported is
+  dropped, not handed to the restart rule below: a missed slot is itself a
+  sign the synchrony the rule assumes did not hold, so the safe block falls
+  back to the finalized one until the rule confirms again. A failed run resets
+  the rule the same way. How often that happens on a live node is not
   measured; each one is logged.
 - **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
   the engine's safe block hash (`get_safe_execution_block_hash`), which falls
@@ -644,9 +647,10 @@ assertion). A later bump should diff those three files against that commit.
   about 14 ms in its first, as the head computation's once-an-epoch
   proto-array rebuild does. `lean_beacon_fast_confirmation_time_seconds` times
   a run.
-- **Restart.** The reported confirmed root is persisted when it changes. A
-  run that starts over (the first synced run of a process, or one after a
-  missed slot) holds the root reported before it, and every run asks
+- **Restart.** The reported confirmed root is persisted when it changes. The
+  first synced run of a process holds the root the previous process
+  persisted (a restart within a process, after a missed or failed run, holds
+  nothing), and every run asks
   `get_restart_resilient_confirmed_root` about it until the rule's own answer
   wins, at which point it is dropped. As in the specification, that function
   only decides what is reported (the event and the safe block); its answer is

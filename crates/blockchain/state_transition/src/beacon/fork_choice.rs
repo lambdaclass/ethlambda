@@ -2823,11 +2823,22 @@ fn walk_head(
 /// the committees of a weak parent's slot, and this runs every slot, so a
 /// cache of its own would recompute every committee on every call.
 pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
+    get_head_node_with_index(store, config, &store.block_index())
+}
+
+/// [`get_head_node`] over an `index` the caller built
+/// ([`Store::block_index`]), so a caller that needs the index again afterwards
+/// (the Fast Confirmation Rule, run right after the head) scans `LiveChain`
+/// once.
+pub fn get_head_node_with_index(
+    store: &Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<ForkChoiceNode> {
     let current_slot = get_current_slot(store, config);
     let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
-    let index = store.block_index();
     let committees = store.committee_cache();
-    walk_head(store, &index, config, &committees, rules)
+    walk_head(store, index, config, &committees, rules)
 }
 
 /// [`get_head_node`], recorded as the store's own head.
@@ -2849,7 +2860,18 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// that is empty whenever the head did not move, set against a whole weighted
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
-    let head = get_head_node(store, config)?;
+    let index = store.block_index();
+    get_head_with_index(store, config, &index)
+}
+
+/// [`get_head`] over an `index` the caller built; see
+/// [`get_head_node_with_index`].
+pub fn get_head_with_index(
+    store: &mut Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<Root> {
+    let head = get_head_node_with_index(store, config, index)?;
     // Recorded with its root, so a reader can tell which head the status is
     // for whichever of the two writes it sees first.
     store.set_head_payload_status(head.root, head.payload_status);
@@ -3671,19 +3693,29 @@ pub fn get_supported_node(store: &Store, message: LatestMessage) -> Result<ForkC
         .get_signed_block(&message.root)
         .expect("get")
         .ok_or(Error::SpecAssert("message.root in store.blocks"))?;
-    let payload_status = if block.slot() < message.slot {
-        if is_pre_gloas(&block) || message.payload_present {
+    Ok(ForkChoiceNode {
+        root: message.root,
+        payload_status: supported_payload_status(block.slot(), is_pre_gloas(&block), &message),
+    })
+}
+
+/// [`get_supported_node`]'s payload status, given the voted-for block's slot
+/// and whether it is pre-gloas, for a caller that already has both and should
+/// not decode the block to get them.
+pub fn supported_payload_status(
+    block_slot: Slot,
+    block_is_pre_gloas: bool,
+    message: &LatestMessage,
+) -> PayloadStatus {
+    if block_slot < message.slot {
+        if block_is_pre_gloas || message.payload_present {
             PayloadStatus::Full
         } else {
             PayloadStatus::Empty
         }
     } else {
         PayloadStatus::Pending
-    };
-    Ok(ForkChoiceNode {
-        root: message.root,
-        payload_status,
-    })
+    }
 }
 
 /// `is_previous_slot_payload_decision` (gloas `fork-choice.md`): whether

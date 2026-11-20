@@ -790,6 +790,19 @@ impl JustifiedBalancesCache {
     }
 }
 
+/// Where [`BeaconScratch::fast_confirmation_restart_root`] stands.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartRoot {
+    /// Not asked for yet: the previous process's persisted root, if any, is
+    /// still to be read.
+    #[default]
+    Unread,
+    /// A root the rule may restore.
+    Held(H256),
+    /// Nothing to restore: none was persisted, or the held one was dropped.
+    Gone,
+}
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
 /// chain history: apart from the entries named below, nothing here
 /// survives a restart, and nothing else here is worth the write
@@ -844,19 +857,6 @@ impl JustifiedBalancesCache {
 /// block, which writes the third once per import. `unrealized_justifications`
 /// is bounded too: [`Store::prune_unrealized_justifications`] evicts it along
 /// with the table rows it caches.
-/// Where [`BeaconScratch::fast_confirmation_restart_root`] stands.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestartRoot {
-    /// Not asked for yet: the previous process's persisted root, if any, is
-    /// still to be read.
-    #[default]
-    Unread,
-    /// A root the rule may restore.
-    Held(H256),
-    /// Nothing to restore: none was persisted, or the held one was dropped.
-    Gone,
-}
-
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
@@ -893,9 +893,10 @@ pub(crate) struct BeaconScratch {
     /// `fast_confirmation::run_fast_confirmation`), which `forkchoiceUpdated`'s
     /// safe block reads and [`KEY_BEACON_FAST_CONFIRMED_ROOT`] persists. Not
     /// always the variables' `confirmed_root`: while a restored root wins, it
-    /// is that one.
-    pub(crate) fast_confirmed_root: Option<H256>,
-    /// The root an earlier run reported before the rule started over, which
+    /// is that one. Kept as `(slot, root)`, so the safe block's on-chain check
+    /// reads the slot without decoding the block.
+    pub(crate) fast_confirmed_root: Option<(u64, H256)>,
+    /// The root the previous process reported last, which
     /// `get_restart_resilient_confirmed_root` may restore.
     pub(crate) fast_confirmation_restart_root: RestartRoot,
     /// In-memory half of `Table::BeaconUnrealizedJustifications`; see this
@@ -4971,49 +4972,56 @@ impl Store {
     /// to the finalized root, which is where the rule's own initialization
     /// puts `confirmed_root`.
     pub fn fast_confirmed_root(&self) -> Option<H256> {
+        self.fast_confirmed_block().map(|(_, root)| root)
+    }
+
+    /// [`Self::fast_confirmed_root`] with its block's slot.
+    pub fn fast_confirmed_block(&self) -> Option<(u64, H256)> {
         self.beacon.lock().unwrap().fast_confirmed_root
     }
 
-    /// Records a run for `slot`: the rule's `variables` and the root it
-    /// reported, persisting that root when it differs from the last one.
+    /// Records a run for `slot`: the rule's `variables` and the block it
+    /// reported (`confirmed_slot`, `confirmed_root`), persisting that root when
+    /// it differs from the last one.
     pub fn set_fast_confirmation(
         &self,
         slot: u64,
         variables: FastConfirmationVariables,
+        confirmed_slot: u64,
         confirmed_root: H256,
     ) {
         let previous = {
             let mut scratch = self.beacon.lock().unwrap();
             scratch.fast_confirmation = Some((slot, variables));
-            scratch.fast_confirmed_root.replace(confirmed_root)
+            scratch
+                .fast_confirmed_root
+                .replace((confirmed_slot, confirmed_root))
         };
-        if previous != Some(confirmed_root) {
+        if previous.map(|(_, root)| root) != Some(confirmed_root) {
             self.set_metadata(KEY_BEACON_FAST_CONFIRMED_ROOT, &confirmed_root);
         }
     }
 
-    /// Forgets the rule's variables and the root it reported, so the next run
-    /// starts from the finalized checkpoint the way a restarted node does: the
-    /// reported root becomes the restart root
-    /// ([`Self::fast_confirmation_restart_root`]), which the specification's
-    /// `get_restart_resilient_confirmed_root` restores if it still holds by
-    /// then.
+    /// Forgets the rule's variables and the root it reported, so the safe
+    /// block falls back to the finalized one and the next run starts from the
+    /// finalized checkpoint, as the rule's initialization does.
     ///
     /// For a run that cannot follow on from the previous one: a slot went by
-    /// without a run, or the node is too far behind the clock to run at all
-    /// (its stored heads would be stale then, and may be pruned).
+    /// without a run, a run failed, or the node is too far behind the clock to
+    /// run at all (its stored heads would be stale then, and may be pruned).
+    /// Each of those breaks the synchrony the rule assumes, so the root
+    /// reported before it is *not* offered to
+    /// `get_restart_resilient_confirmed_root`: the specification restores a
+    /// root only across a node restart, and only the previous process's
+    /// persisted root is that ([`Self::fast_confirmation_restart_root`]).
     pub fn reset_fast_confirmation(&self) {
         let mut scratch = self.beacon.lock().unwrap();
         scratch.fast_confirmation = None;
-        if let Some(root) = scratch.fast_confirmed_root.take() {
-            scratch.fast_confirmation_restart_root = RestartRoot::Held(root);
-        }
+        scratch.fast_confirmed_root = None;
     }
 
-    /// The root an earlier run reported before the rule started over: on the
-    /// first ask of a process, the one the previous process persisted, and
-    /// after [`Self::reset_fast_confirmation`] the one this process reported
-    /// last. Held until [`Self::drop_fast_confirmation_restart_root`].
+    /// The root the previous process reported last, read on the first ask of
+    /// this process. Held until [`Self::drop_fast_confirmation_restart_root`].
     ///
     /// The specification's implementation-defined
     /// `get_root_confirmed_before_restart`.
@@ -9698,8 +9706,8 @@ mod tests {
     }
 
     /// The restart root is the persisted row, read on the first ask and held,
-    /// not taken, until it is dropped; a reset forgets the run and holds the
-    /// root it reported instead.
+    /// not taken, until it is dropped; a reset forgets the run and the root it
+    /// reported, and does not make that root a restart root.
     #[test]
     fn the_fast_confirmation_restart_root_is_held_until_dropped() {
         let store = Store::test_store();
@@ -9707,8 +9715,9 @@ mod tests {
         let (first, second) = (H256::repeat_byte(1), H256::repeat_byte(2));
 
         // The row an earlier process left, read on the first ask.
-        store.set_fast_confirmation(5, variables, first);
+        store.set_fast_confirmation(5, variables, 4, first);
         assert_eq!(store.fast_confirmed_root(), Some(first));
+        assert_eq!(store.fast_confirmed_block(), Some((4, first)));
         assert_eq!(store.fast_confirmation_slot(), Some(5));
         assert_eq!(store.fast_confirmation_restart_root(), Some(first));
         assert_eq!(store.fast_confirmation_restart_root(), Some(first), "held");
@@ -9719,12 +9728,16 @@ mod tests {
             "not read again"
         );
 
-        store.set_fast_confirmation(6, variables, second);
+        store.set_fast_confirmation(6, variables, 5, second);
         store.reset_fast_confirmation();
         assert_eq!(store.fast_confirmation(), None);
         assert_eq!(store.fast_confirmation_slot(), None);
         assert_eq!(store.fast_confirmed_root(), None);
-        assert_eq!(store.fast_confirmation_restart_root(), Some(second));
+        assert_eq!(
+            store.fast_confirmation_restart_root(),
+            None,
+            "a reset within a process restores nothing"
+        );
     }
 
     #[test]
