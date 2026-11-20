@@ -16,8 +16,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
-use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
-use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
+use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
 use libtest_mimic::Trial;
 
 use super::{Case, PRESET, collect};
@@ -58,8 +57,7 @@ fn apply_blocks(
 
     // One cache across the case's blocks, as the node holds one across its
     // imports, so consecutive blocks of an epoch share its shuffling.
-    let committees = CommitteeCache::default();
-    let active_balances = ActiveBalanceCache::default();
+    let caches = OwnedBlockCaches::default();
 
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
@@ -71,19 +69,11 @@ fn apply_blocks(
         }
 
         if warm {
-            super::warm_key_sums_around(&committees, state);
+            super::warm_key_sums_around(&caches.committees, state);
         }
 
-        stf::state_transition(
-            state,
-            &block,
-            true,
-            config,
-            &engine,
-            &committees,
-            &active_balances,
-        )
-        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(state, &block, true, config, &engine, caches.caches())
+            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }

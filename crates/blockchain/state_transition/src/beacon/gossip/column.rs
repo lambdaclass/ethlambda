@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 
 use ethlambda_storage::CacheKey;
+use ethlambda_types::ShortRoot;
+use tracing::debug;
 
 use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlockColumns, SeenColumns,
@@ -223,6 +225,9 @@ pub fn chain_checks_gloas(
 /// stored, say) pays for none of it, and is remembered under everything it
 /// read of the sidecar: the signed header's root *and* signature, so a forged
 /// signature over a block's header is judged on its own, or the block root.
+/// A failed read of a fulu parent's post-state is not an answer: it drops that
+/// sidecar (`Ignore(Internal)`) and is not remembered, so the next sidecar
+/// reads the state again.
 /// Everything else (the structure, the clock, finality, `AlreadyStored`, the
 /// inclusion proof, the slot match and shape against the bid's commitments)
 /// runs for every sidecar, in its place.
@@ -304,14 +309,40 @@ impl<'a> ChainPrechecks<'a> {
             )));
         }
         // Everything the signed header and the parent's post-state decide,
-        // once per signed header. Inserted only once `judge_header` returns,
-        // so a panic inside it leaves nothing behind for the next sidecar to
-        // read.
+        // once per signed header. Inserted only once `judge_header` returns an
+        // answer, so a panic inside it leaves nothing behind for the next
+        // sidecar to read, and neither does a failed read of the parent's
+        // post-state.
         let key = (header_root, signed_header.signature);
-        let shared = *self
-            .headers
-            .entry(key)
-            .or_insert_with(|| judge_header(store, signed_header));
+        let shared = match self.headers.get(&key) {
+            Some(shared) => *shared,
+            None => match judge_header(store, signed_header) {
+                Ok(shared) => {
+                    self.headers.insert(key, shared);
+                    shared
+                }
+                // A failed read or a corrupt row is not a parent still to
+                // come, so parking would wait for an import that need never
+                // happen. Dropped instead, as a panic in this read used to
+                // drop it. Not remembered: the store hands a failed read only
+                // to the caller that ran it, so the group's next sidecar reads
+                // again, as a later miss would. The store has already logged
+                // the failure at `error`, once per read however many callers
+                // shared it, so this only notes which column it cost.
+                Err(err) => {
+                    let slot = header.slot;
+                    let column = sidecar.index;
+                    debug!(
+                        slot,
+                        column,
+                        parent_root = %ShortRoot(&header.parent_root.0),
+                        %err,
+                        "Could not read a data column's parent state; dropping the column"
+                    );
+                    return Err(ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal)));
+                }
+            },
+        };
         shared?;
         // [REJECT] The commitments are the ones the block committed to. Per
         // sidecar: the commitments and the branch proving them are the
@@ -386,27 +417,33 @@ impl<'a> ChainPrechecks<'a> {
 /// in [`chain_checks`]'s order: what [`ChainPrechecks`] runs once per signed
 /// header.
 ///
-/// `Err(AwaitParent)` when the parent has no post-state and the head state
-/// does not show the signature forged; any other `Err` drops the sidecar.
+/// `Ok` carries the header's answer: `Err(AwaitParent)` when the parent has no
+/// post-state and the head state does not show the signature forged, any other
+/// `Err` dropping the sidecar. The outer `Err` is a failed read of the
+/// parent's post-state (`Store::get_state`: a backend error or a corrupt row),
+/// which is no answer about the header, so [`ChainPrechecks`] does not
+/// remember it.
 fn judge_header(
     store: &Store,
     signed_header: &SignedBeaconBlockHeader,
-) -> Result<(), ChainVerdict> {
+) -> Result<Result<(), ChainVerdict>, ethlambda_storage::Error> {
     let header = &signed_header.message;
-    let Ok(Some(parent_state)) = store.get_state(&header.parent_root) else {
+    let Some(parent_state) = store.get_state(&header.parent_root)? else {
         // Parked rather than dropped: the specification's "MAY be queued"
         // for a sidecar whose parent has not been seen. The head-state
         // signature check keeps a forged header from taking a
         // `PendingDataColumns` row while it waits.
-        return Err(
+        return Ok(Err(
             match queue_unless_forged(store, signed_header, QueueReason::ParentUnknown) {
                 Outcome::Queue(_) => ChainVerdict::AwaitParent,
                 outcome => ChainVerdict::Drop(outcome),
             },
-        );
+        ));
     };
-    judge_header_against_parent(store, signed_header, &parent_state, PastLookahead::Advance)
-        .map_err(ChainVerdict::Drop)
+    Ok(
+        judge_header_against_parent(store, signed_header, &parent_state, PastLookahead::Advance)
+            .map_err(ChainVerdict::Drop),
+    )
 }
 
 /// What the KZG proofs of a sidecar that passed [`ChainPrechecks`] are
@@ -893,13 +930,19 @@ fn header_signature_is_valid(
 mod tests {
     use std::sync::Arc;
 
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_storage::{StorageBackend, Table};
+    use ethlambda_types::checkpoint::Checkpoint;
+
     use super::*;
     use crate::beacon::constants::{
         DATA_COLUMN_SIDECAR_SUBNET_COUNT, MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
     use crate::beacon::containers::{SignedBeaconBlock, electra, fulu, shared};
     use crate::beacon::fork::ForkName;
-    use crate::beacon::gossip::test_support::{fulu_parent, seen_columns, slot_start_ms, store};
+    use crate::beacon::gossip::test_support::{
+        GENESIS_TIME, fulu_parent, seen_columns, slot_start_ms, store,
+    };
     use crate::beacon::gossip::{IgnoreReason, Outcome, QueueReason, RejectReason};
     use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
     use crate::beacon::helpers::test_state::secret_key_for;
@@ -1364,6 +1407,43 @@ mod tests {
         assert_eq!(
             chain_checks(&store, &sidecar(5, 1, 0), slot_start_ms(&store, 5)),
             ChainVerdict::AwaitParent
+        );
+    }
+
+    /// A parent whose state is stored but does not read back is not waiting
+    /// on an import, so the sidecar is dropped rather than parked, and the
+    /// failed read is an error rather than a panic.
+    #[test]
+    fn chain_checks_drop_a_sidecar_whose_parent_state_does_not_read_back() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::init_beacon(
+            backend.clone(),
+            GENESIS_TIME,
+            Config::mainnet().with_fork_epoch(ForkName::Fulu, 0),
+            Root::ZERO,
+            Checkpoint {
+                root: Root::ZERO,
+                slot: 0,
+            },
+            0,
+        );
+        let parent_slot = 4;
+        let card = sidecar(parent_slot + 1, 1, 0);
+        let parent_root = card.signed_block_header.message.parent_root;
+        store
+            .insert_pending_block(parent_root, parent_block(parent_slot))
+            .expect("insert pending parent");
+        // `States` is keyed by the block's slot (big-endian), then its root.
+        // A fork selector with no state after it decodes as no fork's state.
+        let key = [parent_slot.to_be_bytes().as_slice(), parent_root.as_slice()].concat();
+        let corrupt = vec![(key, vec![ForkName::Fulu.selector()])];
+        let mut batch = backend.begin_write().expect("write batch");
+        batch.put_batch(Table::States, corrupt).expect("put state");
+        batch.commit().expect("commit");
+
+        assert_eq!(
+            chain_checks(&store, &card, slot_start_ms(&store, parent_slot + 1)),
+            ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Internal))
         );
     }
 

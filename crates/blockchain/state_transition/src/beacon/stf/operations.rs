@@ -122,10 +122,22 @@ pub fn process_operations(
     )?;
 
     for proposer_slashing in proposer_slashings {
-        process_proposer_slashing(state, proposer_slashing, config, signatures)?;
+        process_proposer_slashing(
+            state,
+            proposer_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     for attester_slashing in attester_slashings {
-        process_attester_slashing(state, attester_slashing, config, signatures)?;
+        process_attester_slashing(
+            state,
+            attester_slashing,
+            config,
+            active_balances,
+            signatures,
+        )?;
     }
     // The proposer every attestation below pays (phase0: records), resolved
     // once for the list where the specification's `process_attestation` reads
@@ -266,11 +278,12 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let (proposer_index, _current_epoch) =
         verify_proposer_slashing(state, proposer_slashing, signatures)?;
-    slash_validator(state, proposer_index, None, config)?;
+    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
 
@@ -308,6 +321,7 @@ pub(crate) fn slash_attesting_index_intersection(
     attesting_indices_1: &[ValidatorIndex],
     attesting_indices_2: &[ValidatorIndex],
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let indices_2: HashSet<ValidatorIndex> = attesting_indices_2.iter().copied().collect();
@@ -318,7 +332,7 @@ pub(crate) fn slash_attesting_index_intersection(
             continue;
         }
         if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
+            slash_validator(state, index, None, config, Some(active_balances))?;
             slashed_any = true;
         }
     }
@@ -337,6 +351,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &phase0::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
@@ -362,6 +377,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -765,7 +781,16 @@ mod tests {
         };
 
         assert!(
-            checked(|s| { process_proposer_slashing(&mut state, &slashing, &config, s) }).is_err()
+            checked(|s| {
+                process_proposer_slashing(
+                    &mut state,
+                    &slashing,
+                    &config,
+                    &ActiveBalanceCache::default(),
+                    s,
+                )
+            })
+            .is_err()
         );
     }
 
@@ -852,7 +877,16 @@ mod tests {
         };
 
         assert!(
-            checked(|s| { process_attester_slashing(&mut state, &slashing, &config, s) }).is_err()
+            checked(|s| {
+                process_attester_slashing(
+                    &mut state,
+                    &slashing,
+                    &config,
+                    &ActiveBalanceCache::default(),
+                    s,
+                )
+            })
+            .is_err()
         );
     }
 }
