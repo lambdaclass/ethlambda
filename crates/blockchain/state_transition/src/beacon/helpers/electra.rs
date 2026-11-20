@@ -123,7 +123,7 @@
 //! single easiest mistake to make copying that shape without also copying
 //! the reasoning behind it.
 
-use crate::beacon::bls;
+use crate::beacon::bls::SignatureSet;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::Validator;
@@ -134,18 +134,15 @@ use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei,
-    HashTreeRoot as _, Slot, ValidatorIndex,
+    BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Epoch, Gwei, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
     ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
-    get_current_epoch, get_domain, get_seed, get_total_active_balance,
-    total_active_balance_or_compute,
+    get_current_epoch, get_seed, get_total_active_balance, total_active_balance_or_compute,
 };
 use super::math::bytes_to_uint64;
-use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
-use super::predicates::are_indices_sorted_and_unique;
+use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot};
 use super::shuffling::compute_shuffled_index;
 
 // ---------------------------------------------------------------------------
@@ -272,47 +269,34 @@ pub fn compute_proposer_index(
 /// Whether an indexed attestation names a valid attester set and carries
 /// their aggregate signature.
 ///
-/// Logic identical to [`crate::beacon::helpers::attestation::is_valid_indexed_attestation`];
-/// this exists as its own copy only because [`electra::IndexedAttestation`]
-/// is a different concrete type from phase0's `IndexedAttestation`, bounded
-/// by `MAX_VALIDATORS_PER_SLOT` rather than `MAX_VALIDATORS_PER_COMMITTEE`
-/// (EIP-7549: one electra attestation can span every committee in a slot).
+/// Logic identical to [`crate::beacon::helpers::attestation::is_valid_indexed_attestation`]:
+/// both run [`super::attestation::attesters_signature_set`]. This one exists
+/// only because [`electra::IndexedAttestation`] is a different concrete type
+/// from phase0's `IndexedAttestation`, bounded by `MAX_VALIDATORS_PER_SLOT`
+/// rather than `MAX_VALIDATORS_PER_COMMITTEE` (EIP-7549: one electra
+/// attestation can span every committee in a slot).
 pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &electra::IndexedAttestation,
 ) -> bool {
-    let domain = get_domain(
-        state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
-    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+    indexed_attestation_signature_set(state, indexed_attestation).is_some_and(|set| set.verify())
 }
 
-/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
-///
-/// For gossip, which checks against a state that may not have reached the
-/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
-pub fn is_valid_indexed_attestation_with_domain(
+/// The signature check [`is_valid_indexed_attestation`] makes, resolved but
+/// not yet run, so a block can verify every attestation's signature in one
+/// batch. See [`super::attestation::attesters_signature_set`], which holds the
+/// checks every fork shares.
+pub fn indexed_attestation_signature_set(
     state: &BeaconState,
     indexed_attestation: &electra::IndexedAttestation,
-    domain: Domain,
-) -> bool {
-    let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
-    if indices.is_empty() || !are_indices_sorted_and_unique(indices) {
-        return false;
-    }
-
-    let mut pubkeys = Vec::with_capacity(indices.len());
-    for index in indices {
-        match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
-        }
-    }
-
-    let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
+) -> Option<SignatureSet> {
+    super::attestation::attesters_signature_set(
+        state,
+        &indexed_attestation.attesting_indices,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,19 +1023,22 @@ fn placeholder_pending_deposit(validator: &Validator, amount: Gwei) -> electra::
 /// participation and inactivity entries
 /// ([`Self::push_empty_participation_and_inactivity`]), and the
 /// three pending queues (`pending_deposits`, `pending_partial_withdrawals`,
-/// `pending_consolidations`), both as element-level slice views (`len()`,
-/// `iter()`/`get()` through the returned `&[T]`, one-at-a-time `push_*`) and
-/// as a whole (`take_*`/`set_*`, for epoch processing's own whole-queue
-/// drains).
+/// `pending_consolidations`): one-at-a-time `push_*`, the whole queue
+/// (`take_*`/`set_*`, for epoch processing's own whole-queue drains), and,
+/// for the last two, element-level slice views (`len()`, `iter()`/`get()`
+/// through the returned `&[T]`).
 ///
-/// Electra's, fulu's, and gloas's `pending_deposits` (and the other two
-/// queues) share one element type each but not one container: electra's and
-/// fulu's is the bounded `SszList` (`electra::PendingDeposits` and friends),
-/// gloas's is EIP-7688's unbounded [`libssz_types::ProgressiveList`]
-/// (`crate::beacon::containers::gloas::PendingDeposits` and friends). Both
-/// deref to `[T]` with the same element type, which is what lets the
-/// slice-view and element-`push_*` methods below serve all three forks
-/// through one match rather than needing a gloas copy of every caller.
+/// Electra's, fulu's, and gloas's queues share one element type each but not
+/// one container. `pending_deposits` is tree-backed: an
+/// `ethlambda_ssz_tree::List` on electra and fulu
+/// (`electra::PendingDeposits`), an `ethlambda_ssz_tree::ProgressiveList` on
+/// gloas (`crate::beacon::containers::gloas::PendingDeposits`). Neither has a
+/// slice, so it is reached only through `push_pending_deposit` and
+/// `take_pending_deposits`/`set_pending_deposits`. The other two are the
+/// bounded `SszList` on electra and fulu and EIP-7688's unbounded
+/// [`libssz_types::ProgressiveList`] on gloas, which both deref to `[T]`, so
+/// their slice views serve all three forks. Either way one match per method
+/// covers every fork, rather than a gloas copy of every caller.
 ///
 /// Epoch processing's whole-queue drains and the block-level request
 /// processors (`crate::beacon::stf::electra`'s `process_deposit_request`
@@ -1106,14 +1093,14 @@ impl<'a> PendingQueueFields<'a> {
 
     /// Queues one more [`electra::PendingDeposit`], pushed by
     /// [`queue_excess_active_balance`], [`queue_entire_balance_and_reset_validator`],
-    /// and the deposit-request processors. Infallible on gloas's unbounded
-    /// queue; electra's and fulu's bounded one can still reject a length over
-    /// its own SSZ limit.
+    /// and the deposit-request processors. Electra's and fulu's bounded queue
+    /// can reject a length over its own SSZ limit; gloas's progressive one
+    /// never does.
     pub(crate) fn push_pending_deposit(&mut self, deposit: electra::PendingDeposit) -> Result<()> {
         match self {
             PendingQueueFields::Electra(state) => state.pending_deposits.push(deposit)?,
             PendingQueueFields::Fulu(state) => state.pending_deposits.push(deposit)?,
-            PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit),
+            PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit)?,
         }
         Ok(())
     }
@@ -1129,19 +1116,19 @@ impl<'a> PendingQueueFields<'a> {
     pub(crate) fn take_pending_deposits(&mut self) -> Vec<electra::PendingDeposit> {
         match self {
             PendingQueueFields::Electra(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
             PendingQueueFields::Fulu(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
             PendingQueueFields::Gloas(state) => {
-                core::mem::take(&mut state.pending_deposits).into_inner()
+                core::mem::take(&mut state.pending_deposits).to_vec()
             }
         }
     }
 
     /// See [`Self::take_pending_deposits`]. Fallible only for electra's and
-    /// fulu's bounded `SszList`; gloas's progressive one never rejects a
+    /// fulu's bounded list; gloas's progressive one never rejects a
     /// length.
     pub(crate) fn set_pending_deposits(
         &mut self,
@@ -1266,9 +1253,9 @@ impl<'a> PendingQueueFields<'a> {
     /// and `inactivity_scores` by one all-zero entry each, keeping them
     /// exactly as long as the registry after a new validator is appended.
     ///
-    /// Gloas's own three lists are progressive (`libssz_types::ProgressiveList`),
-    /// so their `push` is infallible, unlike electra's and fulu's bounded
-    /// `SszList`.
+    /// Gloas's own lists are progressive, so their pushes cannot hit a length
+    /// limit; its inactivity scores are still a flat
+    /// `libssz_types::ProgressiveList`, whose `push` is infallible outright.
     pub(crate) fn push_empty_participation_and_inactivity(&mut self) -> Result<()> {
         match self {
             PendingQueueFields::Electra(state) => {
@@ -1282,8 +1269,8 @@ impl<'a> PendingQueueFields<'a> {
                 state.inactivity_scores.push(0)?;
             }
             PendingQueueFields::Gloas(state) => {
-                state.previous_epoch_participation.push(0);
-                state.current_epoch_participation.push(0);
+                state.previous_epoch_participation.push(0)?;
+                state.current_epoch_participation.push(0)?;
                 state.inactivity_scores.push(0);
             }
         }

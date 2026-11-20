@@ -67,8 +67,7 @@ use super::shared::{
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ColumnIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
-    Gwei, KzgCommitment, KzgProof, ParticipationFlags, Root, Slot, Uint256, ValidatorIndex,
-    WithdrawalIndex,
+    Gwei, KzgCommitment, KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,11 +122,14 @@ pub type BuilderDepositRequests = ProgressiveList<BuilderDepositRequest>;
 pub type BuilderExitRequests = ProgressiveList<BuilderExitRequest>;
 /// Per-validator participation flags for one epoch, positionally parallel to
 /// the registry.
-pub type EpochParticipation = ProgressiveList<ParticipationFlags>;
+pub type EpochParticipation = super::shared::ProgressiveEpochParticipation;
 /// Per-validator inactivity scores, positionally parallel to the registry.
 pub type InactivityScores = ProgressiveList<u64>;
 /// Deposits known but not yet credited to the validator registry.
-pub type PendingDeposits = ProgressiveList<PendingDeposit>;
+pub type PendingDeposits = ethlambda_ssz_tree::ProgressiveList<
+    PendingDeposit,
+    std::collections::BTreeMap<usize, PendingDeposit>,
+>;
 /// Partial withdrawals known but not yet paid out.
 pub type PendingPartialWithdrawals = ProgressiveList<PendingPartialWithdrawal>;
 /// Validator consolidations known but not yet applied.
