@@ -54,7 +54,7 @@ use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
     get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
     get_previous_epoch, get_randao_mix,
 };
@@ -77,7 +77,7 @@ use crate::beacon::primitives::{
     ValidatorIndex, WithdrawalIndex,
 };
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -102,15 +102,20 @@ pub fn process_block(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
 
     // [New in Gloas:EIP7732]
-    process_parent_execution_payload(state, block, config)?;
+    process_parent_execution_payload(
+        state,
+        block,
+        config,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     super::block::process_block_header(
         state,
         block.slot,
@@ -131,10 +136,15 @@ pub fn process_block(
         &block.body,
         parent_slot,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -904,6 +914,8 @@ pub fn apply_parent_execution_payload(
     state: &mut BeaconState,
     requests: &gloas::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let (parent_bid, parent_slot, parent_epoch) = {
         let inner = gloas_state_ref(state, "apply_parent_execution_payload")?;
@@ -943,10 +955,22 @@ pub fn apply_parent_execution_payload(
         crate::beacon::stf::fulu::process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        crate::beacon::stf::electra::process_withdrawal_request(state, withdrawal, config)?;
+        crate::beacon::stf::electra::process_withdrawal_request(
+            state,
+            withdrawal,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for consolidation in requests.consolidations.iter() {
-        crate::beacon::stf::electra::process_consolidation_request(state, consolidation, config)?;
+        crate::beacon::stf::electra::process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     for builder_deposit in requests.builder_deposits.iter() {
         process_builder_deposit_request(state, builder_deposit, config)?;
@@ -1010,6 +1034,8 @@ pub fn process_parent_execution_payload(
     state: &mut BeaconState,
     block: &gloas::BeaconBlock,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let bid = &block.body.signed_execution_payload_bid.message;
     let parent_bid = gloas_state_ref(state, "process_parent_execution_payload")?
@@ -1031,7 +1057,7 @@ pub fn process_parent_execution_payload(
         requests.hash_tree_root() == parent_bid.execution_requests_root,
         "process_parent_execution_payload: hash_tree_root(requests) == parent_bid.execution_requests_root",
     )?;
-    apply_parent_execution_payload(state, requests, config)
+    apply_parent_execution_payload(state, requests, config, active_balances, pubkey_indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1212,7 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let (proposer_index, current_epoch) =
         crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
@@ -1206,7 +1233,7 @@ pub fn process_proposer_slashing(
         clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
     }
 
-    slash_validator(state, proposer_index, None, config)?;
+    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
 
@@ -1249,6 +1276,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &gloas::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -1271,6 +1299,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -1622,17 +1651,22 @@ pub fn process_operations(
 
     // [Modified in Gloas:EIP7732]
     for proposer_slashing in body.proposer_slashings.iter() {
-        process_proposer_slashing(state, proposer_slashing, config)?;
+        process_proposer_slashing(state, proposer_slashing, config, active_balances)?;
     }
     for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
+        process_attester_slashing(state, attester_slashing, config, active_balances)?;
     }
     // [Modified in Gloas:EIP7732]
     for attestation in body.attestations.iter() {
         process_attestation(state, attestation, parent_slot, committees, active_balances)?;
     }
     for voluntary_exit in body.voluntary_exits.iter() {
-        crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
+        crate::beacon::stf::electra::process_voluntary_exit(
+            state,
+            voluntary_exit,
+            config,
+            active_balances,
+        )?;
     }
     for signed_change in body.bls_to_execution_changes.iter() {
         crate::beacon::stf::capella::process_bls_to_execution_change(state, signed_change, config)?;
