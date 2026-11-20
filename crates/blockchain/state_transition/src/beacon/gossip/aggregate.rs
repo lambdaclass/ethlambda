@@ -387,12 +387,16 @@ pub fn stateful_checks(
     let Ok(aggregator) = state.validator(aggregator_index) else {
         return Err(Outcome::Reject(RejectReason::UnknownValidator));
     };
+    let aggregator_pubkey = bls::IndexedPubkey {
+        index: aggregator_index,
+        pubkey: aggregator.pubkey,
+    };
     // [REJECT] The selection proof selects the validator as an aggregator.
     let selection_proof = aggregate.selection_proof();
     let selection_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
-    if !bls::verify(&aggregator.pubkey, selection_signing_root, &selection_proof) {
+    if !bls::verify(&aggregator_pubkey, selection_signing_root, &selection_proof) {
         return Err(Outcome::Reject(RejectReason::SelectionProof));
     }
     // [REJECT] The aggregator's own signature, over the whole envelope.
@@ -401,7 +405,7 @@ pub fn stateful_checks(
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
     if !bls::verify(
-        &aggregator.pubkey,
+        &aggregator_pubkey,
         aggregator_signing_root,
         &aggregate.signature(),
     ) {

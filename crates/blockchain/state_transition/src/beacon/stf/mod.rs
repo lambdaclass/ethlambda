@@ -346,7 +346,11 @@ fn proposer_signature_set(
     let proposer = state.validator(proposer_index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(block_root, domain);
-    bls::SignatureSet::single(&proposer.pubkey, signing_root, signature)
+    let proposer = bls::IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
+    bls::SignatureSet::single(&proposer, signing_root, signature)
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and
