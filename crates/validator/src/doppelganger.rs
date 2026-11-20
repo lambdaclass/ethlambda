@@ -65,6 +65,12 @@
 //!   some path that did not register it is registered at the next check).
 //! - A key with no validator index yet is not asked about, and stays withheld:
 //!   with no index it has no duties to withhold either.
+//! - A pending key (deposited, not yet active) is treated as one with no
+//!   index: it cannot act, so the node would answer "not live" for it every
+//!   epoch, and counting that would clear it before a doppelganger could ever
+//!   have shown itself. Once the node reports it active, its first checked
+//!   epoch moves up to the epoch that happened in, so the clean epoch it needs
+//!   is one it could have acted in.
 //! - Only an explicit `is_live: false` counts towards a clean epoch, and only
 //!   when both of the tick's questions were answered. A failed query, or a
 //!   node that is syncing (see [`BeaconNodeApi::liveness`]), makes no
@@ -94,7 +100,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::beacon_node::dto::encode_hex;
-use crate::beacon_node::{BeaconNodeApi, Liveness};
+use crate::beacon_node::{BeaconNodeApi, Liveness, ValidatorEntry};
 use crate::keys::ValidatorStore;
 use crate::slot_clock::SlotClock;
 
@@ -117,9 +123,13 @@ struct Watch {
     first_checked_epoch: Epoch,
     /// Clean epochs still owed. Zero is a key that may sign.
     remaining_epochs: u64,
-    /// The key's validator index, once the beacon node has one for it. An
-    /// index never changes once assigned, so it is asked for only once.
+    /// The key's validator index, once the beacon node has one for it and
+    /// the validator is no longer pending. An index never changes once
+    /// assigned, so it is asked for only until it is recorded.
     index: Option<ValidatorIndex>,
+    /// Whether the node has reported the key pending: its index is then
+    /// recorded only once it is active, from the epoch that happens in.
+    seen_pending: bool,
 }
 
 impl Watch {
@@ -131,6 +141,7 @@ impl Watch {
             // new chain.
             remaining_epochs: if epoch == 0 { 0 } else { DETECTION_EPOCHS },
             index: None,
+            seen_pending: false,
         }
     }
 
@@ -290,16 +301,31 @@ impl Doppelganger {
             .collect()
     }
 
-    /// Record the indices the beacon node resolved, for keys that asked for
-    /// one; an answer about any other key is ignored.
-    fn set_indices(&self, resolved: impl IntoIterator<Item = (BlsPubkey, ValidatorIndex)>) {
+    /// Record the indices the beacon node resolved in `epoch`, for keys that
+    /// asked for one; an answer about any other key is ignored.
+    ///
+    /// A pending validator's index is not recorded (see the module doc).
+    /// One reported pending before and active now became active in `epoch`
+    /// at the earliest, since the lookup runs at most once an epoch, so its
+    /// check starts there: the epochs before it, which it could not have
+    /// acted in, never count as clean.
+    fn set_indices(&self, epoch: Epoch, resolved: impl IntoIterator<Item = ValidatorEntry>) {
         let mut watched = self.watched();
-        for (pubkey, index) in resolved {
-            if let Some(watch) = watched.get_mut(&pubkey)
-                && watch.index.is_none()
-            {
-                watch.index = Some(index);
+        for entry in resolved {
+            let Some(watch) = watched.get_mut(&entry.pubkey) else {
+                continue;
+            };
+            if watch.index.is_some() {
+                continue;
             }
+            if entry.status.starts_with("pending") {
+                watch.seen_pending = true;
+                continue;
+            }
+            if watch.seen_pending {
+                watch.first_checked_epoch = watch.first_checked_epoch.max(epoch);
+            }
+            watch.index = Some(entry.index);
         }
     }
 
@@ -468,7 +494,7 @@ impl Doppelganger {
                 // Marked only on an answer: a node that failed is asked again
                 // next slot, a key the node has no index for next epoch.
                 Ok(entries) => {
-                    self.set_indices(entries.into_iter().map(|entry| (entry.pubkey, entry.index)));
+                    self.set_indices(epoch, entries);
                     *self
                         .resolved_in
                         .lock()
@@ -652,7 +678,6 @@ pub async fn run<B: BeaconNodeApi>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon_node::ValidatorEntry;
     use crate::beacon_node::mock::MockBeaconNode;
 
     const E: Epoch = 10;
@@ -675,11 +700,19 @@ mod tests {
             .collect()
     }
 
+    fn entry(byte: u8, index: ValidatorIndex, status: &str) -> ValidatorEntry {
+        ValidatorEntry {
+            index,
+            pubkey: pubkey(byte),
+            status: status.to_string(),
+        }
+    }
+
     /// One key, registered in `E` with index 7.
     fn watching_one() -> (Doppelganger, HashMap<ValidatorIndex, BlsPubkey>) {
         let doppelganger = Doppelganger::new();
         doppelganger.register(pubkey(1), E);
-        doppelganger.set_indices([(pubkey(1), 7)]);
+        doppelganger.set_indices(E, [entry(1, 7, "active_ongoing")]);
         let asked = doppelganger.checked_indices();
         (doppelganger, asked)
     }
@@ -1068,6 +1101,34 @@ mod tests {
         assert!(!doppelganger.allows_signing(&pubkey(1)));
         node.stop_failing("liveness");
         doppelganger.check(&node, &store, last_slot(E + 3)).await;
+        assert!(doppelganger.allows_signing(&pubkey(1)));
+    }
+
+    /// A pending key is not cleared by the epochs it could not act in: its
+    /// check starts in the epoch the node first reports it active.
+    #[tokio::test]
+    async fn a_pending_key_is_checked_from_its_activation() {
+        let mut node = node_with(&[]);
+        node.validators = vec![entry(1, 7, "pending_queued")];
+        let store = store_holding(&[1]);
+        let doppelganger = Doppelganger::new();
+        doppelganger.register(pubkey(1), E);
+
+        // Pending through E + 2, when an active key would have cleared.
+        for slot in first_slot(E)..=last_slot(E + 2) {
+            doppelganger.check(&node, &store, slot).await;
+        }
+        assert!(node.liveness_requests().is_empty(), "nothing to ask");
+        assert!(!doppelganger.allows_signing(&pubkey(1)));
+
+        // Active from E + 3: E + 3 is the first epoch that can count, so the
+        // key clears at the end of E + 4 and not before.
+        node.validators = vec![entry(1, 7, "active_ongoing")];
+        for slot in first_slot(E + 3)..last_slot(E + 4) {
+            doppelganger.check(&node, &store, slot).await;
+            assert!(!doppelganger.allows_signing(&pubkey(1)), "slot {slot}");
+        }
+        doppelganger.check(&node, &store, last_slot(E + 4)).await;
         assert!(doppelganger.allows_signing(&pubkey(1)));
     }
 

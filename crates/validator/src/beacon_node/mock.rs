@@ -230,6 +230,8 @@ pub struct MockBeaconNode {
     /// Every `liveness` request that got past the configured failures and the
     /// syncing check, as (epoch, indices), in call order.
     pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
+    /// How long `liveness` takes before it answers, as a hung node would.
+    pub liveness_delay: Option<std::time::Duration>,
 }
 
 impl MockBeaconNode {
@@ -451,6 +453,12 @@ impl MockBeaconNode {
     /// Make `produce_block` wait for a permit from `gate` before it answers.
     pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.produce_gate = Some(gate);
+        self
+    }
+
+    /// Make `liveness` take `delay` before it answers.
+    pub fn with_liveness_delay(mut self, delay: std::time::Duration) -> Self {
+        self.liveness_delay = Some(delay);
         self
     }
 
@@ -1393,6 +1401,9 @@ impl BeaconNodeApi for MockBeaconNode {
         // a node, so no node can fail it.
         if indices.is_empty() {
             return Ok(vec![Vec::new(); epochs.len()]);
+        }
+        if let Some(delay) = self.liveness_delay {
+            tokio::time::sleep(delay).await;
         }
         self.guard("liveness")?;
         if self.syncing || self.optimistic {
