@@ -843,16 +843,25 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   in the aggregation committee), casts PTC votes and proposes, each signature
   at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
   `2^31` leaves, each committing to its slot's secret) takes about 100 s of
-  every core per key, so a background thread hashes it after startup and
-  stores its upper nodes in `<validators-dir>/pq_vrf_trees/`; a proposal
-  before its key's tree is ready is missed. The beacon node builds PQ blocks through `POST
+  every core per key, so a background thread hashes it after startup (in a
+  rayon pool of its own: on the global one it starves every leanXMSS
+  signature until done) and stores its upper nodes in
+  `<validators-dir>/pq_vrf_trees/`; a proposal before its key's tree is
+  ready is missed. `--vrf-state-url` loads precomputed tree states instead
+  (ethereum-package's `vrf_state_url` format, which `ethlambda pq-keys`
+  writes along with the genesis key file), and every leaf signed is recorded
+  durably in `<validators-dir>/pq_signed_leaves.bin` before its signature
+  exists. An ethlambda-only devnet at `b5d422b2` (`tooling/pq-devnet/`,
+  "ethlambda alone") proposes with blobs, finalizes and survives a validator
+  client restart. The beacon node builds PQ blocks through `POST
   /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
   `pq_block_production.rs`), packing attestations from the validated
   aggregates in `Store::pq_aggregate_pool` with their proofs merged on the
   sidecar under a deadline (one unmerged attestation when it misses), and
   proves its aggregators' committees ahead (`rpc/src/beacon/pq_aggregation.rs`,
-  `Store::pq_signature_pool`). EIP-8483 is not followed yet, and PQ blocks
-  carry no blobs. The
+  `Store::pq_signature_pool`). Blobs travel as in gloas: the node keeps the
+  blobs of the payload it built and the envelope endpoint publishes their
+  data columns. EIP-8483 is not followed yet. The
   gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
   (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
   and the PQ registry holds each XMSS key in its 48-byte request form so the
