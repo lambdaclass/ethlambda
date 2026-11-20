@@ -24,6 +24,9 @@ pub(crate) struct Params {
     /// Milliseconds slept after each block's import, outside every measured
     /// span. 0 means blocks were fed back to back.
     pub block_delay_ms: u64,
+    /// Whether each epoch's committee key sums were warmed before its first
+    /// block, outside every measured span (`--warm-committee-sums`).
+    pub warm_committee_sums: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,7 +110,7 @@ impl Report {
         let _ = writeln!(out, "Block-import benchmark — {} workload", params.mode);
         let _ = writeln!(
             out,
-            "  corpus={} network={} anchor_slot={} warmup_blocks={} range=[{}, {}] blocks={} block_delay_ms={}",
+            "  corpus={} network={} anchor_slot={} warmup_blocks={} range=[{}, {}] blocks={} block_delay_ms={} warm_committee_sums={}",
             params.corpus,
             params.network,
             params.anchor_slot,
@@ -115,7 +118,8 @@ impl Report {
             params.range_start,
             params.range_end,
             params.blocks,
-            params.block_delay_ms
+            params.block_delay_ms,
+            params.warm_committee_sums
         );
         let _ = writeln!(
             out,
@@ -217,6 +221,7 @@ mod tests {
             range_end: 3,
             blocks: 2,
             block_delay_ms: 0,
+            warm_committee_sums: false,
         }
     }
 
@@ -229,6 +234,17 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
         assert_eq!(json["params"]["block_delay_ms"], 750);
         assert!(report.human_table().contains("block_delay_ms=750"));
+    }
+
+    #[test]
+    fn warm_committee_sums_is_recorded_in_the_json_and_the_header() {
+        let mut params = params();
+        params.warm_committee_sums = true;
+        let report = Report::new(Environment::collect(), params, Vec::new());
+
+        let json: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        assert_eq!(json["params"]["warm_committee_sums"], true);
+        assert!(report.human_table().contains("warm_committee_sums=true"));
     }
 
     #[test]

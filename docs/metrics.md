@@ -663,6 +663,7 @@ leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing block transitions, by whether a precomputed boundary state was cached | On each state transition of a block whose parent is before the block's epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the `engine_newPayload` round trip and then discarded for an `INVALIDATED` verdict, or re-checked in a debug build), and once for a block held after its speculation ran | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_committee_key_sums_warm_seconds` | Histogram | Worker time to sum one epoch's committee keys, off the import path: the sums alone, not the committees they are built from | When a warm-up that built sums finishes; a warm-up that finds them resident records nothing | | 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
 **Read the hit ratio against epochs.** On a synced follower nearly every
@@ -675,21 +676,25 @@ A `timer` start with no matching `head` start means the last slot was skipped.
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
 gossip validation) resolves its signers' compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See `PubkeyCache` in `crates/common/crypto/src/bls.rs`. This is
 ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs `sum(lean_beacon_pubkey_cache_entries)` now | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. `entries` is also the cache's memory
-footprint, roughly a decompressed point plus its compressed key per entry.
+cached and pay the full check every time. `entries{structure="map"}` is the
+map's memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table's is `index_chunks` times a chunk's size, since a chunk is
+allocated whole and a registry's exited validators leave slots in it empty.
 
 ### Data Column Sidecars (Fulu DAS)
 

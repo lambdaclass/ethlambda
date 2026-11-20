@@ -432,6 +432,7 @@ impl BlockChain {
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status,
             sync_status_controller,
             events,
@@ -565,6 +566,11 @@ pub struct BlockChainServer {
     /// The epoch precompute worker running right now, if any (beacon only). At
     /// most one runs at a time; see [`epoch_precompute`].
     epoch_precompute_in_flight: Option<epoch_precompute::PrecomputeKey>,
+
+    /// Whether a warm-only key-sum task is running: one started because the
+    /// epoch's state was already cached, so no precompute worker ran to warm
+    /// the sums. At most one runs at a time; see [`epoch_precompute`].
+    key_sums_warming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
     /// validator duties while syncing, unless that gating was disabled at
@@ -2188,6 +2194,7 @@ impl BlockChainServer {
             safe_slots_to_import_optimistically,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             events: ChainEvents::new(EventBus::default(), &store),
@@ -4694,6 +4701,7 @@ mod tests {
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             last_tick_instant: None,
             epoch_precompute_in_flight: None,
+            key_sums_warming: Default::default(),
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
             duties: ChainDuties::Beacon,
