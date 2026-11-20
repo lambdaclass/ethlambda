@@ -70,11 +70,15 @@ pub(crate) fn encode_attnets(subnets: &HashSet<u64>, committee_count: u64) -> Ve
 /// forever. A subnet we have no committee for cannot be useful to us regardless.
 pub(crate) fn subnets_from_attnets(bits: &[u8], committee_count: u64) -> Vec<u64> {
     (0..committee_count)
-        .filter(|subnet| {
-            bits.get((subnet / 8) as usize)
-                .is_some_and(|byte| byte & (1 << (subnet % 8)) != 0)
-        })
+        .filter(|subnet| attnets_has(bits, *subnet))
         .collect()
+}
+
+/// Whether the `attnets` bitfield `bits` sets `subnet`'s bit. A bitfield too
+/// short to reach it reads as unsubscribed, as in [`subnets_from_attnets`].
+pub(crate) fn attnets_has(bits: &[u8], subnet: u64) -> bool {
+    bits.get((subnet / 8) as usize)
+        .is_some_and(|byte| byte & (1 << (subnet % 8)) != 0)
 }
 
 /// The discv5 node id `node_key` derives, independent of any address or port.

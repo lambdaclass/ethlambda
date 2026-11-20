@@ -42,9 +42,11 @@ The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the
 published ENR inherits that same `0.0.0.0`, which is not a dialable address:
 set the flag to `127.0.0.1` for a local devnet or to the host's public address
-so the ENR is usable as soon as it is published. discv5's PONG-based IP voting
-may still replace the advertised address later, once a peer's response tells
-the node what its external address looks like.
+so the ENR is usable as soon as it is published. Left unset, discv5's PONG-based
+IP voting replaces the advertised address once peers' responses agree on what
+the node's external address looks like. Set, the flag wins and voting cannot
+overwrite it: naming an address is the operator saying they know better than the
+vote.
 
 ## The ENR
 
@@ -79,10 +81,23 @@ a `0` either way, matching every reader's rule that `0` means absent.
 The local ENR is logged once at startup.
 
 This same record is handed to ethrex's `DiscoveryServer`, so it is what answers
-discv5 queries: what we report and what peers see are the same bytes. If IP
-voting later changes our external address, ethrex edits and re-signs that record
-rather than rebuilding one, so the consensus entries survive the bump; only the
-sequence number and `ip` move, which the reported ENR then lags.
+discv5 queries. If IP voting later changes our external address, ethrex edits and
+re-signs that record rather than rebuilding one, so the consensus entries survive
+the bump; only the sequence number and `ip` move.
+
+`/eth/v1/node/identity` reports the record discovery serves *now*, not the one
+logged at startup. ethrex writes every record it re-signs into a shared mirror
+(`SharedLocalNode`) it was started with, and the endpoint reads through that
+(`discovery::LocalEnr`), so what the Beacon API reports and what peers get over
+discv5 are the same bytes even after IP voting.
+
+The other direction is not possible yet: nothing on this side can change the
+record discovery serves. ethrex's discovery protocol has no message that edits
+the local record. Its only consumer-driven edit is the EIP-2124 `eth` entry
+(an execution-chain fork id), not the `eth2` entry a fork-digest boundary moves,
+and writing into the mirror does nothing, since discovery serves its own copy and
+overwrites the mirror on its next edit. See the next section for what that costs
+at a boundary.
 
 ## Which peers get dialed
 
@@ -96,8 +111,9 @@ The digest compared against is the caller's, not a constant: lean passes its
 hardcoded dummy and `beacon` passes the digest it derived at startup and moves
 it at each fork-digest boundary, so one admission policy serves both chains. The
 record this node serves is not refreshed at a boundary (ethrex's
-`DiscoveryServer` cannot replace it at runtime), so its `eth2` entry keeps the
-startup digest until a restart; see [beacon_wire.md](./beacon_wire.md#the-fork-digest).
+`DiscoveryServer` offers no way to edit it at runtime; see [The ENR](#the-enr)),
+so its `eth2` entry keeps the startup digest until a restart; see
+[beacon_wire.md](./beacon_wire.md#the-fork-digest).
 
 A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
@@ -108,11 +124,19 @@ libp2p races them within one attempt and a `quic` entry that does not answer
 falls back to TCP rather than ending the dial. Most mainnet beacon nodes are in
 exactly that state, which is why a QUIC-only dialer peered so poorly with them.
 
-These checks are handed to ethrex's peer table as a `PeerFilter`, so each record
-is judged the moment it arrives and a peer that fails is not offered for dialing.
-No rejection is final: the peer table runs the filter again as soon as the peer
-publishes a higher-`seq` ENR, so a node that adds a transport entry, or gains an
-address through discv5's IP voting, is reconsidered without a restart.
+These checks are handed to ethrex's discovery server as a `PeerFilter`, so each
+record is judged the moment it arrives and a peer that fails is not offered for
+dialing. No rejection is final: discovery runs the filter again as soon as the
+peer publishes a higher-`seq` ENR, so a node that adds a transport entry, or
+gains an address through discv5's IP voting, is reconsidered without a restart.
+
+Judging is also the only moment ethlambda holds a peer's ENR, so the filter files
+what it admits as it goes. Discovery hands back an `enode`-shaped `Node`, which
+knows an address and a public key and nothing about `quic`, `tcp` or `attnets`;
+the dial loop looks the node id back up in what the filter filed to recover the
+multiaddrs and the subnets. A node discovery offers that we never read an admissible record
+for is skipped, which is what happens to a bootnode still known only as a bare
+endpoint.
 
 A peer's dial list carries every address it advertises, `quic` and `tcp` both,
 in one dial attempt, `quic` first. libp2p walks that list `dial_concurrency_factor`
@@ -133,9 +157,10 @@ Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
-Dialing stops once `--discovery.target-peers` peers are connected, and resumes
-if that count drops. Nothing in ethrex's peer table or discv5's own pacing
-enforces it (see [below](#discv5-lookups-run-at-the-startup-rate)).
+Dialing stops once `--discovery.target-peers` peers are connected, and resumes if
+that count drops. The same number also paces discovery itself: every connection
+the swarm opens or closes is reported to it, so it knows how close to the target
+we are and eases its lookups off the startup rate accordingly.
 
 On `beacon` the flag is more than the dial loop's cutoff: the swarm's connection
 limits are derived from it too, so what this node refuses and what it goes
@@ -167,6 +192,42 @@ dial waits that same ceiling regardless of the curve, which is what keeps a
 network with fewer peers to offer than `--discovery.target-peers` — every lean
 devnet, against a default target of 200 — from holding the loop at its floor for
 the life of the process, re-drawing candidates it is already connected to.
+
+## Hunting for subnet peers
+
+Ranking only reorders what the crawl happened to find, and about one mainnet
+record in 32 advertises a given subnet. So the subnets this node subscribes to,
+the ones its own `attnets` advertises, are also searched for directly, with
+ethrex's predicate queries (Lighthouse does the same with sigp/discv5's
+`find_node_predicate`):
+
+```text
+ dial tick ── subscribed subnets with < 3 connected peers ──► hunt task
+     ▲                                                          │ 1. records discovery already holds
+     │                                                          │ 2. a discv5 walk for the rest
+     └───────────── admitted peers, ranked with the rest ◄──────┘
+```
+
+- **What is short.** A subscribed subnet with fewer than `TARGET_SUBNET_PEERS`
+  (3, Lighthouse's number) connected peers advertising it. Counted from the
+  `attnets` of peers dialed from discovery, so an inbound peer covers nothing
+  here, as in ranking.
+- **What matches.** A record that passes admission and sets at least one short
+  subnet's `attnets` bit. A match counts only once its node has answered the
+  walk, so dead records stay out.
+- **How it runs.** One hunt at a time, off the P2P actor: first the matches
+  discovery already holds, then a walk of up to 10 s for the rest, at most 6
+  peers per hunt, then a 30 s pause. Nothing is hunted while the dial loop has
+  no budget to dial a find. A peer a hunt handed over is left out of hunts for
+  10 minutes, since discovery keeps offering a mainnet peer that connected and
+  said goodbye.
+- **Where finds go.** Into the same candidate queue as everything else, ranked
+  after custody gaps and ahead of other subnets, and dialed under the same
+  budget. `lean_discovery_subnet_hunt_peers_total` counts them.
+
+The hunt covers the subnets this node subscribes to, not the ones a validator
+client's duties point at (`beacon_committee_subscriptions`): those are not yet
+fed to discovery.
 
 ## Bootnodes
 
@@ -251,21 +312,12 @@ mainnet's fork schedule and `genesis_validators_root`, so its `eth2` check
 separates mainnet from every other beacon network; see
 [`beacon_wire.md`](./beacon_wire.md).
 
-### discv5 lookups run at the startup rate
+### Only peers dialed from discovery contribute to subnet ranking and the hunt
 
-ethrex paces its discv5 iterative lookups by how full its own peer table is,
-easing from one lookup every 500ms at startup to one every 10s once the table
-reaches its target. That table only counts peers registered through
-`NewConnectedPeer`, which carries an RLPx connection; ethlambda connects over
-libp2p and registers nothing, so the count is permanently zero and the pacing
-never eases off the startup rate. A lean node therefore keeps looking up every
-500ms rather than settling at 10s, roughly 20x the intended steady-state
-`FindNode` traffic, for the life of the process.
-
-`--discovery.target-peers` deliberately does *not* feed that computation, since a
-target of `0` would make it divide by zero and re-fire the lookup timer with no
-delay at all. Closing the gap properly means ethrex learning about non-RLPx
-connections, which is an upstream change.
+An inbound peer never tells us its `attnets`, so a subnet it covers is not
+credited when the dial loop ranks candidates or when the subnet hunt counts what
+is short. Treating an unknown peer as covering nothing makes both more eager
+than they need to be, never wrong.
 
 ### `attnets` is not a fixed-width SSZ `Bitvector`
 
