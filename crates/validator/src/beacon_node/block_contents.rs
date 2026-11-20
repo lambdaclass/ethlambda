@@ -359,12 +359,12 @@ impl ProducedBlock {
                 "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
                     .to_string(),
             )),
-            // The consensus-specs feature forks after gloas: the PQ fork signs
-            // with leanXMSS, which this client has no keys for, and EIP-8483
-            // precedes it only to register them.
+            // The consensus-specs feature forks after gloas. A PQ proposal goes
+            // through `BeaconNodeApi::produce_pq_block`, never this decoder,
+            // and the client does not follow EIP-8483.
             ForkName::Eip8483 | ForkName::Pq => Err(Error::InconsistentResponse(format!(
-                "beacon node produced a block for fork {}, which this client does not support \
-                 (it signs with BLS only)",
+                "beacon node produced a {} block through the BLS production path; PQ blocks \
+                 come from produce_pq_block",
                 fork.as_str()
             ))),
             ForkName::Phase0
