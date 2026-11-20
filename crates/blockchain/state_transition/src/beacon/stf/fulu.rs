@@ -369,8 +369,8 @@ pub fn process_execution_requests(
 /// redefine `process_deposit_request` either, so it inherits this fork's
 /// version rather than electra's, and the only thing that kept a gloas state
 /// from calling this exact copy was the queue's own type
-/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
-/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// ([`crate::beacon::containers::gloas::PendingDeposits`], an
+/// `ethlambda_ssz_tree::ProgressiveList`, EIP-7688), which
 /// [`crate::beacon::helpers::electra::PendingQueueFields::push_pending_deposit`]
 /// already abstracts over.
 pub fn process_deposit_request(
