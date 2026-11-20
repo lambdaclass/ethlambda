@@ -71,6 +71,7 @@
 //! right, so writes, hash caching and rebasing all work per subtree exactly
 //! as they do for [`List`].
 
+mod batch;
 mod cursor;
 mod interface;
 mod iter;
