@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e399118f.js";
+            window.path_to_searchindex_js = "searchindex-63fcd5d2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -902,6 +902,7 @@ leanMetrics spec.</p>
 <tbody>
 <tr><td><code>lean_beacon_epoch_precompute_lookups_total</code></td><td>Counter</td><td>Epoch-crossing block transitions, by whether a precomputed boundary state was cached</td><td>On each state transition of a block whose parent is before the block’s epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the <code>engine_newPayload</code> round trip and then discarded for an <code>INVALIDATED</code> verdict, or re-checked in a debug build), and once for a block held after its speculation ran</td><td>result=hit,miss</td><td></td></tr>
 <tr><td><code>lean_beacon_epoch_precompute_seconds</code></td><td>Histogram</td><td>Worker time to advance, flush and hash one state</td><td>When a precompute worker finishes</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8</td></tr>
+<tr><td><code>lean_beacon_committee_key_sums_warm_seconds</code></td><td>Histogram</td><td>Worker time to sum one epoch’s committee keys, off the import path: the sums alone, not the committees they are built from</td><td>When a warm-up that built sums finishes; a warm-up that finds them resident records nothing</td><td></td><td>0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16</td></tr>
 <tr><td><code>lean_beacon_epoch_precompute_started_total</code></td><td>Counter</td><td>Workers started, by trigger</td><td>When a worker is spawned</td><td>trigger=head,timer</td><td></td></tr>
 </tbody>
 </table>
@@ -914,8 +915,9 @@ A <code>timer</code> start with no matching <code>head</code> start means the la
 <h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
 <p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
 gossip validation) resolves its signers’ compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-<code>PubkeyCache</code> in <code>crates/blockchain/state_transition/src/beacon/bls.rs</code>. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See <code>PubkeyCache</code> in <code>crates/common/crypto/src/bls.rs</code>. This is
 ethlambda-specific, not part of the leanMetrics spec.</p>
 <div class="table-wrapper">
 <table>
@@ -924,7 +926,8 @@ ethlambda-specific, not part of the leanMetrics spec.</p>
 </thead>
 <tbody>
 <tr><td><code>lean_beacon_pubkey_cache_lookups_total</code></td><td>Counter</td><td>Public keys resolved for a signature check, by whether the cache already held them</td><td>Once per signature check, counting every signer</td><td>result=hit,miss</td></tr>
-<tr><td><code>lean_beacon_pubkey_cache_entries</code></td><td>Gauge</td><td>Validated public keys the cache holds</td><td>On each key added; the cache never removes one</td><td></td></tr>
+<tr><td><code>lean_beacon_pubkey_cache_entries</code></td><td>Gauge</td><td>Validated public keys the cache holds, by structure: <code>table</code> for keys looked up by validator index, <code>map</code> for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs <code>sum(lean_beacon_pubkey_cache_entries)</code> now</td><td>On each key added; the cache never removes one</td><td>structure=map,table</td></tr>
+<tr><td><code>lean_beacon_pubkey_cache_index_chunks</code></td><td>Gauge</td><td>Chunks of the index table allocated. The table’s memory follows this rather than its entry count, since a chunk is allocated in full on its first key</td><td>On each chunk allocated; chunks are never freed</td><td></td></tr>
 </tbody>
 </table>
 </div>
@@ -932,8 +935,10 @@ ethlambda-specific, not part of the leanMetrics spec.</p>
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. <code>entries</code> is also the cache’s memory
-footprint, roughly a decompressed point plus its compressed key per entry.</p>
+cached and pay the full check every time. <code>entries{structure="map"}</code> is the
+map’s memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table’s is <code>index_chunks</code> times a chunk’s size, since a chunk is
+allocated whole and a registry’s exited validators leave slots in it empty.</p>
 <h3 id="data-column-sidecars-fulu-das"><a class="header" href="#data-column-sidecars-fulu-das">Data Column Sidecars (Fulu DAS)</a></h3>
 <p><code>ethlambda beacon</code> is a fulu data-availability-sampling custodian: it derives
 a slice of the column matrix from its own discv5 node id (see

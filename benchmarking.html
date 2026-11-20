@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e399118f.js";
+            window.path_to_searchindex_js = "searchindex-63fcd5d2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-dd44a827.js"></script>
@@ -409,6 +409,18 @@ recorded, so it appears in no per-block number and no summary row; the report
 has no end-to-end figure to adjust. The value is recorded as
 <code>params.block_delay_ms</code> in the JSON report and printed in the human header, so
 compare only reports made with the same delay.</p>
+<p><strong><code>--warm-committee-sums</code></strong> (default off) warms each epoch’s committee key
+sums before the epoch’s first block is imported. A live node does this on the
+epoch precompute worker between slots; a replay drives <code>import_block</code>
+directly with no tick loop, so that worker never runs and the sums stay cold,
+which hides the committee-sum saving. This flag reproduces only the worker’s
+committee-sum warm-up (not its state advance, which the import still does
+inside the measured span). It runs before a block whose epoch is later than the
+previous block’s, and for both the first block’s epoch and the one before it
+ahead of the first block. The warm-up runs outside every measured span, so it
+is in no phase and no <code>wall_seconds</code>. The flag is recorded as
+<code>params.warm_committee_sums</code> in the JSON report and printed in the human
+header; compare only reports made with the same setting.</p>
 <h3 id="what-is-measured"><a class="header" href="#what-is-measured">What is measured</a></h3>
 <p>The measured span is one <code>BlockChainServer::import_block</code> call per block, the
 same <code>on_block</code> entry a live node’s own cascade uses. That covers the state
