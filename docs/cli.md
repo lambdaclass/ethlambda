@@ -475,10 +475,18 @@ and it would buy nothing: the attestations this client submits are electra's
 cannot serve whatever it does with blocks. A block from any earlier fork is
 refused by name rather than failing to decode.
 
-Blocks are fetched and published as SSZ rather than JSON. Signing a block means
-computing its `hash_tree_root`, which only the typed container can give; a
-hand-written JSON mapping of an execution payload would be a large surface on
+Blocks are fetched as SSZ by preference and published as SSZ. Signing a block
+means computing its `hash_tree_root`, which only the typed container can give;
+a hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.
+`produceBlockV3` (electra and fulu) is still asked for
+`application/octet-stream;q=1.0,application/json;q=0.9`, and a JSON answer is
+decoded into the same containers through their serde support in
+`ethlambda-types`, the one an ethlambda beacon node writes that answer with.
+That is for ethereum-package's blobber, which sits between the client and its
+node, rewrites `Accept` to `application/json` on block production, and relays
+the node's answer unchanged. Gloas's `produceBlockV4`, which blobber does not
+intercept, stays SSZ-only.
 
 From gloas on a proposal is two messages. The client asks for the block with
 `include_payload=true` (`produceBlockV4`), publishes the block bare, then signs
