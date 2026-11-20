@@ -1,6 +1,6 @@
 # A PQ-at-genesis devnet: Lighthouse (pq-devnet-0) proposes and validates, the
-# ethlambda beacon node follows. The ethlambda image needs
-# tooling/pq-devnet/vrf-4595f0fc.patch. See README.md.
+# ethlambda beacon node follows. Not runnable at b5d422b2 until Lighthouse
+# moves to its VRF rule. See README.md.
 participants:
   - el_type: geth
     cl_type: lighthouse
