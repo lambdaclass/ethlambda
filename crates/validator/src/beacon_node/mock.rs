@@ -58,6 +58,13 @@ pub struct MockBeaconNode {
     /// When set, every method fails with this message, regardless of `failures`.
     pub fail_everything: Option<String>,
     pub genesis: Option<Genesis>,
+    /// What `spec` answers with. `None` is mainnet's. A test changes it to
+    /// have a node start reporting a new schedule after startup.
+    pub spec_config: Mutex<Option<Config>>,
+    /// How many times `genesis` and `spec` were called, for a test that
+    /// checks a node was (or was not) asked.
+    pub genesis_calls: std::sync::atomic::AtomicUsize,
+    pub spec_calls: std::sync::atomic::AtomicUsize,
     pub syncing: bool,
     /// Tracking a head its execution client has not validated. Separate from
     /// `syncing`, because the pair a real node can report and this client must
@@ -360,6 +367,28 @@ impl MockBeaconNode {
     /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_v2_call_count(&self) -> usize {
         *self.proposer_duties_v2_calls.lock().expect("lock")
+    }
+
+    /// Serve `config` as the spec, in place of mainnet's.
+    pub fn with_spec(self, config: Config) -> Self {
+        self.set_spec(config);
+        self
+    }
+
+    /// Change the spec this node serves, as an upgraded node does.
+    pub fn set_spec(&self, config: Config) {
+        *self.spec_config.lock().expect("lock") = Some(config);
+    }
+
+    /// Serve this validators root as the chain's, in place of the default.
+    pub fn with_genesis_root(mut self, root: Root) -> Self {
+        let mut genesis = self.genesis.unwrap_or(Genesis {
+            genesis_time: 0,
+            genesis_validators_root: Root::ZERO,
+        });
+        genesis.genesis_validators_root = root;
+        self.genesis = Some(genesis);
+        self
     }
 
     pub fn with_attestation_data(mut self, slot: Slot) -> Self {
@@ -796,6 +825,8 @@ impl MockBeaconNode {
 #[async_trait]
 impl BeaconNodeApi for MockBeaconNode {
     async fn genesis(&self) -> Result<Genesis> {
+        self.genesis_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.guard("genesis")?;
         self.genesis.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -805,8 +836,15 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn spec(&self) -> Result<Config> {
+        self.spec_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.guard("spec")?;
-        Ok(Config::mainnet())
+        Ok(self
+            .spec_config
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or_else(Config::mainnet))
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {

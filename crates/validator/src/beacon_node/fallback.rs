@@ -3,9 +3,23 @@
 //! First healthy wins, in the order given on the command line. Deliberately not
 //! health-scored: Lighthouse ranks its nodes by sync distance and tie-breaks on
 //! list order, which is better, and is a refinement this does not need yet.
+//!
+//! # Only nodes on this client's chain
+//!
+//! Every node carries a usable flag, and every call here skips a node whose
+//! flag is down: a node on another chain answers calls without complaint and
+//! gets signatures it will reject, or, worse, ones its own chain accepts and
+//! this client's slashing-protection record has not seen. The flags start up
+//! (see [`FallbackBeaconNode::new`]) and are set by
+//! [`FallbackBeaconNode::establish`] at startup and
+//! [`FallbackBeaconNode::check_nodes`] afterwards, which compare each node's
+//! genesis and spec with the chain the client runs on
+//! ([`crate::chain_check::first_chain_difference`]). The order of the nodes
+//! never changes, since a [`Producer`] is a position in it.
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
@@ -15,7 +29,7 @@ use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
@@ -26,6 +40,7 @@ use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
+use crate::chain_check::{ChainId, first_chain_difference};
 use crate::error::{Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
@@ -36,18 +51,253 @@ use crate::error::{Error, Result};
 /// to `Self`.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// What an error says when every node was skipped for being on another chain
+/// (or not yet known to be on this one), so no request was made at all.
+const NO_USABLE_NODE: &str = "no configured beacon node is on this client's chain";
+
+/// Which nodes a [`FallbackBeaconNode::check_nodes`] round asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckScope {
+    /// Every node: the round at an epoch's first slot, which also follows the
+    /// schedule.
+    All,
+    /// Only the nodes not usable now, to let them back in as soon as they are
+    /// compatible again.
+    OnlyUnusable,
+}
+
+/// What asking one node about its chain came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeAnswer {
+    /// On this client's chain, with the configuration it serves.
+    Compatible(Box<Config>),
+    /// On another chain: the first field that differs, or the preset error.
+    Incompatible(String),
+    /// Did not answer both requests, or answered something unusable. Says
+    /// nothing about its chain, so its flag is left as it is.
+    Unreachable(String),
+}
+
+/// One node's genesis and spec, as the chain it is on.
+async fn ask<B: BeaconNodeApi>(node: &B) -> Result<ChainId> {
+    let (genesis, spec) = futures_util::future::join(node.genesis(), node.spec()).await;
+    // The spec first: a node on another preset fails it with the error that
+    // says so, whatever its genesis did.
+    let config = spec?;
+    Ok(ChainId {
+        genesis: genesis?,
+        config,
+    })
+}
+
+/// A node's `asked` chain judged against `ours`.
+fn classify(ours: &ChainId, asked: Result<ChainId>, current_epoch: u64) -> NodeAnswer {
+    match asked {
+        Ok(theirs) => match first_chain_difference(ours, &theirs, current_epoch) {
+            None => NodeAnswer::Compatible(Box::new(theirs.config)),
+            Some(difference) => NodeAnswer::Incompatible(difference),
+        },
+        Err(err @ Error::Preset(_)) => NodeAnswer::Incompatible(err.to_string()),
+        Err(err) => NodeAnswer::Unreachable(err.to_string()),
+    }
+}
+
 /// A `BeaconNodeApi` backed by an ordered list of others, answering from the
 /// first one that succeeds.
 pub struct FallbackBeaconNode<B> {
     /// In the order given, which never changes: a [`Producer`] is a position
     /// in it, so a blinded block goes back to the node that produced it.
     nodes: Vec<B>,
+    /// Whether each node, by position, is on this client's chain. Every call
+    /// skips a node whose flag is down.
+    usable: Vec<AtomicBool>,
+    /// The epoch each node's last unusable-node warning was for, by position,
+    /// so a node that stays unusable warns once per epoch rather than once per
+    /// slot. `u64::MAX` is never.
+    warned_at: Vec<AtomicU64>,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
+    /// Every node starts usable, so a caller that never runs a check (the
+    /// one-shot `voluntary-exit` command, a test) behaves as before.
+    /// [`Self::establish`] is what takes a node out.
     pub fn new(nodes: Vec<B>) -> Self {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
-        Self { nodes }
+        let usable = nodes.iter().map(|_| AtomicBool::new(true)).collect();
+        let warned_at = nodes.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
+        Self {
+            nodes,
+            usable,
+            warned_at,
+        }
+    }
+
+    fn is_usable(&self, position: usize) -> bool {
+        self.usable[position].load(Ordering::Relaxed)
+    }
+
+    /// The nodes calls may go to, with their positions.
+    fn usable_nodes(&self) -> impl Iterator<Item = (usize, &B)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| self.is_usable(*position))
+    }
+
+    /// `last_error`, or the no-usable-node message when nothing was asked,
+    /// with a note of how many configured nodes were skipped for not being on
+    /// this client's chain, so an error from the one node left says that the
+    /// others were not tried and why.
+    fn failure_detail(&self, last_error: Option<Error>) -> String {
+        let skipped = self.nodes.len() - self.usable_nodes().count();
+        match last_error {
+            None => NO_USABLE_NODE.to_string(),
+            Some(err) if skipped == 0 => err.to_string(),
+            Some(err) => {
+                format!("{err} ({skipped} configured node(s) skipped: not on this client's chain)")
+            }
+        }
+    }
+
+    /// Whether a warning for `position` at `epoch` is due: the first one for
+    /// that epoch. Marks it said.
+    fn warning_due(&self, position: usize, epoch: u64) -> bool {
+        self.warned_at[position].swap(epoch, Ordering::Relaxed) != epoch
+    }
+
+    /// Set `position`'s flag from what its check found, and say so when that
+    /// changes it: at `info` for a node coming back, at `warn` for one going
+    /// out, then again at most once per epoch for as long as it stays out.
+    fn record(&self, position: usize, answer: &NodeAnswer, epoch: u64) {
+        let node = self.nodes[position].describe();
+        match answer {
+            NodeAnswer::Compatible(_) => {
+                if !self.usable[position].swap(true, Ordering::Relaxed) {
+                    info!(position, %node, "Beacon node is on this client's chain; using it");
+                }
+            }
+            NodeAnswer::Incompatible(difference) => {
+                let was_usable = self.usable[position].swap(false, Ordering::Relaxed);
+                let due = self.warning_due(position, epoch);
+                if was_usable || due {
+                    warn!(
+                        position,
+                        %node,
+                        %difference,
+                        "Beacon node is on a different chain than this client; not using it"
+                    );
+                }
+            }
+            NodeAnswer::Unreachable(err) => {
+                if self.is_usable(position) {
+                    debug!(position, %node, %err, "Beacon node chain check failed; keeping it");
+                } else if self.warning_due(position, epoch) {
+                    warn!(
+                        position,
+                        %node,
+                        %err,
+                        "Beacon node could not be checked against this client's chain; not using \
+                         it until it can"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The startup check: ask every node about its chain at once and pick the
+    /// chain the client runs on.
+    ///
+    /// The reference is the first node, in command-line order, that answers
+    /// both requests and passes the preset check. Every other node is judged
+    /// against it. A node that did not answer is marked unusable, not
+    /// assumed fine: it has never been checked, so it is not failed over to
+    /// until a later [`Self::check_nodes`] round verifies it. Fails when no
+    /// node answers, naming what each said.
+    ///
+    /// `with_reference` runs once the reference is chosen, and gives the epoch
+    /// the wall clock is in on that chain, which decides which forks are still
+    /// free to differ. It is where the caller adopts the reference's preset:
+    /// nothing before it reads a preset value, and nothing after it may run
+    /// ahead of it. An error from it fails the startup.
+    pub async fn establish(
+        &self,
+        with_reference: impl FnOnce(&ChainId) -> Result<u64>,
+    ) -> Result<ChainId> {
+        let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
+        let Some(reference_at) = asked.iter().position(|answer| answer.is_ok()) else {
+            let detail = asked
+                .iter()
+                .enumerate()
+                .filter_map(|(position, answer)| {
+                    answer
+                        .as_ref()
+                        .err()
+                        .map(|err| format!("node {position}: {err}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            warn!(%detail, "No configured beacon node could be used as the chain reference");
+            return Err(Error::AllBeaconNodesFailed(detail));
+        };
+        let reference = asked[reference_at]
+            .as_ref()
+            .ok()
+            .cloned()
+            .expect("the reference answered");
+        let epoch = with_reference(&reference)?;
+        info!(
+            position = reference_at,
+            node = %self.nodes[reference_at].describe(),
+            "Using this beacon node's chain as the reference; the others are checked against it"
+        );
+
+        for (position, answer) in asked.into_iter().enumerate() {
+            let answer = if position == reference_at {
+                NodeAnswer::Compatible(Box::new(reference.config.clone()))
+            } else {
+                classify(&reference, answer, epoch)
+            };
+            if matches!(answer, NodeAnswer::Unreachable(_)) {
+                self.usable[position].store(false, Ordering::Relaxed);
+            }
+            self.record(position, &answer, epoch);
+        }
+        Ok(reference)
+    }
+
+    /// Ask the nodes `scope` selects about their chain, all at once and
+    /// directly (not through the failover helpers, which would skip exactly
+    /// the nodes being asked), and set each one's flag from the answer.
+    ///
+    /// A node whose chain matches `ours` is usable; one that differs, or is on
+    /// another preset, is not. A node that did not answer keeps its flag: an
+    /// outage says nothing about the chain. A node going out is warned about
+    /// with the first field that differs, then again at most once per epoch.
+    ///
+    /// Returns one answer per node asked, with its position, so the caller
+    /// can follow the schedule the compatible ones serve.
+    pub async fn check_nodes(
+        &self,
+        ours: &ChainId,
+        current_epoch: u64,
+        scope: CheckScope,
+    ) -> Vec<(usize, NodeAnswer)> {
+        let selected: Vec<(usize, &B)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| scope == CheckScope::All || !self.is_usable(*position))
+            .collect();
+        let asked =
+            futures_util::future::join_all(selected.iter().map(|(_, node)| ask(*node))).await;
+
+        let mut answers = Vec::with_capacity(selected.len());
+        for ((position, _), asked) in selected.iter().zip(asked) {
+            let answer = classify(ours, asked, current_epoch);
+            self.record(*position, &answer, current_epoch);
+            answers.push((*position, answer));
+        }
+        answers
     }
 
     /// The nodes, in order, for a test outside this module that drives a
@@ -118,7 +368,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
         let mut last = None;
-        for (position, node) in self.nodes.iter().enumerate() {
+        for (position, node) in self.usable_nodes() {
             match call(node).await {
                 Ok(value) => return Ok((position, value)),
                 Err(err) => {
@@ -131,9 +381,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 }
             }
         }
-        let detail = last
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "no nodes configured".to_string());
+        let detail = self.failure_detail(last);
         if warn_when_all_fail {
             warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
         }
@@ -221,10 +469,15 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
-        let answers = futures_util::future::join_all(self.nodes.iter().map(&call)).await;
+        // Only the nodes on this client's chain: "every node" below is every
+        // one of those.
+        let selected: Vec<(usize, &'p B)> = self.usable_nodes().collect();
+        let answers =
+            futures_util::future::join_all(selected.iter().map(|(_, node)| call(node))).await;
         let mut accepted = 0;
         let mut last = None;
-        for (position, answer) in answers.into_iter().enumerate() {
+        for ((position, _), answer) in selected.iter().zip(answers) {
+            let position = *position;
             match answer {
                 Ok(_) => accepted += 1,
                 Err(err) => {
@@ -240,15 +493,13 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         // Nested, so no node at all is never "every node": the constructor
         // refuses an empty list, but this does not lean on it.
         if accepted > 0 {
-            return if accepted == self.nodes.len() {
+            return if accepted == selected.len() {
                 Ok(Delivery::Everywhere)
             } else {
                 Ok(Delivery::Partly)
             };
         }
-        let detail = last
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "no nodes configured".to_string());
+        let detail = self.failure_detail(last);
         if let Some(all_failed) = all_failed {
             warn!(%what, %detail, all_failed, "No configured beacon node accepted");
         }
@@ -288,7 +539,7 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
         let mut last = None;
         let mut any_answered = false;
-        for (position, node) in self.nodes.iter().enumerate() {
+        for (position, node) in self.usable_nodes() {
             match node.is_optimistic_or_syncing().await {
                 Ok(false) => return Ok(false),
                 Ok(true) => {
@@ -312,9 +563,7 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             return Ok(true);
         }
 
-        let detail = last
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "no nodes configured".to_string());
+        let detail = self.failure_detail(last);
         warn!(
             what = "syncing",
             %detail, "All configured beacon nodes failed; duty likely missed"
@@ -413,6 +662,15 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
                 self.nodes.len()
             ))
         })?;
+        // The producing node left this client's chain after it built the block.
+        // Not another node: only the producer holds the payload (see above).
+        if !self.is_usable(producer.position()) {
+            return Err(Error::AllBeaconNodesFailed(format!(
+                "beacon node {}, which produced the blinded block, is no longer on this \
+                 client's chain",
+                producer.position()
+            )));
+        }
         // The node behind this one is a single node, with nothing to choose.
         node.publish_blinded_block(Producer::default(), fork, body)
             .await
@@ -445,17 +703,19 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         &self,
         registrations: &[SignedValidatorRegistrationV1],
     ) -> Vec<Result<()>> {
+        let selected: Vec<(usize, &B)> = self.usable_nodes().collect();
         let per_node = futures_util::future::join_all(
-            self.nodes
+            selected
                 .iter()
-                .map(|node| node.register_validators_in_batches(registrations)),
+                .map(|(_, node)| node.register_validators_in_batches(registrations)),
         )
         .await;
 
         let batches = registrations.len().div_ceil(super::REGISTRATION_BATCH);
         let mut accepted = vec![false; batches];
         let mut last = vec![None; batches];
-        for (position, outcomes) in per_node.into_iter().enumerate() {
+        for ((position, _), outcomes) in selected.iter().zip(per_node) {
+            let position = *position;
             let mut refused = 0;
             let mut first_refusal = None;
             // One outcome per batch is the trait's contract. A node that
@@ -493,7 +753,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
                     Ok(())
                 } else {
                     Err(Error::AllBeaconNodesFailed(last.unwrap_or_else(|| {
-                        "no beacon node gave an outcome for this batch".to_string()
+                        if selected.is_empty() {
+                            NO_USABLE_NODE.to_string()
+                        } else {
+                            "no beacon node gave an outcome for this batch".to_string()
+                        }
                     })))
                 }
             })

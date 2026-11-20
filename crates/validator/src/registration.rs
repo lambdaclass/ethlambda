@@ -421,7 +421,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
 
     /// Whether `epoch` is at or after gloas, where there is nothing to register.
     fn is_gloas(&self, epoch: Epoch) -> bool {
-        self.context.config.fork_at_epoch(epoch) >= ForkName::Gloas
+        self.context.config().fork_at_epoch(epoch) >= ForkName::Gloas
     }
 
     fn now_secs() -> u64 {

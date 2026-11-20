@@ -936,7 +936,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded. A key can live
+  unguarded. The client checks every beacon node against the chain it runs on
+  (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
+  the first node that answers at startup, and a node whose genesis, preset, slot
+  duration or any active fork's epoch and version differs is skipped by every call
+  until a later check finds it compatible again. A background task re-asks the
+  unusable nodes every slot and every node each epoch, and follows a fork the
+  compatible nodes newly schedule (only a fork still in the future may change)
+  into the `SharedConfig` the slot clock and signing domains read, logging the
+  change at `warn`. The spec parser requires the slot duration and every altair
+  to fulu epoch and version rather than defaulting them to mainnet. A key can live
   in a Web3Signer instead of the process (`SigningMethod::Web3Signer`,
   `keys/web3signer.rs`): every `SigningContext::sign_*` is async, resolves the
   signer under a read guard scoped to the lookup and signs after releasing it,

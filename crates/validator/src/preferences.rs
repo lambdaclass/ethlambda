@@ -346,7 +346,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         // gloas, and with no keys loaded, nothing is owed.
         let targets: Vec<Epoch> = [epoch, epoch + 1]
             .into_iter()
-            .filter(|target| self.context.config.fork_at_epoch(*target) >= ForkName::Gloas)
+            .filter(|target| self.context.config().fork_at_epoch(*target) >= ForkName::Gloas)
             .collect();
         if targets.is_empty() {
             return;
@@ -490,7 +490,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
 
         // The target epoch's fork, which is what the submitted objects belong
         // to (always gloas here).
-        let fork = self.context.config.fork_at_epoch(target);
+        let fork = self.context.config().fork_at_epoch(target);
         let sends = resend
             .into_iter()
             .chain(signed)
@@ -801,7 +801,7 @@ mod tests {
         assert!(proposal_epoch >= GLOAS_EPOCH);
         let domain = compute_domain(
             DOMAIN_PROPOSER_PREFERENCES,
-            context.config.gloas_fork_version,
+            context.config().gloas_fork_version,
             context.genesis_validators_root,
         );
         let root = compute_signing_root(entry.message.hash_tree_root(), domain);
@@ -1784,7 +1784,7 @@ mod tests {
             vec![duty(&pubkeys[0], 3, started), duty(&pubkeys[0], 3, ahead)],
         );
         // One second into slot 5 of the gloas epoch.
-        let config = context().config.clone();
+        let config = (*context().config()).clone();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("after 1970")
@@ -1831,7 +1831,7 @@ mod tests {
             .expect("lock")
             .insert("submit_proposer_preferences", "timed out".to_string());
         // `slot` starts at the third whole second from now.
-        let config = context().config.clone();
+        let config = (*context().config()).clone();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("after 1970")

@@ -621,6 +621,10 @@ impl HttpBeaconNode {
 
 #[async_trait]
 impl BeaconNodeApi for HttpBeaconNode {
+    fn describe(&self) -> String {
+        self.base_url.clone()
+    }
+
     /// Fetches the chain's genesis time and validators root.
     async fn genesis(&self) -> Result<Genesis> {
         let response: DataResponse<GenesisDto> = self.get("/eth/v1/beacon/genesis").await?;
