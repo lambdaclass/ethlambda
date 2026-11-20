@@ -86,7 +86,7 @@
 //! doc), read through [`super::fulu::get_beacon_proposer_index`] rather
 //! than a copy of it here.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
@@ -311,7 +311,10 @@ pub fn indexed_payload_attestation_signature_set(
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
             Err(_) => return None,
         }
     }
