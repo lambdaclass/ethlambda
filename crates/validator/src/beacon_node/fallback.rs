@@ -647,6 +647,22 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// Every node too, quietly: the duty loop sends this again each slot and
+    /// logs its own failure, so a node that is down costs a `debug!` line a
+    /// slot rather than two warnings, one of them claiming a missed duty.
+    async fn prepare_beacon_proposer_quietly(
+        &self,
+        preparations: &[ProposerPreparationDto],
+    ) -> Result<()> {
+        self.try_all_quiet(
+            "prepare_beacon_proposer",
+            "it keeps the fee recipients it was last given",
+            |node| node.prepare_beacon_proposer(preparations),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Every node, for the same reason, and with more at stake. A subscription
     /// is what puts a node on the attestation subnets and what makes it collect
     /// the votes an aggregate is folded from, so a node that never received one
@@ -1106,6 +1122,39 @@ mod tests {
 
         assert_eq!(fallback.nodes[0].preparations().len(), 1);
         assert_eq!(fallback.nodes[1].preparations().len(), 1);
+    }
+
+    /// The per-slot send goes to every node like the epoch's, and fails only
+    /// when none accepted. What it changes is the logging, which this does
+    /// not see.
+    #[tokio::test]
+    async fn the_quiet_fee_recipient_send_reaches_every_node_too() {
+        let preparations = [ProposerPreparationDto {
+            validator_index: 1,
+            fee_recipient: "0xab".to_string(),
+        }];
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::new(),
+            MockBeaconNode::new(),
+        ]);
+        fallback
+            .prepare_beacon_proposer_quietly(&preparations)
+            .await
+            .expect("two nodes accepted");
+        assert!(fallback.nodes[0].preparations().is_empty());
+        assert_eq!(fallback.nodes[1].preparations().len(), 1);
+        assert_eq!(fallback.nodes[2].preparations().len(), 1);
+
+        let down = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::failing("down"),
+        ]);
+        let err = down
+            .prepare_beacon_proposer_quietly(&preparations)
+            .await
+            .expect_err("no node accepted");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
     }
 
     /// One unreachable node must not stop the reachable ones being told.

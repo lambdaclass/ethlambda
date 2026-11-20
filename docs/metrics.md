@@ -260,7 +260,7 @@ The bookkeeping an import triggers (chain-event emission, the finality eviction 
 
 On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` (and still forwarded to the chain actor) rather than queued. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
 
-`engine` and `fcu` are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.
+`engine` and `fcu` are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. `engine` is only the part of the `engine_newPayload` question the import could not hide behind its own state transition: building the request (a copy of the payload), plus whatever of the round trip was left once that transition finished. For a block whose answer arrived first it is the request's construction alone; how often that is the case depends on the execution client being faster than the transition. The round trip itself is `lean_engine_new_payload_seconds`. The transition that ran meanwhile is charged to `stf` whether or not the import used it, and the log line's `speculation` field says which (`used`, `discarded_invalidated`, `discarded_held` or `discarded_mismatch`), so a block whose `stf` holds two transitions says so.
 
 The `source` label has two values, `gossip` and `sync` (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its `defer` section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no `decode` and an empty `queue` taken when the import began. Both still appear in the log, which names them `deferred` and `local`.
 
@@ -269,6 +269,8 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
+| `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client that has its parent's post-state and passes the checks `on_block` makes before its transition (not from the future, past the finalized epoch's start, on the finalized chain); a block refused by one of those is asked about but gets no speculation and is not counted | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
+| `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload*`, from the request to the answer, retry ladder included: a pre-gloas block's payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `engine` phase) | Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks | outcome=valid,optimistic,invalidated,no_verdict (`no_verdict`: the whole retry ladder with no answer, or one attempt answered with a JSON-RPC error, which is not retried) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
 Per-block phases, in the order a block crosses them, plus `total` for a completed import:
@@ -284,10 +286,10 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `cascade_wait` | Between the parent's import finishing and this block being popped off the cascade queue | both |
 | `da_check` | The custody-column availability check itself, not the wait | beacon |
 | `columns_wait` | Held because custody columns had not all arrived | beacon |
-| `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
+| `engine` | What the `engine_newPayload` question cost beyond the state transition that ran meanwhile: building and sending the request (a copy of the payload), and the wait for the verdict left once that transition finished. Observed as `0` for every block with no request to send (no execution client, pre-merge, gloas), and as the request's construction alone for a block whose answer was in before the transition finished. Larger when the execution client was slower than the transition, or gave no answer (the rest of its retry ladder, block held) | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it | both |
+| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it. It includes the transition that ran during the `engine_newPayload` round trip, also when that one was then discarded and run again (an `INVALIDATED` verdict) or the block was held | both |
 | `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |
@@ -335,6 +337,21 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss (and the writer's own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero | role=led,joined |
+| `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
+| `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+
+**`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
+The beacon head computation reads vote weights the store keeps current as votes
+arrive, and rebuilds them from every latest message only when its inputs move
+under it: `balances` when the justified checkpoint moves, `prune` when finality
+prunes the block index (the two usually land together, and one rebuild covers
+both), `unbuilt` once per process. `removal` follows a payload invalidation or the
+restart head repair, `rules` the gloas fork boundary. `coverage` means a block
+reached the index without `Store::insert_fork_choice_node`: `on_block` always
+inserts one, so outside tests and bootstrap a steady rate of it is worth a look
+(an API read racing a block import can cost one now and then). `underflow` is a
+bug: the cache repaired itself, and a warning in the log names the validator.
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -362,6 +379,18 @@ or `has_state` miss means the state was not resident and came from the writer's
 buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
 choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
 epoch boundary when the checkpoint's block precedes it.
+
+**`lean_state_rebuilds_total{role="led"}` is the number of states actually
+read and decoded from storage.** A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. `role="joined"` counts misses that found a rebuild of
+the same root already under way and took the state it read instead, so every
+join has the lead it waited on beside it. A lookup that finds no state for
+its root, or fails, counts under neither, and so does a lead that finds the
+state already cached by a rebuild that settled since its own miss, along with
+whoever waited on it. A burst of joins next to a single lead is the pattern a
+late block's custody columns produce, each gossiped one that gossip queued
+checked on its own task against a parent state that has left the cache.
 
 ### Beacon Gossip Validation
 
@@ -523,7 +552,8 @@ not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations, sync aggregate and exit/consolidation churn | result=hit,miss,unkeyable |
+| `lean_beacon_pubkey_index_lookups_total` | Counter | Pubkey to validator-index lookups in block processing, by whether the pubkey index cache served them | Per sync committee seat, and per pubkey of a withdrawal or consolidation request; `fallback` is a registry search (also counted when the pubkey is not registered) | result=hit,fallback |
 
 Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
 genesis state asking about its own epoch, and should be zero on a
@@ -558,7 +588,7 @@ leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing imports, by whether a precomputed boundary state was cached | On each import whose parent is before the block's epoch start and whose block is at or after it | result=hit,miss | |
+| `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing block transitions, by whether a precomputed boundary state was cached | On each state transition of a block whose parent is before the block's epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the `engine_newPayload` round trip and then discarded for an `INVALIDATED` verdict, or re-checked in a debug build), and once for a block held after its speculation ran | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
@@ -601,9 +631,9 @@ spec.
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
-| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
-| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
-| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
+| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, one sub-batch of at most 16 of one block's sidecars in the chain checks, which for every sub-batch after a block's first is how long it holds its `column_check_permits` permit (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries,peers_exhausted,no_custodian | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
@@ -616,18 +646,27 @@ gossiped one reported `Queue` or `Ignore(Overloaded)`, and a parked one sent
 back once its parent imported. A gossiped sidecar is judged first by the
 gossip rules and counted in
 `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`; the reasons
-here are that counter's reason labels. The chain actor stores what reaches it
-without checking it again.
+here are that counter's reason labels, except `already_seen`, which here
+counts a sidecar repeating a block and column index already in the same call
+(one peer's answer, say), dropped without being judged. `internal` also counts
+the sidecars a panic inside the checks cost, which are dropped (each one
+whose own checks panicked, or a whole group or KZG sub-batch whose task did).
+The chain actor stores what reaches it without checking it again.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two
 of a hold: fetch or gossip should complete well inside the retry ladder
 `lean_data_column_fetch_failures_total` counts down. A gauge that sits above
 zero for several slots means either the fetch is failing — check whether
-`lean_data_column_fetch_failures_total`'s `no_peers` or `max_retries` reason
-is climbing — or no reachable peer actually serves the missing columns; short
-of that, only finality passing the held block's slot clears it, which can be
-minutes away.
+`lean_data_column_fetch_failures_total`'s `no_peers`, `max_retries` or
+`peers_exhausted` reason is climbing (the last: every connected peer failed a
+request or sent an invalid sidecar in one lookup) — or no reachable peer
+actually serves the missing columns, which
+the `no_custodian` reason counts: a lookup that ends without finding anyone
+connected holding the missing columns, because none is known to custody them
+or every peer asked after the block's slot answered without them.
+Short of that, only finality passing the held block's slot clears it, which
+can be minutes away.
 
 **Read `lean_sidecars_awaiting_parent` beside it.** A sidecar whose block's
 parent has no post-state yet is parked rather than dropped, and a held block is
