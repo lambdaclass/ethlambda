@@ -257,11 +257,13 @@ pub fn derive_and_register(
     let mut request_key = [0u8; 48];
     request_key[16..].copy_from_slice(&xmss.public_key().to_bytes());
     // Warm the two bottom trees duties sign in, so the first signature of each
-    // kind does not pay for one at its deadline. Leaf indices fit leanVM's
-    // `u32` for any slot this client reaches.
-    let epoch = current_slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-    xmss.prepare(attestation_leaf(epoch) as u32);
-    xmss.prepare(slot_leaf(current_slot, 0) as u32);
+    // kind does not pay for one at its deadline. Later ones are
+    // `prepare_bottom_tree`'s.
+    for leaf in duty_leaves(current_slot) {
+        if let Ok(leaf) = u32::try_from(leaf) {
+            xmss.prepare(leaf);
+        }
+    }
     let key = Arc::new(PqKey {
         xmss,
         vrf_seed: pq_keys::vrf_seed(secret),
@@ -333,6 +335,41 @@ fn key(pubkey: &BlsPubkey) -> Option<Arc<PqKey>> {
         .by_bls
         .get(pubkey)
         .cloned()
+}
+
+/// The bottom tree `leaf` is in: a leanXMSS layer holds `2^16` leaves.
+pub fn bottom_tree_of(leaf: u64) -> u64 {
+    leaf >> 16
+}
+
+/// The leaves whose bottom trees a validator signs in at `slot`: the
+/// attestation leaf of its epoch and its first per-slot leaf. Every per-slot
+/// leaf of a slot is in one bottom tree, since a slot's
+/// [`XMSS_LEAVES_PER_SLOT`] start at a multiple of it.
+pub fn duty_leaves(slot: Slot) -> [u64; 2] {
+    let epoch = slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    [attestation_leaf(epoch), slot_leaf(slot, 0)]
+}
+
+/// Builds the bottom tree `leaf` is in for every registered key that does
+/// not hold it yet, so no duty pays for one at its deadline (the per-slot
+/// leaves move to a new tree at slot 4096 and every 8192 slots after).
+///
+/// Blocking: about 2.5 s for each key that builds, single-threaded, the keys
+/// across the current rayon pool. A key that holds the tree costs a lookup.
+pub fn prepare_bottom_tree(leaf: u64) {
+    use rayon::prelude::*;
+    let Ok(leaf) = u32::try_from(leaf) else {
+        return;
+    };
+    let keys: Vec<Arc<PqKey>> = registry()
+        .read()
+        .expect("PQ key registry poisoned")
+        .by_bls
+        .values()
+        .cloned()
+        .collect();
+    keys.par_iter().for_each(|key| key.xmss.prepare(leaf));
 }
 
 /// `compute_xmss_attestation_leaf_index`.

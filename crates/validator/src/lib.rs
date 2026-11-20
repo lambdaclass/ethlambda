@@ -92,7 +92,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, Bytes32, ExecutionAddress, Slot, ValidatorIndex,
+};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -444,6 +446,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 }
             })?;
         info!(leaves = kept, "Opened the PQ leaf record");
+        prepare_bottom_trees(clock.clone(), current_slot);
         prepare_vrf_trees(
             pubkeys,
             config.validators_dir.clone(),
@@ -1658,6 +1661,82 @@ fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
     }
 }
 
+/// How far ahead [`prepare_bottom_trees`] looks: long enough to build a tree
+/// for a thousand keys on a few cores, about an hour and three quarters at
+/// 12-second slots.
+const BOTTOM_TREE_LOOKAHEAD_SLOTS: Slot = 512;
+
+/// How often [`prepare_bottom_trees`] looks.
+const BOTTOM_TREE_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The leaves `lookahead` slots past `slot` whose bottom trees are not in
+/// `prepared`, which they are added to: what [`prepare_bottom_trees`] builds
+/// next.
+fn bottom_trees_due(prepared: &mut std::collections::HashSet<u64>, slot: Slot) -> Vec<u64> {
+    pq::duty_leaves(slot + BOTTOM_TREE_LOOKAHEAD_SLOTS)
+        .into_iter()
+        .filter(|&leaf| prepared.insert(pq::bottom_tree_of(leaf)))
+        .collect()
+}
+
+/// Builds every key's next bottom trees ahead of the duties that sign in
+/// them, on a thread of its own: once a minute it looks
+/// [`BOTTOM_TREE_LOOKAHEAD_SLOTS`] ahead and builds any tree a duty leaf
+/// there falls in that it has not built yet. The trees of `current_slot`,
+/// which key derivation built, count as built.
+///
+/// Without this, the first signature in a new tree builds it at its duty's
+/// deadline, about 2.5 s a key: the per-slot leaves move to a new tree at
+/// slot 4096 (about 13.6 h in at 12-second slots) and every 8192 slots after.
+/// leanVM keeps four bottom trees a key, enough for the attestation tree and
+/// the current and next per-slot ones.
+///
+/// In a pool of half the cores, so the duties signing meanwhile keep the
+/// rest. A plain thread, so a shutdown does not wait for it.
+fn prepare_bottom_trees(clock: SlotClock, current_slot: Slot) {
+    let mut prepared: std::collections::HashSet<u64> = pq::duty_leaves(current_slot)
+        .into_iter()
+        .map(pq::bottom_tree_of)
+        .collect();
+    let spawned = std::thread::Builder::new()
+        .name("pq-bottom-trees".into())
+        .spawn(move || {
+            let threads =
+                std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("pq-bottom-tree-{index}"))
+                .build()
+                .inspect_err(|err| {
+                    warn!(%err, "Could not start the bottom-tree pool; building on the shared one")
+                })
+                .ok();
+            loop {
+                if let Some(slot) = clock.now() {
+                    for leaf in bottom_trees_due(&mut prepared, slot) {
+                        let started = std::time::Instant::now();
+                        let tree = pq::bottom_tree_of(leaf);
+                        info!(%slot, tree, leaf, "Building every key's next leanXMSS bottom tree");
+                        let build = || pq::prepare_bottom_tree(leaf);
+                        match &pool {
+                            Some(pool) => pool.install(build),
+                            None => build(),
+                        }
+                        info!(
+                            tree,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Built every key's next leanXMSS bottom tree"
+                        );
+                    }
+                }
+                std::thread::sleep(BOTTOM_TREE_CHECK);
+            }
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "Could not start preparing bottom trees; each is built at its first duty");
+    }
+}
+
 /// How long [`load_xmss_cache`] waits for the beacon node's registry before
 /// building every key instead: [`REGISTRY_ATTEMPTS`] tries this far apart.
 const REGISTRY_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1984,6 +2063,28 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(load_xmss_cache(&node, &keys, gone).await.is_empty());
+    }
+
+    /// Nothing is due while the lookahead stays in the trees key derivation
+    /// built; the per-slot tree after slot 4095 comes due once, as soon as
+    /// the lookahead reaches it.
+    #[test]
+    fn the_next_bottom_tree_comes_due_once_ahead_of_its_first_slot() {
+        let mut prepared: std::collections::HashSet<u64> = pq::duty_leaves(0)
+            .into_iter()
+            .map(pq::bottom_tree_of)
+            .collect();
+        let edge = 4096 - BOTTOM_TREE_LOOKAHEAD_SLOTS;
+        assert!(bottom_trees_due(&mut prepared, 0).is_empty());
+        assert!(bottom_trees_due(&mut prepared, edge - 1).is_empty());
+        let due = bottom_trees_due(&mut prepared, edge);
+        assert_eq!(due, vec![pq::slot_leaf(4096, 0)]);
+        assert_ne!(
+            pq::bottom_tree_of(due[0]),
+            pq::bottom_tree_of(pq::slot_leaf(4095, 7))
+        );
+        assert!(bottom_trees_due(&mut prepared, edge + 1).is_empty());
+        assert!(bottom_trees_due(&mut prepared, 4096).is_empty());
     }
 
     /// A node that never gives its registry costs the cache, not the start:
