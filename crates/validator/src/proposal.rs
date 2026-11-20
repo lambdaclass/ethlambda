@@ -497,6 +497,8 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         )
         .await?;
         info!(%slot, validator, "Published a PQ block");
+        crate::metrics::inc_blocks_proposed();
+        self.observe_publication_delay(slot);
 
         let envelope = contents.execution_payload_envelope;
         let domain = self.context.domain(
@@ -508,6 +510,8 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             domain,
         );
         let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE);
+        // Logged and counted rather than propagated, as for gloas: the block
+        // is out and the proposal did happen.
         match crate::pq::sign(&pubkey, leaf, envelope_root) {
             Ok(signature) => {
                 let signed = pq::SignedExecutionPayloadEnvelope {
@@ -519,11 +523,20 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                     .publish_pq_execution_payload_envelope(&signed.to_ssz())
                     .await
                 {
-                    Ok(()) => info!(%slot, validator, "Published a PQ execution payload envelope"),
-                    Err(err) => warn!(%slot, validator, %err, "Failed to publish the PQ envelope"),
+                    Ok(()) => {
+                        info!(%slot, validator, "Published a PQ execution payload envelope");
+                        crate::metrics::inc_envelopes_published();
+                    }
+                    Err(err) => {
+                        warn!(%slot, validator, %err, "Failed to publish the PQ envelope");
+                        crate::metrics::inc_envelope_failures();
+                    }
                 }
             }
-            Err(err) => warn!(%slot, validator, %err, "Failed to sign the PQ envelope"),
+            Err(err) => {
+                warn!(%slot, validator, %err, "Failed to sign the PQ envelope");
+                crate::metrics::inc_envelope_failures();
+            }
         }
         Ok(Proposed::Full(published))
     }

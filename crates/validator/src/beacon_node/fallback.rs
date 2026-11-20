@@ -631,16 +631,48 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// A 404 is a node with nothing to publish for this committee: it holds
+    /// no votes for it, or (the aggregators' later seats, every slot with two
+    /// of them) an aggregate already broadcast covers every attester this one
+    /// would. Another node may still hold votes, so the walk goes on past it,
+    /// but when every node answered 404 that is the committee's answer, which
+    /// comes back as the last node's [`Error::BeaconNodeStatus`] without the
+    /// missed-duty warning: the specification has the aggregator publish
+    /// nothing then. Any other failure among them still warns, since the node
+    /// that failed may have held the votes.
     async fn pq_aggregate(
         &self,
         slot: Slot,
         attestation_data_root: Root,
         committee_index: u64,
     ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
-        self.try_each("pq_aggregate", |node| {
-            node.pq_aggregate(slot, attestation_data_root, committee_index)
-        })
-        .await
+        let mut nothing_to_publish = None;
+        let mut failure = None;
+        for (position, node) in self.nodes.iter().enumerate() {
+            match node
+                .pq_aggregate(slot, attestation_data_root, committee_index)
+                .await
+            {
+                Ok(aggregate) => return Ok(aggregate),
+                Err(err @ Error::BeaconNodeStatus { status: 404, .. }) => {
+                    debug!(what = "pq_aggregate", position, %err, "Beacon node has no PQ aggregate; trying the next");
+                    nothing_to_publish = Some(err);
+                }
+                Err(err) => {
+                    debug!(what = "pq_aggregate", position, %err, "Beacon node request failed; trying the next");
+                    failure = Some(err);
+                }
+            }
+        }
+        let failure = match (nothing_to_publish, failure) {
+            (Some(answer), None) => return Err(answer),
+            (_, failure) => failure,
+        };
+        let detail = failure
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no nodes configured".to_string());
+        warn!(what = "pq_aggregate", %detail, "All configured beacon nodes failed; duty likely missed");
+        Err(Error::AllBeaconNodesFailed(detail))
     }
 
     async fn publish_pq_aggregates(
@@ -879,6 +911,31 @@ mod tests {
         let fallback = FallbackBeaconNode::new(vec![healthy(), MockBeaconNode::failing("down")]);
         let genesis = fallback.genesis().await.expect("answers");
         assert_eq!(genesis.genesis_time, 1_606_824_023);
+    }
+
+    /// Every node having no PQ aggregate is the committee's answer (a later
+    /// aggregator seat whose committee is already covered), so it comes back
+    /// as the 404 itself; a node that failed outright among them may have held
+    /// the votes, which is a failure.
+    #[tokio::test]
+    async fn a_pq_aggregate_no_node_holds_is_the_404_not_a_failure() {
+        let fallback = FallbackBeaconNode::new(vec![MockBeaconNode::new(), MockBeaconNode::new()]);
+        let err = fallback
+            .pq_aggregate(64, Root::default(), 0)
+            .await
+            .expect_err("no node holds one");
+        assert!(
+            matches!(err, Error::BeaconNodeStatus { status: 404, .. }),
+            "got {err:?}"
+        );
+
+        let fallback =
+            FallbackBeaconNode::new(vec![MockBeaconNode::failing("down"), MockBeaconNode::new()]);
+        let err = fallback
+            .pq_aggregate(64, Root::default(), 0)
+            .await
+            .expect_err("no node holds one");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
     }
 
     #[tokio::test]

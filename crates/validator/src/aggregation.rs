@@ -161,12 +161,18 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                 }
                 // A 404 also when another aggregator's broadcast already
                 // covers every attester: nothing to publish, as the
-                // specification has it.
-                Err(err) => info!(
+                // specification has it. The node's message says which.
+                Err(Error::BeaconNodeStatus { status: 404, body }) => info!(
+                    %slot,
+                    committee = duty.committee_index,
+                    reason = %body,
+                    "No PQ aggregate to publish for this committee"
+                ),
+                Err(err) => warn!(
                     %slot,
                     committee = duty.committee_index,
                     %err,
-                    "No PQ aggregate to publish for this committee"
+                    "Could not fetch this committee's PQ aggregate"
                 ),
             }
         }
@@ -202,9 +208,11 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         if signed.is_empty() {
             return Ok(0);
         }
+        let count = signed.len();
         self.beacon_node.publish_pq_aggregates(&signed).await?;
-        info!(%slot, count = signed.len(), "Published PQ aggregates");
-        Ok(signed.len())
+        info!(%slot, count, "Published PQ aggregates");
+        crate::metrics::inc_aggregates_published(count as u64);
+        Ok(count)
     }
 
     pub async fn aggregate(

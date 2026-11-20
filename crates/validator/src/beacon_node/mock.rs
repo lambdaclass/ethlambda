@@ -1127,9 +1127,11 @@ impl BeaconNodeApi for MockBeaconNode {
         _committee_index: u64,
     ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
         self.guard("pq_aggregate")?;
-        Err(Error::InconsistentResponse(
-            "the mock proves no PQ aggregates".into(),
-        ))
+        // What a node with nothing to publish for the committee answers.
+        Err(Error::BeaconNodeStatus {
+            status: 404,
+            body: "the mock proves no PQ aggregates".into(),
+        })
     }
 
     async fn publish_pq_aggregates(
