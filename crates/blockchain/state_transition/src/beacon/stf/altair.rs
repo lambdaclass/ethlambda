@@ -180,15 +180,18 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `is_valid_indexed_attestation` above refused any `attesting_indices` that
+    // is not strictly ascending, so the reader walks each leaf once rather than
+    // descending the tree for every attester.
+    let mut reader = epoch_participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            epoch_participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: epoch_participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: epoch_participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
         // The attester's validator is read at most once, on the first flag
@@ -225,7 +228,7 @@ pub fn process_attestation(
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -240,14 +243,20 @@ pub fn process_attestation(
         previous_epoch_participation
     };
     let epoch_participation_len = epoch_participation.len();
-    for (index, new_flags) in updates {
-        let flags = epoch_participation
-            .get_mut(index as usize)
-            .ok_or(Error::IndexOutOfBounds {
+    // A blind write of `current_flags | new_flags`, which the read phase
+    // stored, rather than `|=` on the stored value. That is exact:
+    // `is_valid_indexed_attestation` above refused a repeated index, so each
+    // index is written once, and nothing writes this list between the read
+    // phase and here, so the stored value is still `current_flags`. It saves
+    // the tree descent `get_mut` makes to copy the old value into the write
+    // buffer.
+    for (index, flags) in updates {
+        if !epoch_participation.set(index as usize, flags) {
+            return Err(Error::IndexOutOfBounds {
                 index: index as usize,
                 len: epoch_participation_len,
-            })?;
-        *flags |= new_flags;
+            });
+        }
     }
 
     // The weights partition `WEIGHT_DENOMINATOR` between the three flags, the
