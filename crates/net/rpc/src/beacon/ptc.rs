@@ -20,10 +20,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::SyncStatusController;
 use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_engine::EngineClient;
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     fork_choice::get_payload_due_ms,
     gloas_block_production::aggregate_payload_attestations,
@@ -56,7 +56,7 @@ use tracing::{debug, warn};
 use crate::{
     CustodyColumns,
     beacon::{
-        ApiError, decode_list,
+        ApiError, copy_if_listened, decode_list, emit_accepted,
         validator::{head, require_execution_client, require_validated},
     },
     shared::content::{Encoding, ssz_response, with_consensus_version},
@@ -389,6 +389,7 @@ async fn post_pool_payload_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(pool): Extension<SharedPayloadAttestationPool>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -433,8 +434,16 @@ async fn post_pool_payload_attestations(
             debug!(%slot, validator, "Payload attestation already pooled; not republishing");
             continue;
         }
+        let for_event = copy_if_listened(events.as_deref(), &message);
         match p2p.publish_payload_attestation_message(message) {
-            Ok(()) => debug!(%slot, validator, "Accepted payload attestation for gossip"),
+            Ok(()) => {
+                if let Some(message) = for_event {
+                    emit_accepted(events.as_deref(), || {
+                        GossipEvent::PayloadAttestationMessage(message)
+                    });
+                }
+                debug!(%slot, validator, "Accepted payload attestation for gossip")
+            }
             Err(_) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),

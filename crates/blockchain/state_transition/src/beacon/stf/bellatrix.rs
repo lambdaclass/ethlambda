@@ -94,6 +94,7 @@ pub fn process_block(
         config,
         caches.committees,
         caches.active_balances,
+        options.target_delta,
         signatures,
     )?;
     super::altair::process_sync_aggregate(
