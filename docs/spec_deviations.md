@@ -641,8 +641,9 @@ newer than the release the fixtures are pinned to.
 
 `verify_execution_payload_envelope` asks the execution engine last, as part of
 one boolean function. The follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability),
-then asks the engine with `engine_newPayloadV5` only about an envelope that
+(`check_execution_payload_envelope_columns_verified`: signature, bid, state;
+data availability is every sampled column being stored, since a column is
+verified before it is stored), then asks the engine with `engine_newPayloadV5` only about an envelope that
 passed them, and records it with `accept_execution_payload_envelope`. The
 engine's part is answered "valid" inside the checks because its answer has
 three outcomes and the specification's `ExecutionEngine` has two.
