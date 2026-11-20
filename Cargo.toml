@@ -124,6 +124,10 @@ smallvec = "1.15"
 # (`ethlambda_crypto::lean_xmss`). Not leanVM's XMSS: that one hashes with
 # BLAKE2s and signs lean consensus messages only.
 sha3 = "0.10.9"
+# The Keccak-f[1600] permutation `sha3` is built on, called directly by the PQ
+# fork's VRF tree (`ethlambda_crypto::vrf`), whose billions of single-block
+# hashes pay for a streaming hasher's buffering.
+keccak = "0.1.6"
 
 # The client of leanVM's `leanvm-sidecar` (`crates/sidecar` without its
 # `server` feature, which builds no prover) and its claim encoding: the PQ

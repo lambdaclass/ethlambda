@@ -184,6 +184,15 @@ pub enum VrfTreeSource {
     Hashed,
 }
 
+/// Why [`adopt_vrf_state`] did not give a key a tree.
+#[derive(Debug, thiserror::Error)]
+pub enum VrfStateError {
+    #[error("no PQ key for this validator")]
+    UnknownValidator,
+    #[error("the state is not this key's: {0}")]
+    Invalid(vrf::VrfTreeError),
+}
+
 fn vrf_tree_path(validators_dir: &Path, pubkey: &BlsPubkey) -> PathBuf {
     validators_dir
         .join(VRF_TREE_DIRECTORY)
@@ -209,6 +218,102 @@ fn stored_vrf_tree(path: &Path, vrf_seed: vrf::Node) -> Option<vrf::VrfTree> {
         .ok()
 }
 
+/// Writes `tree` where the next start reads it. A tree that cannot be stored
+/// is still used: logged, and obtained again at the next start.
+fn store_vrf_tree(path: &Path, tree: &vrf::VrfTree) {
+    let stored = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .map_err(|err| err.to_string())
+        .and_then(|()| {
+            crate::secure_fs::write_private_durably(path, tree.to_bytes())
+                .map_err(|err| err.to_string())
+        });
+    if let Err(err) = stored {
+        warn!(path = %path.display(), %err, "Could not store a VRF tree; it will be obtained again at the next start");
+    }
+}
+
+/// Gives `pubkey`'s registered key the VRF tree it already has in memory or
+/// under `validators_dir`. `None` when there is none to restore (or the key
+/// is not registered): the caller then loads a precomputed state for it
+/// ([`adopt_vrf_state`]) or hashes it ([`prepare_vrf_tree`]).
+///
+/// Blocking: checking a stored tree hashes one `2^16`-leaf subtree.
+pub fn restore_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<VrfTreeSource> {
+    let key = key(pubkey)?;
+    if key.vrf.get().is_some() {
+        return Some(VrfTreeSource::Held);
+    }
+    let tree = stored_vrf_tree(&vrf_tree_path(validators_dir, pubkey), key.vrf_seed)?;
+    let _ = key.vrf.set(tree);
+    Some(VrfTreeSource::Stored)
+}
+
+/// Gives `pubkey`'s registered key the tree one precomputed state record
+/// restores (`vrf::VrfTree::from_state_record`, ethereum-package's
+/// `vrf_state_url` format), and stores it under `validators_dir` for the
+/// next start. The record must fold the key's own leaf 0 to its root, so a
+/// record of another validator's, or a damaged one, is refused rather than
+/// leaving the key with proofs no state accepts.
+pub fn adopt_vrf_state(
+    pubkey: &BlsPubkey,
+    record: &[u8],
+    validators_dir: &Path,
+) -> Result<(), VrfStateError> {
+    let key = key(pubkey).ok_or(VrfStateError::UnknownValidator)?;
+    let tree =
+        vrf::VrfTree::from_state_record(key.vrf_seed, record).map_err(VrfStateError::Invalid)?;
+    store_vrf_tree(&vrf_tree_path(validators_dir, pubkey), &tree);
+    let _ = key.vrf.set(tree);
+    Ok(())
+}
+
+/// The precomputed VRF state record of validator `index` from `source`: an
+/// HTTP(S) URL of a whole file of [`vrf::STATE_RECORD_SIZE`]-byte records,
+/// asked for the one record by range, or a path to such a file. `None` when
+/// the file does not reach that index.
+pub async fn fetch_vrf_state(
+    client: &reqwest::Client,
+    source: &str,
+    index: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let size = vrf::STATE_RECORD_SIZE as u64;
+    let first = index * size;
+    if !(source.starts_with("http://") || source.starts_with("https://")) {
+        // Read whole: such a file is about a kilobyte per validator, and this
+        // runs once per key, off the duty path.
+        let bytes = std::fs::read(source).map_err(|err| err.to_string())?;
+        let end = (first + size) as usize;
+        return Ok(bytes.get(first as usize..end).map(<[u8]>::to_vec));
+    }
+    let response = client
+        .get(source)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={first}-{}", first + size - 1),
+        )
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("{source} answered {status}"));
+    }
+    let body = response.bytes().await.map_err(|err| err.to_string())?;
+    // A server that ignores the range sends the whole file.
+    let record = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        body.get(..size as usize)
+    } else {
+        body.get(first as usize..(first + size) as usize)
+    };
+    Ok(record.map(<[u8]>::to_vec))
+}
+
 /// Gives `pubkey`'s registered key its VRF tree: the one stored under
 /// `validators_dir` if there is one, else hashed in full and stored. `None`
 /// for a key that is not registered.
@@ -217,33 +322,16 @@ fn stored_vrf_tree(path: &Path, vrf_seed: vrf::Node) -> Option<vrf::VrfTree> {
 /// off the async runtime and one key at a time. A tree that cannot be stored
 /// is still used; it is hashed again at the next start.
 pub fn prepare_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<VrfTreeSource> {
-    let key = key(pubkey)?;
-    if key.vrf.get().is_some() {
-        return Some(VrfTreeSource::Held);
+    if let Some(source) = restore_vrf_tree(pubkey, validators_dir) {
+        return Some(source);
     }
-    let path = vrf_tree_path(validators_dir, pubkey);
-    let (tree, source) = match stored_vrf_tree(&path, key.vrf_seed) {
-        Some(tree) => (tree, VrfTreeSource::Stored),
-        None => {
-            let tree = vrf::VrfTree::build(key.vrf_seed);
-            let stored = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .map_err(|err| err.to_string())
-                .and_then(|()| {
-                    crate::secure_fs::write_private_durably(&path, tree.to_bytes())
-                        .map_err(|err| err.to_string())
-                });
-            if let Err(err) = stored {
-                warn!(path = %path.display(), %err, "Could not store a VRF tree; it will be hashed again at the next start");
-            }
-            (tree, VrfTreeSource::Hashed)
-        }
-    };
+    let key = key(pubkey)?;
+    let tree = vrf::VrfTree::build(key.vrf_seed);
+    store_vrf_tree(&vrf_tree_path(validators_dir, pubkey), &tree);
     // A concurrent call for the same key hashed the same tree: either copy
     // serves.
     let _ = key.vrf.set(tree);
-    Some(source)
+    Some(VrfTreeSource::Hashed)
 }
 
 /// Signs `root` at `leaf` with `pubkey`'s leanXMSS key. Refuses a leaf this
@@ -389,6 +477,60 @@ mod tests {
         assert_eq!(
             prepare_vrf_tree(&BlsPubkey([11; 48]), directory.path()),
             None
+        );
+    }
+
+    /// A record of a `vrf_state_url` file for `vrf_seed`: leaf 0's true
+    /// branch in its first subtree and arbitrary siblings above, which is all
+    /// a record's own check (folding leaf 0 to the root) reads.
+    fn stand_in_state_record(vrf_seed: vrf::Node) -> Vec<u8> {
+        let mut branch = vrf::VrfTree::with_depth(vrf_seed, 16).compact_state().1;
+        branch.extend((16..31).map(|height| [height as u8; 32]));
+        let root = vrf::fold_vrf_branch(&vrf::compute_vrf_secret(&vrf_seed, 0), &branch, 0);
+        vrf::VrfTree::from_compact_state(vrf_seed, root, branch)
+            .unwrap()
+            .to_state_record()
+    }
+
+    #[tokio::test]
+    async fn a_precomputed_state_gives_a_key_its_tree_for_this_and_the_next_start() {
+        let secret = [12u8; 32];
+        let pubkey = BlsPubkey([13; 48]);
+        derive_and_register(pubkey, &secret, 0);
+        let vrf_seed = pq_keys::vrf_seed(&secret);
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(restore_vrf_tree(&pubkey, directory.path()), None);
+
+        // A file of two records, this key's second: it is read by index.
+        let ours = stand_in_state_record(vrf_seed);
+        let theirs = stand_in_state_record([3; 32]);
+        let file = directory.path().join("states.vrf");
+        std::fs::write(&file, [theirs.clone(), ours.clone()].concat()).unwrap();
+        let client = reqwest::Client::new();
+        let source = file.to_str().unwrap();
+        assert_eq!(
+            fetch_vrf_state(&client, source, 1).await.unwrap(),
+            Some(ours.clone())
+        );
+        assert_eq!(fetch_vrf_state(&client, source, 2).await.unwrap(), None);
+
+        // Another validator's record is refused, ours adopted and stored.
+        assert!(matches!(
+            adopt_vrf_state(&pubkey, &theirs, directory.path()),
+            Err(VrfStateError::Invalid(_))
+        ));
+        adopt_vrf_state(&pubkey, &ours, directory.path()).unwrap();
+        let root: [u8; 32] = ours[..32].try_into().unwrap();
+        let proof = vrf_proof(&pubkey, 9).unwrap();
+        let branch = proof[1..].iter().map(|node| &node.0);
+        assert_eq!(vrf::fold_vrf_branch(&proof[0].0, branch, 9), root);
+
+        // The next start reads the compact tree back from the directory.
+        let stored = stored_vrf_tree(&vrf_tree_path(directory.path(), &pubkey), vrf_seed).unwrap();
+        assert_eq!(stored.root(), root);
+        assert_eq!(
+            stored.proof(9).unwrap(),
+            proof.iter().map(|node| node.0).collect::<Vec<_>>()
         );
     }
 

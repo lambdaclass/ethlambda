@@ -28,7 +28,6 @@
 
 use ethlambda_types::beacon::constants::{VRF_LEAF_DOMAIN, VRF_TREE_DEPTH};
 use rayon::prelude::*;
-use sha3::{Digest as _, Keccak256};
 
 /// The specification's `VRF_SECRET_DOMAIN` (`validator.md`).
 pub const VRF_SECRET_DOMAIN: &[u8] = b"VRF_SECRET";
@@ -37,16 +36,48 @@ pub const VRF_SECRET_DOMAIN: &[u8] = b"VRF_SECRET";
 /// proof rebuilds one subtree of this depth, about 200,000 hashes.
 const SUBTREE_DEPTH: usize = 16;
 
+/// The size of one record of ethereum-package's `vrf_state_url` file: the
+/// root, four zero bytes, then the branch of leaf 0, bottom-up. See
+/// [`VrfTree::from_state_record`].
+pub const STATE_RECORD_SIZE: usize = 32 + 4 + 32 * VRF_TREE_DEPTH;
+
 /// A node of the tree, a secret, or a seed.
 pub type Node = [u8; 32];
 
+/// Keccak-256's rate: the bytes one permutation absorbs.
+const KECCAK_RATE: usize = 136;
+
 /// The specification's `keccak256`, over the concatenation of `parts`.
+///
+/// Every input the tree hashes (a secret's preimage, a leaf's, a pair of
+/// nodes) is at most 64 bytes, under one block, so this pads it into a
+/// single block and runs the permutation once rather than going through a
+/// streaming hasher, which the full tree's billions of calls notice.
+///
+/// # Panics
+///
+/// If the parts add up to [`KECCAK_RATE`] bytes or more.
 fn keccak256(parts: &[&[u8]]) -> Node {
-    let mut hasher = Keccak256::new();
+    let mut block = [0u8; KECCAK_RATE];
+    let mut len = 0;
     for part in parts {
-        hasher.update(part);
+        block[len..len + part.len()].copy_from_slice(part);
+        len += part.len();
     }
-    hasher.finalize().into()
+    // Keccak's own padding (`pad10*1` with the `0x01` domain byte), not
+    // SHA-3's `0x06`.
+    block[len] ^= 0x01;
+    block[KECCAK_RATE - 1] ^= 0x80;
+    let mut state = [0u64; 25];
+    for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
+        *lane = u64::from_le_bytes(chunk.try_into().expect("chunks of 8 bytes"));
+    }
+    keccak::f1600(&mut state);
+    let mut out = [0u8; 32];
+    for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    out
 }
 
 fn hash_pair(left: &Node, right: &Node) -> Node {
@@ -125,16 +156,30 @@ pub enum VrfTreeError {
     WrongSeed,
     #[error("the nodes do not fold to the root stored with them")]
     Corrupt,
+    #[error("the state is for leaf {0}, where only leaf 0's is read")]
+    StateIndex(u32),
 }
 
-/// A validator's VRF tree: its seed, and the nodes [`SUBTREE_DEPTH`] levels
-/// above the leaves.
+/// A validator's VRF tree: its seed, and what it keeps of the nodes.
 pub struct VrfTree {
     seed: Node,
     depth: usize,
-    /// Left to right. One node, the root, for a tree no deeper than
+    kept: Kept,
+}
+
+/// What a [`VrfTree`] keeps beside its seed.
+enum Kept {
+    /// Every node [`SUBTREE_DEPTH`] levels above the leaves, left to right:
+    /// a tree hashed in full. One node, the root, for a tree no deeper than
     /// [`SUBTREE_DEPTH`].
-    subtree_roots: Vec<Node>,
+    Subtrees(Vec<Node>),
+    /// The root and the branch of leaf 0, bottom-up: the compact state
+    /// ethereum-package publishes for its genesis validators. A slot below
+    /// `2^k` shares its ancestors from level `k` up with leaf 0, whose
+    /// siblings there `branch` holds, so its proof hashes only the first
+    /// `2^k` leaves: a few milliseconds on a young chain, and still seconds
+    /// a decade in.
+    Leftmost { root: Node, branch: Vec<Node> },
 }
 
 impl VrfTree {
@@ -164,8 +209,92 @@ impl VrfTree {
         Self {
             seed: vrf_seed,
             depth,
-            subtree_roots,
+            kept: Kept::Subtrees(subtree_roots),
         }
+    }
+
+    /// The tree of `vrf_seed` from its root and the branch of leaf 0
+    /// (bottom-up, one sibling per level), without hashing it: the
+    /// branch must fold leaf 0, recomputed from the seed, to the root, which
+    /// ties both to this seed. Its depth is the branch's length.
+    ///
+    /// Proofs then hash the leaves below the slot's highest set bit (see
+    /// [`Kept::Leftmost`]) instead of one `2^16`-leaf subtree.
+    pub fn from_compact_state(
+        vrf_seed: Node,
+        root: Node,
+        branch: Vec<Node>,
+    ) -> Result<Self, VrfTreeError> {
+        if branch.len() > VRF_TREE_DEPTH {
+            return Err(VrfTreeError::Length {
+                expected: 32 * VRF_TREE_DEPTH,
+                actual: 32 * branch.len(),
+            });
+        }
+        if fold_vrf_branch(&compute_vrf_secret(&vrf_seed, 0), &branch, 0) != root {
+            return Err(VrfTreeError::WrongSeed);
+        }
+        Ok(Self {
+            seed: vrf_seed,
+            depth: branch.len(),
+            kept: Kept::Leftmost { root, branch },
+        })
+    }
+
+    /// The root and the branch of leaf 0, which
+    /// [`Self::from_compact_state`] restores the tree from.
+    pub fn compact_state(&self) -> (Node, Vec<Node>) {
+        match &self.kept {
+            Kept::Leftmost { root, branch } => (*root, branch.clone()),
+            Kept::Subtrees(_) => {
+                let mut proof = self.proof(0).expect("leaf 0 is in every tree");
+                proof.remove(0);
+                (self.root(), proof)
+            }
+        }
+    }
+
+    /// The tree of `vrf_seed` from one record of ethereum-package's
+    /// `vrf_state_url` file ([`STATE_RECORD_SIZE`] bytes): the root, four
+    /// zero bytes, then leaf 0's branch, the layout the package's README
+    /// gives and its published file has. Checked as
+    /// [`Self::from_compact_state`] checks.
+    pub fn from_state_record(vrf_seed: Node, record: &[u8]) -> Result<Self, VrfTreeError> {
+        if record.len() != STATE_RECORD_SIZE {
+            return Err(VrfTreeError::Length {
+                expected: STATE_RECORD_SIZE,
+                actual: record.len(),
+            });
+        }
+        let root: Node = record[..32].try_into().expect("32 bytes");
+        let leaf = u32::from_le_bytes(record[32..36].try_into().expect("4 bytes"));
+        if leaf != 0 {
+            return Err(VrfTreeError::StateIndex(leaf));
+        }
+        let branch = record[36..]
+            .chunks_exact(32)
+            .map(|node| node.try_into().expect("chunks of 32 bytes"))
+            .collect();
+        Self::from_compact_state(vrf_seed, root, branch)
+    }
+
+    /// This tree as one record of a `vrf_state_url` file, which
+    /// [`Self::from_state_record`] reads.
+    ///
+    /// # Panics
+    ///
+    /// If the tree is not [`VRF_TREE_DEPTH`] deep.
+    pub fn to_state_record(&self) -> Vec<u8> {
+        assert_eq!(
+            self.depth, VRF_TREE_DEPTH,
+            "a state record is a whole tree's"
+        );
+        let (root, branch) = self.compact_state();
+        let mut record = Vec::with_capacity(STATE_RECORD_SIZE);
+        record.extend_from_slice(&root);
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&branch.concat());
+        record
     }
 
     fn subtree_depth(&self) -> usize {
@@ -175,9 +304,14 @@ impl VrfTree {
     /// `compute_vrf_root`: the tree's root, which a validator registers as its
     /// `vrf_root`.
     pub fn root(&self) -> Node {
-        let mut nodes = self.subtree_roots.clone();
-        reduce(&mut nodes, 0, &mut Vec::new());
-        nodes[0]
+        match &self.kept {
+            Kept::Subtrees(subtree_roots) => {
+                let mut nodes = subtree_roots.clone();
+                reduce(&mut nodes, 0, &mut Vec::new());
+                nodes[0]
+            }
+            Kept::Leftmost { root, .. } => *root,
+        }
     }
 
     /// `compute_vrf_proof`: the secret for `slot`, then the branch of the leaf
@@ -196,38 +330,66 @@ impl VrfTree {
             .map(|index| compute_vrf_leaf(&compute_vrf_secret(&self.seed, index), index))
             .collect();
         reduce(&mut nodes, (slot - first_leaf) as usize, &mut proof);
-        let mut roots = self.subtree_roots.clone();
-        reduce(&mut roots, subtree as usize, &mut proof);
+        match &self.kept {
+            Kept::Subtrees(subtree_roots) => {
+                let mut roots = subtree_roots.clone();
+                reduce(&mut roots, subtree as usize, &mut proof);
+            }
+            Kept::Leftmost { branch, .. } => {
+                // The slot's ancestors from `span` levels up are leaf 0's, so
+                // only the subtrees below them are hashed.
+                let span =
+                    ((u64::BITS - slot.leading_zeros()) as usize).clamp(subtree_depth, self.depth);
+                let mut roots: Vec<Node> = (0..1u64 << (span - subtree_depth))
+                    .into_par_iter()
+                    .map(|index| compute_vrf_node(&self.seed, subtree_depth, index))
+                    .collect();
+                reduce(&mut roots, subtree as usize, &mut proof);
+                proof.extend_from_slice(&branch[span..]);
+            }
+        }
         Some(proof)
     }
 
-    /// The nodes the tree keeps, left to right, then its root: everything
-    /// [`Self::from_bytes`] needs beside the seed. They are commitments, so
-    /// the bytes reveal no secret.
+    /// What the tree keeps, then its root: everything [`Self::from_bytes`]
+    /// needs beside the seed. A tree hashed in full keeps its nodes
+    /// [`SUBTREE_DEPTH`] levels up (1 MiB), one restored from a compact
+    /// state keeps leaf 0's branch (1 KiB). They are commitments, so the
+    /// bytes reveal no secret.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.subtree_roots.concat();
+        let mut bytes = match &self.kept {
+            Kept::Subtrees(subtree_roots) => subtree_roots.concat(),
+            Kept::Leftmost { branch, .. } => branch.concat(),
+        };
         bytes.extend_from_slice(&self.root());
         bytes
     }
 
     /// The full-depth tree of `vrf_seed` from the bytes [`Self::to_bytes`]
-    /// gave, without hashing it again. Two checks stand in for that: the
-    /// first node is recomputed from the seed (one subtree), which refuses
-    /// another seed's nodes, and the nodes must fold to the root stored after
-    /// them, which refuses damaged ones. About 230,000 hashes.
+    /// gave, without hashing it again, told apart by their length.
+    ///
+    /// For kept subtree nodes two checks stand in for the hashing: the first
+    /// node is recomputed from the seed (one subtree), which refuses another
+    /// seed's nodes, and the nodes must fold to the root stored after them,
+    /// which refuses damaged ones. About 230,000 hashes. A compact state is
+    /// checked as [`Self::from_compact_state`] checks it.
     pub fn from_bytes(vrf_seed: Node, bytes: &[u8]) -> Result<Self, VrfTreeError> {
+        let mut nodes: Vec<Node> = bytes
+            .chunks_exact(32)
+            .map(|node| node.try_into().expect("chunks of 32 bytes"))
+            .collect();
         let node_count = 1usize << (VRF_TREE_DEPTH - SUBTREE_DEPTH);
         let expected = 32 * (node_count + 1);
+        if bytes.len() == 32 * (VRF_TREE_DEPTH + 1) {
+            let root = nodes.pop().expect("the root follows the branch");
+            return Self::from_compact_state(vrf_seed, root, nodes);
+        }
         if bytes.len() != expected {
             return Err(VrfTreeError::Length {
                 expected,
                 actual: bytes.len(),
             });
         }
-        let mut nodes: Vec<Node> = bytes
-            .chunks_exact(32)
-            .map(|node| node.try_into().expect("chunks of 32 bytes"))
-            .collect();
         let stored_root = nodes.pop().expect("the root follows the nodes");
         if nodes[0] != compute_vrf_node(&vrf_seed, SUBTREE_DEPTH, 0) {
             return Err(VrfTreeError::WrongSeed);
@@ -235,7 +397,7 @@ impl VrfTree {
         let tree = Self {
             seed: vrf_seed,
             depth: VRF_TREE_DEPTH,
-            subtree_roots: nodes,
+            kept: Kept::Subtrees(nodes),
         };
         if tree.root() != stored_root {
             return Err(VrfTreeError::Corrupt);
@@ -261,6 +423,7 @@ fn reduce(nodes: &mut Vec<Node>, mut index: usize, branch: &mut Vec<Node>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn hex32(text: &str) -> Node {
         hex::decode(text).unwrap().try_into().unwrap()
@@ -426,7 +589,7 @@ mod tests {
         let tree = VrfTree {
             seed,
             depth: VRF_TREE_DEPTH,
-            subtree_roots: nodes,
+            kept: Kept::Subtrees(nodes),
         };
         let bytes = tree.to_bytes();
 
@@ -459,6 +622,94 @@ mod tests {
         }
     }
 
+    /// A tree restored from its root and leaf 0's branch proves exactly as
+    /// the tree hashed in full does, on both sides of every power of two the
+    /// restored tree's hashing span changes at.
+    #[test]
+    fn a_compact_state_proves_as_the_full_tree_does() {
+        let seed = seed();
+        let depth = 20;
+        let full = VrfTree::with_depth(seed, depth);
+        let (root, branch) = full.compact_state();
+        assert_eq!(branch.len(), depth);
+        assert_eq!(root, full.root());
+        let compact = VrfTree::from_compact_state(seed, root, branch.clone()).unwrap();
+        assert_eq!(compact.root(), root);
+        let last = (1u64 << depth) - 1;
+        for slot in [
+            0,
+            1,
+            2,
+            65_535,
+            65_536,
+            65_537,
+            131_071,
+            131_072,
+            1 << 19,
+            last,
+        ] {
+            let proof = compact.proof(slot).unwrap();
+            assert_eq!(proof, full.proof(slot).unwrap(), "slot {slot}");
+            assert_eq!(fold_vrf_branch(&proof[0], &proof[1..], slot), root);
+        }
+        assert!(compact.proof(last + 1).is_none());
+
+        // The branch must fold this seed's leaf 0 to the root.
+        assert_eq!(
+            VrfTree::from_compact_state([9; 32], root, branch.clone()).err(),
+            Some(VrfTreeError::WrongSeed)
+        );
+        let mut damaged = branch;
+        damaged[7][0] ^= 1;
+        assert_eq!(
+            VrfTree::from_compact_state(seed, root, damaged).err(),
+            Some(VrfTreeError::WrongSeed)
+        );
+    }
+
+    /// A full-depth compact state, which is too slow to hash here, built
+    /// from leaf 0's true branch in the first subtree and arbitrary siblings
+    /// above it: the record and byte forms restore it, and a slot in the
+    /// first subtree proves against its root.
+    #[test]
+    fn a_state_record_restores_the_tree_for_its_seed_only() {
+        let seed = seed();
+        let mut branch = VrfTree::with_depth(seed, SUBTREE_DEPTH).compact_state().1;
+        branch.extend((SUBTREE_DEPTH..VRF_TREE_DEPTH).map(|height| [height as u8; 32]));
+        let root = fold_vrf_branch(&compute_vrf_secret(&seed, 0), &branch, 0);
+        let tree = VrfTree::from_compact_state(seed, root, branch).unwrap();
+
+        let record = tree.to_state_record();
+        assert_eq!(record.len(), STATE_RECORD_SIZE);
+        assert_eq!(&record[..32], &root);
+        assert_eq!(&record[32..36], &[0; 4]);
+        let restored = VrfTree::from_state_record(seed, &record).unwrap();
+        let reloaded = VrfTree::from_bytes(seed, &tree.to_bytes()).unwrap();
+        for slot in [0, 9, 65_535] {
+            let proof = restored.proof(slot).unwrap();
+            assert_eq!(fold_vrf_branch(&proof[0], &proof[1..], slot), root);
+            assert_eq!(reloaded.proof(slot).unwrap(), proof);
+        }
+
+        assert_eq!(
+            VrfTree::from_state_record([9; 32], &record).err(),
+            Some(VrfTreeError::WrongSeed)
+        );
+        let mut other_leaf = record.clone();
+        other_leaf[32] = 1;
+        assert_eq!(
+            VrfTree::from_state_record(seed, &other_leaf).err(),
+            Some(VrfTreeError::StateIndex(1))
+        );
+        assert_eq!(
+            VrfTree::from_state_record(seed, &record[1..]).err(),
+            Some(VrfTreeError::Length {
+                expected: STATE_RECORD_SIZE,
+                actual: STATE_RECORD_SIZE - 1,
+            })
+        );
+    }
+
     /// The tree `compute_vrf_root` defines, hashed whole: about 100 seconds
     /// of every core, so not part of an ordinary run.
     #[test]
@@ -468,14 +719,16 @@ mod tests {
         let tree = VrfTree::build(seed);
         let root = tree.root();
         // The root is the fold of the two halves, each a node of its own.
-        assert_eq!(
-            compute_vrf_node(&seed, SUBTREE_DEPTH, 0),
-            tree.subtree_roots[0]
-        );
+        let Kept::Subtrees(subtree_roots) = &tree.kept else {
+            panic!("a hashed tree keeps its subtrees");
+        };
+        assert_eq!(compute_vrf_node(&seed, SUBTREE_DEPTH, 0), subtree_roots[0]);
         let last = (1u64 << VRF_TREE_DEPTH) - 1;
         let restored = VrfTree::from_bytes(seed, &tree.to_bytes()).unwrap();
+        let compact = VrfTree::from_state_record(seed, &tree.to_state_record()).unwrap();
         assert_eq!(restored.root(), root);
-        for slot in [0, 1, 123_456_789, last] {
+        assert_eq!(compact.root(), root);
+        for slot in [0, 1, 70_000, 123_456_789, last] {
             let proof = restored.proof(slot).unwrap();
             assert_eq!(proof.len(), VRF_TREE_DEPTH + 1);
             assert_eq!(
@@ -483,6 +736,9 @@ mod tests {
                 root,
                 "slot {slot}"
             );
+            if slot < 1 << 24 {
+                assert_eq!(compact.proof(slot).unwrap(), proof, "slot {slot}");
+            }
         }
         assert!(restored.proof(last + 1).is_none());
         println!("root {}", hex::encode(root));
