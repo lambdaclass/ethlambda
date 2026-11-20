@@ -44,7 +44,7 @@
 
 use libssz::SszEncode as _;
 
-use crate::beacon::bls;
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{
@@ -54,19 +54,19 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
-    get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
-    get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    PubkeyIndexCacheExt, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::capella::withdrawal_address;
 use crate::beacon::helpers::electra::{
-    compute_exit_epoch_and_update_churn, get_committee_indices,
+    compute_exit_epoch_and_update_churn, electra_attestation_signature_set, get_committee_indices,
     get_consolidation_churn_limit_for_fork, get_indexed_attestation, get_max_effective_balance,
     get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
     has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
-    initiate_validator_exit as electra_initiate_validator_exit, is_fully_withdrawable_validator,
-    is_partially_withdrawable_validator, is_valid_indexed_attestation, pending_queue_fields,
+    indexed_attestation_signature_set, initiate_validator_exit as electra_initiate_validator_exit,
+    is_fully_withdrawable_validator, is_partially_withdrawable_validator, pending_queue_fields,
     pending_queue_fields_ref,
 };
 use crate::beacon::helpers::math::integer_squareroot;
@@ -76,13 +76,17 @@ use crate::beacon::helpers::misc::{
 };
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
     WithdrawalIndex,
 };
+use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Local state projection
@@ -489,6 +493,8 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -528,17 +534,27 @@ pub fn process_voluntary_exit(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
-    verify(
-        bls::verify(
-            &validator.pubkey,
+    signatures.push(
+        SignatureSet::single(
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     // [Modified in Electra:EIP7251]
-    electra_initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
+    electra_initiate_validator_exit(
+        state,
+        voluntary_exit.validator_index,
+        config,
+        Some(active_balances),
+    )?;
     Ok(())
 }
 
@@ -560,8 +576,9 @@ pub fn process_bls_to_execution_change(
     state: &mut BeaconState,
     signed_change: &capella::SignedBLSToExecutionChange,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::capella::process_bls_to_execution_change(state, signed_change, config)
+    super::capella::process_bls_to_execution_change(state, signed_change, config, signatures)
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +603,8 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -594,20 +613,23 @@ pub fn process_attester_slashing(
         is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
         "is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_1),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_1),
         "is_valid_indexed_attestation(state, attestation_1)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_2),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_2),
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
+    // Before anyone is slashed on the strength of them.
+    signatures.verify_pending()?;
 
     super::operations::slash_attesting_index_intersection(
         state,
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -636,11 +658,18 @@ pub fn process_attester_slashing(
 /// Structured as the same two-phase read-then-write split altair's and
 /// deneb's versions use, and for the identical borrow-checker reason: see
 /// `crate::beacon::stf::altair::process_attestation`'s own documentation.
+///
+/// `proposer_index` is the caller's `get_beacon_proposer_index(state)`, as in
+/// altair's and deneb's versions and for the same reason: a block resolves it
+/// once for all its attestations (see [`process_operations`]).
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &electra::Attestation,
+    proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -710,8 +739,8 @@ pub fn process_attestation(
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        electra_attestation_signature_set(state, attestation, &indexed_attestation, committees),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -750,21 +779,27 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `is_valid_indexed_attestation` above refused any `attesting_indices` that
+    // is not strictly ascending, so the reader walks each leaf once rather than
+    // descending the tree for every attester.
+    let mut reader = participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -774,13 +809,15 @@ pub fn process_attestation(
             // `get_base_reward(state, index)` inlined against the hoisted
             // per-increment value above, keeping the helper's own order of
             // operations so the result is bit-identical.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (increments, _, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
             let reward = (increments * base_reward_per_increment)
@@ -792,8 +829,17 @@ pub fn process_attestation(
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (_, effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
+        }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -804,15 +850,20 @@ pub fn process_attestation(
         let mut fields = block_mut(state, "process_attestation")?;
         let participation_mut = fields.epoch_participation_mut(current_epoch_target);
         let participation_len = participation_mut.len();
-        for (index, new_flags) in updates {
-            let flags =
-                participation_mut
-                    .get_mut(index as usize)
-                    .ok_or(Error::IndexOutOfBounds {
-                        index: index as usize,
-                        len: participation_len,
-                    })?;
-            *flags |= new_flags;
+        // A blind write of `current_flags | new_flags`, which the read phase
+        // stored, rather than `|=` on the stored value. That is exact:
+        // `is_valid_indexed_attestation` above refused a repeated index, so
+        // each index is written once, and nothing writes this list between the
+        // read phase and here, so the stored value is still `current_flags`. It
+        // saves the tree descent `get_mut` makes to copy the old value into the
+        // write buffer.
+        for (index, flags) in updates {
+            if !participation_mut.set(index as usize, flags) {
+                return Err(Error::IndexOutOfBounds {
+                    index: index as usize,
+                    len: participation_len,
+                });
+            }
         }
     }
 
@@ -820,7 +871,6 @@ pub fn process_attestation(
     const PROPOSER_REWARD_DENOMINATOR: u64 =
         NON_PROPOSER_WEIGHT * constants::WEIGHT_DENOMINATOR / constants::PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / PROPOSER_REWARD_DENOMINATOR;
-    let proposer_index = get_beacon_proposer_index(state)?;
     increase_balance(state, proposer_index, proposer_reward)?;
 
     Ok(())
@@ -1188,15 +1238,23 @@ pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     for deposit in requests.deposits.iter() {
         process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        process_withdrawal_request(state, withdrawal, config)?;
+        process_withdrawal_request(state, withdrawal, config, active_balances, pubkey_indices)?;
     }
     for consolidation in requests.consolidations.iter() {
-        process_consolidation_request(state, consolidation, config)?;
+        process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     Ok(())
 }
@@ -1307,6 +1365,8 @@ pub fn process_withdrawal_request(
     state: &mut BeaconState,
     request: &electra::WithdrawalRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let amount = request.amount;
     let is_full_exit_request = amount == constants::FULL_EXIT_REQUEST_AMOUNT;
@@ -1321,11 +1381,7 @@ pub fn process_withdrawal_request(
         return Ok(());
     }
 
-    let Some(index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.validator_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(index) = pubkey_indices.validator_index(state, &request.validator_pubkey) else {
         return Ok(());
     };
     let validator = state.validator(index)?;
@@ -1360,7 +1416,7 @@ pub fn process_withdrawal_request(
         // queue; either way, a full exit request never falls through to the
         // partial-withdrawal logic below.
         if pending_balance_to_withdraw == 0 {
-            electra_initiate_validator_exit(state, index, config)?;
+            electra_initiate_validator_exit(state, index, config, Some(active_balances))?;
         }
         return Ok(());
     }
@@ -1388,7 +1444,8 @@ pub fn process_withdrawal_request(
                 "state.balances[index] - MIN_ACTIVATION_BALANCE - pending_balance_to_withdraw",
             ))?
             .min(amount);
-        let exit_queue_epoch = compute_exit_epoch_and_update_churn(state, to_withdraw, config)?;
+        let exit_queue_epoch =
+            compute_exit_epoch_and_update_churn(state, to_withdraw, config, Some(active_balances))?;
         let withdrawable_epoch = exit_queue_epoch
             .checked_add(config.min_validator_withdrawability_delay)
             .ok_or(Error::ArithmeticOverflow(
@@ -1410,9 +1467,12 @@ pub fn process_withdrawal_request(
 // Execution-layer consolidation requests
 // ---------------------------------------------------------------------------
 
-/// Whether `request` is really a request to switch its source (and only
-/// source) validator from an eth1 to a compounding withdrawal credential,
-/// disguised as a self-consolidation.
+/// The specification's `is_valid_switch_to_compounding_request`: whether
+/// `request` is really a request to switch its source (and only source)
+/// validator from an eth1 to a compounding withdrawal credential, disguised as
+/// a self-consolidation. Answers with the source's index when it is (`None`
+/// where the specification returns `False`), so the caller acting on it does
+/// not resolve the same pubkey a second time.
 ///
 /// A validator that already holds an eth1 credential has no other way to
 /// become compounding: [`crate::beacon::helpers::electra::switch_to_compounding_validator`]
@@ -1422,40 +1482,39 @@ pub fn process_withdrawal_request(
 /// functions; nothing inside can actually fail, since every condition here
 /// is itself one of the specification's own `return False` guards rather
 /// than an assertion.
-pub fn is_valid_switch_to_compounding_request(
+pub fn switch_to_compounding_source(
     state: &BeaconState,
     request: &electra::ConsolidationRequest,
-) -> Result<bool> {
+    pubkey_indices: &PubkeyIndexCache,
+) -> Result<Option<ValidatorIndex>> {
     if request.source_pubkey != request.target_pubkey {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let Some(source_validator) = state
-        .iter_validators()
-        .find(|validator| validator.pubkey == request.source_pubkey)
-    else {
-        return Ok(false);
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
+        return Ok(None);
     };
+    let source_validator = state.validator(source_index)?;
 
     if withdrawal_address(source_validator) != request.source_address {
-        return Ok(false);
+        return Ok(None);
     }
     if !has_eth1_withdrawal_credential(source_validator) {
-        return Ok(false);
+        return Ok(None);
     }
     if !is_active_validator(source_validator, get_current_epoch(state)) {
-        return Ok(false);
+        return Ok(None);
     }
     if source_validator.exit_epoch != FAR_FUTURE_EPOCH {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(true)
+    Ok(Some(source_index))
 }
 
 /// Honors (or quietly drops) an execution-layer-triggered consolidation
 /// (EIP-7251): either a switch-to-compounding request in disguise (see
-/// [`is_valid_switch_to_compounding_request`]), or a real merge of one
+/// [`switch_to_compounding_source`]), or a real merge of one
 /// validator's balance into another's.
 ///
 /// Every early return here, in both branches, is the specification's own
@@ -1476,17 +1535,10 @@ pub fn process_consolidation_request(
     state: &mut BeaconState,
     request: &electra::ConsolidationRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    if is_valid_switch_to_compounding_request(state, request)? {
-        // Already known to resolve, by the check just above; state has not
-        // been mutated since.
-        let source_index = state
-            .iter_validators()
-            .position(|validator| validator.pubkey == request.source_pubkey)
-            .map(|index| index as ValidatorIndex)
-            .ok_or(Error::SpecAssert(
-                "is_valid_switch_to_compounding_request already resolved consolidation_request.source_pubkey",
-            ))?;
+    if let Some(source_index) = switch_to_compounding_source(state, request, pubkey_indices)? {
         crate::beacon::helpers::electra::switch_to_compounding_validator(state, source_index)?;
         return Ok(());
     }
@@ -1504,22 +1556,16 @@ pub fn process_consolidation_request(
     if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
         return Ok(());
     }
-    if get_consolidation_churn_limit_for_fork(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
+    if get_consolidation_churn_limit_for_fork(state, config, Some(active_balances))?
+        <= preset::MIN_ACTIVATION_BALANCE
+    {
         return Ok(());
     }
 
-    let Some(source_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.source_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
         return Ok(());
     };
-    let Some(target_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.target_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(target_index) = pubkey_indices.validator_index(state, &request.target_pubkey) else {
         return Ok(());
     };
 
@@ -1568,6 +1614,7 @@ pub fn process_consolidation_request(
         state,
         source_effective_balance,
         config,
+        Some(active_balances),
     )?;
     let withdrawable_epoch = exit_epoch
         .checked_add(config.min_validator_withdrawability_delay)
@@ -1779,12 +1826,16 @@ pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec
 /// len(body.deposits) == 0`, unconditionally, with no `process_deposit` call
 /// at all), so it keeps its own copy, [`super::fulu::process_operations`],
 /// rather than calling this one.
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1802,28 +1853,70 @@ pub fn process_operations(
         verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
     }
 
-    for proposer_slashing in body.proposer_slashings.iter() {
-        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
-    }
-    for attester_slashing in body.attester_slashings.iter() {
-        process_attester_slashing(state, attester_slashing, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        body.proposer_slashings.iter(),
+        |slashing| {
+            super::operations::process_proposer_slashing(
+                state,
+                slashing,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        body.attester_slashings.iter(),
+        |slashing| process_attester_slashing(state, slashing, config, active_balances, signatures),
+    )?;
     // [Modified in Electra:EIP7549]
-    for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, committees, active_balances)?;
+    //
+    // One proposer lookup for the list, not one per attestation, timed with
+    // the attestations it serves: see the same loop in
+    // `super::operations::process_operations`.
+    if !body.attestations.is_empty() {
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in body.attestations.iter() {
+                process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                    target_delta,
+                    signatures,
+                )?;
+            }
+            Ok(())
+        })?;
     }
-    for deposit in body.deposits.iter() {
-        process_deposit(state, deposit, config)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, body.deposits.iter(), |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
     // [Modified in Electra:EIP7251]
-    for voluntary_exit in body.voluntary_exits.iter() {
-        process_voluntary_exit(state, voluntary_exit, config)?;
-    }
-    for signed_change in body.bls_to_execution_changes.iter() {
-        process_bls_to_execution_change(state, signed_change, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::VoluntaryExits,
+        body.voluntary_exits.iter(),
+        |exit| process_voluntary_exit(state, exit, config, active_balances, signatures),
+    )?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        body.bls_to_execution_changes.iter(),
+        |signed_change| process_bls_to_execution_change(state, signed_change, config, signatures),
+    )?;
     // [New in Electra:EIP6110:EIP7002:EIP7251]
-    process_execution_requests(state, &body.execution_requests, config)?;
+    timed(StfPhase::ExecutionRequests, || {
+        process_execution_requests(
+            state,
+            &body.execution_requests,
+            config,
+            active_balances,
+            pubkey_indices,
+        )
+    })?;
 
     Ok(())
 }
@@ -1845,28 +1938,50 @@ pub fn process_operations(
 /// them taking those fields directly rather than a whole body (see
 /// `crate::beacon::stf`'s module documentation). [`super::altair::process_sync_aggregate`]
 /// is reused the same way, for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body, config, engine)
+    })?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        caches.committees,
+        caches.active_balances,
+        caches.pubkey_indices,
+        options.target_delta,
+        signatures,
+    )?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+        signatures,
+    )?;
     Ok(())
 }
 
@@ -1944,8 +2059,14 @@ mod tests {
             validator_pubkey: BlsPubkey([0xff; 48]),
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("an unresolved pubkey is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("an unresolved pubkey is dropped silently, not rejected");
         assert_eq!(
             state, before,
             "no validator should have been touched for a pubkey nobody holds"
@@ -1966,8 +2087,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("a mismatched source address is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a mismatched source address is dropped silently, not rejected");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -1982,7 +2109,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
@@ -2040,8 +2174,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 1,
         };
-        process_withdrawal_request(&mut state, &partial_request, &config)
-            .expect("a full queue drops a partial request silently, not with an error");
+        process_withdrawal_request(
+            &mut state,
+            &partial_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops a partial request silently, not with an error");
         assert_eq!(
             block_mut(&mut state, "test assertion")
                 .unwrap()
@@ -2058,7 +2198,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2092,7 +2239,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2117,7 +2271,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2144,7 +2305,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2167,7 +2335,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert!(has_compounding_withdrawal_credential(
             state.validator(0).unwrap()
@@ -2196,8 +2371,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("neither branch applies, so this must be a silent no-op, not an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("neither branch applies, so this must be a silent no-op, not an error");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -2232,8 +2413,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("a full queue drops the request silently, not with an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops the request silently, not with an error");
 
         assert_eq!(
             pending_queue_fields(&mut state, "test assertion")
@@ -2280,7 +2467,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
@@ -2410,5 +2604,102 @@ mod tests {
         // Each element is longer than its type byte alone.
         assert!(list[0].len() > 1);
         assert!(list[1].len() > 1);
+    }
+
+    // -- process_attestation with warmed committee key sums -------------------
+
+    const ATTESTATION_LABEL: &str =
+        "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))";
+
+    /// An attestation for slot `SLOTS_PER_EPOCH - 1` of a state one epoch in,
+    /// signed by every member of its committee but the first two, so that the
+    /// majority rule subtracts when the sums are warm. `signed_message` is the
+    /// root the committee actually signs; a root other than the attestation's
+    /// own makes the signature bad.
+    fn attestation_for_the_last_slot_of_epoch_zero(
+        state: &BeaconState,
+        signed_message: Option<crate::beacon::primitives::Root>,
+    ) -> electra::Attestation {
+        use crate::beacon::helpers::accessors::{get_beacon_committee, get_domain};
+        use crate::beacon::helpers::misc::compute_signing_root;
+        use crate::beacon::helpers::test_state::sign_for;
+
+        let slot = preset::SLOTS_PER_EPOCH - 1;
+        let committee = get_beacon_committee(state, slot, 0).unwrap();
+        let data = AttestationData {
+            slot,
+            ..Default::default()
+        };
+        let domain = get_domain(state, constants::DOMAIN_BEACON_ATTESTER, Some(0));
+        let root =
+            signed_message.unwrap_or_else(|| compute_signing_root(data.hash_tree_root(), domain));
+
+        let mut aggregation_bits = electra::AggregationBits::with_length(committee.len()).unwrap();
+        let mut signatures = Vec::new();
+        for (position, member) in committee.iter().enumerate().skip(2) {
+            aggregation_bits.set(position, true).unwrap();
+            signatures.push(sign_for(*member as usize, root));
+        }
+        let mut committee_bits = electra::CommitteeBits::default();
+        committee_bits.set(0, true).unwrap();
+        electra::Attestation {
+            aggregation_bits,
+            data,
+            signature: bls::aggregate(&signatures).unwrap(),
+            committee_bits,
+        }
+    }
+
+    fn run_attestation(
+        mut state: BeaconState,
+        attestation: &electra::Attestation,
+        committees: &CommitteeCache,
+    ) -> Result<BeaconState> {
+        let mut signatures = SignatureBatch::new();
+        // Looked up here as a block's `process_operations` does once for all
+        // its attestations.
+        let proposer_index = crate::beacon::helpers::accessors::get_beacon_proposer_index(&state)?;
+        process_attestation(
+            &mut state,
+            attestation,
+            proposer_index,
+            committees,
+            &ActiveBalanceCache::default(),
+            None,
+            &mut signatures,
+        )?;
+        signatures.verify()?;
+        state.apply_pending_mutations();
+        Ok(state)
+    }
+
+    /// A good attestation reaches the same post-state whether the key sums are
+    /// cold or warm, and a bad signature is refused under the attestation's
+    /// own label either way, so the warm path rejects what the cold one does.
+    #[test]
+    fn warm_key_sums_change_no_verdict_and_no_post_state() {
+        let state =
+            crate::beacon::helpers::test_state::with_signing_validators_at(ForkName::Electra, 1024);
+        let epoch = get_previous_epoch(&state);
+        let warm = CommitteeCache::default();
+        warm.warm_key_sums(&state, epoch);
+        assert!(warm.key_sums(&state, epoch).is_some(), "sums are warm");
+        let cold = CommitteeCache::default();
+
+        let good = attestation_for_the_last_slot_of_epoch_zero(&state, None);
+        let cold_state = run_attestation(state.clone(), &good, &cold).unwrap();
+        let warm_state = run_attestation(state.clone(), &good, &warm).unwrap();
+        assert_eq!(cold_state.hash_tree_root(), warm_state.hash_tree_root());
+        assert_ne!(cold_state.hash_tree_root(), state.hash_tree_root());
+
+        let wrong_root = crate::beacon::primitives::Root::repeat_byte(0x5a);
+        let bad = attestation_for_the_last_slot_of_epoch_zero(&state, Some(wrong_root));
+        for committees in [&cold, &warm] {
+            let err = run_attestation(state.clone(), &bad, committees).unwrap_err();
+            assert!(
+                format!("{err:?}").contains(ATTESTATION_LABEL),
+                "unexpected rejection {err:?}"
+            );
+        }
     }
 }

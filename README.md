@@ -36,8 +36,6 @@ mv ethlambda-linux-x86_64 ethlambda && mv ethrex-linux-x86_64 ethrex
 ./ethlambda --version && ./ethrex --version
 
 mkdir -p beacon-data ethrex-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # The secret both clients authenticate the Engine API with
 openssl rand -hex 32 > jwt.hex
 
@@ -51,7 +49,6 @@ openssl rand -hex 32 > jwt.hex
 ./ethlambda beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               beacon-data/node-key \
   --data-dir               beacon-data/db \
   --discovery.advertise-ip "$(curl -s https://ifconfig.me)" \
   --execution-endpoint     http://127.0.0.1:8551 \
@@ -63,8 +60,9 @@ it the node advertises `0.0.0.0` and logs a warning. It still dials out and
 follows the chain, but peers cannot reach it until discovery learns the address
 from their replies. The Beacon API binds `127.0.0.1:5052` by default, so
 `--http-address` is only needed to reach it from another host. Stop the node
-with `Ctrl+C`; it shuts down gracefully on SIGINT only, so a systemd unit needs
-`KillSignal=SIGINT`.
+with `Ctrl+C`. v1.0.0 shuts down gracefully on SIGINT only, so a systemd unit
+running it needs `KillSignal=SIGINT`; later versions handle SIGTERM, systemd's
+default, too.
 
 - `ethlambda-linux-x86_64` targets x86-64-v3, so it needs a CPU with AVX2
   (Haswell or later), and glibc 2.35 or newer.
@@ -134,8 +132,6 @@ docker pull ghcr.io/lambdaclass/ethlambda:latest
 docker pull ghcr.io/lambdaclass/ethrex
 
 mkdir -p beacon-data ethrex-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # The secret both clients authenticate the Engine API with
 openssl rand -hex 32 > jwt.hex
 # This host's public address, published in the node's ENR (see above)
@@ -155,7 +151,8 @@ docker run -d --name ethrex --network ethereum \
   --authrpc.addr      0.0.0.0 \
   --authrpc.jwtsecret /jwt.hex
 
-# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# v1.0.0 shuts down gracefully on SIGINT only (later versions handle SIGTERM too), so
+# `--stop-signal` makes `docker stop` send SIGINT rather than SIGTERM.
 # Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
 # unflushed state is lost, so `--stop-timeout` gives it a minute.
 docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --stop-timeout 60 \
@@ -166,7 +163,6 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --
   ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               /data/node-key \
   --data-dir               /data/db \
   --http-address           0.0.0.0 \
   --discovery.advertise-ip "$PUBLIC_IP" \
@@ -184,12 +180,11 @@ and no `--execution-*` flags.
 docker pull ghcr.io/lambdaclass/ethlambda:latest
 
 mkdir -p beacon-data
-# A persisted key keeps the node's identity, and so its custody set, stable across restarts
-openssl rand -hex 32 > beacon-data/node-key
 # This host's public address, published in the node's ENR (see above)
 PUBLIC_IP=$(curl -s https://ifconfig.me)
 
-# The node shuts down gracefully on SIGINT only, so `--stop-signal` makes `docker stop` send it.
+# v1.0.0 shuts down gracefully on SIGINT only (later versions handle SIGTERM too), so
+# `--stop-signal` makes `docker stop` send SIGINT rather than SIGTERM.
 # Flushing its state can outlast Docker's default 10 s, after which Docker kills it and the
 # unflushed state is lost, so `--stop-timeout` gives it a minute.
 docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
@@ -199,7 +194,6 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   ghcr.io/lambdaclass/ethlambda:latest beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
-  --node-key               /data/node-key \
   --data-dir               /data/db \
   --http-address           0.0.0.0 \
   --discovery.advertise-ip "$PUBLIC_IP"
@@ -302,7 +296,6 @@ what they sign.
 ./target/release/ethlambda beacon \
   --network             mainnet \
   --checkpoint-sync-url <beacon-api-url> \
-  --node-key            ./node-key \
   --data-dir            ./data
 ```
 
@@ -310,8 +303,9 @@ what they sign.
 |---|---|
 | `--network` | `mainnet` (default), `sepolia`, `hoodi`, `plataberget`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
 | `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
-| `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
+| `--node-key` | Optional. Without it, the node generates a key on the data directory's first start and keeps it there as `node.key`, so its identity, and with it the columns it custodies, stays the same across restarts |
 | `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
+| `--builder` | Optional builder API endpoint, normally MEV-Boost. With it, a fulu proposal from a validator registered through this node gets a blinded block when the builder's bid wins; without it every block is built locally |
 
 A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`
 and bootnode list, and the two genesis values the fork digest is computed from,
@@ -337,9 +331,10 @@ endpoints.
 
 A separate process that holds the keys and performs the duties: attestations,
 block proposals, aggregation, sync committee messages and, from Gloas on, the
-payload envelope and the payload timeliness vote. It talks to a beacon node over
-the standard Beacon API, so it works against `ethlambda beacon` (run with the
-`--execution-*` flags) or any other conformant beacon node.
+payload envelope, proposer preferences and the payload timeliness vote. It
+talks to a beacon node over the standard Beacon API, so it works against
+`ethlambda beacon` (run with the `--execution-*` flags) or any other conformant
+beacon node.
 
 > **Slashing protection:** every block and attestation is checked against a
 > durable per-validator record in `--validators-dir` before it is signed, and a
@@ -368,6 +363,8 @@ the standard Beacon API, so it works against `ethlambda beacon` (run with the
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
 | `--graffiti` | Text for proposed blocks, at most 32 bytes |
+| `--gas-limit` | The gas limit validators target (default `60000000`). From gloas the beacon node builds this client's own payloads toward it, so set it on a network whose limit is elsewhere. Sepolia and Platåberget schedule `200000000`: pass `--gas-limit 200000000` there (until [#795](https://github.com/lambdaclass/ethlambda/issues/795)) |
+| `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, a node that cannot build the payload itself may build on a builder's p2p bid, and that block is signed |
 | `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
 
 Metrics are served on `--metrics-port` (default `5064`). See
@@ -502,7 +499,7 @@ We have a proof-of-concept formalization of a part of the state transition funct
 
 ## Community
 
-- **Telegram**: [ethlambda group](https://t.me/lambdaconsensus), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **Telegram**: [ethlambda group](https://t.me/ethlambda), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
 - **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
 - **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
 - **Ecosystem coordination**: the [PQ Interop calls](https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle) on `ethereum/pm` cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.

@@ -132,7 +132,11 @@ pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage
         Some(compute_epoch_at_slot(data.slot)),
     );
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
-    if !bls::verify(&validator.pubkey, signing_root, &message.signature) {
+    let validator = bls::IndexedPubkey {
+        index: validator_index,
+        pubkey: validator.pubkey,
+    };
+    if !bls::verify(&validator, signing_root, &message.signature) {
         return Outcome::Reject(RejectReason::BadSignature);
     }
     Outcome::Accept

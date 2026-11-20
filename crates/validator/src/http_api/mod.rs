@@ -12,18 +12,24 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::Error;
+use crate::beacon_node::BeaconNodeApi;
 use crate::proposer_settings::ProposerSettings;
 use crate::secure_fs;
+use crate::signing::SigningContext;
+use crate::slot_clock::SlotClock;
 
 pub mod keystores;
 pub mod proposer;
+pub mod remotekeys;
+pub mod voluntary_exit;
 
 pub use keystores::SharedStore;
 
@@ -40,7 +46,7 @@ pub struct KeymanagerContext {
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     /// Serializes the open-mutate-save cycle over the validator definitions
-    /// file across concurrent import/delete requests.
+    /// file across concurrent import, delete and proposer-settings requests.
     ///
     /// `store`'s `RwLock` does not close this on its own: an import or delete
     /// takes a fresh [`crate::keys::ValidatorDefinitions`] snapshot from disk
@@ -52,12 +58,31 @@ pub struct KeymanagerContext {
     /// each handler across its entire read-modify-write cycle (not just
     /// `store`), is what actually orders those cycles.
     ///
-    /// Guards the file only, never `store`: holding it across the slow
-    /// EIP-2335 key derivation an import performs must not stall the duty
-    /// loop, which only ever waits on `store`. Where a handler needs both,
-    /// it takes this one first and `store` second, consistently, so the two
-    /// never deadlock against each other.
+    /// Every keymanager handler that changes the store or the file holds it
+    /// until both changes are done, so the two are always judged and changed
+    /// together: a handler that released it between writing the file and
+    /// inserting into the store would let a concurrent delete land in the
+    /// gap and leave memory and disk disagreeing.
+    ///
+    /// The duty loop never takes it, so holding it across the slow EIP-2335
+    /// key derivation an import performs stalls only other keymanager
+    /// requests, a `feerecipient`, `graffiti` or `gas_limit` call among
+    /// them: one made during a full import waits for the import to finish.
+    /// Where a handler needs both, it takes this one first and
+    /// `store` second, consistently, so the two never deadlock against each
+    /// other, and it holds `store` only for in-memory work, never across file
+    /// I/O or the derivation.
     pub definitions_lock: Arc<Mutex<()>>,
+    /// `--web3signer-url`: the signer a remote key imported without a `url`
+    /// of its own is assigned to. `None` makes such an import an error.
+    pub default_remote_signer: Option<String>,
+    /// Where the `voluntary_exit` route resolves a key's validator index.
+    pub beacon_node: Arc<dyn BeaconNodeApi>,
+    /// What the `voluntary_exit` route signs with.
+    pub signing: Arc<SigningContext>,
+    /// What the `voluntary_exit` route reads the current epoch from when the
+    /// caller names none.
+    pub clock: SlotClock,
     /// Whether the last save of the definitions file replaced it without
     /// flushing the directory, so its last change may not survive a power
     /// loss. Set and cleared by `keystores::save_definitions`; read where a
@@ -143,6 +168,12 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
                 .delete(keystores::delete),
         )
         .route(
+            "/eth/v1/remotekeys",
+            get(remotekeys::list)
+                .post(remotekeys::import)
+                .delete(remotekeys::delete),
+        )
+        .route(
             "/eth/v1/validator/{pubkey}/feerecipient",
             get(proposer::get_fee_recipient)
                 .post(proposer::set_fee_recipient)
@@ -160,6 +191,10 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
                 .post(proposer::set_gas_limit)
                 .delete(proposer::delete_gas_limit),
         )
+        .route(
+            "/eth/v1/validator/{pubkey}/voluntary_exit",
+            post(voluntary_exit::create_signed_voluntary_exit),
+        )
         .with_state(context)
         .layer(middleware::from_fn(require_bearer))
         .layer(Extension(ApiToken(token)))
@@ -172,6 +207,25 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
 
 /// The largest request body the keymanager API reads.
 const KEYMANAGER_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Serve the keymanager API on `listener` until `shutdown` is cancelled, then
+/// stop accepting requests and return once the ones in flight have answered.
+///
+/// Stopping that way matters to an import. It saves its keys before it
+/// registers them, and takes them off disk again if the registration fails
+/// (see [`keystores::import`]). Dropped in between, as it would be if the
+/// runtime went away under it, it leaves keys that are saved and enabled with
+/// no slashing-protection record, which the next start refuses, and the start
+/// after that.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+}
 
 #[derive(Clone)]
 struct ApiToken(String);
@@ -224,8 +278,27 @@ async fn require_bearer(request: Request, next: Next) -> Response {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The three `voluntary_exit` fields for a test that is not about that
+    /// route: a mock node resolving no validator, mainnet's schedule and a
+    /// clock started at the Unix epoch.
+    pub(crate) fn exit_route_context() -> (Arc<dyn BeaconNodeApi>, Arc<SigningContext>, SlotClock) {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::Root;
+
+        let config = Config::mainnet();
+        let clock = SlotClock::from_config(0, &config);
+        let signing = Arc::new(SigningContext::new(config, Root::ZERO));
+        let node = Arc::new(crate::beacon_node::mock::MockBeaconNode::new());
+        (node, signing, clock)
+    }
+}
+
 #[cfg(all(test, unix))]
-mod tests {
+mod token_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 

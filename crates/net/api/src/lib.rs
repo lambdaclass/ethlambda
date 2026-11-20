@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use ethlambda_types::{
@@ -515,6 +516,168 @@ impl MetaDataController {
     }
 }
 
+/// Which side opened a peer's first connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerDirection {
+    /// The remote dialed us.
+    Inbound,
+    /// We dialed the remote.
+    Outbound,
+}
+
+impl PeerDirection {
+    /// The value the Beacon API's `Peer.direction` carries.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+/// One connected peer, as the Beacon API's `/eth/v1/node/peers` reports it.
+///
+/// Strings rather than libp2p types, so this crate stays free of libp2p.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectedPeer {
+    /// The peer's libp2p id, base58.
+    pub peer_id: String,
+    pub direction: PeerDirection,
+    /// The remote address of the connection that made the peer connected,
+    /// ending in `/p2p/<peer id>`. Set on the first connection and not updated
+    /// by later ones; for an inbound peer it is the remote's ephemeral source
+    /// port, not an address to dial.
+    pub last_seen_p2p_address: String,
+    /// The peer's `enr:`-prefixed record, when discovery supplied one: the dial
+    /// loop keeps it by peer id for every peer it dials, so a peer that
+    /// connected inbound first still carries it if we had discovered it too.
+    /// `None` otherwise; no request is made to fetch one.
+    pub enr: Option<String>,
+}
+
+/// Shared, runtime-readable table of the peers this node is connected to.
+///
+/// The p2p layer is the sole writer: it inserts a peer when its first
+/// connection is established and removes it when its last one closes, so only
+/// connected peers are ever in the table. The Beacon API's
+/// `/eth/v1/node/peers` clones the handle and reads it at request time.
+///
+/// A poisoned lock is recovered rather than unwrapped: every critical section
+/// is a single map call, so a panic while it was held cannot leave the map
+/// half-updated, and refusing it would take the p2p actor and every peers
+/// request down with it.
+#[derive(Clone, Debug, Default)]
+pub struct PeerTableController {
+    peers: Arc<RwLock<HashMap<String, ConnectedPeer>>>,
+}
+
+impl PeerTableController {
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<String, ConnectedPeer>> {
+        self.peers.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<String, ConnectedPeer>> {
+        self.peers.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a peer as connected, replacing any earlier entry for it.
+    pub fn insert(&self, peer: ConnectedPeer) {
+        self.write().insert(peer.peer_id.clone(), peer);
+    }
+
+    /// Drop a peer that no longer holds a connection.
+    pub fn remove(&self, peer_id: &str) {
+        self.write().remove(peer_id);
+    }
+
+    /// One connected peer, if it is.
+    pub fn get(&self, peer_id: &str) -> Option<ConnectedPeer> {
+        self.read().get(peer_id).cloned()
+    }
+
+    /// How many peers are connected, without copying the table.
+    pub fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    /// Whether no peer is connected.
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Every connected peer, ordered by peer id so a response is stable
+    /// between polls.
+    pub fn snapshot(&self) -> Vec<ConnectedPeer> {
+        let mut peers: Vec<_> = self.read().values().cloned().collect();
+        peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        peers
+    }
+}
+
+#[cfg(test)]
+mod peer_table_tests {
+    use super::*;
+
+    fn peer(id: &str, direction: PeerDirection) -> ConnectedPeer {
+        ConnectedPeer {
+            peer_id: id.to_string(),
+            direction,
+            last_seen_p2p_address: format!("/ip4/10.0.0.1/tcp/9000/p2p/{id}"),
+            enr: None,
+        }
+    }
+
+    #[test]
+    fn a_peer_is_present_from_insert_until_remove() {
+        let table = PeerTableController::default();
+        table.insert(peer("b", PeerDirection::Inbound));
+        assert_eq!(table.get("b").unwrap().direction, PeerDirection::Inbound);
+        assert_eq!(table.len(), 1);
+
+        table.remove("b");
+        assert!(table.get("b").is_none());
+        assert!(table.snapshot().is_empty());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn a_poisoned_table_still_reads_and_writes() {
+        let table = PeerTableController::default();
+        table.insert(peer("a", PeerDirection::Inbound));
+        let poisoner = table.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.peers.write().unwrap();
+            panic!("poison the peer table lock");
+        })
+        .join();
+        assert!(table.peers.is_poisoned());
+
+        assert_eq!(table.len(), 1);
+        table.insert(peer("b", PeerDirection::Outbound));
+        assert_eq!(table.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn inserting_twice_keeps_one_entry_with_the_latest_value() {
+        let table = PeerTableController::default();
+        table.insert(peer("a", PeerDirection::Inbound));
+        table.insert(peer("a", PeerDirection::Outbound));
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].direction, PeerDirection::Outbound);
+    }
+
+    #[test]
+    fn the_snapshot_is_ordered_by_peer_id_and_shared_between_clones() {
+        let table = PeerTableController::default();
+        let reader = table.clone();
+        table.insert(peer("c", PeerDirection::Outbound));
+        table.insert(peer("a", PeerDirection::Inbound));
+        let ids: Vec<_> = reader.snapshot().into_iter().map(|p| p.peer_id).collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
+}
+
 // --- Init messages ---
 // Used to wire actors together after spawn.
 
@@ -532,4 +695,54 @@ pub struct InitBlockChain {
 }
 impl Message for InitBlockChain {
     type Result = ();
+}
+
+// --- Sink: P2P -> event stream ---
+
+/// A gloas gossip object that passed its topic's validation inside
+/// `ethlambda-p2p`, for the Beacon API's event stream.
+///
+/// These are the topics whose objects never reach the chain actor, which is
+/// the event bus's usual publisher: bids and proposer preferences are
+/// validated and kept in the p2p layer's `BuilderMarket`, and a payload
+/// attestation message is pooled there. Carrying only what each event shows
+/// keeps the sink free of a dependency on the blockchain crate, which owns
+/// the bus.
+#[derive(Clone, Debug)]
+pub enum GossipEvent {
+    /// An `execution_payload` envelope passed gossip validation. Only the
+    /// fields the event shows are carried, since the envelope itself holds a
+    /// whole execution payload.
+    ExecutionPayloadGossip {
+        slot: u64,
+        builder_index: u64,
+        block_hash: H256,
+        block_root: H256,
+    },
+    /// An `execution_payload_bid` passed gossip validation.
+    ExecutionPayloadBid(Box<SignedExecutionPayloadBid>),
+    /// A `payload_attestation_message` passed gossip validation.
+    PayloadAttestationMessage(PayloadAttestationMessage),
+    /// A `proposer_preferences` message passed gossip validation.
+    ProposerPreferences(Box<SignedProposerPreferences>),
+    /// A `beacon_attestation_{subnet_id}` single attestation passed gossip
+    /// validation (the `single_attestation` event). Boxed because the bus
+    /// moves the box as is into its `ChainEvent::SingleAttestation`, the
+    /// element its ring stores, which is boxed to keep that ring's slots
+    /// small.
+    SingleAttestation(Box<SingleAttestation>),
+}
+
+/// Where `ethlambda-p2p` reports [`GossipEvent`]s.
+///
+/// Implemented by the event bus in `ethlambda-blockchain`, so the p2p layer
+/// can feed `/eth/v1/events` without depending on the crate that owns it.
+/// Best-effort like the bus itself: `emit` never blocks and never fails.
+pub trait GossipEventSink: Send + Sync {
+    /// Whether anything listens. Asked before building a payload that costs
+    /// a clone, so a node nobody subscribes to pays nothing.
+    fn has_subscribers(&self) -> bool;
+
+    /// Publish `event` to every current subscriber.
+    fn emit(&self, event: GossipEvent);
 }

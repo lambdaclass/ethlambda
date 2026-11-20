@@ -24,34 +24,39 @@ use ethlambda_types::{
 /// [`ForkName::Lean`]'s selector is not a variant index, so the byte must go
 /// back through [`ForkName::from_selector`] rather than being cast.
 pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(state.fork_name().selector());
-    bytes.extend_from_slice(&state.to_ssz());
+    // Encoded straight into the tagged buffer: the state writer runs this on
+    // every import, and a separate `Vec` would hold two copies of a mainnet
+    // state at once. `ssz_append` reserves its own room past the tag.
+    let mut bytes = vec![state.fork_name().selector()];
+    state.ssz_append(&mut bytes);
     bytes
 }
 
 /// The inverse of [`encode_state_value`].
 ///
-/// Panics on a value this build cannot tag-decode, matching every other state
-/// and block read in the crate:
+/// `Err` names what is wrong with a value this build cannot tag-decode.
 /// [`Store::from_db_state`](crate::store::Store::from_db_state) has already
-/// rejected a directory of the wrong format version, so anything reaching
-/// here is corruption rather than an old database.
-pub(crate) fn decode_state_value(bytes: &[u8]) -> BeaconState {
-    let (tag, ssz) = bytes.split_first().expect("value is never empty");
-    let fork = ForkName::from_selector(*tag).expect("value carries a known fork selector");
-    BeaconState::from_ssz(fork, ssz).expect("valid state value")
+/// rejected a directory of the wrong format version, so anything failing
+/// here is corruption rather than an old database. The caller knows which
+/// root it was reading and turns this into
+/// [`Error::CorruptState`](crate::error::Error::CorruptState).
+pub(crate) fn decode_state_value(bytes: &[u8]) -> Result<BeaconState, String> {
+    let (tag, ssz) = bytes.split_first().ok_or("the value is empty")?;
+    let fork =
+        ForkName::from_selector(*tag).ok_or_else(|| format!("unknown fork selector {tag}"))?;
+    BeaconState::from_ssz(fork, ssz).map_err(|err| format!("not a valid {fork} state: {err}"))
 }
 
 /// [`decode_state_value`] for the lean reader, which has no beacon shape to do
-/// anything with.
-pub(crate) fn decode_lean_state_value(bytes: &[u8]) -> State {
-    match decode_state_value(bytes) {
-        BeaconState::Lean(state) => state,
-        beacon => panic!(
-            "lean read a {} state out of the States table; a data directory holds one chain",
+/// anything with: a beacon value in a lean directory is as corrupt as one
+/// that does not decode, since a data directory holds one chain.
+pub(crate) fn decode_lean_state_value(bytes: &[u8]) -> Result<State, String> {
+    match decode_state_value(bytes)? {
+        BeaconState::Lean(state) => Ok(state),
+        beacon => Err(format!(
+            "a {} state in a lean directory",
             beacon.fork_name()
-        ),
+        )),
     }
 }
 
@@ -63,7 +68,28 @@ mod tests {
     fn a_tagged_state_value_round_trips() {
         let state = BeaconState::Lean(State::from_genesis(7, vec![]));
         let bytes = encode_state_value(&state);
-        assert_eq!(decode_state_value(&bytes), state);
+        assert_eq!(decode_state_value(&bytes), Ok(state));
+    }
+
+    #[test]
+    fn a_beacon_state_value_is_its_tag_then_its_ssz_in_one_buffer() {
+        let electra = crate::beacon_state_delta::tests::electra_state_with_validators(64);
+        let state = BeaconState::Electra(electra);
+        let bytes = encode_state_value(&state);
+
+        assert_eq!(bytes[0], ForkName::Electra.selector());
+        assert_eq!(bytes[1..], state.to_ssz());
+        // The buffer holds `ssz_append`'s headroom, so the encoding went into
+        // it directly rather than being made apart and copied in (which would
+        // size it to the encoding alone). That the headroom suffices, so the
+        // append never regrows the buffer, is state_transition's
+        // `ssz_append_never_regrows_a_buffer_with_its_capacity_to_spare`.
+        let tag_and_headroom = 1 + state.ssz_append_capacity();
+        assert!(
+            bytes.capacity() >= tag_and_headroom,
+            "the encoding was not appended in place"
+        );
+        assert_eq!(decode_state_value(&bytes), Ok(state));
     }
 
     #[test]

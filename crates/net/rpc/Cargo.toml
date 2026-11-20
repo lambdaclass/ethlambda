@@ -11,6 +11,9 @@ version.workspace = true
 
 [dependencies]
 axum = "0.8.1"
+# Peer-id validation for /eth/v1/node/peers/{peer_id}; already in the tree
+# through libp2p, which this crate does not depend on.
+bs58 = "0.5.1"
 tokio = { workspace = true, features = ["macros", "time"] }
 tokio-util.workspace = true
 ethlambda-blockchain.workspace = true
@@ -30,6 +33,8 @@ serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true
 jemalloc_pprof.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
 futures-util = "0.3"
 # `/metrics` appends the actor runtime's series (the `metrics` feature).
 spawned-concurrency.workspace = true

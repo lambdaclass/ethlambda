@@ -183,7 +183,10 @@ operation topics. A
 mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
 TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
-own rather than sharing the block and column one. Accept propagates the
+own rather than sharing the block and column one. Each pool's occupancy,
+refusals and blocking-pool queue delay are metrics, with the queries that tell
+whether validation competes with block import: see "Validation contention" in
+[`metrics.md`](metrics.md). Accept propagates the
 message; a message whose dependency is not ready yet is IGNOREd. See
 [Aggregate attestations](#aggregate-attestations) for the two topics with
 their own section.
@@ -319,6 +322,44 @@ validators, P3 off) until the first refresh, which runs at startup. Every 10
 s the swarm task disconnects peers below the graylist. There is no ban list:
 a peer's negative score is kept for `retain_score` (100 epochs) after it
 leaves, so a peer that reconnects comes back graylisted and is dropped again.
+
+The same check also disconnects a peer gossipsub reported as slow (`SlowPeer`:
+its send queue refused a message, or a message expired in it) in each of the
+last `SLOW_PEER_CHECK_LIMIT` checks. This is for a dead gossipsub stream, not
+for slowness in general. The connection handler disables itself for good after
+a few substream negotiations on one connection, successful ones included, and
+then never takes another message off the queue. Gossipsub keeps queueing for
+the peer until the queue is full, and a queued message is only dropped when
+the handler takes it off, so the queue's message copies stay in memory for as
+long as other protocols keep the connection open. On the mainnet follower,
+such queues held about 490 MB. Gossipsub's own penalty for these failures
+(`slow_peer_weight`) left the peer in the `negative` band, never near the
+graylist. Lighthouse penalizes `SlowPeer` reports through its peer manager
+instead.
+
+Two limits keep a slow node of our own from costing it its peers. Gossipsub
+counts a forward that waited too long in a peer's queue as the same failure as
+a full queue, so a saturated uplink or a stalled runtime on our side makes
+every peer look slow at once:
+
+- A report counts only when its priority or its non-priority failures exceed
+  `SLOW_PEER_REPORT_THRESHOLD`. Lighthouse applies the same cut. A dead stream
+  fails every message queued for the peer; a few failures in a heartbeat are
+  more likely late forwards.
+- One check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers,
+  the ones with the most failed messages first. The others keep their streak,
+  so a peer still failing at the next check is disconnected then. Peers held
+  back this way are logged as a warning, since many peers failing together
+  points at our side.
+
+The cap bounds the rate, not the total. A node whose own uplink stays too slow
+for gossip past the streak still loses up to `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK`
+peers per check while discovery refills them. That case is deliberately left
+alone: bandwidth that slow is not something the node can solve from its side.
+
+A dead stream on a peer that gets little traffic, such as one gossipsub has
+already pruned from the mesh, may stay under the threshold. Its queue then
+stays pinned until the connection closes, as it did before this check existed.
 
 Around a fork-digest boundary the node holds two digests' topics, and every
 held digest gets the whole parameter set (exits and slashings included),
@@ -638,6 +679,56 @@ NUMBER_OF_COLUMNS`) bounds what one request may ask for; an answer over that
 is truncated, not refused, matching how the block protocols treat a peer
 built to an older, wider ceiling.
 
+*Checking* what arrives over req/resp, and what gossip left unjudged, is
+`beacon/column_checks.rs`. The sidecars of one call are grouped by block (a
+fulu sidecar's signed header root, a gloas sidecar's `beacon_block_root`),
+keeping the first sidecar of each block and column index: an honest answer
+never repeats one, a faulty one's repeats are dropped unjudged and counted as
+`already_seen`, and that bounds what one block can send to the KZG proofs at
+`NUMBER_OF_COLUMNS` sidecars. Each group is then checked in two stages, on
+`column_check_permits` permits.
+
+First, every rule before the KZG proofs, sidecar by sidecar on one thread, in
+the order `chain_checks` has always run them (`ChainPrechecks`). The rules that
+read only what the block's sidecars share run once for the group, when the
+first sidecar gets that far: for fulu, everything judged against the signed
+header (the parent's post-state, or the head-state signature check before
+parking, then `NotAfterParent`, the signature, the proposer and the finalized
+ancestry), remembered under the header's root and signature, so a forged
+signature is judged on its own; for gloas, the lookup and decode of the block
+the sidecar names. The sidecars this settles, parked or dropped, are forwarded
+at once.
+
+Second, the proofs of every sidecar still standing, in near-equal sub-batches
+of at most 16 columns (`KZG_BATCH_COLUMNS`), each one
+`verify_cell_kzg_proof_batch` call (`kzg_verdicts`) on a permit of its own, the
+first on the group's. The proofs are the last rule on this path, so each
+sidecar's verdict is the one it would have had alone. A batch that fails says
+nothing about which sidecar is at fault, so each of its sidecars is verified
+again by itself and only the ones that fail are rejected. A block's kept
+sidecars go to the chain actor as one batch once its last sub-batch is back,
+not when the whole call is. Gossip keeps one message, one verdict, and is not
+batched.
+
+The sub-batch size trades wall-clock against CPU. Measured locally at 9 blobs
+(`bench_kzg_batch_against_separate_calls`), one column's proofs take 3.2 ms, a
+batch of 8 columns 7.9 ms, of 16 12.6 ms, and of 128 73 ms, each on one
+thread. Computed from those, assuming free permits and cores: a node's 8
+sampled columns are one batch, taking 7.9 ms of wall-clock and 7.9 ms of CPU,
+where eight separate checks running side by side would take 3.2 ms of
+wall-clock but 25.8 ms of CPU between them, so the batch is slower to finish
+for a third of the CPU. A supernode's 128 are 8 sub-batches, about 13 ms of
+wall-clock against 73 ms as one batch and 26 ms as separate checks, for 101 ms
+of CPU against 73 ms and 414 ms. A permit is held for one group's prechecks
+and first sub-batch, or for one further sub-batch, so a block's proofs never
+hold one permit from first column to last; the prechecks' share of a hold
+runs the group's sidecars in turn and is not measured on its own:
+`lean_beacon_validation_run_seconds{kind="column_check"}` times the prechecks
+and the KZG sub-batches together (see "Validation contention" in
+[`metrics.md`](metrics.md)). The envelope checks
+that share the pool wait in arrival order behind only what was queued before
+them.
+
 *Asking* happens on two paths, bulk and per block.
 
 The bulk one rides with range sync: every `BeaconBlocksByRange` batch sends a
@@ -682,11 +773,19 @@ hits this on every held block, and without it such a follower imported
 roughly one block per slot, waiting out the redrive below for a request
 gossip was never going to answer. Either way, `redrive_held_blocks` runs on
 every slot tick: for each block still held it sends the same request for
-exactly the columns still missing, with
-`MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`, a
-peer that has already failed this lookup excluded until the whole pool is
-exhausted. A lookup that runs out of peers or
-retries stops asking until the next tick asks again; see
+exactly the columns still missing. One lookup is split across peers, and each
+request settles on its own once its answer has been through the chain checks:
+what passed leaves the lookup, and what the peer left out is asked again at
+once, without waiting for the lookup's other requests, with
+`MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`.
+Only a request that left something out spends an attempt. A peer whose request
+failed, or that sent a sidecar the checks refused, is not asked again in that
+lookup. A peer that answered without a column is asked for it again only
+while the block is at the tip (it may not have received the column yet), and
+then after every other candidate; past the tip it is not. Before a
+retry asks, the columns the store already holds (gossip often delivers them
+meanwhile) are taken off. A lookup that runs out of retries, or has nobody
+left to ask, stops asking until the next tick asks again; see
 `lean_data_column_fetch_failures_total` in [metrics.md](./metrics.md). The
 block is released the moment its last missing column arrives, and dropped
 along with any pending descendants once finality passes its slot, whichever
@@ -701,8 +800,12 @@ the spec's own observation that "due to the deterministic custody functions, a
 node knows exactly what a peer should be able to respond to". The count comes
 from `metadata/3`, requested once per connection right behind `Status`, and is
 seeded from the ENR `cgc` for a peer this node dialed; a peer that has supplied
-neither is not assumed to custody anything, and the by-root path falls back to
-asking one at random for whatever no known custodian covers. At mainnet's
+neither is not assumed to custody anything, and both paths send whatever no
+known custodian covers to such a peer rather than to one that has said what it
+keeps. The by-root path gives as many of those columns as it can to one such
+peer at a time; only a column none of them can be asked for goes to a peer of
+known custody, once per lookup, since such a peer may hold more than it
+custodies. At mainnet's
 `CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so this is the difference
 between a request that can be answered and one that usually cannot.
 
@@ -816,6 +919,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
 | `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_slow_peer_disconnects_total` | Peers disconnected for persistently failing to take gossipsub messages; see [Peer scoring](#peer-scoring) |
 | `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
 | `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 
@@ -887,7 +991,9 @@ sync committee messages, blocks with their columns, operations), plus relayed
 validated gossip.
 
 `seeds=17` proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. `topics=17` proves the subscription set: the 7
+ENR was skipped with a warning. That holds for a run without `--bootnodes`,
+whose entries are counted on top (in `seeds` only when they carry a discv5
+port). `topics=17` proves the subscription set: the 7
 global topics, the 8 column subnets this run's (randomly generated) node id
 selected, and the 2 attestation subnets the same id selected; `columns=8` and
 `attestation_subnets=[…]` confirm the two families directly.

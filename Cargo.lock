@@ -1994,6 +1994,7 @@ dependencies = [
  "ethlambda-rpc",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-types",
  "ethlambda-validator",
  "eyre",
@@ -2033,6 +2034,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
@@ -2060,6 +2062,7 @@ dependencies = [
  "hex",
  "leanvm",
  "postcard",
+ "rand 0.10.1",
  "rayon",
  "thiserror 2.0.18",
  "tracing",
@@ -2115,6 +2118,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-telemetry",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",
@@ -2144,6 +2148,7 @@ name = "ethlambda-rpc"
 version = "1.0.0"
 dependencies = [
  "axum",
+ "bs58",
  "ethlambda-blockchain",
  "ethlambda-engine",
  "ethlambda-fork-choice",
@@ -2161,9 +2166,11 @@ dependencies = [
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
+ "reqwest",
  "serde",
  "serde_json",
  "spawned-concurrency",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tower",
@@ -2180,6 +2187,7 @@ dependencies = [
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "proptest",
  "rayon",
+ "sha2",
 ]
 
 [[package]]
@@ -2194,6 +2202,7 @@ dependencies = [
  "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
+ "foldhash 0.2.0",
  "hex",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
@@ -2220,6 +2229,7 @@ dependencies = [
  "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-types",
+ "foldhash 0.2.0",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
@@ -2230,6 +2240,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "xdelta3",
+]
+
+[[package]]
+name = "ethlambda-telemetry"
+version = "1.0.0"
+dependencies = [
+ "axum",
+ "ethlambda-metrics",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2276,6 +2300,7 @@ dependencies = [
  "ctr",
  "ethlambda-metrics",
  "ethlambda-types",
+ "futures-util",
  "hex",
  "hmac",
  "http-body-util",
@@ -2294,6 +2319,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "unicode-normalization",

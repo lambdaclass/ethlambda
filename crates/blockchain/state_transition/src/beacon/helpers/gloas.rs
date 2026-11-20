@@ -86,7 +86,7 @@
 //! doc), read through [`super::fulu::get_beacon_proposer_index`] rather
 //! than a copy of it here.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
@@ -95,8 +95,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, Domain, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot,
-    ValidatorIndex,
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -105,7 +104,6 @@ use super::accessors::{
 };
 use super::math::{bytes_to_uint64, integer_squareroot};
 use super::misc::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch};
-use super::predicates::are_indices_sorted_and_unique;
 use super::shuffling::compute_shuffled_index;
 
 // ---------------------------------------------------------------------------
@@ -118,47 +116,54 @@ use super::shuffling::compute_shuffled_index;
 /// Modified from [`super::electra::is_valid_indexed_attestation`] (EIP-7688):
 /// [`gloas::IndexedAttestation::attesting_indices`] is now the unbounded
 /// [`gloas::AttestingIndices`], so the length that used to be enforced by the
-/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked here
-/// explicitly instead.
+/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked
+/// explicitly instead, in [`super::attestation::attesters_signature_set`].
 pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
 ) -> bool {
-    let domain = get_domain(
-        state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
-    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+    indexed_attestation_signature_set(state, indexed_attestation).is_some_and(|set| set.verify())
 }
 
-/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
-///
-/// For gossip, which checks against a state that may not have reached the
-/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
-pub fn is_valid_indexed_attestation_with_domain(
+/// The signature check [`is_valid_indexed_attestation`] makes, resolved but
+/// not yet run, so a block can verify every attestation's signature in one
+/// batch. See [`super::attestation::attesters_signature_set`], which holds the
+/// checks every fork shares, the length bound included.
+pub fn indexed_attestation_signature_set(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
-    domain: Domain,
-) -> bool {
-    let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
-    if indices.is_empty()
-        || indices.len() > preset::MAX_VALIDATORS_PER_SLOT
-        || !are_indices_sorted_and_unique(indices)
-    {
-        return false;
-    }
+) -> Option<SignatureSet> {
+    super::attestation::attesters_signature_set(
+        state,
+        &indexed_attestation.attesting_indices,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        None,
+    )
+}
 
-    let mut pubkeys = Vec::with_capacity(indices.len());
-    for index in indices {
-        match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
-        }
+/// [`super::electra::electra_attestation_signature_set`] for a gloas
+/// attestation: the same checks, plus the length bound the container no longer
+/// enforces (`MAX_VALIDATORS_PER_SLOT`), checked first as
+/// [`super::attestation::attesters_signature_set`] does.
+pub fn gloas_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    indexed_attestation: &gloas::IndexedAttestation,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    if indexed_attestation.attesting_indices.len() > preset::MAX_VALIDATORS_PER_SLOT {
+        return None;
     }
-
-    let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
+    super::electra::attestation_signature_set(
+        state,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        &indexed_attestation.attesting_indices,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -284,16 +289,33 @@ pub fn is_valid_indexed_payload_attestation(
     state: &BeaconState,
     attestation: &gloas::IndexedPayloadAttestation,
 ) -> bool {
+    indexed_payload_attestation_signature_set(state, attestation).is_some_and(|set| set.verify())
+}
+
+/// The signature check [`is_valid_indexed_payload_attestation`] makes,
+/// resolved but not yet run. The structural checks (non-empty, sorted, every
+/// index in range) happen here, at once; `None` means the attestation is
+/// invalid without needing a pairing.
+pub fn indexed_payload_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::IndexedPayloadAttestation,
+) -> Option<SignatureSet> {
     let indices: &[ValidatorIndex] = &attestation.attesting_indices;
+    // `<=`, not the `<` of the other attestation kinds: the spec checks only
+    // `indices == sorted(indices)`, since the PTC is drawn with replacement
+    // and a member can repeat, so duplicates are valid.
     if indices.is_empty() || !indices.windows(2).all(|pair| pair[0] <= pair[1]) {
-        return false;
+        return None;
     }
 
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
+            Err(_) => return None,
         }
     }
 
@@ -303,7 +325,7 @@ pub fn is_valid_indexed_payload_attestation(
         Some(compute_epoch_at_slot(attestation.data.slot)),
     );
     let signing_root = compute_signing_root(attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &attestation.signature)
+    SignatureSet::fast_aggregate(&pubkeys, signing_root, &attestation.signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -822,10 +844,16 @@ pub fn get_activation_churn_limit(state: &BeaconState, config: &Config) -> Resul
 /// rather than electra's combined budget.
 pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
     let total_active_balance = get_total_active_balance(state)?;
+    Ok(exit_churn_limit_for(total_active_balance, config))
+}
+
+/// [`get_exit_churn_limit`] for a caller that already holds the total active
+/// balance, so block processing can take it from the `ActiveBalanceCache`.
+pub(crate) fn exit_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient_gloas);
-    Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
+    churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT
 }
 
 /// The per-epoch churn limit reserved for consolidations, in Gwei.
@@ -840,8 +868,14 @@ pub fn get_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei
 /// exit limits are.
 pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
     let total_active_balance = get_total_active_balance(state)?;
+    Ok(consolidation_churn_limit_for(total_active_balance, config))
+}
+
+/// [`get_consolidation_churn_limit`] for a caller that already holds the total
+/// active balance.
+pub(crate) fn consolidation_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
     let churn = total_active_balance / config.consolidation_churn_limit_quotient;
-    Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
+    churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT
 }
 
 // ---------------------------------------------------------------------------

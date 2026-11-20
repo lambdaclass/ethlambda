@@ -18,6 +18,7 @@ use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::advance_to_slot,
+    bls,
     builder_market::SharedBuilderMarket,
     gloas_block_production::test_support::{
         config as chain_config, parent_state, post_state, randao_reveal,
@@ -25,8 +26,9 @@ use ethlambda_state_transition::beacon::{
     gossip::proposer_preferences::dependent_root_at,
     helpers::{
         accessors::get_domain,
-        misc::compute_signing_root,
-        test_state::{secret_key_for, sign_for},
+        fulu::initialize_proposer_lookahead,
+        misc::{compute_domain, compute_signing_root},
+        test_state::{secret_key_for, sign_for, with_signing_validators_at},
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::block::RandaoVerification,
@@ -35,20 +37,22 @@ use ethlambda_state_transition::beacon::{
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
+        config::Config,
         constants::{
             BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, DOMAIN_PROPOSER_PREFERENCES,
             FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION,
         },
         containers::{
-            BeaconState, SignedBeaconBlock,
+            BeaconState, Fork, SignedBeaconBlock,
             gloas::{
                 BeaconBlock, Builder, ExecutionPayloadBid, ExecutionRequests, ProposerPreferences,
                 SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
                 SignedProposerPreferences,
             },
         },
+        fork::ForkName,
         primitives::{BlsPubkey, BlsSignature, ExecutionAddress, HashTreeRoot as _},
-        signing::compute_epoch_at_slot,
+        signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     },
     primitives::H256,
 };
@@ -65,7 +69,8 @@ use crate::{
 
 /// The slot the block is built for. The head block sits one slot earlier, and
 /// the clock is at the head's slot, so this one is the next slot: the one bids
-/// and preferences are accepted for.
+/// and preferences are accepted for. Production runs once this slot has
+/// started, on [`World::proposing`]'s clock.
 const SLOT: u64 = 33;
 const HEAD_SLOT: u64 = SLOT - 1;
 const GWEI: u64 = 1_000_000_000;
@@ -216,6 +221,8 @@ fn chain_state() -> BeaconState {
 }
 
 struct World {
+    /// The fork schedule the store runs on.
+    config: Config,
     store: Store,
     state: BeaconState,
     head_root: H256,
@@ -225,9 +232,76 @@ struct World {
 }
 
 impl World {
-    /// The head block at slot 32 on a clock where that slot is running.
+    /// The head block at slot 32 on a clock where that slot is running: the
+    /// moment bids and preferences for the next slot arrive.
     fn new() -> Self {
-        let state = chain_state();
+        Self::at_clock(HEAD_SLOT)
+    }
+
+    /// [`World::new`] on a clock where [`SLOT`] is running: the moment a
+    /// validator client asks for its block, since production refuses a slot
+    /// that has not started yet.
+    fn proposing() -> Self {
+        Self::at_clock(SLOT)
+    }
+
+    fn at_clock(clock_slot: u64) -> Self {
+        Self::build(chain_config(), chain_state(), clock_slot)
+    }
+
+    /// [`World::new`] with fulu before gloas: gloas starts at epoch 1, the one
+    /// [`SLOT`] and the head are in, so a preference for [`SLOT`] is for the
+    /// first gloas epoch. The head state carries the fork record
+    /// `upgrade_to_gloas` leaves at that boundary.
+    fn at_the_gloas_fork() -> Self {
+        let config = ForkName::ALL
+            .into_iter()
+            .filter(|&fork| fork < ForkName::Gloas)
+            .fold(chain_config(), |config, fork| {
+                config.with_fork_epoch(fork, 0)
+            })
+            .with_fork_epoch(ForkName::Gloas, compute_epoch_at_slot(SLOT));
+        let mut state = chain_state();
+        *state.fork_mut() = Fork {
+            previous_version: config.fork_version(ForkName::Fulu),
+            current_version: config.fork_version(ForkName::Gloas),
+            epoch: compute_epoch_at_slot(SLOT),
+        };
+        Self::build(config, state, HEAD_SLOT)
+    }
+
+    /// The epoch before gloas, as a node is through all of it: gloas starts at
+    /// epoch 2, and the head is a fulu state at slot 32, the first of epoch 1,
+    /// whose proposer lookahead already holds epoch 2's proposers. The head
+    /// block's parent is the genesis block, slots 1 to 31 having been skipped,
+    /// so that is also the block that fixed epoch 2's shuffling (slot 31).
+    fn before_the_gloas_fork() -> Self {
+        let gloas_epoch = compute_epoch_at_slot(HEAD_SLOT) + 1;
+        let config = ForkName::ALL
+            .into_iter()
+            .filter(|&fork| fork < ForkName::Gloas)
+            .fold(chain_config(), |config, fork| {
+                config.with_fork_epoch(fork, 0)
+            })
+            .with_fork_epoch(ForkName::Gloas, gloas_epoch);
+        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let genesis_root = genesis_block().message_hash_tree_root();
+        let BeaconState::Fulu(inner) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        assert_eq!(inner.slot, HEAD_SLOT);
+        inner.proposer_lookahead = lookahead.try_into().unwrap();
+        inner.latest_block_header.slot = inner.slot;
+        for slot in 0..HEAD_SLOT as usize {
+            inner.block_roots[slot] = genesis_root;
+        }
+        Self::build(config, state, HEAD_SLOT)
+    }
+
+    /// The head block on `state` and `config`, on a clock where `clock_slot`
+    /// is running.
+    fn build(config: Config, state: BeaconState, clock_slot: u64) -> Self {
         let genesis = genesis_block();
         let genesis_root = genesis.message_hash_tree_root();
         let block = gloas_beacon_block(
@@ -242,14 +316,15 @@ impl World {
         let head_root = header.hash_tree_root();
         let mut store = beacon_store_with_head_block(
             state.clone(),
-            chain_config(),
+            config.clone(),
             block,
             head_root,
-            HEAD_SLOT,
+            clock_slot,
         );
         store.insert_signed_block(genesis_root, genesis).unwrap();
         store.insert_state(genesis_root, state.clone()).unwrap();
         Self {
+            config,
             store,
             state,
             head_root,
@@ -267,6 +342,9 @@ impl World {
             .with_state(self.store.clone())
             .layer(Extension(p2p))
             .layer(Extension(engine.map(|engine| engine.client.clone())))
+            .layer(Extension(ethlambda_blockchain::SyncStatusController::new(
+                ethlambda_blockchain::metrics::SyncStatus::Synced,
+            )))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
@@ -283,7 +361,7 @@ impl World {
     }
 
     fn advanced(&self) -> BeaconState {
-        advance_to_slot(&self.state, SLOT, &chain_config()).unwrap()
+        advance_to_slot(&self.state, SLOT, &self.config).unwrap()
     }
 
     /// What `produceBlockV4` reads off the chain for [`SLOT`].
@@ -484,7 +562,7 @@ fn self_built(reply: &Reply) -> bool {
 
 #[tokio::test]
 async fn a_bid_worth_more_than_the_local_payload_is_built_on_and_returned_bare() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let bid = world.bid(5, address(0xcc));
     world.prime_bid(&bid);
@@ -516,7 +594,7 @@ async fn a_bid_worth_more_than_the_local_payload_is_built_on_and_returned_bare()
 
 #[tokio::test]
 async fn a_bid_won_block_is_served_as_ssz_too() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let bid = world.bid(5, address(0xcc));
     world.prime_bid(&bid);
@@ -535,7 +613,7 @@ async fn a_bid_won_block_is_served_as_ssz_too() {
 
 #[tokio::test]
 async fn nothing_is_cached_for_a_bid_block_and_a_self_build_envelope_for_it_is_refused() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     world.prime_bid(&world.bid(5, address(0xcc)));
     let app = world.app(Some(&engine));
@@ -609,7 +687,7 @@ async fn the_local_payload_wins_ties_a_zero_factor_a_floor_and_an_override() {
         (1, true, 0, u64::MAX),
     ];
     for (local_wei, should_override, min_bid, factor) in cases {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(local_wei, should_override).await;
         world.prime_bid(&world.bid(5, address(0xcc)));
 
@@ -644,7 +722,7 @@ async fn the_local_payload_wins_ties_a_zero_factor_a_floor_and_an_override() {
 async fn a_bid_wins_when_the_local_build_is_below_it_by_one_unit_of_weight() {
     // 1e9 wei is 1 gwei: a tie at factor 100. One wei less and the bid wins.
     for (local_wei, bid_wins) in [(GWEI, false), (GWEI - 1, true)] {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(local_wei, false).await;
         world.prime_bid(&world.bid(1, address(0xcc)));
 
@@ -657,7 +735,7 @@ async fn a_bid_wins_when_the_local_build_is_below_it_by_one_unit_of_weight() {
 
 #[tokio::test]
 async fn without_an_engine_a_viable_bid_is_built_on_and_none_is_a_503() {
-    let world = World::new();
+    let world = World::proposing();
     let reply = produce(&world, None, true, &builder_config(0, 0)).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -675,7 +753,7 @@ async fn without_an_engine_a_viable_bid_is_built_on_and_none_is_a_503() {
 
 #[tokio::test]
 async fn a_failed_local_build_falls_back_to_a_viable_bid() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = dead_engine();
     let reply = produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -701,7 +779,7 @@ async fn bids_that_do_not_fit_the_slot_are_left_to_the_local_payload() {
         }),
     ];
     for (name, change) in mismatches {
-        let world = World::new();
+        let world = World::proposing();
         let engine = fake_engine(1, false).await;
         let mut bid = world.bid(5, address(0xcc));
         change(&mut bid.message);
@@ -718,7 +796,7 @@ async fn bids_that_do_not_fit_the_slot_are_left_to_the_local_payload() {
 
 #[tokio::test]
 async fn a_bid_paying_someone_other_than_the_preferred_recipient_is_skipped() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(1, false).await;
     world.prime_preferences(address(0xaa), 30_000_000);
     world.prime_bid(&world.bid(5, address(0xcc)));
@@ -731,7 +809,7 @@ async fn a_bid_paying_someone_other_than_the_preferred_recipient_is_skipped() {
 
 #[tokio::test]
 async fn a_bid_paying_the_preferred_recipient_is_taken() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(1, false).await;
     world.prime_preferences(address(0xaa), 30_000_000);
     let bid = world.bid(5, address(0xaa));
@@ -745,7 +823,7 @@ async fn a_bid_paying_the_preferred_recipient_is_taken() {
 
 #[tokio::test]
 async fn the_self_build_takes_its_fee_recipient_and_gas_target_from_the_preferences() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     world
@@ -775,7 +853,7 @@ async fn the_self_build_takes_its_fee_recipient_and_gas_target_from_the_preferen
 
 #[tokio::test]
 async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient_and_parent_gas() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     world
@@ -799,7 +877,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
     );
 
     // Neither: the zero address.
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
     assert_eq!(
@@ -810,7 +888,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
 
 #[tokio::test]
 async fn preferences_of_another_validator_are_not_the_proposers() {
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
     let other = (proposer + 1) % 64;
@@ -832,7 +910,7 @@ async fn preferences_of_another_validator_are_not_the_proposers() {
 
 #[tokio::test]
 async fn the_existing_error_paths_are_unchanged() {
-    let world = World::new();
+    let world = World::proposing();
     let app = world.app(None);
     // A pre-existing client sends the empty local-preferred config.
     let reply = send(
@@ -844,6 +922,17 @@ async fn the_existing_error_paths_are_unchanged() {
     let reply = send(&app, produce_request(&world, true, "not a config", false)).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["message"], "the body is not a BuilderConfig");
+}
+
+/// A validator client asks once its slot has started. Ahead of that, here a
+/// whole slot early, the slot is refused before the head state is advanced
+/// to it, and before the missing execution client is noticed.
+#[tokio::test]
+async fn a_slot_that_has_not_started_is_refused() {
+    let world = World::new();
+    let reply = produce(&world, None, false, &builder_config(0, 100)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["message"], "the slot has not started yet");
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,9 +1149,160 @@ async fn valid_preferences_are_cached_and_published_once() {
     assert_eq!(world.network.proposer_preferences.lock().unwrap().len(), 1);
 }
 
+/// The validator client's own path for a proposal at `slot`, end to end
+/// against `world`'s node: it reads the proposer duty and its v2
+/// `dependent_root` from the served duties route, signs with
+/// `SigningContext::sign_proposer_preferences`, and posts through
+/// `HttpBeaconNode` under the fork of the preference's slot, as
+/// `PreferencesService` does. The post succeeding means the route's run of the
+/// gossip rules (`validate`) accepted it; this also checks that the market
+/// holds it and that it went out. Returns it with the proposer's key.
+async fn submit_as_the_validator_client(
+    world: &World,
+    slot: u64,
+) -> (SignedProposerPreferences, BlsPubkey) {
+    use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+    use ethlambda_validator::{
+        beacon_node::{BeaconNodeApi as _, dto::parse_pubkey, http::HttpBeaconNode},
+        keys::ValidatorStore,
+        signing::SigningContext,
+    };
+
+    let duties_routes = crate::beacon::validator::routes()
+        .with_state(world.store.clone())
+        .layer(Extension(SyncStatusController::new(SyncStatus::Synced)));
+    let router = world.app(None).merge(duties_routes);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = HttpBeaconNode::new(format!("http://{bound}")).unwrap();
+
+    // The duty and the dependent root the way the validator client reads them.
+    let proposal_epoch = compute_epoch_at_slot(slot);
+    let duties = client
+        .proposer_duties_v2(proposal_epoch)
+        .await
+        .expect("the node serves v2 proposer duties");
+    let duty = duties
+        .duties
+        .iter()
+        .find(|duty| duty.slot == slot)
+        .expect("the slot has a proposer");
+    let proposer = duty.validator_index;
+    let message = ProposerPreferences {
+        dependent_root: duties.dependent_root,
+        proposal_slot: slot,
+        validator_index: proposer,
+        fee_recipient: address(0xaa),
+        target_gas_limit: 30_000_000,
+    };
+
+    let mut keys = ValidatorStore::new();
+    let pubkey = keys
+        .insert_secret("test", &secret_key_for(proposer as usize).to_bytes())
+        .expect("the test secret is a valid key");
+    assert_eq!(
+        pubkey,
+        parse_pubkey(&duty.pubkey).expect("the duty names a key"),
+        "the test registry's key for the proposer"
+    );
+    let keys = tokio::sync::RwLock::new(keys);
+    let context = SigningContext::new(world.config.clone(), world.state.genesis_validators_root());
+    let signature = context
+        .sign_proposer_preferences(&keys, &pubkey, &message)
+        .await
+        .expect("signs");
+    let signed = SignedProposerPreferences { message, signature };
+
+    let fork = world.config.fork_at_epoch(proposal_epoch);
+    client
+        .submit_proposer_preferences(fork, std::slice::from_ref(&signed))
+        .await
+        .expect("the node accepts what the validator client signed");
+
+    assert_eq!(
+        *world.network.proposer_preferences.lock().unwrap(),
+        vec![signed.clone()]
+    );
+    assert_eq!(
+        world
+            .market
+            .preferences(slot, signed.message.dependent_root),
+        Some(signed.clone())
+    );
+    (signed, pubkey)
+}
+
+/// The validator client's preference passes this node's gossip rules. That
+/// pins the duties route's dependent root as the one the preference must
+/// carry, and the JSON the client posts as the one the route decodes. This
+/// world has gloas at epoch 0, so no fork boundary is involved; the next test
+/// has one.
+#[tokio::test]
+async fn preferences_signed_by_the_validator_client_pass_this_nodes_gossip_rules() {
+    submit_as_the_validator_client(&World::new(), SLOT).await;
+}
+
+/// The same across a fulu-to-gloas boundary, for a slot in the first gloas
+/// epoch: the one case where the fork of the proposal's epoch (gloas, what
+/// consensus-specs v1.7.0-beta.4 and every client sign and verify with) and
+/// the fork of the epoch before it (fulu, beta.2's gossip rule) differ.
+///
+/// This node accepts both, so its verdict alone would also pass a client still
+/// signing by beta.2. The signature is therefore also checked against the two
+/// domains directly: it must verify under gloas's version, which Lighthouse
+/// and the others demand, and not under fulu's, which Lighthouse refused.
+#[tokio::test]
+async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_nodes_gossip_rules() {
+    let world = World::at_the_gloas_fork();
+    let proposal_epoch = compute_epoch_at_slot(SLOT);
+    assert_eq!(
+        world.config.fork_at_epoch(proposal_epoch - 1),
+        ForkName::Fulu
+    );
+    assert_eq!(world.config.fork_at_epoch(proposal_epoch), ForkName::Gloas);
+
+    let (signed, pubkey) = submit_as_the_validator_client(&world, SLOT).await;
+
+    let verifies_under = |fork| {
+        let domain = compute_domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            world.config.fork_version(fork),
+            world.state.genesis_validators_root(),
+        );
+        let root = compute_signing_root(signed.message.hash_tree_root(), domain);
+        bls::verify(&pubkey, root, &signed.signature)
+    };
+    assert!(verifies_under(ForkName::Gloas), "the proposal epoch's fork");
+    assert!(!verifies_under(ForkName::Fulu), "not the epoch before it");
+}
+
+/// The same a whole epoch earlier, while this node's head is still fulu: at a
+/// real fork every preference for the first gloas epoch is signed and sent in
+/// the epoch before it, so the gossip rules run on a fulu head. The duty, the
+/// dependent root and the proposer come out of fulu's proposer lookahead, and
+/// the preference goes out for the first slot of gloas.
+#[tokio::test]
+async fn a_first_gloas_epoch_preference_passes_this_nodes_gossip_rules_on_a_fulu_head() {
+    let world = World::before_the_gloas_fork();
+    assert!(matches!(world.state, BeaconState::Fulu(_)), "a fulu head");
+    let gloas_epoch = compute_epoch_at_slot(HEAD_SLOT) + 1;
+    assert_eq!(world.config.fork_at_epoch(gloas_epoch - 1), ForkName::Fulu);
+    assert_eq!(world.config.fork_at_epoch(gloas_epoch), ForkName::Gloas);
+
+    let first_gloas_slot = compute_start_slot_at_epoch(gloas_epoch);
+    let (signed, _) = submit_as_the_validator_client(&world, first_gloas_slot).await;
+    assert_eq!(
+        signed.message.dependent_root,
+        genesis_block().message_hash_tree_root(),
+        "the block at slot 31, the genesis one on this chain"
+    );
+}
+
 #[tokio::test]
 async fn cached_preferences_resubmitted_are_a_200_without_a_publish() {
-    // Needs only the market: an identical entry short-circuits the rules.
+    // Needs only the market: an identical entry stops at the rules' first,
+    // `AlreadySeen`, and is then a success.
     let world = World::new();
     let signed = world.preferences(address(0xaa), 30_000_000);
     assert!(world.market.record_preferences(signed.clone(), HEAD_SLOT));
@@ -1268,7 +1508,7 @@ async fn the_new_routes_are_wired_with_the_production_layers() {
 async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verification() {
     use ethlambda_state_transition::beacon::bls::G2_POINT_AT_INFINITY;
 
-    let world = World::new();
+    let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let app = world.app(Some(&engine));
     let infinity = BlsSignature(G2_POINT_AT_INFINITY);
@@ -1292,4 +1532,88 @@ async fn the_infinity_reveal_is_produced_only_when_the_flag_skips_its_verificati
     let reply = send(&app, produce_request_with(infinity, "")).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["message"], "invalid randao_reveal");
+}
+
+// ---------------------------------------------------------------------------
+// Event stream: what the POST endpoints accept is announced
+// ---------------------------------------------------------------------------
+
+/// The events a router layered with the bus published, in order, as
+/// `{topic, body}`.
+fn drained(
+    rx: &mut tokio::sync::broadcast::Receiver<ethlambda_blockchain::ChainEvent>,
+) -> Vec<serde_json::Value> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|event| {
+            serde_json::json!({
+                "topic": event.topic().as_str(),
+                "body": serde_json::to_value(&event).unwrap(),
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_accepted_bid_is_announced_once_in_its_version_wrapper() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = world_ready_for_bids();
+    let app = world.app(None).layer(Extension(events));
+    let bid = world.bid(5, address(0xaa));
+
+    let reply = send(&app, bid_request(&bid)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // The identical bid again is answered without a publish, and so without
+    // an event.
+    let reply = send(&app, bid_request(&bid)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let emitted = drained(&mut rx);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["topic"], "execution_payload_bid");
+    assert_eq!(emitted[0]["body"]["version"], "gloas");
+    assert_eq!(
+        emitted[0]["body"]["data"],
+        serde_json::to_value(&bid).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_refused_bid_is_not_announced() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = world_ready_for_bids();
+    let app = world.app(None).layer(Extension(events));
+    let mut bid = world.bid(5, address(0xaa));
+    bid.signature = BlsSignature::default();
+
+    let reply = send(&app, bid_request(&bid)).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(drained(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn accepted_preferences_are_announced() {
+    let events = ethlambda_blockchain::EventBus::new(8);
+    let mut rx = events.subscribe();
+    let world = World::new();
+    let app = world.app(None).layer(Extension(events));
+    let signed = world.preferences(address(0xaa), 30_000_000);
+
+    let reply = send(
+        &app,
+        preferences_request(std::slice::from_ref(&signed), Some("gloas")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let emitted = drained(&mut rx);
+    assert_eq!(emitted.len(), 1, "{emitted:?}");
+    assert_eq!(emitted[0]["topic"], "proposer_preferences");
+    assert_eq!(emitted[0]["body"]["version"], "gloas");
+    assert_eq!(
+        emitted[0]["body"]["data"],
+        serde_json::to_value(&signed).unwrap()
+    );
 }

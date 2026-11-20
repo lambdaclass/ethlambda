@@ -150,7 +150,7 @@ If you discover a security vulnerability, **do not open a public issue**. Instea
 
 ## Communication
 
-- **Telegram**: [ethlambda group](https://t.me/lambdaconsensus), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **Telegram**: [ethlambda group](https://t.me/ethlambda), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
 - **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
 - **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
 - **GitHub Issues**: bugs, feature requests, and technical discussion.

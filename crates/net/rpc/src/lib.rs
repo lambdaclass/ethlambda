@@ -1,5 +1,7 @@
+use std::future::IntoFuture as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
@@ -29,6 +31,9 @@ mod shared;
 mod spec;
 pub mod test_driver;
 
+pub use beacon::builder_client::{BuilderClient, BuilderError, VersionedBid};
+pub use beacon::builder_flow::breaker::FallbackThresholds;
+
 pub(crate) use base::json_response;
 
 #[derive(Debug, Clone)]
@@ -51,20 +56,17 @@ pub struct RpcConfig {
 /// stub. The driver swaps its own `Store` on every `fork_choice/init`, so we
 /// don't share state with the regular consensus path (which isn't running in
 /// driver mode anyway — see `bin/ethlambda/src/main.rs`).
+///
+/// Served through `serve` like the node's own servers, so a simulator
+/// connection that stops reading holds shutdown for at most
+/// `HTTP_DRAIN_TIMEOUT`.
 pub async fn start_test_driver_rpc_server(
     config: RpcConfig,
     driver: test_driver::DriverState,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let app = test_driver::build_router(driver);
-    let addr = SocketAddr::new(config.http_address, config.api_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await?;
-    Ok(())
+    serve(config.http_address, config.api_port, app, shutdown).await
 }
 
 pub async fn start_rpc_server(
@@ -98,6 +100,13 @@ pub async fn start_rpc_server(
 /// `Store`, `AggregatorController`, `SyncStatusController` or `EventBus` to
 /// build the lean API from, and would be serving lean answers for a beacon
 /// chain if it invented empty ones.
+///
+/// Returns at most `HTTP_DRAIN_TIMEOUT` after `shutdown` is cancelled, even
+/// with responses still in flight. Those are not ended: they keep running on
+/// the caller's runtime, holding the routers and whatever state the routers
+/// captured (a `Store`), until they finish or that runtime shuts down; see
+/// `serve`. `ethlambda` drops its runtime once shutdown completes, so there
+/// they end with the process.
 pub async fn start_http_servers(
     config: RpcConfig,
     api_router: Option<Router>,
@@ -135,7 +144,37 @@ pub async fn start_http_servers(
     Ok(())
 }
 
+/// How long [`serve`] waits, once shutdown starts, for responses still in
+/// flight before it stops waiting on them.
+///
+/// axum's graceful shutdown waits with no limit, and a response can stall for
+/// as long as its client stops reading: a validator client paused mid-stream,
+/// or a slow download of a whole state.
+///
+/// The deadline runs from cancellation whatever a response is doing, so it
+/// cuts healthy ones too: a peer still reading a whole state from
+/// `/eth/v2/debug/beacon/states/{state_id}` is reset once it passes. Five
+/// seconds is sized against `docker stop`, which sends SIGKILL 10 s after its
+/// first signal unless told otherwise. The node cancels this token as it stops
+/// the actors, so the drain overlaps their stop rather than adding to it, but
+/// those 10 s still have to cover the actors and the final state flush, which
+/// a SIGKILL cuts short. Raising this eats into that room.
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+///
+/// Graceful shutdown waits for every in-flight response, so `app` gets the
+/// token as a [`events::ShutdownSignal`] too: the event streams, which never
+/// finish on their own, end on it. The signal holds a child of the token, not
+/// a clone: a child is cancelled with its parent but cannot cancel it, so a
+/// handler can wait for shutdown and never trigger the node's.
+///
+/// The wait is bounded by [`HTTP_DRAIN_TIMEOUT`]. Past it, this returns
+/// without the stalled responses. The listener is closed by then, but their
+/// connections are not: axum spawns each connection as a task of its own, and
+/// dropping the serve future does not end those. A stalled one keeps its clone
+/// of `app`, and any state `app` captured, until it finishes or the runtime it
+/// was spawned on shuts down.
 async fn serve(
     address: IpAddr,
     port: u16,
@@ -145,11 +184,28 @@ async fn serve(
     let addr = SocketAddr::new(address, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown.cancelled().await;
-        })
-        .await
+    let app = app.layer(Extension(events::ShutdownSignal::of(&shutdown)));
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    let drain_deadline = async move {
+        shutdown.cancelled().await;
+        tokio::time::sleep(HTTP_DRAIN_TIMEOUT).await;
+    };
+    tokio::select! {
+        // The server first: when it finishes in the same wake the deadline
+        // fires, its own result stands, an error included, rather than an
+        // `Ok(())` and a warning about responses no longer in flight.
+        biased;
+        served = server => served,
+        () = drain_deadline => {
+            tracing::warn!(
+                %addr,
+                "HTTP responses still in flight after the shutdown drain timeout; no longer waiting on them"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Build the API router with the given store, client version, and peer ID.
@@ -206,6 +262,10 @@ pub struct BeaconIdentity {
     /// since its sequence number and `syncnets` change at runtime. `None`
     /// without a beacon p2p layer, which leaves `metadata` all-zero.
     pub metadata: Option<ethlambda_network_api::MetaDataController>,
+    /// The peers the p2p layer is connected to, read per request by
+    /// `/eth/v1/node/peers`. `None` without a p2p layer, which leaves the list
+    /// empty.
+    pub peers: Option<ethlambda_network_api::PeerTableController>,
 }
 
 /// What the Beacon API's endpoints reach beyond the store.
@@ -231,8 +291,9 @@ pub struct BeaconApiHandles {
     /// makes block production, attestation data and aggregation answer 503:
     /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
-    /// The chain-event bus `/eth/v1/events` streams from. Read only there:
-    /// the chain actor is its only publisher, so no endpoint here writes to it.
+    /// The chain-event bus `/eth/v1/events` streams from. Besides the chain
+    /// actor and p2p, the submission endpoints publish to it: what they accept
+    /// is an event of its own (see `beacon::emit_accepted`).
     pub events: EventBus,
     /// This build as the Engine API identifies it. Block production appends
     /// its code and commit, with the execution client's, to every block's
@@ -240,6 +301,12 @@ pub struct BeaconApiHandles {
     pub client_version: ethlambda_engine::types::ClientVersionV1,
     /// What `/eth/v1/node/identity` reports beyond the peer id.
     pub identity: BeaconIdentity,
+    /// The builder `--builder` names, for the builder flow's endpoints.
+    /// `None` when the node runs without one.
+    pub builder: Option<BuilderClient>,
+    /// When block production skips the builder for a local block
+    /// (`--builder-fallback-*`). Unused without a builder.
+    pub builder_fallback: FallbackThresholds,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -256,6 +323,13 @@ pub async fn start_beacon_rpc_server(
     peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
+    let builder = handles.builder.map(|client| {
+        Arc::new(beacon::builder_flow::Builder::new(
+            client,
+            handles.builder_fallback,
+            sync_status.clone(),
+        ))
+    });
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
@@ -270,6 +344,12 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(beacon::graffiti::OwnVersion(Arc::new(
             handles.client_version,
         ))));
+    // Layered only when `--builder` is set, so every handler reads it as an
+    // `Option<Extension<_>>` and a node without one keeps the local path.
+    let api_router = match builder {
+        Some(builder) => api_router.layer(Extension(builder)),
+        None => api_router,
+    };
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -752,6 +832,19 @@ pub(crate) mod test_utils {
         Some(client.expect("building a client opens no connection"))
     }
 
+    /// A block root of its own for every `slot`, never the zero hash: `slot + 1`
+    /// in the last eight bytes, big-endian.
+    ///
+    /// For filling a state's `block_roots` so a root read from the wrong slot
+    /// shows up. `H256::repeat_byte(slot as u8 + 1)` cannot do that: the window
+    /// is `SLOTS_PER_HISTORICAL_ROOT` long, more slots than a byte counts, so it
+    /// overflows at slot 255 (a panic in debug, repeating roots in release).
+    pub(crate) fn slot_root(slot: u64) -> H256 {
+        let mut root = [0; 32];
+        root[24..].copy_from_slice(&(slot + 1).to_be_bytes());
+        H256(root)
+    }
+
     /// A beacon store whose anchor, and so head, is `state`, under a block at
     /// the state's slot. Returns the store and that block's root.
     ///
@@ -807,6 +900,20 @@ pub(crate) mod test_utils {
             .update_checkpoints(ForkCheckpoints::head_only(root))
             .expect("make the anchor the head");
         (store, root)
+    }
+
+    /// Finalizes `root` at `slot`'s epoch, leaving the head at `head`.
+    ///
+    /// For a store that keeps its anchor state under a second root, the one a
+    /// block built on it names as its parent: a real anchor's finalized
+    /// checkpoint names that root, and the publish endpoints refuse a parent
+    /// at the finalized slot that is not the finalized block.
+    pub(crate) fn finalize_at(store: &mut Store, head: H256, root: H256, slot: u64) {
+        let finalized = Checkpoint { root, slot };
+        let checkpoints = ForkCheckpoints::new(head, None, Some(finalized));
+        store
+            .update_checkpoints(checkpoints)
+            .expect("finalize the anchor's second root");
     }
 
     /// A beacon store whose head is `block` (a block at `state`'s slot) with

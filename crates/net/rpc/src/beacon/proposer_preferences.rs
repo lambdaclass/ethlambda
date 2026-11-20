@@ -14,7 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_blockchain::EventBus;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     builder_market::SharedBuilderMarket,
     gossip::{IgnoreReason, Outcome, proposer_preferences::validate},
@@ -28,7 +29,7 @@ use tracing::{debug, warn};
 use crate::beacon::{
     ApiError,
     bids::{describe, require_version, unix_ms},
-    decode_list,
+    copy_if_listened, decode_list, emit_accepted,
 };
 
 /// The most entries one request may carry: the SSZ list's bound,
@@ -62,11 +63,14 @@ async fn post_proposer_preferences(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(market): Extension<SharedBuilderMarket>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // A validator client submits during the epoch before gloas, when the
-    // consensus version it names is still fulu.
+    // Every validator client names gloas, even during the epoch before it:
+    // Prysm hardcodes it, the others (this one's too) take the fork of the
+    // preference's slot. Fulu is still accepted, as leniency towards a client
+    // that names the fork of its wall clock instead.
     if let Err(err) = require_version(&headers, &[ForkName::Fulu, ForkName::Gloas]) {
         return err.into_response();
     }
@@ -78,8 +82,11 @@ async fn post_proposer_preferences(
         return ApiError::BadRequest("too many signed proposer preferences").into_response();
     }
 
-    let validated =
-        tokio::task::spawn_blocking(move || submit(&store, &p2p, &market, preferences)).await;
+    let events = events.map(|Extension(events)| events);
+    let validated = tokio::task::spawn_blocking(move || {
+        submit(&store, &p2p, &market, events.as_ref(), preferences)
+    })
+    .await;
     let failures = match validated {
         Ok(failures) => failures,
         Err(_) => return ApiError::Internal("validating the preferences failed").into_response(),
@@ -97,11 +104,20 @@ async fn post_proposer_preferences(
     response
 }
 
+/// Whether `market` holds `signed` itself for its slot and dependent root,
+/// rather than another message: an identical entry is a success.
+fn holds(market: &SharedBuilderMarket, signed: &SignedProposerPreferences) -> bool {
+    let message = &signed.message;
+    let held = market.preferences(message.proposal_slot, message.dependent_root);
+    held.as_ref() == Some(signed)
+}
+
 /// Validate, record and publish each entry, in order.
 fn submit(
     store: &Store,
     p2p: &RpcToP2PRef,
     market: &SharedBuilderMarket,
+    events: Option<&EventBus>,
     preferences: Vec<SignedProposerPreferences>,
 ) -> Vec<Failure> {
     let now_ms = unix_ms();
@@ -110,13 +126,24 @@ fn submit(
     for (index, signed) in preferences.into_iter().enumerate() {
         let slot = signed.message.proposal_slot;
         let validator = signed.message.validator_index;
-        let held = market.preferences(slot, signed.message.dependent_root);
-        if held.as_ref() == Some(&signed) {
+        // An entry identical to the one held is a success, checked before
+        // `validate` so no rule of it (a started slot, say) can refuse a
+        // resubmission, and at no signature check's cost. Asked again after a
+        // refusal and after `record_preferences` too: gossip can record the
+        // same message (relayed by another node this client posted it to)
+        // while this copy is being validated.
+        if holds(market, &signed) {
             debug!(%slot, validator, "Proposer preferences already cached; not republishing");
             continue;
         }
         let verdict = validate(market, store, &signed, now_ms);
         if verdict != Outcome::Accept {
+            // Gossip may have recorded this very message since the check
+            // above, and `validate` then calls it already seen.
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             let (outcome, reason) = verdict.labels();
             warn!(%slot, validator, outcome, reason, "Refused submitted proposer preferences");
             failures.push(Failure {
@@ -126,14 +153,26 @@ fn submit(
             continue;
         }
         if !market.record_preferences(signed.clone(), wall_slot) {
+            if holds(market, &signed) {
+                debug!(%slot, validator, "Proposer preferences cached meanwhile; not republishing");
+                continue;
+            }
             failures.push(Failure {
                 index,
                 message: describe(&Outcome::Ignore(IgnoreReason::AlreadySeen)),
             });
             continue;
         }
+        let for_event = copy_if_listened(events, &signed);
         match p2p.publish_proposer_preferences(signed) {
-            Ok(()) => debug!(%slot, validator, "Accepted proposer preferences for gossip"),
+            Ok(()) => {
+                if let Some(signed) = for_event {
+                    emit_accepted(events, || {
+                        GossipEvent::ProposerPreferences(Box::new(signed))
+                    });
+                }
+                debug!(%slot, validator, "Accepted proposer preferences for gossip")
+            }
             Err(_) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),

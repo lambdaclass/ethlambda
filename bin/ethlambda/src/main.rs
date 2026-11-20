@@ -9,9 +9,11 @@ mod fd_limit;
 mod http_server;
 mod keygen;
 mod network;
+mod shutdown;
 mod slashing_protection;
 mod validator;
 mod version;
+mod voluntary_exit;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
 // See https://github.com/shadow/shadow/issues/3763. Build the Shadow binary
@@ -46,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 use cli::{Network, Options};
 use command::Command;
+use shutdown::ShutdownSignals;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
@@ -56,10 +59,10 @@ use ethlambda_network_api::{
     ToRpcToP2PRef,
 };
 use ethlambda_p2p::{
-    LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
-    build_swarm,
+    Bootnode, LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig,
+    attestation_subscription_subnets, build_swarm,
     discovery::{DiscoverySpawnConfig, spawn_discovery},
-    parse_enrs,
+    parse_bootnode, parse_enrs,
 };
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
@@ -116,6 +119,12 @@ fn main() -> eyre::Result<()> {
             init_node_logging()?;
             validator::run(options)
         }
+        // A one-shot command whose stdout may carry a pre-signed exit, so its
+        // logs go to stderr like keygen's.
+        Command::VoluntaryExit(options) => {
+            init_info_stderr_logging()?;
+            voluntary_exit::run(options)
+        }
         // Offline file work: no runtime, and stdout left alone.
         Command::SlashingProtection(options) => {
             init_info_stderr_logging()?;
@@ -158,6 +167,7 @@ fn beacon_identity(
         ],
         discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
         metadata: None,
+        peers: None,
     }
 }
 
@@ -275,9 +285,10 @@ struct RunningNode {
 ///
 /// Split out of [`DiscoverySpawnConfig`] because the other eight fields there
 /// are the node key, the ports, the bootnodes and the peer target: operator
-/// input, identical on either chain. Writing the whole config in each arm meant
-/// typing those eight out twice, where the compiler could not tell if the two
-/// copies drifted.
+/// input, filled in the same way on either chain (the bootnodes are resolved
+/// per chain, but before the chain match). Writing the whole config in each arm
+/// meant typing those eight out twice, where the compiler could not tell if the
+/// two copies drifted.
 struct DiscoveryWireEntries {
     subscription_subnets: HashSet<u64>,
     attestation_committee_count: u64,
@@ -325,8 +336,9 @@ struct ChainSetup {
     wire: WireConfig,
     /// The ENR entries that describe the wire above: the only part of the discv5
     /// configuration the two chains disagree about. Everything else in
-    /// [`DiscoverySpawnConfig`] is operator-supplied and identical either way,
-    /// so it is filled in once, below the match.
+    /// [`DiscoverySpawnConfig`] is operator-supplied, the bootnodes included
+    /// (resolved per chain above the match), so it is filled in once, below
+    /// the match.
     discovery: DiscoveryWireEntries,
     /// Backs the req/resp handlers on both chains. Both start from the
     /// checkpoint anchor `fetch_initial_state`/`fetch_initial_beacon_state`
@@ -378,6 +390,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let Options { common, network } = options;
     // Read before the chain match below moves `network`.
     let discovery_enabled = network.discovery_enabled();
+    let lean_node_id = match &network {
+        Network::Lean(lean) => Some(lean.node_id.clone()),
+        Network::Mainnet { .. } => None,
+    };
+    let telemetry_url = common.telemetry_clickhouse_url;
+    let telemetry_client_name = common.telemetry_client_name;
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -399,6 +417,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_p2p::metrics::init();
     ethlambda_state_transition::metrics::init();
+    ethlambda_storage::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::client_version());
     ethlambda_blockchain::metrics::set_node_start_time();
 
@@ -433,40 +452,34 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = resolve_node_key(common.node_key.as_deref())?;
-
     #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
 
-    info!(node_key=?common.node_key, "got node key");
-
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
+    // Discovery binds the swarm's address. Named once because two readers must
+    // agree on it: the discv5 socket below, and `beacon`'s bootnode parser,
+    // which refuses an entry a socket bound here could never reach.
+    let discovery_ip = p2p_socket.ip();
 
-    // Resolved once, here, above the bootnode fallback below that reads it:
-    // `default_bootnodes` needs the loaded network's own bootnode list, and
-    // loading a directory decodes a multi-megabyte genesis state, so this must
-    // not run twice for one process. `network` is matched by reference so it
-    // is still available, below, to be matched by value into `ChainSetup`.
-    let network_source = match &network {
-        Network::Lean(_) => None,
+    // The network and the bootnodes, each resolved once, here, for the swarm
+    // and discv5 below. The network comes first: `beacon`'s `--bootnodes`
+    // entries are added to its own list, and loading a directory decodes a
+    // multi-megabyte genesis state, so it must not run twice for one process.
+    // `--bootnodes` means a different thing on each chain: a file of ENRs on
+    // `node`, a list added to the network's own on `beacon`. `network` is
+    // matched by reference so it is still available, below, to be matched by
+    // value into `ChainSetup`.
+    let (network_source, bootnodes) = match &network {
+        Network::Lean(lean) => (None, lean_bootnodes(lean.bootnodes.as_deref())?),
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
-            Some(network::NetworkSource::resolve(&spec)?)
+            let source = network::NetworkSource::resolve(&spec)?;
+            let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes(), discovery_ip)?;
+            (Some(source), bootnodes)
         }
     };
-
-    // The `--bootnodes` file, read and parsed once. An absent flag is not an
-    // empty list: `default_bootnodes` is what each chain falls back to.
-    let bootnodes = parse_enrs(
-        common
-            .bootnodes
-            .as_deref()
-            .map(read_bootnode_strings)
-            .transpose()?
-            .unwrap_or_else(|| default_bootnodes(network_source.as_ref())),
-    );
 
     // Shared, runtime-mutable aggregator flag, seeded from the CLI flag only
     // `node` takes: mainnet has no aggregation duty. Threaded into both the
@@ -476,6 +489,46 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(lean) => lean.is_aggregator,
         Network::Mainnet { .. } => false,
     });
+
+    // A malformed URL fails here, at startup, rather than at the first
+    // proposal; an unreachable builder only warns, since it may come up
+    // after this node does.
+    let builder = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet
+            .builder
+            .as_deref()
+            .map(|url| {
+                ethlambda_rpc::BuilderClient::with_redirects(
+                    url,
+                    std::time::Duration::from_millis(mainnet.builder_header_timeout),
+                    version::client_version(),
+                    mainnet.builder_follow_redirects,
+                )
+            })
+            .transpose()?,
+    };
+    let builder_fallback = match &network {
+        Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
+        Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
+            skips: mainnet.builder_fallback_skips,
+            skips_per_epoch: mainnet.builder_fallback_skips_per_epoch,
+            epochs_since_finalization: mainnet.builder_fallback_epochs_since_finalization,
+        },
+    };
+    // A one-off probe, for the log only: nothing waits on it or reads its
+    // answer, and every later call to the builder is tried on its own.
+    if let Some(builder) = builder.clone() {
+        tokio::spawn(async move {
+            let _ = builder
+                .status()
+                .await
+                .inspect(|()| info!("Builder is up"))
+                .inspect_err(|err| {
+                    warn!(%err, "Builder did not answer the startup status check; each call to it is still tried")
+                });
+        });
+    }
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
@@ -502,6 +555,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             .map_err(|err| eyre::eyre!("{err}"))
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
+
+    // Resolved after the DB open rather than before it, because a generated
+    // key is stored in `data_dir`: RocksDB's lock on that directory is what
+    // stops two processes started on it from both generating a key and racing
+    // to store theirs.
+    let node_p2p_key = resolve_node_key(common.node_key.as_deref(), &data_dir)?;
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
@@ -654,7 +713,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
             info!(
                 network = %source.name(),
-                bootnodes = ?common.bootnodes,
                 gossipsub_port = common.gossipsub_port,
                 http_address = %common.http_address,
                 metrics_port = common.metrics_port,
@@ -669,12 +727,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // the same computation, so the two cannot disagree about this
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
-            let params = beacon::wire_params(
-                &source,
-                node_id,
-                common.node_key.is_some(),
-                mainnet.custody_group_count,
-            )?;
+            let params = beacon::wire_params(&source, node_id, mainnet.custody_group_count)?;
 
             // Cloned ahead of the move into `WireConfig::Beacon` below: the
             // chain actor needs its own copy to gate fulu import on, the same
@@ -755,13 +808,14 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         }
     };
 
-    // The operator-supplied half of the discv5 configuration, which neither
-    // chain varies. Built before `build_swarm` because that moves the node key
-    // and the bootnode list. `None` on a lean node without `--discovery.enable`,
+    // The operator-supplied half of the discv5 configuration, which the chain
+    // match does not vary (the bootnodes were resolved per chain above it).
+    // Built before `build_swarm` because that moves the node key and the
+    // bootnode list. `None` on a lean node without `--discovery.enable`,
     // which then peers from the bootnode list alone.
     let discovery = discovery_enabled.then(|| DiscoverySpawnConfig {
         node_key: node_p2p_key.clone(),
-        bind_ip: p2p_socket.ip(),
+        bind_ip: discovery_ip,
         discovery_port: common.discovery.port,
         // Advertised as both the `quic` and `tcp` entries: TCP and UDP are
         // separate namespaces, so `build_swarm` binds both from this one number.
@@ -853,10 +907,48 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production and the contribution endpoint.
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
+    // Before the P2P actor starts, so its first column rows are not lost.
+    if let Some(url) = telemetry_url {
+        let url = url.into_inner();
+        let config = setup.store.config();
+        let grid = config.time_grid();
+        let (client_name, network_name) = telemetry_names(
+            lean_node_id.as_deref(),
+            telemetry_client_name,
+            setup.store.chain(),
+            config.config_name.as_str(),
+            grid.genesis_time_ms() / 1000,
+        );
+        if sends_credentials_in_clear(&url) {
+            warn!(
+                host = url.host_str(),
+                "The ClickHouse URL carries credentials over plain http to a host that is not \
+                 loopback; they cross the network unencrypted. Use https, or a loopback address"
+            );
+        }
+        // Only the host and port: the URL may carry credentials.
+        info!(
+            %client_name,
+            %network_name,
+            host = url.host_str(),
+            port = url.port_or_known_default(),
+            "Writing block telemetry to ClickHouse"
+        );
+        ethlambda_telemetry::install(ethlambda_telemetry::TelemetryConfig {
+            url,
+            client_name,
+            network_name,
+            clock: ethlambda_telemetry::SlotClock::new(
+                grid.genesis_time_ms(),
+                grid.milliseconds_per_slot,
+            ),
+        });
+    }
     // What the HTTP server and P2P take from values the chain actor's spawn
     // below moves.
     let rpc_store = setup.store.clone();
     let rpc_events = events.clone();
+    let p2p_events = events.clone();
     let rpc_sync_status = sync_status.clone();
     let p2p_store = setup.store.clone();
     let rpc_custody_columns = match &setup.chain {
@@ -916,6 +1008,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         payload_attestation_pool.clone(),
         builder_market.clone(),
         sync_committee_pool.clone(),
+        Some(Arc::new(p2p_events)),
         &network_group,
     )
     .wrap_err("failed to start the P2P actor")?;
@@ -924,6 +1017,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_identity = ethlambda_rpc::BeaconIdentity {
         metadata: p2p.local_metadata(),
+        peers: Some(p2p.peer_table()),
         ..beacon_identity(
             p2p.local_enr().unwrap_or_default(),
             common.discovery.advertise_ip,
@@ -951,6 +1045,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 events: rpc_events,
                 client_version: version::engine_client_version(),
                 identity: rpc_identity.clone(),
+                builder: builder.clone(),
+                builder_fallback,
             };
             Box::pin(ethlambda_rpc::start_beacon_rpc_server(
                 rpc_config,
@@ -1048,6 +1144,65 @@ fn network_workers() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }
 
+/// `(meta_client_name, meta_network_name)` for the telemetry rows.
+///
+/// An explicit `--telemetry.client-name` wins. Otherwise a lean node uses its
+/// `--node-id` (devnets run several nodes per host) and a beacon node
+/// `ethlambda@<hostname>`. The hostname is read only on that last path, so a
+/// node with telemetry off never asks. A loaded `--network` directory may have
+/// no `CONFIG_NAME`, hence the beacon fallback.
+///
+/// A lean network has no name of its own, so it is `lean-<genesis time>`:
+/// two devnets, or one devnet reset with a new genesis, writing to one table
+/// stay apart, and every node of one devnet agrees on the name.
+fn telemetry_names(
+    lean_node_id: Option<&str>,
+    explicit: Option<String>,
+    chain: ethlambda_storage::Chain,
+    config_name: &str,
+    genesis_time_secs: u64,
+) -> (String, String) {
+    let client_name = explicit.unwrap_or_else(|| match lean_node_id {
+        Some(node_id) => node_id.to_owned(),
+        None => format!("ethlambda@{}", hostname()),
+    });
+    let network_name = match chain {
+        ethlambda_storage::Chain::Lean => format!("lean-{genesis_time_secs}"),
+        ethlambda_storage::Chain::Beacon if config_name.is_empty() => "unknown".to_owned(),
+        ethlambda_storage::Chain::Beacon => config_name.to_owned(),
+    };
+    (client_name, network_name)
+}
+
+/// `url` sends a username or password as basic auth, unencrypted, to a host
+/// that is not this machine.
+fn sends_credentials_in_clear(url: &reqwest::Url) -> bool {
+    let has_credentials = !url.username().is_empty() || url.password().is_some();
+    // An IPv6 host comes back bracketed.
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    has_credentials && url.scheme() == "http" && !loopback
+}
+
+/// This machine's hostname, for the default telemetry client name.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, and
+    // `gethostname` writes at most that many. It may leave no NUL when the
+    // name fills the buffer; the `position` fallback below handles that.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        warn!("gethostname failed; telemetry client name falls back to \"unknown\"");
+        return "unknown".to_owned();
+    }
+    let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
 /// The root of the anchor block when it is a gloas block whose execution
 /// payload envelope the store does not hold.
 ///
@@ -1081,24 +1236,39 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Wait for SIGINT or SIGTERM, then stop everything within
+/// Wait for ctrl-c or SIGTERM, then stop everything within
 /// [`SHUTDOWN_DEADLINE`].
 ///
 /// The actor system stops everything in reverse admission order: the HTTP
 /// server (given [`HTTP_SHUTDOWN_TIMEOUT`] of it), then P2P, then the chain
 /// actor. A shutdown that misses it names what is still running and
 /// exits non-zero rather than wait on it: Docker would SIGKILL the process two
-/// seconds later anyway, and then nothing would say which actor held it.
+/// seconds later anyway, and then nothing would say which actor held it. The
+/// last telemetry rows get what is left of the deadline, at most
+/// [`TELEMETRY_FLUSH_TIMEOUT`].
 ///
-/// A 2nd, 3rd and 4th ctrl-c still escalate to `std::process::exit(1)`.
+/// A 2nd, 3rd and 4th signal, ctrl-c or SIGTERM in any mix, escalate to
+/// `std::process::exit(1)` (see [`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// Both signals are listened for before `Node initialized` is logged, so a
+/// signal sent once that line is out is never lost or fatal. One sent earlier,
+/// during startup, still has its default action: see the `shutdown` module.
 ///
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
+/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
+/// one request's timeout plus a margin, so a reachable server gets them and an
+/// unreachable one does not hold the exit up for long. Capped by what is left
+/// of [`SHUTDOWN_DEADLINE`].
+const TELEMETRY_FLUSH_TIMEOUT: Duration = Duration::from_secs(12);
+
 async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
+    let mut signals = ShutdownSignals::listen();
     info!("Node initialized");
 
-    let signal = shutdown_signal().await;
+    // 1st ctrl+c or SIGTERM: start graceful shutdown
+    let signal = signals.recv().await;
     let started = Instant::now();
 
     info!(
@@ -1107,20 +1277,7 @@ async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
         "Shutdown signal received, stopping actors and servers..."
     );
 
-    tokio::spawn(async move {
-        // This can be turned into a loop
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        warn!(
-            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
-        );
-        tokio::signal::ctrl_c().await.ok();
-        info!("Forced ungraceful shutdown...");
-        std::process::exit(1);
-    });
+    signals.force_exit_on_repeats();
 
     let RunningNode {
         system,
@@ -1140,6 +1297,11 @@ async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     let report = system.shutdown(SHUTDOWN_DEADLINE).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if report.complete {
+        // After the actors, which are the only emitters, have stopped.
+        let flush_budget = SHUTDOWN_DEADLINE
+            .saturating_sub(started.elapsed())
+            .min(TELEMETRY_FLUSH_TIMEOUT);
+        ethlambda_telemetry::shutdown(flush_budget).await;
         info!(elapsed_ms, "Shutdown complete");
         return Ok(());
     }
@@ -1175,54 +1337,137 @@ fn log_incomplete_shutdown(report: &ShutdownReport, actors: &[(ActorId, &str)], 
     );
 }
 
-/// Resolve on the first SIGINT (ctrl-c) or SIGTERM, naming which one.
+/// `node`'s bootnodes: the ENRs in its `--bootnodes` file, if one was given.
 ///
-/// SIGTERM is what `docker stop`, systemd and Kubernetes send, so a container
-/// no longer needs `--stop-signal SIGINT` to shut down gracefully.
-async fn shutdown_signal() -> &'static str {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                return tokio::select! {
-                    _ = tokio::signal::ctrl_c() => "SIGINT",
-                    _ = terminate.recv() => "SIGTERM",
-                };
+/// A lean network's ENRs are per-deployment, so there is no list to default to
+/// and an absent flag means this node reaches peers only through discv5, which
+/// a lean node runs only with `--discovery.enable`, or by being dialed. That
+/// case warns, and so does a file that yields no usable ENR, because a node
+/// that then finds nobody is islanded and otherwise looks healthy. A file that
+/// was named and cannot be read is an error, so a typo does not look like "no
+/// peers".
+fn lean_bootnodes(file: Option<&Path>) -> eyre::Result<Vec<Bootnode>> {
+    match file {
+        Some(path) => {
+            let bootnodes = parse_enrs(read_bootnode_strings(path)?);
+            // `parse_enrs` words its own warning for the list, since `beacon`
+            // adds to its result; here the file is the node's whole list.
+            if bootnodes.is_empty() {
+                warn!(
+                    file = %path.display(),
+                    "The --bootnodes file gave no usable bootnode: starting with no bootnodes."
+                );
             }
-            Err(err) => warn!(%err, "Cannot listen for SIGTERM; only ctrl-c shuts down gracefully"),
+            Ok(bootnodes)
         }
-    }
-    tokio::signal::ctrl_c().await.ok();
-    "SIGINT"
-}
-
-/// The ENRs to start from when `--bootnodes` was not given.
-///
-/// A resolved network (built-in mainnet, or a loaded directory) publishes its
-/// own bootnode list, so an absent flag means "use it". A lean network's ENRs
-/// are per-deployment, so there is nothing to default to and an absent flag
-/// means this node reaches peers only through discv5, which a lean node runs
-/// only with `--discovery.enable`, or by being dialed. That case warns, because
-/// a node that then finds nobody is islanded and otherwise looks healthy.
-fn default_bootnodes(source: Option<&network::NetworkSource>) -> Vec<String> {
-    match source {
         None => {
             warn!(
                 "No --bootnodes file supplied: starting with no bootnodes. This node can \
                  only find peers via discv5 (--discovery.enable) or by being dialed."
             );
-            Vec::new()
+            Ok(Vec::new())
         }
-        Some(source) => source.bootnodes(),
     }
+}
+
+/// `beacon`'s bootnodes: its `--bootnodes` entries, then the resolved
+/// network's own list.
+///
+/// Additive, as Lighthouse's `--boot-nodes` is, so naming one extra peer never
+/// costs the node the network's published seeds. The two halves fail
+/// differently on purpose. A command-line entry was typed to reach that peer,
+/// so one that does not parse aborts startup rather than leave the node on a
+/// list it was not given; the network's list keeps [`parse_enrs`]' rule and
+/// skips a bad entry with a warning. Duplicates are left for `build_swarm`,
+/// which merges bootnodes by peer id.
+///
+/// `discovery_ip` is the address discovery binds, which [`parse_bootnode`]
+/// checks each command-line entry against.
+///
+/// Logs the two counts once: the network's half can shrink silently through
+/// skipped entries, and the line is what shows how much of the list the
+/// command line contributed. Warns when the result is empty, which leaves
+/// discv5 with no seed.
+fn beacon_bootnodes(
+    cli_entries: &[String],
+    network_entries: Vec<String>,
+    discovery_ip: IpAddr,
+) -> eyre::Result<Vec<Bootnode>> {
+    let mut bootnodes = Vec::new();
+    // A blank entry is skipped here, where `parse_bootnode` would refuse it:
+    // `--bootnodes ""` and a trailing comma both leave one, and mean
+    // "nothing".
+    for entry in cli_entries.iter().map(|entry| entry.trim()) {
+        if entry.is_empty() {
+            continue;
+        }
+        // `allow_hyphen_values` lets a value-less `--bootnodes` take the next
+        // flag as its value. No ENR starts with `--`, so this is that flag,
+        // not a bootnode. An ENR is an RLP list whose payload is over 55 bytes
+        // (the signature alone is 64) and at most 300, so its first byte is
+        // 0xf8 or 0xf9. In base64 that byte's top six bits (111110) make the
+        // first character `-`, and its low two bits (00 or 01) put the second
+        // character in A-Z or a-f, never `-`.
+        if entry.starts_with("--") {
+            eyre::bail!(
+                "--bootnodes was given no value: it took the flag \"{entry}\" as its value"
+            );
+        }
+        let bootnode = parse_bootnode(entry, discovery_ip).map_err(|reason| {
+            // `--bootnodes` named a file on `beacon` until it became a list,
+            // and launch scripts still pass one. Checked only after a parse
+            // failure, so no entry that parses is ever read from disk. A
+            // bootnode file's usual extensions count too, so a path that does
+            // not exist (a typo, or a file the launcher stopped writing) gets
+            // the same hint rather than a decoding error.
+            let path = Path::new(entry);
+            let file_like = path.is_file()
+                || matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yaml" | "yml" | "txt")
+                );
+            if file_like {
+                eyre::eyre!(
+                    "--bootnodes entry \"{entry}\" looks like a file: beacon --bootnodes \
+                     now takes a comma-separated list of ENRs and multiaddrs, not a file. \
+                     Pass the records themselves, joined with commas, without a YAML \
+                     list's \"- \" markers or any comments. They are added to the \
+                     network's own bootnodes, not put in their place; a network loaded \
+                     from a directory can list them in its bootstrap_nodes.yaml instead"
+                )
+            } else {
+                eyre::eyre!("invalid --bootnodes entry \"{entry}\": {reason}")
+            }
+        })?;
+        bootnodes.push(bootnode);
+    }
+    let from_command_line = bootnodes.len();
+
+    let from_network = parse_enrs(network_entries);
+    info!(
+        from_command_line,
+        from_network = from_network.len(),
+        "Resolved bootnodes"
+    );
+    bootnodes.extend(from_network);
+    // `parse_enrs` warns about its own list only, and only when that list
+    // named entries; a network directory with no bootnode file names none.
+    if bootnodes.is_empty() {
+        warn!(
+            "No bootnodes: neither --bootnodes nor the network's own list gave one. \
+             discv5 has no seed, so this node finds peers only when one reaches it first."
+        );
+    }
+    Ok(bootnodes)
 }
 
 /// Read a bootnode file into one ENR string per entry.
 ///
-/// Shared by both chains: [`run_node`] reads the file once and hands the result
-/// to [`parse_enrs`], which skips an unusable record with a warning rather than
-/// failing startup, and warns again if that leaves the list empty.
+/// Reads `node`'s `--bootnodes` file and a loaded network directory's
+/// `bootstrap_nodes.yaml`/`.txt` (`network::dir`); each result goes to
+/// [`parse_enrs`], which skips an unusable record with a warning rather than
+/// failing startup, and warns again if that leaves the list empty. `beacon`'s
+/// own `--bootnodes` is a list, not a file, and never comes through here.
 ///
 /// YAML first, then a line-oriented fallback. The two sub-commands arrived
 /// with different readers: `node` required a strict YAML sequence, `beacon`
@@ -1291,6 +1536,10 @@ fn init_shadow_cost(shadow: &cli::ShadowOptions) {
 async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
     use tokio::sync::RwLock;
 
+    // Before `Test-driver RPC ready`, so a signal sent once that line is out
+    // is never lost or fatal; `tests/shutdown.rs` relies on it.
+    let mut signals = ShutdownSignals::listen();
+
     let driver: ethlambda_rpc::test_driver::DriverState =
         Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
 
@@ -1307,8 +1556,12 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 
     info!("Test-driver RPC ready");
 
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received, stopping test-driver RPC...");
+    let signal = signals.recv().await;
+    info!(
+        signal,
+        "Shutdown signal received, stopping test-driver RPC..."
+    );
+    signals.force_exit_on_repeats();
     shutdown_token.cancel();
     let _ = rpc_handle.await;
     info!("Shutdown complete");
@@ -1534,36 +1787,76 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
         .wrap_err_with(|| format!("failed to decode hex file from {}", path.display()))
 }
 
-/// Resolve a sub-command's node key: read `--node-key` if given, otherwise
-/// generate a fresh secp256k1 key in memory.
+/// Name of the file, inside `--data-dir`, holding the node key generated when
+/// `--node-key` is absent.
+const STORED_NODE_KEY_FILE: &str = "node.key";
+
+/// Resolve a sub-command's node key: read `--node-key` if given, otherwise the
+/// key stored in `data_dir`, generating and storing one first if the directory
+/// has none yet.
 ///
-/// Shared by both sub-commands, since `--node-key` is optional on both. There
-/// is no precedent elsewhere in this binary for writing generated key material
-/// to `--data-dir`, and doing so would need file permissions this repo does
-/// not otherwise establish; keeping it in memory only is the conservative
-/// choice, so a generated identity does not survive a restart.
+/// Shared by both sub-commands, since `--node-key` is optional on both. A
+/// supplied `--node-key` is only read; nothing is written. Without one, the
+/// identity is kept beside the chain data it belongs to, so it survives a
+/// restart: a lean node keeps its `PeerId`, and with it its place in every
+/// peer's scoring and in any ENR its neighbours cached, and a `beacon` node
+/// keeps its custody columns, which are a function of this same node id, so
+/// the sidecars already on disk stay the ones it advertises and serves.
+/// Wiping the data directory resets the identity together with that data.
 ///
-/// The warning below is about `PeerId`/ENR churn, which costs a lean node its
-/// place in every peer's scoring and in any ENR its neighbours cached.
-/// `beacon` has no validator identity to protect, but it is not exempt
-/// either: its custody columns are a function of this same node id, so an
-/// unstable identity there means a different custody set on every restart.
-/// `beacon::wire_params` carries its own, more specific warning about that;
-/// see it for why `beacon` needs a second one.
-fn resolve_node_key(node_key_path: Option<&Path>) -> eyre::Result<Vec<u8>> {
-    match node_key_path {
-        Some(path) => read_hex_file_bytes(path)
-            .wrap_err_with(|| format!("failed to load node key from {}", path.display())),
-        None => {
-            let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng);
-            warn!(
-                "No --node-key supplied: generated an ephemeral secp256k1 key in memory for \
-                 this run only. This node's PeerId and ENR will be different on the next \
-                 start; pass --node-key with a persisted key file for a stable identity."
-            );
-            Ok(generated.secret_bytes().to_vec())
-        }
+/// The stored file is hex, the format `--node-key` reads, so it can be passed
+/// as `--node-key` to another run. It is written at mode `0600` on unix
+/// through [`ethlambda_validator::secure_fs::write_private_no_symlink`], and
+/// through a `.tmp` sibling renamed into place, so an interrupted first start
+/// leaves no partial key behind and a symlink planted at the `.tmp` path is
+/// refused rather than followed. A stored file that fails to load is an
+/// error, never a cue to generate a replacement, since that would silently
+/// discard an identity that was working; the error says that deleting the
+/// file is how to ask for a new one.
+fn resolve_node_key(node_key_path: Option<&Path>, data_dir: &Path) -> eyre::Result<Vec<u8>> {
+    if let Some(path) = node_key_path {
+        let key = read_node_key(path)
+            .wrap_err_with(|| format!("failed to load node key from {}", path.display()))?;
+        info!(path = %path.display(), "Loaded the node key from --node-key");
+        return Ok(key);
     }
+
+    let stored = data_dir.join(STORED_NODE_KEY_FILE);
+    let exists = stored
+        .try_exists()
+        .wrap_err_with(|| format!("failed to look for a node key at {}", stored.display()))?;
+    if exists {
+        let key = read_node_key(&stored).wrap_err_with(|| {
+            format!(
+                "failed to load the node key stored at {}; deleting the file makes the next \
+                 start generate a new one, which gives this node a new identity",
+                stored.display()
+            )
+        })?;
+        info!(path = %stored.display(), "Loaded the node key stored in the data directory");
+        return Ok(key);
+    }
+
+    let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng).secret_bytes();
+    let contents = format!("{}\n", hex::encode(generated));
+    let temporary = data_dir.join(format!("{STORED_NODE_KEY_FILE}.tmp"));
+    ethlambda_validator::secure_fs::write_private_no_symlink(&temporary, contents)
+        .and_then(|()| std::fs::rename(&temporary, &stored))
+        .wrap_err_with(|| format!("failed to store a node key at {}", stored.display()))?;
+    info!(
+        path = %stored.display(),
+        "No --node-key supplied: generated a node key and stored it in the data directory"
+    );
+    Ok(generated.to_vec())
+}
+
+/// Read a hex node key file, refusing bytes that are not a valid secp256k1
+/// secret key here rather than leaving `build_swarm` to panic on them.
+fn read_node_key(path: &Path) -> eyre::Result<Vec<u8>> {
+    let key = read_hex_file_bytes(path)?;
+    secp256k1::SecretKey::from_slice(&key)
+        .wrap_err("the file does not hold a valid secp256k1 secret key")?;
+    Ok(key)
 }
 
 /// Fetch the initial state for the node.
@@ -2496,6 +2789,54 @@ mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    #[test]
+    fn an_explicit_telemetry_name_wins() {
+        let (client, network) = telemetry_names(
+            Some("node-1"),
+            Some("mine".to_owned()),
+            ethlambda_storage::Chain::Lean,
+            "",
+            1_770_407_233,
+        );
+        assert_eq!(
+            (client.as_str(), network.as_str()),
+            ("mine", "lean-1770407233")
+        );
+    }
+
+    #[test]
+    fn a_lean_node_is_named_by_its_node_id() {
+        let (client, network) =
+            telemetry_names(Some("node-1"), None, ethlambda_storage::Chain::Lean, "", 7);
+        assert_eq!((client.as_str(), network.as_str()), ("node-1", "lean-7"));
+    }
+
+    #[test]
+    fn a_beacon_node_is_named_by_host_and_config() {
+        let (client, network) =
+            telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "mainnet", 0);
+        assert!(client.starts_with("ethlambda@"), "{client}");
+        assert_eq!(network, "mainnet");
+    }
+
+    #[test]
+    fn credentials_in_clear_are_flagged_only_off_loopback_over_http() {
+        let flagged = |raw: &str| sends_credentials_in_clear(&raw.parse().unwrap());
+        assert!(flagged("http://u:p@10.0.0.5:8123/"));
+        assert!(flagged("http://u@clickhouse.example:8123/"));
+        assert!(!flagged("https://u:p@clickhouse.example:8443/"));
+        assert!(!flagged("http://u:p@127.0.0.1:8123/"));
+        assert!(!flagged("http://u:p@[::1]:8123/"));
+        assert!(!flagged("http://u:p@localhost:8123/"));
+        assert!(!flagged("http://10.0.0.5:8123/"));
+    }
+
+    #[test]
+    fn a_beacon_network_without_a_config_name_is_unknown() {
+        let (_, network) = telemetry_names(None, None, ethlambda_storage::Chain::Beacon, "", 0);
+        assert_eq!(network, "unknown");
+    }
 
     /// Emits one event per (target, level) of interest under a subscriber
     /// built from `node_log_filter(rust_log)` and returns what got written.
@@ -3558,50 +3899,127 @@ validators:
         }
     }
 
-    /// A unique path under the OS temp dir, so parallel test runs cannot
-    /// collide on the same file.
-    fn temp_key_path(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("ethlambda-test-node-key-{label}-{nanos}.key"))
-    }
-
     #[test]
-    fn a_supplied_node_key_is_read_verbatim_and_stable_across_calls() {
+    fn a_supplied_node_key_is_read_verbatim_and_nothing_is_stored() {
         // A `PeerId` is a pure function of the key bytes (see
         // `ethlambda_p2p::derive_peer_ids`), so two calls returning the same
         // bytes for the same file is exactly what "the same PeerId across two
         // runs" comes down to, without pulling libp2p's key derivation into
         // this crate's tests.
-        let path = temp_key_path("supplied");
+        let keys = tempfile::tempdir().expect("temp dir");
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let path = keys.path().join("supplied.key");
         std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
 
-        let first = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
-        let second = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let first = resolve_node_key(Some(&path), data_dir.path()).expect("reads the key");
+        let second = resolve_node_key(Some(&path), data_dir.path()).expect("reads the key");
 
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(first, vec![0x01; 32]);
         assert_eq!(first, second);
+        let entries = std::fs::read_dir(data_dir.path()).expect("data dir reads");
+        assert_eq!(
+            entries.count(),
+            0,
+            "a supplied key must not be copied anywhere"
+        );
     }
 
     #[test]
-    fn a_missing_node_key_generates_a_valid_key_that_differs_from_a_supplied_one() {
-        let path = temp_key_path("baseline");
-        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
-        let supplied = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
-        let _ = std::fs::remove_file(&path);
+    fn a_missing_node_key_is_generated_once_and_reloaded_from_the_data_dir() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
 
-        let generated_a = resolve_node_key(None).expect("generates a key");
-        let generated_b = resolve_node_key(None).expect("generates a key");
-
+        let generated = resolve_node_key(None, data_dir.path()).expect("generates a key");
         // "Accepted": the bytes are a valid secp256k1 secret key, the same
         // check `build_swarm` performs before deriving the swarm identity.
-        secp256k1::SecretKey::from_slice(&generated_a)
+        secp256k1::SecretKey::from_slice(&generated)
             .expect("generated key is a valid secp256k1 secret key");
 
-        assert_ne!(generated_a, supplied);
-        assert_ne!(generated_a, generated_b, "two generations must not collide");
+        let reloaded = resolve_node_key(None, data_dir.path()).expect("reloads the key");
+        assert_eq!(generated, reloaded, "a restart must keep the identity");
+
+        // The stored file is in `--node-key`'s own format, so an operator can
+        // hand it to another run as that flag.
+        let stored = data_dir.path().join(STORED_NODE_KEY_FILE);
+        let other_data_dir = tempfile::tempdir().expect("temp dir");
+        let as_flag = resolve_node_key(Some(&stored), other_data_dir.path())
+            .expect("the stored file reads as --node-key");
+        assert_eq!(generated, as_flag);
+        assert!(
+            !data_dir.path().join("node.key.tmp").exists(),
+            "the temporary sibling is renamed into place"
+        );
+
+        let elsewhere = resolve_node_key(None, other_data_dir.path()).expect("generates a key");
+        assert_ne!(
+            generated, elsewhere,
+            "two data directories must not share a key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_node_key_is_stored_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        resolve_node_key(None, data_dir.path()).expect("generates a key");
+
+        let mode = std::fs::metadata(data_dir.path().join(STORED_NODE_KEY_FILE))
+            .expect("the key is stored")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "got {mode:o}");
+    }
+
+    #[test]
+    fn a_stored_node_key_that_fails_to_load_is_an_error_not_a_new_key() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let stored = data_dir.path().join(STORED_NODE_KEY_FILE);
+
+        // Not hex, then hex of the wrong length: neither may be replaced,
+        // since that would silently change the node's identity.
+        for contents in ["not hex", "0102"] {
+            std::fs::write(&stored, contents).expect("writes");
+            let err = resolve_node_key(None, data_dir.path()).expect_err("must refuse the file");
+            assert!(err.to_string().contains(STORED_NODE_KEY_FILE), "{err:#}");
+            assert!(err.to_string().contains("deleting the file"), "{err:#}");
+            assert_eq!(std::fs::read_to_string(&stored).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_temporary_node_key_path_is_not_followed() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let elsewhere = tempfile::tempdir().expect("temp dir");
+        let target = elsewhere.path().join("target");
+        std::fs::write(&target, "untouched").expect("writes target");
+        let temporary = data_dir.path().join(format!("{STORED_NODE_KEY_FILE}.tmp"));
+        std::os::unix::fs::symlink(&target, &temporary).expect("symlinks");
+
+        let err = resolve_node_key(None, data_dir.path()).expect_err("must refuse the symlink");
+        let io = err
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .expect("an I/O error");
+        assert_eq!(io.raw_os_error(), Some(libc::ELOOP), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(!data_dir.path().join(STORED_NODE_KEY_FILE).exists());
+    }
+
+    /// The key is stored in the RocksDB directory itself, after the DB is
+    /// opened, so RocksDB must tolerate a file it did not write there when
+    /// the directory is opened again.
+    #[test]
+    fn rocksdb_reopens_a_data_dir_holding_a_stored_node_key() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let backend = RocksDBBackend::open(data_dir.path()).expect("opens a fresh DB");
+        let generated = resolve_node_key(None, data_dir.path()).expect("generates a key");
+        drop(backend);
+
+        let _backend = RocksDBBackend::open(data_dir.path()).expect("reopens with the key present");
+        let reloaded = resolve_node_key(None, data_dir.path()).expect("reloads the key");
+        assert_eq!(generated, reloaded);
     }
 
     /// Write `contents` to a scratch file and read it back as a bootnode list.
@@ -3658,25 +4076,179 @@ validators:
 
     #[test]
     fn an_unreadable_bootnode_file_is_an_error_but_an_absent_one_is_not() {
-        // The flag is optional on both chains, so no flag is not an error;
-        // what an absent list *means* is each chain's own decision, made in
-        // `default_bootnodes`. A path that was supplied and cannot be read is
-        // still a hard failure: the operator named a file, so a typo must not
-        // look like "no peers".
-        let absent: Option<&Path> = None;
+        // The flag is optional on `node`, so no flag is not an error, just no
+        // bootnodes (warned about in `lean_bootnodes`). A path that was
+        // supplied and cannot be read is still a hard failure: the operator
+        // named a file, so a typo must not look like "no peers".
         assert!(
-            absent
-                .map(read_bootnode_strings)
-                .transpose()
+            lean_bootnodes(None)
                 .expect("no flag is not an error")
-                .is_none()
+                .is_empty()
         );
         let missing = std::env::temp_dir().join("ethlambda-test-enrs-does-not-exist.yaml");
         assert!(read_bootnode_strings(&missing).is_err());
+        assert!(lean_bootnodes(Some(&missing)).is_err());
     }
 
-    /// The two chains read the same absent flag in opposite directions, so an
-    /// arm that starts answering like the other one is a silent peering change:
+    /// A real ENR (`ethlambda-p2p`'s `parse_enrs_extracts_ip_port_and_public_key`
+    /// record: localhost, `quic` 9001), standing in for one typed on the
+    /// command line.
+    const LOCALHOST_ENR: &str = "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
+
+    /// The address `run_node` binds discovery to.
+    const IPV4_DISCOVERY: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+    fn peer_ids(bootnodes: &[Bootnode]) -> Vec<PeerId> {
+        bootnodes.iter().map(Bootnode::peer_id).collect()
+    }
+
+    /// A secp256k1 peer id from a fixed secret, so a test can write a
+    /// multiaddr bootnode and recognize it in the result.
+    fn seeded_peer_id(seed: u8) -> PeerId {
+        let keys = HashMap::from([(String::new(), H256([seed; 32]))]);
+        ethlambda_p2p::derive_peer_ids(keys)
+            .into_keys()
+            .next()
+            .expect("a valid secp256k1 secret")
+    }
+
+    /// Why `beacon_bootnodes` refuses `cli_entries`, panicking if it accepts
+    /// them.
+    fn beacon_bootnodes_refusal(cli_entries: &[&str]) -> String {
+        let entries: Vec<String> = cli_entries.iter().map(|entry| entry.to_string()).collect();
+        let err = beacon_bootnodes(&entries, Vec::new(), IPV4_DISCOVERY)
+            .expect_err("the entries must be refused");
+        format!("{err:#}")
+    }
+
+    /// Additive, as Lighthouse's `--boot-nodes` is: the command line's entries
+    /// come first, in the order given, and the network's whole list follows.
+    #[test]
+    fn beacon_bootnodes_puts_the_command_line_first_and_keeps_the_network_list() {
+        let tcp_peer = seeded_peer_id(1);
+        let udp_peer = seeded_peer_id(2);
+        let cli_entries = [
+            format!("/ip4/203.0.113.7/tcp/9000/p2p/{tcp_peer}"),
+            LOCALHOST_ENR.to_string(),
+            format!("/ip4/203.0.113.8/udp/9000/p2p/{udp_peer}"),
+        ];
+        let network_entries = network::NetworkSource::built_in_mainnet()
+            .unwrap()
+            .bootnodes();
+        let network_peers = peer_ids(&parse_enrs(network_entries.clone()));
+        assert!(!network_peers.is_empty());
+
+        let bootnodes = beacon_bootnodes(&cli_entries, network_entries, IPV4_DISCOVERY)
+            .expect("every entry is valid");
+
+        let enr_peer = parse_bootnode(LOCALHOST_ENR, IPV4_DISCOVERY)
+            .unwrap()
+            .peer_id();
+        let mut expected = vec![tcp_peer, enr_peer, udp_peer];
+        expected.extend(network_peers);
+        assert_eq!(peer_ids(&bootnodes), expected);
+    }
+
+    /// `--bootnodes ""` and a trailing comma reach `beacon_bootnodes` as empty
+    /// entries, and a list split on commas may leave spaces around each one.
+    #[test]
+    fn beacon_bootnodes_skips_empty_and_blank_entries() {
+        let peer = seeded_peer_id(3);
+        let cli_entries = [
+            String::new(),
+            "   ".to_string(),
+            format!(" /ip4/203.0.113.7/tcp/9000/p2p/{peer} "),
+            String::new(),
+        ];
+
+        let bootnodes = beacon_bootnodes(&cli_entries, Vec::new(), IPV4_DISCOVERY)
+            .expect("blank entries are skipped");
+
+        assert_eq!(peer_ids(&bootnodes), [peer]);
+    }
+
+    /// A typed entry that does not parse fails startup, naming the entry and
+    /// the parser's reason, even when the entries around it are fine.
+    #[test]
+    fn a_malformed_beacon_bootnode_is_a_startup_error_naming_it() {
+        let peer = seeded_peer_id(4);
+        let valid = format!("/ip4/203.0.113.7/tcp/9000/p2p/{peer}");
+        for (entry, reason) in [
+            ("1.2.3.4:9000", "neither a multiaddr"),
+            ("/ip4/1.2.3.4/tcp/9000", "missing /p2p"),
+            ("enr:not-a-record", "invalid ENR"),
+        ] {
+            let refusal = beacon_bootnodes_refusal(&[&valid, entry]);
+            assert!(refusal.contains(&format!("\"{entry}\"")), "{refusal}");
+            assert!(refusal.contains(reason), "{refusal}");
+            assert!(!refusal.contains("not a file"), "{refusal}");
+        }
+    }
+
+    /// `allow_hyphen_values` lets a value-less `--bootnodes` (an unset variable
+    /// in a launch script) take the next flag as its value. The error must name
+    /// the missing value, not report the flag as a malformed ENR.
+    #[test]
+    fn a_bootnode_flag_with_no_value_is_refused_as_such() {
+        let refusal = beacon_bootnodes_refusal(&["--builder-follow-redirects"]);
+        assert!(refusal.contains("was given no value"), "{refusal}");
+        assert!(refusal.contains("--builder-follow-redirects"), "{refusal}");
+    }
+
+    /// `beacon --bootnodes` used to name a file, and launchers still pass one
+    /// (kurtosis: `--bootnodes=/tmp/ethlambda-bootnodes.txt`). That fails as a
+    /// multiaddr, but the error has to say why the flag changed rather than
+    /// report a multiaddr syntax error.
+    #[test]
+    fn a_bootnode_file_on_beacon_is_refused_with_a_hint() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(file.path(), format!("- {LOCALHOST_ENR}\n")).expect("writes");
+        let path = file.path().to_str().expect("utf-8 temp path");
+
+        let refusal = beacon_bootnodes_refusal(&[path]);
+
+        assert!(refusal.contains(path), "{refusal}");
+        assert!(
+            refusal.contains("now takes a comma-separated list of ENRs and multiaddrs, not a file"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("joined with commas"), "{refusal}");
+        // The file above is a YAML list; joining its lines as they are would
+        // keep the markers and fail again, as an ENR.
+        assert!(refusal.contains("\"- \" markers"), "{refusal}");
+    }
+
+    /// A launcher whose bootnode file is missing (a typo, or a file it stopped
+    /// writing) passes a path that is not a file at all. Its extension still
+    /// earns the hint, rather than an ENR or multiaddr decoding error.
+    #[test]
+    fn a_missing_bootnode_file_on_beacon_gets_the_same_hint() {
+        for path in ["/no/such/dir/bootnodes.yaml", "bootnodes.txt"] {
+            let refusal = beacon_bootnodes_refusal(&[path]);
+            assert!(refusal.contains(path), "{refusal}");
+            assert!(refusal.contains("not a file"), "{refusal}");
+        }
+    }
+
+    /// The network's own list keeps `parse_enrs`' rule: a bad entry there is
+    /// skipped with a warning, since the operator did not type it.
+    #[test]
+    fn a_bad_network_bootnode_is_skipped_not_refused() {
+        let good = network::NetworkSource::built_in_mainnet()
+            .unwrap()
+            .bootnodes()
+            .remove(0);
+        let good_peer = parse_bootnode(&good, IPV4_DISCOVERY).unwrap().peer_id();
+        let network_entries = vec!["enr:not-a-record".to_string(), good];
+
+        let bootnodes = beacon_bootnodes(&[], network_entries, IPV4_DISCOVERY)
+            .expect("a bad network entry is not an error");
+
+        assert_eq!(peer_ids(&bootnodes), [good_peer]);
+    }
+
+    /// The two chains read an absent flag in opposite directions, so an arm
+    /// that starts answering like the other one is a silent peering change:
     /// mainnet with no seeds cannot bootstrap, and a lean node handed mainnet's
     /// ENRs dials peers that will reject it.
     #[test]
@@ -3698,13 +4270,21 @@ validators:
         let Command::Node(node) = try_parse_from(argv).expect("`node` parses") else {
             panic!("`node` must resolve to the node sub-command");
         };
-        assert!(matches!(Options::from(node).network, Network::Lean(_)));
-        assert!(default_bootnodes(None).is_empty());
+        let Network::Lean(lean) = Options::from(node).network else {
+            panic!("`node` must carry the lean network");
+        };
+        assert!(
+            lean_bootnodes(lean.bootnodes.as_deref())
+                .unwrap()
+                .is_empty()
+        );
 
-        let mainnet_source = network::NetworkSource::built_in_mainnet().unwrap();
-        let fallback = default_bootnodes(Some(&mainnet_source));
+        let network_entries = network::NetworkSource::built_in_mainnet()
+            .unwrap()
+            .bootnodes();
+        let fallback = beacon_bootnodes(&[], network_entries.clone(), IPV4_DISCOVERY).unwrap();
         assert!(!fallback.is_empty());
-        assert_eq!(fallback, mainnet_source.bootnodes());
+        assert_eq!(peer_ids(&fallback), peer_ids(&parse_enrs(network_entries)));
     }
 }
 

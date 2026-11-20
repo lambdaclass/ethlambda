@@ -17,8 +17,11 @@ use crate::shared::block_id::IdError;
 
 pub(crate) mod bid_selection;
 pub(crate) mod bids;
+pub(crate) mod blinded_blocks;
 pub(crate) mod blocks;
+pub(crate) mod builder_client;
 pub(crate) mod builder_config;
+pub(crate) mod builder_flow;
 pub(crate) mod builders;
 pub(crate) mod config;
 pub(crate) mod envelopes;
@@ -33,6 +36,7 @@ pub(crate) mod pool;
 pub(crate) mod proposal;
 pub(crate) mod proposer_preferences;
 pub(crate) mod ptc;
+pub(crate) mod registrations;
 pub(crate) mod states;
 pub(crate) mod sync_committee;
 pub(crate) mod validator;
@@ -155,6 +159,39 @@ impl BodyEncoding {
     }
 }
 
+/// Report an object the API accepted on the event stream, when the node has an
+/// [`EventBus`](ethlambda_blockchain::EventBus) and anyone listens.
+///
+/// `event` builds the payload only behind that check. A handler whose payload
+/// is the object it then moves into the publish copies it beforehand with
+/// [`copy_if_listened`], which asks the same question. The bus is an
+/// `Option<Extension<_>>` on the handlers that call this, so a router built
+/// without one (the handlers' own tests) still serves.
+pub(crate) fn emit_accepted(
+    events: Option<&ethlambda_blockchain::EventBus>,
+    event: impl FnOnce() -> ethlambda_network_api::GossipEvent,
+) {
+    use ethlambda_network_api::GossipEventSink;
+    if let Some(events) = events.filter(|events| events.has_subscribers()) {
+        GossipEventSink::emit(events, event());
+    }
+}
+
+/// A copy of `object` for [`emit_accepted`], made only when the node has an
+/// event bus and anyone listens.
+///
+/// The submission handlers move the object into its publish before they know
+/// whether it went out, so the event needs its own copy, and most nodes have
+/// no subscriber to pay a bid's KZG commitments for.
+pub(crate) fn copy_if_listened<T: Clone>(
+    events: Option<&ethlambda_blockchain::EventBus>,
+    object: &T,
+) -> Option<T> {
+    events
+        .is_some_and(|events| events.has_subscribers())
+        .then(|| object.clone())
+}
+
 /// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
 /// `List[T, ...]` of the same elements, by the request's `Content-Type`.
 pub(crate) fn decode_list<T>(
@@ -190,6 +227,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(config::routes())
         .merge(node::routes(version, peer_id))
         .merge(validator::routes())
+        .merge(registrations::routes())
         .merge(pool::routes())
         .merge(operations::routes())
         .merge(proposal::routes())

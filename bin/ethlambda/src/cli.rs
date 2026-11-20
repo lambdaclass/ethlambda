@@ -5,13 +5,78 @@ use ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+/// The ClickHouse endpoint, wrapped so the options' derived `Debug` cannot
+/// print its credentials: `reqwest::Url`'s own `Debug` includes the password
+/// and the query.
+#[derive(Clone)]
+pub(crate) struct ClickHouseUrl(reqwest::Url);
+
+impl ClickHouseUrl {
+    pub(crate) fn into_inner(self) -> reqwest::Url {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ClickHouseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseUrl")
+            .field("scheme", &self.0.scheme())
+            .field("host", &self.0.host_str())
+            .field("port", &self.0.port_or_known_default())
+            .finish()
+    }
+}
+
+/// Parses `--telemetry.clickhouse-url`.
+///
+/// A plain `value_parser` function would leave clap to print
+/// `invalid value '<raw>'` around its message, and the value may carry a
+/// password. A `TypedValueParser` builds the whole `clap::Error` itself, so
+/// the raw value never reaches the output.
+#[derive(Clone)]
+struct ClickHouseUrlParser;
+
+impl clap::builder::TypedValueParser for ClickHouseUrlParser {
+    type Value = ClickHouseUrl;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<ClickHouseUrl, clap::Error> {
+        let reject = |why: &str| {
+            let flag = arg.map_or_else(String::new, |arg| arg.to_string());
+            cmd.clone().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "invalid {flag} (or ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL): {why} \
+                     (the value is not shown, it may hold a password)"
+                ),
+            )
+        };
+        let raw = value.to_str().ok_or_else(|| reject("not valid UTF-8"))?;
+        let url = reqwest::Url::parse(raw).map_err(|_| reject("not a valid URL"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(reject(
+                "only http and https are supported (ClickHouse's HTTP interface, usually port 8123)",
+            ));
+        }
+        Ok(ClickHouseUrl(url))
+    }
+}
+
 /// Flags every sub-command takes, with the same meaning on each.
 ///
-/// `--node-key`, `--bootnodes` and `--checkpoint-sync-url` used to be declared
-/// once per sub-command because each was required on one and optional on the
-/// other, and a flattened struct has one requiredness. They are optional on
-/// both now, which is what lets one declaration serve both: each sub-command
-/// decides what an absent value means, and says so on the field below.
+/// `--node-key` and `--checkpoint-sync-url` used to be declared once per
+/// sub-command because each was required on one and optional on the other, and
+/// a flattened struct has one requiredness. They are optional on both now,
+/// which is what lets one declaration serve both: each sub-command decides what
+/// an absent value means, and says so on the field below.
+///
+/// `--bootnodes` is not here: it names a file on `node` and is a list on
+/// `beacon`, so each chain declares its own ([`LeanOptions::bootnodes`],
+/// [`MainnetOptions::bootnodes`]).
 ///
 /// The `--discovery.*` tuning flags are here too, in one [`DiscoveryConfig`],
 /// and mean the same thing on both whenever discv5 runs: on
@@ -46,22 +111,12 @@ pub(crate) struct CommonOptions {
     /// Hex file holding the secp256k1 key that is this node's libp2p and
     /// discv5 identity.
     ///
-    /// Optional on both sub-commands. When omitted, a fresh key is generated
-    /// in memory at startup (logged as a warning) and used for that run only,
-    /// so the PeerId and ENR differ on the next start. Pass a persisted key
-    /// file for a stable identity.
+    /// Optional on both sub-commands. When omitted, the key stored in
+    /// `--data-dir` as `node.key` is used, and on the directory's first start
+    /// one is generated and stored there (hex, mode `0600`), so the PeerId
+    /// and ENR stay the same across restarts until the directory is wiped.
     #[arg(long)]
     pub(crate) node_key: Option<PathBuf>,
-    /// Path to a bootnode list: ENRs, one per YAML entry.
-    ///
-    /// Optional on both sub-commands, but an absent file means different
-    /// things. `beacon` falls back to whatever `--network` resolved to: a
-    /// built-in network's own ENR list, or a loaded directory's own
-    /// `bootstrap_nodes.yaml`/`.txt` (empty if the directory has neither).
-    /// `node` has no built-in list for a lean network, so it starts with no
-    /// bootnodes and reaches peers only through discv5, if that is enabled.
-    #[arg(long)]
-    pub(crate) bootnodes: Option<PathBuf>,
     /// Base URL(s) of the peer API servers to take a checkpoint from, e.g.
     /// `http://peer:5052`.
     ///
@@ -94,6 +149,28 @@ pub(crate) struct CommonOptions {
     /// directory, a URL, nor a loaded network's genesis, startup aborts.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
+    /// ClickHouse HTTP endpoint that per-block telemetry rows are written to
+    /// (Silver's `block_events` table), e.g. `http://127.0.0.1:8123`.
+    ///
+    /// Off when unset. Credentials go in the URL (`http://user:pass@host:8123`)
+    /// and are sent as basic auth; a `?database=` parameter passes through.
+    /// A URL with a password is better passed through the environment
+    /// variable, since any local user can read a process's command line.
+    /// See `docs/telemetry.md`.
+    #[arg(
+        long = "telemetry.clickhouse-url",
+        env = "ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL",
+        hide_env_values = true,
+        value_parser = ClickHouseUrlParser
+    )]
+    pub(crate) telemetry_clickhouse_url: Option<ClickHouseUrl>,
+    /// `meta_client_name` on every telemetry row.
+    ///
+    /// Defaults to `--node-id` on `node`, since devnets run several nodes per
+    /// host, and to `ethlambda@<hostname>` on `beacon`, which keeps its rows
+    /// apart from another client writing the same table from the same host.
+    #[arg(long = "telemetry.client-name", requires = "telemetry_clickhouse_url")]
+    pub(crate) telemetry_client_name: Option<String>,
     #[command(flatten)]
     pub(crate) discovery: DiscoveryConfig,
 }
@@ -307,6 +384,83 @@ pub(crate) struct MainnetOptions {
     /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
+
+    /// Extra bootnodes: ENRs (with or without `enr:`) and
+    /// `/ip4|ip6/<ip>/<transport>/p2p/<peer-id>` multiaddrs, comma-separated;
+    /// the flag may be repeated.
+    ///
+    /// Added to the resolved network's own bootnode list, never replacing it,
+    /// as Lighthouse's `--boot-nodes` is. Unlike Lighthouse, a multiaddr must
+    /// end in `/p2p/<peer-id>` and DNS multiaddrs are refused. Unlike an entry
+    /// in the network's list, a bad one here is a startup error, and a file
+    /// path is no longer accepted. See `docs/cli.md#bootnodes-on-beacon`.
+    //
+    // `allow_hyphen_values` because an ENR written without its `enr:` prefix
+    // can start with `-`, which clap would otherwise read as a flag. Each
+    // occurrence takes one value, so a list never swallows the flag after it,
+    // but a `--bootnodes` given no value (an unset variable in a launch
+    // script) takes the next flag as its value; `beacon_bootnodes` refuses
+    // such an entry by name.
+    #[arg(
+        long,
+        value_name = "ENR/MULTIADDR LIST",
+        value_delimiter = ',',
+        allow_hyphen_values = true
+    )]
+    pub(crate) bootnodes: Vec<String>,
+
+    /// Base URL of a builder API endpoint, normally MEV-Boost (for example
+    /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
+    /// is built locally, and `register_validator` answers 500 so a validator
+    /// client configured for a builder hears that it has none (the fee
+    /// recipients it names are still recorded).
+    #[arg(long, value_parser = parse_builder_url)]
+    pub(crate) builder: Option<String>,
+
+    /// Follow the builder's 307 and 308 redirects, up to ten per call and
+    /// never from https to http. A 301, 302 or 303 is not followed even then:
+    /// following one resends a POST as a GET without its body.
+    ///
+    /// Off by default, so registrations and signed blocks go only to the URL
+    /// `--builder` names. A redirect not followed fails the call, with an
+    /// error naming where it pointed.
+    #[arg(long, requires = "builder")]
+    pub(crate) builder_follow_redirects: bool,
+
+    /// How long block production waits for the builder's bid, in
+    /// milliseconds. Also sent to the builder as `X-Timeout-Ms`, so it can
+    /// hold its answer for as long as this node will wait.
+    #[arg(
+        long,
+        default_value_t = 1000,
+        requires = "builder",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub(crate) builder_header_timeout: u64,
+
+    /// Build locally, skipping the builder, after more than this many
+    /// consecutive empty slots right before the proposal (the circuit breaker).
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.skips, requires = "builder")]
+    pub(crate) builder_fallback_skips: u64,
+
+    /// Build locally after more than this many empty slots in the epoch's
+    /// worth of slots before the proposal.
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.skips_per_epoch, requires = "builder")]
+    pub(crate) builder_fallback_skips_per_epoch: u64,
+
+    /// Build locally when the proposal is more than this many epochs past the
+    /// finalized checkpoint.
+    #[arg(long, default_value_t = ethlambda_rpc::FallbackThresholds::DEFAULT.epochs_since_finalization, requires = "builder")]
+    pub(crate) builder_fallback_epochs_since_finalization: u64,
+}
+
+/// `--builder`'s value, refused while the flags are parsed unless it is an
+/// http or https URL: the same check the builder client makes, so the error
+/// names the flag instead of surfacing at startup.
+fn parse_builder_url(value: &str) -> Result<String, String> {
+    ethlambda_rpc::BuilderClient::check_url(value)
+        .map(|()| value.to_owned())
+        .map_err(|err| err.to_string())
 }
 
 /// Flags only the lean chain takes.
@@ -327,6 +481,13 @@ pub(crate) struct LeanOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     pub(crate) node_id: String,
+    /// Path to a bootnode list: ENRs, one per YAML entry.
+    ///
+    /// Optional. A lean network has no built-in list, so without it the node
+    /// starts with no bootnodes and reaches peers only through discv5, if
+    /// that is enabled, or by being dialed.
+    #[arg(long)]
+    pub(crate) bootnodes: Option<PathBuf>,
     /// Whether this node acts as a committee aggregator.
     ///
     /// Seeds the initial value of the live aggregator flag shared by the
@@ -833,8 +994,8 @@ mod tests {
             ["https://checkpointz.example"]
         );
         assert_eq!(options.common.node_key, Some(PathBuf::from("node.key")));
-        // No flag given, so the built-in mainnet ENR list applies.
-        assert_eq!(options.common.bootnodes, None);
+        // No flag given, so the built-in mainnet ENR list applies alone.
+        assert!(options.mainnet.bootnodes.is_empty());
     }
 
     /// Drop `flag` and the value after it from an argv.
@@ -848,22 +1009,78 @@ mod tests {
         args
     }
 
-    /// The three flags that moved into [`CommonOptions`] are optional on both
-    /// sub-commands, so clap accepts an argv carrying none of them. What an
-    /// absent value *means* is each sub-command's own decision, made at
-    /// startup in `main`; the two tests after this one pin the answers that
-    /// are not simply "carry on with nothing".
+    /// The flags that moved into [`CommonOptions`] are optional on both
+    /// sub-commands, and so is each chain's own `--bootnodes`, so clap accepts
+    /// an argv carrying none of them. What an absent value *means* is each
+    /// sub-command's own decision, made at startup in `main`; the two tests
+    /// after this one pin the answers that are not simply "carry on with
+    /// nothing".
     #[test]
     fn the_shared_flags_are_optional_on_both_sub_commands() {
         let node = parse_node(without(&without(&base_args(), "--node-key"), "--bootnodes"));
         assert_eq!(node.common.node_key, None);
-        assert_eq!(node.common.bootnodes, None);
+        assert_eq!(node.lean.bootnodes, None);
         assert!(node.common.checkpoint_sync_url.is_empty());
 
         let beacon = parse_beacon(vec!["ethlambda", "beacon"]);
         assert_eq!(beacon.common.node_key, None);
-        assert_eq!(beacon.common.bootnodes, None);
+        assert!(beacon.mainnet.bootnodes.is_empty());
         assert!(beacon.common.checkpoint_sync_url.is_empty());
+    }
+
+    /// Commas split one occurrence and repeated occurrences add up, in order.
+    /// The trailing `--network` is the point: `allow_hyphen_values` must not
+    /// let a list swallow the flag after it.
+    #[test]
+    fn beacon_bootnodes_combines_commas_and_repeats_in_order() {
+        let mut args = beacon_args();
+        args.extend([
+            "--bootnodes",
+            "enr:a,/ip4/1.2.3.4/tcp/9000/p2p/b",
+            "--bootnodes",
+            "enr:c",
+            "--network",
+            "sepolia",
+        ]);
+        let beacon = parse_beacon(args);
+        assert_eq!(
+            beacon.mainnet.bootnodes,
+            ["enr:a", "/ip4/1.2.3.4/tcp/9000/p2p/b", "enr:c"]
+        );
+        assert_eq!(beacon.mainnet.network, "sepolia");
+    }
+
+    /// An ENR written without its `enr:` prefix can start with `-`, which clap
+    /// would read as a flag without `allow_hyphen_values`.
+    #[test]
+    fn beacon_bootnodes_accepts_a_prefixless_enr_starting_with_a_hyphen() {
+        let enr = "-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys";
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", enr]);
+        assert_eq!(parse_beacon(args).mainnet.bootnodes, [enr]);
+    }
+
+    /// An empty value and a trailing comma parse, and refusing them is not
+    /// clap's job: any empty entry they leave is skipped at startup
+    /// (`main::beacon_bootnodes`). Neither assertion pins how many empty
+    /// entries clap leaves (none or one), since startup handles both.
+    #[test]
+    fn beacon_bootnodes_parses_an_empty_value_and_a_trailing_comma() {
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", ""]);
+        assert!(
+            parse_beacon(args)
+                .mainnet
+                .bootnodes
+                .iter()
+                .all(String::is_empty)
+        );
+
+        let mut args = beacon_args();
+        args.extend(["--bootnodes", "enr:a,"]);
+        let bootnodes = parse_beacon(args).mainnet.bootnodes;
+        assert_eq!(bootnodes.first().map(String::as_str), Some("enr:a"));
+        assert!(bootnodes[1..].iter().all(String::is_empty), "{bootnodes:?}");
     }
 
     #[test]
@@ -894,9 +1111,10 @@ mod tests {
 
     #[test]
     fn an_absent_node_key_parses_on_both_sub_commands() {
-        // Both generate an ephemeral in-memory key instead (`main`'s
-        // `resolve_node_key`), so neither rejects the argv. On `node` that is
-        // a behavior change: `--node-key` used to be required there.
+        // Both use a key stored in `--data-dir` instead, generating it on
+        // the first start (`main`'s `resolve_node_key`), so neither rejects
+        // the argv. On `node` that is a behavior change: `--node-key` used to
+        // be required there.
         assert_eq!(
             parse_node(without(&base_args(), "--node-key"))
                 .common
@@ -973,6 +1191,79 @@ mod tests {
         }
     }
 
+    /// A client name alone configures nothing, so it is a usage error rather
+    /// than a flag silently ignored.
+    ///
+    /// The first half is skipped when the URL variable is exported: clap reads
+    /// the environment itself, has no per-parse override, and `set_var` is
+    /// unsafe and racy across tests, so the flag would be satisfied by it.
+    #[test]
+    fn the_telemetry_client_name_needs_a_clickhouse_url() {
+        if std::env::var_os("ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL").is_none() {
+            let mut args = beacon_args();
+            args.extend(["--telemetry.client-name", "x"]);
+            let err = try_parse_from(args).expect_err("a client name needs a URL");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+
+        let mut args = beacon_args();
+        args.extend([
+            "--telemetry.clickhouse-url",
+            "http://u:p@127.0.0.1:8123/?database=default",
+            "--telemetry.client-name",
+            "x",
+        ]);
+        let beacon = parse_beacon(args);
+        let url = beacon
+            .common
+            .telemetry_clickhouse_url
+            .expect("the URL parses")
+            .into_inner();
+        assert_eq!(url.username(), "u");
+        assert_eq!(beacon.common.telemetry_client_name.as_deref(), Some("x"));
+    }
+
+    /// `reqwest::Url`'s `Debug` prints the password, and the options derive
+    /// `Debug`.
+    #[test]
+    fn the_clickhouse_url_keeps_its_credentials_out_of_debug() {
+        let mut args = beacon_args();
+        args.extend([
+            "--telemetry.clickhouse-url",
+            "http://user:hunter2@clickhouse.example:8123/?database=secret_db",
+        ]);
+        let beacon = parse_beacon(args);
+        let debug = format!("{beacon:?}");
+        for secret in ["hunter2", "user:", "secret_db"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("clickhouse.example"));
+    }
+
+    /// Only the HTTP interface is spoken, so another scheme is a startup
+    /// error rather than endless insert failures, and the message does not
+    /// echo the value, which may hold a password.
+    #[test]
+    fn the_clickhouse_url_must_be_http_and_errors_do_not_echo_it() {
+        for raw in [
+            "tcp://user:hunter2@127.0.0.1:9000",
+            "http://user:hunter2@host:notaport",
+        ] {
+            let mut args = beacon_args();
+            args.extend(["--telemetry.clickhouse-url", raw]);
+            let err = try_parse_from(args).expect_err("must be refused");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+            let shown = err.to_string();
+            assert!(
+                !shown.contains("hunter2"),
+                "error echoed the value: {shown}"
+            );
+        }
+        let mut args = beacon_args();
+        args.extend(["--telemetry.clickhouse-url", "https://127.0.0.1:8443"]);
+        parse_beacon(args);
+    }
+
     /// The invariant `From<BeaconOptions>`'s `unreachable!` rests on. Each
     /// flag `requires` the other, so a half-configured Engine API is a usage
     /// error out of the parser rather than a panic several frames later.
@@ -1018,6 +1309,143 @@ mod tests {
             beacon.mainnet.safe_slots_to_import_optimistically,
             SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY
         );
+    }
+
+    #[test]
+    fn the_builder_is_off_by_default() {
+        let beacon = parse_beacon(beacon_args());
+
+        assert_eq!(beacon.mainnet.builder, None);
+        assert_eq!(beacon.mainnet.builder_header_timeout, 1000);
+    }
+
+    #[test]
+    fn the_builder_flags_parse() {
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-header-timeout",
+            "750",
+        ]);
+
+        let options: Options = parse_beacon(args).into();
+
+        match options.network {
+            Network::Mainnet { mainnet, .. } => {
+                assert_eq!(mainnet.builder.as_deref(), Some("http://127.0.0.1:18550"));
+                assert_eq!(mainnet.builder_header_timeout, 750);
+            }
+            other => panic!("expected the mainnet network, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fallback_flags_parse_and_default_to_lighthouses() {
+        let beacon = parse_beacon(beacon_args());
+        assert_eq!(beacon.mainnet.builder_fallback_skips, 3);
+        assert_eq!(beacon.mainnet.builder_fallback_skips_per_epoch, 8);
+        assert_eq!(beacon.mainnet.builder_fallback_epochs_since_finalization, 3);
+
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-fallback-skips",
+            "5",
+            "--builder-fallback-skips-per-epoch",
+            "12",
+            "--builder-fallback-epochs-since-finalization",
+            "2",
+        ]);
+        let beacon = parse_beacon(args);
+        assert_eq!(beacon.mainnet.builder_fallback_skips, 5);
+        assert_eq!(beacon.mainnet.builder_fallback_skips_per_epoch, 12);
+        assert_eq!(beacon.mainnet.builder_fallback_epochs_since_finalization, 2);
+    }
+
+    #[test]
+    fn each_fallback_flag_needs_a_builder() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            let mut args = beacon_args();
+            args.extend([flag, "5"]);
+            try_parse_from(args).expect_err(flag);
+        }
+    }
+
+    #[test]
+    fn a_bad_fallback_value_is_refused() {
+        for flag in [
+            "--builder-fallback-skips",
+            "--builder-fallback-skips-per-epoch",
+            "--builder-fallback-epochs-since-finalization",
+        ] {
+            for value in ["-1", "many"] {
+                let mut args = beacon_args();
+                args.extend(["--builder", "http://127.0.0.1:18550", flag, value]);
+                try_parse_from(args).expect_err(flag);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_header_timeout_is_refused() {
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-header-timeout",
+            "0",
+        ]);
+
+        try_parse_from(args).expect_err("a zero timeout must not parse");
+    }
+
+    #[test]
+    fn a_header_timeout_needs_a_builder() {
+        let mut args = beacon_args();
+        args.extend(["--builder-header-timeout", "750"]);
+
+        try_parse_from(args).expect_err("a timeout without a builder must not parse");
+    }
+
+    #[test]
+    fn a_builder_url_is_checked_while_parsing() {
+        for bad in ["not a url", "localhost:18550"] {
+            let mut args = beacon_args();
+            args.extend(["--builder", bad]);
+
+            let err = try_parse_from(args).expect_err("a bad builder url must not parse");
+
+            assert!(err.to_string().contains("--builder"), "{err}");
+        }
+    }
+
+    #[test]
+    fn redirects_are_off_unless_asked_for() {
+        let mut args = beacon_args();
+        args.extend(["--builder", "http://127.0.0.1:18550"]);
+        assert!(!parse_beacon(args).mainnet.builder_follow_redirects);
+
+        let mut args = beacon_args();
+        args.extend([
+            "--builder",
+            "http://127.0.0.1:18550",
+            "--builder-follow-redirects",
+        ]);
+        assert!(parse_beacon(args).mainnet.builder_follow_redirects);
+    }
+
+    #[test]
+    fn following_redirects_needs_a_builder() {
+        let mut args = beacon_args();
+        args.push("--builder-follow-redirects");
+
+        try_parse_from(args).expect_err("following redirects without a builder must not parse");
     }
 
     #[test]

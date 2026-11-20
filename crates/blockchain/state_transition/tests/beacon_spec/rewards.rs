@@ -131,9 +131,10 @@ fn components(
         // through fulu reuse this same list; see this module's doc for why
         // none of them changes it. Gloas reuses it too:
         // `BeaconState::altair_validator_lists` now reaches a gloas state's
-        // participation and inactivity lists as plain slices (progressive
-        // rather than `SszList`, EIP-7688, but both `Deref` to `[T]`), which
-        // is all `altair_helpers::get_flag_index_deltas`/
+        // participation and inactivity lists too, as `ParticipationRef` and
+        // `InactivityScoresRef`, which read a bounded and a progressive list
+        // alike (EIP-7688). That read access is all
+        // `altair_helpers::get_flag_index_deltas`/
         // `get_inactivity_penalty_deltas` ever need; see that accessor's own
         // doc.
         ForkName::Altair

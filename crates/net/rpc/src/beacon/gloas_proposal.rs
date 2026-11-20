@@ -44,13 +44,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::checkpoint_hash;
+use ethlambda_blockchain::{EventBus, SyncStatusController, checkpoint_hash, metrics::SyncStatus};
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
     building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
     types::ClientVersionV1,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
@@ -77,7 +77,7 @@ use ethlambda_state_transition::beacon::{
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
-use ethlambda_storage::Store;
+use ethlambda_storage::{PubkeyIndexCache, Store};
 use ethlambda_types::{
     beacon::{
         config::Config,
@@ -108,8 +108,11 @@ use crate::beacon::{
     ApiError, BodyEncoding,
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
+    emit_accepted,
     graffiti::{self, OwnVersion},
-    proposal::{Blobs, CellKzgProofs, decimal, randao_verification, require_gloas_slot},
+    proposal::{
+        Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
+    },
     validator::{FeeRecipients, head},
 };
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
@@ -227,6 +230,7 @@ async fn post_produce_block(
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
+    Extension(sync_status): Extension<SyncStatusController>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -257,7 +261,9 @@ async fn post_produce_block(
         &store.config(),
         slot,
         "this endpoint serves gloas slots only",
-    ) {
+    )
+    .and_then(|()| refuse_future_slot(&store.config(), slot))
+    {
         return err.into_response();
     }
     let builder_config = match decode_builder_config(&headers, &body) {
@@ -267,6 +273,10 @@ async fn post_produce_block(
     let builders = builder_config.usable_entries(slot);
     if builders > 0 {
         debug!(%slot, builders, "Not consulting the builder entries of the block production request");
+    }
+    // Before the head is read, as `produceBlockV3` does.
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
     // Without an execution client a block can only be built on a bid, so a node
     // holding none for the slot has nothing to offer.
@@ -433,7 +443,11 @@ struct Prepared {
     preferences: Option<SignedProposerPreferences>,
     /// What the block's state transition may leave unchecked: the reveal, when
     /// the caller set `skip_randao_verification`.
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
+    /// The store's shared pubkey table, which every state transition of the
+    /// proposal resolves execution requests and the sync committee through
+    /// (a fresh one would ingest the whole registry each time).
+    pubkey_indices: Arc<PubkeyIndexCache>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,15 +693,24 @@ fn prepare(
         ExecutionRequests::default()
     };
 
-    let state = advance_to_slot(&head_state, slot, &config)
-        .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
+    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
+        warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
+        ApiError::Internal("advancing the head state failed")
+    })?;
     let proposer = get_beacon_proposer_index(&state)
         .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
     if randao == RandaoVerification::Verify {
         verify_randao_reveal(&state, proposer, randao_reveal)?;
     }
-    let mut inputs = gloas_payload_inputs(&state, build_on_full, &parent_requests, &config)
-        .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
+    let pubkey_indices = store.pubkey_index_cache();
+    let mut inputs = gloas_payload_inputs(
+        &state,
+        build_on_full,
+        &parent_requests,
+        &config,
+        &pubkey_indices,
+    )
+    .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
 
     // The proposer's signed preferences for this slot, under the dependent root
     // the head's chain gives it. They name the fee recipient and gas target the
@@ -706,7 +729,11 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
-        options: BlockProcessingOptions { randao },
+        options: BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
+        pubkey_indices,
     })
 }
 
@@ -720,10 +747,13 @@ fn verify_randao_reveal(
     let epoch = compute_epoch_at_slot(state.slot());
     let domain = get_domain(state, constants::DOMAIN_RANDAO, Some(epoch));
     let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
-    let pubkey = state
-        .validator(proposer)
-        .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: proposer,
+        pubkey: state
+            .validator(proposer)
+            .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
+            .pubkey,
+    };
     if bls::verify(&pubkey, signing_root, &randao_reveal) {
         Ok(())
     } else {
@@ -865,6 +895,7 @@ fn assemble(
         head_slot,
         parent_requests,
         options,
+        pubkey_indices,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -891,7 +922,7 @@ fn assemble(
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
-    match assemble_gloas_block(state, attempt, config, *options) {
+    match assemble_gloas_block(state, attempt, config, pubkey_indices, *options) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, and
         // the sync aggregate was verified above, so this should not happen; but
@@ -899,7 +930,7 @@ fn assemble(
         Err(err) if operations > 0 || has_sync_aggregate => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
             let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
-            assemble_gloas_block(state, bare, config, *options)
+            assemble_gloas_block(state, bare, config, pubkey_indices, *options)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -923,6 +954,7 @@ fn assemble_on_bid(
         head_slot,
         parent_requests,
         options,
+        pubkey_indices,
         ..
     } = prepared;
     let attestations = pack_gloas_attestations(state, candidates);
@@ -941,13 +973,20 @@ fn assemble_on_bid(
         state,
         inputs(attestations, payload_attestations),
         config,
+        pubkey_indices,
         *options,
     ) {
         Ok(block) => Ok(block),
         Err(err) if operations > 0 => {
             warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
-            assemble_gloas_block_on_bid(state, inputs(Vec::new(), Vec::new()), config, *options)
-                .map_err(|_| ApiError::Internal("the block failed to build"))
+            assemble_gloas_block_on_bid(
+                state,
+                inputs(Vec::new(), Vec::new()),
+                config,
+                pubkey_indices,
+                *options,
+            )
+            .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
     }
@@ -1022,16 +1061,40 @@ async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(cache): Extension<PayloadCache>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    post_envelope_waiting(&store, &p2p, &cache, &headers, &body, BLOCK_WAIT).await
+    post_envelope_emitting(
+        &store,
+        &p2p,
+        &cache,
+        events.as_deref(),
+        &headers,
+        &body,
+        BLOCK_WAIT,
+    )
+    .await
 }
 
+/// [`post_envelope_emitting`] without an event bus, for the handler's tests.
+#[cfg(test)]
 async fn post_envelope_waiting(
     store: &Store,
     p2p: &RpcToP2PRef,
     cache: &PayloadCache,
+    headers: &HeaderMap,
+    body: &[u8],
+    block_wait: Duration,
+) -> Response {
+    post_envelope_emitting(store, p2p, cache, None, headers, body, block_wait).await
+}
+
+async fn post_envelope_emitting(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    cache: &PayloadCache,
+    events: Option<&EventBus>,
     headers: &HeaderMap,
     body: &[u8],
     block_wait: Duration,
@@ -1160,12 +1223,19 @@ async fn post_envelope_waiting(
 
     let sidecars: Vec<DataColumnSidecar> =
         sidecars.into_iter().map(DataColumnSidecar::Gloas).collect();
+    let accepted = GossipEvent::ExecutionPayloadGossip {
+        slot: block_slot,
+        builder_index: signed.message.builder_index,
+        block_hash: signed.message.payload.block_hash,
+        block_root,
+    };
     if p2p
         .publish_execution_payload_envelope(Box::new(signed), sidecars)
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();
     }
+    emit_accepted(events, || accepted);
     StatusCode::OK.into_response()
 }
 
@@ -1198,9 +1268,18 @@ mod tests {
     }
 
     fn produce_app(store: Store, engine: Option<EngineClient>) -> Router {
+        produce_app_with_sync(store, engine, SyncStatus::Synced)
+    }
+
+    fn produce_app_with_sync(
+        store: Store,
+        engine: Option<EngineClient>,
+        sync: SyncStatus,
+    ) -> Router {
         routes()
             .with_state(store)
             .layer(Extension(engine))
+            .layer(Extension(SyncStatusController::new(sync)))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(SharedBuilderMarket::default()))
@@ -1268,6 +1347,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The syncing refusal precedes the execution-client one, so the message
+    /// tells the two apart.
+    #[tokio::test]
+    async fn producing_on_a_syncing_node_is_a_503() {
+        let (store, head_slot) = gloas_scheduled_store();
+        let app = produce_app_with_sync(store, None, SyncStatus::Syncing);
+        let (status, json) = respond(
+            app,
+            produce_request(head_slot + 1, "&include_payload=true", EMPTY_CONFIG),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["message"], "the node is syncing");
     }
 
     #[tokio::test]
@@ -1517,7 +1611,14 @@ mod tests {
             test_support::{payload_for, randao_reveal},
         };
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assemble_gloas_block(
             state,
             GloasBlockInputs {
@@ -1533,6 +1634,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap()
@@ -1571,7 +1673,14 @@ mod tests {
             payload_for, randao_reveal,
         };
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let built = BuiltGloasPayload {
             execution_payload: payload_for(&inputs),
             block_value: Default::default(),
@@ -1588,6 +1697,7 @@ mod tests {
             parent_requests: requests.clone(),
             preferences: None,
             options: BlockProcessingOptions::default(),
+            pubkey_indices: Default::default(),
         };
         assemble(
             &config(),
@@ -1854,7 +1964,14 @@ mod tests {
         let commitment = blob_to_kzg_commitment(&blob).unwrap();
         let (_, proofs) = compute_cells_and_kzg_proofs(&blob).unwrap();
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
@@ -1870,6 +1987,7 @@ mod tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             ethlambda_state_transition::beacon::stf::block::BlockProcessingOptions::default(),
         )
         .unwrap();

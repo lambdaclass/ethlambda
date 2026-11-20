@@ -15,7 +15,7 @@ use crate::beacon_node::dto::{
 use crate::beacon_node::{BeaconNodeApi, validate_attestation_data};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
-use crate::signing::SigningContext;
+use crate::signing::{SigningContext, sign_all};
 use crate::slashing_protection::SharedProtection;
 
 /// What one slot's attestation duty produced.
@@ -112,10 +112,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             });
         }
 
-        // The fork of the slot, by this client's own schedule, tells the node
-        // which form of the query to answer: from gloas the `committee_index`
-        // is omitted and the answer's `index` is the payload signal. It is
-        // signed as received, never reset to zero.
+        // The fork of the slot, by this client's own schedule, decides which
+        // `index` the answer may carry: from gloas it is the payload signal.
+        // It is signed as received, never reset to zero.
         let slot_fork = self
             .context
             .config
@@ -135,7 +134,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // returned; failing here loses the slot rather than trying the next
         // node. That is why the same check now lives in the implementation,
         // where an `Err` is something failover can act on.
-        validate_attestation_data(slot, &data)?;
+        validate_attestation_data(slot, slot_fork, &data)?;
 
         // Consistent with the check just above: `data.target.epoch` is now
         // known to equal `expected_target_epoch`, so this is the fork this
@@ -195,8 +194,8 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // Check and durably record the whole batch before any signature exists:
         // a signature that exists is a signature that can escape, whatever the
         // code after it intended. One write for the slot, off the executor,
-        // and before the store's read lock below is taken, so the disk flush
-        // never holds up a keymanager writer queued behind it.
+        // and with no guard on the store held, so the disk flush never holds
+        // up a keymanager writer queued behind it.
         let pubkeys: Vec<BlsPubkey> = candidates.iter().map(|(_, pubkey)| *pubkey).collect();
         let verdicts = crate::slashing_protection::blocking(&self.protection, move |protection| {
             protection.check_and_record_attestations(&pubkeys, &data)
@@ -219,48 +218,68 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             }
         };
 
-        // The read guard is scoped to this block alone and must never be widened to cover an
-        // await. `tokio::sync::RwLock` is write-preferring, so a keymanager
-        // import or delete queuing for the write lock blocks every read behind
-        // it; keeping this guard narrow bounds how long that wait can be. The
-        // import holds its own write lock for the inserts alone, doing the slow
-        // EIP-2335 derivation outside it (see `http_api::keystores::import`),
-        // so this is the duty path keeping its half of the same bargain.
-        let mut attestations = Vec::with_capacity(candidates.len());
+        // Every duty the record let through is signed together below.
+        let mut to_sign = Vec::with_capacity(candidates.len());
         let mut refused = 0;
-        {
-            let _timing = crate::metrics::time_signing();
-            let store = store.read().await;
-            for ((duty, pubkey), verdict) in candidates.into_iter().zip(verdicts) {
-                if let Err(refusal) = verdict {
-                    warn!(
-                        %slot,
-                        validator = duty.validator_index,
-                        %refusal,
-                        "Refusing to sign: slashing protection judged this attestation unsafe"
-                    );
-                    crate::metrics::inc_attestations_refused();
-                    refused += 1;
+        for ((duty, pubkey), verdict) in candidates.into_iter().zip(verdicts) {
+            if let Err(refusal) = verdict {
+                warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    %refusal,
+                    "Refusing to sign: slashing protection judged this attestation unsafe"
+                );
+                crate::metrics::inc_attestations_refused();
+                refused += 1;
+                continue;
+            }
+            to_sign.push((duty, pubkey));
+        }
+
+        // Signed concurrently rather than one after another. A local key
+        // signs in microseconds either way; a remote signer costs a round
+        // trip per signature, and a hundred validators behind one signer
+        // must not pay a hundred of them in series inside one slot. Each
+        // signature takes the store's read guard for its own lookup only
+        // (see `SigningContext::sign`), so nothing here holds it across an
+        // await: `tokio::sync::RwLock` is write-preferring, and a keymanager
+        // import queuing for the write lock would otherwise stall every read
+        // behind it for as long as the guard was held.
+        //
+        // Each signature gets `SIGNING_BUDGET` and no more, so a hung signer
+        // loses only its own keys' votes: the batch below goes out with
+        // every signature that arrived, rather than the slot's deadline
+        // dropping the whole batch, local keys included, while it waits. It
+        // does go out late, though. The batch is published whole, so while
+        // a signer hangs every vote in it, a local key's too, is published
+        // the full budget after the attestation offset (see
+        // `SIGNING_BUDGET` for what that leaves before aggregation).
+        let signatures =
+            {
+                let _timing = crate::metrics::time_signing();
+                sign_all(to_sign.iter().map(|(_, pubkey)| {
+                    (*pubkey, self.context.sign_attestation(store, pubkey, &data))
+                }))
+                .await
+            };
+
+        let mut attestations = Vec::with_capacity(to_sign.len());
+        for ((duty, _), signature) in to_sign.iter().zip(signatures) {
+            // One validator failing must not cost the others their attestation.
+            let signature = match signature {
+                Ok(signature) => signature,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
+                    crate::metrics::inc_signing_failures();
                     continue;
                 }
-
-                // One validator failing must not cost the others their attestation.
-                let signature = match self.context.sign_attestation(&store, &pubkey, &data) {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
-                        crate::metrics::inc_signing_failures();
-                        continue;
-                    }
-                };
-
-                attestations.push(SingleAttestationDto {
-                    committee_index: duty.committee_index,
-                    attester_index: duty.validator_index,
-                    data: data_dto.clone(),
-                    signature: encode_hex(&signature.0),
-                });
-            }
+            };
+            attestations.push(SingleAttestationDto {
+                committee_index: duty.committee_index,
+                attester_index: duty.validator_index,
+                data: data_dto.clone(),
+                signature: encode_hex(&signature.0),
+            });
         }
 
         if attestations.is_empty() {
@@ -331,10 +350,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet(),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(Config::mainnet(), Root::ZERO))
     }
 
     fn duty(
@@ -427,7 +443,7 @@ mod tests {
         keys: &[ethlambda_types::beacon::primitives::BlsPubkey],
     ) -> SharedProtection {
         let protection = SlashingProtection::open(dir, Root::ZERO, keys, true).expect("opens");
-        Arc::new(std::sync::Mutex::new(protection))
+        crate::slashing_protection::SharedProtection::new(protection)
     }
 
     /// The restart shape the old in-memory guard could not cover: a fresh
@@ -705,7 +721,14 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let node = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        // A node that breaks the trait's contract and hands the stale data
+        // back unchecked, so the refusal below is `attest`'s own, the last
+        // one before a signature, and not the implementation's.
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .without_attestation_data_check(),
+        );
         let service =
             AttestationService::new(node.clone(), context(), SlashingProtection::in_memory());
 
@@ -734,7 +757,8 @@ mod tests {
         let store = RwLock::new(store);
         let pubkey_hex = encode_hex(&pubkey.0);
 
-        let mut node = MockBeaconNode::new();
+        // Unchecked by the node, so `attest`'s own check is what refuses.
+        let mut node = MockBeaconNode::new().without_attestation_data_check();
         node.attestation_data = Some(AttestationData {
             slot: 96,
             index: 0,
@@ -761,6 +785,49 @@ mod tests {
 
         assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
         assert!(node.submitted().is_empty());
+    }
+
+    /// A liveness check rather than a slashing one: an index that cannot be
+    /// valid at the slot's fork is refused before anything is recorded, so
+    /// the validator's one vote for the epoch is not spent on an attestation
+    /// every peer would reject, and a correct answer for the same slot is
+    /// still signed. `context()` is mainnet's schedule, where slot 96 is long
+    /// before gloas, so 1 is not an index a vote there can carry.
+    ///
+    /// The node hands its answer back unchecked, so what refuses it is
+    /// `attest`'s own check, under the fork `attest` derives for the slot:
+    /// with that check gone, or run under gloas, the first call would sign.
+    #[tokio::test]
+    async fn an_index_invalid_at_the_slots_fork_is_refused_and_records_nothing() {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let duties = vec![duty(&encode_hex(&pubkey.0), 1337, 96, 3)];
+        let store = RwLock::new(store);
+        let protection = SlashingProtection::in_memory();
+
+        let wrong = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .with_attestation_index(1)
+                .without_attestation_data_check(),
+        );
+        let err = AttestationService::new(wrong.clone(), context(), protection.clone())
+            .attest(96, &duties, &store)
+            .await
+            .expect_err("must reject an index of 1 before gloas");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+        assert!(wrong.submitted().is_empty(), "nothing may be signed");
+
+        let right = Arc::new(MockBeaconNode::new().with_attestation_data(96));
+        let attested = AttestationService::new(right.clone(), context(), protection)
+            .attest(96, &duties, &store)
+            .await
+            .expect("attests");
+        assert_eq!(
+            (attested.published, attested.refused),
+            (1, 0),
+            "the refused answer must not have recorded the target"
+        );
     }
 
     /// The regression test for why `attest` derives the `Eth-Consensus-Version`
@@ -820,11 +887,10 @@ mod tests {
     }
 
     fn gloas_context() -> Arc<SigningContext> {
-        Arc::new(SigningContext {
-            config: Config::mainnet()
-                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 10),
-            genesis_validators_root: Root::ZERO,
-        })
+        Arc::new(SigningContext::new(
+            Config::mainnet().with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 10),
+            Root::ZERO,
+        ))
     }
 
     /// From gloas `data.index` is the payload signal, so a node answering 1
@@ -893,8 +959,8 @@ mod tests {
         );
     }
 
-    /// Slots before gloas are asked about under their own fork, so the HTTP
-    /// client keeps sending `committee_index=0` there.
+    /// Slots before gloas are asked about under their own fork, so the answer
+    /// is held to that fork's `index` rule (0 only), not gloas's.
     #[tokio::test]
     async fn a_pre_gloas_slot_is_asked_about_under_its_own_fork() {
         use ethlambda_types::beacon::fork::ForkName;

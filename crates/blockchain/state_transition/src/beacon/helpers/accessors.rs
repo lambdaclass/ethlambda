@@ -7,14 +7,17 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 // Re-exported at this old path (`crate::beacon::helpers::accessors::CommitteeCache`,
 // and so on), so every existing import of the type this module used to define
 // is unaffected by its move to `ethlambda-storage`; see [`CommitteeCacheExt`]
 // below for what this crate still contributes.
 pub use ethlambda_storage::{
-    ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, ShufflingKey,
+    ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, PubkeyIndexCache, ShufflingKey,
 };
 
+use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
@@ -24,7 +27,7 @@ use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
+    BlsPubkey, Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
 };
 
 use super::misc::{
@@ -278,6 +281,66 @@ pub trait CommitteeCacheExt {
     /// the previous head pinned stays resident until an insertion evicts it
     /// on epoch like any other entry.
     fn update_head(&self, head_root: Root, head_state: &BeaconState);
+
+    /// `epoch`'s committee key sums as `state` names them, if they have been
+    /// warmed.
+    ///
+    /// Lookup only, and it never builds: building costs a pass over every
+    /// active validator's key, which is more than the sums save for
+    /// committees attested once, so block import must never be the one to pay
+    /// it. `None` (cold, evicted, or an epoch `state` cannot key) means the
+    /// caller sums its attesters directly. Warmed by [`Self::warm_key_sums`].
+    ///
+    /// # Why the sums can be shared on the shuffling's key
+    ///
+    /// The sums are filed under the same [`ShufflingKey`] as the committees,
+    /// so two states with one key must agree on every member's *public key* as
+    /// well as on who the members are. They do, for three reasons, each
+    /// checked against this crate's spec code:
+    ///
+    /// - A validator's index and public key are fixed when it is appended to
+    ///   the registry and never change after: the registry only grows
+    ///   (`process_deposit`, and electra's pending-deposit path through
+    ///   `add_validator_to_registry`, push; nothing removes or reorders), and
+    ///   no code assigns `validator.pubkey` after construction.
+    /// - A new validator is appended with `activation_epoch` at
+    ///   `FAR_FUTURE_EPOCH`. The only writer that gives it a real one is
+    ///   `process_registry_updates`, running in epoch `N`'s epoch processing,
+    ///   and it writes `compute_activation_exit_epoch(N)`, which is
+    ///   `N + 1 + MAX_SEED_LOOKAHEAD`. (Genesis validators are active from
+    ///   `GENESIS_EPOCH` and are in every state's history.)
+    /// - A validator in `epoch`'s committees is active there, so its
+    ///   `activation_epoch <= epoch`, so it was activated by epoch processing
+    ///   at some `N <= epoch - 1 - MAX_SEED_LOOKAHEAD`, and appended no later
+    ///   than that. That is before the end of `epoch - 2`, so the block the
+    ///   [`ShufflingKey`] names as the decision root already has it in its
+    ///   registry, at that index, with that key. Every state descending from
+    ///   that block inherits it.
+    ///
+    /// So the member list and each member's key are functions of the key,
+    /// and so is their sum. This is a stronger claim than the committees'
+    /// own (which need only the activation and exit epochs to be fixed), but
+    /// it follows from the same lookahead and from the registry being
+    /// append-only.
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>>;
+
+    /// Builds `epoch`'s committee key sums as `state` names them, unless they
+    /// are already there. Meant for a background task: it derives the
+    /// committees if they are not resident, then spends one pass over the
+    /// registry and one key sum per committee, parallel across committees.
+    ///
+    /// A committee with a member whose key fails validation gets no sum
+    /// (`None` in its slot), so lookups of it fall back to the direct path
+    /// rather than to a sum that omits the member. Does nothing for an epoch
+    /// `state` cannot key, since there is nowhere to file the result, nor
+    /// before electra, whose attestations never read the sums. Idempotent, so
+    /// a caller unsure whether an epoch is warm can just ask again.
+    ///
+    /// Deriving the committees, when they are not resident yet, is part of a
+    /// warm-up's cost, but `lean_beacon_committee_key_sums_warm_seconds`
+    /// times the sums alone: the committees are the shuffling every
+    /// attestation of the epoch needs anyway, warm or not.
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch);
 }
 
 impl CommitteeCacheExt for CommitteeCache {
@@ -303,6 +366,81 @@ impl CommitteeCacheExt for CommitteeCache {
         let keys = epochs.map(|epoch| shuffling_key(head_state, epoch));
         self.pin_head(head_root, keys);
     }
+
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>> {
+        self.resident_key_sums(shuffling_key(state, epoch)?)
+    }
+
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch) {
+        if state.fork_name() < ForkName::Electra {
+            return;
+        }
+        let Some(key) = shuffling_key(state, epoch) else {
+            return;
+        };
+        if self.resident_key_sums(key).is_some() {
+            return;
+        }
+        // Resident before the sums are filed into it; a no-op when the import
+        // path already built them.
+        let committees = self.committees(state, epoch);
+        self.get_or_init_key_sums(key, || {
+            // The sums alone: not the committees above, nor a lookup that
+            // found the work already done.
+            let _timing = crate::metrics::time_key_sums_warm();
+            build_committee_key_sums(state, &committees, epoch)
+        });
+    }
+}
+
+/// Every committee of `committees`' epoch summed, indexed by committee number.
+///
+/// One `state.iter_validators()` pass copies each validator's key bytes into a
+/// flat list (a per-index `state.validator(i)` is a tree descent, and the
+/// whole active set is read), then committees are summed in parallel. An entry
+/// is `None` for a committee with a member whose key fails validation or whose
+/// index is outside the registry, and for an empty committee.
+///
+/// The flat key list is transient, about 48 MB on a mainnet-sized registry.
+/// The parallel sums run on rayon's global pool, which block import's key
+/// validation also uses (blst's pairings and leanVM's prover have pools of
+/// their own). A warm-up is short, about 70 ms per epoch measured on a mainnet
+/// node, and runs once or twice an epoch, so it delays import's key work only
+/// briefly when the two coincide.
+fn build_committee_key_sums(
+    state: &BeaconState,
+    committees: &EpochCommittees,
+    epoch: Epoch,
+) -> CommitteeKeySums {
+    let pubkeys: Vec<BlsPubkey> = state.iter_validators().map(|v| v.pubkey).collect();
+    let per_slot = committees.committees_per_slot();
+    let first_slot = compute_start_slot_at_epoch(epoch);
+
+    let members: Vec<&[ValidatorIndex]> = (0..preset::SLOTS_PER_EPOCH)
+        .flat_map(|offset| (0..per_slot).map(move |index| (first_slot + offset, index)))
+        .map(|(slot, index)| {
+            committees
+                .committee(slot, index)
+                .expect("slot is in the epoch and index is below the committee count")
+        })
+        .collect();
+
+    let sums = members
+        .par_iter()
+        .map(|committee| {
+            // The index is attached per committee rather than stored in the
+            // flat list, which spans the whole registry.
+            let keys: Option<Vec<IndexedPubkey>> = committee
+                .iter()
+                .map(|&index| {
+                    let pubkey = *pubkeys.get(index as usize)?;
+                    Some(IndexedPubkey { index, pubkey })
+                })
+                .collect();
+            AggregatePubkey::sum(&keys?)
+        })
+        .collect();
+    CommitteeKeySums::new(sums)
 }
 
 /// The key `state`'s total active balance is cached under, or `None` if
@@ -344,11 +482,20 @@ impl CommitteeCacheExt for CommitteeCache {
 /// Between `process_effective_balance_updates` and the slot increment that
 /// follows it, a state is still in epoch `E - 1` but already carries epoch
 /// `E`'s effective balances, so its total would not match a key rooted at
-/// `E - 2`'s end. The only callers routed through the cache are block
-/// processing's (attestations, sync aggregate), which never run in that
-/// window: a block is processed on a state that `process_slots` has already
-/// advanced to the block's slot. Epoch processing keeps calling the
-/// uncached [`get_total_active_balance`].
+/// `E - 2`'s end. Every caller routed through the cache is block processing,
+/// which never runs in that window: a block is processed on a state that
+/// `process_slots` has already advanced to the block's slot. Those callers
+/// are attestations and the sync aggregate (base rewards), and the churn
+/// limits of everything a block can make exit or consolidate (voluntary
+/// exits, proposer and attester slashings, withdrawal and consolidation
+/// requests, gloas's `apply_parent_execution_payload` included), which reach
+/// it through [`total_active_balance_or_compute`] with `Some`. Block
+/// production's scratch runs of those same functions count too: their state
+/// is advanced to the block's slot first.
+///
+/// Epoch processing keeps calling the uncached [`get_total_active_balance`],
+/// and its ejections pass `None` to the same churn helpers. So does any other
+/// caller of those helpers that is not processing a block at its slot.
 fn active_balance_key(state: &BeaconState) -> Option<ActiveBalanceKey> {
     let epoch = get_current_epoch(state);
     let decision_slot = compute_start_slot_at_epoch(epoch).saturating_sub(1);
@@ -392,6 +539,95 @@ impl ActiveBalanceCacheExt for ActiveBalanceCache {
             );
         }
         Ok(total)
+    }
+}
+
+/// `state`'s total active balance for block processing: through `cache` when
+/// the caller holds one, the spec-shaped uncached pass when not.
+///
+/// The churn helpers take an `Option` so that block processing, which holds an
+/// [`ActiveBalanceCache`], shares one registry pass across a block's exits,
+/// consolidations and slashings, while epoch processing and the spec-shaped
+/// unit tests keep the uncached function. Passing `Some` is sound only for the
+/// callers [`active_balance_key`] lists: states advanced to their block's
+/// slot, never mid epoch processing. A new `Some` caller belongs on that list.
+pub fn total_active_balance_or_compute(
+    state: &BeaconState,
+    cache: Option<&ActiveBalanceCache>,
+) -> Result<Gwei> {
+    match cache {
+        Some(cache) => cache.total_active_balance(state),
+        None => get_total_active_balance(state),
+    }
+}
+
+/// Extends `ethlambda-storage`'s [`PubkeyIndexCache`] with the consensus logic
+/// that feeds it a registry and checks its answers, for the same reason
+/// [`CommitteeCacheExt`] lives here and not in `ethlambda-storage`.
+///
+/// # Soundness
+///
+/// Pubkeys are unique within any reachable registry (a deposit for a pubkey
+/// already registered tops the existing validator up instead of appending),
+/// and a registry only ever grows by appending, so on one chain a pubkey's
+/// index is fixed from the block that registers it. The table is process-wide
+/// and so also holds positions from other forks, where an unfinalized index can
+/// differ. Every candidate is therefore checked against the asking state's own
+/// validator at that index, which is what makes a stale, foreign or
+/// prefix-colliding entry cost a scan instead of a wrong answer.
+pub trait PubkeyIndexCacheExt {
+    /// The index holding `pubkey` in `state`, from the cache only: `None` if
+    /// no candidate survives verification, which is *not* proof the pubkey is
+    /// absent. Brings the table up to `state`'s registry length first, then
+    /// does no scan.
+    fn verified_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex>;
+
+    /// The index holding `pubkey` in `state`, exactly as a position search of
+    /// the registry would answer: the cache when it verifies, otherwise that
+    /// search, whose answer is then recorded in the table
+    /// ([`PubkeyIndexCache::insert`]) so it is searched for once. A pubkey
+    /// that is not registered costs one search, never a rebuild of the table.
+    /// Counted in `lean_beacon_pubkey_index_lookups_total`.
+    fn validator_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex>;
+}
+
+impl PubkeyIndexCacheExt for PubkeyIndexCache {
+    fn verified_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex> {
+        let count = state.validator_count();
+        let covered = self.covered_len();
+        if count > covered {
+            // Scanned outside the table's lock; `extend` skips whatever a
+            // racing caller already ingested. The first call on a fresh table
+            // ingests the whole registry once.
+            let tail: Vec<u64> = state
+                .iter_validators_from(covered)
+                .map(|validator| PubkeyIndexCache::key_of(&validator.pubkey))
+                .collect();
+            self.extend(covered, &tail);
+        }
+        self.candidates(pubkey).into_iter().find(|index| {
+            *index < count as u64
+                && state
+                    .validator(*index)
+                    .is_ok_and(|validator| validator.pubkey == *pubkey)
+        })
+    }
+
+    fn validator_index(&self, state: &BeaconState, pubkey: &BlsPubkey) -> Option<ValidatorIndex> {
+        if let Some(index) = self.verified_index(state, pubkey) {
+            crate::metrics::inc_pubkey_index_lookups("hit", 1);
+            return Some(index);
+        }
+        crate::metrics::inc_pubkey_index_lookups("fallback", 1);
+        let found = state
+            .iter_validators()
+            .position(|validator| validator.pubkey == *pubkey)
+            .map(|index| index as ValidatorIndex);
+        // Recorded so the next lookup of this pubkey on this chain is a hit.
+        if let Some(index) = found {
+            self.insert(pubkey, index);
+        }
+        found
     }
 }
 
@@ -1004,5 +1240,132 @@ mod tests {
             get_validator_churn_limit(&state, &config),
             config.min_per_epoch_churn_limit
         );
+    }
+
+    // -- PubkeyIndexCache ----------------------------------------------------
+
+    fn pubkey_at(state: &BeaconState, index: u64) -> BlsPubkey {
+        state.validator(index).unwrap().pubkey
+    }
+
+    fn append_validator(state: &mut BeaconState, pubkey: BlsPubkey) {
+        let mut validator = state.validator(0).unwrap().clone();
+        validator.pubkey = pubkey;
+        state.push_validator(validator, 0).unwrap();
+    }
+
+    #[test]
+    fn a_pubkey_resolves_from_the_cache_after_one_ingest() {
+        let state = with_validators(20);
+        let cache = PubkeyIndexCache::default();
+        assert_eq!(cache.covered_len(), 0);
+
+        assert_eq!(cache.verified_index(&state, &pubkey_at(&state, 7)), Some(7));
+        assert_eq!(cache.covered_len(), 20);
+        assert_eq!(
+            cache.verified_index(&state, &pubkey_at(&state, 19)),
+            Some(19)
+        );
+    }
+
+    #[test]
+    fn appended_validators_are_ingested_without_a_rebuild() {
+        let mut state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        assert_eq!(cache.verified_index(&state, &pubkey_at(&state, 3)), Some(3));
+
+        let fresh = BlsPubkey([0xAB; 48]);
+        append_validator(&mut state, fresh);
+        assert_eq!(cache.verified_index(&state, &fresh), Some(10));
+        assert_eq!(cache.covered_len(), 11);
+    }
+
+    #[test]
+    fn a_wrong_index_from_another_fork_fails_verification() {
+        let ours = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // The table is fed by a fork where index 4 holds a different key.
+        let mut other_fork = ours.clone();
+        let foreign = BlsPubkey([0xCD; 48]);
+        other_fork.validator_mut(4).unwrap().pubkey = foreign;
+        assert_eq!(cache.verified_index(&other_fork, &foreign), Some(4));
+
+        // On our fork index 4 does not hold it: the candidate is refused, and
+        // the public lookup falls back to a scan that finds nothing.
+        assert_eq!(cache.verified_index(&ours, &foreign), None);
+        assert_eq!(cache.validator_index(&ours, &foreign), None);
+        // Our own key at that index, absent from the table's fork, is found by
+        // the scan.
+        let own = pubkey_at(&ours, 4);
+        assert_eq!(cache.verified_index(&ours, &own), None);
+        assert_eq!(cache.validator_index(&ours, &own), Some(4));
+    }
+
+    #[test]
+    fn a_fallback_scan_records_what_it_found() {
+        let ours = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // The table is fed by a fork where index 4 holds a different key, so
+        // our own key at index 4 is nowhere in it.
+        let mut other_fork = ours.clone();
+        other_fork.validator_mut(4).unwrap().pubkey = BlsPubkey([0xCD; 48]);
+        cache.verified_index(&other_fork, &pubkey_at(&other_fork, 0));
+        let own = pubkey_at(&ours, 4);
+        assert_eq!(cache.verified_index(&ours, &own), None);
+
+        // One scan, and from then on the cache answers by itself, without
+        // having covered another position.
+        let covered = cache.covered_len();
+        assert_eq!(cache.validator_index(&ours, &own), Some(4));
+        assert_eq!(cache.verified_index(&ours, &own), Some(4));
+        assert_eq!(cache.covered_len(), covered);
+    }
+
+    #[test]
+    fn an_absent_pubkey_costs_a_scan_and_does_not_rebuild_the_table() {
+        let state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        cache.verified_index(&state, &pubkey_at(&state, 0));
+        let covered = cache.covered_len();
+
+        let missing = BlsPubkey([0xEE; 48]);
+        assert_eq!(cache.validator_index(&state, &missing), None);
+        assert_eq!(cache.covered_len(), covered);
+        assert!(cache.candidates(&missing).is_empty());
+    }
+
+    #[test]
+    fn a_key_prefix_collision_resolves_both_validators() {
+        let mut state = with_validators(10);
+        let cache = PubkeyIndexCache::default();
+        // Two distinct pubkeys sharing the eight bytes the table keys on.
+        let first = pubkey_at(&state, 2);
+        let mut twin = first;
+        twin.0[47] ^= 0xFF;
+        assert_eq!(
+            PubkeyIndexCache::key_of(&first),
+            PubkeyIndexCache::key_of(&twin)
+        );
+        append_validator(&mut state, twin);
+
+        // Both are kept under the shared key, so neither needs a scan.
+        assert_eq!(cache.verified_index(&state, &first), Some(2));
+        assert_eq!(cache.verified_index(&state, &twin), Some(10));
+        assert_eq!(cache.validator_index(&state, &first), Some(2));
+        assert_eq!(cache.validator_index(&state, &twin), Some(10));
+    }
+
+    #[test]
+    fn the_cache_agrees_with_a_registry_scan_for_every_validator() {
+        let state = with_validators(64);
+        let cache = PubkeyIndexCache::default();
+        for index in 0..64u64 {
+            let pubkey = pubkey_at(&state, index);
+            let scanned = state
+                .iter_validators()
+                .position(|validator| validator.pubkey == pubkey)
+                .map(|position| position as u64);
+            assert_eq!(cache.validator_index(&state, &pubkey), scanned);
+        }
     }
 }

@@ -118,6 +118,35 @@ impl SlotPosition {
 
 // --- Gauges ---
 
+static LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_beacon_epoch_precompute_running",
+            "1 while an epoch precompute worker is running its advance, 0 otherwise"
+        )
+        .unwrap()
+    });
+
+/// Marks an epoch precompute worker as running in
+/// `lean_beacon_epoch_precompute_running` until dropped. A guard rather than a
+/// set/unset pair so a panicking worker still clears the gauge. At most one
+/// worker runs at a time (`epoch_precompute_in_flight`), so a plain 0/1 gauge
+/// is exact.
+pub struct EpochPrecomputeRunning;
+
+impl EpochPrecomputeRunning {
+    pub fn start() -> Self {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(1);
+        Self
+    }
+}
+
+impl Drop for EpochPrecomputeRunning {
+    fn drop(&mut self) {
+        LEAN_BEACON_EPOCH_PRECOMPUTE_RUNNING.set(0);
+    }
+}
+
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     register_int_gauge!("lean_head_slot", "Latest slot of the lean chain").unwrap()
 });
@@ -402,6 +431,25 @@ static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         register_histogram!(
             "lean_beacon_head_compute_time_seconds",
             "Duration of one beacon fork-choice head computation",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
+/// One `on_fast_confirmation` run of the beacon Fast Confirmation Rule: the
+/// balance and score reads (from the fork choice's caches, a fold on an
+/// epoch's first slot), the per-block safety checks and the variable
+/// bookkeeping, excluding the head computation that precedes it.
+///
+/// Buckets reach a whole mainnet slot, since a run that costs seconds is one
+/// the chain actor cannot afford at the start of a slot.
+static LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_fast_confirmation_time_seconds",
+            "Duration of one beacon Fast Confirmation Rule run",
             vec![
                 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
             ]
@@ -1188,6 +1236,12 @@ pub fn time_beacon_head_compute() -> TimingGuard {
     TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
 }
 
+/// Start timing one beacon Fast Confirmation Rule run. Records when the guard
+/// is dropped, including on the error path, like [`time_beacon_head_compute`].
+pub fn time_beacon_fast_confirmation() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS)
+}
+
 /// Increment the PQ aggregated signatures counter.
 pub fn inc_pq_sig_aggregated_signatures() {
     LEAN_PQ_SIG_AGGREGATED_SIGNATURES_TOTAL.inc();
@@ -1505,6 +1559,71 @@ pub fn inc_engine_no_verdict() {
             .unwrap()
         });
     LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
+}
+
+/// Speculative state transitions, by what became of them.
+///
+/// With an execution client, the chain actor runs a block's state transition
+/// while the `engine_newPayload` round trip is in flight, for a block that has
+/// its parent's post-state and passes the checks `on_block` makes before its
+/// own transition (see `fork_choice::speculate_transition`). A block asked
+/// about without one is not counted here. `outcome` is `used` (handed to
+/// `fork_choice::on_block` with a verdict that lets it stand in for the
+/// transition), `discarded_invalidated`
+/// (the verdict was `INVALIDATED`, so `on_block` runs its own), `discarded_held`
+/// (no verdict, or a non-candidate `SYNCING`/`ACCEPTED`, so the block is not
+/// imported) or `discarded_mismatch` (computed for another root or parent;
+/// not expected from the actor). A high `discarded_*` share means the overlap
+/// is buying nothing.
+pub fn inc_engine_speculation(outcome: &str) {
+    static LEAN_ENGINE_SPECULATION_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_speculation_total",
+                "Speculative state transitions run during the engine round trip, by outcome",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_SPECULATION_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How long the execution client took to answer `engine_newPayload*` for a
+/// payload, from sending the request to its answer, retry ladder included:
+/// a pre-gloas block's payload, and from gloas on the payload an envelope
+/// reveals.
+///
+/// For a pre-gloas block the import computes the state transition meanwhile,
+/// so this is not what the import waited: that is
+/// `lean_block_import_phase_seconds`'s `engine` phase, only the request's
+/// construction whenever the answer was in before the transition finished.
+/// This is the execution
+/// client's own processing time. `outcome` is `valid`, `optimistic`,
+/// `invalidated` or `no_verdict`. A `no_verdict` sample is either the whole
+/// retry ladder, when no answer came, or a single attempt, when the execution
+/// client answered with a JSON-RPC error, which is not retried.
+pub fn observe_engine_new_payload(outcome: &str, duration: Duration) {
+    static LEAN_ENGINE_NEW_PAYLOAD_SECONDS: std::sync::LazyLock<HistogramVec> =
+        std::sync::LazyLock::new(|| {
+            register_histogram_vec!(
+                "lean_engine_new_payload_seconds",
+                "Time the execution client took to answer engine_newPayload for a block's \
+                 or an envelope's payload, retries included",
+                &["outcome"],
+                // Up to the retry ladder's worst case: three attempts at the
+                // per-attempt timeout plus the backoff between them.
+                vec![
+                    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    8.0, 12.0, 16.0, 32.0,
+                ]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NEW_PAYLOAD_SECONDS
+        .with_label_values(&[outcome])
+        .observe(duration.as_secs_f64());
 }
 
 /// Blocks not imported because the execution client has not validated them and

@@ -476,11 +476,18 @@ costs nothing to supply.
 Sidecars are written on arrival, once the p2p layer has verified one (gossip
 validation for a sidecar gossip accepted, the chain checks in
 `beacon::gossip::column::chain_checks` for any other), rather than at block
-import. That ordering is what lets the availability
+import. This node's own fulu proposal's custody columns skip the p2p checks:
+the Beacon API verified them before publishing (`data_columns::verified_sidecars`). That ordering is what lets the availability
 gate read a block's columns before the block itself is allowed to import (a
 column has to exist first for the gate to find it), and what lets a restart
 keep every sidecar this node already paid a KZG batch to verify rather than
-re-fetching and re-verifying them. One consequence: a sidecar is stored for
+re-fetching and re-verifying them. The same property is what lets block import
+(and a gloas envelope's import) treat a present column as verified: the availability
+gate checks presence only and hands fork choice `DataAvailability::ColumnsVerified`,
+so the stored sidecars are not decoded and their KZG proofs are not checked a second
+time. A row damaged on disk after it was written therefore does not stop an import;
+it shows up when the by-root or by-range handler serves it, as a logged read or decode
+error, with that column left out of the answer. One consequence: a sidecar is stored for
 any block whose header, parent and proposer check out, whether or not that
 block ever actually imports — an equivocation or an orphaned fork's sidecars
 land here too, since gossip only requires a known, unfinalized parent, not a
@@ -698,7 +705,38 @@ Reads go through `get_state`, which tries three levels:
 ```
 
 If the diff chain is broken or the target's header is missing, `get_state`
-returns `None` rather than a partial state.
+returns `None` rather than a partial state. If a read fails, or a state on
+the way does not decode (a snapshot, a delta that does not apply to its base,
+a lean snapshot or diff), it returns an error rather than panicking:
+`Error::StateRebuild` wrapping `Error::Storage` or `Error::CorruptState`. A
+`BlockHeaders` row that does not decode still panics, in the slot lookup that
+reads it before any state row. The store logs every failed rebuild at `error`
+(`State rebuild failed`, with the root), once per read rather than once per
+caller, since most callers report the error as something else or not at all.
+Each caller decides what an error costs: p2p's column checks drop the sidecar
+whose check read it, and do not remember the error, so the next sidecar of the
+same block reads again; fork choice and the state writer still panic on it.
+
+Concurrent misses on one root rebuild it once (`StateRebuilds` in
+`crates/storage/src/state_writer.rs`, a `OnceLock` per root under way). The
+first caller rebuilds. Every other caller that misses on that root while the
+rebuild is under way waits for it and gets the same state, so p2p's column
+checks of separate deliveries of one block's columns (each gossiped column
+gossip queued is a delivery of its own; a fetched answer or a replayed batch
+reads the parent state once for the whole block, through `ChainPrechecks`),
+the chain actor and the RPC asking for one evicted parent state cost one
+snapshot read and one decode, not one each. A corrupt state is shared the same way, so it is
+read once rather than once per caller, and every caller waiting on it fails;
+since a later read fails again, a late block's custody columns are all dropped
+when their parent's state does not decode. A failed read
+(`Error::Storage`) is not shared, since it can be transient: a caller only
+ever gets one from a read it ran itself, and the callers that waited on it go
+round again and share a read of their own. That keeps a p2p column check's
+failed read from reaching fork choice's or the state writer's panic on a read
+they never made. The first caller out removes the rebuild's entry; a miss
+arriving before that takes the settled result (or, for a failed read, goes
+round again), and any later miss reads storage again. A rebuild that panics
+hands the waiting callers nothing, and one of them rebuilds for the rest.
 
 ## Write Paths: What a Block Import Persists
 
@@ -926,6 +964,15 @@ current slot: ~30 minutes at lean's four-second slots, ~90 minutes at beacon's
 twelve-second ones. A staler DB, or one whose anchor checkpoint state is
 missing, falls through to checkpoint sync, which writes a fresh anchor on top
 of the existing data.
+
+One file in `--data-dir` is not RocksDB's: `node.key`, the node's secp256k1
+libp2p and discv5 identity. When `--node-key` is absent, `run_node` reads it on
+every start and generates it on the first (hex, mode `0600`). It never goes
+through the `StorageBackend`, is written only after the DB is open so RocksDB's
+lock covers it, and is lost with the directory when the directory is wiped,
+together with the custody columns that identity selected. A `node.key` that
+fails to load stops startup rather than being replaced; deleting it is how to
+ask for a new identity.
 
 ## Key Files
 

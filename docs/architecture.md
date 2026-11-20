@@ -246,10 +246,12 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
 
 1. Install the tracing subscriber, parse CLI options, register metrics, raise the
    file-descriptor limit for RocksDB's unbounded table cache.
-2. Load the node key, then genesis config, validator config, bootnode ENRs and validator keys.
-3. Open the database, then pick an anchor: resume from disk if the on-disk head is recent
-   enough, otherwise [checkpoint sync](./checkpoint_sync.md) from the configured URLs, and
-   otherwise build the genesis state. A stale database with no checkpoint URL configured is
+2. Load genesis config, validator config, bootnode ENRs and validator keys.
+3. Open the database, then load the node key: `--node-key`, else the `node.key` stored in
+   the data directory, generated there on its first start. Then pick an anchor: resume from
+   disk if the on-disk head is recent enough, otherwise
+   [checkpoint sync](./checkpoint_sync.md) from the configured URLs, and otherwise build the
+   genesis state. A stale database with no checkpoint URL configured is
    resumed anyway, with a warning, since that is the setup the node was given.
 4. Build the shared handles: aggregator controller, sync-status controller, event bus, and
    the subnet set that both the swarm and the actor need to agree on.
@@ -257,8 +259,8 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
    swarm, spawn `P2PServer`, and wire the two together with `InitP2P` and `InitBlockChain`.
 6. Spawn the API and metrics servers.
 
-Shutdown runs in reverse: the first ctrl+c stops both actors and cancels the servers'
-shutdown token, and three more force the process to exit if a graceful stop hangs.
+Shutdown runs in reverse: the first ctrl+c or SIGTERM stops both actors and cancels the servers'
+shutdown token, and three more, of either kind, force the process to exit if a graceful stop hangs.
 
 > Note: booting with `HIVE_LEAN_TEST_DRIVER=1` short-circuits everything from step 2 on and
 > exposes only the Hive test-driver endpoints, so a driver run never touches the node key,

@@ -41,7 +41,7 @@
 //! fresh here, since capella's own [`capella::ExecutionPayloadHeader`] adds
 //! `withdrawals_root` and is a distinct type from bellatrix's.
 
-use crate::beacon::bls;
+use crate::beacon::bls::SignatureSet;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::{Deposit, ProposerSlashing, SignedVoluntaryExit};
@@ -56,10 +56,14 @@ use crate::beacon::helpers::capella::{
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_signing_root};
 use crate::beacon::helpers::mutators::decrease_balance;
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{H256, HashTreeRoot as _};
+use crate::beacon::stf::signatures::SignatureBatch;
 
-use super::ExecutionEngine;
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -72,25 +76,32 @@ use super::ExecutionEngine;
 /// See this module's own documentation for why [`process_withdrawals`] runs
 /// before [`process_operations`], and so before this same block's own
 /// `bls_to_execution_changes` are processed.
+#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &capella::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body.execution_payload, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(state, &block.body.execution_payload, config, engine)
+    })?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
         state,
@@ -101,10 +112,18 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
+        options.target_delta,
+        signatures,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+        signatures,
+    )?;
     Ok(())
 }
 
@@ -369,6 +388,8 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     super::operations::process_operations(
         state,
@@ -380,10 +401,14 @@ pub fn process_operations(
         config,
         committees,
         active_balances,
+        target_delta,
+        signatures,
     )?;
-    for signed_change in bls_to_execution_changes {
-        process_bls_to_execution_change(state, signed_change, config)?;
-    }
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        bls_to_execution_changes,
+        |signed_change| process_bls_to_execution_change(state, signed_change, config, signatures),
+    )?;
     Ok(())
 }
 
@@ -414,6 +439,7 @@ pub fn process_bls_to_execution_change(
     state: &mut BeaconState,
     signed_change: &capella::SignedBLSToExecutionChange,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let change = &signed_change.message;
 
@@ -434,14 +460,16 @@ pub fn process_bls_to_execution_change(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(change.hash_tree_root(), domain);
-    verify(
-        bls::verify(
+    signatures.push(
+        SignatureSet::single(
             &change.from_bls_pubkey,
             signing_root,
             &signed_change.signature,
         ),
         "bls.Verify(address_change.from_bls_pubkey, signing_root, signed_address_change.signature)",
     )?;
+    // Before the credentials are rewritten on the strength of it.
+    signatures.verify_pending()?;
 
     let mut credentials = [0u8; 32];
     credentials[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
@@ -508,6 +536,7 @@ mod tests {
         BlsPubkey, BlsSignature, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
         ValidatorIndex,
     };
+    use crate::beacon::stf::signatures::checked;
     use libssz_types::SszVector;
 
     /// A capella state with `count` fully active, full-balance validators, one
@@ -748,7 +777,8 @@ mod tests {
         );
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
-        process_bls_to_execution_change(&mut state, &signed_change, &config).unwrap();
+        checked(|s| process_bls_to_execution_change(&mut state, &signed_change, &config, s))
+            .unwrap();
 
         let validator = state.validator(0).unwrap();
         assert_eq!(
@@ -797,7 +827,85 @@ mod tests {
         );
         let signed_change = capella::SignedBLSToExecutionChange { message, signature };
 
-        assert!(process_bls_to_execution_change(&mut state, &signed_change, &config).is_err());
+        assert!(
+            checked(|s| {
+                process_bls_to_execution_change(&mut state, &signed_change, &config, s)
+            })
+            .is_err()
+        );
+    }
+
+    /// A credential change rewrites a validator's record, so its signature and
+    /// every one still pending are checked before it writes, even through a
+    /// batch that defers: a forged change is refused by the operation itself,
+    /// and so is a genuine one while a forged set from earlier in the block is
+    /// pending. Either way the credentials are left as they were.
+    #[test]
+    fn a_credential_change_checks_its_signature_and_every_pending_one_before_it_writes() {
+        let config = Config::mainnet();
+        let mut state = capella_state_with_validators(1);
+        let secret_key = SecretKey::key_gen(&[6u8; 32], &[]).expect("32 bytes of key material");
+        let from_pubkey = BlsPubkey(secret_key.sk_to_pk().to_bytes());
+        let hashed = hash(&from_pubkey.0);
+        {
+            let validator = state.validator_mut(0).unwrap();
+            validator.withdrawal_credentials.0[0] = constants::BLS_WITHDRAWAL_PREFIX;
+            validator.withdrawal_credentials.0[1..].copy_from_slice(&hashed.0[1..]);
+        }
+        let credentials_before = state.validator(0).unwrap().withdrawal_credentials;
+
+        let message = capella::BLSToExecutionChange {
+            validator_index: 0,
+            from_bls_pubkey: from_pubkey,
+            to_execution_address: ExecutionAddress::repeat_byte(0xcd),
+        };
+        let domain = compute_domain(
+            constants::DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            config.genesis_fork_version,
+            state.genesis_validators_root(),
+        );
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let sign = |root: Root| BlsSignature(secret_key.sign(root.as_slice(), DST, &[]).to_bytes());
+        let genuine = capella::SignedBLSToExecutionChange {
+            message: message.clone(),
+            signature: sign(signing_root),
+        };
+        let forged = capella::SignedBLSToExecutionChange {
+            message,
+            signature: sign(Root::repeat_byte(1)),
+        };
+
+        let mut signatures = SignatureBatch::new();
+        let err = process_bls_to_execution_change(&mut state, &forged, &config, &mut signatures)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("bls.Verify(address_change.from_bls_pubkey"),
+            "{err:?}"
+        );
+        assert_eq!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
+        );
+
+        let mut signatures = SignatureBatch::new();
+        let earlier = SignatureSet::single(&from_pubkey, Root::repeat_byte(2), &sign(Root::ZERO));
+        signatures.push(earlier, "an earlier operation").unwrap();
+        let err = process_bls_to_execution_change(&mut state, &genuine, &config, &mut signatures)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("an earlier operation"),
+            "{err:?}"
+        );
+        assert_eq!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
+        );
+
+        checked(|s| process_bls_to_execution_change(&mut state, &genuine, &config, s)).unwrap();
+        assert_ne!(
+            state.validator(0).unwrap().withdrawal_credentials,
+            credentials_before
+        );
     }
 
     #[test]
@@ -818,6 +926,11 @@ mod tests {
             signature: BlsSignature::default(),
         };
 
-        assert!(process_bls_to_execution_change(&mut state, &signed_change, &config).is_err());
+        assert!(
+            checked(|s| {
+                process_bls_to_execution_change(&mut state, &signed_change, &config, s)
+            })
+            .is_err()
+        );
     }
 }
