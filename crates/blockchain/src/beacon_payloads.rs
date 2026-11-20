@@ -105,12 +105,46 @@ pub fn checkpoint_hash(store: &Store, root: H256) -> ExecutionBlockHash {
 ///
 /// The rule has not run yet (or was reset while the node is syncing) when the
 /// store holds no confirmed root, and then its own initialization applies: the
-/// finalized block.
+/// finalized block. So does a confirmed block that is no longer on the head's
+/// chain: see [`safe_root`].
 pub(crate) fn get_safe_execution_block_hash(store: &Store) -> ExecutionBlockHash {
-    let confirmed_root = store
-        .fast_confirmed_root()
-        .unwrap_or_else(|| store.beacon_finalized_checkpoint().root);
-    checkpoint_hash(store, confirmed_root)
+    checkpoint_hash(store, safe_root(store))
+}
+
+/// The block `forkchoiceUpdated` names as safe: the most recent confirmed one
+/// while it is on the stored head's chain at or above finality, and the
+/// finalized block otherwise.
+///
+/// The rule runs once a slot, at the tick, while imports move the head many
+/// times a slot, and the execution client refuses a safe block that is not an
+/// ancestor of the head (`-38002 Invalid forkchoice state`). A confirmed block
+/// leaves the head's chain only when the rule's synchrony assumption broke,
+/// and the rule's own next run then falls back to the finalized block too
+/// (`get_latest_confirmed`'s canonical check). Checked against the canonical
+/// `BlockRoots` index, which `update_checkpoints` keeps on the stored head's
+/// chain: one point read, where walking the head's ancestry would decode a
+/// block per hop. A slot the index cannot answer counts as off the chain.
+/// This clamp is not in the specification; see `docs/spec_deviations.md`.
+fn safe_root(store: &Store) -> H256 {
+    let finalized = store.beacon_finalized_checkpoint();
+    let Some(confirmed) = store.fast_confirmed_root() else {
+        return finalized.root;
+    };
+    if confirmed == finalized.root {
+        return confirmed;
+    }
+    // Every canonical block at or after the finalized epoch's start slot other
+    // than the finalized block itself descends from it, so this also keeps a
+    // confirmed block that finality has overtaken out.
+    let on_head_chain = store.block_entry(&confirmed).is_some_and(|(slot, _)| {
+        slot >= compute_start_slot_at_epoch(finalized.epoch)
+            && store.canonical_root_at_slot(slot).ok().flatten() == Some(confirmed)
+    });
+    if on_head_chain {
+        confirmed
+    } else {
+        finalized.root
+    }
 }
 
 /// What `forkchoiceUpdated` should carry for the current head, or `None` when
@@ -515,6 +549,7 @@ mod tests {
             store.insert_pending_block(root, block).expect("insert");
             store.insert_beacon_el_block_hash(root, slot, hash);
         }
+        make_head(&mut store, root_2, PayloadStatus::Full);
 
         // The rule has not run: its own initialization, the finalized block
         // (here the unknown zero anchor, which has no payload).
@@ -586,8 +621,48 @@ mod tests {
         confirm(&store, fulu_root);
         let plan = forkchoice_plan(&store, gloas_root).expect("a plan");
         assert_eq!(plan.state.safe_block_hash, fulu_hash);
-        // A confirmed block with no known payload is zero, like finalized.
+        // A confirmed block the store does not hold is no block of the
+        // head's chain: the finalized one stands in (here the zero anchor,
+        // with no payload).
         confirm(&store, H256::repeat_byte(0x99));
         assert_eq!(get_safe_execution_block_hash(&store), H256::ZERO);
+    }
+
+    /// The rule runs once a slot, imports move the head in between, and the
+    /// execution client refuses a safe block off the head's chain: a confirmed
+    /// block the head has left gives way to the finalized one until the head
+    /// is back on its chain.
+    #[test]
+    fn a_confirmed_block_off_the_heads_chain_is_not_sent_as_safe() {
+        let mut store = beacon_store(0, 0);
+        let (hash_a, hash_b) = (H256::repeat_byte(0x0a), H256::repeat_byte(0x0b));
+        let block_a = fulu_block(H256::ZERO, 1, 0);
+        let root_a = block_a.message_hash_tree_root();
+        let block_b = fulu_block(H256::ZERO, 2, 0);
+        let root_b = block_b.message_hash_tree_root();
+        for (root, block, slot, hash) in
+            [(root_a, block_a, 1, hash_a), (root_b, block_b, 2, hash_b)]
+        {
+            store.insert_pending_block(root, block).expect("insert");
+            store.insert_beacon_el_block_hash(root, slot, hash);
+        }
+        make_head(&mut store, root_a, PayloadStatus::Full);
+        confirm(&store, root_a);
+        assert_eq!(get_safe_execution_block_hash(&store), hash_a);
+
+        // An import moves the head to a sibling branch before the next run.
+        store
+            .update_checkpoints(ethlambda_storage::ForkCheckpoints::head_only(root_b))
+            .expect("move head");
+        let plan = forkchoice_plan(&store, root_b).expect("a plan");
+        assert_eq!(plan.state.head_block_hash, hash_b);
+        assert_eq!(plan.state.safe_block_hash, plan.state.finalized_block_hash);
+        assert_ne!(plan.state.safe_block_hash, hash_a);
+
+        // Back on the confirmed block's chain, it is safe again.
+        store
+            .update_checkpoints(ethlambda_storage::ForkCheckpoints::head_only(root_a))
+            .expect("move head");
+        assert_eq!(get_safe_execution_block_hash(&store), hash_a);
     }
 }

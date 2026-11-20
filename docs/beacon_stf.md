@@ -599,7 +599,9 @@ assertion). A later bump should diff those three files against that commit.
   is more than 32 slots behind the wall clock (the `head` event's gate): the
   rule assumes synchrony from the start of the previous slot.
 - **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
-  the engine's safe block hash (`get_safe_execution_block_hash`).
+  the engine's safe block hash (`get_safe_execution_block_hash`), which falls
+  back to the finalized block while the confirmed one is off the head's chain
+  (an import can move the head between two runs).
 - **Cost.** A run reuses what the fork choice already keeps, so most runs cost
   about what the head computation does:
   - Balance sources are the store's per-checkpoint balances

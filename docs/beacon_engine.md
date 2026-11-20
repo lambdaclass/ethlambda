@@ -326,7 +326,10 @@ Its three hashes come from the cached execution hash of the head, the root of
 the block the Fast Confirmation Rule last confirmed (see
 [`beacon_stf.md`](beacon_stf.md#fast-confirmation-rule)) and the finalized
 checkpoint's root. The rule's confirmed root starts at the finalized block and
-is updated once per slot, in the same tick, before this call. A root with no
+is updated once per slot, in the same tick, before this call. Between two runs
+an import can move the head off the confirmed block's chain, and the finalized
+block is sent as safe until the head is back on it (see `docs/spec_deviations.md`,
+"`forkchoiceUpdated` for a gloas head"; the rule applies on every fork). A root with no
 cached hash contributes the zero hash, which is a meaningful value here rather
 than an absence: EIP-3675 requires `finalized_block_hash` to be zero before a
 post-transition block is finalized, and a confirmed block before the merge has
