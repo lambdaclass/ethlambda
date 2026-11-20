@@ -18,7 +18,7 @@
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::BeaconState;
+use crate::beacon::containers::{BeaconState, EpochParticipation};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::get_current_epoch;
 use crate::beacon::helpers::altair::get_next_sync_committee;
@@ -400,7 +400,10 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
         state.altair_validator_lists_mut()?;
 
     *previous_epoch_participation = core::mem::take(current_epoch_participation);
-    *current_epoch_participation = vec![0; validator_count].try_into()?;
+    // `repeat` rather than a zeroed `Vec`: the `Vec` builds hundreds of
+    // separate leaves that the next state root then hashes one by one, while
+    // `repeat` shares one zero leaf and its cached hash among all of them.
+    *current_epoch_participation = EpochParticipation::repeat(0, validator_count)?;
 
     Ok(())
 }
@@ -498,7 +501,8 @@ mod tests {
         // none has yet this epoch: only the previous epoch should justify.
         {
             let (previous_epoch_participation, _, _) = state.altair_validator_lists_mut().unwrap();
-            for flags in previous_epoch_participation.iter_mut() {
+            for index in 0..previous_epoch_participation.len() {
+                let flags = &mut previous_epoch_participation[index];
                 *flags = add_flag(*flags, constants::TIMELY_TARGET_FLAG_INDEX);
             }
         }

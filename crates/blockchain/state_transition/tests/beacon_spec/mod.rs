@@ -92,7 +92,7 @@ pub fn preset() -> &'static str {
     Preset::active().name()
 }
 
-/// The compiled-in preset with every fork up to and including `case.fork`
+/// The active preset's configuration with every fork up to and including `case.fork`
 /// pulled back to genesis, never a later one.
 ///
 /// The fallback [`case_config`] uses when a case carries no `config.yaml` of

@@ -63,6 +63,7 @@ pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod signatures;
 
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
@@ -208,6 +209,14 @@ pub fn apply_block(
         "the block's fork matches the state's",
     )?;
 
+    // The proposer's signature on its own, before the body runs, rather than in
+    // the body's batch: a block nobody but its sender signed then costs one
+    // pairing to reject instead of a whole body's processing. Gossip checked it
+    // already (`precheck_block`), but a block fetched by request arrives here
+    // unchecked. `process_block` batches the body's own signatures and checks
+    // them before returning, so before the state root below is computed (and
+    // the ones that slash, exit, redirect or feed the RANDAO mix before they
+    // write; see `signatures`).
     if validate_result {
         verify(
             verify_block_signature(state, signed_block),
@@ -238,6 +247,9 @@ pub fn apply_block(
 }
 
 /// Whether the block carries its proposer's signature.
+///
+/// Checked on its own, never batched: [`apply_block`] runs it before the body
+/// so that a block its proposer never signed costs one pairing to reject.
 pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -261,12 +273,23 @@ pub fn verify_proposer_signature(
     block_root: Root,
     signature: &BlsSignature,
 ) -> bool {
-    let Ok(proposer) = state.validator(proposer_index) else {
-        return false;
-    };
+    proposer_signature_set(state, proposer_index, block_root, signature)
+        .is_some_and(|set| set.verify())
+}
+
+/// [`verify_proposer_signature`]'s check, resolved but not yet run. `None` is
+/// a proposer index outside the registry, or a key or signature that does not
+/// validate.
+fn proposer_signature_set(
+    state: &BeaconState,
+    proposer_index: ValidatorIndex,
+    block_root: Root,
+    signature: &BlsSignature,
+) -> Option<bls::SignatureSet> {
+    let proposer = state.validator(proposer_index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(block_root, domain);
-    bls::verify(&proposer.pubkey, signing_root, signature)
+    bls::SignatureSet::single(&proposer.pubkey, signing_root, signature)
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and

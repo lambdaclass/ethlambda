@@ -124,10 +124,10 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// serves everything from altair on, gloas included: nothing in gloas's own
 /// `beacon-chain.md` touches this step either, and
 /// [`crate::beacon::containers::BeaconState::altair_validator_lists`] now reaches
-/// a gloas state's participation lists too (as plain slices, since gloas's are
-/// progressive rather than `SszList`; see that accessor's own doc), which is
-/// what lets this one copy serve every fork from altair on without a
-/// gloas-specific one.
+/// a gloas state's participation lists too (as
+/// [`crate::beacon::containers::ParticipationRef`]s, which read a bounded and a
+/// progressive list alike; see that accessor's own doc), which is what lets
+/// this one copy serve every fork from altair on without a gloas-specific one.
 pub fn process_justification_and_finalization(
     state: &mut BeaconState,
     config: &Config,

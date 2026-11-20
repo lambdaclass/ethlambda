@@ -82,10 +82,10 @@ fn apply(
         "rewards_and_penalties" => match fork {
             ForkName::Phase0 => epoch::rewards::process_rewards_and_penalties(state, config),
             // `BeaconState::altair_validator_lists` now reaches a gloas
-            // state's participation and inactivity lists too, as plain
-            // slices (progressive rather than `SszList`, EIP-7688, but both
-            // `Deref` to `[T]`), so this one copy serves gloas as well; see
-            // that accessor's own doc.
+            // state's participation and inactivity lists too, as
+            // `ParticipationRef` and `InactivityScoresRef`, which read a
+            // bounded and a progressive list alike (EIP-7688), so this one
+            // copy serves gloas as well; see that accessor's own doc.
             ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
