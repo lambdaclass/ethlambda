@@ -102,9 +102,11 @@ make test                                    # All tests + forkchoice spec tests
 ```
 
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
-jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
-the Makefile names the first; `test-node` is the workspace minus it. Run one half
-directly when iterating on it.
+jobs because together they no longer fit a runner's disk, plus `test-ethrex`, the
+embedded execution client's tests with the `include-ethrex` feature on (a third
+job). `CONSENSUS_CRATES` in the Makefile names the first half; `test-node` is the
+workspace minus it and `ETHREX_CRATES`. Run one part directly when iterating on
+it.
 
 ### Docs-only changes skip CI
 
@@ -740,7 +742,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
 - Tests: `make test-beacon` (builds once per preset), or `test-beacon-mainnet` /
   `test-beacon-minimal` for one. CI runs the two as a job each, so they build and
   run concurrently. `make test` covers the whole
-  workspace, in two halves, and still needs no fixture download: the
+  workspace, in two halves plus `test-ethrex`, and still needs no fixture download: the
   `beacon_spec_tests` target declares `required-features = ["beacon-spec-tests"]`
   so `cargo test` skips it, and the BLS and KZG fixture vectors, which are unit
   tests inside the module, are `#[cfg_attr(not(feature = ...), ignore)]` so they

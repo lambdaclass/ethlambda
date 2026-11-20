@@ -118,7 +118,8 @@ jobs:
         run: cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
 
   # The embedded execution client, in a job of its own: `make test-ethrex`
-  # says why it is kept out of both halves of `test`. No leanSpec fixtures:
+  # (the third part of `make test`) says why it is kept out of
+  # `test-consensus` and `test-node`. No leanSpec fixtures:
   # its integration tests run ethrex against a checked-in dev genesis.
   ethrex:
     name: Test (include-ethrex)
