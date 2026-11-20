@@ -410,7 +410,8 @@ static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     });
 
 /// One `on_fast_confirmation` run of the beacon Fast Confirmation Rule: the
-/// registry flattening, the per-block safety checks and the variable
+/// balance and score reads (from the fork choice's caches, a fold on an
+/// epoch's first slot), the per-block safety checks and the variable
 /// bookkeeping, excluding the head computation that precedes it.
 ///
 /// Buckets reach a whole mainnet slot, since a run that costs seconds is one
