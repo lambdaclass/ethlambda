@@ -4,6 +4,7 @@ pub mod backend;
 mod beacon_state_delta;
 mod committee_cache;
 mod error;
+mod execution_optimistic;
 mod liveness;
 pub mod metrics;
 pub mod pools;
