@@ -337,6 +337,21 @@ In practice the distribution is bimodal and dominated by production rather than 
 | `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
 | `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 | `lean_state_cache_lookups_total` | Counter | State cache lookups, by the `Store` method that made them, the kind of state asked for, and whether the cache held it | On every `get_state` (and the writer's own parent read), `has_state` and `cached_state` call | method=get_state,has_state,cached_state<br>kind=block,checkpoint<br>result=hit,miss |
+| `lean_state_rebuilds_total` | Counter | Block states read back from storage after missing the cache and the write buffer, by whether the read did the rebuild or waited on one already under way for that root | On every `get_state` miss (and the writer's own parent read) that reads a state back from storage, or takes the state a rebuild under way read; a miss that finds no state, finds it cached by the time it leads, or fails counts as neither. Both roles are seeded at zero | role=led,joined |
+| `lean_beacon_proto_array_rebuilds_total` | Counter | Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale | On a head computation that found the cache stale or not following its inputs | reason=unbuilt,prune,removal,balances,rules,coverage,link,underflow |
+| `lean_beacon_proto_array_rebuild_seconds` | Histogram | Time to rebuild the cached beacon fork-choice weights from every latest message | Per rebuild | |
+
+**`lean_beacon_proto_array_rebuilds_total` should move about once per epoch.**
+The beacon head computation reads vote weights the store keeps current as votes
+arrive, and rebuilds them from every latest message only when its inputs move
+under it: `balances` when the justified checkpoint moves, `prune` when finality
+prunes the block index (the two usually land together, and one rebuild covers
+both), `unbuilt` once per process. `removal` follows a payload invalidation or the
+restart head repair, `rules` the gloas fork boundary. `coverage` means a block
+reached the index without `Store::insert_fork_choice_node`: `on_block` always
+inserts one, so outside tests and bootstrap a steady rate of it is worth a look
+(an API read racing a block import can cost one now and then). `underflow` is a
+bug: the cache repaired itself, and a warning in the log names the validator.
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -364,6 +379,18 @@ or `has_state` miss means the state was not resident and came from the writer's
 buffer or RocksDB. A `cached_state` miss with `kind="checkpoint"` means fork
 choice's `checkpoint_state` rebuilt the state, running `process_slots` up to the
 epoch boundary when the checkpoint's block precedes it.
+
+**`lean_state_rebuilds_total{role="led"}` is the number of states actually
+read and decoded from storage.** A beacon rebuild costs about a second of CPU
+and several hundred megabytes at its peak, so this is the series to watch for
+resident-memory spikes. `role="joined"` counts misses that found a rebuild of
+the same root already under way and took the state it read instead, so every
+join has the lead it waited on beside it. A lookup that finds no state for
+its root, or fails, counts under neither, and so does a lead that finds the
+state already cached by a rebuild that settled since its own miss, along with
+whoever waited on it. A burst of joins next to a single lead is the pattern a
+late block's custody columns produce, each gossiped one that gossip queued
+checked on its own task against a parent state that has left the cache.
 
 ### Beacon Gossip Validation
 
@@ -522,7 +549,8 @@ not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations, sync aggregate and exit/consolidation churn | result=hit,miss,unkeyable |
+| `lean_beacon_pubkey_index_lookups_total` | Counter | Pubkey to validator-index lookups in block processing, by whether the pubkey index cache served them | Per sync committee seat, and per pubkey of a withdrawal or consolidation request; `fallback` is a registry search (also counted when the pubkey is not registered) | result=hit,fallback |
 
 Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
 genesis state asking about its own epoch, and should be zero on a
@@ -641,7 +669,7 @@ spec.
 | `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
 | `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=already_seen,malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
 | `lean_data_column_kzg_verify_seconds` | Histogram | Time spent in one KZG cell-proof batch verification: one sidecar's cells in gossip validation, one sub-batch of at most 16 of one block's sidecars in the chain checks, which for every sub-batch after a block's first is how long it holds its `column_check_permits` permit (see [Data column sidecars](beacon_wire.md#data-column-sidecars)), plus one observation per sidecar if that batch fails and each is re-verified alone | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
-| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
+| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries,peers_exhausted,no_custodian | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
@@ -666,10 +694,15 @@ availability gate, and a healthy node returns it to zero within a slot or two
 of a hold: fetch or gossip should complete well inside the retry ladder
 `lean_data_column_fetch_failures_total` counts down. A gauge that sits above
 zero for several slots means either the fetch is failing — check whether
-`lean_data_column_fetch_failures_total`'s `no_peers` or `max_retries` reason
-is climbing — or no reachable peer actually serves the missing columns; short
-of that, only finality passing the held block's slot clears it, which can be
-minutes away.
+`lean_data_column_fetch_failures_total`'s `no_peers`, `max_retries` or
+`peers_exhausted` reason is climbing (the last: every connected peer failed a
+request or sent an invalid sidecar in one lookup) — or no reachable peer
+actually serves the missing columns, which
+the `no_custodian` reason counts: a lookup that ends without finding anyone
+connected holding the missing columns, because none is known to custody them
+or every peer asked after the block's slot answered without them.
+Short of that, only finality passing the held block's slot clears it, which
+can be minutes away.
 
 **Read `lean_sidecars_awaiting_parent` beside it.** A sidecar whose block's
 parent has no post-state yet is parked rather than dropped, and a held block is

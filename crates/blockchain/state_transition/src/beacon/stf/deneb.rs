@@ -55,7 +55,7 @@ use crate::beacon::primitives::{
 
 use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Block processing
@@ -79,8 +79,7 @@ pub fn process_block(
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     // The body's root is an argument, so it is hashed inside the timed span:
@@ -115,10 +114,15 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -176,12 +180,16 @@ fn process_operations(
     try_for_each_timed(
         StfPhase::ProposerSlashings,
         proposer_slashings,
-        |slashing| super::operations::process_proposer_slashing(state, slashing, config),
+        |slashing| {
+            super::operations::process_proposer_slashing(state, slashing, config, active_balances)
+        },
     )?;
     try_for_each_timed(
         StfPhase::AttesterSlashings,
         attester_slashings,
-        |slashing| super::operations::process_attester_slashing(state, slashing, config),
+        |slashing| {
+            super::operations::process_attester_slashing(state, slashing, config, active_balances)
+        },
     )?;
     // One proposer lookup for the list, not one per attestation, timed with
     // the attestations it serves: see the same loop in

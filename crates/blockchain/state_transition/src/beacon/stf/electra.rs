@@ -54,9 +54,9 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
-    get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
-    get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    PubkeyIndexCacheExt, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::capella::withdrawal_address;
@@ -84,7 +84,7 @@ use crate::beacon::primitives::{
 
 use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
-use super::ExecutionEngine;
+use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
 // Local state projection
@@ -491,6 +491,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -540,7 +541,12 @@ pub fn process_voluntary_exit(
     )?;
 
     // [Modified in Electra:EIP7251]
-    electra_initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
+    electra_initiate_validator_exit(
+        state,
+        voluntary_exit.validator_index,
+        config,
+        Some(active_balances),
+    )?;
     Ok(())
 }
 
@@ -588,6 +594,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -610,6 +617,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -1194,15 +1202,23 @@ pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     for deposit in requests.deposits.iter() {
         process_deposit_request(state, deposit)?;
     }
     for withdrawal in requests.withdrawals.iter() {
-        process_withdrawal_request(state, withdrawal, config)?;
+        process_withdrawal_request(state, withdrawal, config, active_balances, pubkey_indices)?;
     }
     for consolidation in requests.consolidations.iter() {
-        process_consolidation_request(state, consolidation, config)?;
+        process_consolidation_request(
+            state,
+            consolidation,
+            config,
+            active_balances,
+            pubkey_indices,
+        )?;
     }
     Ok(())
 }
@@ -1313,6 +1329,8 @@ pub fn process_withdrawal_request(
     state: &mut BeaconState,
     request: &electra::WithdrawalRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let amount = request.amount;
     let is_full_exit_request = amount == constants::FULL_EXIT_REQUEST_AMOUNT;
@@ -1327,11 +1345,7 @@ pub fn process_withdrawal_request(
         return Ok(());
     }
 
-    let Some(index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.validator_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(index) = pubkey_indices.validator_index(state, &request.validator_pubkey) else {
         return Ok(());
     };
     let validator = state.validator(index)?;
@@ -1366,7 +1380,7 @@ pub fn process_withdrawal_request(
         // queue; either way, a full exit request never falls through to the
         // partial-withdrawal logic below.
         if pending_balance_to_withdraw == 0 {
-            electra_initiate_validator_exit(state, index, config)?;
+            electra_initiate_validator_exit(state, index, config, Some(active_balances))?;
         }
         return Ok(());
     }
@@ -1394,7 +1408,8 @@ pub fn process_withdrawal_request(
                 "state.balances[index] - MIN_ACTIVATION_BALANCE - pending_balance_to_withdraw",
             ))?
             .min(amount);
-        let exit_queue_epoch = compute_exit_epoch_and_update_churn(state, to_withdraw, config)?;
+        let exit_queue_epoch =
+            compute_exit_epoch_and_update_churn(state, to_withdraw, config, Some(active_balances))?;
         let withdrawable_epoch = exit_queue_epoch
             .checked_add(config.min_validator_withdrawability_delay)
             .ok_or(Error::ArithmeticOverflow(
@@ -1416,9 +1431,12 @@ pub fn process_withdrawal_request(
 // Execution-layer consolidation requests
 // ---------------------------------------------------------------------------
 
-/// Whether `request` is really a request to switch its source (and only
-/// source) validator from an eth1 to a compounding withdrawal credential,
-/// disguised as a self-consolidation.
+/// The specification's `is_valid_switch_to_compounding_request`: whether
+/// `request` is really a request to switch its source (and only source)
+/// validator from an eth1 to a compounding withdrawal credential, disguised as
+/// a self-consolidation. Answers with the source's index when it is (`None`
+/// where the specification returns `False`), so the caller acting on it does
+/// not resolve the same pubkey a second time.
 ///
 /// A validator that already holds an eth1 credential has no other way to
 /// become compounding: [`crate::beacon::helpers::electra::switch_to_compounding_validator`]
@@ -1428,40 +1446,39 @@ pub fn process_withdrawal_request(
 /// functions; nothing inside can actually fail, since every condition here
 /// is itself one of the specification's own `return False` guards rather
 /// than an assertion.
-pub fn is_valid_switch_to_compounding_request(
+pub fn switch_to_compounding_source(
     state: &BeaconState,
     request: &electra::ConsolidationRequest,
-) -> Result<bool> {
+    pubkey_indices: &PubkeyIndexCache,
+) -> Result<Option<ValidatorIndex>> {
     if request.source_pubkey != request.target_pubkey {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let Some(source_validator) = state
-        .iter_validators()
-        .find(|validator| validator.pubkey == request.source_pubkey)
-    else {
-        return Ok(false);
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
+        return Ok(None);
     };
+    let source_validator = state.validator(source_index)?;
 
     if withdrawal_address(source_validator) != request.source_address {
-        return Ok(false);
+        return Ok(None);
     }
     if !has_eth1_withdrawal_credential(source_validator) {
-        return Ok(false);
+        return Ok(None);
     }
     if !is_active_validator(source_validator, get_current_epoch(state)) {
-        return Ok(false);
+        return Ok(None);
     }
     if source_validator.exit_epoch != FAR_FUTURE_EPOCH {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(true)
+    Ok(Some(source_index))
 }
 
 /// Honors (or quietly drops) an execution-layer-triggered consolidation
 /// (EIP-7251): either a switch-to-compounding request in disguise (see
-/// [`is_valid_switch_to_compounding_request`]), or a real merge of one
+/// [`switch_to_compounding_source`]), or a real merge of one
 /// validator's balance into another's.
 ///
 /// Every early return here, in both branches, is the specification's own
@@ -1482,17 +1499,10 @@ pub fn process_consolidation_request(
     state: &mut BeaconState,
     request: &electra::ConsolidationRequest,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
-    if is_valid_switch_to_compounding_request(state, request)? {
-        // Already known to resolve, by the check just above; state has not
-        // been mutated since.
-        let source_index = state
-            .iter_validators()
-            .position(|validator| validator.pubkey == request.source_pubkey)
-            .map(|index| index as ValidatorIndex)
-            .ok_or(Error::SpecAssert(
-                "is_valid_switch_to_compounding_request already resolved consolidation_request.source_pubkey",
-            ))?;
+    if let Some(source_index) = switch_to_compounding_source(state, request, pubkey_indices)? {
         crate::beacon::helpers::electra::switch_to_compounding_validator(state, source_index)?;
         return Ok(());
     }
@@ -1510,22 +1520,16 @@ pub fn process_consolidation_request(
     if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
         return Ok(());
     }
-    if get_consolidation_churn_limit_for_fork(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
+    if get_consolidation_churn_limit_for_fork(state, config, Some(active_balances))?
+        <= preset::MIN_ACTIVATION_BALANCE
+    {
         return Ok(());
     }
 
-    let Some(source_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.source_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(source_index) = pubkey_indices.validator_index(state, &request.source_pubkey) else {
         return Ok(());
     };
-    let Some(target_index) = state
-        .iter_validators()
-        .position(|validator| validator.pubkey == request.target_pubkey)
-        .map(|index| index as ValidatorIndex)
-    else {
+    let Some(target_index) = pubkey_indices.validator_index(state, &request.target_pubkey) else {
         return Ok(());
     };
 
@@ -1574,6 +1578,7 @@ pub fn process_consolidation_request(
         state,
         source_effective_balance,
         config,
+        Some(active_balances),
     )?;
     let withdrawable_epoch = exit_epoch
         .checked_add(config.min_validator_withdrawability_delay)
@@ -1791,6 +1796,7 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1811,12 +1817,14 @@ pub fn process_operations(
     try_for_each_timed(
         StfPhase::ProposerSlashings,
         body.proposer_slashings.iter(),
-        |slashing| super::operations::process_proposer_slashing(state, slashing, config),
+        |slashing| {
+            super::operations::process_proposer_slashing(state, slashing, config, active_balances)
+        },
     )?;
     try_for_each_timed(
         StfPhase::AttesterSlashings,
         body.attester_slashings.iter(),
-        |slashing| process_attester_slashing(state, slashing, config),
+        |slashing| process_attester_slashing(state, slashing, config, active_balances),
     )?;
     // [Modified in Electra:EIP7549]
     //
@@ -1845,7 +1853,7 @@ pub fn process_operations(
     try_for_each_timed(
         StfPhase::VoluntaryExits,
         body.voluntary_exits.iter(),
-        |exit| process_voluntary_exit(state, exit, config),
+        |exit| process_voluntary_exit(state, exit, config, active_balances),
     )?;
     try_for_each_timed(
         StfPhase::BlsToExecutionChanges,
@@ -1854,7 +1862,13 @@ pub fn process_operations(
     )?;
     // [New in Electra:EIP6110:EIP7002:EIP7251]
     timed(StfPhase::ExecutionRequests, || {
-        process_execution_requests(state, &body.execution_requests, config)
+        process_execution_requests(
+            state,
+            &body.execution_requests,
+            config,
+            active_balances,
+            pubkey_indices,
+        )
     })?;
 
     Ok(())
@@ -1882,8 +1896,7 @@ pub fn process_block(
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     // The body's root is an argument, so it is hashed inside the timed span:
@@ -1903,8 +1916,20 @@ pub fn process_block(
     })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+    process_operations(
+        state,
+        &block.body,
+        config,
+        caches.committees,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
+    super::altair::process_sync_aggregate(
+        state,
+        &block.body.sync_aggregate,
+        caches.active_balances,
+        caches.pubkey_indices,
+    )?;
     Ok(())
 }
 
@@ -1982,8 +2007,14 @@ mod tests {
             validator_pubkey: BlsPubkey([0xff; 48]),
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("an unresolved pubkey is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("an unresolved pubkey is dropped silently, not rejected");
         assert_eq!(
             state, before,
             "no validator should have been touched for a pubkey nobody holds"
@@ -2004,8 +2035,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config)
-            .expect("a mismatched source address is dropped silently, not rejected");
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a mismatched source address is dropped silently, not rejected");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -2020,7 +2057,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
@@ -2078,8 +2122,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 1,
         };
-        process_withdrawal_request(&mut state, &partial_request, &config)
-            .expect("a full queue drops a partial request silently, not with an error");
+        process_withdrawal_request(
+            &mut state,
+            &partial_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops a partial request silently, not with an error");
         assert_eq!(
             block_mut(&mut state, "test assertion")
                 .unwrap()
@@ -2096,7 +2146,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2130,7 +2187,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: constants::FULL_EXIT_REQUEST_AMOUNT,
         };
-        process_withdrawal_request(&mut state, &full_exit_request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &full_exit_request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_ne!(
             state.validator(1).unwrap().exit_epoch,
             FAR_FUTURE_EPOCH,
@@ -2155,7 +2219,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2182,7 +2253,14 @@ mod tests {
             validator_pubkey: pubkey,
             amount: 500_000_000,
         };
-        process_withdrawal_request(&mut state, &request, &config).unwrap();
+        process_withdrawal_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         let queued =
             crate::beacon::helpers::electra::get_pending_balance_to_withdraw(&state, 0).unwrap();
@@ -2205,7 +2283,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert!(has_compounding_withdrawal_credential(
             state.validator(0).unwrap()
@@ -2234,8 +2319,14 @@ mod tests {
             source_pubkey: pubkey,
             target_pubkey: pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("neither branch applies, so this must be a silent no-op, not an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("neither branch applies, so this must be a silent no-op, not an error");
         assert_eq!(state, before, "no validator should have been touched");
     }
 
@@ -2270,8 +2361,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config)
-            .expect("a full queue drops the request silently, not with an error");
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .expect("a full queue drops the request silently, not with an error");
 
         assert_eq!(
             pending_queue_fields(&mut state, "test assertion")
@@ -2318,7 +2415,14 @@ mod tests {
             source_pubkey,
             target_pubkey,
         };
-        process_consolidation_request(&mut state, &request, &config).unwrap();
+        process_consolidation_request(
+            &mut state,
+            &request,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         assert_ne!(
             state.validator(0).unwrap().exit_epoch,
