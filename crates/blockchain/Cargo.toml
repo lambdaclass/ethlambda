@@ -36,6 +36,7 @@ hex.workspace = true
 
 [dev-dependencies]
 hex = { workspace = true }
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 libssz.workspace = true
 libssz-types.workspace = true
 # The mock execution client the payload-validity tests talk to over a socket.

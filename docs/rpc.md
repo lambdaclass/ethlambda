@@ -1078,11 +1078,12 @@ these are ever sent:
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `payload_attributes` | `{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}`; from gloas, `parent_block_number` is gone and `safe_block_hash`/`finalized_block_hash` are added | The next slot's attributes, a third of a slot before it, for a proposer registered through `prepare_beacon_proposer` (every proposer with `--always-prepare-payload`); again when the head moves after that point |
 
 Never emitted: `single_attestation` (subnet votes are verified and relayed but
 never reach the chain actor), the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
-`contribution_and_proof`: no operation pools), `payload_attributes`, the light
+`contribution_and_proof`: no operation pools), the light
 client topics, `blob_sidecar`, and `head_v2` with every other gloas topic (this
 build stops at fulu).
 
@@ -1114,6 +1115,29 @@ too: gossip never delivers a node its own messages, so
 `POST /eth/v2/validator/aggregate_and_proofs` hands each accepted one to the
 actor after gossiping it. That is also what puts this node's own aggregates
 into its fork choice.
+
+How `payload_attributes` behaves:
+
+- **What it carries** is what `produceBlockV3`/`produceBlockV4` would send the
+  execution client for a block at `proposal_slot` on the current head, from
+  the same code: the head state advanced to the slot, the fee recipient
+  (gloas: the proposer's signed preferences, else `prepare_beacon_proposer`'s,
+  else the zero address), and on gloas the parent payload the head's payload
+  status selects and the preferences' gas target. `payload_attributes` is the
+  execution API's `PayloadAttributesV3` (`V4` from gloas) in `snake_case` with
+  quoted integers.
+- **When**: at two thirds of each slot (Lighthouse's default
+  `--prepare-payload-lookahead` of a third of a slot), then once more each time
+  the head, or on gloas its payload status, changes before the slot ends. Not
+  while the node is syncing, and only for slots at fulu or later.
+- **For whom**: proposers some validator client named through
+  `prepare_beacon_proposer` or a builder registration, or every proposer with
+  `beacon --always-prepare-payload`, which an external builder reading this
+  stream (ethereum-package's buildoor) needs.
+- **Nothing reaches the execution client early.** Other clients send a
+  `forkchoiceUpdated` with these attributes at the same point, so the payload
+  is already building when `produceBlock` arrives; this node still starts the
+  build at `produceBlock`.
 
 Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing.

@@ -44,32 +44,30 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::{SyncStatusController, checkpoint_hash, metrics::SyncStatus};
+use ethlambda_blockchain::{
+    FeeRecipients, SyncStatusController,
+    metrics::SyncStatus,
+    payload_attributes::{
+        FeeRecipientSource, GloasProposal, ProposalError, building_forkchoice_state,
+        gloas_fee_recipient, payload_attributes_v4, prepare_gloas_proposal,
+    },
+};
 use ethlambda_engine::{
-    CustodyColumns, EngineClient, ForkchoiceStateV1,
-    building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
-    types::ClientVersionV1,
+    CustodyColumns, EngineClient, building::BuiltGloasPayload, types::ClientVersionV1,
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
+    block_production::{empty_sync_aggregate, verified_sync_aggregate},
     bls,
     builder_market::SharedBuilderMarket,
-    fork_choice::{
-        get_head_node, gloas_verify_data_column_sidecar,
-        gloas_verify_data_column_sidecar_kzg_proofs, should_build_on_full,
-    },
+    fork_choice::{gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs},
     gloas_block_production::{
         GloasBidBlockInputs, GloasBlockInputs, GloasPayloadInputs, GloasProduced,
         assemble_gloas_block, assemble_gloas_block_on_bid, bid_is_includable,
-        gloas_data_column_sidecars, gloas_payload_inputs, pack_gloas_attestations,
-        pack_payload_attestations, parse_gloas_execution_requests,
+        gloas_data_column_sidecars, pack_gloas_attestations, pack_payload_attestations,
+        parse_gloas_execution_requests,
     },
-    gossip::proposer_preferences::dependent_root_at,
-    helpers::{
-        accessors::{get_beacon_proposer_index, get_domain},
-        misc::compute_signing_root,
-    },
+    helpers::{accessors::get_domain, misc::compute_signing_root},
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::{
         block::{BlockProcessingOptions, RandaoVerification},
@@ -93,7 +91,6 @@ use ethlambda_types::{
             },
         },
         fork::ForkName,
-        fork_choice::{ForkChoiceNode, PayloadStatus},
         primitives::{BlsSignature, Bytes32, ExecutionAddress, HashTreeRoot as _, KzgProof, Slot},
         signing::compute_epoch_at_slot,
     },
@@ -112,7 +109,7 @@ use crate::beacon::{
     proposal::{
         Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
     },
-    validator::{FeeRecipients, head},
+    validator::head,
 };
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
 // The node's custody set as the Beacon API's handles carry it, renamed so it
@@ -641,8 +638,8 @@ fn candidate_bids(
         .collect()
 }
 
-/// The chain-side half of production: pick the parent payload branch, advance
-/// the head state to `slot` and derive the payload inputs from it.
+/// The chain-side half of production, shared with the `payload_attributes`
+/// event ([`prepare_gloas_proposal`]), then the reveal's check.
 fn prepare(
     store: &Store,
     market: &SharedBuilderMarket,
@@ -650,76 +647,29 @@ fn prepare(
     randao_reveal: BlsSignature,
     randao: RandaoVerification,
 ) -> Result<Prepared, ApiError> {
-    let config = store.config();
     let (head_root, head_state) = head(store)?;
-    let head_slot = head_state.slot();
-    if slot <= head_slot {
-        return Err(ApiError::BadRequest("slot is not after the head block"));
-    }
-
-    // The payload branch of the head: the one fork choice recorded, or, when
-    // it has not been recorded for this head yet, a fresh walk.
-    let payload_status = match store.head_payload_status() {
-        Some(status) => status,
-        None => {
-            get_head_node(store, &config)
-                .map_err(|_| ApiError::Internal("fork choice could not name the head"))?
-                .payload_status
-        }
-    };
-    let node = ForkChoiceNode {
-        root: head_root,
-        payload_status,
-    };
-    let build_on_full = should_build_on_full(store, node, slot)
-        .map_err(|_| ApiError::Internal("could not decide which parent payload to build on"))?;
-    debug_assert_ne!(payload_status, PayloadStatus::Pending);
-
-    let head_is_gloas = matches!(
-        store.get_signed_block(&head_root),
-        Ok(Some(containers::SignedBeaconBlock::Gloas(_)))
-    );
-    let parent_requests = if build_on_full && head_is_gloas {
-        store
-            .get_execution_payload_envelope(&head_root)
-            .map_err(|_| ApiError::Internal("store read failed"))?
-            .ok_or(ApiError::ServiceUnavailable(
+    let proposal = prepare_gloas_proposal(store, market, head_root, &head_state, slot).map_err(
+        |err| match err {
+            ProposalError::NotAfterHead => ApiError::BadRequest("slot is not after the head block"),
+            ProposalError::ParentEnvelopeMissing => ApiError::ServiceUnavailable(
                 "the parent's payload envelope is not held to build on",
-            ))?
-            .message
-            .execution_requests
-    } else {
-        ExecutionRequests::default()
-    };
-
-    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
-        warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
-        ApiError::Internal("advancing the head state failed")
-    })?;
-    let proposer = get_beacon_proposer_index(&state)
-        .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
+            ),
+            ProposalError::Internal(message) => ApiError::Internal(message),
+        },
+    )?;
     if randao == RandaoVerification::Verify {
-        verify_randao_reveal(&state, proposer, randao_reveal)?;
+        verify_randao_reveal(&proposal.state, proposal.proposer, randao_reveal)?;
     }
-    let pubkey_indices = store.pubkey_index_cache();
-    let mut inputs = gloas_payload_inputs(
-        &state,
-        build_on_full,
-        &parent_requests,
-        &config,
-        &pubkey_indices,
-    )
-    .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
-
-    // The proposer's signed preferences for this slot, under the dependent root
-    // the head's chain gives it. They name the fee recipient and gas target the
-    // bids on the slot were judged against, so the self-build follows them too.
-    let preferences = dependent_root_at(&head_state, head_root, slot)
-        .and_then(|dependent_root| market.preferences(slot, dependent_root))
-        .filter(|signed| signed.message.validator_index == proposer);
-    if let Some(preferences) = &preferences {
-        inputs.target_gas_limit = preferences.message.target_gas_limit;
-    }
+    let GloasProposal {
+        state,
+        inputs,
+        proposer,
+        head_root,
+        head_slot,
+        parent_requests,
+        preferences,
+        pubkey_indices,
+    } = proposal;
     Ok(Prepared {
         state,
         inputs,
@@ -789,34 +739,30 @@ async fn build_local(
 /// Where a self-built payload's fee recipient comes from: the proposer's signed
 /// preferences, else `prepare_beacon_proposer`'s, else the zero address.
 fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> ExecutionAddress {
-    if let Some(preferences) = &prepared.preferences {
-        debug!(
-            proposer = prepared.proposer,
-            "Using the signed proposer preferences' fee recipient"
-        );
-        return preferences.message.fee_recipient;
-    }
-    let prepared_recipient = fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&prepared.proposer)
-        .copied();
-    match prepared_recipient {
-        Some(recipient) => {
+    let proposer = prepared.proposer;
+    let (recipient, source) =
+        gloas_fee_recipient(fee_recipients, proposer, prepared.preferences.as_ref());
+    match source {
+        FeeRecipientSource::Preferences => {
             debug!(
-                proposer = prepared.proposer,
+                proposer,
+                "Using the signed proposer preferences' fee recipient"
+            );
+        }
+        FeeRecipientSource::Prepared => {
+            debug!(
+                proposer,
                 "Using the fee recipient from prepare_beacon_proposer"
             );
-            recipient
         }
-        None => {
+        FeeRecipientSource::Unknown => {
             warn!(
-                proposer = prepared.proposer,
+                proposer,
                 "No fee recipient for the proposer; using the zero address"
             );
-            ExecutionAddress::ZERO
         }
     }
+    recipient
 }
 
 /// Ask the execution client to build on the chosen parent payload for the
@@ -833,24 +779,9 @@ async fn build_payload(
     custody: &NodeCustodyColumns,
     prepared: &Prepared,
 ) -> Result<BuiltGloasPayload, ApiError> {
-    let inputs = &prepared.inputs;
     let fee_recipient = fee_recipient_for(fee_recipients, prepared);
-    let forkchoice = ForkchoiceStateV1 {
-        head_block_hash: inputs.head_block_hash,
-        safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
-        finalized_block_hash: checkpoint_hash(store, store.beacon_finalized_checkpoint().root),
-    };
-    let attributes = PayloadAttributesV4 {
-        v3: PayloadAttributesV3 {
-            timestamp: inputs.timestamp,
-            prev_randao: inputs.prev_randao,
-            suggested_fee_recipient: fee_recipient,
-            withdrawals: inputs.withdrawals.clone(),
-            parent_beacon_block_root: inputs.parent_beacon_block_root,
-        },
-        slot_number: inputs.slot_number,
-        target_gas_limit: inputs.target_gas_limit,
-    };
+    let forkchoice = building_forkchoice_state(store, prepared.inputs.head_block_hash);
+    let attributes = payload_attributes_v4(&prepared.inputs, fee_recipient);
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
     let (status, payload_id) = engine
         .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
@@ -1209,9 +1140,11 @@ mod tests {
     use super::*;
     use crate::test_utils::{RecordingNetwork, beacon_store_with_config};
     use axum::{body::Body, http::Request};
+    use ethlambda_state_transition::beacon::gloas_block_production::gloas_payload_inputs;
     use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
         config, post_state, produce as produce_block, sign_block, sign_envelope, state_to_build_on,
     };
+    use ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index;
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;

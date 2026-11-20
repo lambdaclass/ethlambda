@@ -16,15 +16,18 @@
 //! surface accepts its own set of [`Topic`] names ([`Topic::LEAN`],
 //! [`Topic::BEACON`]).
 
+use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4};
 use ethlambda_network_api::BlockAnnouncement;
 use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_slot;
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::{AttestationData, SignedAttestation};
 use ethlambda_types::beacon::containers::{
-    BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra, gloas,
-    phase0,
+    BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+    capella::Withdrawal, electra, gloas, phase0,
 };
+use ethlambda_types::beacon::fork::ForkName;
+use ethlambda_types::beacon::primitives::ExecutionAddress;
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use ethlambda_types::checkpoint::Checkpoint;
@@ -43,10 +46,10 @@ use tracing::warn;
 /// One enum for both surfaces, so a name means the same thing on each: every
 /// Beacon API eventstream topic, plus the two ethlambda extensions lean serves
 /// (`justified_checkpoint`, `aggregate`). [`FromStr`] parses all of them; which
-/// ones a surface *accepts* is [`Topic::LEAN`] or [`Topic::BEACON`]. Most beacon
-/// names are accepted and never emitted: the node has no producer for them (no
-/// operation pools, no light-client server, no gloas), and the specification
-/// lists them all as valid subscriptions.
+/// ones a surface *accepts* is [`Topic::LEAN`] or [`Topic::BEACON`]. Several
+/// beacon names are accepted and never emitted, since the node has no producer
+/// for them (see `docs/rpc.md`), and the specification lists them all as valid
+/// subscriptions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Topic {
     Head,
@@ -66,6 +69,8 @@ pub enum Topic {
     /// The new head does not descend from the previous one. On both surfaces.
     ChainReorg,
     DataColumnSidecar,
+    /// The next slot's payload attributes, for external block builders.
+    PayloadAttributes,
     // Accepted on the beacon surface, never emitted. See `docs/rpc.md`.
     SingleAttestation,
     VoluntaryExit,
@@ -75,7 +80,6 @@ pub enum Topic {
     ContributionAndProof,
     LightClientFinalityUpdate,
     LightClientOptimisticUpdate,
-    PayloadAttributes,
     /// Removed from the specification's `master` by beacon-APIs#577 but still
     /// in its last release, so a client built against that release may ask.
     BlobSidecar,
@@ -309,6 +313,10 @@ pub enum ChainEvent {
     BeaconAttestation(Box<BeaconAttestationEvent>),
     /// Beacon `data_column_sidecar`: a column this node custodies was stored.
     DataColumnSidecar(DataColumnSidecarEvent),
+    /// Beacon `payload_attributes`: what a block at the next slot would ask
+    /// the execution client to build. Boxed for the reason
+    /// [`ChainEvent::BeaconAttestation`] is.
+    BeaconPayloadAttributes(Box<PayloadAttributesEvent>),
 }
 
 impl ChainEvent {
@@ -325,6 +333,7 @@ impl ChainEvent {
             ChainEvent::Aggregate { .. } => Topic::Aggregate,
             ChainEvent::ChainReorg { .. } | ChainEvent::BeaconChainReorg(_) => Topic::ChainReorg,
             ChainEvent::DataColumnSidecar(_) => Topic::DataColumnSidecar,
+            ChainEvent::BeaconPayloadAttributes(_) => Topic::PayloadAttributes,
         }
     }
 }
@@ -429,6 +438,119 @@ pub struct DataColumnSidecarEvent {
     pub index: u64,
     #[serde(serialize_with = "quoted_or_bare::serialize")]
     pub slot: u64,
+}
+
+/// The Beacon API `payload_attributes` payload: `version` is the fork at
+/// `proposal_slot`, which selects the shape of `data`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PayloadAttributesEvent {
+    #[serde(serialize_with = "fork_name")]
+    pub version: ForkName,
+    pub data: PayloadAttributesEventData,
+}
+
+fn fork_name<S: serde::Serializer>(fork: &ForkName, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(fork.as_str())
+}
+
+/// `payload_attributes`'s `data`, by the `PayloadAttributesV<N>` it carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum PayloadAttributesEventData {
+    /// Deneb through fulu.
+    V3(PayloadAttributesEventV3),
+    /// Gloas, which drops `parent_block_number` and adds the forkchoice
+    /// state's safe and finalized hashes.
+    V4(PayloadAttributesEventV4),
+}
+
+/// `payload_attributes`'s `data` before gloas.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PayloadAttributesEventV3 {
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub proposer_index: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub proposal_slot: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub parent_block_number: u64,
+    pub parent_block_root: H256,
+    pub parent_block_hash: H256,
+    pub payload_attributes: BeaconPayloadAttributesV3,
+}
+
+/// `payload_attributes`'s `data` from gloas.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PayloadAttributesEventV4 {
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub proposer_index: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub proposal_slot: u64,
+    pub parent_block_root: H256,
+    pub parent_block_hash: H256,
+    pub safe_block_hash: H256,
+    pub finalized_block_hash: H256,
+    pub payload_attributes: BeaconPayloadAttributesV4,
+}
+
+/// `PayloadAttributesV3` in the Beacon API's encoding: the execution API's
+/// fields in `snake_case`, integers as quoted decimals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BeaconPayloadAttributesV3 {
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub timestamp: u64,
+    pub prev_randao: H256,
+    pub suggested_fee_recipient: ExecutionAddress,
+    pub withdrawals: Vec<Withdrawal>,
+    pub parent_beacon_block_root: H256,
+}
+
+impl From<&PayloadAttributesV3> for BeaconPayloadAttributesV3 {
+    fn from(attributes: &PayloadAttributesV3) -> Self {
+        Self {
+            timestamp: attributes.timestamp,
+            prev_randao: attributes.prev_randao,
+            suggested_fee_recipient: attributes.suggested_fee_recipient,
+            withdrawals: attributes.withdrawals.clone(),
+            parent_beacon_block_root: attributes.parent_beacon_block_root,
+        }
+    }
+}
+
+/// `PayloadAttributesV4` in the Beacon API's encoding: V3's fields, then the
+/// slot and the target gas limit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BeaconPayloadAttributesV4 {
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub timestamp: u64,
+    pub prev_randao: H256,
+    pub suggested_fee_recipient: ExecutionAddress,
+    pub withdrawals: Vec<Withdrawal>,
+    pub parent_beacon_block_root: H256,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub slot_number: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub target_gas_limit: u64,
+}
+
+impl From<&PayloadAttributesV4> for BeaconPayloadAttributesV4 {
+    fn from(attributes: &PayloadAttributesV4) -> Self {
+        let BeaconPayloadAttributesV3 {
+            timestamp,
+            prev_randao,
+            suggested_fee_recipient,
+            withdrawals,
+            parent_beacon_block_root,
+        } = (&attributes.v3).into();
+        Self {
+            timestamp,
+            prev_randao,
+            suggested_fee_recipient,
+            withdrawals,
+            parent_beacon_block_root,
+            slot_number: attributes.slot_number,
+            target_gas_limit: attributes.target_gas_limit,
+        }
+    }
 }
 
 /// Capacity of the chain-event broadcast channel.
@@ -670,6 +792,17 @@ impl ChainEvents {
         let attestation = BeaconAttestationEvent::from(aggregate);
         self.bus
             .emit(ChainEvent::BeaconAttestation(Box::new(attestation)));
+    }
+
+    /// Whether anyone is listening: see [`EventBus::has_subscribers`].
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.bus.has_subscribers()
+    }
+
+    /// Beacon `payload_attributes`.
+    pub(crate) fn publish_payload_attributes(&self, event: PayloadAttributesEvent) {
+        self.bus
+            .emit(ChainEvent::BeaconPayloadAttributes(Box::new(event)));
     }
 
     /// Beacon `data_column_sidecar`: `sidecar`, of the block under
