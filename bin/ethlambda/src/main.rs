@@ -436,6 +436,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let network_source = match &network {
         Network::Lean(_) => None,
         Network::Mainnet { mainnet, .. } => {
+            // Resolving selects the preset. A preset value read above this
+            // line would pass unnoticed on mainnet and fail on a minimal
+            // network, so it is refused on both.
+            ethlambda_types::beacon::preset::Preset::require_unread()?;
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
             Some(network::NetworkSource::resolve(&spec)?)
         }

@@ -81,8 +81,9 @@ pub fn select_preset() {
     let Ok(name) = std::env::var(PRESET_VAR) else {
         return;
     };
-    let preset = Preset::from_name(&name)
-        .unwrap_or_else(|| panic!("{PRESET_VAR}={name} names neither mainnet nor minimal"));
+    let preset: Preset = name
+        .parse()
+        .unwrap_or_else(|_| panic!("{PRESET_VAR}={name} names neither mainnet nor minimal"));
     Preset::select(preset).expect("the harness selects before anything reads a preset");
 }
 

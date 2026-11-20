@@ -1118,12 +1118,18 @@ pub enum Preset {
     Minimal,
 }
 
-/// The active preset as `selector() + 1`, or 0 while nothing has selected or
-/// read one.
+/// The active preset, and how it came to be: 0 while nothing has selected or
+/// read one, `selector() + 1` once [`Preset::select`] chose it, and
+/// `selector() + 1 + READ_OFFSET` when a read froze [`Preset::DEFAULT`] before
+/// anything selected.
 ///
 /// `Relaxed` throughout: the byte is the whole of the published data, and no
 /// other memory is read on the strength of having seen it.
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// What [`ACTIVE`] adds to a preset that was frozen by a read rather than
+/// selected. See [`Preset::require_unread`].
+const READ_OFFSET: u8 = 2;
 
 impl Preset {
     /// The preset a process runs when nothing selects one before its first
@@ -1153,7 +1159,8 @@ impl Preset {
     #[cold]
     fn freeze_default() -> Preset {
         let default = Self::DEFAULT;
-        match ACTIVE.compare_exchange(0, default.stored(), Ordering::Relaxed, Ordering::Relaxed) {
+        let frozen = default.stored() + READ_OFFSET;
+        match ACTIVE.compare_exchange(0, frozen, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => default,
             Err(stored) => Self::from_stored(stored),
         }
@@ -1168,11 +1175,32 @@ impl Preset {
     pub fn select(preset: Preset) -> Result<(), PresetAlreadyActive> {
         match ACTIVE.compare_exchange(0, preset.stored(), Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => Ok(()),
-            Err(stored) if stored == preset.stored() => Ok(()),
+            Err(stored) if Self::from_stored(stored) == preset => Ok(()),
             Err(stored) => Err(PresetAlreadyActive {
                 active: Self::from_stored(stored),
                 requested: preset,
             }),
+        }
+    }
+
+    /// Fails when a read froze [`Preset::DEFAULT`] before anything selected a
+    /// preset.
+    ///
+    /// [`Preset::select`] accepts the preset already in force, so on a
+    /// mainnet network a preset value read ahead of the select goes
+    /// unnoticed: the read froze mainnet and the select then names mainnet.
+    /// The same startup on a minimal network fails. An entry point calls this
+    /// right before it selects, so the ordering bug fails on every network,
+    /// mainnet's tests included, and not only on the first minimal devnet.
+    ///
+    /// Only for an entry point that owns its process. A test binary shares
+    /// one process between tests, any of which may read first.
+    pub fn require_unread() -> Result<(), PresetReadBeforeSelect> {
+        match ACTIVE.load(Ordering::Relaxed) {
+            stored if stored > READ_OFFSET => Err(PresetReadBeforeSelect {
+                frozen: Self::from_stored(stored),
+            }),
+            _ => Ok(()),
         }
     }
 
@@ -1181,7 +1209,8 @@ impl Preset {
     }
 
     fn from_stored(stored: u8) -> Preset {
-        Self::from_selector(stored - 1).expect("ACTIVE only ever holds a stored preset")
+        Self::from_selector((stored - 1) % READ_OFFSET)
+            .expect("ACTIVE only ever holds a stored preset")
     }
 
     /// The byte this preset is stored under. Spelled out rather than derived
@@ -1211,15 +1240,25 @@ impl Preset {
             Preset::Minimal => "minimal",
         }
     }
+}
 
-    /// The inverse of [`Preset::name`]. `None` for any other `PRESET_BASE`,
-    /// such as `gnosis`, whose values this crate does not carry.
-    pub fn from_name(name: &str) -> Option<Preset> {
+/// The inverse of [`Preset::name`]. Fails for any other `PRESET_BASE`, such as
+/// `gnosis`, whose values this crate does not carry.
+impl core::str::FromStr for Preset {
+    type Err = UnknownPreset;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
         [Preset::Mainnet, Preset::Minimal]
             .into_iter()
             .find(|preset| preset.name() == name)
+            .ok_or(UnknownPreset)
     }
 }
+
+/// A name that is neither `mainnet` nor `minimal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a preset this crate has values for: it carries mainnet and minimal")]
+pub struct UnknownPreset;
 
 impl core::fmt::Display for Preset {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1236,6 +1275,16 @@ impl core::fmt::Display for Preset {
 pub struct PresetAlreadyActive {
     pub active: Preset,
     pub requested: Preset,
+}
+
+/// [`Preset::require_unread`] found the preset frozen by a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a preset value was read before this process selected its preset, which froze {frozen}; \
+     this is a startup ordering bug, not a configuration error"
+)]
+pub struct PresetReadBeforeSelect {
+    pub frozen: Preset,
 }
 
 // ================================================================
@@ -1757,9 +1806,9 @@ mod tests {
     #[test]
     fn names_round_trip() {
         for preset in [Preset::Mainnet, Preset::Minimal] {
-            assert_eq!(Preset::from_name(preset.name()), Some(preset));
+            assert_eq!(preset.name().parse(), Ok(preset));
         }
-        assert_eq!(Preset::from_name("gnosis"), None);
+        assert_eq!("gnosis".parse::<Preset>(), Err(super::UnknownPreset));
     }
 
     /// Values pinned directly from the specification, so a typo or an accidental

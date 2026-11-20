@@ -64,12 +64,25 @@ pub fn adopt_preset(spec: &ethlambda_types::beacon::config::Config) -> Result<()
     use ethlambda_types::beacon::preset::Preset;
 
     let name = spec.preset_base.as_str();
-    let preset = Preset::from_name(name).ok_or_else(|| {
+    let preset: Preset = name.parse().map_err(|_| {
         Error::Preset(format!(
             "PRESET_BASE: {name:?} names no preset this client has values for"
         ))
     })?;
     Preset::select(preset).map_err(|err| Error::Preset(err.to_string()))
+}
+
+/// Refuse to go on when something in this process read a preset value before
+/// the beacon node's was adopted.
+///
+/// [`adopt_preset`] accepts the preset already in force, so against a mainnet
+/// node such a read goes unnoticed and only a minimal one fails. The two
+/// commands that own their process call this first, so the ordering bug fails
+/// against every node. Kept out of `adopt_preset` itself, which tests sharing
+/// one process also reach.
+pub(crate) fn require_unread_preset() -> Result<()> {
+    ethlambda_types::beacon::preset::Preset::require_unread()
+        .map_err(|err| Error::Preset(err.to_string()))
 }
 
 use std::path::PathBuf;
@@ -262,6 +275,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     let genesis = beacon_node.genesis().await?;
     let spec = beacon_node.spec().await?;
+    require_unread_preset()?;
     adopt_preset(&spec)?;
     info!(
         preset = spec.preset_base.as_str(),

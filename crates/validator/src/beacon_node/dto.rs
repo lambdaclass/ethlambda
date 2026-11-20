@@ -545,7 +545,7 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
             let name = field
                 .as_str()
                 .ok_or_else(|| Error::Decode("config/spec: PRESET_BASE is not a string".into()))?;
-            Preset::from_name(name).ok_or_else(|| {
+            name.parse().map_err(|_| {
                 Error::Preset(format!(
                     "the node reports PRESET_BASE: {name}, which this client has no values for"
                 ))

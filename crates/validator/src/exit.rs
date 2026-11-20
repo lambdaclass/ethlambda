@@ -94,6 +94,8 @@ pub enum Outcome {
 /// Decrypt the keystore and run the exit against the configured node. Input
 /// for the confirmation phrase is the process's stdin.
 pub async fn run(config: ExitConfig) -> Result<Outcome> {
+    // `run_with` adopts the node's preset, which nothing may read before.
+    crate::require_unread_preset()?;
     let (store, pubkey) = load_keystore(&config.keystore, &config.password_file)?;
     let node = HttpBeaconNode::new(&config.beacon_node)?;
     // Behind the lock every signing method takes its store through. Nothing

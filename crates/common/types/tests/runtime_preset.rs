@@ -17,7 +17,11 @@ use libssz::{SszDecode as _, SszEncode as _};
 
 #[test]
 fn a_process_that_selects_minimal_builds_minimal_containers() {
+    assert_eq!(Preset::require_unread(), Ok(()));
     Preset::select(Preset::Minimal).expect("nothing in this process read a preset before");
+    // Selected, not frozen by a read: reads after the select change nothing.
+    assert_eq!(Preset::active(), Preset::Minimal);
+    assert_eq!(Preset::require_unread(), Ok(()));
 
     assert_eq!(Preset::active(), Preset::Minimal);
     assert_eq!(preset::slots_per_epoch(), preset::minimal::SLOTS_PER_EPOCH);

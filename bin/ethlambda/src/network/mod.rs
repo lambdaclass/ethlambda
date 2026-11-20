@@ -98,9 +98,11 @@ pub(crate) fn select_preset(declared: &str) -> Result<Preset, PresetSelectError>
     if declared.is_empty() {
         return Err(PresetSelectError::Missing);
     }
-    let preset = Preset::from_name(declared).ok_or_else(|| PresetSelectError::Unsupported {
-        declared: declared.to_string(),
-    })?;
+    let preset: Preset = declared
+        .parse()
+        .map_err(|_| PresetSelectError::Unsupported {
+            declared: declared.to_string(),
+        })?;
     Preset::select(preset)?;
     Ok(preset)
 }

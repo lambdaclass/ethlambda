@@ -2104,8 +2104,9 @@ mod tests {
         );
     }
 
-    /// Gated to `preset-minimal`, which makes minimal the preset of a test
-    /// process that selects none: mainnet's own
+    /// Runs under the minimal preset only (`preset-minimal` makes it the
+    /// preset of a test process that selects none) and returns at once under
+    /// mainnet: mainnet's own
     /// `PENDING_PARTIAL_WITHDRAWALS_LIMIT` is large enough (a fraction over
     /// a hundred million) that actually building a queue at that literal
     /// size would allocate several gigabytes and take seconds, for a check
@@ -2115,9 +2116,14 @@ mod tests {
     /// which is why `preset::MIN_ACTIVATION_BALANCE` and friends throughout
     /// this file are written against whichever preset is active rather than
     /// hardcoded, the same as everywhere else in this module.
+    ///
+    /// A runtime skip rather than a `cfg`, so the default build compiles and
+    /// lints it.
     #[test]
-    #[cfg(feature = "preset-minimal")]
     fn a_full_queue_silently_drops_a_partial_request_but_not_a_full_exit() {
+        if preset::Preset::active() != preset::Preset::Minimal {
+            return;
+        }
         let mut state = electra_state_with_validators(2);
         let config = Config::mainnet();
 
