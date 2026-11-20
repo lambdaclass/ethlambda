@@ -13,10 +13,8 @@ of the fork.
 > `pq-devnet-0` image, ethPandaOps' genesis generator and ethereum-package's
 > published VRF states still follow the rule before it (consensus-specs `pq`
 > at `4595f0fc`), so every proposal splits the chain until they move: see
-> [Known limits](#known-limits). The Lighthouse steps below are the ones that
-> ran on 2026-11-20 with ethlambda's two VRF functions switched locally to
-> the older rule. An ethlambda-only devnet runs at this pin on key files
-> ethlambda writes itself: see [ethlambda alone](#ethlambda-alone).
+> [Known limits](#known-limits). An ethlambda-only devnet runs at this pin on
+> key files ethlambda writes itself: see [ethlambda alone](#ethlambda-alone).
 
 ## What runs
 
@@ -136,10 +134,7 @@ kurtosis run --enclave pq "$PWD/ethereum-package"   --args-file <ethlambda>/tool
   `4595f0fc`'s leaf, `keccak256(vrf_seed || le64(slot))`, revealed as it is.
   A root either side registers fails the other's `is_valid_vrf_proof`, so
   the first block of either side is invalid to the other. Until they move
-  to `b5d422b2`, run ethlambda alone (above). For a local check against
-  them in the meantime, `compute_vrf_secret` in `ethlambda_crypto::vrf` can
-  return the older leaf and `compute_vrf_leaf` pass its input through; the
-  state transition and the validator client follow from those two.
+  to `b5d422b2`, run ethlambda alone (above).
 - **Without VRF tree states, a validator's first start hashes its trees.**
   Minutes a key on all cores, one key after another, in a pool of their own
   so attestations, aggregates and PTC votes are signed meanwhile; a proposal
