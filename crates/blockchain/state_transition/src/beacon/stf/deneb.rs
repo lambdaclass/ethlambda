@@ -413,12 +413,13 @@ pub fn process_attestation(
                 })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and neither the
-        // effective balance nor `slashed` can change inside this read-only
-        // phase. The target-balance delta below needs the same two values, so
-        // both are kept rather than read again.
-        let mut attester: Option<(Gwei, bool)> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -430,16 +431,17 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let (effective_balance, _) = match attester {
+            let (increments, _, _) = match attester {
                 Some(attester) => attester,
                 None => {
                     let validator = state.validator(index)?;
-                    let read = (validator.effective_balance, validator.slashed);
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
                     attester = Some(read);
                     read
                 }
             };
-            let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
             let reward = (increments * base_reward_per_increment)
                 .checked_mul(weight)
                 .ok_or(Error::ArithmeticOverflow(
@@ -454,7 +456,7 @@ pub fn process_attestation(
         {
             // Earning the target flag means the loop above reached that flag
             // and so read the attester.
-            let (effective_balance, slashed) =
+            let (_, effective_balance, slashed) =
                 attester.expect("a newly earned flag read the attester");
             delta.record_new_target(current_epoch_target, effective_balance, slashed);
         }
