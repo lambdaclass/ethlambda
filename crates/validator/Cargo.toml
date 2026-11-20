@@ -14,6 +14,9 @@ ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
 # leanXMSS signing and VRF proofs for the PQ fork (`pq`).
 ethlambda-crypto.workspace = true
+# A pool of the VRF trees' own, so hashing one does not hold up the leanXMSS
+# signatures on rayon's global pool (`prepare_vrf_trees`).
+rayon.workspace = true
 
 # A produced block is decoded and re-published as SSZ, not JSON: signing it
 # needs its `hash_tree_root`, which only the typed container can give. See
