@@ -90,6 +90,53 @@ impl StateCacheMethod {
     }
 }
 
+static LEAN_STATE_REBUILDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_state_rebuilds_total",
+        "Block states read back from storage after missing the cache and the write buffer, \
+         by whether the read did the rebuild or waited on one already under way for that root",
+        &["role"]
+    )
+    .unwrap()
+});
+
+/// How a `read_state` miss got its state from storage.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RebuildRole {
+    /// Read and decoded the state itself.
+    Led,
+    /// Waited on a rebuild of the same root already under way and took the
+    /// state it read.
+    Joined,
+}
+
+impl RebuildRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Led => "led",
+            Self::Joined => "joined",
+        }
+    }
+}
+
+/// Count one storage read of a block state, by `role`.
+pub(crate) fn inc_state_rebuilds(role: RebuildRole) {
+    LEAN_STATE_REBUILDS_TOTAL
+        .with_label_values(&[role.label()])
+        .inc();
+}
+
+/// Register the metrics that should be visible before their first
+/// observation.
+pub fn init() {
+    // Both roles at zero, so `increase()` sees the first burst after a
+    // restart: a burst of rebuilds is rare enough that it can be the only one
+    // in the range a dashboard looks at.
+    for role in [RebuildRole::Led, RebuildRole::Joined] {
+        LEAN_STATE_REBUILDS_TOTAL.with_label_values(&[role.label()]);
+    }
+}
+
 /// Count one state-cache lookup for `key`, made by `method`.
 pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, hit: bool) {
     let kind = match key {
@@ -100,4 +147,36 @@ pub(crate) fn inc_state_cache_lookups(method: StateCacheMethod, key: &CacheKey, 
     LEAN_STATE_CACHE_LOOKUPS_TOTAL
         .with_label_values(&[method.label(), kind, result])
         .inc();
+}
+
+static LEAN_BEACON_PROTO_ARRAY_REBUILDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_proto_array_rebuilds_total",
+        "Full rebuilds of the cached beacon fork-choice weights, by what made the cache stale",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_PROTO_ARRAY_REBUILD_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_beacon_proto_array_rebuild_seconds",
+        "Time to rebuild the cached beacon fork-choice weights from every latest message",
+        vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5
+        ]
+    )
+    .unwrap()
+});
+
+/// Count one rebuild of the cached fork-choice weights, by `reason`.
+pub(crate) fn inc_proto_array_rebuilds(reason: &str) {
+    LEAN_BEACON_PROTO_ARRAY_REBUILDS_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Time one rebuild of the cached fork-choice weights; the guard records on drop.
+pub(crate) fn time_proto_array_rebuild() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_PROTO_ARRAY_REBUILD_SECONDS)
 }
