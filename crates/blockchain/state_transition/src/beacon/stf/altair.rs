@@ -26,7 +26,7 @@
 //! two are the same number applied with opposite sign, not two independently
 //! derived quantities that happen to match.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{EthFastAggregate, SignatureSet};
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
@@ -38,11 +38,17 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::altair::{
     add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
 };
-use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::beacon::helpers::attestation::{
+    get_indexed_attestation, indexed_attestation_signature_set,
+};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsPubkey, Gwei, ParticipationFlags, ValidatorIndex};
+use crate::beacon::stf::signatures::SignatureBatch;
+#[cfg(test)]
+use crate::beacon::stf::signatures::checked;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +97,8 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -144,8 +152,8 @@ pub fn process_attestation(
         get_attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -174,21 +182,27 @@ pub fn process_attestation(
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    // `is_valid_indexed_attestation` above refused any `attesting_indices` that
+    // is not strictly ascending, so the reader walks each leaf once rather than
+    // descending the tree for every attester.
+    let mut reader = epoch_participation.sorted_reader();
     for index in attesting_indices {
-        let current_flags =
-            epoch_participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: epoch_participation.len(),
-                })?;
+        let current_flags = reader
+            .get(index as usize)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index: index as usize,
+                len: epoch_participation.len(),
+            })?;
 
         let mut new_flags: ParticipationFlags = 0;
-        // The attester's validator is read at most once, on the first flag
-        // it newly earns: each read is a tree descent, and the effective
-        // balance cannot change inside this read-only phase.
-        let mut attester_increments: Option<Gwei> = None;
+        // The attester's validator is read at most once, on the first flag it
+        // newly earns: each read is a tree descent, and neither the effective
+        // balance nor `slashed` can change inside this read-only phase. Its
+        // reward increments are divided out once there too, and the effective
+        // balance and `slashed` kept beside them for the target-balance delta
+        // below.
+        let mut attester: Option<(Gwei, Gwei, bool)> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -200,13 +214,15 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let increments = match attester_increments {
-                Some(increments) => increments,
+            let (increments, _, _) = match attester {
+                Some(attester) => attester,
                 None => {
-                    let increments = state.validator(index)?.effective_balance
-                        / preset::EFFECTIVE_BALANCE_INCREMENT;
-                    attester_increments = Some(increments);
-                    increments
+                    let validator = state.validator(index)?;
+                    let effective_balance = validator.effective_balance;
+                    let increments = effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    let read = (increments, effective_balance, validator.slashed);
+                    attester = Some(read);
+                    read
                 }
             };
             let reward = (increments * base_reward_per_increment)
@@ -218,8 +234,17 @@ pub fn process_attestation(
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
         }
+        if let Some(delta) = target_delta
+            && has_flag(new_flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        {
+            // Earning the target flag means the loop above reached that flag
+            // and so read the attester.
+            let (_, effective_balance, slashed) =
+                attester.expect("a newly earned flag read the attester");
+            delta.record_new_target(current_epoch_target, effective_balance, slashed);
+        }
         if new_flags != 0 {
-            updates.push((index, new_flags));
+            updates.push((index, current_flags | new_flags));
         }
     }
 
@@ -234,14 +259,20 @@ pub fn process_attestation(
         previous_epoch_participation
     };
     let epoch_participation_len = epoch_participation.len();
-    for (index, new_flags) in updates {
-        let flags = epoch_participation
-            .get_mut(index as usize)
-            .ok_or(Error::IndexOutOfBounds {
+    // A blind write of `current_flags | new_flags`, which the read phase
+    // stored, rather than `|=` on the stored value. That is exact:
+    // `is_valid_indexed_attestation` above refused a repeated index, so each
+    // index is written once, and nothing writes this list between the read
+    // phase and here, so the stored value is still `current_flags`. It saves
+    // the tree descent `get_mut` makes to copy the old value into the write
+    // buffer.
+    for (index, flags) in updates {
+        if !epoch_participation.set(index as usize, flags) {
+            return Err(Error::IndexOutOfBounds {
                 index: index as usize,
                 len: epoch_participation_len,
-            })?;
-        *flags |= new_flags;
+            });
+        }
     }
 
     // The weights partition `WEIGHT_DENOMINATOR` between the three flags, the
@@ -279,10 +310,11 @@ pub fn process_attestation(
 /// in this module needs one) and its own aggregation already batches every
 /// point in a single pass, so this collapses the three cases into one direct
 /// aggregation of the participating members' pubkeys.
-/// [`bls::eth_fast_aggregate_verify`]'s own convention for an empty list
-/// (accept only when the signature is the point at infinity) covers the case
-/// nobody participated exactly the way the specification's own "less than
-/// half" branch does when zero bits are set.
+/// [`crate::beacon::bls::eth_fast_aggregate_verify`]'s own convention for an empty list
+/// (accept only when the signature is the point at infinity), written once in
+/// [`SignatureSet::eth_fast_aggregate`] and read here through it, covers the
+/// case nobody participated exactly the way the specification's own "less
+/// than half" branch does when zero bits are set.
 ///
 /// Every reward and penalty here is the same `participant_reward`, applied
 /// with opposite sign: [`crate::beacon::constants::SYNC_REWARD_WEIGHT`] and
@@ -312,11 +344,18 @@ pub fn process_sync_aggregate(
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // Timed here, not at the six forks' call sites, since every fork from
     // altair on reaches this one function.
     crate::metrics::timed(crate::metrics::StfPhase::SyncAggregate, || {
-        apply_sync_aggregate(state, sync_aggregate, active_balances, pubkey_indices)
+        apply_sync_aggregate(
+            state,
+            sync_aggregate,
+            active_balances,
+            pubkey_indices,
+            signatures,
+        )
     })
 }
 
@@ -325,6 +364,7 @@ fn apply_sync_aggregate(
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -348,14 +388,19 @@ fn apply_sync_aggregate(
         Some(compute_epoch_at_slot(previous_slot)),
     );
     let signing_root = compute_signing_root(get_block_root_at_slot(state, previous_slot)?, domain);
-    verify(
-        bls::eth_fast_aggregate_verify(
-            &participant_pubkeys,
-            signing_root,
-            &sync_aggregate.sync_committee_signature,
-        ),
-        "eth_fast_aggregate_verify(participant_pubkeys, signing_root, sync_aggregate.sync_committee_signature)",
-    )?;
+    // `eth_fast_aggregate_verify`, the same constructor block production's
+    // check of a pooled aggregate goes through. No participants is decided
+    // there and then, with nothing to pair; otherwise the pairing is deferred.
+    let eth_fast_aggregate_verify = "eth_fast_aggregate_verify(participant_pubkeys, signing_root, sync_aggregate.sync_committee_signature)";
+    match SignatureSet::eth_fast_aggregate(
+        &participant_pubkeys,
+        signing_root,
+        &sync_aggregate.sync_committee_signature,
+    ) {
+        EthFastAggregate::Valid => {}
+        EthFastAggregate::Invalid => verify(false, eth_fast_aggregate_verify)?,
+        EthFastAggregate::Pairing(set) => signatures.push(Some(set), eth_fast_aggregate_verify)?,
+    }
 
     // Resolve every committee seat's validator index up front; see this
     // function's documentation for why the mutation loop below cannot do its
@@ -478,10 +523,12 @@ mod tests {
     use blst::min_pk::SecretKey;
 
     use super::*;
+    use crate::beacon::bls;
     use crate::beacon::containers::altair::SyncCommittee;
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
     use crate::beacon::helpers::accessors::{get_beacon_committee, get_total_active_balance};
     use crate::beacon::helpers::altair::get_base_reward_per_increment;
+    use crate::beacon::helpers::participation::ParticipationTotals;
     use crate::beacon::primitives::{
         BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _, Root,
     };
@@ -651,13 +698,17 @@ mod tests {
         let proposer_index = get_beacon_proposer_index(&state).unwrap();
         let balance_before = state.balance(proposer_index).unwrap();
 
-        process_attestation(
-            &mut state,
-            &attestation,
-            proposer_index,
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
-        )
+        checked(|s| {
+            process_attestation(
+                &mut state,
+                &attestation,
+                proposer_index,
+                &CommitteeCache::default(),
+                &ActiveBalanceCache::default(),
+                None,
+                s,
+            )
+        })
         .unwrap();
 
         let (previous_epoch_participation, _, _) = state.altair_validator_lists().unwrap();
@@ -688,18 +739,129 @@ mod tests {
         // so reprocessing the identical attestation must grant nothing new, and
         // the proposer's balance must not move.
         let balance_before_replay = state.balance(proposer_index).unwrap();
-        process_attestation(
-            &mut state,
-            &attestation,
-            proposer_index,
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
-        )
+        checked(|s| {
+            process_attestation(
+                &mut state,
+                &attestation,
+                proposer_index,
+                &CommitteeCache::default(),
+                &ActiveBalanceCache::default(),
+                None,
+                s,
+            )
+        })
         .unwrap();
         let balance_after_replay = state.balance(proposer_index).unwrap();
         assert_eq!(
             balance_before_replay, balance_after_replay,
             "a repeat vote must earn nothing, since every flag it could set is already set"
+        );
+    }
+
+    /// A signed attestation by every member of `data_slot`'s first committee,
+    /// targeting that slot's epoch, for the all-zero synthetic root history.
+    fn full_committee_attestation(
+        state: &BeaconState,
+        secret_keys: &[SecretKey],
+        data_slot: u64,
+    ) -> phase0::Attestation {
+        let target_epoch = compute_epoch_at_slot(data_slot);
+        let committee = get_beacon_committee(state, data_slot, 0).expect("committee exists");
+        let data = AttestationData {
+            slot: data_slot,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: target_epoch,
+                root: Root::ZERO,
+            },
+        };
+        let mut aggregation_bits =
+            crate::beacon::containers::phase0::AggregationBits::with_length(committee.len())
+                .expect("committee.len() is far below MAX_VALIDATORS_PER_COMMITTEE");
+        for position in 0..committee.len() {
+            aggregation_bits.set(position, true).unwrap();
+        }
+        let domain = get_domain(state, constants::DOMAIN_BEACON_ATTESTER, Some(target_epoch));
+        let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+        let signatures: Vec<BlsSignature> = committee
+            .iter()
+            .map(|&index| {
+                BlsSignature(
+                    secret_keys[index as usize]
+                        .sign(signing_root.as_slice(), DST, &[])
+                        .to_bytes(),
+                )
+            })
+            .collect();
+        phase0::Attestation {
+            aggregation_bits,
+            data,
+            signature: bls::aggregate(&signatures).unwrap(),
+        }
+    }
+
+    /// The invariant `compute_pulled_up_tip` relies on: the unslashed
+    /// timely-target balances after a block equal the balances before it plus
+    /// the delta `process_attestation` collected, for the previous and current
+    /// epoch alike, with a slashed attester left out and a repeated vote
+    /// counted once.
+    #[test]
+    fn the_target_delta_is_what_a_registry_scan_gains() {
+        let (mut state, secret_keys) = altair_state_with_keypairs(64);
+        // Slot after the first slot of epoch 1: both the previous epoch's last
+        // slot and the current epoch's first slot are attestable.
+        *state.slot_mut() = preset::SLOTS_PER_EPOCH + 1;
+        let previous_slot = preset::SLOTS_PER_EPOCH - 1;
+        let current_slot = preset::SLOTS_PER_EPOCH;
+
+        let previous_committee = get_beacon_committee(&state, previous_slot, 0).unwrap();
+        state.validator_mut(previous_committee[0]).unwrap().slashed = true;
+
+        let before = ParticipationTotals::compute_raw_target(&state).unwrap();
+        let committees = CommitteeCache::default();
+        let active_balances = ActiveBalanceCache::default();
+        let delta = TargetBalanceDelta::default();
+        // Resolved once, as a block's `process_operations` does.
+        let proposer_index = get_beacon_proposer_index(&state).unwrap();
+        for slot in [previous_slot, current_slot] {
+            let attestation = full_committee_attestation(&state, &secret_keys, slot);
+            // Twice: the second pass sets no new flag and must add nothing.
+            for _ in 0..2 {
+                checked(|s| {
+                    process_attestation(
+                        &mut state,
+                        &attestation,
+                        proposer_index,
+                        &committees,
+                        &active_balances,
+                        Some(&delta),
+                        s,
+                    )
+                })
+                .unwrap();
+            }
+        }
+        let after = ParticipationTotals::compute_raw_target(&state).unwrap();
+
+        assert!(
+            delta.previous() > 0 && delta.current() > 0,
+            "both epochs voted"
+        );
+        assert_eq!(after.0, before.0 + delta.previous());
+        assert_eq!(after.1, before.1 + delta.current());
+        // Every previous-slot attester's balance but the slashed one's,
+        // summed rather than assumed equal.
+        let unslashed_share = previous_committee[1..]
+            .iter()
+            .map(|&index| state.validator(index).unwrap().effective_balance)
+            .sum::<u64>();
+        assert_eq!(
+            delta.previous(),
+            unslashed_share,
+            "the slashed attester adds nothing"
         );
     }
 
@@ -771,12 +933,15 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(
-            &mut state,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
 
         // Independently derived expected rewards, sharing only the
@@ -844,19 +1009,25 @@ mod tests {
         assert_eq!(cache.verified_index(&state, &member), None);
 
         let mut with_fresh = state.clone();
-        process_sync_aggregate(
-            &mut with_fresh,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut with_fresh,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
-        process_sync_aggregate(
-            &mut state,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &cache,
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &cache,
+                s,
+            )
+        })
         .unwrap();
 
         assert_eq!(state, with_fresh);
@@ -892,12 +1063,15 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(
-                &mut state.clone(),
-                &wrong,
-                &ActiveBalanceCache::default(),
-                &PubkeyIndexCache::default()
-            )
+            checked(|s| {
+                process_sync_aggregate(
+                    &mut state.clone(),
+                    &wrong,
+                    &ActiveBalanceCache::default(),
+                    &PubkeyIndexCache::default(),
+                    s,
+                )
+            })
             .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
@@ -907,12 +1081,15 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(
-            &mut state,
-            &correct,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &correct,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
 
         // The sole validator holds every seat and none of them participated,
