@@ -23,6 +23,57 @@ carry. Roots are serialized as `0x`-prefixed hex strings on both.
 
 If `--api-port` and `--metrics-port` are equal, all routers are merged onto a single port.
 
+### What the servers trust
+
+Neither server authenticates its callers. Anyone who can open a connection to
+`--api-port` or `--metrics-port` is treated as this node's operator and its
+validator client, which is why `--http-address` defaults to `127.0.0.1`. Bind
+it anywhere else only behind something that decides who may call, such as a
+firewall rule or an authenticating reverse proxy, and never expose it to the
+internet.
+
+**What the node checks for itself.** Nothing it gossips on a caller's behalf
+is taken on the caller's word. A published block's proposer signature and KZG
+proofs, an envelope's signature and KZG proofs, attestations, aggregates, sync
+committee messages and contributions, slashings, exits, BLS changes, and
+gloas's payload attestations, builder bids and signed proposer preferences are
+all checked against the chain, signatures included, before they reach the
+network; a failed check is a `400`. A caller can only make this node publish
+what passes these checks. They are not every gossip rule, so peers may still
+ignore a message that passed them, such as a duplicate or one outside gossip's
+timing windows.
+
+**What it takes on the caller's word.** These carry no signature to check, or
+one the node does not check:
+
+- **Where a validator's execution rewards go.**
+  `POST /eth/v1/validator/prepare_beacon_proposer` sets the fee recipient of
+  any validator index, and `POST /eth/v1/validator/register_validator` sets it
+  for the key of any active or pending validator, for the blocks this node
+  builds. A builder registration is signed, but the node does not verify the
+  signature (neither does Lighthouse). It sets the fee recipient first, then
+  forwards the registration to `--builder`, which does verify it; the fee
+  recipient stays set whatever the builder answers, and with no `--builder` at
+  all. The last call wins, so a caller can redirect a validator's rewards from
+  locally built blocks for as long as it keeps calling: the validator client's
+  own call, normally once an epoch, restores the address only until the
+  caller's next one.
+- **Which subnets the node joins.**
+  `POST /eth/v1/validator/beacon_committee_subscriptions` and
+  `/eth/v1/validator/sync_committee_subscriptions` join gossip subnets on
+  request, which costs bandwidth and CPU until the slot or epoch the caller
+  named. A sync committee subscription is capped at the end of the next sync
+  committee period; an attestation subnet's is not capped.
+- **When the node builds a block.** Every
+  `GET /eth/v3/validator/blocks/{slot}` and
+  `POST /eth/v4/validator/blocks/{slot}` request has the execution client
+  build a payload.
+- **On a lean node, who aggregates.** `POST /lean/v0/admin/aggregator` switches
+  the aggregator role on or off.
+- **On the metrics server, heap profiles.** `/debug/pprof/allocs` and its
+  flamegraph take a jemalloc heap profile on request. A default Linux build
+  has profiling on from startup; other platforms answer `501`.
+
 ## API Server (`:5052`)
 
 | Method | Path | Response | Description |
@@ -243,6 +294,9 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID, ENR and listen multiaddrs (see below) |
+| `GET` | `/eth/v1/node/peers` | JSON | Connected peers, filterable by `state` and `direction` (see below) |
+| `GET` | `/eth/v1/node/peers/{peer_id}` | JSON | One connected peer; `400` for a malformed id, `404` if it is not connected |
+| `GET` | `/eth/v1/node/peer_count` | JSON | Peers per connection state, as quoted integers |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
 | `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
@@ -412,7 +466,9 @@ the chain actor writes, so no request waits on the actor.
   next slot's block is asked for. Entries more than an epoch old are dropped
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
-  memory (a validator client repeats the call every epoch).
+  memory, so a restart forgets it and the node builds its own payloads for the
+  zero address until the next call. ethlambda's validator client repeats the
+  call every slot, as Lighthouse's does.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
@@ -962,6 +1018,33 @@ no IP. `metadata` is the `MetaData` the node answers peers with over req/resp,
 read at request time, so `syncnets` and `seq_number` follow the sync committee
 subnets a validator client asks for. That `seq_number` versions `MetaData`
 alone: the p2p specification counts it separately from the ENR's `seq`.
+
+`/eth/v1/node/peers`, `/eth/v1/node/peers/{peer_id}` and
+`/eth/v1/node/peer_count` read the p2p layer's table of connected peers at
+request time. Only **connected** peers are tracked: a peer enters the table when
+its first connection is established and leaves when its last one closes, so
+`state` is always `connected`. A `state` filter naming `disconnected`,
+`connecting` or `disconnecting` is valid and returns an empty list, and
+`peer_count` reports `"0"` for those states. A `state` or `direction` value
+outside the specification's enum is a `400`; the parameters may be repeated or
+comma-separated, values of one parameter are alternatives, and the two
+parameters are AND-combined. Empty values (`?state=`, a trailing comma) are
+skipped rather than refused, so `?state=` filters nothing. `meta.count` is the
+length of the filtered list, and peers are ordered by peer id.
+
+`direction` is that of the peer's first connection, and `last_seen_p2p_address`
+is that connection's remote address, ending in `/p2p/<peer id>` (appended, or
+put in place of a trailing `/p2p` naming another peer). It is set when the peer
+connects and not updated by later connections, and for an inbound peer it is
+the remote's ephemeral source port rather than an address to dial, as in
+Lighthouse. `enr` is the record discovery supplied for the peer, kept by peer
+id for every peer the dial loop dials, so a peer that also connected to us
+first still carries it; it is `null` when discovery never supplied one, as for
+a peer that found us first or a bootnode dialed from `--bootnodes`. No request
+is made to obtain it. A `peer_id` must decode the way libp2p's own parser
+accepts it (base58 of a sha2-256 multihash, or of an inlined key of at most 42
+bytes, with nothing left over), or it is a `400`; a well-formed one that is not
+connected is a `404`.
 
 ### `GET /eth/v1/events`
 

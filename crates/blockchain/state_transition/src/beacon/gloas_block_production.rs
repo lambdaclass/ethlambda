@@ -26,14 +26,14 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch,
+    ActiveBalanceCache, PubkeyIndexCache, get_beacon_proposer_index, get_current_epoch,
     get_randao_mix,
 };
 use super::helpers::gloas::{
     can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, gloas_state_ref,
     is_active_builder, is_attestation_same_slot, is_valid_indexed_payload_attestation,
 };
-use super::stf;
+use super::stf::{self, BlockCaches, OwnedBlockCaches};
 use ethlambda_types::beacon::{
     constants,
     containers::{
@@ -81,17 +81,30 @@ pub struct GloasPayloadInputs {
 /// the parent's payload is skipped and the withdrawals are the ones the state
 /// already expects. The target gas limit is the parent bid's own (contract
 /// decision: this node expresses no preference of its own).
+///
+/// `pubkey_indices` resolves the parent's withdrawal and consolidation
+/// requests; pass the `Store`'s shared table, as for [`assemble_gloas_block`].
 pub fn gloas_payload_inputs(
     state: &BeaconState,
     build_on_full: bool,
     parent_requests: &ExecutionRequests,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<GloasPayloadInputs> {
     let inner = gloas_state_ref(state, "gloas_payload_inputs")?;
     let parent_bid = &inner.latest_execution_payload_bid;
     let (withdrawals, head_block_hash) = if build_on_full {
         let mut applied = state.clone();
-        stf::gloas::apply_parent_execution_payload(&mut applied, parent_requests, config)?;
+        // A scratch copy used once: a fresh total-active-balance table, but
+        // the caller's pubkey table, which a withdrawal or consolidation
+        // request resolves through (a fresh one would ingest the registry).
+        stf::gloas::apply_parent_execution_payload(
+            &mut applied,
+            parent_requests,
+            config,
+            &ActiveBalanceCache::default(),
+            pubkey_indices,
+        )?;
         (
             stf::gloas::get_expected_withdrawals(&applied)?.withdrawals,
             parent_bid.block_hash,
@@ -372,12 +385,13 @@ pub struct GloasBidBlockInputs {
 /// a copy fills `state_root` and enforces `process_execution_payload_bid`:
 /// the builder is active, covers the bid and signed it, and the bid's slot,
 /// parent hash and root and randao are the state's. There is no envelope: the
-/// builder reveals the payload itself. `options` is what that run may leave
-/// unchecked, as in [`assemble_gloas_block`].
+/// builder reveals the payload itself. `options` and `pubkey_indices` are as
+/// in [`assemble_gloas_block`].
 pub fn assemble_gloas_block_on_bid(
     state: &BeaconState,
     inputs: GloasBidBlockInputs,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
     verify(
@@ -403,14 +417,12 @@ pub fn assemble_gloas_block_on_bid(
         body,
     };
     let mut post = state.clone();
-    stf::gloas::process_block(
-        &mut post,
-        &block,
-        config,
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
-        options,
-    )?;
+    let scratch = OwnedBlockCaches::default();
+    let caches = BlockCaches {
+        pubkey_indices,
+        ..scratch.caches()
+    };
+    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -476,10 +488,17 @@ pub struct GloasProduced {
 /// malformed build fails here and not on the network. `options` is what the
 /// `process_block` run may leave unchecked: only a caller that set
 /// `skip_randao_verification` passes anything but the default.
+///
+/// `pubkey_indices` is the pubkey table that run resolves the parent's
+/// execution requests and the sync committee through. A node passes its
+/// `Store`'s shared one: a fresh table would first ingest the whole registry,
+/// which at mainnet's size costs more than the registry scans it replaces. The
+/// run's committee and total-active-balance tables are fresh.
 pub fn assemble_gloas_block(
     state: &BeaconState,
     inputs: GloasBlockInputs,
     config: &Config,
+    pubkey_indices: &PubkeyIndexCache,
     options: stf::block::BlockProcessingOptions,
 ) -> Result<GloasProduced> {
     verify(
@@ -529,14 +548,12 @@ pub fn assemble_gloas_block(
     let BeaconState::Gloas(_) = &post else {
         unreachable!("checked above")
     };
-    stf::gloas::process_block(
-        &mut post,
-        &block,
-        config,
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
-        options,
-    )?;
+    let scratch = OwnedBlockCaches::default();
+    let caches = BlockCaches {
+        pubkey_indices,
+        ..scratch.caches()
+    };
+    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
 
     let envelope = ExecutionPayloadEnvelope {
@@ -623,7 +640,7 @@ pub mod test_support {
     use super::*;
     use crate::beacon::ForkName;
     use crate::beacon::block_production::{advance_to_slot, empty_sync_aggregate};
-    use crate::beacon::helpers::accessors::get_domain;
+    use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
     use crate::beacon::helpers::gloas::compute_ptc;
     use crate::beacon::helpers::misc::compute_signing_root;
@@ -723,7 +740,13 @@ pub mod test_support {
         payload_attestations: Vec<PayloadAttestation>,
     ) -> Result<GloasProduced> {
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(state, build_on_full, &requests, &config())?;
+        let inputs = gloas_payload_inputs(
+            state,
+            build_on_full,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )?;
         assemble_gloas_block(
             state,
             GloasBlockInputs {
@@ -738,6 +761,7 @@ pub mod test_support {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
     }
@@ -749,8 +773,7 @@ pub mod test_support {
             &mut post,
             block,
             &config(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            OwnedBlockCaches::default().caches(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -864,7 +887,14 @@ mod gloas_block_production_tests {
         );
 
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
@@ -879,6 +909,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -913,8 +944,7 @@ mod gloas_block_production_tests {
             &wrapped,
             &config(),
             &ExecutionEngine::valid(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            OwnedBlockCaches::default().caches(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -974,8 +1004,22 @@ mod gloas_block_production_tests {
     fn building_on_full_extends_the_parent_payload_and_on_empty_skips_it() {
         let state = state_to_build_on();
         let requests = ExecutionRequests::default();
-        let full = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
-        let empty = gloas_payload_inputs(&state, false, &requests, &config()).unwrap();
+        let full = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        let empty = gloas_payload_inputs(
+            &state,
+            false,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assert_eq!(
             full.head_block_hash,
             ExecutionBlockHash::repeat_byte(PARENT_BLOCK_HASH)
@@ -1014,7 +1058,14 @@ mod gloas_block_production_tests {
         };
         let produce_with = |options| {
             let requests = ExecutionRequests::default();
-            let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+            let inputs = gloas_payload_inputs(
+                &state,
+                true,
+                &requests,
+                &config(),
+                &PubkeyIndexCache::default(),
+            )
+            .unwrap();
             assemble_gloas_block(
                 &state,
                 GloasBlockInputs {
@@ -1029,6 +1080,7 @@ mod gloas_block_production_tests {
                     execution_requests: ExecutionRequests::default(),
                 },
                 &config(),
+                &PubkeyIndexCache::default(),
                 options,
             )
         };
@@ -1046,8 +1098,7 @@ mod gloas_block_production_tests {
             &mut post,
             &produced.block,
             &config(),
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
+            OwnedBlockCaches::default().caches(),
             skip,
         )
         .unwrap();
@@ -1058,7 +1109,14 @@ mod gloas_block_production_tests {
     fn a_payload_on_the_wrong_parent_is_refused_before_signing() {
         let state = state_to_build_on();
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let mut payload = payload_for(&inputs);
         payload.parent_hash = ExecutionBlockHash::repeat_byte(9);
         let result = assemble_gloas_block(
@@ -1075,6 +1133,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         );
         assert!(result.is_err());
@@ -1084,7 +1143,14 @@ mod gloas_block_production_tests {
     fn a_withdrawal_set_the_state_does_not_expect_is_refused() {
         let state = state_to_build_on();
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         let mut payload = payload_for(&inputs);
         payload.withdrawals = vec![Withdrawal {
             index: 99,
@@ -1107,6 +1173,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         );
         assert!(produced.is_err());
@@ -1247,7 +1314,14 @@ mod gloas_block_production_tests {
         // The packed vote rides in a block that passes the full STF.
         let packed = pack_gloas_attestations(&state, vec![vote(&state, parent_root, 0)]);
         let requests = ExecutionRequests::default();
-        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
         assemble_gloas_block(
             &state,
             GloasBlockInputs {
@@ -1262,6 +1336,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -1392,6 +1467,7 @@ mod bid_assembly_tests {
             &state,
             inputs(&state, bid.clone()),
             &config(),
+            &PubkeyIndexCache::default(),
             BlockProcessingOptions::default(),
         )
         .unwrap();
@@ -1427,6 +1503,7 @@ mod bid_assembly_tests {
                 &state,
                 inputs(&state, bid),
                 &config(),
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()
@@ -1449,6 +1526,7 @@ mod bid_assembly_tests {
                 &state,
                 inputs(&state, bid),
                 &config(),
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()
@@ -1469,6 +1547,7 @@ mod bid_assembly_tests {
                 &state,
                 inputs(&state, bid),
                 &config(),
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()
@@ -1490,6 +1569,7 @@ mod bid_assembly_tests {
                 &state,
                 inputs(&state, bid),
                 &config(),
+                &PubkeyIndexCache::default(),
                 BlockProcessingOptions::default(),
             )
             .is_err()

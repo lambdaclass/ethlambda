@@ -31,9 +31,9 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
-    get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
-    get_previous_epoch,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, PubkeyIndexCache,
+    PubkeyIndexCacheExt, get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch,
+    get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::altair::{
     add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
@@ -76,12 +76,19 @@ use std::collections::HashMap;
 /// attester newly earns and totals the proposer's reward for them, then a
 /// write phase that only ever applies what the first phase already decided.
 ///
+/// `proposer_index` is `get_beacon_proposer_index(state)`, which the
+/// specification reads here to pay the including proposer. The caller
+/// supplies it so a block resolves it once for all its attestations rather
+/// than once each; see the attestation loop in
+/// [`crate::beacon::stf::operations::process_operations`].
+///
 /// Takes no [`crate::beacon::config::Config`]: every quantity this needs is either a
 /// [`crate::beacon::constants`] weight or a [`preset`] value, and the specification
 /// lists none of them under a network's "Configuration" table.
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
@@ -248,7 +255,6 @@ pub fn process_attestation(
     const PROPOSER_REWARD_DENOMINATOR: u64 =
         NON_PROPOSER_WEIGHT * constants::WEIGHT_DENOMINATOR / constants::PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / PROPOSER_REWARD_DENOMINATOR;
-    let proposer_index = get_beacon_proposer_index(state)?;
     increase_balance(state, proposer_index, proposer_reward)?;
 
     Ok(())
@@ -284,9 +290,10 @@ pub fn process_attestation(
 /// there is no independently-derived penalty formula that could drift out of
 /// sync with the reward one.
 ///
-/// Resolving each committee seat's validator index needs a linear scan of
-/// `state.validators` (sync committee membership is recorded as pubkeys, not
-/// indices), and the specification does that scan inside the very loop that
+/// Resolving each committee seat's validator index is, in the specification, a
+/// linear scan of `state.validators` (sync committee membership is recorded as
+/// pubkeys, not indices); here it goes through the [`PubkeyIndexCache`], with
+/// that scan as the fallback. The specification does the scan inside the very loop that
 /// also calls `get_beacon_proposer_index` and adjusts balances. Doing the scan
 /// there would need `state` borrowed immutably (to search) and mutably (to
 /// pay or penalize) at the same time, which does not borrow-check; this
@@ -304,6 +311,7 @@ pub fn process_sync_aggregate(
     state: &mut BeaconState,
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
+    pubkey_indices: &PubkeyIndexCache,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -341,30 +349,22 @@ pub fn process_sync_aggregate(
     // own scan of `state.validators` the way the specification's single loop
     // does.
     //
-    // One pass over the registry, not one per seat. The specification writes
-    // this as a search per committee member, which is `SYNC_COMMITTEE_SIZE`
-    // scans of the whole validator set: at mainnet's ~1M validators that is
-    // hundreds of millions of 48-byte pubkey comparisons per block, and it was
-    // measured as the single largest cost in a live import, dwarfing the
-    // signature verification above it. Inverting the loop makes it one scan
-    // against a committee-sized map.
-    //
-    // A pubkey may hold more than one seat, since sync-committee selection
-    // samples with replacement, so each key maps to every seat it occupies
-    // rather than to one.
-    let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
-    for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
-        seats_by_pubkey.entry(pubkey).or_default().push(seat);
+    // Through the pubkey index cache: the specification writes this as a
+    // search per committee member, which at mainnet's registry size was the
+    // largest single cost of a live import (a hash probe per validator, every
+    // block), where the cache answers each seat with a lookup and one
+    // verifying tree descent.
+    let mut resolved: Vec<Option<ValidatorIndex>> = committee_pubkeys
+        .iter()
+        .map(|pubkey| pubkey_indices.verified_index(state, pubkey))
+        .collect();
+    let missing = resolved.iter().filter(|index| index.is_none()).count();
+    crate::metrics::inc_pubkey_index_lookups("hit", (resolved.len() - missing) as u64);
+    if missing > 0 {
+        crate::metrics::inc_pubkey_index_lookups("fallback", missing as u64);
+        resolve_missing_seats_by_scan(state, committee_pubkeys, &mut resolved, pubkey_indices);
     }
-    let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
-    for (index, validator) in state.iter_validators().enumerate() {
-        if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
-            for &seat in seats {
-                resolved[seat] = Some(index as ValidatorIndex);
-            }
-        }
-    }
-    let committee_indices: Vec<ValidatorIndex> = resolved
+    let committee_indices = resolved
         .into_iter()
         .map(|index| {
             index.ok_or(Error::SpecAssert(
@@ -413,6 +413,51 @@ pub fn process_sync_aggregate(
     }
 
     Ok(())
+}
+
+/// Fills every seat of `resolved` the pubkey index cache could not verify, by
+/// one pass over the registry, and records each index it finds in the cache
+/// so the next block's lookup of that seat is a hit.
+///
+/// Only the missing seats are searched for: the cache vouched for the rest,
+/// so one unconfirmable member costs one scan, not a scan for the whole
+/// committee.
+///
+/// One pass, not one per seat. The specification writes this as a search per
+/// committee member, which is `SYNC_COMMITTEE_SIZE` scans of the whole
+/// validator set: at mainnet's ~1M validators that is hundreds of millions of
+/// 48-byte pubkey comparisons per block. Inverting the loop makes it one scan
+/// against a map of the missing seats, which stops once every one is found.
+///
+/// A pubkey may hold more than one seat, since sync-committee selection
+/// samples with replacement, so each key maps to every seat it occupies
+/// rather than to one. A key's first position is taken, as the
+/// specification's `.index()` does; a seat whose pubkey is not registered is
+/// left `None` for the caller to reject.
+fn resolve_missing_seats_by_scan(
+    state: &BeaconState,
+    committee_pubkeys: &[BlsPubkey],
+    resolved: &mut [Option<ValidatorIndex>],
+    pubkey_indices: &PubkeyIndexCache,
+) {
+    let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
+    for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
+        if resolved[seat].is_none() {
+            seats_by_pubkey.entry(pubkey).or_default().push(seat);
+        }
+    }
+    for (index, validator) in state.iter_validators().enumerate() {
+        if seats_by_pubkey.is_empty() {
+            break;
+        }
+        if let Some(seats) = seats_by_pubkey.remove(&validator.pubkey) {
+            let index = index as ValidatorIndex;
+            for seat in seats {
+                resolved[seat] = Some(index);
+            }
+            pubkey_indices.insert(&validator.pubkey, index);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +641,7 @@ mod tests {
         process_attestation(
             &mut state,
             &attestation,
+            proposer_index,
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
         )
@@ -632,6 +678,7 @@ mod tests {
         process_attestation(
             &mut state,
             &attestation,
+            proposer_index,
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
         )
@@ -711,8 +758,13 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(&mut state, &sync_aggregate, &ActiveBalanceCache::default())
-            .unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         // Independently derived expected rewards, sharing only the
         // already-tested building blocks (`get_total_active_balance`,
@@ -748,6 +800,56 @@ mod tests {
         }
     }
 
+    /// A seat the shared pubkey cache cannot verify (here, because the table
+    /// was fed by a fork whose registry holds another key at that index) is
+    /// scanned for, gives the same post-state as a fresh cache, and is
+    /// recorded so the next block's lookup is a hit.
+    #[test]
+    fn process_sync_aggregate_scans_for_an_unverifiable_seat_and_records_it() {
+        let (mut state, secret_keys) = altair_state_with_keypairs(3);
+        let pubkeys_vec: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE)
+            .map(|seat| BlsPubkey(secret_keys[seat % 3].sk_to_pk().to_bytes()))
+            .collect();
+        let aggregate_pubkey = bls::eth_aggregate_pubkeys(&pubkeys_vec).unwrap();
+        {
+            let (current_sync_committee, _) = state.sync_committees_mut().unwrap();
+            *current_sync_committee = SyncCommittee {
+                pubkeys: pubkeys_vec.try_into().unwrap(),
+                aggregate_pubkey,
+            };
+        }
+        let sync_aggregate = altair::SyncAggregate {
+            sync_committee_bits: altair::SyncCommitteeBits::default(),
+            sync_committee_signature: g2_point_at_infinity(),
+        };
+
+        let cache = PubkeyIndexCache::default();
+        let mut other_fork = state.clone();
+        other_fork.validator_mut(1).unwrap().pubkey = BlsPubkey([0xCD; 48]);
+        cache.verified_index(&other_fork, &BlsPubkey([0xCD; 48]));
+        let member = state.validator(1).unwrap().pubkey;
+        assert_eq!(cache.verified_index(&state, &member), None);
+
+        let mut with_fresh = state.clone();
+        process_sync_aggregate(
+            &mut with_fresh,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &sync_aggregate,
+            &ActiveBalanceCache::default(),
+            &cache,
+        )
+        .unwrap();
+
+        assert_eq!(state, with_fresh);
+        assert_eq!(cache.verified_index(&state, &member), Some(1));
+    }
+
     #[test]
     fn process_sync_aggregate_rejects_a_non_infinity_signature_for_zero_participants() {
         let (mut state, secret_keys) = altair_state_with_keypairs(1);
@@ -777,8 +879,13 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(&mut state.clone(), &wrong, &ActiveBalanceCache::default())
-                .is_err(),
+            process_sync_aggregate(
+                &mut state.clone(),
+                &wrong,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default()
+            )
+            .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
 
@@ -787,7 +894,13 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(&mut state, &correct, &ActiveBalanceCache::default()).unwrap();
+        process_sync_aggregate(
+            &mut state,
+            &correct,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
 
         // The sole validator holds every seat and none of them participated,
         // so it is penalized once per seat and the proposer (itself, the only
