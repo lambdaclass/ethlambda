@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-aa6887ac.js";
+            window.path_to_searchindex_js = "searchindex-777beda6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1028,7 +1028,15 @@ a client can ask every epoch. A gloas head state answers from its
 under a fulu head, is answered from a copy of the head state advanced to the
 epoch’s first slot, crossing the gloas upgrade where it falls, on a blocking
 thread. A gloas epoch more than one before the head state’s is a <code>400</code>.
-<code>dependent_root</code> is defined as for attester duties. There is no <code>503</code>.</li>
+The gloas fork epoch is a <code>400</code> until its first slot has started by the wall
+clock, allowing <code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code> (500 ms), while the head is
+still before it: its committee is computed at the fork from the effective
+balances the last pre-gloas epoch ends with, so it can change until then
+(Lighthouse refuses it the same way). <code>dependent_root</code> is defined as for
+attester duties, except for the fork epoch, whose root is the block root at
+the last slot before the fork (the genesis block’s when gloas starts at
+genesis).
+There is no <code>503</code>.</li>
 <li><strong><code>GET /eth/v1/validator/payload_attestation_data?slot=</code></strong> answers
 <code>{version: "gloas", data: {beacon_block_root, slot, payload_present, blob_data_available}}</code> as JSON, or the SSZ <code>PayloadAttestationData</code> on
 <code>Accept: application/octet-stream</code>, with <code>Eth-Consensus-Version: gloas</code>. The
