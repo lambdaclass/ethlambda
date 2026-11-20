@@ -679,8 +679,10 @@ running follower does not wait for the answer at all
 For a gloas payload the follower also orders the checks differently:
 `verify_execution_payload_envelope` asks the engine last, as part of one boolean
 function, while the follower runs the pure consensus checks first
-(`check_execution_payload_envelope`: signature, bid, state, data availability)
-and asks with `engine_newPayloadV5` only about an envelope that passed them,
+(`check_execution_payload_envelope_columns_verified`: signature, bid, state;
+data availability is every sampled column being stored, since a column is
+verified before it is stored) and asks with `engine_newPayloadV5` only about an
+envelope that passed them,
 recording it with `accept_execution_payload_envelope`. The engine's part is
 answered "valid" inside the checks because its answer has three outcomes and
 the specification's `ExecutionEngine` has two.
