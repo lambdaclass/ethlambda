@@ -8,6 +8,7 @@ mod liveness;
 pub mod metrics;
 pub mod pools;
 mod proto_array;
+mod pubkey_index_cache;
 mod state_codec;
 mod state_diff;
 mod state_writer;
@@ -23,6 +24,7 @@ pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 pub use error::Error;
 pub use liveness::ObservedLiveness;
 pub use proto_array::{ProtoArrayError, WeightRules};
+pub use pubkey_index_cache::PubkeyIndexCache;
 // `CacheKey` lives in `state_writer` (beside the `StateCache` it keys), not
 // `store`; re-exported here so the public path (`ethlambda_storage::CacheKey`)
 // is unaffected by which module owns it.
