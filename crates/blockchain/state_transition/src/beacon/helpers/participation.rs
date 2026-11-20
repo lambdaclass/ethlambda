@@ -6,8 +6,10 @@
 //! the specification's helpers for that one question at a time reads the
 //! tree-backed registry many times over and, per active validator, once more
 //! by index (a tree descent each). Here the registry is walked once, with
-//! `validators().iter()` zipped against the participation slices, and every
-//! later step runs over flat data.
+//! `iter_validators()` in lockstep with both participation lists' iterators
+//! (through [`ParticipationRef`](crate::beacon::containers::ParticipationRef),
+//! since the lists are tree-backed), and every later step runs over flat
+//! data.
 //!
 //! The pieces, from cheapest to most complete:
 //!
@@ -134,7 +136,16 @@ fn scan(
     let mut previous_error = None;
     let mut current_error = None;
 
+    // Walked in lockstep with the registry, not indexed per validator: each
+    // `get` on a tree-backed list is a descent, which at mainnet size was the
+    // largest cost of this pass. A list shorter than the registry yields
+    // `None` from the index it runs out at, the same as `get` did.
+    let mut previous_flags_iter = previous_list.iter();
+    let mut current_flags_iter = current_list.iter();
+
     for (index, validator) in state.iter_validators().enumerate() {
+        let previous_entry = previous_flags_iter.next();
+        let current_entry = current_flags_iter.next();
         let effective_balance = validator.effective_balance;
         let active_now = is_active_validator(validator, current_epoch);
         let active_before = is_active_validator(validator, previous_epoch);
@@ -145,7 +156,7 @@ fn scan(
 
         let mut bits = 0u8;
         if active_before {
-            match previous_list.get(index) {
+            match previous_entry {
                 Some(&participation) => {
                     if !validator.slashed {
                         for (flag_index, total) in previous_flags.iter_mut().enumerate() {
@@ -172,7 +183,7 @@ fn scan(
         }
 
         if current_target && active_now {
-            match current_list.get(index) {
+            match current_entry {
                 Some(&participation) => {
                     if has_flag(participation, constants::TIMELY_TARGET_FLAG_INDEX)
                         && !validator.slashed
