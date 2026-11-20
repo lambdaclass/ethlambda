@@ -16,7 +16,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
-use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource};
+use ethlambda_network_api::{
+    AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, GossipEvent,
+};
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
@@ -269,6 +271,7 @@ impl Validated {
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
         if outcome == Outcome::Accept {
             record_liveness(server, &self);
+            publish_gossip_event(server, &self);
         }
         if let Self::Aggregate { aggregate, .. } = &self
             && outcome == Outcome::Accept
@@ -391,8 +394,7 @@ impl Validated {
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
-            // The SSE `execution_payload_bid` and `proposer_preferences` events
-            // hook in here once the events endpoint lands.
+            // Their events went out above, in `publish_gossip_event`.
             | Self::ExecutionPayloadBid { .. }
             | Self::ProposerPreferences(_)
             | Self::PayloadAttestation(_)
@@ -401,6 +403,40 @@ impl Validated {
             | Self::SyncContribution(_) => {}
         }
     }
+}
+
+/// Report an accepted gloas object on the Beacon API's event stream, for the
+/// four topics whose objects never reach the chain actor that publishes the
+/// rest (bids and preferences stop here, and a payload attestation message
+/// only ever feeds fork choice).
+///
+/// Only on `Accept`, since each event names objects that passed the topic's
+/// rules. A queued envelope has not, so `execution_payload_gossip` waits for
+/// the copy that does. Behind the subscriber check, because a bid is cloned
+/// into the event.
+fn publish_gossip_event(server: &P2PServer, object: &Validated) {
+    let Some(sink) = &server.gossip_events else {
+        return;
+    };
+    let event = match object {
+        Validated::Envelope(envelope) => GossipEvent::ExecutionPayloadGossip {
+            slot: envelope.message.payload.slot_number,
+            builder_index: envelope.message.builder_index,
+            block_hash: envelope.message.payload.block_hash,
+            block_root: envelope.message.beacon_block_root,
+        },
+        Validated::ExecutionPayloadBid { bid, .. } if sink.has_subscribers() => {
+            GossipEvent::ExecutionPayloadBid(bid.clone())
+        }
+        Validated::ProposerPreferences(preferences) if sink.has_subscribers() => {
+            GossipEvent::ProposerPreferences(preferences.clone())
+        }
+        Validated::PayloadAttestation(message) if sink.has_subscribers() => {
+            GossipEvent::PayloadAttestationMessage(message.clone())
+        }
+        _ => return,
+    };
+    sink.emit(event);
 }
 
 /// Mark the validators an accepted aggregate or subnet attestation names as
