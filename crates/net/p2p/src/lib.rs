@@ -2724,6 +2724,11 @@ fn parse_bootnode_multiaddr(entry: &str) -> Result<Bootnode, String> {
 /// libp2p inlines a key of up to 42 encoded bytes (secp256k1, ed25519) under
 /// the identity multihash and hashes a longer one (RSA) with sha256, which
 /// keeps no key to read back.
+///
+/// The key must also re-encode to the id it came from. The protobuf decoder
+/// takes its two fields in either order, so a hand-built id can embed a valid
+/// key and still not be that key's id. [`Bootnode`] keeps only the key, so the
+/// node would dial and log the key's canonical id instead of the one typed.
 fn embedded_public_key(peer_id: &PeerId) -> Result<PublicKey, String> {
     const IDENTITY_MULTIHASH_CODE: u64 = 0;
     let multihash: &libp2p::multihash::Multihash<64> = peer_id.as_ref();
@@ -2732,8 +2737,12 @@ fn embedded_public_key(peer_id: &PeerId) -> Result<PublicKey, String> {
             "peer id does not embed its public key (it is a hash, as for an RSA key)".to_string(),
         );
     }
-    PublicKey::try_decode_protobuf(multihash.digest())
-        .map_err(|err| format!("peer id embeds no decodable public key: {err}"))
+    let key = PublicKey::try_decode_protobuf(multihash.digest())
+        .map_err(|err| format!("peer id embeds no decodable public key: {err}"))?;
+    if PeerId::from_public_key(&key) != *peer_id {
+        return Err("peer id is not the canonical encoding of the key it embeds".to_string());
+    }
+    Ok(key)
 }
 
 // --- Utility functions ---
@@ -4835,6 +4844,26 @@ mod tests {
         let reason = bootnode_refusal(&format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}"));
 
         assert!(reason.contains("does not embed its public key"), "{reason}");
+    }
+
+    #[test]
+    fn parse_bootnode_refuses_a_peer_id_that_is_not_its_keys_canonical_encoding() {
+        // A secp256k1 key encodes as its type (field 1: `08 02`), then its
+        // data (field 2). The decoder takes the fields in either order, so
+        // swapping them embeds the same key under a different id.
+        let canonical = Keypair::generate_secp256k1().public().encode_protobuf();
+        assert_eq!(canonical[..2], [0x08, 0x02], "the type field leads");
+        let reordered = [&canonical[2..], &canonical[..2]].concat();
+        const IDENTITY_MULTIHASH_CODE: u64 = 0;
+        let multihash =
+            libp2p::multihash::Multihash::<64>::wrap(IDENTITY_MULTIHASH_CODE, &reordered).unwrap();
+        let peer_id = PeerId::from_multihash(multihash).unwrap();
+        let key = PublicKey::try_decode_protobuf(&reordered).expect("the key still decodes");
+        assert_ne!(PeerId::from_public_key(&key), peer_id);
+
+        let reason = bootnode_refusal(&format!("/ip4/1.2.3.4/tcp/9000/p2p/{peer_id}"));
+
+        assert!(reason.contains("not the canonical encoding"), "{reason}");
     }
 
     #[test]

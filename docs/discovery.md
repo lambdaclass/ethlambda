@@ -229,7 +229,8 @@ swarm and accepted.
 The form follows Lighthouse's `--boot-nodes`, with four deliberate departures:
 
 - **`/p2p/<peer-id>` is required**, and the peer id must embed its public key,
-  which every secp256k1 peer id does. Every bootnode is keyed by its peer id
+  which every secp256k1 peer id does, in the key's canonical encoding (a
+  hand-built id with the key's fields reordered is refused). Every bootnode is keyed by its peer id
   (its dial addresses are merged under it, and it is how this node skips its
   own entry and redials the others), and discv5 is seeded with that key, so an
   anonymous entry has no place to go. Lighthouse dials a TCP multiaddr with no peer id
