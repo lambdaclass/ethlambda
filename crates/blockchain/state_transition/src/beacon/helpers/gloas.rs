@@ -86,7 +86,7 @@
 //! doc), read through [`super::fulu::get_beacon_proposer_index`] rather
 //! than a copy of it here.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
@@ -139,6 +139,30 @@ pub fn indexed_attestation_signature_set(
         &indexed_attestation.data,
         &indexed_attestation.signature,
         None,
+    )
+}
+
+/// [`super::electra::electra_attestation_signature_set`] for a gloas
+/// attestation: the same checks, plus the length bound the container no longer
+/// enforces (`MAX_VALIDATORS_PER_SLOT`), checked first as
+/// [`super::attestation::attesters_signature_set`] does.
+pub fn gloas_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    indexed_attestation: &gloas::IndexedAttestation,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    if indexed_attestation.attesting_indices.len() > preset::MAX_VALIDATORS_PER_SLOT {
+        return None;
+    }
+    super::electra::attestation_signature_set(
+        state,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        &indexed_attestation.attesting_indices,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
     )
 }
 
@@ -287,7 +311,10 @@ pub fn indexed_payload_attestation_signature_set(
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
             Err(_) => return None,
         }
     }

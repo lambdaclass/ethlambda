@@ -1,0 +1,21 @@
+[package]
+name = "ethlambda-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ethlambda-metrics.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+# A stand-in ClickHouse HTTP endpoint for the writer tests. Already in the
+# lockfile through ethlambda-rpc, so this adds no new crate.
+axum = "0.8.1"
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }

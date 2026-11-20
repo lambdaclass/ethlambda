@@ -750,6 +750,12 @@ pub enum GossipEvent {
     PayloadAttestationMessage(PayloadAttestationMessage),
     /// A `proposer_preferences` message passed gossip validation.
     ProposerPreferences(Box<SignedProposerPreferences>),
+    /// A `beacon_attestation_{subnet_id}` single attestation passed gossip
+    /// validation (the `single_attestation` event). Boxed because the bus
+    /// moves the box as is into its `ChainEvent::SingleAttestation`, the
+    /// element its ring stores, which is boxed to keep that ring's slots
+    /// small.
+    SingleAttestation(Box<SingleAttestation>),
 }
 
 /// Where `ethlambda-p2p` reports [`GossipEvent`]s.

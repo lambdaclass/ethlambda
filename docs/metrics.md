@@ -306,6 +306,15 @@ Per-arrival phases, charged once per arriving message however many blocks its ca
 | `get_head` | `fork_choice::get_head` (beacon) |
 | `fcu` | The `engine_forkchoiceUpdated` round trip (beacon) |
 
+### Block Telemetry
+
+Present only with `--telemetry.clickhouse-url`; see [Block telemetry](./telemetry.md). Both series are published at zero at startup, so a node whose inserts never succeed shows a rising failure count next to zero inserted rows instead of no series.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows the shutdown flush could not deliver) | outcome=inserted,dropped |
+| `lean_telemetry_insert_failures_total` | Counter | Failed ClickHouse insert attempts, refusals included | On every failed insert; a failed best-effort schema statement alone is not counted | |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
@@ -654,6 +663,7 @@ leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing block transitions, by whether a precomputed boundary state was cached | On each state transition of a block whose parent is before the block's epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the `engine_newPayload` round trip and then discarded for an `INVALIDATED` verdict, or re-checked in a debug build), and once for a block held after its speculation ran | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_committee_key_sums_warm_seconds` | Histogram | Worker time to sum one epoch's committee keys, off the import path: the sums alone, not the committees they are built from | When a warm-up that built sums finishes; a warm-up that finds them resident records nothing | | 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
 **Read the hit ratio against epochs.** On a synced follower nearly every
@@ -662,25 +672,69 @@ block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
 duration), the node was syncing, or the entry was evicted from the state cache.
 A `timer` start with no matching `head` start means the last slot was skipped.
 
+### Beacon State Transition Phases
+
+Where the time of one beacon state transition goes. `lean_block_import_phase_seconds{phase="stf"}`
+says how long an import's transition took; this says which step.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_stf_phase_seconds` | Histogram | Time one step of the beacon state transition took | Once per step per transition, when the step finishes (a step that did not run writes nothing) | context=import,other; phase (see below) | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
+
+`phase` is one of `BEACON_STF_PHASES` (`crates/blockchain/state_transition/src/metrics.rs`):
+
+| Phase | Covers |
+|-------|--------|
+| `process_slots` | Advancing the state to the block's slot, **excluding** epoch work: per-slot root bookkeeping, fork upgrades, the closing flush |
+| `process_epoch` | The epoch transition, once per boundary crossed (a long skip observes it several times) |
+| `block_signature` | The proposer's signature over the block, when the caller asked for result validation |
+| `block_header` | The header check, including the hash of the block body it commits to |
+| `randao` | The mix update and the building of the reveal's signature set; the reveal (and, on gloas, the bid pending before it) is verified in `batch_signatures` |
+| `eth1_data` | The eth1 vote |
+| `execution_payload` | Withdrawals and the execution payload; gloas: the parent payload, then the withdrawals and the bid, two observations per block |
+| `proposer_slashings`, `attester_slashings`, `attestations`, `deposits`, `voluntary_exits`, `bls_to_execution_changes`, `payload_attestations` | One observation per block for the whole list, absent when the list is empty; the fork must have the list. Through fulu, `attestations` includes the one proposer lookup the whole list shares |
+| `execution_requests` | Electra and fulu's requests of the execution layer |
+| `sync_aggregate` | The sync aggregate, altair onward |
+| `batch_signatures` | The random-weight check of every signature the block's steps deferred (RANDAO reveal, attestations, slashings, exits, BLS changes, sync aggregate). The steps' own phases cover building those signature sets, not verifying them. Observed once per check, so a block can observe it more than once: the reveal's check also verifies whatever is still pending (gloas: the bid), and a slashing, exit or BLS change verifies before it writes. A check that runs inside another phase is taken out of that phase, so the phases do not double count |
+| `state_root` | The post-state flush and `hash_tree_root` that checks `block.state_root`; only observed when the caller validates the result |
+
+**`context` keeps background work out of an import's numbers.** The epoch
+precompute worker runs `process_epoch` on its own thread while an import runs,
+so one series would charge the worker's seconds to whichever import was in
+flight. `context="import"` is written only by the import path
+(`fork_choice::on_block`'s transition, including the speculative one an import
+runs while `engine_newPayload` is in flight; a build with debug assertions also
+observes the second transition that checks a used speculation); every other
+caller (the precompute worker, checkpoint-state advances, block production,
+gossip validation) writes `context="other"`. A dashboard that wants an
+import's cost reads `context="import"`; one that wants the precompute worker's
+reads `other`, which also holds the other callers, so
+`lean_beacon_epoch_precompute_seconds` is the cleaner series for the worker
+alone.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
 gossip validation) resolves its signers' compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See `PubkeyCache` in `crates/common/crypto/src/bls.rs`. This is
 ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs `sum(lean_beacon_pubkey_cache_entries)` now | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. `entries` is also the cache's memory
-footprint, roughly a decompressed point plus its compressed key per entry.
+cached and pay the full check every time. `entries{structure="map"}` is the
+map's memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table's is `index_chunks` times a chunk's size, since a chunk is
+allocated whole and a registry's exited validators leave slots in it empty.
 
 ### Data Column Sidecars (Fulu DAS)
 

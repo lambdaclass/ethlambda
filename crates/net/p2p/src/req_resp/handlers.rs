@@ -2948,6 +2948,7 @@ async fn handle_data_column_sidecars_range_response(
     end_slot: u64,
     sidecars: Vec<DataColumnSidecar>,
 ) {
+    let received_at = Instant::now();
     let received = sidecars.len();
     trace!(%peer, start_slot, end_slot, received, "Received DataColumnsByRange response");
 
@@ -2980,7 +2981,11 @@ async fn handle_data_column_sidecars_range_response(
     // answer and the imports waiting on it; a message per block lets the
     // actor count a block's columns toward availability as soon as that block
     // is checked, rather than after the slowest block of the span.
-    column_checks::check_and_forward(server, in_range);
+    column_checks::check_and_forward(
+        server,
+        in_range,
+        column_checks::ColumnArrival::received("by_range", received_at),
+    );
 }
 
 /// Keep the sidecars of `sidecars` that answer the request: the requested
@@ -3037,6 +3042,7 @@ fn handle_data_column_sidecars_response(
     sidecars: Vec<DataColumnSidecar>,
     ctx: &Context<P2PServer>,
 ) {
+    let received_at = Instant::now();
     let back = ctx.clone();
     let on_checked = move |report: ColumnReport| {
         let message = p2p_protocol::ColumnAnswerChecked { report };
@@ -3044,7 +3050,8 @@ fn handle_data_column_sidecars_response(
             .send(message)
             .inspect_err(|err| warn!(%err, "Failed to settle a checked DataColumnsByRoot answer"));
     };
-    if let Some(outcome) = take_column_answer(server, request.clone(), sidecars, on_checked) {
+    let outcome = take_column_answer(server, request.clone(), sidecars, received_at, on_checked);
+    if let Some(outcome) = outcome {
         follow_column_attempt(&request, &outcome, ctx);
     }
 }
@@ -3053,10 +3060,12 @@ fn handle_data_column_sidecars_response(
 /// answers `request`, then either settle an answer with nothing left at once,
 /// or hand the rest to the checks, which call `on_checked` with the report to
 /// settle once they are done. Returns the outcome of a request settled here.
+/// `received_at` is when the answer was delivered, for the telemetry rows.
 fn take_column_answer(
     server: &mut P2PServer,
     request: ColumnRequest,
     sidecars: Vec<DataColumnSidecar>,
+    received_at: Instant,
     on_checked: impl FnOnce(ColumnReport) + Send + 'static,
 ) -> Option<ColumnAttemptOutcome> {
     let block_root = request.block_root;
@@ -3092,7 +3101,8 @@ fn take_column_answer(
             reply: ColumnReply::Answered(verdicts),
         });
     });
-    column_checks::check_and_forward_then(server, sidecars, Some(done));
+    let arrival = column_checks::ColumnArrival::received("by_root", received_at);
+    column_checks::check_and_forward_then(server, sidecars, arrival, Some(done));
     None
 }
 
@@ -4218,9 +4228,15 @@ pub(crate) mod tests {
 
         let (reports, mut checked) = tokio::sync::mpsc::unbounded_channel();
         let request = column_request(root, peer, &[1]);
-        let outcome = take_column_answer(&mut server, request, vec![sidecar], move |report| {
-            let _ = reports.send(report);
-        });
+        let outcome = take_column_answer(
+            &mut server,
+            request,
+            vec![sidecar],
+            Instant::now(),
+            move |report| {
+                let _ = reports.send(report);
+            },
+        );
 
         assert_eq!(outcome, None, "nothing is settled before the checks");
         assert_eq!(
@@ -4257,10 +4273,15 @@ pub(crate) mod tests {
 
         let (reports, mut checked) = tokio::sync::mpsc::unbounded_channel();
         let request = column_request(root, peer, &[1]);
-        let outcome =
-            take_column_answer(&mut server, request, vec![sidecar.clone()], move |report| {
+        let outcome = take_column_answer(
+            &mut server,
+            request,
+            vec![sidecar.clone()],
+            Instant::now(),
+            move |report| {
                 let _ = reports.send(report);
-            });
+            },
+        );
 
         assert_eq!(outcome, None);
         assert_eq!(
@@ -4288,7 +4309,7 @@ pub(crate) mod tests {
         let before = metrics::data_column_fetch_failures_total("max_retries");
 
         let request = column_request(root, peer, &[1, 2]);
-        let outcome = take_column_answer(&mut server, request, Vec::new(), |_| {
+        let outcome = take_column_answer(&mut server, request, Vec::new(), Instant::now(), |_| {
             unreachable!("an empty answer has nothing to check")
         });
 
@@ -4314,7 +4335,7 @@ pub(crate) mod tests {
         let before = metrics::data_column_fetch_failures_total("no_custodian");
 
         let request = column_request(root, silent, &[1]);
-        let outcome = take_column_answer(&mut server, request, Vec::new(), |_| {
+        let outcome = take_column_answer(&mut server, request, Vec::new(), Instant::now(), |_| {
             unreachable!("an empty answer has nothing to check")
         });
 

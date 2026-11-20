@@ -916,7 +916,11 @@ fn header_signature_is_valid(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(header.hash_tree_root(), domain);
-    if !bls::verify(&proposer.pubkey, signing_root, &signed_header.signature) {
+    let proposer = bls::IndexedPubkey {
+        index: header.proposer_index,
+        pubkey: proposer.pubkey,
+    };
+    if !bls::verify(&proposer, signing_root, &signed_header.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
