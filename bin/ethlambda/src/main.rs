@@ -8,6 +8,7 @@ mod era;
 mod fd_limit;
 mod keygen;
 mod network;
+mod pq_keys;
 mod slashing_protection;
 mod validator;
 mod version;
@@ -128,6 +129,11 @@ fn main() -> eyre::Result<()> {
         Command::Keygen(options) => {
             init_info_stderr_logging()?;
             keygen::run(options)
+        }
+        // Minutes of every core per validator, for files: as keygen.
+        Command::PqKeys(options) => {
+            init_info_stderr_logging()?;
+            pq_keys::run(options)
         }
     }
 }

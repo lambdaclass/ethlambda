@@ -33,6 +33,7 @@ const EXPLICIT: &[&str] = &[
     VOLUNTARY_EXIT,
     SLASHING_PROTECTION,
     KEYGEN,
+    PQ_KEYS,
     "help",
     "-h",
     "--help",
@@ -48,6 +49,7 @@ const VALIDATOR: &str = "validator";
 const VOLUNTARY_EXIT: &str = "voluntary-exit";
 const SLASHING_PROTECTION: &str = "slashing-protection";
 const KEYGEN: &str = "keygen";
+const PQ_KEYS: &str = "pq-keys";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -98,6 +100,9 @@ pub(crate) enum Command {
     SlashingProtection(crate::slashing_protection::SlashingProtectionOptions),
     /// Generate validator XMSS keys for a genesis.
     Keygen(KeygenOptions),
+    /// Write a Beacon Chain PQ-fork genesis's leanXMSS keys and VRF roots for
+    /// a mnemonic's validators, in ethPandaOps' genesis tooling's file formats.
+    PqKeys(crate::pq_keys::PqKeysOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -465,6 +470,7 @@ mod tests {
             VOLUNTARY_EXIT,
             SLASHING_PROTECTION,
             KEYGEN,
+            PQ_KEYS,
         ] {
             let args = [OsString::from("ethlambda"), OsString::from(token)];
             assert_eq!(

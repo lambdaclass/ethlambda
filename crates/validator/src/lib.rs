@@ -118,6 +118,10 @@ pub struct ValidatorConfig {
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
+    /// Where precomputed VRF tree states are read from on a network that
+    /// schedules PQ (an HTTP(S) URL or a file path), so a key's tree need
+    /// not be hashed in full. See [`pq::fetch_vrf_state`].
+    pub vrf_state_url: Option<String>,
     pub init_slashing_protection: bool,
 }
 
@@ -308,7 +312,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Derived the validators' PQ keys"
         );
-        prepare_vrf_trees(pubkeys, config.validators_dir.clone());
+        prepare_vrf_trees(
+            pubkeys,
+            config.validators_dir.clone(),
+            config.vrf_state_url.clone(),
+            beacon_node.clone(),
+        );
     }
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
@@ -1043,8 +1052,9 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     Ok(registrable.map(|entry| entry.pubkey).collect())
 }
 
-/// Read or hash every key's VRF tree, one key after another, on a thread of
-/// its own.
+/// Give every key its VRF tree, one key after another, on a thread of its
+/// own: the tree it stored at an earlier start, else its record from
+/// `vrf_state_url` when one is configured, else the tree hashed in full.
 ///
 /// Off the duty path because hashing a tree takes minutes of every core
 /// (`ethlambda_crypto::vrf`), and only a proposal reads one: the keys attest
@@ -1053,26 +1063,76 @@ async fn refresh_epoch<B: BeaconNodeApi>(
 /// core. A plain thread, not the runtime's blocking pool, so a shutdown does
 /// not wait minutes for a tree nobody will use; each finished tree is already
 /// on disk for the next start.
-fn prepare_vrf_trees(pubkeys: Vec<BlsPubkey>, validators_dir: PathBuf) {
+///
+/// A state record is looked up by validator index, which the beacon node
+/// resolves, and checked against the key's own seed: a genesis whose
+/// validators are not in the file's order only costs those keys the hashing.
+fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
+    pubkeys: Vec<BlsPubkey>,
+    validators_dir: PathBuf,
+    vrf_state_url: Option<String>,
+    beacon_node: Arc<B>,
+) {
+    let runtime = tokio::runtime::Handle::current();
     let spawned = std::thread::Builder::new()
         .name("pq-vrf-trees".into())
         .spawn(move || {
             let count = pubkeys.len();
             let started = std::time::Instant::now();
-            let mut hashed = 0usize;
-            info!(
-                count,
-                "Preparing the validators' VRF trees; a tree not hashed before takes minutes"
-            );
-            for (done, pubkey) in pubkeys.iter().enumerate() {
+            let mut pending: Vec<BlsPubkey> = pubkeys
+                .into_iter()
+                .filter(|pubkey| pq::restore_vrf_tree(pubkey, &validators_dir).is_none())
+                .collect();
+            let stored = count - pending.len();
+            let mut loaded = 0usize;
+            if let Some(source) = vrf_state_url.filter(|_| !pending.is_empty()) {
+                let indices = runtime.block_on(resolve_indices(beacon_node.as_ref(), &pending));
+                let client = reqwest::Client::new();
+                pending.retain(|pubkey| {
+                    let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
+                    let Some(&index) = indices.get(pubkey) else {
+                        warn!(pubkey = %encoded, "No validator index for this key; hashing its VRF tree");
+                        return true;
+                    };
+                    let fetched = runtime.block_on(pq::fetch_vrf_state(&client, &source, index));
+                    let record = match fetched {
+                        Ok(Some(record)) => record,
+                        Ok(None) => {
+                            warn!(pubkey = %encoded, index, "The VRF state file has no record for this validator; hashing its tree");
+                            return true;
+                        }
+                        Err(err) => {
+                            warn!(pubkey = %encoded, index, %err, "Could not fetch this validator's VRF state; hashing its tree");
+                            return true;
+                        }
+                    };
+                    match pq::adopt_vrf_state(pubkey, &record, &validators_dir) {
+                        Ok(()) => {
+                            loaded += 1;
+                            false
+                        }
+                        Err(err) => {
+                            warn!(pubkey = %encoded, index, %err, "Refused this validator's VRF state; hashing its tree");
+                            true
+                        }
+                    }
+                });
+            }
+            if !pending.is_empty() {
+                info!(
+                    count = pending.len(),
+                    "Hashing the VRF trees no state was found for; each takes minutes"
+                );
+            }
+            let to_hash = pending.len();
+            for (done, pubkey) in pending.iter().enumerate() {
                 let key_started = std::time::Instant::now();
-                let source = pq::prepare_vrf_tree(pubkey, &validators_dir);
-                if source == Some(pq::VrfTreeSource::Hashed) {
-                    hashed += 1;
+                if pq::prepare_vrf_tree(pubkey, &validators_dir) == Some(pq::VrfTreeSource::Hashed)
+                {
                     info!(
                         pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
-                        ready = done + 1,
-                        count,
+                        hashed = done + 1,
+                        count = to_hash,
                         elapsed_ms = key_started.elapsed().as_millis() as u64,
                         "Hashed a validator's VRF tree"
                     );
@@ -1080,13 +1140,39 @@ fn prepare_vrf_trees(pubkeys: Vec<BlsPubkey>, validators_dir: PathBuf) {
             }
             info!(
                 count,
-                hashed,
+                stored,
+                loaded,
+                hashed = to_hash,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Every validator's VRF tree is ready; PQ proposals can be made"
             );
         });
     if let Err(err) = spawned {
-        warn!(%err, "Could not start hashing the VRF trees; PQ proposals will be missed");
+        warn!(%err, "Could not start preparing the VRF trees; PQ proposals will be missed");
+    }
+}
+
+/// Each of `pubkeys`' validator index, from the beacon node, retried for a
+/// few minutes while the node is not answering (a validator client may start
+/// before its node). Keys the node does not know are left out.
+async fn resolve_indices<B: BeaconNodeApi>(
+    beacon_node: &B,
+    pubkeys: &[BlsPubkey],
+) -> std::collections::HashMap<BlsPubkey, u64> {
+    for attempt in 1..=20u32 {
+        match beacon_node.validator_indices(pubkeys).await {
+            Ok(entries) => {
+                return entries
+                    .into_iter()
+                    .map(|entry| (entry.pubkey, entry.index))
+                    .collect();
+            }
+            Err(err) => {
+                warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
+    std::collections::HashMap::new()
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }
     }
 }
 

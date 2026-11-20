@@ -156,6 +156,18 @@ pub(crate) struct ValidatorOptions {
     /// one; remove it once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
+
+    /// Where to read the validators' precomputed VRF tree states from, on a
+    /// network that schedules the PQ fork: an HTTP(S) URL or a file path, of
+    /// 1028-byte records indexed by validator index (ethereum-package's
+    /// `vrf_state_url`).
+    ///
+    /// Each record is checked against the validator's own VRF seed, and a key
+    /// whose record is missing or does not match hashes its tree in full
+    /// instead, which takes minutes per key. A tree read either way is kept
+    /// under the validators directory, so this is read once per key.
+    #[arg(long)]
+    pub(crate) vrf_state_url: Option<String>,
 }
 
 impl ValidatorOptions {
@@ -252,6 +264,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder,
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
+        vrf_state_url: options.vrf_state_url,
     })
     .await
     .map_err(Into::into)
@@ -278,6 +291,7 @@ mod tests {
             prefer_builder_proposals: false,
             builder_min_bid: 0,
             init_slashing_protection: false,
+            vrf_state_url: None,
         }
     }
 
