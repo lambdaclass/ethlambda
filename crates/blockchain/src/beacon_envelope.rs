@@ -58,7 +58,7 @@ use ethlambda_state_transition::beacon::fork_choice::{
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, gloas};
+use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
@@ -416,40 +416,22 @@ impl BlockChainServer {
             return false;
         }
 
-        let sidecars = if commitment_count == 0 {
-            Vec::new()
-        } else {
-            match self.stored_gloas_columns(slot, &root) {
-                Some(sidecars) => sidecars,
-                None => {
-                    // Every sampled column was listed as stored a moment ago,
-                    // so failing to read one back is a storage or decode
-                    // fault, not a wait. Holding would name nothing missing
-                    // and be redriven every slot for as long as the fault
-                    // lasts, so the envelope is dropped (and asked for again
-                    // if children wait on it).
-                    warn!(
-                        %slot,
-                        block_root = %ShortRoot(&root.0),
-                        "Dropping an envelope: a stored sampled column could not be read back"
-                    );
-                    self.refetch_envelope_if_children_wait(root);
-                    return false;
-                }
-            }
-        };
-
+        // Every sampled column is stored, and a stored column has passed the
+        // slot match, the structural check and the KZG batch against this
+        // block's bid's commitments in the p2p layer (gossip validation, or
+        // `chain_checks_gloas` for any other, this node's own included), so
+        // none is read back and verified a second time here. With no commitments there
+        // is nothing to sample and nothing to verify.
         // The consensus checks come first, as `verify_execution_payload_envelope`
         // orders them, so the execution client is only ever asked about an
         // envelope this node would accept: signed by the builder, matching
         // the bid and the state, and with its data available.
         self.advance_beacon_clock_to(held.event_ms);
         let config = self.store.config();
-        if let Err(err) = fork_choice::check_execution_payload_envelope(
+        if let Err(err) = fork_choice::check_execution_payload_envelope_columns_verified(
             &self.store,
             &held.envelope,
             &config,
-            &sidecars,
             &ExecutionEngine::valid(),
         ) {
             // p2p judged the envelope before it got here, so no peer is
@@ -574,6 +556,14 @@ impl BlockChainServer {
             held.envelope.message.payload.block_hash,
         );
         self.envelopes.verified.push_back(root);
+        let message = &held.envelope.message;
+        self.events.publish_envelope_imported(
+            slot,
+            message.builder_index,
+            message.payload.block_hash,
+            root,
+            status,
+        );
         true
     }
 
@@ -605,28 +595,6 @@ impl BlockChainServer {
     fn release_envelopes_awaiting_engine(&mut self) {
         let roots: Vec<H256> = self.envelopes.awaiting_engine.keys().copied().collect();
         self.envelopes.work.extend(roots);
-    }
-
-    /// Every sampled column stored for `root`, decoded as gloas sidecars, or
-    /// `None` if any is missing or not one.
-    fn stored_gloas_columns(
-        &self,
-        slot: u64,
-        root: &H256,
-    ) -> Option<Vec<gloas::DataColumnSidecar>> {
-        self.custody_columns
-            .iter()
-            .map(
-                |&index| match self.store.get_data_column(slot, root, index) {
-                    Ok(Some(DataColumnSidecar::Gloas(sidecar))) => Some(sidecar),
-                    Ok(Some(DataColumnSidecar::Fulu(_))) | Ok(None) => None,
-                    Err(err) => {
-                        error!(%err, "Failed to read back a stored data column sidecar");
-                        None
-                    }
-                },
-            )
-            .collect()
     }
 
     /// Hold `held` for a block that is in the store but has no post-state yet,
@@ -2333,6 +2301,60 @@ pub(crate) mod tests {
         envelope.message.payload.block_hash
     }
 
+    /// The actor's import of an envelope is what publishes `execution_payload`,
+    /// and `execution_payload_available` right after it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_imported_envelope_emits_execution_payload_then_available() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        let mut rx = server.events.subscribe();
+        let envelope = valid_envelope_for_full_parent();
+        let builder_index = envelope.message.builder_index;
+        let block_hash = payload_hash(&envelope);
+
+        server.receive_envelope(envelope, 0).await;
+
+        let payload_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::ChainEvent::ExecutionPayload(_)
+                        | crate::ChainEvent::ExecutionPayloadAvailable(_)
+                )
+            })
+            .collect();
+        let slot = server
+            .store
+            .block_slot_and_state_root(&root(FULL_PARENT))
+            .expect("the parent is imported")
+            .0;
+        match payload_events.as_slice() {
+            [
+                crate::ChainEvent::ExecutionPayload(payload),
+                crate::ChainEvent::ExecutionPayloadAvailable(available),
+            ] => {
+                assert_eq!(
+                    (payload.slot, payload.builder_index, payload.block_hash),
+                    (slot, builder_index, block_hash)
+                );
+                assert_eq!(payload.block_root, root(FULL_PARENT));
+                assert!(!payload.execution_optimistic);
+                assert_eq!(
+                    (available.slot, available.block_root),
+                    (slot, root(FULL_PARENT))
+                );
+            }
+            other => panic!("expected execution_payload then available, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
@@ -2379,6 +2401,7 @@ pub(crate) mod tests {
         let (client, _mock) =
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
+        let mut rx = server.events.subscribe();
 
         server
             .receive_envelope(valid_envelope_for_full_parent(), 0)
@@ -2390,6 +2413,14 @@ pub(crate) mod tests {
         assert_eq!(status, PayloadStatusEnum::Syncing);
         assert!(status.is_not_validated());
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        // The `execution_payload` event says the payload is not vouched for.
+        let imported: Vec<bool> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::ChainEvent::ExecutionPayload(payload) => Some(payload.execution_optimistic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported, [true]);
     }
 
     #[tokio::test]

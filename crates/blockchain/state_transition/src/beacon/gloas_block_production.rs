@@ -422,7 +422,7 @@ pub fn assemble_gloas_block_on_bid(
         pubkey_indices,
         ..scratch.caches()
     };
-    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
+    stf::gloas::process_block_and_verify(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -553,7 +553,7 @@ pub fn assemble_gloas_block(
         pubkey_indices,
         ..scratch.caches()
     };
-    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
+    stf::gloas::process_block_and_verify(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
 
     let envelope = ExecutionPayloadEnvelope {
@@ -769,7 +769,7 @@ pub mod test_support {
     /// The state after `block` is applied to `state`, as the chain stores it.
     pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             block,
             &config(),
@@ -1055,6 +1055,7 @@ mod gloas_block_production_tests {
         let state = state_to_build_on();
         let skip = BlockProcessingOptions {
             randao: RandaoVerification::Skip,
+            ..Default::default()
         };
         let produce_with = |options| {
             let requests = ExecutionRequests::default();
@@ -1094,7 +1095,7 @@ mod gloas_block_production_tests {
 
         // Importing it with the same option lands on the state root it names.
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             &produced.block,
             &config(),
