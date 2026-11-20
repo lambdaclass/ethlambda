@@ -33,6 +33,8 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
 
+use crate::metrics::{StfPhase, timed};
+
 use super::{BlockCaches, ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
 /// Dispatches on the block's fork and runs that fork's own block processing,
@@ -165,13 +167,17 @@ pub fn process_block_phase0(
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
     process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
@@ -204,13 +210,17 @@ pub fn process_block_altair(
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
     process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
@@ -338,6 +348,17 @@ pub fn process_randao(
     verification: RandaoVerification,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
+    timed(StfPhase::Randao, || {
+        apply_randao(state, randao_reveal, verification, signatures)
+    })
+}
+
+fn apply_randao(
+    state: &mut BeaconState,
+    randao_reveal: &BlsSignature,
+    verification: RandaoVerification,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
     let epoch = get_current_epoch(state);
     let proposer_index = get_beacon_proposer_index(state)?;
     let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
@@ -374,6 +395,10 @@ pub fn process_randao(
 /// count used for the majority check includes the vote just appended, so a
 /// single block can supply the deciding vote.
 pub fn process_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> {
+    timed(StfPhase::Eth1Data, || apply_eth1_data(state, eth1_data))
+}
+
+fn apply_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> {
     state.eth1_data_votes_mut().push(eth1_data.clone())?;
 
     let matching_votes = state

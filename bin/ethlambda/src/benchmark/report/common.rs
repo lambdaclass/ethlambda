@@ -47,6 +47,10 @@ pub(crate) struct Stats {
     pub mean_seconds: f64,
     pub p50_seconds: f64,
     pub p90_seconds: f64,
+    /// Nearest-rank, like the others, so a short run reports its maximum for the
+    /// tail: up to 51 samples for the p99 and 11 for the p95.
+    pub p95_seconds: f64,
+    pub p99_seconds: f64,
     pub max_seconds: f64,
     /// Coefficient of variation (stddev / mean); NaN-free (0 when mean is 0).
     pub cv: f64,
@@ -64,6 +68,8 @@ pub(crate) fn stats(values: &[f64]) -> Stats {
             mean_seconds: 0.0,
             p50_seconds: 0.0,
             p90_seconds: 0.0,
+            p95_seconds: 0.0,
+            p99_seconds: 0.0,
             max_seconds: 0.0,
             cv: 0.0,
         };
@@ -88,6 +94,8 @@ pub(crate) fn stats(values: &[f64]) -> Stats {
         mean_seconds: mean,
         p50_seconds: percentile(&sorted, 0.50),
         p90_seconds: percentile(&sorted, 0.90),
+        p95_seconds: percentile(&sorted, 0.95),
+        p99_seconds: percentile(&sorted, 0.99),
         max_seconds: sorted[count - 1],
         cv,
     }
@@ -131,6 +139,29 @@ mod tests {
         assert_eq!(stats.mean_seconds, 5.0);
         // population stddev of this classic set is 2.0 => cv = 0.4
         assert!((stats.cv - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_tail_percentiles_are_nearest_rank_over_the_sorted_samples() {
+        // 1..=200 in a scrambled order: nearest rank of (n - 1) * q, rounded.
+        // p95 = index round(199 * 0.95) = 189 -> 190.0, p99 = index
+        // round(199 * 0.99) = 197 -> 198.0.
+        let mut values: Vec<f64> = (1..=200).map(f64::from).collect();
+        values.reverse();
+        values.swap(3, 150);
+        let stats = stats(&values);
+        assert_eq!(stats.p95_seconds, 190.0);
+        assert_eq!(stats.p99_seconds, 198.0);
+        assert_eq!(stats.max_seconds, 200.0);
+        assert!(stats.p90_seconds <= stats.p95_seconds);
+        assert!(stats.p95_seconds <= stats.p99_seconds);
+    }
+
+    #[test]
+    fn a_short_run_reports_its_maximum_as_the_tail() {
+        let stats = stats(&[0.1, 0.4, 0.2]);
+        assert_eq!(stats.p95_seconds, 0.4);
+        assert_eq!(stats.p99_seconds, 0.4);
     }
 
     #[test]
