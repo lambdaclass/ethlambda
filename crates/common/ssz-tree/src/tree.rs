@@ -5,9 +5,10 @@ use std::iter::Peekable;
 use std::sync::{Arc, OnceLock};
 
 use libssz::SszEncode;
-use libssz_merkle::{HashTreeRoot, Sha2Hasher, ZERO_HASHES, hash_nodes, merkleize, pack};
+use libssz_merkle::{HashTreeRoot, Sha2Hasher, ZERO_HASHES, pack};
 use rayon::prelude::*;
 
+use crate::batch::{hash_layer, merkleize};
 use crate::{
     Hash256, NODE_LEVELS, Value, child_height, is_packed, leaf_height, max_leaf_height,
     packing_factor,
@@ -104,9 +105,9 @@ impl<T: Value> Leaf<T> {
             for value in &self.values {
                 value.ssz_append(&mut bytes);
             }
-            return merkleize(&Sha2Hasher, &pack(&bytes), Some(chunks));
+            return merkleize(&pack(&bytes), chunks);
         }
-        merkleize(&Sha2Hasher, self.element_roots(), Some(chunks))
+        merkleize(self.element_roots(), chunks)
     }
 
     /// Each element's root, computed and kept on first use.
@@ -430,14 +431,8 @@ fn fold_roots(mut layer: Vec<Hash256>, below: usize, height: usize) -> Hash256 {
     if layer.is_empty() {
         return ZERO_HASHES[height];
     }
-    for &zero in &ZERO_HASHES[below..height] {
-        let pairs = layer.len().div_ceil(2);
-        for pair in 0..pairs {
-            let left = layer[2 * pair];
-            let right = layer.get(2 * pair + 1).copied().unwrap_or(zero);
-            layer[pair] = hash_nodes(&Sha2Hasher, &left, &right);
-        }
-        layer.truncate(pairs);
+    for zero in &ZERO_HASHES[below..height] {
+        hash_layer(&mut layer, zero);
     }
     layer[0]
 }

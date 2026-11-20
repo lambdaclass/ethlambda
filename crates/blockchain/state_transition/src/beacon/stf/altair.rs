@@ -26,7 +26,7 @@
 //! two are the same number applied with opposite sign, not two independently
 //! derived quantities that happen to match.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{EthFastAggregate, SignatureSet};
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
@@ -38,11 +38,16 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::altair::{
     add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
 };
-use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::beacon::helpers::attestation::{
+    get_indexed_attestation, indexed_attestation_signature_set,
+};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsPubkey, Gwei, ParticipationFlags, ValidatorIndex};
+use crate::beacon::stf::signatures::SignatureBatch;
+#[cfg(test)]
+use crate::beacon::stf::signatures::checked;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +96,7 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -144,8 +150,8 @@ pub fn process_attestation(
         get_attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -279,10 +285,11 @@ pub fn process_attestation(
 /// in this module needs one) and its own aggregation already batches every
 /// point in a single pass, so this collapses the three cases into one direct
 /// aggregation of the participating members' pubkeys.
-/// [`bls::eth_fast_aggregate_verify`]'s own convention for an empty list
-/// (accept only when the signature is the point at infinity) covers the case
-/// nobody participated exactly the way the specification's own "less than
-/// half" branch does when zero bits are set.
+/// [`crate::beacon::bls::eth_fast_aggregate_verify`]'s own convention for an empty list
+/// (accept only when the signature is the point at infinity), written once in
+/// [`SignatureSet::eth_fast_aggregate`] and read here through it, covers the
+/// case nobody participated exactly the way the specification's own "less
+/// than half" branch does when zero bits are set.
 ///
 /// Every reward and penalty here is the same `participant_reward`, applied
 /// with opposite sign: [`crate::beacon::constants::SYNC_REWARD_WEIGHT`] and
@@ -312,6 +319,7 @@ pub fn process_sync_aggregate(
     sync_aggregate: &altair::SyncAggregate,
     active_balances: &ActiveBalanceCache,
     pubkey_indices: &PubkeyIndexCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -335,14 +343,19 @@ pub fn process_sync_aggregate(
         Some(compute_epoch_at_slot(previous_slot)),
     );
     let signing_root = compute_signing_root(get_block_root_at_slot(state, previous_slot)?, domain);
-    verify(
-        bls::eth_fast_aggregate_verify(
-            &participant_pubkeys,
-            signing_root,
-            &sync_aggregate.sync_committee_signature,
-        ),
-        "eth_fast_aggregate_verify(participant_pubkeys, signing_root, sync_aggregate.sync_committee_signature)",
-    )?;
+    // `eth_fast_aggregate_verify`, the same constructor block production's
+    // check of a pooled aggregate goes through. No participants is decided
+    // there and then, with nothing to pair; otherwise the pairing is deferred.
+    let eth_fast_aggregate_verify = "eth_fast_aggregate_verify(participant_pubkeys, signing_root, sync_aggregate.sync_committee_signature)";
+    match SignatureSet::eth_fast_aggregate(
+        &participant_pubkeys,
+        signing_root,
+        &sync_aggregate.sync_committee_signature,
+    ) {
+        EthFastAggregate::Valid => {}
+        EthFastAggregate::Invalid => verify(false, eth_fast_aggregate_verify)?,
+        EthFastAggregate::Pairing(set) => signatures.push(Some(set), eth_fast_aggregate_verify)?,
+    }
 
     // Resolve every committee seat's validator index up front; see this
     // function's documentation for why the mutation loop below cannot do its
@@ -465,6 +478,7 @@ mod tests {
     use blst::min_pk::SecretKey;
 
     use super::*;
+    use crate::beacon::bls;
     use crate::beacon::containers::altair::SyncCommittee;
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
     use crate::beacon::helpers::accessors::{get_beacon_committee, get_total_active_balance};
@@ -638,13 +652,16 @@ mod tests {
         let proposer_index = get_beacon_proposer_index(&state).unwrap();
         let balance_before = state.balance(proposer_index).unwrap();
 
-        process_attestation(
-            &mut state,
-            &attestation,
-            proposer_index,
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
-        )
+        checked(|s| {
+            process_attestation(
+                &mut state,
+                &attestation,
+                proposer_index,
+                &CommitteeCache::default(),
+                &ActiveBalanceCache::default(),
+                s,
+            )
+        })
         .unwrap();
 
         let (previous_epoch_participation, _, _) = state.altair_validator_lists().unwrap();
@@ -675,13 +692,16 @@ mod tests {
         // so reprocessing the identical attestation must grant nothing new, and
         // the proposer's balance must not move.
         let balance_before_replay = state.balance(proposer_index).unwrap();
-        process_attestation(
-            &mut state,
-            &attestation,
-            proposer_index,
-            &CommitteeCache::default(),
-            &ActiveBalanceCache::default(),
-        )
+        checked(|s| {
+            process_attestation(
+                &mut state,
+                &attestation,
+                proposer_index,
+                &CommitteeCache::default(),
+                &ActiveBalanceCache::default(),
+                s,
+            )
+        })
         .unwrap();
         let balance_after_replay = state.balance(proposer_index).unwrap();
         assert_eq!(
@@ -758,12 +778,15 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(
-            &mut state,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
 
         // Independently derived expected rewards, sharing only the
@@ -831,19 +854,25 @@ mod tests {
         assert_eq!(cache.verified_index(&state, &member), None);
 
         let mut with_fresh = state.clone();
-        process_sync_aggregate(
-            &mut with_fresh,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut with_fresh,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
-        process_sync_aggregate(
-            &mut state,
-            &sync_aggregate,
-            &ActiveBalanceCache::default(),
-            &cache,
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &sync_aggregate,
+                &ActiveBalanceCache::default(),
+                &cache,
+                s,
+            )
+        })
         .unwrap();
 
         assert_eq!(state, with_fresh);
@@ -879,12 +908,15 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(
-                &mut state.clone(),
-                &wrong,
-                &ActiveBalanceCache::default(),
-                &PubkeyIndexCache::default()
-            )
+            checked(|s| {
+                process_sync_aggregate(
+                    &mut state.clone(),
+                    &wrong,
+                    &ActiveBalanceCache::default(),
+                    &PubkeyIndexCache::default(),
+                    s,
+                )
+            })
             .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
@@ -894,12 +926,15 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(
-            &mut state,
-            &correct,
-            &ActiveBalanceCache::default(),
-            &PubkeyIndexCache::default(),
-        )
+        checked(|s| {
+            process_sync_aggregate(
+                &mut state,
+                &correct,
+                &ActiveBalanceCache::default(),
+                &PubkeyIndexCache::default(),
+                s,
+            )
+        })
         .unwrap();
 
         // The sole validator holds every seat and none of them participated,
