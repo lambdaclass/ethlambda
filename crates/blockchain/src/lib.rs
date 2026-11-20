@@ -6341,11 +6341,12 @@ mod tests {
         let (mut store, mut events, mut rx) = fork_fixture(A);
         set_head(&mut store, B);
         events.publish_beacon_changes(&store, 2 + HEAD_EVENT_RECENCY_SLOTS + 1);
-        assert!(drain(&mut rx).is_empty());
+        // Neither `head` nor `head_v2`.
+        assert!(drain_all(&mut rx).is_empty());
 
         // The move was recorded: a recent diff now has nothing to report.
         events.publish_beacon_changes(&store, 2);
-        assert!(drain(&mut rx).is_empty());
+        assert!(drain_all(&mut rx).is_empty());
     }
 
     #[test]
@@ -6641,6 +6642,25 @@ mod tests {
         assert!(!v2.epoch_transition);
 
         // Reported once: the view now holds FULL.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+    }
+
+    /// The second `head_v2` keeps the recency gate the first one has: a
+    /// payload arriving for a head too old to announce is not announced
+    /// either, and the view still records it.
+    #[test]
+    fn a_stale_heads_payload_arrival_is_gated_but_the_view_still_moves() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        store.set_head_payload_status(B, PayloadStatus::Empty);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain_all(&mut rx).is_empty());
+
+        store.set_head_payload_status(B, PayloadStatus::Full);
+        events.publish_beacon_changes(&store, 2 + HEAD_EVENT_RECENCY_SLOTS + 1);
+        assert!(drain_all(&mut rx).is_empty());
+
+        // The arrival was recorded: a recent diff now has nothing to report.
         events.publish_beacon_changes(&store, 2);
         assert!(drain_all(&mut rx).is_empty());
     }
