@@ -38,8 +38,8 @@ use std::{
 
 use either::Either;
 use ethlambda_network_api::{
-    ConnectedPeer, FetchRequest, InitBlockChain, MetaDataController, P2PToBlockChainRef,
-    PeerDirection, PeerTableController,
+    ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
+    P2PToBlockChainRef, PeerDirection, PeerTableController,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -1255,6 +1255,7 @@ impl P2P {
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
+        gossip_events: Option<Arc<dyn GossipEventSink>>,
     ) -> Result<P2P, DiscoveryError> {
         let (discovery, local_enr) = match discovery {
             Some(config) => {
@@ -1340,6 +1341,7 @@ impl P2P {
                 BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool,
+            gossip_events,
             aggregator_subnets: HashMap::new(),
             peer_scoring,
         };
@@ -1545,6 +1547,10 @@ pub struct P2PServer {
     /// Beacon API that serves and fills the same pool (block production reads
     /// it). Filled by `verdict::forward`; lean never touches it.
     pub(crate) sync_committee_pool: SharedSyncCommitteePool,
+
+    /// Where gloas gossip objects that passed validation are reported for the
+    /// Beacon API's event stream. `None` on a node with no event bus.
+    pub(crate) gossip_events: Option<Arc<dyn GossipEventSink>>,
 
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
@@ -3259,6 +3265,7 @@ pub(crate) mod test_support {
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
+            gossip_events: None,
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }
