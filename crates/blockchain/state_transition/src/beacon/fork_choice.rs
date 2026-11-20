@@ -4311,6 +4311,31 @@ pub fn get_payload_due_ms(config: &Config) -> u64 {
     get_slot_component_duration_ms(config.payload_due_bps, config)
 }
 
+/// `get_aggregate_due_ms` as PQ modifies it (`pq/fork-choice.md`): how far
+/// into a slot, in milliseconds, the aggregator at `position` in its
+/// aggregation committee broadcasts its aggregate.
+///
+/// The aggregators of a committee are staggered, `AGGREGATOR_DELAY_BPS`
+/// apart in the committee's order, so a later one can skip an aggregate an
+/// earlier one already covered. Named apart from the earlier forks'
+/// `get_aggregate_due_ms`, which takes no position and which nothing in this
+/// crate implements: its reader is the validator client's clock.
+pub fn get_pq_aggregate_due_ms(position: u64, config: &Config) -> u64 {
+    let delay_ms = get_slot_component_duration_ms(config.aggregator_delay_bps, config);
+    get_slot_component_duration_ms(config.aggregate_due_bps_pq, config)
+        .saturating_add(position.saturating_mul(delay_ms))
+}
+
+/// `get_aggregation_cutoff_ms` (PQ `fork-choice.md`): how far into a slot, in
+/// milliseconds, the aggregator at `position` in its aggregation committee
+/// stops collecting attestations. From then until
+/// [`get_pq_aggregate_due_ms`] it proves the ones it has.
+pub fn get_aggregation_cutoff_ms(position: u64, config: &Config) -> u64 {
+    let delay_ms = get_slot_component_duration_ms(config.aggregator_delay_bps, config);
+    get_slot_component_duration_ms(config.aggregation_cutoff_bps, config)
+        .saturating_add(position.saturating_mul(delay_ms))
+}
+
 // ---------------------------------------------------------------------------
 // Merge transition helpers (bellatrix)
 // ---------------------------------------------------------------------------
@@ -6362,6 +6387,31 @@ mod tests {
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
+
+    /// PQ `validator.md`'s table for a 12-second slot: each seat of an
+    /// aggregation committee stops collecting and broadcasts 0.6 s after the
+    /// one before it, with 2.4 s in between to prove.
+    #[test]
+    fn pq_aggregators_are_staggered_by_their_seat() {
+        let config = Config::mainnet();
+        assert_eq!(config.slot_duration_ms, 12_000);
+        let expected = [
+            (4_800, 7_200),
+            (5_400, 7_800),
+            (6_000, 8_400),
+            (6_600, 9_000),
+        ];
+        for (position, (cutoff, due)) in (0..constants::AGGREGATORS_PER_COMMITTEE).zip(expected) {
+            assert_eq!(get_aggregation_cutoff_ms(position, &config), cutoff);
+            assert_eq!(get_pq_aggregate_due_ms(position, &config), due);
+        }
+        // The last seat still broadcasts within the slot, on both presets.
+        for config in [Config::mainnet(), Config::minimal()] {
+            let last = constants::AGGREGATORS_PER_COMMITTEE - 1;
+            assert!(get_pq_aggregate_due_ms(last, &config) <= config.slot_duration_ms);
+            assert!(get_aggregation_cutoff_ms(0, &config) > get_attestation_due_ms(0, &config));
+        }
+    }
 
     /// A store backed by a fresh in-memory backend, with every checkpoint at
     /// its default (genesis) value and no anchor block or state written.

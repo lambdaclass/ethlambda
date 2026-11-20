@@ -224,8 +224,9 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// same policy every previous change followed.
 ///
 /// 8 widened `Config` with the EIP-8483 and PQ fork versions and epochs,
-/// `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
-/// `ATTESTATION_SUBNET_COUNT_PQ`, so a directory written by
+/// `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, PQ's aggregation timing
+/// (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`, `AGGREGATOR_DELAY_BPS`)
+/// and `ATTESTATION_SUBNET_COUNT_PQ`, so a directory written by
 /// version 7 decodes into the wrong fields, the same consequence as 3, 4 and
 /// 6.
 pub const DB_VERSION: u64 = 8;

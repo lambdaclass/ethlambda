@@ -81,6 +81,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+# Keccak-256, to fold the stand-in VRF trees `pq`'s tests store.
+sha3.workspace = true
 
 [features]
 # Exposes `SlashingProtection::in_memory` to other crates' tests.

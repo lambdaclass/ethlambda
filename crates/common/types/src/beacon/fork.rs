@@ -43,7 +43,7 @@ const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
 ///
 /// [`ForkName::Eip8483`] and [`ForkName::Pq`] are consensus-specs feature
 /// forks (`specs/_features/{eip8483,pq}` on the `pq` branch, pinned at
-/// `a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`), not mainnet upgrades: the
+/// `b5d422b255db80c9bbc48f515370655ecc8bf6e5`), not mainnet upgrades: the
 /// PQ fork replaces BLS with leanXMSS, and needs the EIP-8483 registrations
 /// made before it, so the two are scheduled in that order after gloas. Other
 /// forks after gloas exist upstream but are out of scope for this crate.

@@ -1,12 +1,19 @@
 # PQ devnet
 
 A local kurtosis devnet on the consensus-specs `pq` fork (pinned at
-`a4d16c5b`), active from genesis, with ethlambda next to Lighthouse's PQ
+`b5d422b2`), active from genesis, with ethlambda next to Lighthouse's PQ
 client. `network_params.yaml` runs an ethlambda beacon node that only
 follows; `network_params_validators.yaml` gives it 16 of the 64 validators
 behind ethlambda's own validator client. See
 [`docs/beacon_pq.md`](../../docs/beacon_pq.md) for what ethlambda implements
 of the fork.
+
+> **Not runnable at this pin yet.** `b5d422b2` changed the VRF tree (each leaf
+> now commits to its slot's secret, and the tree is hashed with Keccak-256
+> over all `2^31` leaves). No published genesis generator or Lighthouse build
+> registers roots under that rule, so every proposal splits the chain: see
+> [Known limits](#known-limits). The steps below are the ones last run, at
+> `a4d16c5b`, and need a matching generator and Lighthouse to work again.
 
 ## What runs
 
@@ -14,7 +21,8 @@ of the fork.
   `284025a0`). Fulu, gloas and PQ at epoch 0, mainnet preset, 12 s slots.
   Every validator's leanXMSS key is `KeyGen(sha256("leanxmss-seed" || sk))`
   and its VRF seed `sha256("vrf-seed" || sk)`, `sk` its EIP-2333 signing key;
-  ethereum-package ships the first 1000 keys of its default mnemonic. The
+  ethereum-package ships the first 1000 keys of its default mnemonic. That
+  generator's VRF tree is the one before `b5d422b2` (see Known limits). The
   EIP-7002, EIP-7251 and EIP-8282 request contracts are inert stubs.
 - **Lighthouse**: `ethdreamer/lighthouse:pq`, which proves attestation
   aggregates with leanVM through a `leanvm-sidecar` (`lighthouse-pq-bn`).
@@ -61,6 +69,28 @@ stalled chain.
 
 ## Known limits
 
+- **The VRF tree changed under every other client.** At `b5d422b2` a VRF
+  leaf is `keccak256("VRF_LEAF" || secret || le64(slot))` over the secret
+  `keccak256("VRF_SECRET" || vrf_seed || le64(slot))`, and a reveal is the
+  secret, not the leaf. When this was written:
+  - `ethpandaops/eth-beacon-genesis`'s `pq` branch (`ff42fce0`, the
+    `pq-full-vrf` image ethereum-package now defaults to) hashes all `2^31`
+    leaves with Keccak-256, but each leaf is `keccak256(vrf_seed ||
+    le64(slot))` itself, the rule `b5d422b2` replaced;
+  - Lighthouse's PQ branch (`ethdreamer/lighthouse:pq` at `0c76c6e1`) uses the
+    same leaf with only the first `2^20` leaves populated and the rest zero.
+
+  A root either registers fails ethlambda's `is_valid_vrf_proof`, and
+  ethlambda's reveals fail theirs, so the first block of either side is
+  invalid to the other. The image at `284025a0` this devnet was last run with
+  is older still (SHA-256). Until both move, run ethlambda alone against a
+  genesis whose VRF roots are `compute_vrf_root` of each validator's seed,
+  which `ethlambda_crypto::vrf::VrfTree::build` computes.
+- **A validator's first start hashes its VRF trees.** About 100 seconds a key
+  on an Apple M4 Max's 14 cores, one key after another, in the background:
+  attestations start at once, proposals before a key's tree is ready are
+  missed. The trees are kept under `<validators-dir>/pq_vrf_trees/`, so a
+  restart reads them back.
 - **Lighthouse does not serve PQ envelopes over req/resp.** Its `pq` branch
   answers `execution_payload_envelopes_by_{range,root}` with a gloas-shaped
   envelope under the PQ digest ("Pq payload envelope RPC decoding is not

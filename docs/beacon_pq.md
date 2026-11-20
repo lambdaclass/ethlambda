@@ -1,7 +1,7 @@
 # The PQ fork
 
 consensus-specs' `pq` branch (pinned here at
-`a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c`) specifies an emergency fork that
+`b5d422b255db80c9bbc48f515370655ecc8bf6e5`) specifies an emergency fork that
 replaces BLS with leanXMSS, a hash-based signature scheme believed secure
 against a quantum adversary. It comes as two feature forks after gloas:
 
@@ -63,7 +63,8 @@ changes.
 | Genesis | `genesis_anchor_block` | the body carries the state's bid from gloas on, as the specification's genesis helper and ethpandaops' generator build it |
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
 | Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; no blobs. Every block it built on the devnet was canonical on Lighthouse |
-| Validator client | `ethlambda_validator::pq` and the duty services | keys derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on the devnet |
+| VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each committing to its slot's secret; known answers from an independent transcription of the specification |
+| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; aggregators staggered by seat; run on the devnet before the VRF change (see [the devnet's limits](../tooling/pq-devnet/README.md#known-limits)) |
 | Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
 | Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
@@ -227,6 +228,31 @@ aggregation committee of up to `AGGREGATORS_PER_COMMITTEE` validators sampled
 by effective balance, kept in the state's `aggregation_committee_window` for the
 previous, current and lookahead epochs.
 
+## The VRF tree
+
+XMSS signatures are not unique, so a RANDAO reveal signed with one could be
+ground. A validator instead has a secret for each slot,
+`compute_vrf_secret(vrf_seed, slot)`, and registers as its VRF root the root
+of a Merkle tree of depth `VRF_TREE_DEPTH` (31), hashed with Keccak-256,
+whose leaf for a slot is `compute_vrf_leaf(secret, slot)`: a hash of
+`VRF_LEAF_DOMAIN`, the secret and the slot. The reveal is the secret followed
+by the leaf's branch, and `process_randao` mixes the secret in.
+
+Two consequences, both deliberate in the specification:
+
+- **A reveal discloses only its own slot's secret.** The branch holds
+  commitments, never secrets. (Before `b5d422b2` the leaf was the secret
+  itself, so the sibling leaf in a branch was the neighbouring slot's reveal.)
+- **The root costs the whole tree.** A leaf commits to its index, so no two
+  leaves are equal and no subtree can be reused: the root takes three
+  Keccak-256 calls for each of `2^31` leaves, about 100 seconds of all 14
+  cores of an Apple M4 Max (`vrf::tests::the_whole_tree_...`, `--ignored`).
+
+`is_valid_vrf_proof` folds the branch itself (`vrf::fold_vrf_branch`), not
+through the SHA-256 `is_valid_merkle_branch`. The leaf commits to the whole
+slot while the branch reads only its low 31 bits, so a proof for `slot` does
+not open `slot + 2^31`.
+
 ## Inclusion delay
 
 A PQ block includes attestations from at least
@@ -242,15 +268,26 @@ PQ, and take the delay from the state's fork
 ## Validator duties
 
 The validator client keeps its BLS keystores and derives each validator's PQ
-material from the BLS signing key at startup, the way ethereum-package's
-genesis generator and Lighthouse's PQ branch do: the leanXMSS key from
-`sha256("leanxmss-seed" || sk)` and the VRF tree from `sha256("vrf-seed" ||
-sk)` (`ethlambda_crypto::pq_keys`). The registry names a validator by its
-key's 48-byte request form, which the client looks its validators up by and
-maps back to the BLS key it holds, so a validator whose derived key is not
-the registered one resolves to no index and gets no duties. Key generation
-builds two bottom trees per key, which takes under a minute for 16
-validators.
+seeds from the BLS signing key at startup, the way ethereum-package's genesis
+generator and Lighthouse's PQ branch do: the leanXMSS key grows from
+`sha256("leanxmss-seed" || sk)` and the VRF tree from the VRF seed
+`sha256("vrf-seed" || sk)` (`ethlambda_crypto::pq_keys`). The specification
+asks only that both seeds be secret; deriving them from the signing key is
+the devnet's convention. The registry names a validator by its key's 48-byte
+request form, which the client looks its validators up by and maps back to
+the BLS key it holds, so a validator whose derived key is not the registered
+one resolves to no index and gets no duties. Key generation builds two bottom
+trees per key, which takes under a minute for 16 validators.
+
+The VRF tree takes minutes per key (see [The VRF tree](#the-vrf-tree)) and
+only a proposal reads it, so the keys attest at once and a background thread
+hashes the trees one after another. It keeps the `2^15` nodes 16 levels above
+the leaves (1 MiB a key, commitments only, so no secret) in
+`<validators-dir>/pq_vrf_trees/0x<bls pubkey>.bin`, from which a restart
+restores the tree after checking it against the seed and its stored root. A
+proof rebuilds one `2^16`-leaf subtree, about 30 ms. A proposal that falls
+before its key's tree is ready is missed (`the VRF tree is still being
+hashed`).
 
 Each duty signs at the leaf the fork assigns it (see [Leaves](#leaves)): the
 attestation at its target epoch's, the others at the slot's own offset. The
@@ -276,14 +313,23 @@ proposals, the two that slashing punishes.
   seconds, for Lighthouse too, so blocks there carry one attestation each.
 - **Aggregating**: a PQ aggregator is a member of its committee's
   aggregation committee, which the attester duties report as
-  `is_aggregator`. Proving takes seconds, so the node proves ahead, as
-  Lighthouse's PQ branch does: the client's committee subscriptions join the
-  committee's subnet and register it, the node keeps the validated votes'
-  signatures for registered committees, and halfway between the attestation
-  and aggregate deadlines seals the slot and proves each committee before the
-  aggregate deadline. `GET aggregate_attestation` then answers the proved
-  aggregate and its proof, and the client signs the `AggregateAndProof` at the
-  slot's aggregate leaf.
+  `is_aggregator`, with its seat in it as `aggregator_position`. The seats
+  are staggered (PQ `validator.md`, "Construct aggregate"): the one at
+  `position` stops collecting at `get_aggregation_cutoff_ms(position)`
+  (`AGGREGATION_CUTOFF_BPS` plus `position` times `AGGREGATOR_DELAY_BPS`) and
+  broadcasts at `get_aggregate_due_ms(position)` (`AGGREGATE_DUE_BPS_PQ` plus
+  the same delay); on a 12-second slot that is 4.8 s and 7.2 s for the first
+  seat, each later one 0.6 s after. Proving takes seconds, so the node proves
+  ahead, as Lighthouse's PQ branch does: the client's committee subscriptions
+  join the committee's subnet and register it with the aggregating validator,
+  the node keeps the validated votes' signatures for registered committees,
+  and at each seat's cutoff proves what it has for the committees one of its
+  validators holds that seat in. The client asks for each aggregate at its
+  seat's broadcast time; `GET aggregate_attestation` answers the proved
+  aggregate and its proof, or a 404 when an aggregate already broadcast for
+  the committee, gossip's or this node's, covers every attester of it
+  (`should_broadcast_aggregate`). The client signs the `AggregateAndProof` at
+  the slot's aggregate leaf.
 
 ## Spec fixtures
 
@@ -292,7 +338,7 @@ No consensus-specs release ships fixtures for either fork. The pyspec on the
 
 ```sh
 git clone https://github.com/ethereum/consensus-specs && cd consensus-specs
-git checkout a4d16c5be5e8bf8c5a3fb323ee1cb0293efecb1c
+git checkout b5d422b255db80c9bbc48f515370655ecc8bf6e5
 make test reftests=true fork=eip8483 preset=minimal
 make test reftests=true fork=pq preset=minimal
 ```
@@ -337,6 +383,11 @@ generated.
   one.
 - A persistent leaf record for the aggregate, PTC and envelope leaves, which
   slashing protection does not cover.
+- A devnet on `b5d422b2`'s VRF rule: neither ethPandaOps' genesis generator
+  nor Lighthouse's PQ branch registers its roots yet (see
+  [the devnet's limits](../tooling/pq-devnet/README.md#known-limits)).
+- Loading VRF tree states published beside a network's keys (ethereum-package
+  ships them for consensoor and Lodestar) instead of hashing every tree once.
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ
   key's request form: still correct (every candidate is verified, and a miss
   scans), but every PQ lookup scans.

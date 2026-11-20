@@ -266,8 +266,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     });
 
     // A network scheduling the PQ fork: derive every validator's leanXMSS key
-    // and VRF tree before any duty runs, since index lookup already needs the
-    // keys. About a second and a half a key, the keys in parallel.
+    // before any duty runs, since index lookup already needs the keys. About
+    // a second and a half a key, the keys in parallel. Their VRF trees, which
+    // only proposals read and which take minutes each to hash, follow in the
+    // background.
     let pq_epoch = context
         .config
         .fork_epoch(ethlambda_types::beacon::fork::ForkName::Pq);
@@ -285,6 +287,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 .collect()
         };
         let count = secrets.len();
+        let pubkeys: Vec<BlsPubkey> = secrets.iter().map(|(pubkey, _)| *pubkey).collect();
         let current_slot = clock.now().unwrap_or(0);
         let started = std::time::Instant::now();
         info!(count, pq_epoch, "Deriving the validators' PQ keys");
@@ -305,6 +308,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Derived the validators' PQ keys"
         );
+        prepare_vrf_trees(pubkeys, config.validators_dir.clone());
     }
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
@@ -851,7 +855,7 @@ async fn aggregate<B: BeaconNodeApi>(
     // PQ aggregators are the aggregation committee and publish what the node
     // proved; see `AggregationService::aggregate_pq`.
     let outcome = if data.target.epoch >= aggregation.pq_fork_epoch() {
-        tokio::time::timeout(budget, aggregation.aggregate_pq(slot, data, duties)).await
+        tokio::time::timeout(budget, aggregation.aggregate_pq(clock, slot, data, duties)).await
     } else {
         tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store)).await
     };
@@ -1037,6 +1041,53 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     metrics::set_beacon_node_available(true);
     let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
     Ok(registrable.map(|entry| entry.pubkey).collect())
+}
+
+/// Read or hash every key's VRF tree, one key after another, on a thread of
+/// its own.
+///
+/// Off the duty path because hashing a tree takes minutes of every core
+/// (`ethlambda_crypto::vrf`), and only a proposal reads one: the keys attest
+/// meanwhile, and a proposal that falls before its key's tree is ready is
+/// missed and logged as such. One key at a time since each already uses every
+/// core. A plain thread, not the runtime's blocking pool, so a shutdown does
+/// not wait minutes for a tree nobody will use; each finished tree is already
+/// on disk for the next start.
+fn prepare_vrf_trees(pubkeys: Vec<BlsPubkey>, validators_dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("pq-vrf-trees".into())
+        .spawn(move || {
+            let count = pubkeys.len();
+            let started = std::time::Instant::now();
+            let mut hashed = 0usize;
+            info!(
+                count,
+                "Preparing the validators' VRF trees; a tree not hashed before takes minutes"
+            );
+            for (done, pubkey) in pubkeys.iter().enumerate() {
+                let key_started = std::time::Instant::now();
+                let source = pq::prepare_vrf_tree(pubkey, &validators_dir);
+                if source == Some(pq::VrfTreeSource::Hashed) {
+                    hashed += 1;
+                    info!(
+                        pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
+                        ready = done + 1,
+                        count,
+                        elapsed_ms = key_started.elapsed().as_millis() as u64,
+                        "Hashed a validator's VRF tree"
+                    );
+                }
+            }
+            info!(
+                count,
+                hashed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Every validator's VRF tree is ready; PQ proposals can be made"
+            );
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "Could not start hashing the VRF trees; PQ proposals will be missed");
+    }
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
