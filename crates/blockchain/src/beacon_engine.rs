@@ -231,6 +231,32 @@ pub async fn ask_request(
     Ok(verdict(&status))
 }
 
+/// Asks the execution client about `block`'s payload, borrowing the block.
+///
+/// For a task that already owns the block it asks about: the answered-later
+/// path in `beacon_new_payload`, whose request task holds the block in its
+/// `PayloadQuestion`, so no payload copy is needed there.
+///
+/// `Ok(None)` means there was nothing to ask, which is not a failure:
+/// [`PayloadValidity::NotRequired`] is the right verdict. `Err` means no
+/// verdict, as for [`ask_request`].
+pub async fn ask(
+    client: &EngineClient,
+    block: &SignedBeaconBlock,
+) -> Result<Option<PayloadValidity>, EngineError> {
+    let Some(request) = new_payload_request(block) else {
+        return Ok(None);
+    };
+    let call = client.new_payload(
+        request.execution_payload,
+        &request.versioned_hashes,
+        request.parent_beacon_block_root,
+        &request.execution_requests,
+    );
+    let status = timed_new_payload(call).await?;
+    Ok(Some(verdict(&status)))
+}
+
 /// Awaits `call`, one `engine_newPayload*` request, and observes the time from
 /// sending it to its answer as `lean_engine_new_payload_seconds`, under the
 /// [`outcome_label`] of the verdict the answer reads as.

@@ -277,12 +277,16 @@ is state-transition work and the two phases do not overlap. When blocks import
 faster than the writer persists them, the wait shows up here rather than in
 `stf`.
 
-With an execution client the beacon `stf` row also includes a state
-transition that ran while `engine_newPayload` was in flight, and `engine` then
-reports only what the request cost beyond it: building it, and the wait left
-after the transition, which is nothing when the answer was already in. The
-execution client's own time is `lean_engine_new_payload_seconds`. A replay has
-no client, so none of this applies to its numbers.
+With an execution client, a block whose answer the import waits for inline
+(one that is not an optimistic candidate, or a server with no mailbox; see
+"Asking without waiting" in [`beacon_engine.md`](beacon_engine.md)) also has in
+its beacon `stf` row a state transition that ran while `engine_newPayload` was
+in flight, and `engine` then reports only what the request cost beyond it:
+building it, and the wait left after the transition, which is nothing when the
+answer was already in. A block imported before its answer has neither: its
+`engine` is the queueing of the question. The execution client's own time is
+`lean_engine_new_payload_seconds`. A replay has no client, so none of this
+applies to its numbers.
 
 ### What is excluded, and why
 

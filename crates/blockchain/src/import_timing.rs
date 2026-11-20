@@ -222,6 +222,11 @@ pub struct ImportTimings {
     /// send (no execution client, or a block with no payload in it: pre-merge
     /// or gloas). How long the execution client itself took is
     /// `lean_engine_new_payload_seconds`, not this.
+    ///
+    /// That is the path that waits for the answer inline. A block imported
+    /// before its answer (see `beacon_new_payload`) waits for nothing here:
+    /// the pair spans only queueing its question, and no transition overlaps
+    /// it.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
 
@@ -253,8 +258,10 @@ pub struct ImportTimings {
     /// spans this one and its row subtracts it, so the rows still sum to the
     /// end-to-end time instead of counting the overlap twice. `None` whenever
     /// no speculation was computed: every import that sent no request (no
-    /// execution client, or no payload to ask about), and a request for a
-    /// block `fork_choice::speculate_transition` declined. Nothing overlapped
+    /// execution client, or no payload to ask about), a block imported before
+    /// its answer (nothing is awaited, so there is no wait to fill), and a
+    /// request for a block `fork_choice::speculate_transition` declined.
+    /// Nothing overlapped
     /// then, and the `engine` row is its whole pair.
     pub stf_speculative_start: Option<Instant>,
     pub stf_speculative_end: Option<Instant>,
