@@ -1243,11 +1243,15 @@ fn is_registrable(status: &str) -> bool {
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
-/// each only if it is a gloas epoch.
+/// each only if it is a gloas epoch, and the gloas fork epoch's only once it
+/// has begun.
 ///
 /// Gated per epoch rather than once, because the fork can activate between the
-/// two: the lookahead is the epoch the first gloas slots belong to when the
-/// current one is the last before the fork. A failed fetch is logged and
+/// two. The fork epoch is no lookahead, though: its committee is computed at
+/// the fork from the effective balances the last pre-gloas epoch ends with, so
+/// a node serves it only from the fork on (beacon-APIs `ptc.yaml`; Lighthouse
+/// answers `400` before). It is fetched at the fork epoch's own first slot,
+/// with the epoch after it as the lookahead. A failed fetch is logged and
 /// shrugged off, like the proposer and lookahead ones: it must not cost this
 /// epoch's attester schedule, which is already in hand.
 async fn refresh_ptc<B: BeaconNodeApi>(
@@ -1257,6 +1261,9 @@ async fn refresh_ptc<B: BeaconNodeApi>(
 ) {
     for target in [epoch, epoch + 1] {
         if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+            continue;
+        }
+        if target == context.config.gloas_fork_epoch && epoch < target {
             continue;
         }
         if let Err(err) = duties.refresh_ptc(target).await {
@@ -1787,35 +1794,39 @@ mod tests {
     }
 
     /// The committee schedule is fetched for gloas epochs only, so a chain that
-    /// has not forked is never asked, and the lookahead is gated on its own
-    /// epoch: the last pre-gloas epoch looks ahead into the first gloas one.
+    /// has not forked is never asked. The fork epoch's is not fetched as a
+    /// lookahead from the last pre-gloas epoch, since a node cannot know it
+    /// before the fork, but at the fork epoch itself, with the next as the
+    /// lookahead.
     #[tokio::test]
     async fn the_committee_schedule_is_fetched_for_gloas_epochs_only() {
         let node = Arc::new(
             node()
+                .with_duties(5, Root::repeat_byte(2), Vec::new())
+                .with_proposers(4, Root::repeat_byte(2), Vec::new())
                 .with_ptc_duties(4, Root::repeat_byte(1), vec![ptc_duty(11, 130)])
                 .with_ptc_duties(5, Root::repeat_byte(1), Vec::new()),
         );
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
+        let gloas_at_4 = gloas_context(4);
 
-        // Epoch 3 is the last before gloas at epoch 4: only the lookahead asks.
-        node.set_duties(3, Root::repeat_byte(1), Vec::new());
-        refresh_epoch(
-            &node,
-            &mut duties,
-            &keys,
-            3,
-            &settings(None),
-            &gloas_context(4),
-        )
-        .await
-        .expect("refreshes");
+        // Epoch 3 is the last before gloas at epoch 4: nothing is asked.
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &gloas_at_4)
+            .await
+            .expect("refreshes");
         assert_eq!(
-            node.ptc_call_count(),
-            1,
-            "only epoch 4, the first gloas one"
+            node.ptc_requested_epochs(),
+            Vec::<u64>::new(),
+            "the fork epoch's committee is not known before the fork"
         );
+        assert!(duties.ptc_at_slot(130, 4).is_empty());
+
+        // At the fork epoch, both it and the next are asked.
+        refresh_epoch(&node, &mut duties, &keys, 4, &settings(None), &gloas_at_4)
+            .await
+            .expect("refreshes");
+        assert_eq!(node.ptc_requested_epochs(), vec![4, 5]);
         assert_eq!(duties.ptc_at_slot(130, 4).len(), 1);
 
         // A chain with no gloas scheduled is never asked at all.

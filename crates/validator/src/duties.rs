@@ -25,7 +25,8 @@
 //! next, replaced when the `dependent_root` changes. They are narrowed to this
 //! client's indices on arrival, and are not part of subnet subscriptions
 //! either. Whether an epoch is a gloas one is the caller's to decide, since
-//! this service holds no fork schedule.
+//! this service holds no fork schedule, and so is holding off the gloas fork
+//! epoch's until the fork, before which a node cannot know them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -224,7 +225,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// changed.
     ///
     /// Only to be called for a gloas epoch: an earlier one answers with no
-    /// duties, which is harmless but a request wasted every epoch.
+    /// duties, which is harmless but a request wasted every epoch. Nor for the
+    /// gloas fork epoch before it has begun, which a node refuses.
     pub async fn refresh_ptc(&mut self, epoch: Epoch) -> Result<()> {
         if self.indices.is_empty() {
             return Ok(());

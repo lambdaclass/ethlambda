@@ -28,7 +28,7 @@ use ethlambda_state_transition::beacon::{
     fork_choice::get_payload_due_ms,
     gloas_block_production::aggregate_payload_attestations,
     gossip::{
-        Outcome,
+        Outcome, is_future_slot,
         payload_attestation::{SeenPayloadAttestations, cheap_checks, stateful_checks},
     },
     helpers::{accessors::get_block_root_at_slot, gloas::get_ptc_assignments},
@@ -110,12 +110,23 @@ struct PtcDuty {
 ///
 /// An epoch before gloas has no committee, so the answer is empty rather than
 /// an error: a validator client asks every epoch and reads the empty list as
-/// "no duty".
+/// "no duty". This stays a `200`, not the `400` the fork epoch gets below.
+///
+/// The gloas fork epoch itself is refused with a `400` until its first slot
+/// has started by the wall clock, allowing `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+/// (as Lighthouse does), while the head is still before it. Its committee is
+/// computed at the fork, by `upgrade_to_gloas`, from the effective balances the
+/// last pre-gloas epoch ends with, so until then any answer is one the rest of
+/// that epoch can change (beacon-APIs `ptc.yaml`: "Duties for this epoch are
+/// not available before the fork").
 ///
 /// `dependent_root` is the block root at `compute_start_slot_at_epoch(epoch - 1) - 1`
 /// (the genesis block's at the start), the same definition the attester duties
 /// use: the committee window is fixed by the state at the end of the epoch
-/// before the previous one.
+/// before the previous one. The fork epoch is the exception, for the reason
+/// above: its root is the block at `compute_start_slot_at_epoch(epoch) - 1`,
+/// the last slot before the fork (the genesis block's when gloas starts at
+/// genesis).
 async fn post_ptc_duties(
     Path(epoch): Path<String>,
     State(store): State<Store>,
@@ -128,7 +139,11 @@ async fn post_ptc_duties(
         Ok(wanted) => wanted,
         Err(err) => return err.into_response(),
     };
-    let computed = tokio::task::spawn_blocking(move || ptc_duties(&store, epoch, &wanted)).await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let computed =
+        tokio::task::spawn_blocking(move || ptc_duties(&store, epoch, &wanted, now_ms)).await;
     match computed {
         Ok(Ok(body)) => crate::json_response(body),
         Ok(Err(err)) => err.into_response(),
@@ -149,10 +164,13 @@ fn parse_validator_indices(body: &[u8]) -> Result<HashSet<ValidatorIndex>, ApiEr
         .map_err(|_| ApiError::BadRequest("invalid validator index"))
 }
 
+/// The duties of [`post_ptc_duties`], with `now_ms` the wall clock the gloas
+/// fork epoch's refusal is judged against.
 fn ptc_duties(
     store: &Store,
     epoch: Epoch,
     wanted: &HashSet<ValidatorIndex>,
+    now_ms: u64,
 ) -> Result<serde_json::Value, ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
@@ -167,7 +185,26 @@ fn ptc_duties(
         ));
     }
 
-    let dependent_slot = compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1);
+    // The fork epoch's committee does not exist until the fork, so it is not
+    // served before then (see the handler). Only while the head is before the
+    // fork, which leaves a chain with gloas at genesis answerable before
+    // genesis: its committee is in the genesis state already.
+    let fork_epoch = epoch == config.gloas_fork_epoch;
+    let start_slot = compute_start_slot_at_epoch(epoch);
+    if fork_epoch && state_epoch < epoch && is_future_slot(&config, start_slot, now_ms) {
+        return Err(ApiError::BadRequest(
+            "PTC duties for the gloas fork epoch are not available until the fork",
+        ));
+    }
+
+    // The fork epoch's committee is fixed by the last state before the fork,
+    // every other epoch's by the end of the epoch before the previous one. Both
+    // saturate to the genesis block's slot.
+    let dependent_slot = if fork_epoch {
+        start_slot.saturating_sub(1)
+    } else {
+        compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1)
+    };
     let dependent_root = if dependent_slot >= head_state.slot() {
         head_root
     } else {
@@ -182,6 +219,8 @@ fn ptc_duties(
         })
     };
 
+    // Before gloas there is no committee: an empty `200`, not an error, so a
+    // client can ask every epoch.
     if epoch < config.gloas_fork_epoch {
         return Ok(respond(Vec::new()));
     }
@@ -196,7 +235,6 @@ fn ptc_duties(
     let state: Arc<BeaconState> = if readable_from_head {
         head_state
     } else {
-        let start_slot = compute_start_slot_at_epoch(epoch);
         let mut advanced = (*head_state).clone();
         process_slots(&mut advanced, start_slot, &config)
             .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
@@ -825,22 +863,15 @@ mod tests {
     }
 
     /// While the head is still fulu, the first gloas epoch is answered from a
-    /// copy of the head state advanced across the upgrade.
+    /// copy of the head state advanced across the upgrade. The store's clock is
+    /// mainnet's, long past the fork, so the fork epoch is not refused.
     #[tokio::test]
     async fn the_first_gloas_epoch_is_computed_from_a_fulu_head() {
-        use ethlambda_state_transition::beacon::helpers::fulu::initialize_proposer_lookahead;
-        let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
-        let lookahead = initialize_proposer_lookahead(&state).unwrap();
-        let BeaconState::Fulu(fulu) = &mut state else {
-            unreachable!("built as fulu")
-        };
-        fulu.proposer_lookahead = lookahead.try_into().unwrap();
+        let state = fulu_state();
         let head_epoch = compute_epoch_at_slot(state.slot());
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, head_epoch + 1);
         let (store, _root) = crate::test_utils::beacon_store_with_config(state, config);
-        let everyone =
-            serde_json::to_string(&(0..COUNT as u64).map(|i| i.to_string()).collect::<Vec<_>>())
-                .unwrap();
+        let everyone = everyone();
 
         let reply = request(store.clone(), duties_request(head_epoch + 1, &everyone)).await;
 
@@ -858,6 +889,150 @@ mod tests {
         // The fulu epoch itself has none.
         let reply = request(store, duties_request(head_epoch, &everyone)).await;
         assert_eq!(reply.json()["data"], serde_json::json!([]));
+    }
+
+    /// A fulu state with a real proposer lookahead (epoch processing needs it
+    /// to cross the gloas upgrade) and distinct `block_roots`.
+    fn fulu_state() -> BeaconState {
+        use ethlambda_state_transition::beacon::helpers::fulu::initialize_proposer_lookahead;
+        let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let BeaconState::Fulu(fulu) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        fulu.proposer_lookahead = lookahead.try_into().unwrap();
+        for slot in 0..fulu.block_roots.len() {
+            fulu.block_roots[slot] = slot_root(slot as u64);
+        }
+        state
+    }
+
+    /// The fork epoch used by the boundary tests below.
+    const FORK_EPOCH: Epoch = 2;
+
+    /// A fulu head at the last slot before gloas at [`FORK_EPOCH`], on a clock
+    /// whose slot `clock_slot` began a second ago.
+    fn fulu_head_before_the_fork(clock_slot: Slot) -> (Store, H256) {
+        let mut state = fulu_state();
+        let BeaconState::Fulu(fulu) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        fulu.slot = compute_start_slot_at_epoch(FORK_EPOCH) - 1;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, FORK_EPOCH);
+        store_with_head_at_clock(state, config, 0, clock_slot)
+    }
+
+    fn everyone() -> String {
+        serde_json::to_string(&(0..COUNT as u64).map(|i| i.to_string()).collect::<Vec<_>>())
+            .unwrap()
+    }
+
+    /// The fork epoch's committee is fixed by the last state before the fork,
+    /// so its `dependent_root` is the block at the fork's first slot minus one,
+    /// not the generic rule's block an epoch earlier. The epoch after it keeps
+    /// the generic rule, which names the same slot.
+    #[tokio::test]
+    async fn the_fork_epochs_dependent_root_is_the_last_block_before_the_fork() {
+        let state = gloas_state();
+        let fork_epoch = compute_epoch_at_slot(state.slot());
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, fork_epoch);
+        let (store, _) = store_with_head(state, config, 0);
+        let last_before_fork = compute_start_slot_at_epoch(fork_epoch) - 1;
+
+        for epoch in [fork_epoch, fork_epoch + 1] {
+            let reply = request(store.clone(), duties_request(epoch, r#"["1"]"#)).await;
+            assert_eq!(reply.status, StatusCode::OK, "epoch {epoch}");
+            assert_eq!(
+                reply.json()["dependent_root"],
+                format!("{:?}", slot_root(last_before_fork)),
+                "epoch {epoch}"
+            );
+        }
+        // The generic rule would have named the block an epoch earlier.
+        assert_ne!(
+            compute_start_slot_at_epoch(fork_epoch - 1).saturating_sub(1),
+            last_before_fork
+        );
+
+        // A pre-gloas epoch is untouched: still an empty `200` on the generic
+        // rule's root.
+        let reply = request(store, duties_request(fork_epoch - 1, r#"["1"]"#)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["data"], serde_json::json!([]));
+        assert_eq!(
+            reply.json()["dependent_root"],
+            format!("{:?}", slot_root(0))
+        );
+    }
+
+    /// Before the fork the fork epoch's committee does not exist yet, so it is
+    /// refused; from the boundary on it is served, from the head state advanced
+    /// across the upgrade, and depends on the head: the last block before the
+    /// fork.
+    #[tokio::test]
+    async fn the_fork_epoch_is_refused_before_the_fork_and_served_from_the_boundary() {
+        let fork_start = compute_start_slot_at_epoch(FORK_EPOCH);
+
+        let (store, _) = fulu_head_before_the_fork(fork_start - 1);
+        let reply = request(store.clone(), duties_request(FORK_EPOCH, &everyone())).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        // The epoch before the fork is still an empty `200`.
+        let reply = request(store, duties_request(FORK_EPOCH - 1, &everyone())).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["data"], serde_json::json!([]));
+
+        let (store, head_root) = fulu_head_before_the_fork(fork_start);
+        let reply = request(store, duties_request(FORK_EPOCH, &everyone())).await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        let json = reply.json();
+        assert_eq!(json["dependent_root"], format!("{head_root:?}"));
+        let duties = json["data"].as_array().unwrap();
+        assert!(
+            !duties.is_empty(),
+            "the committee seats some of the registry"
+        );
+        for duty in duties {
+            let slot: u64 = duty["slot"].as_str().unwrap().parse().unwrap();
+            assert!((fork_start..fork_start + preset::SLOTS_PER_EPOCH).contains(&slot));
+        }
+    }
+
+    /// The refusal allows gossip's clock disparity: a request that far ahead of
+    /// the fork's first slot is served, one a millisecond earlier is not.
+    #[test]
+    fn the_fork_epoch_is_served_within_the_clock_disparity() {
+        use ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+        let fork_start = compute_start_slot_at_epoch(FORK_EPOCH);
+        let (store, _) = fulu_head_before_the_fork(fork_start - 1);
+        let config = store.config();
+        let fork_start_ms = config.genesis_time_ms() + fork_start * config.slot_duration_ms;
+        let wanted = HashSet::from([1]);
+
+        let earliest = fork_start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+        assert!(ptc_duties(&store, FORK_EPOCH, &wanted, earliest).is_ok());
+        let too_early = ptc_duties(&store, FORK_EPOCH, &wanted, earliest - 1);
+        assert!(matches!(too_early, Err(ApiError::BadRequest(_))));
+    }
+
+    /// With gloas at genesis the fork epoch's committee is in the genesis
+    /// state, so it is served before genesis too, as it was before the fork
+    /// epoch was refused at all.
+    #[test]
+    fn a_chain_with_gloas_at_genesis_serves_its_first_epoch_before_genesis() {
+        let mut state = gloas_state();
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        inner.slot = 0;
+        let (store, head_root) = store_with_head_at_clock(state, gloas_config(), 0, 0);
+        let before_genesis = store.config().genesis_time_ms() - 60_000;
+
+        let answer = ptc_duties(&store, 0, &HashSet::from([1]), before_genesis);
+
+        let Ok(json) = answer else {
+            panic!("refused: {answer:?}")
+        };
+        assert_eq!(json["dependent_root"], format!("{head_root:?}"));
     }
 
     // ----- payload attestation data ----------------------------------------

@@ -845,7 +845,15 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
   under a fulu head, is answered from a copy of the head state advanced to the
   epoch's first slot, crossing the gloas upgrade where it falls, on a blocking
   thread. A gloas epoch more than one before the head state's is a `400`.
-  `dependent_root` is defined as for attester duties. There is no `503`.
+  The gloas fork epoch is a `400` until its first slot has started by the wall
+  clock, allowing `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms), while the head is
+  still before it: its committee is computed at the fork from the effective
+  balances the last pre-gloas epoch ends with, so it can change until then
+  (Lighthouse refuses it the same way). `dependent_root` is defined as for
+  attester duties, except for the fork epoch, whose root is the block root at
+  the last slot before the fork (the genesis block's when gloas starts at
+  genesis).
+  There is no `503`.
 - **`GET /eth/v1/validator/payload_attestation_data?slot=`** answers
   `{version: "gloas", data: {beacon_block_root, slot, payload_present,
   blob_data_available}}` as JSON, or the SSZ `PayloadAttestationData` on
