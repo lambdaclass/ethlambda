@@ -1137,13 +1137,24 @@ fn beacon_bootnodes(
         let bootnode = parse_bootnode(entry).map_err(|reason| {
             // `--bootnodes` named a file on `beacon` until it became a list,
             // and launch scripts still pass one. Checked only after a parse
-            // failure, so no entry that parses is ever read from disk.
-            if Path::new(entry).is_file() {
+            // failure, so no entry that parses is ever read from disk. A
+            // bootnode file's usual extensions count too, so a path that does
+            // not exist (a typo, or a file the launcher stopped writing) gets
+            // the same hint rather than a decoding error.
+            let path = Path::new(entry);
+            let file_like = path.is_file()
+                || matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yaml" | "yml" | "txt")
+                );
+            if file_like {
                 eyre::eyre!(
-                    "--bootnodes entry \"{entry}\" is a file: beacon --bootnodes now \
-                     takes a comma-separated list of ENRs and multiaddrs, not a file. \
-                     Pass the file's entries joined with commas instead. They are added \
-                     to the network's own bootnodes, not put in their place"
+                    "--bootnodes entry \"{entry}\" looks like a file: beacon --bootnodes \
+                     now takes a comma-separated list of ENRs and multiaddrs, not a file. \
+                     Pass the records themselves, joined with commas, without a YAML \
+                     list's \"- \" markers or any comments. They are added to the \
+                     network's own bootnodes, not put in their place; a network loaded \
+                     from a directory can list them in its bootstrap_nodes.yaml instead"
                 )
             } else {
                 eyre::eyre!("invalid --bootnodes entry \"{entry}\": {reason}")
@@ -3869,6 +3880,21 @@ validators:
             "{refusal}"
         );
         assert!(refusal.contains("joined with commas"), "{refusal}");
+        // The file above is a YAML list; joining its lines as they are would
+        // keep the markers and fail again, as an ENR.
+        assert!(refusal.contains("\"- \" markers"), "{refusal}");
+    }
+
+    /// A launcher whose bootnode file is missing (a typo, or a file it stopped
+    /// writing) passes a path that is not a file at all. Its extension still
+    /// earns the hint, rather than an ENR or multiaddr decoding error.
+    #[test]
+    fn a_missing_bootnode_file_on_beacon_gets_the_same_hint() {
+        for path in ["/no/such/dir/bootnodes.yaml", "bootnodes.txt"] {
+            let refusal = beacon_bootnodes_refusal(&[path]);
+            assert!(refusal.contains(path), "{refusal}");
+            assert!(refusal.contains("not a file"), "{refusal}");
+        }
     }
 
     /// The network's own list keeps `parse_enrs`' rule: a bad entry there is

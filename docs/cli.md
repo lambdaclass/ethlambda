@@ -258,7 +258,11 @@ The entries are added to the resolved network's own list (a built-in network's
 embedded one, or a loaded directory's `bootstrap_nodes.yaml`/`.txt`), never put
 in its place, which is Lighthouse's behavior too. Giving the flag used to
 replace that list; now the network's bootnodes are always used, and the flag
-only adds to them.
+only adds to them. Nothing turns them off: each one with a QUIC or TCP port is
+dialed at startup and redialed 12 seconds after every failed dial or
+disconnect, even on a host that cannot reach it. To run on other bootnodes
+alone, load the network from a directory whose `bootstrap_nodes.yaml` lists
+only those.
 
 An IPv6 entry is dialed like an IPv4 one, but discv5 listens on IPv4 only, so
 an IPv6 entry that is only a discv5 contact (`/ip6/<ip>/udp/<port>`, or an ENR
@@ -272,9 +276,11 @@ not given. The network's own list keeps the old rule, a bad entry there being
 skipped with a warning, as `node` skips one in its file.
 
 **A file path is no longer accepted.** Startup fails on one, with a hint that
-`--bootnodes` now takes a list. A launch script that passed `beacon` a bootnode
-file must pass its entries joined with commas instead, or, for a network loaded
-from a directory, list them in that directory's `bootstrap_nodes.yaml`.
+`--bootnodes` now takes a list; so does a missing path ending in `.yaml`,
+`.yml` or `.txt`. A launch script that passed `beacon` a bootnode file must
+pass the records it lists joined with commas instead (without a YAML list's
+`- ` markers or any comments), or, for a network loaded from a directory, list
+them in that directory's `bootstrap_nodes.yaml`.
 
 ## What `ethlambda beacon` does today
 
