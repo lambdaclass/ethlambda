@@ -42,6 +42,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
+use crate::beacon::payload_hash::{self, EnvelopeSource};
 use crate::beacon::{builder_market, column_checks};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
@@ -123,8 +124,12 @@ impl Validated {
     /// them.
     fn stateful_checks(&mut self, store: &Store) -> Outcome {
         match self {
+            // The payload block hash rule (`payload_hash`), stricter than the
+            // specification, runs only once the topic's own rules accept,
+            // that is once the proposer's or builder's signature verified.
             Self::Block { block, block_root } => {
-                gossip::block::stateful_checks(store, block, *block_root)
+                let outcome = gossip::block::stateful_checks(store, block, *block_root);
+                payload_hash::block_verdict(outcome, block, *block_root)
             }
             Self::Column(sidecar) => match &**sidecar {
                 DataColumnSidecar::Fulu(sidecar) => gossip::column::stateful_checks(store, sidecar),
@@ -146,7 +151,10 @@ impl Validated {
                 attestation,
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
-            Self::Envelope(envelope) => gossip::envelope::stateful_checks(store, envelope),
+            Self::Envelope(envelope) => {
+                let outcome = gossip::envelope::stateful_checks(store, envelope);
+                payload_hash::envelope_verdict(outcome, envelope, EnvelopeSource::Gossip)
+            }
             Self::ExecutionPayloadBid { bid, market } => {
                 gossip::execution_payload_bid::stateful_checks(store, market, bid)
             }
@@ -573,9 +581,21 @@ impl Message for GossipVerdict {
 /// validation on separate blocking threads at once, and only the first
 /// `Accept` to reach the actor stands, which is the specification's "first
 /// valid". Any other outcome passes through unrecorded, since only an Accept
-/// is a candidate for the seen cache in the first place.
+/// is a candidate for the seen cache in the first place, with one exception.
+///
+/// A block IGNOREd for its payload block hash passed every rule the
+/// specification has, signature included, so it is the specification's "first
+/// block with a valid signature" for its slot and proposer, and is recorded
+/// too, as `AlreadySeen` when another one got there first. Otherwise a
+/// proposer could send any number of signed blocks for one slot, each
+/// verified and hashed in full, where the cheap checks would IGNORE every one
+/// after the first.
 fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outcome {
-    if outcome == Outcome::Accept && !object.record_seen(server) {
+    let seen_candidate = matches!(
+        outcome,
+        Outcome::Accept | Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch)
+    );
+    if seen_candidate && !object.record_seen(server) {
         Outcome::Ignore(IgnoreReason::AlreadySeen)
     } else {
         outcome
@@ -589,11 +609,18 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
-        let received_at = id.received_at;
-        if report(self, id, outcome) {
-            object.forward(self, received_at, outcome);
-        }
+        conclude(self, id, outcome, object);
+    }
+}
+
+/// What the actor does with a blocking task's verdict: settle it against the
+/// seen cache, report it to gossipsub, and hand the object on only when the
+/// outcome allows it ([`disposition`]).
+fn conclude(server: &mut P2PServer, id: GossipId, outcome: Outcome, object: Validated) {
+    let outcome = settle(server, outcome, &object);
+    let received_at = id.received_at;
+    if report(server, id, outcome) {
+        object.forward(server, received_at, outcome);
     }
 }
 
@@ -988,6 +1015,78 @@ mod tests {
                 BlockAnnouncement::Silent,
                 BlockAnnouncement::Silent
             ]
+        );
+    }
+
+    /// A block IGNOREd for its payload hash had a valid signature, so its slot
+    /// and proposer are marked seen: another block for them is IGNOREd by the
+    /// cheap checks, before any signature or hash work, and a later `Accept`
+    /// for them is `AlreadySeen`. So is a later mismatch, which was checked
+    /// concurrently and lost the race to the first.
+    #[tokio::test]
+    async fn a_payload_hash_mismatch_marks_its_slot_and_proposer_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let block = |root: u8| Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(root),
+        };
+        let mismatch = Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch);
+
+        assert_eq!(settle(&mut server, mismatch, &block(1)), mismatch);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis() as u64;
+        let second = fulu_block(5, 1);
+        assert_eq!(
+            gossip::block::cheap_checks(&server.seen_blocks, &server.store, &second, now_ms),
+            Err(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &block(2)),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        assert_eq!(
+            settle(&mut server, mismatch, &block(3)),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+    }
+
+    /// A block whose payload block hash is not its header's ends in
+    /// `Ignore(PayloadBlockHashMismatch)`, which neither relays it nor hands
+    /// it to the chain actor. `Ignore(Overloaded)` is the one ignore that
+    /// still forwards a block, and only from `spawn_stateful_checks`, when no
+    /// permit was free and no check ran.
+    #[tokio::test]
+    async fn a_block_with_a_mismatched_payload_hash_is_not_imported_from_gossip() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain::default());
+        server.blockchain = Some(chain.clone());
+        let id = |byte: u8| GossipId {
+            message_id: MessageId::new(&[byte]),
+            propagation_source: PeerId::random(),
+            received_at: Instant::now(),
+            kind: "beacon_block",
+        };
+        let block = |slot| Validated::Block {
+            block: Box::new(fulu_block(slot, 1)),
+            block_root: Root::repeat_byte(slot as u8),
+        };
+
+        let mismatch = Outcome::Ignore(IgnoreReason::PayloadBlockHashMismatch);
+        assert!(matches!(
+            disposition(mismatch),
+            (MessageAcceptance::Ignore, false)
+        ));
+        conclude(&mut server, id(1), mismatch, block(5));
+        assert!(chain.announcements.lock().unwrap().is_empty());
+
+        // The same path does forward an accepted block.
+        conclude(&mut server, id(2), Outcome::Accept, block(6));
+        assert_eq!(
+            *chain.announcements.lock().unwrap(),
+            [BlockAnnouncement::Announce]
         );
     }
 

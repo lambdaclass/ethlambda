@@ -626,6 +626,24 @@ pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
         .inc();
 }
 
+static LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        register_int_counter_vec!(
+            "lean_beacon_payload_block_hash_mismatch_total",
+            "Signed execution payloads whose block hash is not the hash of the header rebuilt from their fields, by kind (block: a gossip block, IGNOREd; envelope: counted, not refused)",
+            &["kind"]
+        )
+        .unwrap()
+    },
+);
+
+/// Count one signed payload whose block hash is not its header's.
+pub fn inc_beacon_payload_block_hash_mismatch(kind: &str) {
+    LEAN_BEACON_PAYLOAD_BLOCK_HASH_MISMATCH_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
 pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }

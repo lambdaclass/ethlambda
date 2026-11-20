@@ -196,6 +196,13 @@ pub enum IgnoreReason {
     AlreadyExiting,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
+    /// A signed block's execution payload `block_hash` is not the hash of the
+    /// execution block header rebuilt from the payload's own fields. A rule
+    /// the specification does not have, run in p2p once the proposer's
+    /// signature has verified: see `docs/spec_deviations.md`. IGNORE rather
+    /// than REJECT because other clients forward such a block, and a REJECT
+    /// would score every honest peer that relayed it.
+    PayloadBlockHashMismatch,
 }
 
 impl IgnoreReason {
@@ -238,6 +245,7 @@ impl IgnoreReason {
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
+            Self::PayloadBlockHashMismatch => "payload_block_hash_mismatch",
         }
     }
 }

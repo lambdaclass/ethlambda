@@ -32,6 +32,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use tracing::{debug, error, warn};
 
+use crate::beacon::payload_hash::{self, EnvelopeSource};
 use crate::{P2PServer, metrics};
 
 /// Whether a fetched envelope goes to the chain actor.
@@ -48,10 +49,13 @@ fn judge(store: &Store, envelope: &SignedExecutionPayloadEnvelope) -> Outcome {
     // A fresh, empty cache: a fetched envelope is not a gossip duplicate of
     // anything, so the cache's one rule never fires.
     let seen = SeenEnvelopes::new(NonZeroUsize::MIN);
-    match cheap_checks(&seen, store, envelope) {
-        Ok(()) => stateful_checks(store, envelope),
-        Err(outcome) => outcome,
+    if let Err(outcome) = cheap_checks(&seen, store, envelope) {
+        return outcome;
     }
+    // The payload block hash rule the gossip topic runs too, after the
+    // builder's signature verified. Counted, never refused, for gloas.
+    let outcome = stateful_checks(store, envelope);
+    payload_hash::envelope_verdict(outcome, envelope, EnvelopeSource::Fetch)
 }
 
 /// Run the gossip rules on `envelopes` and send the chain actor the ones that

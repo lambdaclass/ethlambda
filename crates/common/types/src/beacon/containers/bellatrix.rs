@@ -117,6 +117,34 @@ pub struct ExecutionPayload {
     pub transactions: Transactions,
 }
 
+/// The specification's `ExecutionPayload()`: every field zero or empty, which
+/// is what a bellatrix block proposed before the merge carries.
+///
+/// Written out rather than derived because `logs_bloom` is an [`SszVector`],
+/// which libssz gives no `Default` (a vector can never validly be empty), so
+/// its all-zero value is built at its exact length.
+impl Default for ExecutionPayload {
+    fn default() -> Self {
+        Self {
+            parent_hash: ExecutionBlockHash::ZERO,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                .expect("BYTES_PER_LOGS_BLOOM zeros fit LogsBloom's exact length"),
+            prev_randao: Bytes32::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: ExecutionBlockHash::ZERO,
+            transactions: Default::default(),
+        }
+    }
+}
+
 /// An [`ExecutionPayload`] with its transaction list replaced by a merkle
 /// root, so [`BeaconState::latest_execution_payload_header`] can commit to
 /// the previous payload without the state growing with every transaction
@@ -197,17 +225,11 @@ pub struct BeaconBlockBody {
 }
 
 impl BeaconBlockBody {
-    /// An empty body: no operations of any kind, and an all-zero execution
-    /// payload.
-    ///
-    /// Not `#[derive(Default)]`, unlike phase0's and altair's bodies (which
-    /// have no execution payload to build): `execution_payload.logs_bloom` is
-    /// an [`SszVector`], and unlike a list, a vector can never validly be
-    /// empty, so libssz gives it no `Default` impl. Its all-zero value is
-    /// built explicitly at its exact length instead, the same construction
-    /// `state_transition::beacon::upgrade`'s
-    /// `empty_bellatrix_execution_payload_header` uses for the header shape
-    /// of the same payload.
+    /// An empty body: no operations of any kind, and the all-zero execution
+    /// payload ([`ExecutionPayload`]'s `Default`, what a pre-merge block
+    /// carries; `state_transition::beacon::upgrade`'s
+    /// `empty_bellatrix_execution_payload_header` builds the header shape of
+    /// the same value).
     pub fn empty() -> Self {
         Self {
             randao_reveal: Default::default(),
@@ -219,23 +241,7 @@ impl BeaconBlockBody {
             deposits: Default::default(),
             voluntary_exits: Default::default(),
             sync_aggregate: Default::default(),
-            execution_payload: ExecutionPayload {
-                parent_hash: ExecutionBlockHash::ZERO,
-                fee_recipient: ExecutionAddress::ZERO,
-                state_root: Bytes32::ZERO,
-                receipts_root: Bytes32::ZERO,
-                logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
-                    .expect("BYTES_PER_LOGS_BLOOM zeros fit LogsBloom's exact length"),
-                prev_randao: Bytes32::ZERO,
-                block_number: 0,
-                gas_limit: 0,
-                gas_used: 0,
-                timestamp: 0,
-                extra_data: Default::default(),
-                base_fee_per_gas: Uint256::ZERO,
-                block_hash: ExecutionBlockHash::ZERO,
-                transactions: Default::default(),
-            },
+            execution_payload: ExecutionPayload::default(),
         }
     }
 }

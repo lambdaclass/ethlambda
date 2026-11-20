@@ -1780,6 +1780,24 @@ mod tests {
         ));
     }
 
+    /// Triage never hashes a payload: an envelope whose block hash is not its
+    /// header's still goes on to the stateful checks, where the payload hash
+    /// is looked at only after the builder's signature verified.
+    #[tokio::test]
+    async fn a_wrong_payload_block_hash_is_not_judged_in_triage() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let envelope = crate::test_support::envelope(1, 3);
+        assert!(
+            crate::beacon::payload_hash::verify_envelope(&envelope).is_err(),
+            "the test envelope's block hash is arbitrary"
+        );
+
+        assert!(matches!(
+            triage_envelope(&server, &envelope.to_ssz()),
+            Dispatch::Validate(Validated::Envelope(_))
+        ));
+    }
+
     /// A payload attestation for a slot before gloas is rejected by the cheap
     /// checks; mainnet's gloas epoch is not zero, so slot zero is before it.
     #[tokio::test]
