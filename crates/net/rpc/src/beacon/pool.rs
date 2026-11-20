@@ -653,8 +653,10 @@ async fn get_aggregate_attestation(
     }
     // The pool holds electra-shaped votes; a slot from gloas on is served the
     // same vote in gloas's container, whose JSON is the same shape. EIP-8483
-    // keeps that container. PQ replaces it, but no PQ vote reaches the pool:
-    // `header_matches_slot` leaves no version that submits at a PQ slot.
+    // keeps that container. PQ replaces it, but its votes never reach this
+    // pool: the pq header submits them to `pq_signature_pool`
+    // (`post_pq_attestations`), and a PQ slot is answered by
+    // `get_pq_aggregate` above.
     let data = if fork >= ForkName::Gloas {
         serde_json::json!(gloas::Attestation::from(&aggregate))
     } else {
@@ -1386,8 +1388,9 @@ mod tests {
 
     /// The forks after gloas build on it, so their slots are gloas slots, not
     /// electra ones: a vote there under fulu's header is refused rather than
-    /// judged by electra's rules. Gloas's header names a different fork, and
-    /// the node follows neither EIP-8483 nor PQ, so no header submits there.
+    /// judged by electra's rules. Gloas's header names a different fork too:
+    /// a PQ vote is PQ's own container, which only the pq header submits
+    /// (`post_pq_attestations`).
     #[tokio::test]
     async fn no_header_submits_at_a_slot_after_gloas() {
         let schedules: [&[ForkName]; 2] = [

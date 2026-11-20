@@ -22,7 +22,7 @@ follows PQ** (`ForkName::is_followed`): it imports PQ blocks and envelopes
 from gossip and req/resp, applies PQ aggregates and payload attestations to
 fork choice, and asks its execution client about PQ payloads. It was run
 next to Lighthouse's PQ client on a PQ-at-genesis devnet
-([`tooling/pq-devnet`](../tooling/pq-devnet/README.md)). Its validator
+(`tooling/pq-devnet/README.md`). Its validator
 client runs every PQ duty (attest, aggregate, the PTC vote, propose and
 reveal the payload), and the beacon node builds PQ blocks with their
 attestations' proofs merged: see [Validator duties](#validator-duties). It
@@ -62,9 +62,9 @@ changes.
 | Engine | `beacon_engine::gloas_new_payload_request` | each fork's typed requests list to `engine_newPayloadV5`, `engine_forkchoiceUpdatedV4` for a PQ head |
 | Genesis | `genesis_anchor_block` | the body carries the state's bid from gloas on, as the specification's genesis helper and ethpandaops' generator build it |
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
-| Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; no blobs. Every block it built on the devnet was canonical on Lighthouse |
-| VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each committing to its slot's secret; known answers from an independent transcription of the specification |
-| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; aggregators staggered by seat; run on the devnet before the VRF change (see [the devnet's limits](../tooling/pq-devnet/README.md#known-limits)) |
+| Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; blobs, their columns gossiped with the envelope. Every block it built on the devnet was canonical on Lighthouse |
+| VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each committing to its slot's secret; known answers from an independent transcription of the specification. Restorable from a compact state (root and leaf 0's branch), which `ethlambda pq-keys` writes for a genesis |
+| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; aggregators staggered by seat; run on the devnet before the VRF change (see "Known limits" in `tooling/pq-devnet/README.md`) |
 | Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
 | Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
@@ -96,17 +96,21 @@ Every reshaped topic decodes by its topic's digest into PQ's container
 The rules are gloas's with only the `[Modified in PQ]` and `[New in PQ]` lines
 applied; see `docs/spec_deviations.md`. A rule that needs a PQ state (every
 stateful one) ignores the message when the state it reads is of another fork,
-which on a live node is always: the node imports no PQ block. So the cheap
-rules judge what arrives on a PQ digest a network schedules, and the rest end
-in an ignore. An accepted message is relayed and recorded in the seen caches
-the other forks share (bids and preferences in a PQ builder market of their
-own, which block production never reads), and goes no further: no pool, event
-stream or chain actor takes one. A message that does not decode as PQ's
-container is ignored, not rejected, as on every topic of a fork the node does
-not follow.
+as around the boundary into PQ. An accepted message is relayed, recorded in
+the seen caches the other forks share, and handed on: an aggregate to fork
+choice and to the pool PQ block production packs from
+(`Store::pq_aggregate_pool`), an attestation's signature to the committees
+this node's aggregators registered (`Store::pq_signature_pool`), a payload
+attestation or an envelope to the chain actor, and a bid or preferences to
+the PQ builder market, which PQ block production does not read yet (it
+self-builds). Slashings are relayed only, and no accepted PQ message raises an
+event. A message that does not decode as PQ's container is ignored, not
+rejected, as on every topic of a fork the node does not follow.
 
 Blocks, data column sidecars and the topic set the node holds keep the shared
-path. A block of a fork the node does not follow is ignored before any rule.
+path: a PQ block's columns are judged against its bid's commitments, as a
+gloas block's are. A block of a fork the node does not follow is ignored
+before any rule.
 
 ## The XMSS scheme
 
@@ -281,12 +285,26 @@ trees per key, which takes under a minute for 16 validators.
 
 The VRF tree takes minutes per key (see [The VRF tree](#the-vrf-tree)) and
 only a proposal reads it, so the keys attest at once and a background thread
-hashes the trees one after another. It keeps the `2^15` nodes 16 levels above
-the leaves (1 MiB a key, commitments only, so no secret) in
-`<validators-dir>/pq_vrf_trees/0x<bls pubkey>.bin`, from which a restart
-restores the tree after checking it against the seed and its stored root. A
-proof rebuilds one `2^16`-leaf subtree, about 30 ms. A proposal that falls
-before its key's tree is ready is missed (`the VRF tree is still being
+prepares the trees one after another, each from the first source that has
+it:
+
+1. The tree a previous start stored in
+   `<validators-dir>/pq_vrf_trees/0x<bls pubkey>.bin`, checked against the
+   seed and its stored root.
+2. With `--vrf-state-url` (a URL or a path), the key's record in a file of
+   precomputed states, read at its validator index: ethereum-package's
+   `vrf_state_url` format, 1028 bytes a validator (the root, four zero
+   bytes, then leaf 0's branch), which `ethlambda pq-keys` writes. The
+   record must fold the key's own leaf 0 to its root, so a record of another
+   validator's, or of another VRF rule's, falls through to the next source.
+   A proof then hashes only the leaves below the slot's highest bit, a few
+   milliseconds on a young chain.
+3. The whole tree, hashed. It keeps the `2^15` nodes 16 levels above the
+   leaves (1 MiB, commitments only, so no secret), and a proof rebuilds one
+   `2^16`-leaf subtree, about 30 ms.
+
+Whatever the source, the tree is stored for the next start. A proposal that
+falls before its key's tree is ready is missed (`the VRF tree is still being
 hashed`).
 
 Each duty signs at the leaf the fork assigns it (see [Leaves](#leaves)): the
@@ -311,6 +329,16 @@ proposals, the two that slashing punishes.
   the most valuable single-committee attestation alone, whose proof is the
   block's as it is. On the devnet's VM a two-child merge takes about four
   seconds, for Lighthouse too, so blocks there carry one attestation each.
+  A payload with blobs keeps them on the node that built it, and the
+  envelope's publication builds the data columns from them and gossips them
+  with it (PQ keeps gloas's sidecar).
+- **Proposer preferences**: from the epoch before a proposal, signed with
+  leanXMSS at the proposal slot's preferences leaf, over gloas's signing root,
+  and submitted under the `pq` header; the node judges them by gloas's rules
+  over its PQ builder market and gossips them. A slot's leaf takes one
+  message, so the client signs a slot's preferences once: a reorg that moves
+  the dependent root leaves the slot without preferences rather than with
+  two, as `pq/p2p-interface.md` asks.
 - **Aggregating**: a PQ aggregator is a member of its committee's
   aggregation committee, which the attester duties report as
   `is_aggregator`, with its seat in it as `aggregator_position`. The seats
@@ -375,19 +403,17 @@ generated.
 - The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
   `DiscoveryServer` cannot replace the served record at runtime (the same gap
   as its `eth2` entry, see `CLAUDE.md`).
-- Blobs in PQ block production: a payload with blobs is refused, since the
-  envelope's column sidecars are not built for PQ yet.
 - Merging ahead of a proposal: the aggregates a slot-`N` block may pack are
   all known a slot earlier, so a node could merge during slot `N - 1` for a
   proposer it serves, where today a slow merge costs every attestation but
   one.
-- A persistent leaf record for the aggregate, PTC and envelope leaves, which
-  slashing protection does not cover.
-- A devnet on `b5d422b2`'s VRF rule: neither ethPandaOps' genesis generator
-  nor Lighthouse's PQ branch registers its roots yet (see
-  [the devnet's limits](../tooling/pq-devnet/README.md#known-limits)).
-- Loading VRF tree states published beside a network's keys (ethereum-package
-  ships them for consensoor and Lodestar) instead of hashing every tree once.
+- Interop on `b5d422b2`'s VRF rule: neither ethPandaOps' genesis generator
+  nor Lighthouse's PQ branch uses it yet, so the published key and state
+  files fail `is_valid_vrf_proof`, and a network with Lighthouse cannot run.
+  An ethlambda-only network runs on files `ethlambda pq-keys` writes (see
+  `tooling/pq-devnet/README.md`).
+- PQ block production does not weigh builder bids: it self-builds, and the
+  PQ builder market it would read is filled but unused.
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ
   key's request form: still correct (every candidate is verified, and a miss
   scans), but every PQ lookup scans.
