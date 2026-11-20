@@ -124,6 +124,15 @@ pub struct MockBeaconNode {
     /// records its batch, so a test releases calls one at a time instead of
     /// guessing how long a delay must be.
     pub registration_gate: Option<Arc<Semaphore>>,
+    /// When set, each `prepare_beacon_proposer` call takes a permit before it
+    /// records its preparations and answers, as a slow node does, for as long
+    /// as the test holds it back.
+    pub preparation_gate: Option<Arc<Semaphore>>,
+    /// Notified when `prepare_beacon_proposer` is called, before the gate.
+    /// Every call stores a permit (`notify_one`), so a test that awaits it
+    /// must not make an earlier call it does not mean to wait for: that call's
+    /// permit would answer the wait.
+    pub preparation_entered: Arc<Notify>,
     /// Every blinded block published, as (fork, body).
     pub published_blinded: Mutex<Vec<(ForkName, Vec<u8>)>>,
     /// What `publish_blinded_block` reports. `None` is `Ok(HandedToBuilder)`;
@@ -429,6 +438,13 @@ impl MockBeaconNode {
     /// before it records its batch.
     pub fn with_registration_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.registration_gate = Some(gate);
+        self
+    }
+
+    /// Make each `prepare_beacon_proposer` call wait for a permit from `gate`
+    /// before it records its preparations.
+    pub fn with_preparation_gate(mut self, gate: Arc<Semaphore>) -> Self {
+        self.preparation_gate = Some(gate);
         self
     }
 
@@ -1226,6 +1242,13 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn prepare_beacon_proposer(&self, preparations: &[ProposerPreparationDto]) -> Result<()> {
         self.guard("prepare_beacon_proposer")?;
+        self.preparation_entered.notify_one();
+        if let Some(gate) = &self.preparation_gate {
+            gate.acquire()
+                .await
+                .expect("the gate is never closed")
+                .forget();
+        }
         self.preparations
             .lock()
             .expect("lock")
