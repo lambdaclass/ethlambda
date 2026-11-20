@@ -2644,6 +2644,7 @@ mod tests {
             proposer_index,
             committees,
             &ActiveBalanceCache::default(),
+            None,
             &mut signatures,
         )?;
         signatures.verify()?;
