@@ -348,32 +348,35 @@ pub fn process_randao(
     verification: RandaoVerification,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    // Two spans around the batch check rather than one over all of it: the
-    // check is observed as `batch_signatures`, and nesting it inside `randao`
-    // would charge the same seconds to both.
-    let epoch = timed(StfPhase::Randao, || -> Result<_> {
-        let epoch = get_current_epoch(state);
-        let proposer_index = get_beacon_proposer_index(state)?;
-        if verification == RandaoVerification::Verify {
-            let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
-            let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
-            let proposer = state.validator(proposer_index)?;
-            signatures.push(
-                SignatureSet::single(&proposer.pubkey, signing_root, randao_reveal),
-                "RANDAO reveal signature",
-            )?;
-        }
-        Ok(epoch)
-    })?;
+    timed(StfPhase::Randao, || {
+        apply_randao(state, randao_reveal, verification, signatures)
+    })
+}
+
+fn apply_randao(
+    state: &mut BeaconState,
+    randao_reveal: &BlsSignature,
+    verification: RandaoVerification,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
+    let epoch = get_current_epoch(state);
+    let proposer_index = get_beacon_proposer_index(state)?;
+    let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
+    let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
+
+    let proposer = state.validator(proposer_index)?;
     if verification == RandaoVerification::Verify {
+        signatures.push(
+            SignatureSet::single(&proposer.pubkey, signing_root, randao_reveal),
+            "RANDAO reveal signature",
+        )?;
         signatures.verify_pending()?;
     }
-    timed(StfPhase::Randao, || {
-        let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
-        let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
-        state.randao_mixes_mut()[position] = mix;
-        Ok(())
-    })
+
+    let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
+    let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+    state.randao_mixes_mut()[position] = mix;
+    Ok(())
 }
 
 /// Records the block's eth1 vote, adopting it once it holds a majority within

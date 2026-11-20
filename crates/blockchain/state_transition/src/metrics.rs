@@ -371,16 +371,40 @@ pub fn observe_stf_phase(phase: StfPhase, elapsed: std::time::Duration) {
         .observe(elapsed.as_secs_f64());
 }
 
+thread_local! {
+    /// Seconds of `batch_signatures` this thread has observed. A step that
+    /// runs a batch check inside its own span (RANDAO, the gloas bid, a
+    /// slashing, an exit, a BLS change: each verifies everything pending
+    /// before it writes) subtracts what accrued during the span, so the check
+    /// is charged to `batch_signatures` alone and the phases still add up.
+    static BATCH_SIGNATURES_SECONDS: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Observe one signature batch check of `elapsed` as `batch_signatures`, and
+/// take it out of whichever timed step it ran inside.
+pub fn observe_batch_signatures(elapsed: std::time::Duration) {
+    observe_stf_phase(StfPhase::BatchSignatures, elapsed);
+    BATCH_SIGNATURES_SECONDS.with(|total| total.set(total.get() + elapsed));
+}
+
+fn batch_signatures_so_far() -> std::time::Duration {
+    BATCH_SIGNATURES_SECONDS.with(|total| total.get())
+}
+
 /// Run `step`, observing its duration as `phase`: one `Instant` pair, however
-/// long the step.
+/// long the step. Any batch check inside it is left out (see
+/// [`observe_batch_signatures`]).
 ///
 /// A step that fails inside `step` is observed too, since the closure returns
 /// before the observation. That is deliberate: a rejected block's cost is
 /// still cost.
 pub fn timed<T>(phase: StfPhase, step: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
+    let batch_before = batch_signatures_so_far();
     let result = step();
-    observe_stf_phase(phase, started.elapsed());
+    let nested = batch_signatures_so_far().saturating_sub(batch_before);
+    observe_stf_phase(phase, started.elapsed().saturating_sub(nested));
     result
 }
 
@@ -400,16 +424,21 @@ where
     I: IntoIterator,
 {
     let mut started = None;
+    let mut batch_before = std::time::Duration::ZERO;
     let mut outcome = Ok(());
     for item in items {
-        started.get_or_insert_with(std::time::Instant::now);
+        started.get_or_insert_with(|| {
+            batch_before = batch_signatures_so_far();
+            std::time::Instant::now()
+        });
         outcome = step(item);
         if outcome.is_err() {
             break;
         }
     }
     if let Some(started) = started {
-        observe_stf_phase(phase, started.elapsed());
+        let nested = batch_signatures_so_far().saturating_sub(batch_before);
+        observe_stf_phase(phase, started.elapsed().saturating_sub(nested));
     }
     outcome
 }
