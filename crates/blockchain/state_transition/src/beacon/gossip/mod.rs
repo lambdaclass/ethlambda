@@ -124,7 +124,7 @@ pub enum IgnoreReason {
     NoConsumer,
     /// Every stateful-validation permit was taken.
     Overloaded,
-    /// Validation panicked.
+    /// Validation panicked, or a store read it needed failed.
     Internal,
     /// The message's own fork is one this build does not validate or decode
     /// (currently gloas): not the sender's fault, and not malformed, so this
