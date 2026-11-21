@@ -4,11 +4,18 @@
 # a network scheduling the PQ fork. Built from the revision ethlambda's client
 # crate pins (`ethlambda_crypto::stark::sidecar::LEANVM_REV`, bindings v0.15.0,
 # the release pq-devnet-0 runs): a proof only verifies with the same verifier.
+# leanVM's own .cargo/config.toml builds with `-C target-cpu=native`, which on
+# CI's arm64 runner (Neoverse, with SVE) gives a binary that dies with SIGILL
+# on Apple silicon, and on an amd64 runner with AVX-512 one that dies on hosts
+# without it. ethlambda's config replaces it, so the sidecar gets the node's
+# own portable CPU baseline (and the carryless-multiply features leanVM needs).
 FROM rust:1.97-bookworm AS sidecar
 ARG LEANVM_REV=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764
+COPY .cargo/config.toml /ethlambda-cargo-config.toml
 RUN git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
     && cd /leanVM \
     && git checkout -q ${LEANVM_REV} \
+    && cp /ethlambda-cargo-config.toml .cargo/config.toml \
     && cargo build --release -p leanvm-sidecar --features experimental_prover \
     && cp target/release/leanvm-sidecar /leanvm-sidecar
 
