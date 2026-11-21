@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-bcc78702.js";
+            window.path_to_searchindex_js = "searchindex-2384e716.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -2843,7 +2843,10 @@ and on <code>Queue</code>, since the actor holds an envelope whose block is not 
 yet. A payload attestation is validated on the attestation permit pool and goes
 to the actor on <code>Accept</code> only: a vote for a block not imported here is dropped,
 since it is valid only within its own slot. Bids and preferences are the
-builder market: they never reach the chain actor. Their rules live in
+builder market: they never reach the chain actor, which only hears, by
+proposal slot, that preferences were accepted (from gossip or the Beacon API),
+since its <code>payload_attributes</code> event carries the fee recipient and gas target
+they name. Their rules live in
 <code>state_transition::beacon::gossip::{execution_payload_bid, proposer_preferences}</code>,
 the cheap half runs in p2p’s triage (<code>p2p/src/beacon/builder_market.rs</code>) and the
 stateful half on a permit pool of their own (<code>builder_validation_permits</code>), so
@@ -4483,6 +4486,7 @@ from a normal build.</p>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
+<tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). Lighthouse’s flag of the same name</td></tr>
 <tr><td><code>--builder</code></td><td>none</td><td>Base URL of a builder API endpoint, normally MEV-Boost (e.g. <code>http://127.0.0.1:18550</code>). Without it every block is built locally</td></tr>
 <tr><td><code>--builder-header-timeout</code></td><td><code>1000</code></td><td>Milliseconds block production waits for the builder’s bid; also sent to the builder as <code>X-Timeout-Ms</code>. Requires <code>--builder</code></td></tr>
 <tr><td><code>--builder-follow-redirects</code></td><td>off</td><td>Follow the builder’s 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where <code>--builder</code> points; on, so does any redirect it does not follow. Requires <code>--builder</code></td></tr>
@@ -6347,13 +6351,14 @@ these are ever sent:</p>
 <tr><td><code>execution_payload_bid</code></td><td><code>{"version":"gloas", "data":&lt;SignedExecutionPayloadBid&gt;}</code></td><td>A bid passed the <code>execution_payload_bid</code> gossip rules, or was accepted by <code>POST /eth/v1/beacon/execution_payload_bids</code></td></tr>
 <tr><td><code>payload_attestation_message</code></td><td><code>{"version":"gloas", "data":&lt;PayloadAttestationMessage&gt;}</code></td><td>A message passed the <code>payload_attestation_message</code> gossip rules, or was accepted by <code>POST /eth/v1/beacon/pool/payload_attestations</code></td></tr>
 <tr><td><code>proposer_preferences</code></td><td><code>{"version":"gloas", "data":&lt;SignedProposerPreferences&gt;}</code></td><td>Preferences passed the <code>proposer_preferences</code> gossip rules, or were accepted by <code>POST /eth/v1/validator/proposer_preferences</code></td></tr>
+<tr><td><code>payload_attributes</code></td><td><code>{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}</code>; from gloas, <code>parent_block_number</code> is gone and <code>safe_block_hash</code>/<code>finalized_block_hash</code> are added</td><td>The next slot’s attributes, a third of a slot before it, for a proposer registered through <code>prepare_beacon_proposer</code> (every proposer with <code>--always-prepare-payload</code>); again when an input to them changes after that point (see below)</td></tr>
 </tbody>
 </table>
 </div>
 <p>Never emitted: the operation topics (<code>voluntary_exit</code>,
 <code>proposer_slashing</code>, <code>attester_slashing</code>, <code>bls_to_execution_change</code>,
-<code>contribution_and_proof</code>: no operation pools), <code>payload_attributes</code>, the light
-client topics and <code>blob_sidecar</code>.</p>
+<code>contribution_and_proof</code>: no operation pools), the light client topics and
+<code>blob_sidecar</code>.</p>
 <p>The gloas topics and <code>single_attestation</code> are emitted by whichever part of the
 node accepted the object, since several never reach the chain actor: the actor
 publishes <code>execution_payload</code> and <code>execution_payload_available</code>; p2p publishes
@@ -6396,6 +6401,39 @@ too: gossip never delivers a node its own messages, so
 <code>POST /eth/v2/validator/aggregate_and_proofs</code> hands each accepted one to the
 actor after gossiping it. That is also what puts this node’s own aggregates
 into its fork choice.</p>
+<p>How <code>payload_attributes</code> behaves:</p>
+<ul>
+<li><strong>What it carries</strong> is what <code>produceBlockV3</code>/<code>produceBlockV4</code> would send the
+execution client for a block at <code>proposal_slot</code> on the current head, from
+the same code: the head state advanced to the slot, the fee recipient
+(gloas: the proposer’s signed preferences, else <code>prepare_beacon_proposer</code>‘s,
+else the zero address), and on gloas the parent payload fork choice selects
+(the head’s payload status, and for a head at the previous slot the PTC’s
+votes on its payload) and the preferences’ gas target. <code>payload_attributes</code>
+is the execution API’s <code>PayloadAttributesV3</code> (<code>V4</code> from gloas) in
+<code>snake_case</code> with quoted integers.</li>
+<li><strong>When</strong>: at two thirds of each slot (Lighthouse’s default
+<code>--prepare-payload-lookahead</code> of a third of a slot), then once more each time
+an input to the attributes changes before the slot ends: the head; on gloas
+the parent payload the proposal extends (the head’s payload arriving, or the
+PTC voting it late, which happens after the lookahead point) and the
+proposer’s signed preferences (from gossip or
+<code>POST /eth/v1/validator/proposer_preferences</code>); and the fee recipient
+<code>prepare_beacon_proposer</code> names, once something else re-checks. An event is
+sent only while the inputs it was computed from are still current, so a
+change while it is being computed replaces it rather than following it. A
+computation that fails is retried at the next re-check, up to three times
+for the same inputs. Not while the node is syncing, and only for slots at
+fulu or later.</li>
+<li><strong>For whom</strong>: proposers some validator client named through
+<code>prepare_beacon_proposer</code> or a builder registration, or every proposer with
+<code>beacon --always-prepare-payload</code>, which an external builder reading this
+stream (ethereum-package’s buildoor) needs.</li>
+<li><strong>Nothing reaches the execution client early.</strong> Other clients send a
+<code>forkchoiceUpdated</code> with these attributes at the same point, so the payload
+is already building when <code>produceBlock</code> arrives; this node still starts the
+build at <code>produceBlock</code>.</li>
+</ul>
 <p>Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing.</p>
 <h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
