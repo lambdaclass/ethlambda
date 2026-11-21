@@ -1,0 +1,35 @@
+# An ethlambda-only PQ-at-genesis devnet at consensus-specs pq 2f43bc0f (the
+# pq-devnet-0 spec): two ethlambda beacon nodes, each with its own ethlambda
+# validator client, on ethereum-package's published leanXMSS keys and VRF
+# roots. The validator clients read the package's published VRF tree states,
+# served from the host (see README.md, "ethlambda alone").
+participants:
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ethlambda:pq-local
+    vc_type: ethlambda
+    vc_image: ethlambda:pq-local
+    vc_extra_params:
+      - --init-slashing-protection
+      - --vrf-state-url=http://host.docker.internal:8642/b9dec4e1daa17dfe.vrf
+    validator_count: 16
+    supernode: true
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ethlambda:pq-local
+    vc_type: ethlambda
+    vc_image: ethlambda:pq-local
+    vc_extra_params:
+      - --init-slashing-protection
+      - --vrf-state-url=http://host.docker.internal:8642/b9dec4e1daa17dfe.vrf
+    validator_count: 16
+    supernode: true
+network_params:
+  preset: mainnet
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+  # The validator clients derive their leanXMSS keys at startup; genesis waits.
+  genesis_delay: 120
+additional_services:
+  - dora

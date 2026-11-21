@@ -165,6 +165,9 @@ something specific here.
 |---|---|---|
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 | `--bootnodes` | none: the network's own list alone | Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network's own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See [Bootnodes on `beacon`](#bootnodes-on-beacon) |
+| `--pq-prover-binary` | none | A `leanvm-sidecar` executable (path or name on `PATH`) the node starts itself, as Teku does: it waits for the warm-up, and the sidecar exits with the node. Listens on `--pq-prover-socket`, or `<data-dir>/pq-prover/sidecar.sock` without it, and logs to the socket's path plus `.log`. The image ships `leanvm-sidecar` |
+| `--pq-prover-threads` | `0` (one per core) | Proving threads of the sidecar `--pq-prover-binary` starts |
+| `--pq-prover-socket` | none | The Unix socket of a `leanvm-sidecar` built from leanVM `c5ee9d239` (bindings v0.15.0), which makes and checks the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ devnet's clients use. Without it the node uses the specification's reference encoding (the signatures concatenated), which only another node on the reference accepts. Read only on a network scheduling PQ. `ethlambda-pq` (`bin/ethlambda/pq/`) starts a sidecar and passes this flag |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,

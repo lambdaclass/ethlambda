@@ -129,7 +129,7 @@
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, eip8483, electra, gloas, phase0, pq, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, PubkeyIndexCache, get_beacon_proposer_index,
@@ -139,9 +139,11 @@ use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
 use ethlambda_state_transition::beacon::stf::capella as capella_stf;
 use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
+use ethlambda_state_transition::beacon::stf::eip8483 as eip8483_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
+use ethlambda_state_transition::beacon::stf::pq as pq_stf;
 use ethlambda_state_transition::beacon::stf::signatures::SignatureBatch;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
@@ -298,6 +300,26 @@ fn run(
                     block.body.hash_tree_root(),
                 )
             }
+            ForkName::Eip8483 => {
+                let block: eip8483::BeaconBlock = case.ssz("block");
+                block::process_block_header(
+                    state,
+                    block.slot,
+                    block.proposer_index,
+                    block.parent_root,
+                    block.body.hash_tree_root(),
+                )
+            }
+            ForkName::Pq => {
+                let block: pq::BeaconBlock = case.ssz("block");
+                block::process_block_header(
+                    state,
+                    block.slot,
+                    block.proposer_index,
+                    block.parent_root,
+                    block.body.hash_tree_root(),
+                )
+            }
             // No `other` arm: the patterns above already cover every `ForkName`
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
@@ -380,7 +402,7 @@ fn run(
             // accounting, EIP-7732), so this reads the case's own `meta.yaml`
             // for `parent_slot` rather than only the operation file every
             // other fork's arm reads.
-            ForkName::Gloas => {
+            ForkName::Gloas | ForkName::Eip8483 => {
                 let attestation: gloas::Attestation = case.ssz("attestation");
                 let meta: AttestationMeta = case.yaml("meta");
                 gloas_stf::process_attestation(
@@ -391,6 +413,20 @@ fn run(
                     &active_balances,
                     None,
                     signatures,
+                )
+            }
+            // No signature: the block's `proof` covers its attestations, in
+            // `process_stark`, which the operation alone does not run.
+            ForkName::Pq => {
+                let attestation: pq::Attestation = case.ssz("attestation");
+                let meta: AttestationMeta = case.yaml("meta");
+                pq_stf::process_attestation(
+                    state,
+                    &attestation,
+                    meta.parent_slot,
+                    committees,
+                    &active_balances,
+                    None,
                 )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
@@ -428,7 +464,7 @@ fn run(
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
-            ForkName::Gloas => {
+            ForkName::Gloas | ForkName::Eip8483 => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
                 gloas_stf::process_attester_slashing(
                     state,
@@ -438,6 +474,10 @@ fn run(
                     signatures,
                 )
             }
+            ForkName::Pq => {
+                let slashing: pq::AttesterSlashing = case.ssz("attester_slashing");
+                pq_stf::process_attester_slashing(state, &slashing, config, &active_balances)
+            }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
         // `ProposerSlashing` never changes shape, container included, gloas's
@@ -446,32 +486,40 @@ fn run(
         // which every earlier fork's `process_proposer_slashing` has no
         // notion of, so this alone needs the routing every other fork's
         // `proposer_slashing` handler above already has.
-        "proposer_slashing" => {
-            let slashing: shared::ProposerSlashing = case.ssz("proposer_slashing");
-            match case.fork {
-                ForkName::Phase0
-                | ForkName::Altair
-                | ForkName::Bellatrix
-                | ForkName::Capella
-                | ForkName::Deneb
-                | ForkName::Electra
-                | ForkName::Fulu => operations::process_proposer_slashing(
+        "proposer_slashing" => match case.fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => {
+                let slashing: shared::ProposerSlashing = case.ssz("proposer_slashing");
+                operations::process_proposer_slashing(
                     state,
                     &slashing,
                     config,
                     &active_balances,
                     signatures,
-                ),
-                ForkName::Gloas => gloas_stf::process_proposer_slashing(
-                    state,
-                    &slashing,
-                    config,
-                    &active_balances,
-                    signatures,
-                ),
-                ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
+                )
             }
-        }
+            ForkName::Gloas | ForkName::Eip8483 => {
+                let slashing: shared::ProposerSlashing = case.ssz("proposer_slashing");
+                gloas_stf::process_proposer_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
+            }
+            // XMSS-signed headers, a container of the PQ fork's own.
+            ForkName::Pq => {
+                let slashing: pq::ProposerSlashing = case.ssz("proposer_slashing");
+                pq_stf::process_proposer_slashing(state, &slashing, config, &active_balances)
+            }
+            ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
+        },
         "deposit" => match case.fork {
             // The `Deposit` container never changes shape; through deneb a
             // deposit's amount is credited the moment it is processed.
@@ -498,10 +546,10 @@ fn run(
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
-            ForkName::Gloas => Err(
+            fork @ (ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq) => Err(
                 ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                     function: "deposit",
-                    fork: ForkName::Gloas,
+                    fork,
                 },
             ),
             ForkName::Lean => lean_is_not_a_fixture_fork("deposit"),
@@ -530,7 +578,7 @@ fn run(
             // limits are read by `crate::beacon::helpers::electra::compute_exit_epoch_and_update_churn`
             // dispatching on the state's own fork, not by a gloas copy of
             // `process_voluntary_exit`; see that function's own doc).
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(
                     state,
@@ -539,6 +587,11 @@ fn run(
                     &active_balances,
                     signatures,
                 )
+            }
+            // The PQ fork's exits are execution-layer requests
+            // (`voluntary_exit_request` below).
+            ForkName::Pq => {
+                return Err("voluntary_exit has no handler for fork `pq`".to_string());
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
@@ -621,10 +674,10 @@ fn run(
                         "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
-                ForkName::Gloas => Err(
+                fork @ (ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq) => Err(
                     ethlambda_state_transition::beacon::Error::UnsupportedForFork {
                         function: "execution_payload",
-                        fork: ForkName::Gloas,
+                        fork,
                     },
                 ),
                 ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
@@ -671,28 +724,59 @@ fn run(
             // its `payload` parameter entirely, since withdrawals are now
             // deterministic from the state alone. This is the one fork whose
             // arm reads no operation file at all.
-            ForkName::Gloas => gloas_stf::process_withdrawals(state),
+            ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
+                gloas_stf::process_withdrawals(state)
+            }
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // New in gloas (EIP-7732): the block's binding commitment to a
         // builder's payload.
-        "execution_payload_bid" => {
-            let signed_bid: gloas::SignedExecutionPayloadBid = case.ssz("execution_payload_bid");
-            gloas_stf::process_execution_payload_bid(state, &signed_bid, config, signatures)
-        }
+        "execution_payload_bid" => match case.fork {
+            ForkName::Pq => {
+                let signed_bid: pq::SignedExecutionPayloadBid = case.ssz("execution_payload_bid");
+                pq_stf::process_execution_payload_bid(state, &signed_bid, config)
+            }
+            _ => {
+                let signed_bid: gloas::SignedExecutionPayloadBid =
+                    case.ssz("execution_payload_bid");
+                gloas_stf::process_execution_payload_bid(state, &signed_bid, config, signatures)
+            }
+        },
         // New in gloas (EIP-7732): the *next* block's processing of the
         // previous slot's payload, so the fixture's operation file is a whole
         // `BeaconBlock`, named `block` like `block_header`'s.
-        "parent_execution_payload" => {
-            let block: gloas::BeaconBlock = case.ssz("block");
-            gloas_stf::process_parent_execution_payload(
-                state,
-                &block,
-                config,
-                &active_balances,
-                &pubkey_indices,
-            )
-        }
+        "parent_execution_payload" => match case.fork {
+            ForkName::Eip8483 => {
+                let block: eip8483::BeaconBlock = case.ssz("block");
+                eip8483_stf::process_parent_execution_payload(
+                    state,
+                    &block,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            }
+            ForkName::Pq => {
+                let block: pq::BeaconBlock = case.ssz("block");
+                pq_stf::process_parent_execution_payload(
+                    state,
+                    &block,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            }
+            _ => {
+                let block: gloas::BeaconBlock = case.ssz("block");
+                gloas_stf::process_parent_execution_payload(
+                    state,
+                    &block,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            }
+        },
         // `consolidation_request` and `withdrawal_request` are new in
         // electra, alongside `withdrawals`; neither fulu's nor gloas's own
         // specification lists either as modified (gloas's own
@@ -704,13 +788,23 @@ fn run(
         // match is needed for either the type or the call.
         "consolidation_request" => {
             let request: electra::ConsolidationRequest = case.ssz("consolidation_request");
-            electra_stf::process_consolidation_request(
-                state,
-                &request,
-                config,
-                &active_balances,
-                &pubkey_indices,
-            )
+            if case.fork == ForkName::Pq {
+                pq_stf::process_consolidation_request(
+                    state,
+                    &request,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            } else {
+                electra_stf::process_consolidation_request(
+                    state,
+                    &request,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            }
         }
         // `deposit_request` is new in electra too, but fulu's specification
         // does list a modified version (`beacon-chain.md`'s "Modified
@@ -726,9 +820,13 @@ fn run(
         // so far, since pyspec's own genesis for both already sets that
         // field, but it is not the function either fork's specification names.
         "deposit_request" => match case.fork {
-            ForkName::Fulu | ForkName::Gloas => {
+            ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 => {
                 let request: electra::DepositRequest = case.ssz("deposit_request");
                 fulu_stf::process_deposit_request(state, &request)
+            }
+            ForkName::Pq => {
+                let request: electra::DepositRequest = case.ssz("deposit_request");
+                pq_stf::process_deposit_request(state, &request)
             }
             ForkName::Phase0
             | ForkName::Altair
@@ -743,13 +841,23 @@ fn run(
         },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");
-            electra_stf::process_withdrawal_request(
-                state,
-                &request,
-                config,
-                &active_balances,
-                &pubkey_indices,
-            )
+            if case.fork == ForkName::Pq {
+                pq_stf::process_withdrawal_request(
+                    state,
+                    &request,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            } else {
+                electra_stf::process_withdrawal_request(
+                    state,
+                    &request,
+                    config,
+                    &active_balances,
+                    &pubkey_indices,
+                )
+            }
         }
         // New in gloas (EIP-8282): the builder registry's own onboarding and
         // exit requests, applied by `apply_parent_execution_payload` the same
@@ -757,11 +865,54 @@ fn run(
         // requests are.
         "builder_deposit_request" => {
             let request: gloas::BuilderDepositRequest = case.ssz("builder_deposit_request");
-            gloas_stf::process_builder_deposit_request(state, &request, config)
+            if case.fork == ForkName::Pq {
+                pq_stf::process_builder_deposit_request(state, &request, config)
+            } else {
+                gloas_stf::process_builder_deposit_request(state, &request, config)
+            }
         }
         "builder_exit_request" => {
             let request: gloas::BuilderExitRequest = case.ssz("builder_exit_request");
-            gloas_stf::process_builder_exit_request(state, &request, config)
+            if case.fork == ForkName::Pq {
+                pq_stf::process_builder_exit_request(state, &request, config)
+            } else {
+                gloas_stf::process_builder_exit_request(state, &request, config)
+            }
+        }
+        // New in EIP-8483: the post-quantum material the PQ fork adopts.
+        "validator_pq_registration_request" => {
+            let request: eip8483::ValidatorPqRegistrationRequest =
+                case.ssz("validator_pq_registration_request");
+            eip8483_stf::process_validator_pq_registration_request(state, &request)
+        }
+        "builder_pq_registration_request" => {
+            let request: eip8483::BuilderPqRegistrationRequest =
+                case.ssz("builder_pq_registration_request");
+            eip8483_stf::process_builder_pq_registration_request(state, &request)
+        }
+        // New in PQ (preregistrations from EIP-8205, exits moved to the
+        // execution layer).
+        "validator_preregistration_request" => {
+            let request: pq::ValidatorPreregistrationRequest =
+                case.ssz("validator_preregistration_request");
+            pq_stf::process_validator_preregistration_request(state, &request)
+        }
+        "builder_preregistration_request" => {
+            let request: pq::BuilderPreregistrationRequest =
+                case.ssz("builder_preregistration_request");
+            pq_stf::process_builder_preregistration_request(state, &request)
+        }
+        "voluntary_exit_request" => {
+            let request: pq::VoluntaryExitRequest = case.ssz("voluntary_exit_request");
+            pq_stf::process_voluntary_exit_request(state, &request, config, &active_balances)
+        }
+        "randao" if case.fork == ForkName::Pq => {
+            let body: pq::BeaconBlockBody = case.ssz("body");
+            pq_stf::process_randao(
+                state,
+                &body.randao_reveal,
+                ethlambda_state_transition::beacon::stf::block::RandaoVerification::Verify,
+            )
         }
         // New in gloas (EIP-7732): the payload timeliness committee's vote on
         // whether the *previous* slot's payload showed up on time.

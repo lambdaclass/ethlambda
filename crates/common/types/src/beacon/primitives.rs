@@ -21,6 +21,7 @@ use core::{cmp::Ordering, fmt};
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
+pub use super::constants::{XMSS_PUBKEY_SIZE, XMSS_SIGNATURE_SIZE};
 use super::serde_helpers::HexPrefixed;
 pub use crate::primitives::{H256, HashTreeRoot};
 
@@ -416,6 +417,76 @@ impl fmt::Debug for BlsSignature {
     }
 }
 
+/// A leanXMSS public key (the PQ fork's `XMSSPubkey`): the top tree's Merkle
+/// root followed by the public parameter, 16 bytes each.
+///
+/// The SSZ shape of a `Bytes32`, and a separate type from [`Root`] so a key
+/// and a root cannot be passed for one another.
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, SszEncode, SszDecode, HashTreeRoot,
+)]
+#[ssz(transparent)]
+pub struct XmssPubkey(pub [u8; XMSS_PUBKEY_SIZE]);
+
+impl XmssPubkey {
+    /// The 48-byte form an execution-layer request or a pending deposit names
+    /// this key by: `XMSS_DEPOSIT_PREFIX` (16 zero bytes), then the key.
+    pub fn to_request_key(&self) -> BlsPubkey {
+        let mut out = [0u8; BLS_PUBKEY_SIZE];
+        out[BLS_PUBKEY_SIZE - XMSS_PUBKEY_SIZE..].copy_from_slice(&self.0);
+        BlsPubkey(out)
+    }
+
+    /// The key a 48-byte request field names: its last 32 bytes, the
+    /// specification's `XMSSPubkey(pubkey[16:])`. Reads the bytes whatever the
+    /// first 16 are; whether they mark a legacy BLS key is the caller's
+    /// question (`is_legacy_pubkey`).
+    pub fn from_request_key(key: &BlsPubkey) -> Self {
+        let mut out = [0u8; XMSS_PUBKEY_SIZE];
+        out.copy_from_slice(&key.0[BLS_PUBKEY_SIZE - XMSS_PUBKEY_SIZE..]);
+        Self(out)
+    }
+}
+
+impl AsRef<[u8]> for XmssPubkey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for XmssPubkey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_byte_vector(f, "XmssPubkey", &self.0)
+    }
+}
+
+/// A leanXMSS signature (the PQ fork's `XMSSSignature`): the leaf index, four
+/// bytes little endian, then one signature per layer.
+///
+/// `Clone` but not `Copy`, unlike [`BlsSignature`]: at 2404 bytes an implicit
+/// copy is worth seeing at the call site.
+#[derive(Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(transparent)]
+pub struct XmssSignature(pub [u8; XMSS_SIGNATURE_SIZE]);
+
+impl Default for XmssSignature {
+    fn default() -> Self {
+        Self([0; XMSS_SIGNATURE_SIZE])
+    }
+}
+
+impl AsRef<[u8]> for XmssSignature {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for XmssSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_byte_vector(f, "XmssSignature", &self.0)
+    }
+}
+
 /// A KZG commitment to a blob.
 ///
 /// The same width as [`KzgProof`] and as [`BlsPubkey`], and a separate type from
@@ -498,7 +569,15 @@ macro_rules! impl_hex_serialize {
     };
 }
 
-impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
+impl_hex_serialize!(
+    H160,
+    BlsPubkey,
+    BlsSignature,
+    KzgCommitment,
+    KzgProof,
+    XmssPubkey,
+    XmssSignature,
+);
 
 /// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
 /// Beacon API accepts in a request body: a validator's public key (as a
@@ -521,7 +600,15 @@ macro_rules! impl_hex_deserialize {
     };
 }
 
-impl_hex_deserialize!(BlsPubkey, BlsSignature, H160, KzgCommitment, KzgProof);
+impl_hex_deserialize!(
+    BlsPubkey,
+    BlsSignature,
+    H160,
+    KzgCommitment,
+    KzgProof,
+    XmssPubkey,
+    XmssSignature,
+);
 
 #[cfg(test)]
 mod tests {

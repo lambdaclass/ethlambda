@@ -33,6 +33,8 @@ pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod operations;
 pub(crate) mod pool;
+pub(crate) mod pq_aggregation;
+pub(crate) mod pq_proposal;
 pub(crate) mod proposal;
 pub(crate) mod proposer_preferences;
 pub(crate) mod ptc;
@@ -217,6 +219,10 @@ where
 /// does not carry, so serving both off one store would answer lean questions
 /// with beacon data, or panic trying.
 pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
+    // PQ production hands the validator client the block and the envelope
+    // only; the envelope endpoint builds the data columns from the blobs it
+    // kept.
+    let pq_blobs = pq_proposal::PqBlobs::default();
     Router::new()
         .merge(blocks::routes())
         .merge(events::routes())
@@ -231,7 +237,8 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(pool::routes())
         .merge(operations::routes())
         .merge(proposal::routes())
-        .merge(gloas_proposal::routes())
+        .merge(gloas_proposal::routes().layer(axum::Extension(pq_blobs.clone())))
+        .merge(pq_proposal::routes().layer(axum::Extension(pq_blobs)))
         .merge(ptc::routes())
         .merge(bids::routes())
         .merge(proposer_preferences::routes())

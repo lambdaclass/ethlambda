@@ -328,8 +328,13 @@ fn prepare_gloas_proposal_on(
             .get_execution_payload_envelope(&head_root)
             .map_err(|_| ProposalError::Internal("store read failed"))?
             .ok_or(ProposalError::ParentEnvelopeMissing)?
+            .as_gloas()
+            .ok_or(ProposalError::Internal(
+                "a gloas head with a non-gloas envelope",
+            ))?
             .message
             .execution_requests
+            .clone()
     } else {
         ExecutionRequests::default()
     };
@@ -465,6 +470,10 @@ pub(crate) fn payload_attributes_event(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Lean => return Ok(None),
+        // PQ blocks are produced through their own endpoint
+        // (`pq_blocks/{slot}`), which this preparation does not model, and
+        // EIP-8483 is not followed.
+        ForkName::Eip8483 | ForkName::Pq => return Ok(None),
     };
     Ok(Some(PayloadAttributesEvent::new(fork, data)))
 }

@@ -146,6 +146,8 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             .as_str();
 
         let data_dto = AttestationDataOutDto::from(&data);
+        let is_pq = self.context.config.fork_at_epoch(data.target.epoch)
+            == ethlambda_types::beacon::fork::ForkName::Pq;
 
         let candidates: Vec<(&AttesterDutyDto, BlsPubkey)> = duties
             .iter()
@@ -254,14 +256,38 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // a signer hangs every vote in it, a local key's too, is published
         // the full budget after the attestation offset (see
         // `SIGNING_BUDGET` for what that leaves before aggregation).
-        let signatures =
-            {
-                let _timing = crate::metrics::time_signing();
+        //
+        // From PQ a leanXMSS signature at the target epoch's leaf, over the
+        // same signing root: the slashing protection record above already
+        // guards that leaf (one per target epoch). Those keys are derived from
+        // local keystores at startup, so they sign here, with no round trip.
+        let signatures: Vec<std::result::Result<String, String>> = {
+            let _timing = crate::metrics::time_signing();
+            if is_pq {
+                let root = self.context.attestation_signing_root(&data);
+                let leaf = crate::pq::attestation_leaf(data.target.epoch);
+                to_sign
+                    .iter()
+                    .map(|(_, pubkey)| {
+                        crate::pq::sign(pubkey, leaf, root)
+                            .map(|signature| encode_hex(&signature.0))
+                            .map_err(|err| err.to_string())
+                    })
+                    .collect()
+            } else {
                 sign_all(to_sign.iter().map(|(_, pubkey)| {
                     (*pubkey, self.context.sign_attestation(store, pubkey, &data))
                 }))
                 .await
-            };
+                .into_iter()
+                .map(|signature| {
+                    signature
+                        .map(|signature| encode_hex(&signature.0))
+                        .map_err(|err| err.to_string())
+                })
+                .collect()
+            }
+        };
 
         let mut attestations = Vec::with_capacity(to_sign.len());
         for ((duty, _), signature) in to_sign.iter().zip(signatures) {
@@ -278,7 +304,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 committee_index: duty.committee_index,
                 attester_index: duty.validator_index,
                 data: data_dto.clone(),
-                signature: encode_hex(&signature.0),
+                signature,
             });
         }
 
@@ -367,6 +393,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 7,
             slot,
+            is_aggregator: None,
         }
     }
 

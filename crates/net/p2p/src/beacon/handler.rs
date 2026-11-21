@@ -188,7 +188,14 @@ pub(crate) fn advertised_metadata(wire: &BeaconWire) -> AdvertisedMetaData {
 /// answer than setting none.
 fn attnets(wire: &BeaconWire) -> AttnetsBits {
     let mut attnets = AttnetsBits::default();
-    for &subnet_id in &wire.attestation_subnets {
+    // Under a PQ digest, its own backbone: only those bits may be set
+    // (`pq/p2p-interface.md`).
+    let backbone = super::topics::backbone_subnets(
+        wire.fork,
+        &wire.attestation_subnets,
+        &wire.attestation_subnets_pq,
+    );
+    for &subnet_id in backbone {
         let _ = attnets.set(subnet_id as usize, true);
     }
     attnets
@@ -291,6 +298,7 @@ mod tests {
             metadata: Default::default(),
             custody_columns: Vec::new(),
             attestation_subnets: Vec::new(),
+            attestation_subnets_pq: Vec::new(),
             sync_committee_subnets: Default::default(),
         }
     }

@@ -15,7 +15,7 @@ use ethlambda_state_transition::beacon::helpers::gloas::is_active_builder;
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
     constants::FAR_FUTURE_EPOCH,
-    containers::{BeaconState, gloas::Builder},
+    containers::gloas::Builder,
     primitives::{BlsPubkey, ValidatorIndex},
 };
 use serde::{Deserialize, Serialize};
@@ -139,7 +139,10 @@ async fn post_builders(
         Ok(found) => found,
         Err(err) => return err.into_response(),
     };
-    let BeaconState::Gloas(inner) = state.as_ref() else {
+    // Gloas or a fork built on it. A PQ builder's key is its XMSS key in the
+    // 48-byte form an execution-layer request names it by, which is how the
+    // state holds it (see `containers::pq`).
+    let Some(inner) = state.gloas_family() else {
         return ApiError::BadRequest("the requested state is prior to Gloas").into_response();
     };
 
@@ -151,7 +154,7 @@ async fn post_builders(
         }
         let status = if builder.withdrawable_epoch != FAR_FUTURE_EPOCH {
             BuilderStatus::Exited
-        } else if is_active_builder(inner, index).unwrap_or(false) {
+        } else if is_active_builder(&inner, index).unwrap_or(false) {
             BuilderStatus::Active
         } else {
             BuilderStatus::Pending
@@ -182,7 +185,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
-    use ethlambda_types::beacon::{config::Config, fork::ForkName};
+    use ethlambda_types::beacon::{config::Config, containers::BeaconState, fork::ForkName};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 

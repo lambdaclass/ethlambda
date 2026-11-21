@@ -63,6 +63,14 @@ pub struct AggregationService<B> {
 }
 
 impl<B: BeaconNodeApi> AggregationService<B> {
+    /// The epoch the PQ fork activates at, from which this service does not
+    /// aggregate (`FAR_FUTURE_EPOCH` when unscheduled).
+    pub fn pq_fork_epoch(&self) -> u64 {
+        self.context
+            .config
+            .fork_epoch(ethlambda_types::beacon::fork::ForkName::Pq)
+    }
+
     pub fn new(beacon_node: Arc<B>, context: Arc<SigningContext>) -> Self {
         Self {
             beacon_node,
@@ -79,6 +87,100 @@ impl<B: BeaconNodeApi> AggregationService<B> {
     /// Returns how many aggregates were published, which is zero whenever none
     /// of this client's validators was selected. That is the ordinary case: a
     /// validator aggregates a few times a day.
+    /// PQ's aggregation: each of this client's validators the node names an
+    /// aggregator (its seat in the committee's aggregation committee) wraps
+    /// the aggregate the node proved for its committee and signs the wrapper
+    /// with leanXMSS at the slot's aggregate leaf (PQ `validator.md`,
+    /// "Broadcast aggregate"). There is no selection proof, and the proof of
+    /// the attesters' signatures is the node's: it collects them and proves
+    /// ahead, since proving takes seconds.
+    pub async fn aggregate_pq(
+        &self,
+        slot: Slot,
+        data: &AttestationData,
+        duties: &[AttesterDutyDto],
+    ) -> Result<usize> {
+        use ethlambda_types::beacon::constants::LEAF_OFFSET_AGGREGATE_AND_PROOF;
+        use ethlambda_types::beacon::containers::pq;
+
+        let selected: Vec<&AttesterDutyDto> = duties
+            .iter()
+            .filter(|duty| duty.is_aggregator == Some(true))
+            .collect();
+        if selected.is_empty() {
+            return Ok(0);
+        }
+
+        // One fetch per committee, as for the other forks.
+        let data_root = data.hash_tree_root();
+        let mut aggregates = BTreeMap::new();
+        for duty in &selected {
+            if aggregates.contains_key(&duty.committee_index) {
+                continue;
+            }
+            match self
+                .beacon_node
+                .pq_aggregate(slot, data_root, duty.committee_index)
+                .await
+            {
+                Ok(aggregate) => {
+                    aggregates.insert(duty.committee_index, aggregate);
+                }
+                // The node proved nothing for the committee: no votes reached
+                // it, or the proof missed the aggregate deadline.
+                Err(Error::BeaconNodeStatus { status: 404, body }) => warn!(
+                    %slot,
+                    committee = duty.committee_index,
+                    reason = %body,
+                    "No PQ aggregate available for this committee"
+                ),
+                Err(err) => warn!(
+                    %slot,
+                    committee = duty.committee_index,
+                    %err,
+                    "Could not fetch this committee's PQ aggregate"
+                ),
+            }
+        }
+
+        let mut signed = Vec::new();
+        for duty in &selected {
+            let Some(proven) = aggregates.get(&duty.committee_index) else {
+                continue;
+            };
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    warn!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                    continue;
+                }
+            };
+            let message = pq::AggregateAndProof {
+                aggregator_index: duty.validator_index,
+                aggregate: proven.aggregate.clone(),
+                proof: proven.proof.clone(),
+            };
+            let root = self
+                .context
+                .aggregate_and_proof_signing_root(message.hash_tree_root(), slot);
+            let leaf = crate::pq::slot_leaf(slot, LEAF_OFFSET_AGGREGATE_AND_PROOF);
+            match crate::pq::sign(&pubkey, leaf, root) {
+                Ok(signature) => signed.push(pq::SignedAggregateAndProof { message, signature }),
+                Err(err) => {
+                    warn!(%slot, validator = duty.validator_index, %err, "Failed to sign a PQ aggregate");
+                }
+            }
+        }
+        if signed.is_empty() {
+            return Ok(0);
+        }
+        let count = signed.len();
+        self.beacon_node.publish_pq_aggregates(&signed).await?;
+        info!(%slot, count, "Published PQ aggregates");
+        crate::metrics::inc_aggregates_published(count as u64);
+        Ok(count)
+    }
+
     pub async fn aggregate(
         &self,
         slot: Slot,
@@ -360,6 +462,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 7,
             slot,
+            is_aggregator: None,
         }
     }
 

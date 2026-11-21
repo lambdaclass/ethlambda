@@ -135,6 +135,11 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
+        // Not followed (`ForkName::is_followed`), and their envelopes are not
+        // gloas's shape.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => {
+            return Outcome::Ignore(IgnoreReason::UnsupportedFork);
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("envelope::stateful_checks"),
     };
     let bid = &block.body.signed_execution_payload_bid.message;

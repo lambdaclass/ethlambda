@@ -39,8 +39,10 @@ use ethlambda_state_transition::beacon::{
         checkpoint_state, compute_shuffling_dependent_slot, get_current_store_epoch, get_head_node,
     },
     gossip::attestation::compute_subnet_for_attestation,
+    gossip::pq::compute_subnet_for_attestation as pq_compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
+    helpers::pq::get_aggregation_committee,
 };
 
 use crate::beacon::ApiError;
@@ -311,9 +313,10 @@ async fn post_committee_subscriptions(
     Json(subscriptions): Json<Vec<CommitteeSubscription>>,
 ) -> Response {
     let config = store.config();
+    let is_pq_slot = |slot: Slot| config.fork_at_epoch(compute_epoch_at_slot(slot)) >= ForkName::Pq;
     let subnets: Vec<(u64, Slot)> = subscriptions
         .iter()
-        .filter(|entry| entry.is_aggregator)
+        .filter(|entry| entry.is_aggregator && !is_pq_slot(entry.slot))
         .map(|entry| {
             let subnet_id = compute_subnet_for_attestation(
                 entry.committees_at_slot,
@@ -324,7 +327,35 @@ async fn post_committee_subscriptions(
             (subnet_id, entry.slot)
         })
         .collect();
+    // A PQ slot's committees travel on PQ's 16 subnets, and its aggregators
+    // prove what this node collects for them (see `pq_aggregation`).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let now = now_ms.saturating_sub(config.genesis_time.saturating_mul(1000))
+        / config.slot_duration_ms.max(1);
+    let pq_subnets: Vec<(u64, Slot)> = subscriptions
+        .iter()
+        .filter(|entry| entry.is_aggregator && is_pq_slot(entry.slot))
+        .filter(|entry| {
+            store
+                .pq_signature_pool()
+                .subscribe(now, entry.slot, entry.committee_index)
+        })
+        .map(|entry| {
+            let subnet_id = pq_compute_subnet_for_attestation(
+                entry.committees_at_slot,
+                entry.slot,
+                entry.committee_index,
+                &config,
+            );
+            (subnet_id, entry.slot)
+        })
+        .collect();
     if !subnets.is_empty() && p2p.subscribe_attestation_subnets(subnets).is_err() {
+        return ApiError::Internal("the network actor is not running").into_response();
+    }
+    if !pq_subnets.is_empty() && p2p.subscribe_pq_attestation_subnets(pq_subnets).is_err() {
         return ApiError::Internal("the network actor is not running").into_response();
     }
     axum::http::StatusCode::OK.into_response()
@@ -577,12 +608,15 @@ fn proposer_duties(
 
     // Gloas keeps fulu's lookahead as it is, and `upgrade_to_gloas` carries it
     // over, so a fulu head already holds the first gloas epoch's proposers.
+    // The forks built on gloas keep the lookahead too.
     let proposer_lookahead = match state.as_ref() {
         BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        BeaconState::Eip8483(state) => &state.proposer_lookahead,
+        BeaconState::Pq(state) => &state.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
-                "proposer duties are served from the proposer lookahead of fulu and gloas only",
+                "proposer duties are served from the proposer lookahead of fulu on",
             ));
         }
     };
@@ -632,6 +666,12 @@ struct AttesterDuty {
     validator_committee_index: u64,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     slot: Slot,
+    /// At a PQ slot, whether the validator sits on its committee's
+    /// aggregation committee, which is what makes a PQ aggregator (PQ
+    /// `validator.md`, "Aggregation selection"); absent before PQ, where
+    /// aggregators select themselves. Lighthouse's PQ branch's field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_aggregator: Option<bool>,
 }
 
 /// `POST /eth/v1/validator/duties/attester/{epoch}`, with the validator
@@ -698,6 +738,7 @@ fn attester_duties(
     let committees = store.committee_cache().committees(&state, epoch);
     let committees_at_slot = committees.committees_per_slot();
     let first_slot = compute_start_slot_at_epoch(epoch);
+    let is_pq = store.config().fork_at_epoch(epoch) == ForkName::Pq;
     let mut duties = Vec::new();
     for slot in first_slot..first_slot + preset::slots_per_epoch() {
         for committee_index in 0..committees_at_slot {
@@ -711,6 +752,12 @@ fn attester_duties(
                 let validator = state
                     .validator(validator_index)
                     .map_err(|_| ApiError::Internal("committee names an unknown validator"))?;
+                // A state not yet at PQ (the fork's first epoch, asked
+                // early) names no aggregation committee: not an aggregator.
+                let is_aggregator = is_pq.then(|| {
+                    get_aggregation_committee(&state, slot, committee_index)
+                        .is_ok_and(|members| members.contains(&validator_index))
+                });
                 duties.push(AttesterDuty {
                     pubkey: validator.pubkey,
                     validator_index,
@@ -719,6 +766,7 @@ fn attester_duties(
                     committees_at_slot,
                     validator_committee_index: position as u64,
                     slot,
+                    is_aggregator,
                 });
             }
         }
@@ -811,7 +859,8 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
-    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+    // Gloas or a fork after it (`fork_at_epoch` never names lean).
+    let index = if store.config().fork_at_epoch(epoch) >= ForkName::Gloas {
         payload_present_index(store, &state, slot)?
     } else {
         0
@@ -847,7 +896,8 @@ fn payload_present_index(
     if head_state.slot() == slot {
         return Ok(0);
     }
-    if !matches!(head_state, BeaconState::Gloas(_)) {
+    // A head of a fork after gloas has a payload status too.
+    if !head_state.fork_name().has_payload_envelopes() {
         return Ok(1);
     }
     let status = match store.head_payload_status() {

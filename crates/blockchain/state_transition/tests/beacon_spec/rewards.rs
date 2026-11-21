@@ -143,7 +143,9 @@ fn components(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
-        | ForkName::Gloas => vec![
+        | ForkName::Gloas
+        | ForkName::Eip8483
+        | ForkName::Pq => vec![
             (
                 "source_deltas",
                 altair_helpers::get_flag_index_deltas(state, TIMELY_SOURCE_FLAG_INDEX),

@@ -280,11 +280,15 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Gloas => Ok(SignedAggregateAndProof::Gloas(
+        ForkName::Gloas | ForkName::Eip8483 => Ok(SignedAggregateAndProof::Gloas(
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
+        // The PQ fork's aggregate carries a proof and an XMSS signature, which
+        // the gossip rules here do not model.
+        ForkName::Pq | ForkName::Lean => {
+            Err(format!("no aggregate shape for fork {:?}", case.fork))
+        }
     }
 }
 
@@ -323,7 +327,11 @@ fn deliver_payload(
     let Some(name) = &entry.payload else {
         return Ok(());
     };
-    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&case.ssz_bytes(name))
+    let envelope =
+        ethlambda_state_transition::beacon::containers::SignedExecutionPayloadEnvelope::from_ssz(
+            case.fork,
+            &case.ssz_bytes(name),
+        )
         .map_err(|err| format!("decoding {name}: {err:?}"))?;
     if trusted {
         fork_choice::accept_execution_payload_envelope(store, &envelope);
@@ -574,7 +582,7 @@ fn run_case(case: &Case) -> Result<(), String> {
         fork_choice::get_head(&mut store, &config)
             .map_err(|err| format!("computing the head: {err:?}"))?;
     }
-    let market = BuilderMarket::default();
+    let market: BuilderMarket = BuilderMarket::default();
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
     let mut seen_columns = SeenColumns::new(capacity);

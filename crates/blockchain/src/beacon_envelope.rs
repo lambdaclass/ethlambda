@@ -58,8 +58,10 @@ use ethlambda_state_transition::beacon::fork_choice::{
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
-use ethlambda_types::primitives::{H256, HashTreeRoot as _};
+use ethlambda_types::beacon::containers::{
+    SignedBeaconBlock, SignedExecutionPayloadEnvelope, gloas,
+};
+use ethlambda_types::primitives::H256;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::beacon_engine;
@@ -145,7 +147,7 @@ pub(crate) const MAX_REJECTED_ENVELOPES: usize = 64;
 
 /// An envelope the actor is holding until it can be verified.
 pub(crate) struct HeldEnvelope {
-    envelope: gloas::SignedExecutionPayloadEnvelope,
+    envelope: SignedExecutionPayloadEnvelope,
     /// The envelope's own root, which tells a re-delivery from a different
     /// envelope for the same block.
     envelope_root: H256,
@@ -161,12 +163,13 @@ pub(crate) struct HeldEnvelope {
 
 impl HeldEnvelope {
     pub(crate) fn new(
-        envelope: gloas::SignedExecutionPayloadEnvelope,
+        envelope: impl Into<SignedExecutionPayloadEnvelope>,
         slot: u64,
         event_ms: u64,
     ) -> Self {
+        let envelope = envelope.into();
         Self {
-            envelope_root: envelope.hash_tree_root(),
+            envelope_root: envelope.signed_root(),
             envelope,
             slot,
             event_ms,
@@ -302,16 +305,17 @@ pub(crate) fn missing_columns_for_envelope(
 /// The checks of `verify_execution_payload_envelope` that need only the block's
 /// bid, not its post-state: the envelope is the one the bid promised.
 fn envelope_matches_bid(
-    envelope: &gloas::ExecutionPayloadEnvelope,
+    envelope: &SignedExecutionPayloadEnvelope,
     bid: &gloas::ExecutionPayloadBid,
     block_slot: u64,
 ) -> bool {
-    envelope.builder_index == bid.builder_index
-        && envelope.payload.block_hash == bid.block_hash
-        && envelope.payload.prev_randao == bid.prev_randao
-        && envelope.payload.gas_limit == bid.gas_limit
-        && envelope.execution_requests.hash_tree_root() == bid.execution_requests_root
-        && envelope.payload.slot_number == block_slot
+    let payload = envelope.payload();
+    envelope.builder_index() == bid.builder_index
+        && payload.block_hash == bid.block_hash
+        && payload.prev_randao == bid.prev_randao
+        && payload.gas_limit == bid.gas_limit
+        && envelope.execution_requests_root() == bid.execution_requests_root
+        && payload.slot_number == block_slot
 }
 
 impl BlockChainServer {
@@ -321,7 +325,7 @@ impl BlockChainServer {
     /// caller then settles the queues.
     pub(crate) async fn receive_envelope(
         &mut self,
-        envelope: gloas::SignedExecutionPayloadEnvelope,
+        envelope: impl Into<SignedExecutionPayloadEnvelope>,
         event_ms: u64,
     ) {
         let config = self.store.config();
@@ -333,7 +337,7 @@ impl BlockChainServer {
     /// Verify `held` against its block, or put it back in the queue for what it
     /// is waiting on. `true` when the envelope was verified and recorded.
     async fn apply_or_hold_envelope(&mut self, held: HeldEnvelope) -> bool {
-        let root = held.envelope.message.beacon_block_root;
+        let root = held.envelope.beacon_block_root();
         if self
             .store
             .beacon_block_payload_status(root)
@@ -412,7 +416,7 @@ impl BlockChainServer {
         // envelope is parked (see `Self::hold_envelope_awaiting_columns`), or
         // by `on_execution_payload_envelope` when it is applied: gossip
         // validation does not reach it for an envelope it queued.
-        if !envelope_matches_bid(&held.envelope.message, bid, slot) {
+        if !envelope_matches_bid(&held.envelope, bid, slot) {
             warn!(
                 %slot,
                 block_root = %ShortRoot(&root.0),
@@ -567,17 +571,13 @@ impl BlockChainServer {
         let seen_ms = held.event_ms.saturating_sub(config.genesis_time_ms());
         self.store.insert_beacon_envelope_seen(root, slot, seen_ms);
         // Lets `latestValidHash` find this FULL node.
-        self.store.insert_beacon_el_block_hash(
-            root,
-            slot,
-            held.envelope.message.payload.block_hash,
-        );
+        self.store
+            .insert_beacon_el_block_hash(root, slot, held.envelope.payload().block_hash);
         self.envelopes.verified.push_back(root);
-        let message = &held.envelope.message;
         self.events.publish_envelope_imported(
             slot,
-            message.builder_index,
-            message.payload.block_hash,
+            held.envelope.builder_index(),
+            held.envelope.payload().block_hash,
             root,
             status,
         );
@@ -654,7 +654,7 @@ impl BlockChainServer {
             );
             return None;
         };
-        if !envelope_matches_bid(&held.envelope.message, bid, slot) {
+        if !envelope_matches_bid(&held.envelope, bid, slot) {
             warn!(
                 %slot,
                 block_root = %ShortRoot(&root.0),
@@ -726,12 +726,13 @@ impl BlockChainServer {
     fn envelope_signature_holds(
         &self,
         root: H256,
-        envelope: &gloas::SignedExecutionPayloadEnvelope,
+        envelope: &SignedExecutionPayloadEnvelope,
     ) -> bool {
         let Some(state) = self.store.get_state(&root).ok().flatten() else {
             return false;
         };
-        stf_gloas::verify_execution_payload_envelope_signature(&state, envelope).unwrap_or(false)
+        stf_gloas::verify_any_execution_payload_envelope_signature(&state, envelope)
+            .unwrap_or(false)
     }
 
     fn hold_envelope_awaiting_columns(
@@ -1203,6 +1204,7 @@ pub(crate) mod tests {
     use crate::tests::{GENESIS_TIME, beacon_server, beacon_store};
     use ethlambda_network_api::BlockSource;
     use ethlambda_state_transition::beacon::fork::ForkName;
+    use ethlambda_types::primitives::HashTreeRoot as _;
 
     /// A held child at `slot`, proposed by validator 0.
     fn held_child(slot: u64) -> HeldChild {

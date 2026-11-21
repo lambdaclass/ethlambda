@@ -12,7 +12,7 @@ use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWri
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
-use crate::pools::{AttestationPool, OperationPool};
+use crate::pools::{AttestationPool, OperationPool, PqAggregatePool, PqSignaturePool};
 use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
 use crate::pubkey_index_cache::PubkeyIndexCache;
 use crate::target_balance_cache::TargetBalanceCache;
@@ -29,7 +29,7 @@ use ethlambda_types::{
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
-            gloas,
+            SignedExecutionPayloadEnvelope, StorableEnvelope,
         },
         fork::ForkName,
         fork_choice::{
@@ -224,7 +224,18 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// [`Store::prune_finalized_states`]). A directory written by the previous
 /// version holds rows no lookup can find, and there is no migration, by the
 /// same policy every previous change followed.
-pub const DB_VERSION: u64 = 7;
+///
+/// 8 widened `Config` with the EIP-8483 and PQ fork versions and epochs,
+/// `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
+/// `ATTESTATION_SUBNET_COUNT_PQ`, so a directory written by
+/// version 7 decodes into the wrong fields, the same consequence as 3, 4 and
+/// 6.
+///
+/// 9 narrowed `Config` again: the PQ aggregation timing keys of consensus-specs
+/// `4595f0fc` (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`,
+/// `AGGREGATOR_DELAY_BPS`) left with the move back to `2f43bc0f`, so a
+/// directory a version 8 build wrote with them decodes into the wrong fields.
+pub const DB_VERSION: u64 = 9;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -1107,6 +1118,24 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
                 .parent_block_hash
                 == *payload_block_hash
         }
+        SignedBeaconBlock::Eip8483(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        SignedBeaconBlock::Pq(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
         // A pre-gloas block cannot follow a gloas one.
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
@@ -1253,6 +1282,10 @@ pub struct Store {
     attestation_pool: Arc<Mutex<AttestationPool>>,
     /// Beacon operation pool. See [`Store::operation_pool`].
     operation_pool: Arc<Mutex<OperationPool>>,
+    /// PQ network aggregates. See [`Store::pq_aggregate_pool`].
+    pq_aggregate_pool: Arc<Mutex<PqAggregatePool>>,
+    /// PQ aggregators' signatures. See [`Store::pq_signature_pool`].
+    pq_signature_pool: Arc<Mutex<PqSignaturePool>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -1971,6 +2004,8 @@ impl Store {
             ))),
             attestation_pool: Default::default(),
             operation_pool: Default::default(),
+            pq_aggregate_pool: Default::default(),
+            pq_signature_pool: Default::default(),
             state_cache,
             pending_states,
             state_rebuilds,
@@ -2005,6 +2040,23 @@ impl Store {
         self.operation_pool
             .lock()
             .expect("operation pool lock poisoned")
+    }
+
+    /// The PQ network aggregates block production packs. Same sharing and
+    /// locking rules as [`Store::attestation_pool`].
+    pub fn pq_aggregate_pool(&self) -> MutexGuard<'_, PqAggregatePool> {
+        self.pq_aggregate_pool
+            .lock()
+            .expect("PQ aggregate pool lock poisoned")
+    }
+
+    /// The signatures this node's PQ aggregators prove aggregates from, and
+    /// what it proved. Same sharing and locking rules as
+    /// [`Store::attestation_pool`].
+    pub fn pq_signature_pool(&self) -> MutexGuard<'_, PqSignaturePool> {
+        self.pq_signature_pool
+            .lock()
+            .expect("PQ signature pool lock poisoned")
     }
 
     // ============ Metadata Helpers ============
@@ -4132,12 +4184,8 @@ impl Store {
     /// `slot` is the slot of the block the envelope fulfills, which the
     /// caller has already read while verifying the envelope against it; the
     /// envelope carries none and the row is keyed by it.
-    pub fn insert_verified_payload(
-        &mut self,
-        slot: u64,
-        envelope: &gloas::SignedExecutionPayloadEnvelope,
-    ) {
-        let root = envelope.message.beacon_block_root;
+    pub fn insert_verified_payload(&mut self, slot: u64, envelope: &impl StorableEnvelope) {
+        let root = envelope.beacon_block_root();
         debug_assert_eq!(
             beacon_block_slot(self.backend.as_ref(), &root),
             Some(slot),
@@ -4188,11 +4236,24 @@ impl Store {
             .collect()
     }
 
+    /// The fork of an envelope stored at `slot`: the fork of the block it
+    /// reveals the payload of. Gloas's when the configuration schedules no
+    /// fork with envelopes there, which only a store fed gloas envelopes under
+    /// another schedule (a test) holds.
+    fn envelope_fork(&self, slot: u64) -> ForkName {
+        let fork = self.config.fork_at_epoch(slot / slots_per_epoch());
+        if fork.has_payload_envelopes() {
+            fork
+        } else {
+            ForkName::Gloas
+        }
+    }
+
     /// Gloas: the verified envelope stored for `root`, if any.
     pub fn get_execution_payload_envelope(
         &self,
         root: &H256,
-    ) -> Result<Option<gloas::SignedExecutionPayloadEnvelope>, Error> {
+    ) -> Result<Option<SignedExecutionPayloadEnvelope>, Error> {
         let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) else {
             return Ok(None);
         };
@@ -4204,7 +4265,7 @@ impl Store {
             )
             .expect("get");
         Ok(bytes.map(|bytes| {
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+            SignedExecutionPayloadEnvelope::from_ssz(self.envelope_fork(slot), &bytes)
                 .expect("a stored envelope decodes")
         }))
     }
@@ -4230,7 +4291,7 @@ impl Store {
         &self,
         start_slot: u64,
         end_slot: u64,
-    ) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, Error> {
+    ) -> Result<Vec<SignedExecutionPayloadEnvelope>, Error> {
         if self.chain != Chain::Beacon {
             Self::lean_only("canonical_execution_payload_envelopes");
         }
@@ -4284,8 +4345,9 @@ impl Store {
             let Some(bytes) = envelope_row(slot, &root) else {
                 continue;
             };
-            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
-                .expect("a stored envelope decodes");
+            let envelope =
+                SignedExecutionPayloadEnvelope::from_ssz(self.envelope_fork(slot), &bytes)
+                    .expect("a stored envelope decodes");
             let builds_on_it = match window.get(index + 1) {
                 // No successor: this is the head, whose envelope is part of
                 // the chain only on the FULL node.
@@ -4296,9 +4358,7 @@ impl Store {
                         .expect("get")
                         .map(|bytes| decode_beacon_block_value(&bytes));
                     match next {
-                        Some(next) => {
-                            builds_on_payload(&next, &envelope.message.payload.block_hash)
-                        }
+                        Some(next) => builds_on_payload(&next, &envelope.payload().block_hash),
                         None => false,
                     }
                 }
@@ -4378,7 +4438,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas) => true,
+                Some(ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair
@@ -5732,6 +5792,7 @@ mod tests {
     use crate::committee_cache::{Lookup, ShufflingKey};
     use ethlambda_types::beacon::committees::EpochCommittees;
     use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
+    use ethlambda_types::beacon::containers::gloas;
     // Only the tests name a status variant: the store itself stores and hands
     // back whole `PayloadStatusV1` values without ever reading the tag.
     use ethlambda_types::beacon::fork_choice::PayloadStatusEnum;
@@ -7746,6 +7807,7 @@ mod tests {
         let key = ShufflingKey {
             epoch: 1,
             decision_root: H256::from([1u8; 32]),
+            max_committees_per_slot: 64,
         };
 
         let (first, first_lookup) = clone
@@ -9463,7 +9525,7 @@ mod tests {
             reopened
                 .get_execution_payload_envelope(&root)
                 .expect("read"),
-            Some(envelope)
+            Some(envelope.into())
         );
     }
 
@@ -10777,7 +10839,7 @@ mod tests {
     /// slot a full decode yields, for every fork shape the table can hold.
     #[test]
     fn peeking_a_beacon_block_slot_equals_decoding_it() {
-        use ethlambda_types::beacon::containers::{altair, electra, gloas};
+        use ethlambda_types::beacon::containers::{altair, eip8483, electra, gloas, pq};
 
         let altair_block = SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
             message: altair::BeaconBlock {
@@ -10815,10 +10877,32 @@ mod tests {
                 },
                 signature: Default::default(),
             }),
+            SignedBeaconBlock::Eip8483(eip8483::SignedBeaconBlock {
+                message: eip8483::BeaconBlock {
+                    slot: 0x0e0f,
+                    proposer_index: 6,
+                    parent_root: root(8),
+                    state_root: root(9),
+                    body: eip8483::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            }),
+            // An XMSS signature widens the fixed part ahead of `message`'s
+            // offset, which the peek reads rather than assumes.
+            SignedBeaconBlock::Pq(Box::new(pq::SignedBeaconBlock {
+                message: pq::BeaconBlock {
+                    slot: 0x1011_1213,
+                    proposer_index: 7,
+                    parent_root: root(10),
+                    state_root: root(11),
+                    body: pq::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            })),
         ];
         // The fork tag is part of the value; the newest fork in `ALL` is among
         // the blocks above.
-        assert_eq!(blocks[5].fork_name(), *ForkName::ALL.last().unwrap());
+        assert_eq!(blocks[7].fork_name(), *ForkName::ALL.last().unwrap());
         for block in blocks {
             let value = encode_beacon_block_value(&block);
             assert_eq!(

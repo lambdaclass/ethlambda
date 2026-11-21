@@ -213,6 +213,11 @@ pub struct AttesterDutyDto {
     pub validator_committee_index: u64,
     #[serde(with = "quoted_u64")]
     pub slot: Slot,
+    /// At a PQ slot, whether the node counts the validator on its committee's
+    /// aggregation committee, which is what makes a PQ aggregator; absent
+    /// before PQ, where aggregators select themselves with a BLS proof.
+    #[serde(default)]
+    pub is_aggregator: Option<bool>,
 }
 
 /// One proposer duty, from `GET /eth/v1/validator/duties/proposer/{epoch}`.
@@ -468,6 +473,10 @@ pub fn parse_signature(text: &str) -> Result<BlsSignature> {
     Ok(BlsSignature(array))
 }
 
+/// A 48-byte pubkey from the beacon node. On the PQ fork the registry names a
+/// validator by its XMSS key in request form (16 zero bytes, then the key);
+/// one of this client's own is answered as the BLS key that owns it
+/// (`crate::pq`), so every duty still matches a local key by BLS key.
 pub fn parse_pubkey(text: &str) -> Result<BlsPubkey> {
     let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(text))
         .map_err(|err| Error::Decode(format!("bad pubkey hex: {err}")))?;
@@ -477,7 +486,7 @@ pub fn parse_pubkey(text: &str) -> Result<BlsPubkey> {
             got.len()
         ))
     })?;
-    Ok(BlsPubkey(array))
+    Ok(crate::pq::bls_for_request_key(&array).unwrap_or(BlsPubkey(array)))
 }
 
 /// `0x`-prefixed hex, through the same adapter the beacon node writes its own

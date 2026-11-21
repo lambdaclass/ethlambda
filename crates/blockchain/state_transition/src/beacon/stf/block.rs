@@ -151,6 +151,18 @@ fn process_block_with_signatures(
         containers::SignedBeaconBlock::Gloas(signed) => {
             gloas::process_block(state, &signed.message, config, caches, options, signatures)
         }
+        containers::SignedBeaconBlock::Eip8483(signed) => super::eip8483::process_block(
+            state,
+            &signed.message,
+            config,
+            caches,
+            options,
+            signatures,
+        ),
+        // Signed with leanXMSS: nothing goes into the BLS batch.
+        containers::SignedBeaconBlock::Pq(signed) => {
+            super::pq::process_block(state, &signed.message, config, caches, options)
+        }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }

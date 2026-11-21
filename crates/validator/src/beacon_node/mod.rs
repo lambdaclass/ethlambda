@@ -130,7 +130,8 @@ fn highest_attestation_index(fork: ForkName) -> u64 {
         // a block whose payload was seen. Which of the two is right depends
         // on the node's view of the block, which this client does not have,
         // so only the range is checked.
-        ForkName::Gloas => 1,
+        // EIP-8483 and PQ keep gloas's payload signal.
+        ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => 1,
         // Not a Beacon Chain fork: `Config::fork_at_epoch` never names it, so
         // a caller that does has a bug of its own. A panic rather than an
         // `Err`, because this runs after the node has answered: an `Err`
@@ -418,6 +419,16 @@ pub trait BeaconNodeApi: Send + Sync {
     /// loaded, and the answer it wants is "none of them", not "all of them".
     async fn validator_indices(&self, pubkeys: &[BlsPubkey]) -> Result<Vec<ValidatorEntry>>;
 
+    /// Every validator in the head state's registry: its index and its
+    /// pubkey exactly as the state holds it (on the PQ fork, an XMSS key in
+    /// request form), with no mapping to a local key.
+    ///
+    /// The whole registry, deliberately: before a PQ key is built its only
+    /// known part is its public parameter, which no id lookup takes, so the
+    /// leanXMSS cache (`crate::pq::xmss_cache`) finds a key's entry by scanning
+    /// for it. Only that startup lookup calls this, on networks of devnet size.
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>>;
+
     /// The attester duties for `indices` in `epoch`, and the block root the
     /// schedule was computed against. A reorg past that root invalidates the
     /// schedule; the caller is the one that notices, by comparing roots.
@@ -631,6 +642,13 @@ pub trait BeaconNodeApi: Send + Sync {
         preferences: &[gloas::SignedProposerPreferences],
     ) -> Result<Delivery>;
 
+    /// The PQ fork's [`Self::submit_proposer_preferences`]: leanXMSS-signed
+    /// preferences, under the `pq` header, with the same delivery contract.
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery>;
+
     /// The envelope the node cached for the self-built payload of the block
     /// whose root is `block_root`, proposed at `slot`.
     ///
@@ -681,6 +699,29 @@ pub trait BeaconNodeApi: Send + Sync {
         messages: &[gloas::PayloadAttestationMessage],
     ) -> Result<usize>;
 
+    /// The PQ fork's [`Self::submit_payload_attestations`]: leanXMSS-signed
+    /// messages, under the `pq` header.
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize>;
+
+    /// The unsigned PQ block for `slot` and the unsigned envelope revealing
+    /// its self-built payload (ethlambda's `POST
+    /// /eth/v1/validator/pq_blocks/{slot}`), given the proposer's VRF proof
+    /// for the slot.
+    ///
+    /// # Contract: the block is for `slot`, and the envelope names it
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents>;
+
+    /// Publish a signed PQ envelope, given its SSZ body.
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()>;
+
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since
     /// the endpoint requires it as a header rather than inferring it.
@@ -729,6 +770,22 @@ pub trait BeaconNodeApi: Send + Sync {
     /// The endpoint takes a list even for one aggregate, so this does too.
     async fn publish_aggregates(&self, fork: ForkName, aggregates: &SignedAggregates)
     -> Result<()>;
+
+    /// The aggregate the node proved for `committee_index`'s vote on the data
+    /// whose root is `attestation_data_root` at a PQ slot, with its proof: what
+    /// a PQ aggregator wraps and signs. A 404 when it proved none.
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate>;
+
+    /// Publish signed PQ aggregates.
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()>;
 
     /// Tells the node where to pay each validator's execution-layer block
     /// rewards, so it has somewhere to send them when it builds a payload.

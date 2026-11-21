@@ -25,7 +25,10 @@ use std::time::Duration;
 
 use ethlambda_p2p::beacon::decode;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use ethlambda_types::beacon::containers::{
+    BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope,
+};
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::block::SignedBlock;
 use ethlambda_types::genesis::{GenesisMismatch, verify_state_genesis};
@@ -717,8 +720,8 @@ enum EnvelopeFetchError {
     Unknown,
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("SSZ deserialization failed: {0:?}")]
-    Decode(DecodeError),
+    #[error("SSZ deserialization failed: {0}")]
+    Decode(String),
     #[error("the envelope is for another block")]
     WrongBlock,
 }
@@ -729,7 +732,8 @@ async fn fetch_envelope(
     client: &Client,
     base_url: &str,
     anchor_root: H256,
-) -> Result<gloas::SignedExecutionPayloadEnvelope, EnvelopeFetchError> {
+    fork: ForkName,
+) -> Result<SignedExecutionPayloadEnvelope, EnvelopeFetchError> {
     let url = format!("{base_url}{}", beacon_envelope_path(anchor_root));
     let response = client
         .get(&url)
@@ -740,9 +744,9 @@ async fn fetch_envelope(
         return Err(EnvelopeFetchError::Unknown);
     }
     let bytes = response.error_for_status()?.bytes().await?;
-    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
-        .map_err(EnvelopeFetchError::Decode)?;
-    if envelope.message.beacon_block_root != anchor_root {
+    let envelope = SignedExecutionPayloadEnvelope::from_ssz(fork, &bytes)
+        .map_err(|err| EnvelopeFetchError::Decode(format!("{err:?}")))?;
+    if envelope.beacon_block_root() != anchor_root {
         return Err(EnvelopeFetchError::WrongBlock);
     }
     Ok(envelope)
@@ -760,13 +764,14 @@ async fn fetch_envelope(
 pub async fn fetch_anchor_envelope(
     urls: &[String],
     anchor_root: H256,
-) -> Option<gloas::SignedExecutionPayloadEnvelope> {
+    fork: ForkName,
+) -> Option<SignedExecutionPayloadEnvelope> {
     let client = build_client()
         .inspect_err(|err| info!(%err, "Skipping the anchor envelope fetch"))
         .ok()?;
     for url in urls {
         let base_url = trim_trailing_slash(url);
-        match fetch_envelope(&client, base_url, anchor_root).await {
+        match fetch_envelope(&client, base_url, anchor_root, fork).await {
             Ok(envelope) => {
                 info!(%url, "Fetched the anchor's execution payload envelope");
                 return Some(envelope);
@@ -1406,7 +1411,10 @@ mod anchor_envelope_tests {
         (url, rx)
     }
 
-    fn envelope_for(root: H256) -> gloas::SignedExecutionPayloadEnvelope {
+    fn envelope_for(
+        root: H256,
+    ) -> ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope {
+        use ethlambda_types::beacon::containers::gloas;
         let payload = gloas::ExecutionPayload {
             parent_hash: Default::default(),
             fee_recipient: Default::default(),
@@ -1448,9 +1456,9 @@ mod anchor_envelope_tests {
         let envelope = envelope_for(root);
         let (url, mut requests) = serve("200 OK", envelope.to_ssz()).await;
 
-        let fetched = fetch_anchor_envelope(&[url], root).await;
+        let fetched = fetch_anchor_envelope(&[url], root, ForkName::Gloas).await;
 
-        assert_eq!(fetched, Some(envelope));
+        assert_eq!(fetched, Some(envelope.into()));
         let line = requests.recv().await.unwrap();
         assert!(
             line.starts_with(&format!(
@@ -1468,13 +1476,13 @@ mod anchor_envelope_tests {
         let (knows, _) = serve("200 OK", envelope.to_ssz()).await;
 
         assert_eq!(
-            fetch_anchor_envelope(std::slice::from_ref(&unknown), root).await,
+            fetch_anchor_envelope(std::slice::from_ref(&unknown), root, ForkName::Gloas).await,
             None,
             "a 404 is not an envelope"
         );
         assert_eq!(
-            fetch_anchor_envelope(&[unknown, knows], root).await,
-            Some(envelope)
+            fetch_anchor_envelope(&[unknown, knows], root, ForkName::Gloas).await,
+            Some(envelope.into())
         );
     }
 
@@ -1485,10 +1493,16 @@ mod anchor_envelope_tests {
         let (garbage, _) = serve("200 OK", vec![1, 2, 3]).await;
         let (other, _) = serve("200 OK", envelope_for(H256::from([8u8; 32])).to_ssz()).await;
 
-        assert_eq!(fetch_anchor_envelope(&[broken], root).await, None);
-        assert_eq!(fetch_anchor_envelope(&[garbage], root).await, None);
         assert_eq!(
-            fetch_anchor_envelope(&[other], root).await,
+            fetch_anchor_envelope(&[broken], root, ForkName::Gloas).await,
+            None
+        );
+        assert_eq!(
+            fetch_anchor_envelope(&[garbage], root, ForkName::Gloas).await,
+            None
+        );
+        assert_eq!(
+            fetch_anchor_envelope(&[other], root, ForkName::Gloas).await,
             None,
             "an envelope for another block must not be handed over"
         );

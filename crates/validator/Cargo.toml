@@ -12,6 +12,11 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
+# leanXMSS signing and VRF proofs for the PQ fork (`pq`).
+ethlambda-crypto.workspace = true
+# A pool of the VRF trees' own, so hashing one does not hold up the leanXMSS
+# signatures on rayon's global pool (`prepare_vrf_trees`).
+rayon.workspace = true
 
 # A produced block is decoded and re-published as SSZ, not JSON: signing it
 # needs its `hash_tree_root`, which only the typed container can give. See
@@ -29,8 +34,9 @@ tracing.workspace = true
 # `time` for the duty loop's sleep between slots, `rt` for `spawn_blocking`,
 # which keeps the slashing-protection record's disk flush off the executor.
 # Declared here rather than relied on through workspace feature unification,
-# so this crate still builds if it is ever compiled on its own.
-tokio = { workspace = true, features = ["time", "macros", "rt"] }
+# so this crate still builds if it is ever compiled on its own. `sync` and
+# `fs` for the PQ record files (`pq::RecordFile`).
+tokio = { workspace = true, features = ["time", "macros", "rt", "sync", "fs"] }
 # `CancellationToken`: the signal that stops the client when the
 # slashing-protection record becomes unusable, and the one that tells the
 # keymanager server to finish its requests in flight.
@@ -81,6 +87,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+# Keccak-256, to fold the stand-in VRF trees `pq`'s tests store.
+sha3.workspace = true
 
 [features]
 # Exposes `SlashingProtection::in_memory` to other crates' tests.

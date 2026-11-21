@@ -2,9 +2,11 @@
 //!
 //! Seven global topics (four more from gloas: the execution payload envelope,
 //! the payload attestation message, the builder bid and the proposer
-//! preferences), plus two families this node's own node id selects a
+//! preferences; three fewer at PQ, which drops the exit, BLS-change and sync
+//! contribution topics), plus two families this node's own node id selects a
 //! narrow slice of: the data column subnets it custodies, and the
-//! `SUBNETS_PER_NODE` attestation subnets it backbones.
+//! `SUBNETS_PER_NODE` attestation subnets it backbones (among
+//! `ATTESTATION_SUBNET_COUNT_PQ` under a PQ digest).
 //!
 //! "Only what it consumes" is no longer the whole rule, and
 //! `beacon_attestation_{subnet_id}` is where it stops applying.
@@ -70,8 +72,24 @@ pub const GLOAS_TOPIC_KINDS: [&str; 4] = [
     PROPOSER_PREFERENCES,
 ];
 
-/// Every topic kind this node subscribes to at every fork, in the order they
-/// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
+/// The global topic kinds a PQ digest carries (`pq/p2p-interface.md`):
+/// gloas's, without `voluntary_exit` (exits are execution-layer requests),
+/// `bls_to_execution_change` (disabled) and
+/// `sync_committee_contribution_and_proof` (sync committees are removed).
+pub const PQ_TOPIC_KINDS: [&str; 8] = [
+    BEACON_BLOCK,
+    BEACON_AGGREGATE_AND_PROOF,
+    PROPOSER_SLASHING,
+    ATTESTER_SLASHING,
+    EXECUTION_PAYLOAD,
+    PAYLOAD_ATTESTATION_MESSAGE,
+    EXECUTION_PAYLOAD_BID,
+    PROPOSER_PREFERENCES,
+];
+
+/// Every topic kind this node subscribes to at every fork before PQ, in the
+/// order they are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas;
+/// [`PQ_TOPIC_KINDS`] replace both at PQ.
 pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
     BEACON_BLOCK,
     BEACON_AGGREGATE_AND_PROOF,
@@ -240,8 +258,10 @@ pub fn data_column_subnet(kind: &str) -> Option<u64> {
 #[derive(Debug, Clone)]
 pub struct BeaconTopics {
     pub fork_digest: ForkDigest,
-    /// Parallel to [`SUBSCRIBED_TOPIC_KINDS`], then `column_topics`'s values in
-    /// ascending subnet order. Derived from `column_topics` rather than built
+    /// The fork's global topic kinds ([`SUBSCRIBED_TOPIC_KINDS`] and, from
+    /// gloas, [`GLOAS_TOPIC_KINDS`]; [`PQ_TOPIC_KINDS`] at PQ), then
+    /// `column_topics`'s values in ascending subnet order, then
+    /// `attestation_topics`'s. Derived from `column_topics` rather than built
     /// alongside it, so the two cannot disagree about how many column topics
     /// there are: pushing one entry per `column_subnets` element here, while a
     /// map dedupes the same input, is exactly how the two would drift the
@@ -266,6 +286,11 @@ pub struct BeaconTopics {
     ///
     /// A `BTreeMap` for the reason `column_topics` is one.
     pub attestation_topics: BTreeMap<u64, IdentTopic>,
+    /// Whether these are a PQ digest's topics. Sync committees are removed at
+    /// PQ, and its attestation subnets are `ATTESTATION_SUBNET_COUNT_PQ`, so
+    /// the sync committee and aggregator subnets a validator client asks for,
+    /// both from BLS duties, are never joined under one.
+    pub pq: bool,
 }
 
 impl BeaconTopics {
@@ -290,12 +315,26 @@ impl BeaconTopics {
             | ForkName::Electra
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
             // Gloas adds the payload envelope and the payload attestation
-            // topics, which the follower consumes.
-            ForkName::Gloas => Self::with_extra_kinds(
+            // topics, which the follower consumes. EIP-8483 builds on it and
+            // keeps its topics: its gossip containers are gloas's, bar the
+            // block and envelope.
+            ForkName::Gloas | ForkName::Eip8483 => Self::with_kinds(
                 fork_digest,
-                &GLOAS_TOPIC_KINDS,
+                SUBSCRIBED_TOPIC_KINDS.iter().chain(&GLOAS_TOPIC_KINDS),
                 column_subnets,
                 attestation_subnets,
+                false,
+            ),
+            // PQ's own set, and `attestation_subnets` is its own backbone
+            // (see [`backbone_subnets`]). The node does not follow PQ, so
+            // its blocks, columns and envelopes are ignored there, while the
+            // rest are judged by `gossip::pq` and relayed.
+            ForkName::Pq => Self::with_kinds(
+                fork_digest,
+                PQ_TOPIC_KINDS.iter(),
+                column_subnets,
+                attestation_subnets,
+                true,
             ),
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
@@ -303,21 +342,29 @@ impl BeaconTopics {
         }
     }
 
+    /// A fork before gloas's topics: [`SUBSCRIBED_TOPIC_KINDS`] and the two
+    /// subnet families.
     pub fn new(
         fork_digest: ForkDigest,
         column_subnets: &[u64],
         attestation_subnets: &[u64],
     ) -> Self {
-        Self::with_extra_kinds(fork_digest, &[], column_subnets, attestation_subnets)
+        Self::with_kinds(
+            fork_digest,
+            SUBSCRIBED_TOPIC_KINDS.iter(),
+            column_subnets,
+            attestation_subnets,
+            false,
+        )
     }
 
-    /// [`Self::new`] plus the global topic `extra_kinds` a fork adds, placed
-    /// after [`SUBSCRIBED_TOPIC_KINDS`] and ahead of the subnet families.
-    fn with_extra_kinds(
+    /// The global topic `kinds`, in order and ahead of the subnet families.
+    fn with_kinds<'a>(
         fork_digest: ForkDigest,
-        extra_kinds: &[&str],
+        kinds: impl Iterator<Item = &'a &'a str>,
         column_subnets: &[u64],
         attestation_subnets: &[u64],
+        pq: bool,
     ) -> Self {
         // Built first so the map's own key semantics do the deduplication;
         // `topics` below only ever sees what survived that.
@@ -335,9 +382,7 @@ impl BeaconTopics {
                 .or_insert_with(|| IdentTopic::new(attestation_topic_name(fork_digest, subnet_id)));
         }
 
-        let mut topics: Vec<IdentTopic> = SUBSCRIBED_TOPIC_KINDS
-            .iter()
-            .chain(extra_kinds)
+        let mut topics: Vec<IdentTopic> = kinds
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
             .collect();
         topics.extend(column_topics.values().cloned());
@@ -348,7 +393,23 @@ impl BeaconTopics {
             topics,
             column_topics,
             attestation_topics,
+            pq,
         }
+    }
+}
+
+/// The attestation subnets this node backbones under a digest of `fork`:
+/// PQ's own set (`compute_subscribed_subnet` modified in PQ, over
+/// `ATTESTATION_SUBNET_COUNT_PQ`) at PQ, the shared one before it.
+pub fn backbone_subnets<'a>(
+    fork: ForkName,
+    subnets: &'a [u64],
+    subnets_pq: &'a [u64],
+) -> &'a [u64] {
+    if fork == ForkName::Pq {
+        subnets_pq
+    } else {
+        subnets
     }
 }
 
@@ -382,6 +443,48 @@ mod tests {
         // a healthy mesh of zero peers rather than an error.
         let name = topic_name([0x0a, 0xbc, 0xde, 0xf0], BEACON_BLOCK);
         assert!(name.starts_with("/eth2/0abcdef0/"), "got {name}");
+    }
+
+    /// `pq/p2p-interface.md`: no `voluntary_exit`, `bls_to_execution_change`
+    /// or `sync_committee_contribution_and_proof` under a PQ digest, and its
+    /// own backbone.
+    #[test]
+    fn a_pq_digest_holds_its_own_topic_set_and_backbone() {
+        let pq = BeaconTopics::for_fork(
+            ForkName::Pq,
+            MAINNET,
+            &[],
+            backbone_subnets(ForkName::Pq, &[40], &[7]),
+        );
+        assert!(pq.pq);
+        let names: Vec<String> = pq.topics.iter().map(ToString::to_string).collect();
+        for kind in PQ_TOPIC_KINDS {
+            assert!(names.contains(&topic_name(MAINNET, kind)), "{kind}");
+        }
+        for kind in [
+            VOLUNTARY_EXIT,
+            BLS_TO_EXECUTION_CHANGE,
+            SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF,
+        ] {
+            assert!(!names.contains(&topic_name(MAINNET, kind)), "{kind}");
+        }
+        assert_eq!(
+            pq.attestation_topics.keys().copied().collect::<Vec<_>>(),
+            [7]
+        );
+
+        let gloas = BeaconTopics::for_fork(
+            ForkName::Gloas,
+            MAINNET,
+            &[],
+            backbone_subnets(ForkName::Gloas, &[40], &[7]),
+        );
+        assert!(!gloas.pq);
+        assert_eq!(gloas.topics.len(), 7 + 4 + 1);
+        assert_eq!(
+            gloas.attestation_topics.keys().copied().collect::<Vec<_>>(),
+            [40]
+        );
     }
 
     #[test]

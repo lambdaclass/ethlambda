@@ -681,8 +681,17 @@ impl BeaconNodeApi for HttpBeaconNode {
         struct Body {
             ids: Vec<String>,
         }
+        // Each key in both forms the registry may name it by: its BLS key, and
+        // on the PQ fork its XMSS key's request form (`crate::pq`). The answer
+        // names whichever the head state holds, which `parse_pubkey` maps back.
         let body = Body {
-            ids: pubkeys.iter().map(|key| encode_hex(&key.0)).collect(),
+            ids: pubkeys
+                .iter()
+                .flat_map(|key| {
+                    std::iter::once(encode_hex(&key.0))
+                        .chain(crate::pq::request_key(key).map(|request| encode_hex(&request)))
+                })
+                .collect(),
         };
         let response: DataResponse<Vec<ValidatorEntryDto>> = self
             .post("/eth/v1/beacon/states/head/validators", &body, None)
@@ -696,6 +705,25 @@ impl BeaconNodeApi for HttpBeaconNode {
                     pubkey: parse_pubkey(&entry.validator.pubkey)?,
                     status: entry.status,
                 })
+            })
+            .collect()
+    }
+
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        // No ids: the endpoint answers for every validator.
+        let response: DataResponse<Vec<ValidatorEntryDto>> =
+            self.get("/eth/v1/beacon/states/head/validators").await?;
+        response
+            .data
+            .into_iter()
+            .map(|entry| {
+                let text = entry.validator.pubkey;
+                let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(&text))
+                    .map_err(|err| Error::Decode(format!("bad pubkey hex: {err}")))?;
+                let pubkey = <[u8; 48]>::try_from(bytes).map_err(|got| {
+                    Error::Decode(format!("pubkey is {} bytes, expected 48", got.len()))
+                })?;
+                Ok((entry.index, pubkey))
             })
             .collect()
     }
@@ -943,6 +971,22 @@ impl BeaconNodeApi for HttpBeaconNode {
         .map(|()| Delivery::Everywhere)
     }
 
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        if preferences.is_empty() {
+            return Ok(Delivery::Everywhere);
+        }
+        self.post_no_content(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+        .map(|()| Delivery::Everywhere)
+    }
+
     async fn execution_payload_envelope(
         &self,
         slot: Slot,
@@ -1071,6 +1115,116 @@ impl BeaconNodeApi for HttpBeaconNode {
         Self::handle_pool_submission(status, body, messages.len())
     }
 
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/pool/payload_attestations", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Pq.as_str())
+            .json(messages)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(messages.len());
+        }
+        let body = read_error_body(response).await;
+        Self::handle_pool_submission(status, body, messages.len())
+    }
+
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        #[derive(Serialize)]
+        struct Body {
+            randao_reveal: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            graffiti: Option<String>,
+        }
+        let body = Body {
+            randao_reveal: randao_reveal
+                .iter()
+                .map(|node| encode_hex(&node.0))
+                .collect(),
+            graffiti: graffiti.map(|graffiti| encode_hex(&graffiti.0)),
+        };
+        let url = format!("{}/eth/v1/validator/pq_blocks/{slot}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = error_body(response).await;
+            return Err(Error::BeaconNodeStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let bytes = response.bytes().await.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let contents =
+            <ethlambda_types::beacon::containers::pq::BlockContents as libssz::SszDecode>::from_ssz_bytes(&bytes)
+                .map_err(|err| Error::Decode(format!("pq block contents: {err:?}")))?;
+        let block_root =
+            ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&contents.block);
+        if contents.block.slot != slot
+            || contents.execution_payload_envelope.beacon_block_root != block_root
+        {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ block at slot {slot}, node answered one at slot {} or an envelope for another block",
+                contents.block.slot
+            )));
+        }
+        Ok(contents)
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()> {
+        let (url, sent) = self
+            .post_ssz_body(
+                "/eth/v1/beacon/execution_payload_envelopes",
+                ForkName::Pq,
+                body,
+            )
+            .await;
+        let response = sent.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = error_body(response).await;
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body,
+        })
+    }
+
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -1156,6 +1310,13 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
             }
+            // Not supported by this client: see `ProducedBlock::from_ssz`.
+            ForkName::Eip8483 | ForkName::Pq => {
+                return Err(Error::InconsistentResponse(format!(
+                    "node produced a {} aggregate, which this client does not publish",
+                    fork.as_str()
+                )));
+            }
         };
         // The same contract the other two fetches carry, enforced here so a
         // node answering about the wrong slot is failed over from rather than
@@ -1174,6 +1335,46 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// JSON, because Lighthouse answers an SSZ body here with 415. See the
     /// contract on [`BeaconNodeApi::publish_aggregates`].
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        let path = Self::aggregate_path(slot, attestation_data_root, committee_index);
+        let response: VersionedResponse<ethlambda_types::beacon::containers::pq::ProvenAggregate> =
+            self.get(&path).await?;
+        if !response.version.eq_ignore_ascii_case(ForkName::Pq.as_str()) {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ aggregate, node answered a {} one",
+                response.version
+            )));
+        }
+        let aggregate = response.data;
+        if aggregate.aggregate.data.slot != slot
+            || ethlambda_types::primitives::HashTreeRoot::hash_tree_root(&aggregate.aggregate.data)
+                != attestation_data_root
+        {
+            return Err(Error::InconsistentResponse(
+                "the PQ aggregate is for another vote".into(),
+            ));
+        }
+        Ok(aggregate)
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        // The PQ container serialises as the endpoint's JSON itself.
+        self.post_no_content(
+            "/eth/v2/validator/aggregate_and_proofs",
+            &aggregates,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+    }
+
     async fn publish_aggregates(
         &self,
         fork: ForkName,

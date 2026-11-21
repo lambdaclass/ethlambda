@@ -1,5 +1,17 @@
 # syntax=docker.io/docker/dockerfile:1.7-labs
 
+# leanVM's prover sidecar, which `--pq-prover-binary leanvm-sidecar` starts on
+# a network scheduling the PQ fork. Built from the revision ethlambda's client
+# crate pins (`ethlambda_crypto::stark::sidecar::LEANVM_REV`, bindings v0.15.0,
+# the release pq-devnet-0 runs): a proof only verifies with the same verifier.
+FROM rust:1.97-bookworm AS sidecar
+ARG LEANVM_REV=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764
+RUN git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
+    && cd /leanVM \
+    && git checkout -q ${LEANVM_REV} \
+    && cargo build --release -p leanvm-sidecar --features experimental_prover \
+    && cp target/release/leanvm-sidecar /leanvm-sidecar
+
 FROM rust:1.97-bookworm AS chef
 WORKDIR /app
 
@@ -79,6 +91,7 @@ LABEL org.opencontainers.image.version=$VERSION
 
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
+COPY --from=sidecar /leanvm-sidecar /usr/local/bin/leanvm-sidecar
 
 # Copy licenses
 COPY LICENSE ./
