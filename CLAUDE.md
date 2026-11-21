@@ -360,7 +360,9 @@ actual_slot = finalized_slot + 1 + relative_index
     `execution_payload`, `payload_attestation_message`, `execution_payload_bid` and
     `proposer_preferences` (`BeaconTopics::for_fork`; earlier digests never carry them).
     Bids and preferences are validated in p2p against one shared `BuilderMarket`
-    (`state_transition::beacon::builder_market`) and never reach the chain actor. Gloas has its own rules for `beacon_block`,
+    (`state_transition::beacon::builder_market`) and never reach the chain actor, except that an
+    accepted preference (gossip or API) is reported to it by proposal slot alone
+    (`new_proposer_preferences`), for `payload_attributes`. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate
@@ -589,7 +591,10 @@ disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
 handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
 same `SyncStatusController` the chain actor writes to. The beacon arm takes no
 `AggregatorController`, because a follower has no aggregator duty to toggle, but it does
-take the same `EventBus` lean does, for `GET /eth/v1/events`. It also takes the P2P
+take the same `EventBus` lean does, for `GET /eth/v1/events`, and shares its `FeeRecipients`
+map with the chain actor, which publishes `payload_attributes` a third of a slot ahead for the
+proposers named there (every proposer with `--always-prepare-payload`), from the same
+preparation `produceBlockV3`/`V4` uses (`ethlambda_blockchain::payload_attributes`). It also takes the P2P
 actor's `RpcToP2PRef` (`crates/net/api`), the one path by which this node gossips on the
 beacon wire: `POST /eth/v2/beacon/pool/attestations` validates a validator client's
 attestations and publishes them through it.

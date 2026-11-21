@@ -373,6 +373,17 @@ pub(crate) struct MainnetOptions {
     #[arg(long, default_value_t = SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY)]
     pub(crate) safe_slots_to_import_optimistically: u64,
 
+    /// Publish the `payload_attributes` event for every slot, not only for
+    /// proposers a validator client registered through
+    /// `prepare_beacon_proposer`.
+    ///
+    /// For an external block builder reading this node's event stream (the
+    /// way ethereum-package's buildoor does), which builds for every
+    /// proposer. Lighthouse's `--always-prepare-payload`. The attributes
+    /// are computed only while something is subscribed to `/eth/v1/events`.
+    #[arg(long)]
+    pub(crate) always_prepare_payload: bool,
+
     /// Which network to follow: a built-in name (`mainnet`, `sepolia`,
     /// `hoodi` or `plataberget`), or a path to a directory of published
     /// network files.

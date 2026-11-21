@@ -57,7 +57,7 @@ use crate::beacon::containers::{BeaconState, fulu};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Bytes32, Epoch, ValidatorIndex};
+use crate::beacon::primitives::{Bytes32, Epoch, Slot, ValidatorIndex};
 
 use super::accessors::{get_active_validator_indices, get_current_epoch, get_seed};
 use super::electra::compute_proposer_index;
@@ -188,6 +188,21 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
             index,
             len: lookahead.len(),
         })
+}
+
+/// The proposer of `slot` as `state`'s `proposer_lookahead` names it, without
+/// advancing the state: `None` when `slot` is before the state's epoch, past
+/// the window's `MIN_SEED_LOOKAHEAD` epochs beyond it, or the state predates
+/// fulu.
+///
+/// Exact, not an estimate: an epoch transition only shifts the window and
+/// appends a new last epoch, so the entry a state holds for a later slot is the
+/// one that slot's own state will hold.
+pub fn lookahead_proposer(state: &BeaconState, slot: Slot) -> Option<ValidatorIndex> {
+    let lookahead = proposer_lookahead(state, "lookahead_proposer").ok()?;
+    let window_start = compute_start_slot_at_epoch(get_current_epoch(state));
+    let index = usize::try_from(slot.checked_sub(window_start)?).ok()?;
+    lookahead.get(index).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -321,5 +336,31 @@ mod tests {
     fn get_beacon_proposer_index_rejects_a_state_older_than_fulu() {
         let phase0_state = crate::beacon::helpers::test_state::with_validators(4);
         assert!(get_beacon_proposer_index(&phase0_state).is_err());
+    }
+
+    #[test]
+    fn lookahead_proposer_reads_any_slot_of_the_window() {
+        let state = fulu_state_with_validators(32);
+        assert_eq!(
+            lookahead_proposer(&state, state.slot()),
+            Some(get_beacon_proposer_index(&state).unwrap())
+        );
+        let next_epoch = get_current_epoch(&state) + 1;
+        let next_epoch_proposers = get_beacon_proposer_indices(&state, next_epoch).unwrap();
+        for (offset, expected) in next_epoch_proposers.into_iter().enumerate() {
+            let slot = compute_start_slot_at_epoch(next_epoch) + offset as u64;
+            assert_eq!(lookahead_proposer(&state, slot), Some(expected));
+        }
+    }
+
+    #[test]
+    fn lookahead_proposer_is_none_outside_the_window() {
+        let state = fulu_state_with_validators(32);
+        let window_start = compute_start_slot_at_epoch(get_current_epoch(&state));
+        assert_eq!(lookahead_proposer(&state, window_start - 1), None);
+        let past_window = window_start + preset::proposer_lookahead_length() as u64;
+        assert_eq!(lookahead_proposer(&state, past_window), None);
+        let phase0_state = crate::beacon::helpers::test_state::with_validators(4);
+        assert_eq!(lookahead_proposer(&phase0_state, phase0_state.slot()), None);
     }
 }
