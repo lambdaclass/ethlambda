@@ -51,7 +51,7 @@ pub(crate) const FUTURE_HEAD_TOLERANCE: u64 = 1;
 pub(crate) fn thresholds(store: &Store) -> SyncThresholds {
     match store.chain() {
         Chain::Lean => SyncThresholds::LEAN,
-        Chain::Beacon => SyncThresholds::BEACON,
+        Chain::Beacon => SyncThresholds::beacon(),
     }
 }
 
@@ -763,7 +763,9 @@ pub(crate) fn publish(server: &mut P2PServer) {
 mod tests {
     use super::*;
 
-    const BEACON_REFRESH: u64 = SyncThresholds::BEACON.status_refresh_slots;
+    fn beacon_refresh() -> u64 {
+        SyncThresholds::beacon().status_refresh_slots
+    }
 
     #[test]
     fn the_held_back_count_splits_suspects_from_peers_cooling_down() {
@@ -1008,12 +1010,12 @@ mod tests {
         // them, and every one is asked within the interval after they fell
         // due.
         let peers: Vec<PeerId> = (0..200).map(|_| PeerId::random()).collect();
-        let share = peers.len().div_ceil(BEACON_REFRESH as usize);
+        let share = peers.len().div_ceil(beacon_refresh() as usize);
         let mut heads = PeerHeads::default();
-        heads.due_for_refresh(peers.iter().copied(), 0, BEACON_REFRESH);
+        heads.due_for_refresh(peers.iter().copied(), 0, beacon_refresh());
         let mut asked = HashSet::new();
-        for slot in BEACON_REFRESH..2 * BEACON_REFRESH {
-            let batch = heads.due_for_refresh(peers.iter().copied(), slot, BEACON_REFRESH);
+        for slot in beacon_refresh()..2 * beacon_refresh() {
+            let batch = heads.due_for_refresh(peers.iter().copied(), slot, beacon_refresh());
             assert!(
                 batch.len() <= share,
                 "slot {slot} asked {} peers",

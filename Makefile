@@ -46,24 +46,27 @@ test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run t
 	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
 	$(TEST) -p ethlambda-validator --test interchange_vectors
 
-# --lib as well as the spec target: the BLS and KZG modules keep their fixture
-# vectors as unit tests, which are `ignore`d unless this feature is on.
-BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_tests --profile release-fast
+# The spec binary selects its preset at runtime from BEACON_SPEC_PRESET, so both
+# presets run off one build of it.
+BEACON_SPEC_TEST=cargo test -p ethlambda-state-transition --test beacon_spec_tests --profile release-fast --features beacon-spec-tests
 
-# The preset fixes SSZ container bounds at compile time, so each preset needs its
-# own build, and a run walks its own preset's fixture tree and nothing else; the
-# BLS and KZG vectors are a separate, preset-independent download
-# (`cryptography-specs`). Hence a target per preset rather than one recipe
-# running both: CI gives each its own job, so the two build and run
-# concurrently and each downloads only the trees its preset reads.
+# A run walks its own preset's fixture tree and nothing else; the BLS and KZG
+# vectors are a separate, preset-independent download (`cryptography-specs`).
+# Hence a target per preset rather than one recipe running both: CI gives each
+# its own job, so the two run concurrently and each downloads only the trees
+# its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
+# --lib as well: the BLS and KZG modules keep their fixture vectors as unit
+# tests, which are `ignore`d unless `beacon-spec-tests` is on. They are
+# preset-independent, so only this target runs them.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
-	$(BEACON_TEST) --features beacon-spec-tests
+	cargo test -p ethlambda-state-transition --lib --profile release-fast --features beacon-spec-tests
+	BEACON_SPEC_PRESET=mainnet $(BEACON_SPEC_TEST)
 	cargo test -p ethlambda-blockchain --lib --profile release-fast --features beacon-spec-tests
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
-	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal
+	BEACON_SPEC_PRESET=minimal $(BEACON_SPEC_TEST)
 
 # Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
 # is nightly-only, everything else runs on the stable toolchain pinned in

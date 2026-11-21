@@ -6,7 +6,7 @@
 //! drift: a refresh cadence that no longer fits the lead it is meant to detect
 //! is a silent sensitivity loss, not a compile error.
 
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset;
 
 /// How far behind a node may fall before it reports itself syncing, per chain.
 ///
@@ -117,13 +117,26 @@ impl SyncThresholds {
     /// follower importing about one block a slot right at the boundary would
     /// otherwise flip twice a slot. The stall window is an epoch, and the
     /// `Status` refresh is Prysm's half epoch (`maintainPeerStatuses`).
-    pub const BEACON: Self = Self {
-        clock_lag: 2 * SLOTS_PER_EPOCH,
-        peer_lead: SLOTS_PER_EPOCH,
-        hysteresis: 4,
-        stall_window: SLOTS_PER_EPOCH,
-        status_refresh_slots: SLOTS_PER_EPOCH / 2,
-    };
+    ///
+    /// Not a constant like [`Self::LEAN`]: every number but the hysteresis is
+    /// a count of epochs, and the epoch's length is the preset's, which the
+    /// process selects at startup.
+    pub fn beacon() -> Self {
+        Self::beacon_for(preset::slots_per_epoch())
+    }
+
+    /// [`Self::beacon`] for a preset with `slots_per_epoch` slots in an
+    /// epoch. Apart from it so the bounds below are checked at compile time
+    /// for each preset the node can run.
+    pub const fn beacon_for(slots_per_epoch: u64) -> Self {
+        Self {
+            clock_lag: 2 * slots_per_epoch,
+            peer_lead: slots_per_epoch,
+            hysteresis: 4,
+            stall_window: slots_per_epoch,
+            status_refresh_slots: slots_per_epoch / 2,
+        }
+    }
 
     /// Slots a peer's `Status` report counts towards the network head after
     /// it arrived: four refresh intervals. That outlasts a refresh that times
@@ -155,4 +168,5 @@ impl SyncThresholds {
 }
 
 const _: () = assert!(SyncThresholds::LEAN.is_consistent());
-const _: () = assert!(SyncThresholds::BEACON.is_consistent());
+const _: () = assert!(SyncThresholds::beacon_for(preset::mainnet::SLOTS_PER_EPOCH).is_consistent());
+const _: () = assert!(SyncThresholds::beacon_for(preset::minimal::SLOTS_PER_EPOCH).is_consistent());

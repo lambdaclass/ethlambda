@@ -975,7 +975,7 @@ with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
-One flat object holding the network's configuration, the compiled preset, and
+One flat object holding the network's configuration, the active preset's values, and
 the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.

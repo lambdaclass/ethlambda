@@ -18,7 +18,7 @@ use eyre::{WrapErr as _, bail, ensure, eyre};
 use tracing::info;
 
 use crate::network::{DEFAULT_NETWORK, NetworkSource, NetworkSpec};
-use replay::{Replay, SLOTS_PER_ERA};
+use replay::{Replay, slots_per_era};
 use report::EraReport;
 
 /// One `--era` value.
@@ -177,14 +177,15 @@ fn write_report(path: &Path, reports: &[EraReport]) -> eyre::Result<()> {
 /// process. `Config` has no gloas fork, so decoding such a state as fulu would
 /// fail with an SSZ error that names neither the fork nor the fix.
 fn check_replayable(era: u64, gloas_epoch: Option<u64>, name: &str) -> eyre::Result<()> {
-    let end_epoch = era * SLOTS_PER_ERA / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    let end_epoch = era * slots_per_era() / ethlambda_types::beacon::preset::slots_per_epoch();
     if let Some(gloas) = gloas_epoch
         && end_epoch >= gloas
     {
         bail!(
             "{name} era {era} ends at epoch {end_epoch}, at or past the gloas fork (epoch {gloas}), \
              which this build cannot process; the last replayable era is {}",
-            (gloas * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH).div_ceil(SLOTS_PER_ERA) - 1
+            (gloas * ethlambda_types::beacon::preset::slots_per_epoch()).div_ceil(slots_per_era())
+                - 1
         );
     }
     Ok(())

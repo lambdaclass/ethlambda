@@ -371,7 +371,7 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
         process_slot(state)?;
         // Epoch processing runs on the last slot of an epoch, before the counter
         // moves into the next one.
-        if (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_EPOCH) {
+        if (state.slot() + 1).is_multiple_of(preset::slots_per_epoch()) {
             let epoch_started = Instant::now();
             epoch::process_epoch(state, config)?;
             let elapsed = epoch_started.elapsed();
@@ -422,10 +422,10 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
 /// another's. Upgrading one fork per slot would silently leave the state a fork
 /// behind.
 fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<()> {
-    if !state.slot().is_multiple_of(preset::SLOTS_PER_EPOCH) {
+    if !state.slot().is_multiple_of(preset::slots_per_epoch()) {
         return Ok(());
     }
-    let epoch = state.slot() / preset::SLOTS_PER_EPOCH;
+    let epoch = state.slot() / preset::slots_per_epoch();
 
     while let Some(next) = state.fork_name().next() {
         if config.fork_epoch(next) != epoch {
@@ -459,7 +459,7 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
     // throwaway copy.
     state.apply_pending_mutations();
     let previous_state_root = state.compute_state_root();
-    let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+    let position = state.slot() as usize % preset::slots_per_historical_root();
     state.state_roots_mut()[position] = previous_state_root;
 
     if state.latest_block_header().state_root.is_zero() {
@@ -487,7 +487,7 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
                 .slot
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
-            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            let next_position = (next_slot % preset::slots_per_historical_root() as u64) as usize;
             inner
                 .execution_payload_availability
                 .set(next_position, false)
@@ -540,9 +540,9 @@ mod tests {
     #[test]
     fn process_slot_unsets_next_slots_payload_availability_on_gloas() {
         let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
-        let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
-        let next_position = (position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
-        let other_position = (next_position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let position = state.slot() as usize % preset::slots_per_historical_root();
+        let next_position = (position + 1) % preset::slots_per_historical_root();
+        let other_position = (next_position + 1) % preset::slots_per_historical_root();
         let BeaconState::Gloas(inner) = &mut state else {
             panic!("with_validators_at(Gloas) returns a gloas state");
         };
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn process_slot_wraps_the_payload_availability_index_at_the_end_of_the_window() {
         let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
-        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot - 1;
+        *state.slot_mut() = preset::slots_per_historical_root() as Slot - 1;
         let BeaconState::Gloas(inner) = &mut state else {
             panic!("with_validators_at(Gloas) returns a gloas state");
         };
@@ -629,7 +629,7 @@ mod tests {
     fn process_slots_across_an_epoch_boundary_leaves_no_buffered_writes() {
         let mut state = test_state::with_validators(4);
         let config = Config::mainnet();
-        let target_slot = state.slot() + preset::SLOTS_PER_EPOCH;
+        let target_slot = state.slot() + preset::slots_per_epoch();
 
         process_slots(&mut state, target_slot, &config).unwrap();
 
@@ -646,7 +646,7 @@ mod tests {
 
         let config = Config::mainnet();
         let mut state = test_state::with_validators(4);
-        let two_epochs = state.slot() + 2 * preset::SLOTS_PER_EPOCH;
+        let two_epochs = state.slot() + 2 * preset::slots_per_epoch();
 
         take_observation_log();
         process_slots(&mut state, two_epochs, &config).unwrap();

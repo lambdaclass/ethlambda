@@ -297,28 +297,28 @@ pub fn process_withdrawals(
     }
 
     let validator_count = state.validator_count() as ValidatorIndex;
-    let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
-    {
-        let latest_withdrawal = expected_withdrawals
-            .last()
-            .expect("MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty");
-        latest_withdrawal
-            .validator_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "latest_withdrawal.validator_index + 1",
-            ))?
-            % validator_count
-    } else {
-        let current_cursor =
-            deneb_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
-        current_cursor
-            .checked_add(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
-            .ok_or(Error::ArithmeticOverflow(
-                "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
-            ))?
-            % validator_count
-    };
+    let next_validator_index =
+        if expected_withdrawals.len() == preset::max_withdrawals_per_payload() {
+            let latest_withdrawal = expected_withdrawals.last().expect(
+                "MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty",
+            );
+            latest_withdrawal
+                .validator_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow(
+                    "latest_withdrawal.validator_index + 1",
+                ))?
+                % validator_count
+        } else {
+            let current_cursor =
+                deneb_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
+            current_cursor
+                .checked_add(preset::max_validators_per_withdrawals_sweep())
+                .ok_or(Error::ArithmeticOverflow(
+                    "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
+                ))?
+                % validator_count
+        };
     deneb_state(state, "process_withdrawals")?.next_withdrawal_validator_index =
         next_validator_index;
 
@@ -575,7 +575,7 @@ fn attestation_participation_flag_indices(
     verify(is_matching_source, "is_matching_source")?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
     // [EIP-7045]: no `inclusion_delay` bound, unlike altair's

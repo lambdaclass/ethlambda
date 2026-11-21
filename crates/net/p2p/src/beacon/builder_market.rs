@@ -185,7 +185,7 @@ mod tests {
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome, RejectReason};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::{Epoch, ExecutionBlockHash};
     use libssz::SszEncode;
 
@@ -319,7 +319,8 @@ mod tests {
             triage_proposer_preferences(&server, &past.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::SlotStarted))
         ));
-        let two_epochs_ahead = preferences_at((wall / SLOTS_PER_EPOCH + 2) * SLOTS_PER_EPOCH + 1);
+        let two_epochs_ahead =
+            preferences_at((wall / slots_per_epoch() + 2) * slots_per_epoch() + 1);
         assert!(matches!(
             triage_proposer_preferences(&server, &two_epochs_ahead.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::BeyondLookahead))
@@ -382,7 +383,7 @@ mod tests {
         assert_ne!(gloas_digest, fulu_digest);
 
         let kind = beacon_topics::PROPOSER_PREFERENCES;
-        let first_gloas_slot = GLOAS * SLOTS_PER_EPOCH;
+        let first_gloas_slot = GLOAS * slots_per_epoch();
         assert_eq!(
             topic_of(&server, kind, first_gloas_slot),
             Some(beacon_topics::topic_name(gloas_digest, kind))
@@ -402,6 +403,6 @@ mod tests {
         let mut server = unconnected_beacon_server(rollover_config(), 0).await;
         apply(&mut server, GLOAS - 3);
         let kind = beacon_topics::EXECUTION_PAYLOAD_BID;
-        assert_eq!(topic_of(&server, kind, GLOAS * SLOTS_PER_EPOCH), None);
+        assert_eq!(topic_of(&server, kind, GLOAS * slots_per_epoch()), None);
     }
 }

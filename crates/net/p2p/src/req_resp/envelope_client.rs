@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn only_a_span_reaching_gloas_asks_for_envelopes() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 10);
-        let first_gloas_slot = 10 * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let first_gloas_slot = 10 * ethlambda_types::beacon::preset::slots_per_epoch();
 
         assert!(!range_reaches_gloas(&config, &(0..=first_gloas_slot - 1)));
         // A span that starts before gloas and ends inside it overlaps.
@@ -570,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn a_range_batch_asks_for_envelopes_only_where_gloas_overlaps() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 10);
-        let first_gloas_slot = 10 * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let first_gloas_slot = 10 * ethlambda_types::beacon::preset::slots_per_epoch();
         let mut server = crate::test_support::unconnected_beacon_server(config, 0).await;
         let peer = PeerId::random();
         server

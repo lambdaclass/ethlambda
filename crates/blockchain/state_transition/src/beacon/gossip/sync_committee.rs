@@ -29,7 +29,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::altair::{
-    SYNC_SUBCOMMITTEE_SIZE, SignedContributionAndProof, SyncCommitteeMessage,
+    SignedContributionAndProof, SyncCommitteeMessage, sync_subcommittee_size,
 };
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::sync_committee::{
@@ -67,7 +67,7 @@ impl SeenSyncCommitteeMessages {
 /// A subcommittee's aggregation bits, packed into one word.
 fn pack_bits(signed: &SignedContributionAndProof) -> u128 {
     let bits = &signed.message.contribution.aggregation_bits;
-    (0..SYNC_SUBCOMMITTEE_SIZE)
+    (0..sync_subcommittee_size())
         .filter(|&index| bits.get(index).unwrap_or(false))
         .fold(0u128, |packed, index| packed | (1 << index))
 }
@@ -417,7 +417,9 @@ mod tests {
     use crate::beacon::preset;
 
     const SLOT: Slot = 5;
-    const VALIDATORS: usize = preset::SYNC_COMMITTEE_SIZE;
+    fn validators() -> usize {
+        preset::sync_committee_size()
+    }
 
     fn root() -> Root {
         Root::repeat_byte(4)
@@ -434,7 +436,7 @@ mod tests {
     /// A store whose head state is the committee state, cached.
     fn store_with_head() -> (Store, std::sync::Arc<BeaconState>) {
         let mut store = store(0);
-        let state = state_with_committees(VALIDATORS);
+        let state = state_with_committees(validators());
         let head = store.head().expect("head root");
         store.insert_state(head, state).expect("insert head state");
         let cached = store
@@ -460,7 +462,7 @@ mod tests {
     }
 
     fn subnet_of(index: u64) -> u64 {
-        index / SYNC_SUBCOMMITTEE_SIZE as u64
+        index / sync_subcommittee_size() as u64
     }
 
     #[test]
@@ -517,7 +519,7 @@ mod tests {
         let message = message_from(1, 1);
         assert_eq!(
             message_stateful_checks(&store, &message, subnet_of(1)),
-            Ok(vec![(subnet_of(1), 1 % SYNC_SUBCOMMITTEE_SIZE)])
+            Ok(vec![(subnet_of(1), 1 % sync_subcommittee_size())])
         );
     }
 
@@ -543,10 +545,10 @@ mod tests {
         );
         // With fewer validators than seats a committee still has non-members
         // only when the registry is larger than the committee.
-        let big = state_with_committees(VALIDATORS + 1);
-        let outsider = VALIDATORS as u64;
+        let big = state_with_committees(validators() + 1);
+        let outsider = validators() as u64;
         big.validator(outsider).expect("the outsider is registered");
-        let outsider_message = message_from(outsider, VALIDATORS);
+        let outsider_message = message_from(outsider, validators());
         assert_eq!(
             check_message(&big, &config, &outsider_message, None),
             Err(Outcome::Reject(RejectReason::NotInCommittee))
@@ -566,7 +568,7 @@ mod tests {
     fn a_period_the_head_cannot_answer_is_ignored() {
         let (store, state) = store_with_head();
         let mut message = message_from(0, 0);
-        message.slot = 3 * preset::SLOTS_PER_EPOCH * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        message.slot = 3 * preset::slots_per_epoch() * preset::epochs_per_sync_committee_period();
         assert_eq!(
             check_message(&state, &store.config(), &message, None),
             Err(Outcome::Ignore(IgnoreReason::SyncCommitteeUnavailable))
@@ -582,7 +584,7 @@ mod tests {
         subcommittee: u64,
         participants: &[usize],
     ) -> SignedContributionAndProof {
-        let base = subcommittee as usize * SYNC_SUBCOMMITTEE_SIZE;
+        let base = subcommittee as usize * sync_subcommittee_size();
         let signing_root = sync_committee_message_signing_root(config, Root::ZERO, SLOT, root());
         let signatures: Vec<BlsSignature> = participants
             .iter()
@@ -602,7 +604,7 @@ mod tests {
         let selection_root =
             sync_selection_proof_signing_root(config, Root::ZERO, SLOT, subcommittee);
         // The first member whose selection proof selects it.
-        let (aggregator, selection_proof) = (0..SYNC_SUBCOMMITTEE_SIZE)
+        let (aggregator, selection_proof) = (0..sync_subcommittee_size())
             .map(|position| (base + position, sign_for(base + position, selection_root)))
             .find(|(_, proof)| is_sync_committee_aggregator(proof))
             .expect("some member of the subcommittee is selected");
@@ -680,7 +682,7 @@ mod tests {
         let good = contribution_from(&mainnet_fulu(), 1, &[0]);
         // Another member's proof for the same data is validly signed, but not by this aggregator.
         let selection_root = sync_selection_proof_signing_root(&config, Root::ZERO, SLOT, 1);
-        let impostor = (0..SYNC_SUBCOMMITTEE_SIZE * 4)
+        let impostor = (0..sync_subcommittee_size() * 4)
             .map(|index| sign_for(index, selection_root))
             .find(|proof| {
                 is_sync_committee_aggregator(proof) && *proof != good.message.selection_proof
@@ -728,7 +730,7 @@ mod tests {
         let unselected = (0u8..=255)
             .map(|byte| BlsSignature([byte; 96]))
             .find(|proof| !is_sync_committee_aggregator(proof));
-        if cfg!(feature = "preset-minimal") {
+        if crate::beacon::preset::Preset::active() == crate::beacon::preset::Preset::Minimal {
             assert!(unselected.is_none());
         } else {
             let mut bad = good.clone();

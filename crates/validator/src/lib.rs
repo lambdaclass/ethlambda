@@ -51,6 +51,40 @@ mod test_support;
 
 pub use error::{Error, Result};
 
+/// Run this process on the preset the beacon node reports, before anything
+/// reads one.
+///
+/// A validator client has no network config of its own: the node's
+/// `/eth/v1/config/spec` is where it learns the chain, `PRESET_BASE`
+/// included. Every container this client decodes, builds or signs is bounded
+/// by that preset (a sync committee's bits, an attestation's committee bits,
+/// the slots in an epoch), so it is selected here, right after the spec is
+/// fetched and before any duty runs.
+pub fn adopt_preset(spec: &ethlambda_types::beacon::config::Config) -> Result<()> {
+    use ethlambda_types::beacon::preset::Preset;
+
+    let name = spec.preset_base.as_str();
+    let preset: Preset = name.parse().map_err(|_| {
+        Error::Preset(format!(
+            "PRESET_BASE: {name:?} names no preset this client has values for"
+        ))
+    })?;
+    Preset::select(preset).map_err(|err| Error::Preset(err.to_string()))
+}
+
+/// Refuse to go on when something in this process read a preset value before
+/// the beacon node's was adopted.
+///
+/// [`adopt_preset`] accepts the preset already in force, so against a mainnet
+/// node such a read goes unnoticed and only a minimal one fails. The two
+/// commands that own their process call this first, so the ordering bug fails
+/// against every node. Kept out of `adopt_preset` itself, which tests sharing
+/// one process also reach.
+pub(crate) fn require_unread_preset() -> Result<()> {
+    ethlambda_types::beacon::preset::Preset::require_unread()
+        .map_err(|err| Error::Preset(err.to_string()))
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -241,7 +275,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     let genesis = beacon_node.genesis().await?;
     let spec = beacon_node.spec().await?;
+    require_unread_preset()?;
+    adopt_preset(&spec)?;
     info!(
+        preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
         slot_duration_ms = spec.slot_duration_ms,
         attestation_due_bps = spec.attestation_due_bps,
@@ -1346,7 +1383,7 @@ async fn refresh_sync<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD_EPOCHS;
+    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
     if context.config.fork_at_epoch(epoch) < ForkName::Altair {
         return;
@@ -1366,14 +1403,14 @@ async fn refresh_sync<B: BeaconNodeApi>(
 
     let current = duties.sync_for_period(period);
     if let Err(err) =
-        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * PERIOD_EPOCHS).await
+        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * period_epochs()).await
     {
         warn!(%err, "Failed to subscribe to sync committee subnets");
     }
-    if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * PERIOD_EPOCHS {
+    if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * period_epochs() {
         let next = duties.sync_for_period(period + 1);
         if let Err(err) =
-            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * PERIOD_EPOCHS).await
+            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * period_epochs()).await
         {
             warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
         }
@@ -2036,12 +2073,12 @@ mod tests {
     /// subscribed every refresh, to the period's end.
     #[tokio::test]
     async fn sync_duties_for_both_periods_are_fetched_and_subscribed() {
-        use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD;
+        use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period;
 
         let node = Arc::new(
             node()
                 .with_sync_duties(0, vec![sync_duty(11, vec![3, 130])])
-                .with_sync_duties(PERIOD, vec![sync_duty(11, vec![200])]),
+                .with_sync_duties(period(), vec![sync_duty(11, vec![200])]),
         );
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
@@ -2063,13 +2100,13 @@ mod tests {
             .iter()
             .map(|(epoch, _)| *epoch)
             .collect();
-        assert_eq!(requested, vec![0, PERIOD, 0, PERIOD]);
+        assert_eq!(requested, vec![0, period(), 0, period()]);
         assert_eq!(duties.sync_for_period(1).len(), 1);
 
         let sent = node.sync_subscriptions();
         assert_eq!(sent.len(), 2, "re-sent every epoch, current period only");
         assert_eq!(sent[0].sync_committee_indices, vec![3, 130]);
-        assert_eq!(sent[0].until_epoch, PERIOD);
+        assert_eq!(sent[0].until_epoch, period());
     }
 
     /// Not asked before altair.

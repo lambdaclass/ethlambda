@@ -124,7 +124,7 @@ impl BeaconWire {
     /// the switch has not run yet.
     pub fn digest_for_slot(&self, slot: Slot) -> ForkDigest {
         self.schedule
-            .digest_at(slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH)
+            .digest_at(slot / ethlambda_types::beacon::preset::slots_per_epoch())
     }
 
     /// [`Self::digest_for_slot`], but only if this node holds that digest's

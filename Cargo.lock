@@ -2287,6 +2287,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

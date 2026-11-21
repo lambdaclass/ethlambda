@@ -17,12 +17,12 @@ use crate::beacon::primitives::{
 
 /// The epoch containing `slot`.
 pub fn compute_epoch_at_slot(slot: Slot) -> Epoch {
-    slot / preset::SLOTS_PER_EPOCH
+    slot / preset::slots_per_epoch()
 }
 
 /// The first slot of `epoch`.
 pub fn compute_start_slot_at_epoch(epoch: Epoch) -> Slot {
-    epoch * preset::SLOTS_PER_EPOCH
+    epoch * preset::slots_per_epoch()
 }
 
 /// The signing domain for a message type on a particular fork and chain.
@@ -155,7 +155,7 @@ mod tests {
         let start = compute_start_slot_at_epoch(epoch);
         assert_eq!(compute_epoch_at_slot(start), epoch);
         assert_eq!(
-            compute_epoch_at_slot(start + preset::SLOTS_PER_EPOCH - 1),
+            compute_epoch_at_slot(start + preset::slots_per_epoch() - 1),
             epoch
         );
     }

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::{Epoch, Slot};
 
 /// Basis points in a whole, which is what the duty offsets are expressed in.
@@ -107,7 +107,7 @@ impl SlotClock {
 
     /// The epoch containing `slot`.
     pub fn epoch_of(&self, slot: Slot) -> Epoch {
-        slot / SLOTS_PER_EPOCH
+        slot / slots_per_epoch()
     }
 
     /// How long one slot lasts.
@@ -418,8 +418,8 @@ mod tests {
     fn an_epoch_is_slots_per_epoch_slots() {
         let clock = clock();
         assert_eq!(clock.epoch_of(0), 0);
-        assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH - 1), 0);
-        assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH), 1);
+        assert_eq!(clock.epoch_of(slots_per_epoch() - 1), 0);
+        assert_eq!(clock.epoch_of(slots_per_epoch()), 1);
     }
 
     /// 3333 basis points of a 12-second slot is 3999 ms, not the 4000 a third
@@ -618,8 +618,8 @@ mod tests {
     fn the_offsets_change_at_the_gloas_boundary() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
         let clock = SlotClock::from_config(GENESIS, &config);
-        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
-        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let last_fulu = 2 * slots_per_epoch() - 1;
+        let first_gloas = 2 * slots_per_epoch();
         let ms =
             |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
 
@@ -647,8 +647,8 @@ mod tests {
     fn the_sync_offsets_follow_the_fork_of_the_slot() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
         let clock = SlotClock::from_config(GENESIS, &config);
-        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
-        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let last_fulu = 2 * slots_per_epoch() - 1;
+        let first_gloas = 2 * slots_per_epoch();
         let ms =
             |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
 

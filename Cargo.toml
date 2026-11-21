@@ -120,6 +120,9 @@ secp256k1 = { version = "0.30.0", default-features = false, features = ["global-
 # through to the pure-Rust backend. Selection stays at run time either way, so the
 # build remains portable to hardware lacking the extensions.
 sha2 = { version = "0.10.9", features = ["asm"] }
+# Inline byte storage for the preset-sized bitfields, as libssz-types' own
+# bitfields use, so decoding committee or sync bits does not allocate.
+smallvec = "1.15"
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the

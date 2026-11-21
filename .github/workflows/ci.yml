@@ -122,16 +122,16 @@ jobs:
   # because those jobs are by far the slowest in the workflow, and because this
   # is the only place the runners are linted at `-D warnings`.
   #
-  # `preset-minimal` is a whole second compilation, because the beacon
-  # containers' SSZ bounds are const-generic arguments and everything in `lint`
-  # builds the default (mainnet) preset only. The fixture-reading unit tests
-  # stay `ignore`d here, since `beacon-spec-tests` is off.
+  # The preset is selected at runtime, but a unit-test binary never selects
+  # one, so `preset-minimal` (which makes minimal the default) is how the
+  # `--lib` tests run under minimal. It is a second compilation of these two
+  # crates, and only of the tests: the binary never enables it. The
+  # fixture-reading unit tests stay `ignore`d here, since `beacon-spec-tests`
+  # is off.
   #
   # `--lib`: this job downloads no fixtures, and the integration targets
   # (`ssz_spectests`, `stf_spectests`) walk the leanSpec tree, which only `test`
-  # has. Both presets, not just the default: the spec suite's `genesis` runner
-  # is `#![cfg(feature = "preset-minimal")]`, so a mainnet build type-checks
-  # every runner except the sole coverage `beacon::genesis` has.
+  # has.
   presets:
     name: Test minimal preset
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
@@ -153,7 +153,6 @@ jobs:
       - name: Check the beacon spec-test suite compiles
         run: |
           cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests -- -D warnings
-          cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests,preset-minimal -- -D warnings
 
       - name: Check the minimal preset
         run: |

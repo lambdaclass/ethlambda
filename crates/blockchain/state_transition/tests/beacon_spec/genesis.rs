@@ -9,12 +9,11 @@
 //!
 //! This release's fixtures ship `genesis` cases for the `minimal` preset only
 //! (there is no `genesis` directory anywhere under `mainnet` in the extracted
-//! tree), so this whole runner is gated on the `preset-minimal` feature. That
-//! keeps the mainnet build from failing [`super::discovery_trial`]'s "matched
-//! no fixture cases" check over a suite the release never populates for it,
-//! without having to teach the shared harness a new kind of "expected empty"
-//! outcome for one runner.
-#![cfg(feature = "preset-minimal")]
+//! tree), so `main` adds this runner only to a minimal run. That keeps a
+//! mainnet run from failing [`super::discovery_trial`]'s "matched no fixture
+//! cases" check over a suite the release never populates for it, without
+//! having to teach the shared harness a new kind of "expected empty" outcome
+//! for one runner.
 
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Root};
 use libssz::SszDecode as _;
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect};
+use super::{Case, collect, preset};
 
 #[derive(serde::Deserialize)]
 struct Eth1 {
@@ -103,7 +102,7 @@ fn validity_case(case: &Case, config: &Config) -> Result<(), String> {
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::minimal());
 
-    let initialization_cases = collect(PRESET, "genesis", "initialization");
+    let initialization_cases = collect(preset(), "genesis", "initialization");
     let mut trials = vec![super::discovery_trial(
         "genesis/initialization",
         initialization_cases.len(),
@@ -124,7 +123,7 @@ pub fn trials() -> Vec<Trial> {
         ));
     }
 
-    let validity_cases = collect(PRESET, "genesis", "validity");
+    let validity_cases = collect(preset(), "genesis", "validity");
     trials.push(super::discovery_trial(
         "genesis/validity",
         validity_cases.len(),
