@@ -454,13 +454,14 @@ pub trait BeaconNodeApi: Send + Sync {
 
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
-    /// No committee index is ever a parameter here. Before gloas the query
-    /// still carries `committee_index=0`, which the specification deprecated
+    /// No committee index is ever a parameter here. The query carries
+    /// `committee_index=0` at every fork, which the specification deprecated
     /// from electra on and nodes ignore, so a caller cannot get it wrong. From
-    /// gloas it is omitted, because the answer's `index` is no longer a
-    /// committee but the payload signal (0 for a same-slot block, 1 when the
-    /// attested block's payload was seen as full), and the caller must pass it
-    /// through unchanged: it is signed.
+    /// gloas the specification says to omit it, but Lighthouse still requires
+    /// it (see `HttpBeaconNode::attestation_data_path`). From gloas the
+    /// answer's `index` is no longer a committee but the payload signal (0 for
+    /// a same-slot block, 1 when the attested block's payload was seen as
+    /// full), and the caller must pass it through unchanged: it is signed.
     ///
     /// # Contract: the answer is for `slot`, or this is an `Err`
     ///

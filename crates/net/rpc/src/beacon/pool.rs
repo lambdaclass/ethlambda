@@ -25,8 +25,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ethlambda_blockchain::EventBus;
 use ethlambda_engine::EngineClient;
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     bls,
     gossip::attestation::compute_subnet_for_attestation,
@@ -52,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::beacon::{
-    ApiError, decode_list,
+    ApiError, decode_list, emit_accepted,
     validator::{head, require_execution_client, require_validated},
 };
 
@@ -91,6 +92,7 @@ pub(crate) struct Failure {
 async fn post_pool_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -134,7 +136,22 @@ async fn post_pool_attestations(
                 checked.committee_position,
                 checked.committee_len,
             );
+            // The event needs its own copy, since the attestation moves into
+            // the publish; made only when a client is subscribed, as a batch
+            // can carry a whole validator client's votes.
+            let for_event = events
+                .as_deref()
+                .is_some_and(EventBus::has_subscribers)
+                .then(|| attestation.clone());
             p2p.publish_beacon_attestation(checked.subnet_id, attestation)
+                .map(|()| {
+                    // The `(from P2P or API)` half of `single_attestation`.
+                    if let Some(attestation) = for_event {
+                        emit_accepted(events.as_deref(), || {
+                            GossipEvent::SingleAttestation(Box::new(attestation))
+                        });
+                    }
+                })
                 .map_err(|_| "the network actor is not running")
         });
         match published {
@@ -243,10 +260,13 @@ fn validate(
     // [REJECT] The signature is valid, under the attester domain at the target
     // epoch. The schedule's domain, not the head state's: the head may still be
     // the previous fork's while the target epoch's first slots are empty.
-    let pubkey = state
-        .validator(attestation.attester_index)
-        .map_err(|_| "attester index is unknown")?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: attestation.attester_index,
+        pubkey: state
+            .validator(attestation.attester_index)
+            .map_err(|_| "attester index is unknown")?
+            .pubkey,
+    };
     let domain =
         get_domain_from_schedule(&config, state, DOMAIN_BEACON_ATTESTER, data.target.epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
@@ -660,10 +680,22 @@ mod tests {
         attestations: &[SingleAttestation],
         version: &str,
     ) -> (StatusCode, serde_json::Value) {
+        submit_with_events(fixture, attestations, version, None).await
+    }
+
+    async fn submit_with_events(
+        fixture: &Fixture,
+        attestations: &[SingleAttestation],
+        version: &str,
+        events: Option<EventBus>,
+    ) -> (StatusCode, serde_json::Value) {
         let network: RpcToP2PRef = fixture.network.clone();
-        let app = routes()
+        let mut app = routes()
             .with_state(fixture.store.clone())
             .layer(Extension(network));
+        if let Some(events) = events {
+            app = app.layer(Extension(events));
+        }
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("content-type", "application/json")
             .header("eth-consensus-version", version)
@@ -678,6 +710,34 @@ mod tests {
             serde_json::from_slice(&body).unwrap()
         };
         (status, json)
+    }
+
+    /// An accepted attestation goes out on the event stream next to its
+    /// publication; one that fails validation does not.
+    #[tokio::test]
+    async fn an_accepted_attestation_is_reported_on_the_event_stream() {
+        let fixture = fixture();
+        let good = attestation(&fixture, 0, 0);
+        let mut bad = attestation(&fixture, 0, 1);
+        bad.signature = Default::default();
+        let events = EventBus::new(8);
+        let mut stream = events.subscribe();
+
+        let (status, _) = submit_with_events(
+            &fixture,
+            &[bad, good.clone()],
+            fixture.version,
+            Some(events),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let event = stream.try_recv().expect("the accepted attestation");
+        let ethlambda_blockchain::ChainEvent::SingleAttestation(reported) = event else {
+            panic!("expected a single_attestation event, got {event:?}");
+        };
+        assert_eq!(*reported, good);
+        assert!(stream.try_recv().is_err(), "the refused one stays off");
     }
 
     #[tokio::test]

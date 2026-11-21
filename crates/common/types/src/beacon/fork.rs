@@ -26,7 +26,9 @@ const LEAN_SNAPSHOT_INTERVAL: u64 = 1_024;
 /// one delta against its snapshot whatever the interval, so what this bounds
 /// is how large a delta grows (it carries every change since its snapshot) and
 /// how often a full snapshot is written.
-const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
+fn beacon_snapshot_interval() -> u64 {
+    preset::slots_per_epoch()
+}
 
 /// A named fork of the Beacon Chain, ordered oldest to newest, followed by
 /// Lean.
@@ -194,7 +196,7 @@ impl ForkName {
     /// interval lets deltas grow large, and a snapshot is a full copy of the
     /// state. Beacon takes an epoch, which bounds both; a read applies a single
     /// delta whatever the interval, and decodes once.
-    pub const fn snapshot_interval(self) -> u64 {
+    pub fn snapshot_interval(self) -> u64 {
         match self {
             ForkName::Lean => LEAN_SNAPSHOT_INTERVAL,
             ForkName::Phase0
@@ -204,7 +206,7 @@ impl ForkName {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => BEACON_SNAPSHOT_INTERVAL,
+            | ForkName::Gloas => beacon_snapshot_interval(),
         }
     }
 
@@ -323,7 +325,7 @@ mod tests {
         assert_eq!(ForkName::Lean.snapshot_interval(), LEAN_SNAPSHOT_INTERVAL);
         assert_eq!(
             ForkName::Electra.snapshot_interval(),
-            BEACON_SNAPSHOT_INTERVAL
+            beacon_snapshot_interval()
         );
         assert_ne!(
             ForkName::Lean.snapshot_interval(),

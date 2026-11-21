@@ -34,7 +34,9 @@ use crate::beacon::{
 
 /// The most entries one request may carry: the SSZ list's bound,
 /// `(MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH`.
-const MAX_ENTRIES: usize = preset::PROPOSER_LOOKAHEAD_LENGTH;
+fn max_entries() -> usize {
+    preset::proposer_lookahead_length()
+}
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new().route(
@@ -78,7 +80,7 @@ async fn post_proposer_preferences(
         Ok(preferences) => preferences,
         Err(err) => return err.into_response(),
     };
-    if preferences.len() > MAX_ENTRIES {
+    if preferences.len() > max_entries() {
         return ApiError::BadRequest("too many signed proposer preferences").into_response();
     }
 

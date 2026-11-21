@@ -504,17 +504,19 @@ impl HttpBeaconNode {
         Ok(block)
     }
 
-    /// The path for one slot's attestation data.
+    /// The path for one slot's attestation data, the same at every fork.
     ///
-    /// Gloas omits `committee_index`: the parameter is optional there, and the
-    /// answer's `index` is the payload signal rather than a committee, so
-    /// asking about committee 0 would only suggest the old meaning.
-    fn attestation_data_path(slot: Slot, fork: ForkName) -> String {
-        if fork >= ForkName::Gloas {
-            format!("/eth/v1/validator/attestation_data?slot={slot}")
-        } else {
-            format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
-        }
+    /// `committee_index=0` is sent even at gloas slots, against the Beacon
+    /// API's "for slots in Gloas and later, this parameter SHOULD be omitted".
+    /// Lighthouse (v8.3.3, and `unstable`) still declares the parameter
+    /// required and answers a query without it with a 400, which would cost
+    /// every gloas attestation against a Lighthouse node. Sending it is safe:
+    /// Lighthouse's handler produces the data for committee 0 whatever the
+    /// query names, ethlambda's own beacon node ignores the parameter, and the
+    /// answer's `index` is the payload signal whatever was asked. Omit it at
+    /// gloas once Lighthouse accepts a query without it.
+    fn attestation_data_path(slot: Slot) -> String {
+        format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
     }
 
     /// The query string for one aggregate.
@@ -732,7 +734,7 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         let response: DataResponse<AttestationDataDto> =
-            self.get(&Self::attestation_data_path(slot, fork)).await?;
+            self.get(&Self::attestation_data_path(slot)).await?;
         let data = AttestationData::try_from(&response.data)?;
         // Enforced here rather than at the call site so that failover works:
         // see the contract on `BeaconNodeApi::attestation_data`. An `Err` here
@@ -1476,8 +1478,6 @@ mod tests {
         }
     }
 
-    /// Before gloas the query still names committee 0, exactly as it always
-    /// has; from gloas it is omitted.
     #[test]
     fn the_sync_contribution_query_carries_all_three_parameters_without_whitespace() {
         let path = HttpBeaconNode::sync_contribution_path(7, 2, Root::repeat_byte(0xab));
@@ -1492,16 +1492,22 @@ mod tests {
         assert!(!path.contains(' '));
     }
 
-    #[test]
-    fn the_committee_index_is_omitted_from_gloas_on() {
-        assert_eq!(
-            HttpBeaconNode::attestation_data_path(96, ForkName::Fulu),
-            "/eth/v1/validator/attestation_data?slot=96&committee_index=0"
-        );
-        assert_eq!(
-            HttpBeaconNode::attestation_data_path(96, ForkName::Gloas),
-            "/eth/v1/validator/attestation_data?slot=96"
-        );
+    /// The query names committee 0 at every fork, gloas included, where the
+    /// Beacon API says to omit it: Lighthouse answers a query without it with
+    /// a 400. Driven through `attestation_data` rather than the path function,
+    /// so the fork the caller passes is part of what is checked.
+    #[tokio::test]
+    async fn the_committee_index_is_sent_at_every_fork() {
+        for fork in [ForkName::Fulu, ForkName::Gloas] {
+            let served = serve(500, vec![], vec![]).await;
+            let _ = served.node.attestation_data(96, fork).await;
+            let seen = served.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1, "one request at {fork:?}");
+            assert_eq!(
+                seen[0].0, "/eth/v1/validator/attestation_data?slot=96&committee_index=0",
+                "at {fork:?}"
+            );
+        }
     }
 
     /// The body `produceBlockV4` requires: no builders, the boost factor

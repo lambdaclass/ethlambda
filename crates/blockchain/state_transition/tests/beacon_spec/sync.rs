@@ -41,7 +41,7 @@ use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::ExecutionBlockHash;
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect_all_handlers};
+use super::{Case, collect_all_handlers, preset};
 
 /// One entry of a case's `steps.yaml`.
 ///
@@ -257,7 +257,7 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
 /// handler it came from.
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect_all_handlers(PRESET, "sync");
+    let cases = collect_all_handlers(preset(), "sync");
     let mut trials = vec![super::discovery_trial("sync", cases.len())];
 
     for (_handler, case) in cases {

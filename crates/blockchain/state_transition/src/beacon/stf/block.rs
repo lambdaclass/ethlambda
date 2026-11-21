@@ -17,7 +17,7 @@
 //! every driver, present and future, call the identical function regardless of
 //! what else that fork's body carries.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, altair, phase0};
@@ -32,6 +32,8 @@ use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
+
+use crate::metrics::{StfPhase, timed};
 
 use super::{BlockCaches, ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
@@ -165,13 +167,17 @@ pub fn process_block_phase0(
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
     process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
@@ -204,13 +210,17 @@ pub fn process_block_altair(
     options: BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
     process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     process_eth1_data(state, &block.body.eth1_data)?;
     crate::beacon::stf::operations::process_operations(
@@ -338,6 +348,17 @@ pub fn process_randao(
     verification: RandaoVerification,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
+    timed(StfPhase::Randao, || {
+        apply_randao(state, randao_reveal, verification, signatures)
+    })
+}
+
+fn apply_randao(
+    state: &mut BeaconState,
+    randao_reveal: &BlsSignature,
+    verification: RandaoVerification,
+    signatures: &mut SignatureBatch,
+) -> Result<()> {
     let epoch = get_current_epoch(state);
     let proposer_index = get_beacon_proposer_index(state)?;
     let domain = get_domain(state, constants::DOMAIN_RANDAO, None);
@@ -346,14 +367,21 @@ pub fn process_randao(
     let proposer = state.validator(proposer_index)?;
     if verification == RandaoVerification::Verify {
         signatures.push(
-            SignatureSet::single(&proposer.pubkey, signing_root, randao_reveal),
+            SignatureSet::single(
+                &IndexedPubkey {
+                    index: proposer_index,
+                    pubkey: proposer.pubkey,
+                },
+                signing_root,
+                randao_reveal,
+            ),
             "RANDAO reveal signature",
         )?;
         signatures.verify_pending()?;
     }
 
     let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
-    let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+    let position = epoch as usize % preset::epochs_per_historical_vector();
     state.randao_mixes_mut()[position] = mix;
     Ok(())
 }
@@ -367,6 +395,10 @@ pub fn process_randao(
 /// count used for the majority check includes the vote just appended, so a
 /// single block can supply the deciding vote.
 pub fn process_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> {
+    timed(StfPhase::Eth1Data, || apply_eth1_data(state, eth1_data))
+}
+
+fn apply_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> {
     state.eth1_data_votes_mut().push(eth1_data.clone())?;
 
     let matching_votes = state
@@ -374,7 +406,7 @@ pub fn process_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Resul
         .iter()
         .filter(|vote| *vote == eth1_data)
         .count() as u64;
-    let voting_period_slots = preset::EPOCHS_PER_ETH1_VOTING_PERIOD * preset::SLOTS_PER_EPOCH;
+    let voting_period_slots = preset::epochs_per_eth1_voting_period() * preset::slots_per_epoch();
     if matching_votes * 2 > voting_period_slots {
         *state.eth1_data_mut() = eth1_data.clone();
     }

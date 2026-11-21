@@ -138,6 +138,10 @@ pub enum Error {
     ExitRefused(String),
     #[error("malformed response: {0}")]
     Decode(String),
+    /// The beacon node runs a preset this process cannot adopt: one with no
+    /// values here, or a different one from what this process already runs.
+    #[error("cannot run the beacon node's preset: {0}")]
+    Preset(String),
 
     #[error("keystore {path}: {reason}")]
     Keystore { path: String, reason: String },
@@ -266,8 +270,10 @@ impl Error {
             | Self::Decode(_) => true,
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.
+            // The node's preset does not change under a running client.
             Self::ProposalRefused { .. }
             | Self::ExitRefused(_)
+            | Self::Preset(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)
             | Self::KeystoreBadPassword

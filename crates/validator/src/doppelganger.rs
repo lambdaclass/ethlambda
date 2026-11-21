@@ -92,7 +92,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
@@ -408,7 +408,7 @@ impl Doppelganger {
             return applied;
         };
         applied.progressed = true;
-        if !(slot + 1).is_multiple_of(SLOTS_PER_EPOCH) {
+        if !(slot + 1).is_multiple_of(slots_per_epoch()) {
             return applied;
         }
         for answer in previous.iter().filter(|answer| !answer.is_live) {
@@ -510,7 +510,7 @@ impl Doppelganger {
 
         let asked = self.checked_indices();
         let detecting = self.detecting();
-        if detecting > 0 && slot.is_multiple_of(SLOTS_PER_EPOCH) {
+        if detecting > 0 && slot.is_multiple_of(slots_per_epoch()) {
             info!(
                 %epoch,
                 validators = detecting,
@@ -597,7 +597,7 @@ impl Doppelganger {
         // otherwise no key could have been cleared this tick anyway.
         if previous_epoch.is_some()
             && !applied.progressed
-            && (slot + 1).is_multiple_of(SLOTS_PER_EPOCH)
+            && (slot + 1).is_multiple_of(slots_per_epoch())
         {
             error!(
                 %slot,
@@ -687,7 +687,7 @@ mod tests {
     }
 
     fn first_slot(epoch: Epoch) -> Slot {
-        epoch * SLOTS_PER_EPOCH
+        epoch * slots_per_epoch()
     }
 
     fn last_slot(epoch: Epoch) -> Slot {
@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(node.validator_indices_call_count(), 1, "resolved once");
 
         let asked = node.liveness_requests();
-        let per_epoch = SLOTS_PER_EPOCH as usize;
+        let per_epoch = slots_per_epoch() as usize;
         assert_eq!(
             asked.len(),
             per_epoch + 2 * per_epoch,

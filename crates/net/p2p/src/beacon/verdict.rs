@@ -42,7 +42,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks};
+use crate::beacon::column_checks;
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -215,9 +215,10 @@ impl Validated {
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.builder_market.record_bid((**bid).clone())
             }
-            Self::ProposerPreferences(preferences) => server
-                .builder_market
-                .record_preferences((**preferences).clone(), builder_market::wall_slot(server)),
+            Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
+                (**preferences).clone(),
+                crate::wall_clock_slot(&server.store),
+            ),
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
@@ -354,11 +355,26 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
+                // Accept means gossip already ran every rule. This instant is
+                // taken in `forward`, after the verdict's trip back through
+                // the p2p actor, where `check_and_forward` takes the instant
+                // its check finished.
+                ethlambda_telemetry::emit(|| {
+                    column_checks::passed_rows(
+                        &sidecar,
+                        column_checks::ColumnArrival::received("gossip", received_at),
+                        Instant::now(),
+                    )
+                });
                 let _ = blockchain
                     .new_data_column_sidecars(vec![*sidecar])
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
-            Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
+            Self::Column(sidecar) => column_checks::check_and_forward(
+                server,
+                vec![*sidecar],
+                column_checks::ColumnArrival::received("gossip", received_at),
+            ),
             Self::Aggregate {
                 aggregate,
                 attesting_indices,
@@ -405,10 +421,10 @@ impl Validated {
     }
 }
 
-/// Report an accepted gloas object on the Beacon API's event stream, for the
-/// four topics whose objects never reach the chain actor that publishes the
-/// rest (bids and preferences stop here, and a payload attestation message
-/// only ever feeds fork choice).
+/// Report an accepted object on the Beacon API's event stream, for the topics
+/// whose objects never reach the chain actor that publishes the rest (bids
+/// and preferences stop here, a payload attestation message only ever feeds
+/// fork choice, and a subnet attestation is relayed and nothing more).
 ///
 /// Only on `Accept`, since each event names objects that passed the topic's
 /// rules. A queued envelope has not, so `execution_payload_gossip` waits for
@@ -433,6 +449,12 @@ fn publish_gossip_event(server: &P2PServer, object: &Validated) {
         }
         Validated::PayloadAttestation(message) if sink.has_subscribers() => {
             GossipEvent::PayloadAttestationMessage(message.clone())
+        }
+        // The highest-rate event the node has (every attestation on its
+        // backbone subnets), so nothing is cloned for a node nobody listens
+        // to. Any subscriber turns it on, whatever its topics.
+        Validated::Attestation { attestation, .. } if sink.has_subscribers() => {
+            GossipEvent::SingleAttestation(attestation.clone())
         }
         _ => return,
     };
@@ -582,6 +604,27 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
     }
 }
 
+/// [`settle`] for the gossip message delivered as `message_id`.
+///
+/// An accepted column the execution-layer path published under the same id
+/// keeps its `Accept` without being recorded: the key is taken by that very
+/// column, and that publish sent nothing, so this copy is the only one
+/// gossipsub can relay. See [`crate::beacon::engine_columns`]'s module doc.
+pub(crate) fn settle_message(
+    server: &mut P2PServer,
+    message_id: &MessageId,
+    outcome: Outcome,
+    object: &Validated,
+) -> Outcome {
+    if outcome == Outcome::Accept
+        && matches!(object, Validated::Column(_))
+        && server.engine_published_columns.take(message_id)
+    {
+        return Outcome::Accept;
+    }
+    settle(server, outcome, object)
+}
+
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict {
@@ -589,7 +632,7 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
+        let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
         if report(self, id, outcome) {
             object.forward(self, received_at, outcome);
@@ -637,20 +680,26 @@ fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
 ) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
+    match pool_of(object) {
+        "gossip" => &server.gossip_validation_permits,
+        "attestation" => &server.attestation_validation_permits,
+        "builder" => &server.builder_validation_permits,
+        _ => &server.sync_validation_permits,
+    }
+}
+
+/// The label (see [`metrics::VALIDATION_POOLS`]) of the permit pool
+/// [`permits_for`] draws `object`'s permit from. The one `match` on the
+/// object kind, so the pool metrics and the pool actually used cannot differ.
+fn pool_of(object: &Validated) -> &'static str {
     match object {
-        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
-            &server.gossip_validation_permits
-        }
+        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => "gossip",
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
-        | Validated::Operation(_) => &server.attestation_validation_permits,
-        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
-            &server.builder_validation_permits
-        }
-        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
-            &server.sync_validation_permits
-        }
+        | Validated::Operation(_) => "attestation",
+        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => "builder",
+        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => "sync",
     }
 }
 
@@ -679,7 +728,9 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
+    let pool = pool_of(&object);
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
+        metrics::inc_validation_permit_exhausted(pool);
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -688,8 +739,12 @@ pub(crate) fn spawn_stateful_checks(
     };
     let store = server.store.clone();
     let actor = ctx.actor_ref();
+    let in_use = metrics::PoolInUse::new(pool);
+    let task = metrics::BlockingTask::new(id.kind);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _in_use = in_use;
+        let _run = task.start();
         let mut object = object;
         let outcome = guarded(|| object.stateful_checks(&store));
         let _ = actor
@@ -1148,6 +1203,59 @@ mod tests {
         object.forward(&server, Instant::now(), Outcome::Accept);
 
         assert!(chain.aggregates.lock().unwrap().is_empty());
+    }
+
+    /// A sink that keeps what p2p reported, with a switchable audience.
+    #[derive(Default)]
+    struct RecordingSink {
+        subscribed: bool,
+        events: std::sync::Mutex<Vec<GossipEvent>>,
+    }
+
+    impl ethlambda_network_api::GossipEventSink for RecordingSink {
+        fn has_subscribers(&self) -> bool {
+            self.subscribed
+        }
+
+        fn emit(&self, event: GossipEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// A subnet attestation reaches the event sink on `Accept` alone, and only
+    /// when someone listens.
+    #[tokio::test]
+    async fn an_accepted_subnet_attestation_reaches_the_event_sink_only_when_listened_to() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forward = |server: &P2PServer, outcome| {
+            Validated::Attestation {
+                attestation: Box::new(electra_attestation(5, 1)),
+                subnet_id: 0,
+            }
+            .forward(server, Instant::now(), outcome)
+        };
+
+        // No subscriber: the `has_subscribers` guard keeps even an accepted
+        // attestation from being cloned and sent.
+        let silent = Arc::new(RecordingSink::default());
+        server.gossip_events = Some(silent.clone());
+        forward(&server, Outcome::Accept);
+        assert!(silent.events.lock().unwrap().is_empty());
+
+        let sink = Arc::new(RecordingSink {
+            subscribed: true,
+            ..Default::default()
+        });
+        server.gossip_events = Some(sink.clone());
+        forward(&server, Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(&server, Outcome::Reject(RejectReason::BadSignature));
+        assert!(sink.events.lock().unwrap().is_empty());
+        forward(&server, Outcome::Accept);
+        let events = sink.events.lock().unwrap();
+        let [GossipEvent::SingleAttestation(attestation)] = events.as_slice() else {
+            panic!("expected exactly one single attestation event, got {events:?}");
+        };
+        assert_eq!(**attestation, electra_attestation(5, 1));
     }
 
     /// What `forward` handed the chain actor, by method.

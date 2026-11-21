@@ -140,7 +140,7 @@ impl EpochCommittees {
         // `committees_per_slot` comes from `committee_count_per_slot`, which
         // never returns less than one, so `count` is at least
         // `SLOTS_PER_EPOCH` and the divisions below cannot divide by zero.
-        let count = self.committees_per_slot * preset::SLOTS_PER_EPOCH;
+        let count = self.committees_per_slot * preset::slots_per_epoch();
         let committee_index = committee_number(slot, self.committees_per_slot, index)?;
         verify(committee_index < count, "index < count")?;
 
@@ -186,7 +186,7 @@ pub fn committee_number(
     committees_per_slot: u64,
     index: CommitteeIndex,
 ) -> Result<u64> {
-    ((slot % preset::SLOTS_PER_EPOCH) * committees_per_slot)
+    ((slot % preset::slots_per_epoch()) * committees_per_slot)
         .checked_add(index)
         .ok_or(Error::ArithmeticOverflow(
             "(slot % SLOTS_PER_EPOCH) * committees_per_slot + index",
@@ -213,7 +213,7 @@ mod tests {
     /// [`EpochCommittees::committee`] is exercised the same way
     /// `ethlambda-state-transition`'s own tests exercise it.
     fn synthetic_committees() -> EpochCommittees {
-        let total = PER_SLOT * preset::SLOTS_PER_EPOCH * 3 + 1;
+        let total = PER_SLOT * preset::slots_per_epoch() * 3 + 1;
         let shuffled = (0..total).collect();
         EpochCommittees::new(EPOCH, shuffled, PER_SLOT)
     }
@@ -236,7 +236,7 @@ mod tests {
         );
         assert!(
             committees
-                .committee(slot, PER_SLOT * preset::SLOTS_PER_EPOCH)
+                .committee(slot, PER_SLOT * preset::slots_per_epoch())
                 .is_err(),
             "an index past the whole epoch's committees has nothing to slice"
         );
@@ -250,8 +250,8 @@ mod tests {
     #[test]
     fn a_committee_number_that_would_wrap_is_rejected() {
         let committees = synthetic_committees();
-        let last_slot = compute_start_slot_at_epoch(EPOCH) + preset::SLOTS_PER_EPOCH - 1;
-        let wraps_to_zero = 0u64.wrapping_sub((preset::SLOTS_PER_EPOCH - 1) * PER_SLOT);
+        let last_slot = compute_start_slot_at_epoch(EPOCH) + preset::slots_per_epoch() - 1;
+        let wraps_to_zero = 0u64.wrapping_sub((preset::slots_per_epoch() - 1) * PER_SLOT);
 
         assert!(committees.committee(last_slot, wraps_to_zero).is_err());
     }
@@ -275,10 +275,10 @@ mod tests {
     #[test]
     fn committees_cover_every_shuffled_member_once_per_epoch() {
         let committees = synthetic_committees();
-        let total = PER_SLOT * preset::SLOTS_PER_EPOCH * 3 + 1;
+        let total = PER_SLOT * preset::slots_per_epoch() * 3 + 1;
 
         let mut all = Vec::new();
-        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+        for slot_offset in 0..preset::slots_per_epoch() {
             let slot = compute_start_slot_at_epoch(EPOCH) + slot_offset;
             for index in 0..PER_SLOT {
                 all.extend_from_slice(committees.committee(slot, index).unwrap());

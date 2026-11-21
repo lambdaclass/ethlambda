@@ -243,7 +243,7 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 { "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
 ```
 
-`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+`is_syncing` is the node's own stateful sync decision, updated each tick and after each block arrival: true while the head trails the wall clock and the head the node's peers report in `Status` is ahead of it, with hysteresis. With no peer ahead (a stalled network, or no peers, including right after startup before any peer has reported) it is false. It is also false once peers have claimed a lead for a whole stall window in all (`SyncThresholds::LEAN.stall_window`, 16 slots) while the head stayed flat, until the head next advances, and a peer that has just failed to serve a range request does not count towards the lead while it cools down. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
 
 `sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
@@ -845,7 +845,15 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
   under a fulu head, is answered from a copy of the head state advanced to the
   epoch's first slot, crossing the gloas upgrade where it falls, on a blocking
   thread. A gloas epoch more than one before the head state's is a `400`.
-  `dependent_root` is defined as for attester duties. There is no `503`.
+  The gloas fork epoch is a `400` until its first slot has started by the wall
+  clock, allowing `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms), while the head is
+  still before it: its committee is computed at the fork from the effective
+  balances the last pre-gloas epoch ends with, so it can change until then
+  (Lighthouse refuses it the same way). `dependent_root` is defined as for
+  attester duties, except for the fork epoch, whose root is the block root at
+  the last slot before the fork (the genesis block's when gloas starts at
+  genesis).
+  There is no `503`.
 - **`GET /eth/v1/validator/payload_attestation_data?slot=`** answers
   `{version: "gloas", data: {beacon_block_root, slot, payload_present,
   blob_data_available}}` as JSON, or the SSZ `PayloadAttestationData` on
@@ -967,7 +975,7 @@ with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
-One flat object holding the network's configuration, the compiled preset, and
+One flat object holding the network's configuration, the active preset's values, and
 the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.
@@ -1084,7 +1092,9 @@ these are ever sent:
 | `finalized_checkpoint` | `{"block":"0x…", "state":"0x…", "epoch":"2", "execution_optimistic":false}` | The finalized checkpoint advanced |
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
+| `single_attestation` | `{"committee_index":"1", "attester_index":"1", "data":<AttestationData>, "signature":"0x…"}` | A subnet attestation passed the `beacon_attestation_{subnet_id}` gossip rules, or was accepted by `POST /eth/v2/beacon/pool/attestations`. This is the highest-rate topic (every attestation on the node's backbone subnets). Nothing is built while no client is connected, but a client subscribed to any topic turns it on: all topics share one ring, so a client that stalls lags that much sooner |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `fast_confirmation` | `{"block":"0x…", "slot":"1", "current_slot":"2"}` | The Fast Confirmation Rule ran, once per slot at the slot's tick, whether or not the confirmed block changed. `block` and `slot` are the most recent confirmed block's (after a restart or a slot without a run, the restored one while it wins), `current_slot` the slot of the run. Not sent while the head is more than 32 slots behind the wall clock, nor for a slot whose tick ran past its attestation deadline (the rule is not run then) |
 | `execution_payload` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}` | The chain actor imported a gloas envelope (from gossip, req/resp or `POST /eth/v1/beacon/execution_payload_envelopes`). `execution_optimistic` is the envelope rule of "`execution_optimistic` under gloas": true when the execution client answered `SYNCING` or `ACCEPTED` |
 | `execution_payload_gossip` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…"}` | An envelope passed the `execution_payload` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_envelopes` |
 | `execution_payload_available` | `{"slot":"10", "block_root":"0x…"}` | Right after `execution_payload` (see below) |
@@ -1092,18 +1102,18 @@ these are ever sent:
 | `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
 | `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
 
-Never emitted: `single_attestation` (subnet votes are verified and relayed but
-never reach the chain actor), the operation topics (`voluntary_exit`,
+Never emitted: the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
 `contribution_and_proof`: no operation pools), `payload_attributes`, the light
-client topics, `blob_sidecar`, and `fast_confirmation` (no producer).
+client topics and `blob_sidecar`.
 
-The gloas topics are emitted by whichever part of the node accepted the object,
-since several never reach the chain actor: the actor publishes `execution_payload`
-and `execution_payload_available`; p2p publishes the gossip-accepted
-`execution_payload_gossip`, `execution_payload_bid`,
-`payload_attestation_message` and `proposer_preferences`; and the API handlers
-publish what a validator client or builder submits.
+The gloas topics and `single_attestation` are emitted by whichever part of the
+node accepted the object, since several never reach the chain actor: the actor
+publishes `execution_payload` and `execution_payload_available`; p2p publishes
+the gossip-accepted `execution_payload_gossip`, `execution_payload_bid`,
+`payload_attestation_message`, `proposer_preferences` and `single_attestation`
+(subnet attestations are relayed, never applied); and the API handlers publish
+what a validator client or builder submits.
 
 **`execution_payload_available` is not a separate moment.** The specification
 asks for it when the payload and its blobs are verified available. The chain

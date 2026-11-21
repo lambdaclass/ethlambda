@@ -42,7 +42,7 @@
 //! for the generalized-index table this implies.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitlist, SszBitvector, SszList};
+use libssz_types::SszList;
 
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::bellatrix::LogsBloom;
@@ -55,6 +55,7 @@ use super::shared::{
     Slashings, StateRoots, Validators,
 };
 use crate::beacon::preset;
+use crate::beacon::preset_sized::{PresetBitlist, PresetBitvector, PresetList};
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
     Gwei, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
@@ -71,7 +72,7 @@ use crate::beacon::primitives::{
 /// Bounded by `MAX_VALIDATORS_PER_SLOT`, the product of `MAX_COMMITTEES_PER_SLOT`
 /// and `MAX_VALIDATORS_PER_COMMITTEE`, since one attestation can now span
 /// every committee in the slot.
-pub type AggregationBits = SszBitlist<{ preset::MAX_VALIDATORS_PER_SLOT }>;
+pub type AggregationBits = PresetBitlist<preset::MaxValidatorsPerSlot>;
 
 /// Which of a slot's committees an [`Attestation`] covers, one bit per
 /// committee index.
@@ -81,7 +82,7 @@ pub type AggregationBits = SszBitlist<{ preset::MAX_VALIDATORS_PER_SLOT }>;
 /// committee's member bits in that same ascending order, so `committee_bits`
 /// is what tells a reader where one committee's segment ends and the next
 /// begins.
-pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT }>;
+pub type CommitteeBits = PresetBitvector<preset::MaxCommitteesPerSlot>;
 
 /// The attesters covered by one aggregate, named explicitly rather than as a
 /// bitfield, which is the form signature verification needs.
@@ -89,7 +90,7 @@ pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT }>;
 /// Bounded the same way as [`AggregationBits`], for the same reason: one
 /// [`IndexedAttestation`] can now name attesters from every committee in a
 /// slot.
-pub type AttestingIndices = SszList<ValidatorIndex, { preset::MAX_VALIDATORS_PER_SLOT }>;
+pub type AttestingIndices = PresetList<ValidatorIndex, preset::MaxValidatorsPerSlot>;
 
 /// Attestations included in a block.
 ///
@@ -121,11 +122,11 @@ pub type PendingDeposits = ethlambda_ssz_tree::List<
 
 /// Partial withdrawals queued in the state, not yet paid out.
 pub type PendingPartialWithdrawals =
-    SszList<PendingPartialWithdrawal, { preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT }>;
+    PresetList<PendingPartialWithdrawal, preset::PendingPartialWithdrawalsLimit>;
 
 /// Validator consolidations queued in the state, not yet applied.
 pub type PendingConsolidations =
-    SszList<PendingConsolidation, { preset::PENDING_CONSOLIDATIONS_LIMIT }>;
+    PresetList<PendingConsolidation, preset::PendingConsolidationsLimit>;
 
 // ---------------------------------------------------------------------------
 // Attestations

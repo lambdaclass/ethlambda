@@ -18,6 +18,7 @@ ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-telemetry.workspace = true
 ethlambda-types.workspace = true
 ethlambda-test-fixtures.workspace = true
 
@@ -35,6 +36,9 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+# `test_state`'s validator keys, so a test can sign a block that has to pass
+# the proposer-signature precheck before its blobs are asked for.
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true

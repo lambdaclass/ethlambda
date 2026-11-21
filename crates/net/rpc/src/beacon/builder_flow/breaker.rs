@@ -11,7 +11,7 @@
 
 use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_slot;
 use ethlambda_types::beacon::containers::BeaconState;
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::Slot;
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
@@ -96,7 +96,7 @@ pub(crate) fn check(
     if consecutive > thresholds.skips {
         return Err(Trip::ConsecutiveSkips);
     }
-    let window_start = slot.saturating_sub(SLOTS_PER_EPOCH).max(1);
+    let window_start = slot.saturating_sub(slots_per_epoch()).max(1);
     let in_window = (window_start..slot).filter(|&i| is_empty(state, i)).count() as u64;
     if in_window > thresholds.skips_per_epoch {
         return Err(Trip::SkipsPerEpoch);

@@ -93,7 +93,7 @@ pub fn cheap_checks(
     // progressive, and without this only the gossip size cap would bound what
     // a parked envelope holds. The specification checks them after the block
     // lookups; an envelope invalid under every block is rejected either way.
-    if message.payload.withdrawals.len() > preset::MAX_WITHDRAWALS_PER_PAYLOAD {
+    if message.payload.withdrawals.len() > preset::max_withdrawals_per_payload() {
         return Err(Outcome::Reject(RejectReason::TooManyWithdrawals));
     }
     if !execution_requests_within_limits(&message.execution_requests) {
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn too_many_withdrawals_are_rejected_before_any_block_lookup() {
         let store = store(0);
-        let envelope = envelope(5, preset::MAX_WITHDRAWALS_PER_PAYLOAD + 1);
+        let envelope = envelope(5, preset::max_withdrawals_per_payload() + 1);
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &envelope),
             Err(Outcome::Reject(RejectReason::TooManyWithdrawals))
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn an_envelope_within_the_limits_for_an_unseen_block_is_queued() {
         let store = store(0);
-        let envelope = envelope(5, preset::MAX_WITHDRAWALS_PER_PAYLOAD);
+        let envelope = envelope(5, preset::max_withdrawals_per_payload());
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope),
             Outcome::Queue(QueueReason::BlockUnknown)

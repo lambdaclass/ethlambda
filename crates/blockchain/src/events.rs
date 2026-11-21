@@ -79,8 +79,10 @@ pub enum Topic {
     /// The new head does not descend from the previous one. On both surfaces.
     ChainReorg,
     DataColumnSidecar,
-    // Accepted on the beacon surface; `docs/rpc.md` lists which are emitted.
+    /// Beacon: a subnet attestation that passed the
+    /// `beacon_attestation_{subnet_id}` rules.
     SingleAttestation,
+    // The rest are accepted on the beacon surface; `docs/rpc.md` lists which are emitted.
     VoluntaryExit,
     BlsToExecutionChange,
     ProposerSlashing,
@@ -98,6 +100,8 @@ pub enum Topic {
     ExecutionPayloadAvailable,
     ExecutionPayloadBid,
     PayloadAttestationMessage,
+    /// Beacon only, and one of the few on this side of the line that is
+    /// emitted: once per run of the Fast Confirmation Rule.
     FastConfirmation,
     ProposerPreferences,
 }
@@ -322,6 +326,8 @@ pub enum ChainEvent {
     BeaconAttestation(Box<BeaconAttestationEvent>),
     /// Beacon `data_column_sidecar`: a column this node custodies was stored.
     DataColumnSidecar(DataColumnSidecarEvent),
+    /// Beacon `fast_confirmation`: the Fast Confirmation Rule ran.
+    BeaconFastConfirmation(BeaconFastConfirmationEvent),
     /// Beacon `head_v2`: `head` with the head's payload status, version-wrapped.
     BeaconHeadV2(Versioned<BeaconHeadV2Event>),
     /// Beacon `execution_payload`: an envelope was imported.
@@ -340,6 +346,13 @@ pub enum ChainEvent {
     PayloadAttestationMessage(Versioned<gloas::PayloadAttestationMessage>),
     /// Beacon `proposer_preferences`.
     ProposerPreferences(Box<Versioned<gloas::SignedProposerPreferences>>),
+    /// Beacon `single_attestation`: a subnet attestation passed the
+    /// `beacon_attestation_{subnet_id}` rules. Boxed for the reason
+    /// [`ChainEvent::BeaconAttestation`] is. It is also the highest-rate
+    /// topic, so the clone is only made while a client is subscribed, though
+    /// to any topic: the bus does not track which ones (see
+    /// [`EventBus::has_subscribers`]).
+    SingleAttestation(Box<electra::SingleAttestation>),
 }
 
 impl ChainEvent {
@@ -356,6 +369,7 @@ impl ChainEvent {
             ChainEvent::Aggregate { .. } => Topic::Aggregate,
             ChainEvent::ChainReorg { .. } | ChainEvent::BeaconChainReorg(_) => Topic::ChainReorg,
             ChainEvent::DataColumnSidecar(_) => Topic::DataColumnSidecar,
+            ChainEvent::BeaconFastConfirmation(_) => Topic::FastConfirmation,
             ChainEvent::BeaconHeadV2(_) => Topic::HeadV2,
             ChainEvent::ExecutionPayload(_) => Topic::ExecutionPayload,
             ChainEvent::ExecutionPayloadGossip(_) => Topic::ExecutionPayloadGossip,
@@ -363,6 +377,7 @@ impl ChainEvent {
             ChainEvent::ExecutionPayloadBid(_) => Topic::ExecutionPayloadBid,
             ChainEvent::PayloadAttestationMessage(_) => Topic::PayloadAttestationMessage,
             ChainEvent::ProposerPreferences(_) => Topic::ProposerPreferences,
+            ChainEvent::SingleAttestation(_) => Topic::SingleAttestation,
         }
     }
 }
@@ -565,6 +580,20 @@ impl From<&SignedAggregateAndProof> for BeaconAttestationEvent {
     }
 }
 
+/// The Beacon API `fast_confirmation` payload.
+///
+/// Emitted every time the rule runs, whether or not the confirmed block
+/// changed: `block` and `slot` are the most recent confirmed block's, and
+/// `current_slot` is the wall-clock slot of the run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BeaconFastConfirmationEvent {
+    pub block: H256,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub slot: u64,
+    #[serde(serialize_with = "quoted_or_bare::serialize")]
+    pub current_slot: u64,
+}
+
 /// The Beacon API `data_column_sidecar` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DataColumnSidecarEvent {
@@ -662,6 +691,9 @@ impl GossipEventSink for EventBus {
             }
             GossipEvent::ProposerPreferences(preferences) => {
                 ChainEvent::ProposerPreferences(Box::new(Versioned::gloas(*preferences)))
+            }
+            GossipEvent::SingleAttestation(attestation) => {
+                ChainEvent::SingleAttestation(attestation)
             }
         };
         EventBus::emit(self, event);
@@ -785,6 +817,17 @@ impl ChainEvents {
     fn advance_view(&mut self, store: &Store) -> Option<EventView> {
         let previous = std::mem::replace(&mut self.view, EventView::capture(store));
         self.bus.has_subscribers().then_some(previous)
+    }
+
+    /// Beacon `fast_confirmation` for one run of the Fast Confirmation Rule.
+    pub(crate) fn publish_fast_confirmation(&self, block: H256, slot: u64, current_slot: u64) {
+        self.bus.emit(ChainEvent::BeaconFastConfirmation(
+            BeaconFastConfirmationEvent {
+                block,
+                slot,
+                current_slot,
+            },
+        ));
     }
 
     /// `block`: `block` was imported at `slot`, in the store's chain's shape.
@@ -2042,6 +2085,45 @@ mod tests {
     }
 
     #[test]
+    fn beacon_fast_confirmation_matches_the_specification_example() {
+        let event = ChainEvent::BeaconFastConfirmation(BeaconFastConfirmationEvent {
+            block: root("0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"),
+            slot: 1,
+            current_slot: 2,
+        });
+        assert_matches_example(
+            event,
+            Topic::FastConfirmation,
+            r#"{"block": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "slot": "1", "current_slot": "2"}"#,
+        );
+    }
+
+    #[test]
+    fn a_fast_confirmation_run_is_published_even_when_nothing_changed() {
+        let store = crate::tests::beacon_store(0, 0);
+        let events = ChainEvents::new(EventBus::default(), &store);
+        let mut receiver = events.subscribe();
+        let block = H256::repeat_byte(5);
+        events.publish_fast_confirmation(block, 7, 9);
+        events.publish_fast_confirmation(block, 7, 10);
+        for current_slot in [9, 10] {
+            match receiver.try_recv().expect("an event per run") {
+                ChainEvent::BeaconFastConfirmation(event) => {
+                    assert_eq!(
+                        event,
+                        BeaconFastConfirmationEvent {
+                            block,
+                            slot: 7,
+                            current_slot
+                        }
+                    );
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn beacon_block_gossip_matches_the_specification_example() {
         let event = ChainEvent::BeaconBlockGossip(BeaconBlockGossipEvent {
             slot: 10,
@@ -2121,5 +2203,37 @@ mod tests {
         });
         let event = ChainEvent::BeaconAttestation(Box::new(BeaconAttestationEvent::from(&signed)));
         assert_matches_example(event, Topic::Attestation, example);
+    }
+
+    /// The specification's `single_attestation` example, carried through the
+    /// event unchanged: quoted integers, `0x` hex, electra's field names.
+    #[test]
+    fn single_attestation_matches_the_specification_example() {
+        let example = r#"{"committee_index":"1", "attester_index":"1", "data":{"slot":"1", "index":"1", "beacon_block_root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "source":{"epoch":"1", "root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"}, "target":{"epoch":"1", "root":"0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"}}, "signature":"0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"}"#;
+        let attestation: electra::SingleAttestation = serde_json::from_str(example).unwrap();
+        let event = ChainEvent::SingleAttestation(Box::new(attestation));
+        assert_matches_example(event, Topic::SingleAttestation, example);
+    }
+
+    #[tokio::test]
+    async fn the_bus_turns_a_gossip_single_attestation_into_its_topic() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let sink: &dyn GossipEventSink = &bus;
+
+        let attestation = electra::SingleAttestation {
+            committee_index: 1,
+            attester_index: 2,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        sink.emit(GossipEvent::SingleAttestation(Box::new(
+            attestation.clone(),
+        )));
+
+        let ChainEvent::SingleAttestation(received) = rx.try_recv().unwrap() else {
+            panic!("expected a single_attestation event");
+        };
+        assert_eq!(*received, attestation);
     }
 }

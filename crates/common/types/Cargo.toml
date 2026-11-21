@@ -10,10 +10,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-# Compile the beacon containers against the minimal preset instead of mainnet.
+# Make minimal the preset a process runs when nothing selects one
+# (`Preset::DEFAULT`), instead of mainnet.
 #
-# Container shapes are compile-time constants (SSZ list and vector bounds), so
-# the preset cannot be selected at runtime. Mainnet is the implicit default.
+# The preset is a runtime choice: `ethlambda beacon` selects its network's
+# `PRESET_BASE` at startup, and the validator client its beacon node's. This
+# only matters to a process that never selects, which is a unit-test binary:
+# it is how the `--lib` tests run under minimal. The binary never enables it.
 # `ethlambda-state-transition`'s feature of the same name forwards to this one.
 preset-minimal = []
 
@@ -27,6 +30,7 @@ libssz-derive.workspace = true
 libssz-merkle.workspace = true
 libssz-types.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
 
 ethlambda-ssz-tree.workspace = true
 

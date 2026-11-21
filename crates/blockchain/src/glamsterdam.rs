@@ -101,10 +101,12 @@ fn log(slot: u64, block_root: H256) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::beacon::{fork::ForkName, preset::SLOTS_PER_EPOCH};
+    use ethlambda_types::beacon::{fork::ForkName, preset::slots_per_epoch};
 
     const GLOAS_EPOCH: u64 = 5;
-    const FORK_SLOT: u64 = GLOAS_EPOCH * SLOTS_PER_EPOCH;
+    fn fork_slot() -> u64 {
+        GLOAS_EPOCH * slots_per_epoch()
+    }
 
     fn gloas_at(epoch: u64) -> Config {
         Config::mainnet()
@@ -119,17 +121,18 @@ mod tests {
     #[test]
     fn the_block_crossing_the_fork_is_the_first() {
         let mut banner = GlamsterdamBanner::default();
-        let first = banner
-            .take_first_gloas_block(&gloas_at(GLOAS_EPOCH), FORK_SLOT, || Some(FORK_SLOT - 1));
+        let first = banner.take_first_gloas_block(&gloas_at(GLOAS_EPOCH), fork_slot(), || {
+            Some(fork_slot() - 1)
+        });
         assert!(first);
     }
 
     #[test]
     fn missed_slots_at_the_fork_still_leave_a_first_block() {
         let mut banner = GlamsterdamBanner::default();
-        let slot = FORK_SLOT + SLOTS_PER_EPOCH + 3;
+        let slot = fork_slot() + slots_per_epoch() + 3;
         let first =
-            banner.take_first_gloas_block(&gloas_at(GLOAS_EPOCH), slot, || Some(FORK_SLOT - 2));
+            banner.take_first_gloas_block(&gloas_at(GLOAS_EPOCH), slot, || Some(fork_slot() - 2));
         assert!(first);
     }
 
@@ -137,24 +140,24 @@ mod tests {
     fn blocks_before_the_fork_neither_log_nor_settle() {
         let config = gloas_at(GLOAS_EPOCH);
         let mut banner = GlamsterdamBanner::default();
-        assert!(!banner.take_first_gloas_block(&config, FORK_SLOT - 1, no_parent_read));
-        assert!(banner.take_first_gloas_block(&config, FORK_SLOT, || Some(FORK_SLOT - 1)));
+        assert!(!banner.take_first_gloas_block(&config, fork_slot() - 1, no_parent_read));
+        assert!(banner.take_first_gloas_block(&config, fork_slot(), || Some(fork_slot() - 1)));
     }
 
     #[test]
     fn the_banner_is_logged_once() {
         let config = gloas_at(GLOAS_EPOCH);
         let mut banner = GlamsterdamBanner::default();
-        assert!(banner.take_first_gloas_block(&config, FORK_SLOT, || Some(FORK_SLOT - 1)));
+        assert!(banner.take_first_gloas_block(&config, fork_slot(), || Some(fork_slot() - 1)));
         // A competing first gloas block, on a fork from the same parent.
-        assert!(!banner.take_first_gloas_block(&config, FORK_SLOT + 1, no_parent_read));
+        assert!(!banner.take_first_gloas_block(&config, fork_slot() + 1, no_parent_read));
     }
 
     #[test]
     fn a_node_started_after_the_fork_settles_without_a_banner() {
         let config = gloas_at(GLOAS_EPOCH);
         let mut banner = GlamsterdamBanner::default();
-        let slot = FORK_SLOT + 10;
+        let slot = fork_slot() + 10;
         assert!(!banner.take_first_gloas_block(&config, slot, || Some(slot - 1)));
         assert!(!banner.pending);
     }
@@ -162,7 +165,7 @@ mod tests {
     #[test]
     fn a_parent_off_record_settles_without_a_banner() {
         let mut banner = GlamsterdamBanner::default();
-        assert!(!banner.take_first_gloas_block(&gloas_at(GLOAS_EPOCH), FORK_SLOT, || None));
+        assert!(!banner.take_first_gloas_block(&gloas_at(GLOAS_EPOCH), fork_slot(), || None));
         assert!(!banner.pending);
     }
 
