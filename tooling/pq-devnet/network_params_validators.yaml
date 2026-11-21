@@ -15,8 +15,8 @@ participants:
     cl_log_level: info
     # The sidecar proves aggregates and merges block proofs; two threads keep
     # it next to Lighthouse's in the Docker VM.
-    cl_extra_env_vars:
-      LEANVM_THREADS: "2"
+    cl_extra_params:
+      - --pq-prover-threads=2
     vc_type: ethlambda
     vc_image: ethlambda:pq-local
     vc_extra_params:

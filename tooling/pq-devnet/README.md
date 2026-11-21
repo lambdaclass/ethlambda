@@ -28,19 +28,21 @@ of the fork.
 - **Lighthouse**: `ethpandaops/lighthouse:pq-devnet-0` (last run at
   `sha256:f571048f`), which proves attestation aggregates with leanVM through
   a `leanvm-sidecar` (`lighthouse-pq-bn`).
-- **ethlambda**: this repository's image with `leanvm-sidecar` added, started
-  through `ethlambda-pq` (`bin/ethlambda/pq/ethlambda-pq`), which starts the
-  sidecar and passes its socket as `--pq-prover-socket`. Without the sidecar
-  ethlambda checks proofs with the specification's reference encoding, which
-  rejects every Lighthouse block that carries attestations.
+- **ethlambda**: this repository's image, which ships `leanvm-sidecar`. The
+  launcher patch passes `--pq-prover-binary=leanvm-sidecar`, so the node
+  starts the sidecar itself, waits for it to warm up, and the sidecar exits
+  with the node (its log is `<data-dir>/pq-prover/sidecar.sock.log`). Without
+  the sidecar ethlambda checks proofs with the specification's reference
+  encoding, which rejects every Lighthouse block that carries attestations.
 - **Execution**: geth (`ethereum/client-go:latest`).
 - **Dora**: `ethpandaops/dora:pq`.
 
 ## Run it
 
 ```sh
-# 1. The image, from the repository root (about 15 minutes).
-docker build -f tooling/pq-devnet/Dockerfile -t ethlambda:pq-local .
+# 1. The image, from the repository root (about 15 minutes), or CI's
+#    `ghcr.io/lambdaclass/ethlambda:pq-devnet-0` retagged.
+docker build -t ethlambda:pq-local .
 
 # 2. The package: lambdaclass/ethereum-package's `add-ethlambda` (the
 #    ethlambda launcher) merged with ethpandaops/ethereum-package's `pq` (the
@@ -137,8 +139,9 @@ kurtosis run --enclave pq "$PWD/ethereum-package" \
   unaffected.
 - **Memory.** Every `leanvm-sidecar` warms up by proving twice and stays
   large. In Docker Desktop's default 8 GB VM, starting a second sidecar next
-  to Lighthouse's has had the kernel kill Lighthouse's. Set `LEANVM_THREADS`
-  (through `cl_extra_env_vars`) on ethlambda nodes that only verify.
+  to Lighthouse's has had the kernel kill Lighthouse's. Set
+  `--pq-prover-threads` (through `cl_extra_params`) on ethlambda nodes that
+  only verify.
 
 ## What to check
 

@@ -28,8 +28,13 @@
 //! failure: one for proving, where requests queue in the sidecar, and one for
 //! verifying, which the sidecar answers without waiting for proofs in
 //! progress.
+//!
+//! The sidecar is either one already listening ([`SidecarBackend::connect`])
+//! or one this process starts ([`SidecarBackend::launch`]), as Teku does:
+//! through leanVM's own launcher, which waits for it to warm up and has it
+//! exit with this process.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -107,9 +112,43 @@ pub struct SidecarBackend {
     config: SidecarConfig,
     prove_connection: Mutex<Option<Client>>,
     verify_connection: Mutex<Option<Client>>,
+    /// The sidecar [`Self::launch`] started, kept for as long as the backend
+    /// lives. Dropping it stops the sidecar; so does this process exiting,
+    /// since the sidecar watches its standard input, a pipe from here.
+    _launched: Option<Box<leanvm_pq::Sidecar>>,
 }
 
 impl SidecarBackend {
+    /// Starts the `leanvm-sidecar` executable at `binary` (looked up on `PATH`
+    /// when a bare name) on `config.socket` with `threads` proving threads (0:
+    /// one per core), waits until it has warmed up and listens, then connects
+    /// as [`Self::connect`] does.
+    ///
+    /// leanVM's launcher does the starting: it creates the socket's directory
+    /// private (mode 0700) and refuses one open to other users, appends the
+    /// sidecar's log to `<socket>.log`, refuses a socket another sidecar
+    /// already listens on, and waits up to ten minutes for the warm-up.
+    /// Blocks the calling thread until the sidecar is ready.
+    pub fn launch(binary: &Path, threads: usize, config: SidecarConfig) -> Result<Self, Error> {
+        let started = Instant::now();
+        let launched = leanvm_pq::Sidecar::start(binary, &config.socket, threads)
+            .map_err(|err| Error::Sidecar(err.to_string()))?;
+        let mut log = config.socket.clone().into_os_string();
+        log.push(".log");
+        tracing::info!(
+            binary = %binary.display(),
+            socket = %config.socket.display(),
+            log = %PathBuf::from(log).display(),
+            threads,
+            prover = launched.prover(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "Started the leanVM prover sidecar"
+        );
+        let mut backend = Self::connect(config)?;
+        backend._launched = Some(Box::new(launched));
+        Ok(backend)
+    }
+
     /// Opens both connections now, checking each hello (magic, protocol
     /// version, verifier tag), so a missing or incompatible sidecar is
     /// reported at startup.
@@ -126,6 +165,7 @@ impl SidecarBackend {
             config,
             prove_connection: Mutex::new(Some(prove_connection)),
             verify_connection: Mutex::new(Some(verify_connection)),
+            _launched: None,
         })
     }
 

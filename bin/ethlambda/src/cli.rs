@@ -191,7 +191,7 @@ pub(crate) enum Network {
     /// its payloads are validated against. Everything else it needs is a
     /// common flag.
     Mainnet {
-        mainnet: MainnetOptions,
+        mainnet: Box<MainnetOptions>,
         execution: Option<ExecutionOptions>,
     },
 }
@@ -279,7 +279,7 @@ impl From<BeaconOptions> for Options {
         Options {
             common: options.common,
             network: Network::Mainnet {
-                mainnet: options.mainnet,
+                mainnet: Box::new(options.mainnet),
                 execution,
             },
         }
@@ -425,11 +425,29 @@ pub(crate) struct MainnetOptions {
     /// the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ
     /// devnet's clients use.
     ///
-    /// Without it the node uses the specification's reference encoding (a
-    /// proof is the signatures concatenated), which only another node on the
-    /// reference accepts. Only a network scheduling the PQ fork reads either.
+    /// Without it, or `--pq-prover-binary`, the node uses the specification's
+    /// reference encoding (a proof is the signatures concatenated), which only
+    /// another node on the reference accepts. With `--pq-prover-binary`, the
+    /// socket the started sidecar listens on.
     #[arg(long)]
     pub(crate) pq_prover_socket: Option<PathBuf>,
+
+    /// A `leanvm-sidecar` executable (a path, or a name looked up on `PATH`)
+    /// for the node to start itself, as Teku does: the node waits for it to
+    /// warm up before going on, and it exits with the node. The image ships
+    /// one as `leanvm-sidecar`.
+    ///
+    /// It listens on `--pq-prover-socket`, or on
+    /// `<data-dir>/pq-prover/sidecar.sock` without it; the socket's directory
+    /// must be private (it is created mode 0700), and the sidecar logs to the
+    /// socket's path with `.log` appended.
+    #[arg(long)]
+    pub(crate) pq_prover_binary: Option<PathBuf>,
+
+    /// How many threads the started sidecar proves on (0, the default: one per
+    /// core). Only with `--pq-prover-binary`.
+    #[arg(long, requires = "pq_prover_binary")]
+    pub(crate) pq_prover_threads: Option<usize>,
 
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block

@@ -6,10 +6,6 @@ name: Publish Docker Image
 # tags (release.yaml for candidates, release_promote.yaml for final releases),
 # and `latest` (release_promote.yaml). `sha-*` is refused too, since this
 # workflow already adds `sha-<7>` for the commit it builds. See RELEASE.md.
-#
-# `dockerfile` picks another image recipe from the same tree, such as
-# `tooling/pq-devnet/Dockerfile` (the node plus leanVM's prover sidecar). It
-# takes the same build args as the root Dockerfile, so both variants build.
 
 on:
   workflow_dispatch:
@@ -17,10 +13,6 @@ on:
       tags:
         description: "Docker image tags, comma-separated (e.g., devnet5,devnet5-fix)"
         required: true
-      dockerfile:
-        description: "Dockerfile to build, relative to the repository root (e.g., tooling/pq-devnet/Dockerfile)"
-        required: false
-        default: ./Dockerfile
 
 permissions:
   contents: read
@@ -115,7 +107,7 @@ jobs:
         uses: docker/build-push-action@v6.19.2
         with:
           context: .
-          file: ${{ inputs.dockerfile }}
+          file: ./Dockerfile
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}

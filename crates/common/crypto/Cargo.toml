@@ -24,6 +24,7 @@ leanvm.workspace = true
 leanvm_claims.workspace = true
 leanvm_lean_xmss.workspace = true
 leanvm_sidecar.workspace = true
+leanvm_pq.workspace = true
 postcard.workspace = true
 
 thiserror.workspace = true

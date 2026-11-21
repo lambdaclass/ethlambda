@@ -141,6 +141,10 @@ keccak = "0.1.6"
 leanvm_sidecar = { package = "sidecar", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 leanvm_claims = { package = "claims", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 leanvm_lean_xmss = { package = "lean_xmss", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
+# leanVM's own Rust bindings, for their sidecar launcher only (`Sidecar::start`,
+# what Teku's Java bindings run): the node starts `leanvm-sidecar` itself,
+# waits for it to warm up, and the sidecar exits with the node.
+leanvm_pq = { package = "lean-pq", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the

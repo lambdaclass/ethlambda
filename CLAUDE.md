@@ -301,9 +301,11 @@ actual_slot = finalized_slot + 1 + relative_index
   consensus-specs' and leanVM's known answers), and proves many signatures at
   once through `ethlambda_crypto::stark`: the specification's reference (the
   signatures concatenated) by default, or real leanVM proofs from a
-  `leanvm-sidecar` process (`--pq-prover-socket`, leanVM `c5ee9d239`,
-  bindings v0.15.0, the release pq-devnet-0 runs for its signer, prover,
-  verifier and sidecar), which is what the PQ devnet runs.
+  `leanvm-sidecar` process (leanVM `c5ee9d239`, bindings v0.15.0, the
+  release pq-devnet-0 runs for its signer, prover, verifier and sidecar),
+  which is what the PQ devnet runs. The node starts the sidecar itself with
+  `--pq-prover-binary` (as Teku does; the image ships `leanvm-sidecar`), or
+  connects to one already listening with `--pq-prover-socket`.
   The two encodings do not verify each other's proofs. Never pass one
   scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`

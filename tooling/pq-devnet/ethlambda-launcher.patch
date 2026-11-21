@@ -7,10 +7,10 @@ index 477e74f..158d344 100644
          )
  
 +    # A network on the consensus-specs pq fork needs the leanVM prover sidecar
-+    # its other clients prove with: `ethlambda-pq` starts one and passes its
-+    # socket, as lighthouse-pq-bn does for Lighthouse.
++    # its other clients prove with: the image ships one, and the node starts
++    # it, as Teku does.
 +    if network_params.pq_fork_epoch != constants.FAR_FUTURE_EPOCH:
-+        cmd[0] = "ethlambda-pq"
++        cmd.append("--pq-prover-binary=leanvm-sidecar")
 +
      cmd_str = " && ".join(setup_cmds + ["exec " + " ".join(cmd)])
  
