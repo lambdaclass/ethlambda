@@ -493,9 +493,11 @@ pub trait BeaconNodeApi: Send + Sync {
     /// envelope in the answer, which saves a round trip inside the proposal's
     /// budget.
     ///
-    /// Returns the block and whatever travelled with it, decoded from SSZ.
-    /// JSON is not used here: see [`block_contents`] for why a block, alone
-    /// among everything this client handles, cannot go through the JSON path.
+    /// Returns the block and whatever travelled with it, decoded into the
+    /// typed container its root is taken from. SSZ is asked for first; before
+    /// gloas a JSON answer is decoded too, for a proxy that rewrites the
+    /// request's `Accept`. See [`block_contents`] for why either way ends in
+    /// the same container, and never in a mapping of this crate's own.
     ///
     /// # Contract: the answer is for this request, or it is an `Err`
     ///
