@@ -622,14 +622,14 @@ mod tests {
         // the PTC and aggregation committees sample from.
         let gloas = test_state::with_validators_at(ForkName::Gloas, 64);
         // The test state starts in epoch 1, so the boundaries come after it.
-        let next = gloas.slot() / preset::SLOTS_PER_EPOCH + 1;
+        let next = gloas.slot() / preset::slots_per_epoch() + 1;
         let config = |eip8483, pq| {
             Config::mainnet()
                 .with_fork_epoch(ForkName::Gloas, 0)
                 .with_fork_epoch(ForkName::Eip8483, eip8483)
                 .with_fork_epoch(ForkName::Pq, pq)
         };
-        let epoch_start = |epoch| epoch * preset::SLOTS_PER_EPOCH;
+        let epoch_start = |epoch| epoch * preset::slots_per_epoch();
 
         let together = config(next, next);
         let mut state = gloas.clone();

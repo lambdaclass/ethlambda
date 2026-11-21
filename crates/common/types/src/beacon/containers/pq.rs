@@ -40,7 +40,7 @@
 use libssz::{DecodeError, SszDecode, SszEncode};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Node, Sha256Hasher};
-use libssz_types::{ProgressiveBitlist, ProgressiveList, SszBitvector, SszList, SszVector};
+use libssz_types::{ProgressiveBitlist, ProgressiveList, SszList, SszVector};
 
 use super::fulu::ProposerLookahead;
 use super::gloas::{
@@ -58,6 +58,7 @@ use super::shared::{
 };
 use crate::beacon::constants::VRF_TREE_DEPTH;
 use crate::beacon::preset;
+use crate::beacon::preset_sized::{PresetBitvector, PresetVector};
 use crate::beacon::primitives::{
     Bytes32, CommitteeIndex, Epoch, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Slot,
     ValidatorIndex, WithdrawalIndex, XmssPubkey, XmssSignature,
@@ -69,7 +70,7 @@ use crate::beacon::primitives::{
 
 /// Bits marking which of a slot's (at most `MAX_COMMITTEES_PER_SLOT_PQ`)
 /// committees take part in an attestation.
-pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT_PQ }>;
+pub type CommitteeBits = PresetBitvector<preset::MaxCommitteesPerSlotPq>;
 
 /// A secret committed to by a leaf of the tree under a validator's VRF root,
 /// then the leaf's Merkle branch: the PQ fork's RANDAO reveal.
@@ -99,7 +100,7 @@ pub type AggregationCommittee = ProgressiveList<ValidatorIndex>;
 pub type AggregationCommittees = ProgressiveList<AggregationCommittee>;
 /// The aggregation committees of the previous, current, and lookahead epochs.
 pub type AggregationCommitteeWindow =
-    SszVector<AggregationCommittees, { preset::AGGREGATION_COMMITTEE_WINDOW_LENGTH }>;
+    PresetVector<AggregationCommittees, preset::AggregationCommitteeWindowLength>;
 
 /// The PQ validator registry: tree-backed and progressively merkleized like
 /// gloas's [`shared::ProgressiveValidators`], over this fork's [`Validator`].
@@ -1021,11 +1022,12 @@ fn serialize_window<S: serde::Serializer>(
     serializer.collect_seq(window.iter().map(Committees))
 }
 
-/// An all-empty [`AggregationCommitteeWindow`], which [`SszVector`] has no
+/// An all-empty [`AggregationCommitteeWindow`], which [`PresetVector`] has no
 /// `Default` for: what the fork upgrade starts from before
 /// `initialize_aggregation_committee_window` fills it.
 pub fn empty_aggregation_committee_window() -> AggregationCommitteeWindow {
-    let empty = vec![AggregationCommittees::default(); preset::AGGREGATION_COMMITTEE_WINDOW_LENGTH];
+    let empty =
+        vec![AggregationCommittees::default(); preset::aggregation_committee_window_length()];
     AggregationCommitteeWindow::try_from(empty)
         .expect("AGGREGATION_COMMITTEE_WINDOW_LENGTH entries fit the window's exact length")
 }
@@ -1115,12 +1117,13 @@ mod tests {
 
     /// The most attesters one attestation can name: every member of every
     /// committee of a slot.
-    const MAX_ATTESTERS: usize =
-        preset::MAX_VALIDATORS_PER_COMMITTEE * preset::MAX_COMMITTEES_PER_SLOT_PQ;
+    fn max_attesters() -> usize {
+        preset::MAX_VALIDATORS_PER_COMMITTEE * preset::max_committees_per_slot_pq()
+    }
 
     fn largest_indexed_attestation() -> IndexedAttestation {
         IndexedAttestation {
-            attesting_indices: vec![0; MAX_ATTESTERS].into(),
+            attesting_indices: vec![0; max_attesters()].into(),
             data: Default::default(),
             proof: largest_proof(),
         }
@@ -1138,14 +1141,14 @@ mod tests {
         };
         assert_eq!(
             slashing.to_ssz().len(),
-            preset::MAX_ATTESTER_SLASHING_SIZE_PQ
+            preset::max_attester_slashing_size_pq()
         );
 
         let aggregate = SignedAggregateAndProof {
             message: AggregateAndProof {
                 aggregator_index: 0,
                 aggregate: Attestation {
-                    aggregation_bits: ProgressiveBitlist::with_length(MAX_ATTESTERS),
+                    aggregation_bits: ProgressiveBitlist::with_length(max_attesters()),
                     data: Default::default(),
                     committee_bits: Default::default(),
                 },
@@ -1155,7 +1158,7 @@ mod tests {
         };
         assert_eq!(
             aggregate.to_ssz().len(),
-            preset::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ
+            preset::max_signed_aggregate_and_proof_size_pq()
         );
 
         let commitments = vec![Default::default(); preset::MAX_BLOB_COMMITMENTS_PER_BLOCK];

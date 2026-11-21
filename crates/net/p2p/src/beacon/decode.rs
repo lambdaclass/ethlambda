@@ -481,7 +481,7 @@ pub fn decode_pq_gossip(kind: &str, bytes: &[u8]) -> Result<PqGossip, DecodeErro
     match kind {
         topics::BEACON_AGGREGATE_AND_PROOF => pq::SignedAggregateAndProof::from_ssz_bytes(bounded(
             bytes,
-            preset::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ,
+            preset::max_signed_aggregate_and_proof_size_pq(),
         )?)
         .map(|value| PqGossip::Aggregate(Box::new(value)))
         .map_err(ssz),
@@ -490,7 +490,7 @@ pub fn decode_pq_gossip(kind: &str, bytes: &[u8]) -> Result<PqGossip, DecodeErro
             .map_err(ssz),
         topics::ATTESTER_SLASHING => pq::AttesterSlashing::from_ssz_bytes(bounded(
             bytes,
-            preset::MAX_ATTESTER_SLASHING_SIZE_PQ,
+            preset::max_attester_slashing_size_pq(),
         )?)
         .map(|value| PqGossip::AttesterSlashing(Box::new(value)))
         .map_err(ssz),
@@ -960,11 +960,11 @@ mod tests {
         for (kind, bound) in [
             (
                 topics::BEACON_AGGREGATE_AND_PROOF,
-                preset::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ,
+                preset::max_signed_aggregate_and_proof_size_pq(),
             ),
             (
                 topics::ATTESTER_SLASHING,
-                preset::MAX_ATTESTER_SLASHING_SIZE_PQ,
+                preset::max_attester_slashing_size_pq(),
             ),
             (
                 topics::EXECUTION_PAYLOAD_BID,

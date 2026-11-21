@@ -281,13 +281,13 @@ pub fn get_aggregation_committee(
             epoch + 1 == state_epoch,
             "get_aggregation_committee: epoch + 1 == state_epoch",
         )?;
-        slot % preset::SLOTS_PER_EPOCH
+        slot % preset::slots_per_epoch()
     } else {
         crate::beacon::verify(
             epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD,
             "get_aggregation_committee: epoch <= state_epoch + MIN_SEED_LOOKAHEAD",
         )?;
-        (epoch - state_epoch + 1) * preset::SLOTS_PER_EPOCH + slot % preset::SLOTS_PER_EPOCH
+        (epoch - state_epoch + 1) * preset::slots_per_epoch() + slot % preset::slots_per_epoch()
     } as usize;
     let slot_committees = &inner.aggregation_committee_window[position];
     slot_committees
@@ -309,7 +309,7 @@ pub fn initialize_aggregation_committee_window(
     let current_epoch = get_current_epoch(state);
     let start_slot = compute_start_slot_at_epoch(current_epoch);
     let end_slot = compute_start_slot_at_epoch(current_epoch + preset::MIN_SEED_LOOKAHEAD + 1);
-    let mut window = vec![pq::AggregationCommittees::default(); preset::SLOTS_PER_EPOCH as usize];
+    let mut window = vec![pq::AggregationCommittees::default(); preset::slots_per_epoch() as usize];
     for slot in start_slot..end_slot {
         window.push(compute_aggregation_committees(state, slot, &committees)?);
     }
@@ -429,7 +429,8 @@ pub fn is_valid_indexed_attestation(
 ) -> Result<bool> {
     let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
     if indices.is_empty()
-        || indices.len() > preset::MAX_VALIDATORS_PER_COMMITTEE * preset::MAX_COMMITTEES_PER_SLOT_PQ
+        || indices.len()
+            > preset::MAX_VALIDATORS_PER_COMMITTEE * preset::max_committees_per_slot_pq()
         || !super::predicates::are_indices_sorted_and_unique(indices)
     {
         return Ok(false);
@@ -546,7 +547,7 @@ pub fn get_latest_block_slot(state: &BeaconState, slot: Slot, parent_slot: Slot)
     let block_root = get_block_root_at_slot(state, slot)?;
     let mut slot = slot;
     while slot > 0
-        && slot + preset::SLOTS_PER_HISTORICAL_ROOT as u64 > state.slot()
+        && slot + preset::slots_per_historical_root() as u64 > state.slot()
         && get_block_root_at_slot(state, slot - 1)? == block_root
     {
         slot -= 1;
@@ -626,7 +627,7 @@ mod tests {
     /// than reading past it.
     #[test]
     fn the_walk_stops_at_the_oldest_root_kept() {
-        let history = preset::SLOTS_PER_HISTORICAL_ROOT as u64;
+        let history = preset::slots_per_historical_root() as u64;
         let state = pq_state_with_roots(history + 2, &[]);
         // Every root is the default: the walk would run to slot 0 if it could.
         assert_eq!(get_latest_block_slot(&state, 3, history).unwrap(), 2);

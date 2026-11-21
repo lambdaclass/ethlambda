@@ -2166,7 +2166,7 @@ mod tests {
 
         // The window's current and lookahead epochs are filled, the previous
         // one empty.
-        let slots = preset::SLOTS_PER_EPOCH as usize;
+        let slots = preset::slots_per_epoch() as usize;
         assert!(
             inner.aggregation_committee_window[..slots]
                 .iter()

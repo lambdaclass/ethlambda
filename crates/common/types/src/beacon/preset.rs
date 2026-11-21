@@ -28,7 +28,7 @@
 //!   const-generic bound. The build asserts each one equal in both presets.
 //! - A value they disagree on is a function returning it under
 //!   [`Preset::active`]: `preset::slots_per_epoch()` is `SLOTS_PER_EPOCH`.
-//!   There are 29 of these, every one listed in `per_preset!` below.
+//!   There are 35 of these, every one listed in `per_preset!` below.
 //! - A container bounded by such a value cannot carry the bound as a const
 //!   generic, since it is not known when the crate is compiled. It takes a
 //!   [`Length`] marker instead (`preset::SyncCommitteeSize`), through the
@@ -1561,6 +1561,15 @@ shared! {
     MAX_PAYLOAD_ATTESTATIONS: u64,
     MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64,
     MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MIN_ATTESTATION_INCLUSION_DELAY_PQ: u64,
+    MAX_STARK_PROOF_SIZE: usize,
+    MAX_ATTESTATIONS_PQ: u64,
+    MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ: usize,
 }
 
 // ================================================================
@@ -1624,6 +1633,12 @@ per_preset! {
     max_builders_per_withdrawals_sweep => MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64,
     ptc_window_length => PTC_WINDOW_LENGTH: usize,
     builder_pending_payments_length => BUILDER_PENDING_PAYMENTS_LENGTH: usize,
+    max_committees_per_slot_pq => MAX_COMMITTEES_PER_SLOT_PQ: usize,
+    max_signed_aggregate_and_proof_size_pq => MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ: usize,
+    max_attester_slashing_size_pq => MAX_ATTESTER_SLASHING_SIZE_PQ: usize,
+    preregistrations_limit => PREREGISTRATIONS_LIMIT: u64,
+    preregistration_expiry_slots => PREREGISTRATION_EXPIRY_SLOTS: u64,
+    aggregation_committee_window_length => AGGREGATION_COMMITTEE_WINDOW_LENGTH: usize,
 }
 
 // ================================================================
@@ -1669,6 +1684,8 @@ length_markers! {
     PtcSize => ptc_size,
     PtcWindowLength => ptc_window_length,
     BuilderPendingPaymentsLength => builder_pending_payments_length,
+    MaxCommitteesPerSlotPq => max_committees_per_slot_pq,
+    AggregationCommitteeWindowLength => aggregation_committee_window_length,
 }
 
 /// Preset values that a later fork retunes without changing any container's

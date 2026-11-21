@@ -82,8 +82,9 @@ pub const MAX_VOTE_STATE_ADVANCE_EPOCHS: u64 = preset::MIN_SEED_LOOKAHEAD + 1;
 /// The most aggregation bits a PQ aggregate may carry: every committee of a
 /// slot at full size, under the PQ committee cap. The progressive bitlist has
 /// no bound of its own, so the rules enforce this one before reading the bits.
-pub const MAX_AGGREGATION_BITS: usize =
-    preset::MAX_VALIDATORS_PER_COMMITTEE * preset::MAX_COMMITTEES_PER_SLOT_PQ;
+pub fn max_aggregation_bits() -> usize {
+    preset::MAX_VALIDATORS_PER_COMMITTEE * preset::max_committees_per_slot_pq()
+}
 
 // ---------------------------------------------------------------------------
 // Shared
@@ -97,7 +98,7 @@ pub fn compute_subnet_for_attestation(
     committee_index: CommitteeIndex,
     config: &Config,
 ) -> u64 {
-    let slots_since_epoch_start = slot % preset::SLOTS_PER_EPOCH;
+    let slots_since_epoch_start = slot % preset::slots_per_epoch();
     let committees_since_epoch_start = committees_per_slot.saturating_mul(slots_since_epoch_start);
     committees_since_epoch_start.saturating_add(committee_index)
         % config.attestation_subnet_count_pq.max(1)
@@ -233,7 +234,7 @@ pub fn aggregate_cheap_checks(
     let data = &aggregate.data;
     // [REJECT] The bitfield fits every committee of a slot, read without
     // expanding it: everything below expands it.
-    if aggregate.aggregation_bits.len() > MAX_AGGREGATION_BITS {
+    if aggregate.aggregation_bits.len() > max_aggregation_bits() {
         return Err(Outcome::Reject(RejectReason::BitsLength));
     }
     // [REJECT] The aggregate attestation's data index is 0 or 1.
@@ -700,7 +701,7 @@ pub fn envelope_cheap_checks(
         return Err(Outcome::Ignore(IgnoreReason::Finalized));
     }
     // [REJECT] The withdrawals and execution requests are within their limits.
-    if message.payload.withdrawals.len() > preset::MAX_WITHDRAWALS_PER_PAYLOAD {
+    if message.payload.withdrawals.len() > preset::max_withdrawals_per_payload() {
         return Err(Outcome::Reject(RejectReason::TooManyWithdrawals));
     }
     if !execution_requests_within_limits(&message.execution_requests) {

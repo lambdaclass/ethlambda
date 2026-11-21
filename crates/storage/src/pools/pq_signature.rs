@@ -32,7 +32,9 @@ const RETAINED_SLOTS: Slot = 3;
 /// How many distinct `(AttestationData, committee)` groups one slot may hold:
 /// four votes per committee leaves room for honest disagreement and bounds
 /// what a peer can make the node store.
-const MAX_GROUPS_PER_SLOT: usize = preset::MAX_COMMITTEES_PER_SLOT_PQ * 4;
+fn max_groups_per_slot() -> usize {
+    preset::max_committees_per_slot_pq() * 4
+}
 
 /// `(slot, data root, committee index)`.
 type Key = (Slot, Root, u64);
@@ -73,8 +75,8 @@ impl PqSignaturePool {
     pub fn subscribe(&mut self, now: Slot, slot: Slot, committee: u64) -> bool {
         self.prune(now);
         let accepted = slot >= now
-            && slot <= now.saturating_add(2 * preset::SLOTS_PER_EPOCH)
-            && committee < preset::MAX_COMMITTEES_PER_SLOT_PQ as u64;
+            && slot <= now.saturating_add(2 * preset::slots_per_epoch())
+            && committee < preset::max_committees_per_slot_pq() as u64;
         if accepted {
             self.subscriptions.insert((slot, committee));
         }
@@ -106,7 +108,7 @@ impl PqSignaturePool {
                 .range((slot, Root::ZERO, 0)..)
                 .take_while(|((held, _, _), _)| *held == slot)
                 .count();
-            if groups >= MAX_GROUPS_PER_SLOT {
+            if groups >= max_groups_per_slot() {
                 return false;
             }
         }
@@ -212,18 +214,18 @@ mod tests {
     fn a_slot_holds_a_bounded_number_of_groups() {
         let mut pool = PqSignaturePool::default();
         pool.subscribe(3, 3, 0);
-        for root in 0..=MAX_GROUPS_PER_SLOT as u8 {
+        for root in 0..=max_groups_per_slot() as u8 {
             pool.insert(3, &vote(3, 0, root as u64, root));
         }
-        assert_eq!(pool.seal(3).len(), MAX_GROUPS_PER_SLOT);
+        assert_eq!(pool.seal(3).len(), max_groups_per_slot());
     }
 
     #[test]
     fn subscriptions_are_bounded_in_time_and_committee() {
         let mut pool = PqSignaturePool::default();
         assert!(!pool.subscribe(10, 9, 0));
-        assert!(!pool.subscribe(10, 10 + 2 * preset::SLOTS_PER_EPOCH + 1, 0));
-        assert!(!pool.subscribe(10, 10, preset::MAX_COMMITTEES_PER_SLOT_PQ as u64));
+        assert!(!pool.subscribe(10, 10 + 2 * preset::slots_per_epoch() + 1, 0));
+        assert!(!pool.subscribe(10, 10, preset::max_committees_per_slot_pq() as u64));
         assert!(pool.subscribe(10, 12, 1));
         assert!(pool.is_subscribed(12, 1));
     }

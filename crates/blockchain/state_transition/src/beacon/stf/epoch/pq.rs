@@ -59,14 +59,14 @@ pub fn process_aggregation_committee_window(state: &mut BeaconState) -> Result<(
     let next_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
     let start_slot = compute_start_slot_at_epoch(next_epoch);
     let committees = CommitteeCache::default();
-    let mut new_slice = Vec::with_capacity(preset::SLOTS_PER_EPOCH as usize);
-    for slot in start_slot..start_slot + preset::SLOTS_PER_EPOCH {
+    let mut new_slice = Vec::with_capacity(preset::slots_per_epoch() as usize);
+    for slot in start_slot..start_slot + preset::slots_per_epoch() {
         new_slice.push(compute_aggregation_committees(state, slot, &committees)?);
     }
 
     let inner = pq_state(state, "process_aggregation_committee_window")?;
-    let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
-    let mut window = Vec::with_capacity(preset::AGGREGATION_COMMITTEE_WINDOW_LENGTH);
+    let slots_per_epoch = preset::slots_per_epoch() as usize;
+    let mut window = Vec::with_capacity(preset::aggregation_committee_window_length());
     window.extend_from_slice(&inner.aggregation_committee_window[slots_per_epoch..]);
     window.extend(new_slice);
     inner.aggregation_committee_window = window.try_into().expect(

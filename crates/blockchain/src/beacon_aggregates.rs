@@ -112,13 +112,13 @@ pub(crate) struct AggregateGossip {
 
 impl AggregateGossip {
     /// Holds a PQ aggregate until its slot has passed. The oldest is dropped
-    /// once the queue holds [`MAX_DEFERRED`].
+    /// once the queue holds [`max_deferred`].
     pub(crate) fn defer_pq(
         &mut self,
         data: AttestationData,
         attesting_indices: Vec<ValidatorIndex>,
     ) {
-        if self.pq_deferred.len() >= MAX_DEFERRED {
+        if self.pq_deferred.len() >= max_deferred() {
             self.pq_deferred.pop_front();
         }
         self.pq_deferred.push_back((data, attesting_indices));

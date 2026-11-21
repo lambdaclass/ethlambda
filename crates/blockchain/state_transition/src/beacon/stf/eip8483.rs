@@ -23,33 +23,37 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, eip8483};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache, PubkeyIndexCache};
+use crate::beacon::helpers::accessors::{ActiveBalanceCache, PubkeyIndexCache};
 use crate::beacon::helpers::electra::has_execution_withdrawal_credential;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
 use crate::metrics::{StfPhase, timed};
 
+use super::BlockCaches;
 use super::gloas::{
     GloasRequests, mark_parent_payload_available, parent_payload_context,
     process_gloas_execution_requests, settle_parent_builder_payment,
 };
 
 /// `process_block`: gloas's, over EIP-8483's block.
-#[allow(clippy::too_many_arguments)]
 pub fn process_block(
     state: &mut BeaconState,
     block: &eip8483::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let parent_slot = state.latest_block_header().slot;
     timed(StfPhase::ExecutionPayload, || {
-        process_parent_execution_payload(state, block, config, active_balances, pubkey_indices)
+        process_parent_execution_payload(
+            state,
+            block,
+            config,
+            caches.active_balances,
+            caches.pubkey_indices,
+        )
     })?;
     timed(StfPhase::BlockHeader, || {
         super::block::process_block_header(
@@ -76,16 +80,16 @@ pub fn process_block(
         &block.body,
         parent_slot,
         config,
-        committees,
-        active_balances,
-        signatures,
+        caches.committees,
+        caches.active_balances,
         options.target_delta,
+        signatures,
     )?;
     super::altair::process_sync_aggregate(
         state,
         &block.body.sync_aggregate,
-        active_balances,
-        pubkey_indices,
+        caches.active_balances,
+        caches.pubkey_indices,
         signatures,
     )?;
     Ok(())

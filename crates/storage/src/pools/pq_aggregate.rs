@@ -32,7 +32,9 @@ use ethlambda_types::{
 /// How many slots of aggregates the pool holds below the newest one it has
 /// seen: an attestation is includable through the end of the epoch after its
 /// own, so two epochs cover every one a block could still pack.
-const RETAINED_SLOTS: Slot = 2 * preset::SLOTS_PER_EPOCH;
+fn retained_slots() -> Slot {
+    2 * preset::slots_per_epoch()
+}
 
 /// One validated network aggregate.
 #[derive(Debug, Clone)]
@@ -55,7 +57,7 @@ pub struct PqAggregatePool {
 impl PqAggregatePool {
     /// Hold `aggregate` unless the pool already has one for its data and
     /// committee covering at least as many attesters. Returns whether it was
-    /// kept. Drops everything more than [`RETAINED_SLOTS`] below the newest
+    /// kept. Drops everything more than [`retained_slots`] below the newest
     /// slot held.
     pub fn insert(&mut self, mut aggregate: PooledPqAggregate) -> bool {
         aggregate.attesting_indices.sort_unstable();
@@ -64,7 +66,7 @@ impl PqAggregatePool {
             .by_slot
             .last_key_value()
             .map_or(slot, |(&newest, _)| newest.max(slot));
-        let floor = newest.saturating_sub(RETAINED_SLOTS);
+        let floor = newest.saturating_sub(retained_slots());
         if slot < floor {
             return false;
         }
@@ -158,9 +160,9 @@ mod tests {
     fn slots_two_epochs_below_the_newest_are_dropped() {
         let mut pool = PqAggregatePool::default();
         pool.insert(aggregate(1, 0, &[1]));
-        pool.insert(aggregate(1 + RETAINED_SLOTS, 0, &[2]));
+        pool.insert(aggregate(1 + retained_slots(), 0, &[2]));
         assert_eq!(pool.len(), 2);
-        pool.insert(aggregate(2 + RETAINED_SLOTS, 0, &[3]));
+        pool.insert(aggregate(2 + retained_slots(), 0, &[3]));
         assert_eq!(pool.len(), 2);
         assert!(!pool.insert(aggregate(1, 0, &[4, 5])));
     }

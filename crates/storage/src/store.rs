@@ -4241,7 +4241,7 @@ impl Store {
     /// fork with envelopes there, which only a store fed gloas envelopes under
     /// another schedule (a test) holds.
     fn envelope_fork(&self, slot: u64) -> ForkName {
-        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        let fork = self.config.fork_at_epoch(slot / slots_per_epoch());
         if fork.has_payload_envelopes() {
             fork
         } else {

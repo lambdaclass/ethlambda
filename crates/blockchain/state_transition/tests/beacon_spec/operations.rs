@@ -476,7 +476,7 @@ fn run(
             }
             ForkName::Pq => {
                 let slashing: pq::AttesterSlashing = case.ssz("attester_slashing");
-                pq_stf::process_attester_slashing(state, &slashing, config)
+                pq_stf::process_attester_slashing(state, &slashing, config, &active_balances)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
@@ -516,7 +516,7 @@ fn run(
             // XMSS-signed headers, a container of the PQ fork's own.
             ForkName::Pq => {
                 let slashing: pq::ProposerSlashing = case.ssz("proposer_slashing");
-                pq_stf::process_proposer_slashing(state, &slashing, config)
+                pq_stf::process_proposer_slashing(state, &slashing, config, &active_balances)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
         },

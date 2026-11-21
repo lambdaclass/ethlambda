@@ -25,7 +25,6 @@ use ethlambda_types::beacon::primitives::ValidatorIndex;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{debug, trace, warn};
 
-use crate::beacon::builder_market::wall_slot;
 use crate::beacon::decode::{self as beacon_decode, PqGossip};
 use crate::beacon::topics as beacon_topics;
 use crate::beacon::verdict::{Dispatch, Validated};
@@ -119,9 +118,10 @@ impl PqValidated {
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.pq_builder_market.record_bid((**bid).clone())
             }
-            Self::ProposerPreferences(preferences) => server
-                .pq_builder_market
-                .record_preferences((**preferences).clone(), wall_slot(server)),
+            Self::ProposerPreferences(preferences) => server.pq_builder_market.record_preferences(
+                (**preferences).clone(),
+                crate::wall_clock_slot(&server.store),
+            ),
             Self::Envelope(envelope) => {
                 let recorded = server.seen_envelopes.record(
                     envelope.message.beacon_block_root,

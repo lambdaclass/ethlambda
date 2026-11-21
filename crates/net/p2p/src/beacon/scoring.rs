@@ -357,7 +357,9 @@ impl ScoreSettings {
             .into_iter()
             .filter(|(topic, _)| topic.hash() != voluntary_exit)
             .collect();
-        let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
+        let active = inputs
+            .active_validators
+            .max(placeholder_active_validators());
         let (aggregators_per_slot, committees_per_slot) = expected_pq_aggregators_per_slot(active);
         topics.extend(self.dynamic_topic_params_with(
             fork_digest,
@@ -433,7 +435,9 @@ impl ScoreSettings {
         committees_per_slot: u64,
         subnet_count: u64,
     ) -> Vec<(IdentTopic, TopicScoreParams)> {
-        let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
+        let active = inputs
+            .active_validators
+            .max(placeholder_active_validators());
         // Whether each subnet sees more than one committee's burst an epoch,
         // which shortens its decay windows.
         let multiple_bursts_per_subnet_per_epoch =

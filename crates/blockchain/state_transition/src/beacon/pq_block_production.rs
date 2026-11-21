@@ -208,15 +208,8 @@ pub fn assemble_pq_block(
     };
 
     let mut post = state.clone();
-    stf::pq::process_block(
-        &mut post,
-        &block,
-        config,
-        &CommitteeCache::default(),
-        &ActiveBalanceCache::default(),
-        &PubkeyIndexCache::default(),
-        options,
-    )?;
+    let scratch = stf::OwnedBlockCaches::default();
+    stf::pq::process_block(&mut post, &block, config, scratch.caches(), options)?;
     post.apply_pending_mutations();
     block.state_root = post.hash_tree_root();
 
@@ -514,7 +507,7 @@ mod tests {
     /// A registry that fills exactly two committees per slot under either
     /// preset (8192 validators on mainnet, 64 on minimal).
     fn two_committees_per_slot() -> usize {
-        (2 * preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE) as usize
+        (2 * preset::slots_per_epoch() * preset::target_committee_size()) as usize
     }
 
     fn data_at(state: &BeaconState, slot: Slot) -> AttestationData {

@@ -780,9 +780,7 @@ fn gloas_block(store: &Store, root: &Root) -> Result<GloasBlock, Outcome> {
             .to_vec()),
         // Not followed (`ForkName::is_followed`): no column of its blocks is
         // judged here.
-        SignedBeaconBlock::Eip8483(_) => {
-            Err(Outcome::Ignore(IgnoreReason::UnsupportedFork))
-        }
+        SignedBeaconBlock::Eip8483(_) => Err(Outcome::Ignore(IgnoreReason::UnsupportedFork)),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::gloas_block"),
     };
     Ok(GloasBlock {

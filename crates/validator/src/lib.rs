@@ -374,7 +374,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             store
                 .pubkeys()
                 .into_iter()
-                .filter_map(|pubkey| match store.get(&pubkey)? {
+                .filter_map(|pubkey| match store.signer(&pubkey)? {
                     keys::store::SigningMethod::LocalKeystore { secret_key } => {
                         Some((pubkey, secret_key.to_bytes()))
                     }

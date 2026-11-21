@@ -64,7 +64,9 @@ const LEAF_RECORD_SIZE: usize = 48 + 8 + 32;
 /// How many slots back [`open_leaf_record`] keeps a leaf. The client signs
 /// only for the current slot, the next epoch's proposals' preferences and the
 /// current target epoch, so a leaf two epochs old is never asked for again.
-const LEAF_RECORD_KEEP_SLOTS: Slot = 2 * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+fn leaf_record_keep_slots() -> Slot {
+    2 * ethlambda_types::beacon::preset::slots_per_epoch()
+}
 
 /// The directory under the validators directory that holds each key's VRF
 /// tree nodes, one file per validator, named by its BLS public key.
@@ -170,7 +172,7 @@ fn leaf_slot(leaf: u64) -> Option<Slot> {
     let attestations = XMSS_RESERVED_LEAVES..XMSS_RESERVED_LEAVES + XMSS_ATTESTATION_LEAVES;
     attestations
         .contains(&leaf)
-        .then(|| (leaf - XMSS_RESERVED_LEAVES) * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH)
+        .then(|| (leaf - XMSS_RESERVED_LEAVES) * ethlambda_types::beacon::preset::slots_per_epoch())
 }
 
 fn signed_leaves() -> &'static Mutex<LeafRecord> {
@@ -180,10 +182,10 @@ fn signed_leaves() -> &'static Mutex<LeafRecord> {
 
 /// Opens `validators_dir`'s leaf record and takes it as this process's: the
 /// leaves signed before a restart stay spent. Leaves of slots more than
-/// [`LEAF_RECORD_KEEP_SLOTS`] before `current_slot` are dropped from it.
+/// [`leaf_record_keep_slots`] before `current_slot` are dropped from it.
 /// Returns how many leaves it holds. Call it once, before any PQ signature.
 pub fn open_leaf_record(validators_dir: &Path, current_slot: Slot) -> std::io::Result<usize> {
-    let keep_from = current_slot.saturating_sub(LEAF_RECORD_KEEP_SLOTS);
+    let keep_from = current_slot.saturating_sub(leaf_record_keep_slots());
     let (mut record, count) = LeafRecord::open(&validators_dir.join(LEAF_RECORD_FILE), keep_from)?;
     let mut global = signed_leaves().lock().expect("PQ leaf record poisoned");
     // Anything this process signed before opening is kept, and written
@@ -347,7 +349,7 @@ pub fn bottom_tree_of(leaf: u64) -> u64 {
 /// leaf of a slot is in one bottom tree, since a slot's
 /// [`XMSS_LEAVES_PER_SLOT`] start at a multiple of it.
 pub fn duty_leaves(slot: Slot) -> [u64; 2] {
-    let epoch = slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    let epoch = slot / ethlambda_types::beacon::preset::slots_per_epoch();
     [attestation_leaf(epoch), slot_leaf(slot, 0)]
 }
 

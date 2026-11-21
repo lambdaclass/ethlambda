@@ -56,6 +56,7 @@ use crate::beacon::primitives::{
 };
 use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
+use super::BlockCaches;
 use super::block::RandaoVerification;
 use super::gloas::{
     mark_parent_payload_available, parent_payload_context, settle_parent_builder_payment,
@@ -70,14 +71,18 @@ pub fn process_block(
     state: &mut BeaconState,
     block: &pq::BeaconBlock,
     config: &Config,
-    committees: &CommitteeCache,
-    active_balances: &ActiveBalanceCache,
-    pubkey_indices: &PubkeyIndexCache,
+    caches: BlockCaches<'_>,
     options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     let parent_slot = state.latest_block_header().slot;
     timed(StfPhase::ExecutionPayload, || {
-        process_parent_execution_payload(state, block, config, active_balances, pubkey_indices)
+        process_parent_execution_payload(
+            state,
+            block,
+            config,
+            caches.active_balances,
+            caches.pubkey_indices,
+        )
     })?;
     timed(StfPhase::BlockHeader, || {
         super::block::process_block_header(
@@ -101,8 +106,8 @@ pub fn process_block(
         &block.body,
         parent_slot,
         config,
-        committees,
-        active_balances,
+        caches.committees,
+        caches.active_balances,
         options.target_delta,
     )
 }
@@ -151,7 +156,7 @@ pub fn process_randao(
     input.extend_from_slice(&randao_reveal[0].0);
     input.extend_from_slice(&constants::DOMAIN_RANDAO);
     let mix = crate::beacon::hash::hash(&input);
-    let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+    let position = epoch as usize % preset::epochs_per_historical_vector();
     state.randao_mixes_mut()[position] = mix;
     Ok(())
 }
@@ -288,12 +293,12 @@ pub fn process_operations(
     try_for_each_timed(
         StfPhase::ProposerSlashings,
         body.proposer_slashings.iter(),
-        |slashing| process_proposer_slashing(state, slashing, config),
+        |slashing| process_proposer_slashing(state, slashing, config, active_balances),
     )?;
     try_for_each_timed(
         StfPhase::AttesterSlashings,
         body.attester_slashings.iter(),
-        |slashing| process_attester_slashing(state, slashing, config),
+        |slashing| process_attester_slashing(state, slashing, config, active_balances),
     )?;
     try_for_each_timed(
         StfPhase::Attestations,
@@ -337,6 +342,7 @@ pub fn process_proposer_slashing(
     state: &mut BeaconState,
     proposer_slashing: &pq::ProposerSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
@@ -374,7 +380,7 @@ pub fn process_proposer_slashing(
         )?;
     }
 
-    slash_validator(state, proposer_index, None, config)
+    slash_validator(state, proposer_index, None, config, Some(active_balances))
 }
 
 pub(crate) fn header_signature_valid(
@@ -399,6 +405,7 @@ pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &pq::AttesterSlashing,
     config: &Config,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -419,6 +426,7 @@ pub fn process_attester_slashing(
         &attestation_1.attesting_indices,
         &attestation_2.attesting_indices,
         config,
+        active_balances,
     )
 }
 
@@ -809,7 +817,7 @@ pub fn process_validator_preregistration_request(
             crate::beacon::helpers::pq::is_active_validator_preregistration(inner, record)
         })
         .count() as u64;
-    if active >= preset::PREREGISTRATIONS_LIMIT {
+    if active >= preset::preregistrations_limit() {
         return Ok(());
     }
 
@@ -860,7 +868,7 @@ pub fn process_builder_preregistration_request(
             crate::beacon::helpers::pq::is_active_builder_preregistration(inner, record)
         })
         .count() as u64;
-    if active >= preset::PREREGISTRATIONS_LIMIT {
+    if active >= preset::preregistrations_limit() {
         return Ok(());
     }
 
@@ -881,7 +889,7 @@ pub fn process_builder_preregistration_request(
 }
 
 fn expiry_slot(slot: Slot) -> Result<Slot> {
-    slot.checked_add(preset::PREREGISTRATION_EXPIRY_SLOTS)
+    slot.checked_add(preset::preregistration_expiry_slots())
         .ok_or(Error::ArithmeticOverflow(
             "state.slot + PREREGISTRATION_EXPIRY_SLOTS",
         ))
@@ -1412,7 +1420,7 @@ mod tests {
         let committees = CommitteeCache::default();
         let epoch = get_current_epoch(&state);
         let slot = crate::beacon::helpers::misc::compute_start_slot_at_epoch(epoch);
-        let first = &window[preset::SLOTS_PER_EPOCH as usize][0];
+        let first = &window[preset::slots_per_epoch() as usize][0];
         let committee = committees
             .committees(&state, epoch)
             .committee(slot, 0)

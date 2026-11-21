@@ -1056,10 +1056,7 @@ mod tests {
         config = config
             .with_fork_epoch(ForkName::Eip8483, GLOAS_EPOCH)
             .with_fork_epoch(ForkName::Pq, GLOAS_EPOCH);
-        let context = Arc::new(SigningContext {
-            config,
-            genesis_validators_root: Root::repeat_byte(0x42),
-        });
+        let context = Arc::new(SigningContext::new(config, Root::repeat_byte(0x42)));
         let node = Arc::new(MockBeaconNode::new().with_proposers_v2(
             GLOAS_EPOCH,
             Root::repeat_byte(0x11),
