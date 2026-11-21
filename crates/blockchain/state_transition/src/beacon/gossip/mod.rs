@@ -96,6 +96,12 @@ pub enum QueueReason {
     /// moments ago. See `envelope::stateful_checks` for why this is not an
     /// ignore.
     StateNotCached,
+    /// A gloas block builds on its parent's full payload branch, but the
+    /// parent's envelope has not been seen and verified yet. The
+    /// specification IGNOREs it and lets it be queued until the envelope is;
+    /// the chain actor holds it until then. An `Ignore` here would drop it
+    /// instead, and it would come back only when a child named it.
+    ParentPayloadUnverified,
 }
 
 impl QueueReason {
@@ -107,6 +113,7 @@ impl QueueReason {
             Self::BlockUnknown => "block_unknown",
             Self::BlockNotReady => "block_not_ready",
             Self::StateNotCached => "state_not_cached",
+            Self::ParentPayloadUnverified => "parent_payload_unverified",
         }
     }
 }
@@ -173,10 +180,17 @@ pub enum IgnoreReason {
     SlotStarted,
     /// Proposer preferences name a dependent root no chain here can have.
     ImpossibleDependentRoot,
-    /// A gloas block builds on its parent's full payload branch, but the
-    /// parent's envelope has not been seen and verified (the specification
-    /// lets it be queued until it is).
+    /// A bid builds on its parent's full payload, but the parent's envelope
+    /// has not been seen and verified. A gloas block in the same position is
+    /// queued instead ([`QueueReason::ParentPayloadUnverified`]).
     ParentPayloadUnverified,
+    /// A gloas block builds on its parent's full payload branch, and the
+    /// execution client found that payload invalid. Not queued, since nothing
+    /// will verify it; IGNORE rather than REJECT, as the specification has
+    /// it for a block whose parent passed validation but whose payload did
+    /// not, so a peer that relayed it on an optimistic verdict is not
+    /// penalized.
+    ParentPayloadInvalid,
     /// A gloas vote names the full payload (`data.index == 1`) of a block whose
     /// envelope has not been seen and verified (the specification lets it be
     /// queued until it is).
@@ -230,6 +244,7 @@ impl IgnoreReason {
             Self::SlotStarted => "slot_started",
             Self::ImpossibleDependentRoot => "impossible_dependent_root",
             Self::ParentPayloadUnverified => "parent_payload_unverified",
+            Self::ParentPayloadInvalid => "parent_payload_invalid",
             Self::PayloadEnvelopeUnseen => "payload_envelope_unseen",
             Self::PayloadOptimistic => "payload_optimistic",
             Self::NotCurrentSlot => "not_current_slot",
