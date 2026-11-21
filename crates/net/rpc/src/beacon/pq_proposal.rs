@@ -381,15 +381,27 @@ async fn pack_attestations(
     let Ok(permit) = MERGE_PERMIT.try_acquire() else {
         return fall_back("a merge is still running");
     };
+    let budget_ms = remaining.as_millis() as u64;
     let job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let started = Instant::now();
         let proof = packed.merge().map_err(|err| err.to_string());
-        // Logged when it ends, deadline or not: what a merge costs here.
+        // Logged when it ends, deadline or not: what a merge costs here, how
+        // big it was and how much of the budget it used.
+        let signatures: usize = packed
+            .children
+            .iter()
+            .flat_map(|(statements, _)| statements)
+            .map(|statement| statement.pubkeys.len())
+            .sum();
         info!(
             %slot,
+            attestations = packed.attestations.len(),
             children,
+            signatures,
+            proof_bytes = proof.as_ref().map_or(0, Vec::len),
             took_ms = started.elapsed().as_millis() as u64,
+            budget_ms,
             ok = proof.is_ok(),
             "Merged PQ attestation proofs"
         );

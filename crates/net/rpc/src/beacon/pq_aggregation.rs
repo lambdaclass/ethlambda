@@ -73,43 +73,98 @@ async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
         return;
     };
     let deadline = Instant::now() + Duration::from_millis(budget);
+    let committees = groups.len();
+    let signatures: usize = groups.iter().map(|group| group.signatures.len()).sum();
     let store = store.clone();
+    let spawned = Instant::now();
     let job = tokio::task::spawn_blocking(move || {
+        // Time spent waiting for a blocking thread, which comes out of the
+        // budget like the proving does.
+        let queued_ms = spawned.elapsed().as_millis() as u64;
+        let started = Instant::now();
         let state = match head(&store) {
             Ok((_, state)) => state,
-            Err(_) => return,
+            Err(err) => {
+                warn!(%slot, ?err, "Could not read the head state to prove this slot's PQ aggregates");
+                return;
+            }
         };
+        let state_ms = started.elapsed().as_millis() as u64;
         let mut groups = groups;
         // The larger groups first, in case not every one fits before the
         // deadline.
         groups.sort_by_key(|group| std::cmp::Reverse(group.signatures.len()));
+        let (mut proved, mut failed, mut late) = (0usize, 0usize, 0usize);
+        let mut prove_ms_total = 0u64;
         for group in groups {
             if Instant::now() >= deadline {
                 warn!(%slot, "The PQ aggregate deadline passed with committees left to prove");
                 break;
             }
             let committee = group.committee_index;
-            let started = Instant::now();
-            match prove_committee(&store, &state, group) {
-                Ok(aggregate) if Instant::now() < deadline => {
+            let collected = group.signatures.len();
+            let committee_started = Instant::now();
+            let result = prove_committee(&store, &state, group);
+            let took_ms = committee_started.elapsed().as_millis() as u64;
+            match result {
+                Ok((aggregate, prove_ms)) if Instant::now() < deadline => {
+                    proved += 1;
+                    prove_ms_total += prove_ms;
                     info!(
                         %slot,
                         committee,
                         attesters = aggregate.attesting_indices.len(),
                         proof_bytes = aggregate.proof.len(),
-                        took_ms = started.elapsed().as_millis() as u64,
+                        prove_ms,
+                        took_ms,
                         "Proved a PQ aggregate"
                     );
                     store.pq_aggregate_pool().insert((*aggregate).clone());
                     store.pq_signature_pool().insert_proven(aggregate);
                 }
-                Ok(_) => {
-                    warn!(%slot, committee, "A PQ aggregate was proved after its deadline");
+                Ok((aggregate, prove_ms)) => {
+                    late += 1;
+                    prove_ms_total += prove_ms;
+                    warn!(
+                        %slot,
+                        committee,
+                        attesters = aggregate.attesting_indices.len(),
+                        prove_ms,
+                        took_ms,
+                        "A PQ aggregate was proved after its deadline"
+                    );
                     break;
                 }
-                Err(err) => debug!(%slot, committee, %err, "Could not prove a PQ aggregate"),
+                Err(err) => {
+                    failed += 1;
+                    debug!(
+                        %slot,
+                        committee,
+                        signatures = collected,
+                        took_ms,
+                        %err,
+                        "Could not prove a PQ aggregate"
+                    );
+                }
             }
         }
+        // One line for the slot's whole proving pass: what the sidecar was
+        // asked for, what it cost, and what the budget left undone.
+        info!(
+            %slot,
+            committees,
+            signatures,
+            proved,
+            failed,
+            late,
+            unproved = committees - proved - failed - late,
+            queued_ms,
+            state_ms,
+            prove_ms = prove_ms_total,
+            took_ms = started.elapsed().as_millis() as u64,
+            budget_ms = budget,
+            "Finished proving this slot's PQ aggregates"
+        );
     });
     let _ = job.await;
 }
@@ -118,11 +173,14 @@ async fn prove_slot(store: &Store, config: &Config, slot: Slot) {
 /// signatures, over the committee `state` assigns: bits at the attesters'
 /// positions, signatures in committee order, which is the order
 /// `get_attestation_statements` lists their keys in.
+///
+/// Also returns how long the proof itself took, in milliseconds: the rest
+/// of the call is reading the committee and assembling the statements.
 fn prove_committee(
     store: &Store,
     state: &BeaconState,
     group: CommitteeSignatures,
-) -> Result<Arc<PooledPqAggregate>, String> {
+) -> Result<(Arc<PooledPqAggregate>, u64), String> {
     let committees = store.committee_cache();
     let epoch_committees = committees.committees(state, group.data.target.epoch);
     let committee = epoch_committees
@@ -154,20 +212,23 @@ fn prove_committee(
     };
     let statements = get_attestation_statements(state, &attestation, &committees)
         .map_err(|err| err.to_string())?;
+    let proving = Instant::now();
     let proof = ethlambda_state_transition::beacon::helpers::pq::prove_aggregates(
         &statements,
         &[signatures],
     )
     .map_err(|err| err.to_string())?;
+    let prove_ms = proving.elapsed().as_millis() as u64;
     attesting_indices.sort_unstable();
-    Ok(Arc::new(PooledPqAggregate {
+    let aggregate = Arc::new(PooledPqAggregate {
         attestation,
         committee_index: group.committee_index,
         attesting_indices,
         proof: proof
             .try_into()
             .map_err(|_| "the proof exceeds MAX_STARK_PROOF_SIZE".to_string())?,
-    }))
+    });
+    Ok((aggregate, prove_ms))
 }
 
 fn now_ms() -> u64 {
