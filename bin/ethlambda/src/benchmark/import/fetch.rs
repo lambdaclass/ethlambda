@@ -100,7 +100,7 @@ pub(crate) async fn fetch_corpus(
          would be recorded as empty"
     );
 
-    let anchor = resolve_anchor(source, from, preset::SLOTS_PER_EPOCH).await?;
+    let anchor = resolve_anchor(source, from, preset::slots_per_epoch()).await?;
     let created = CreatedDir::create(dir)?;
 
     // The one state this phase holds. Decoded to read the network

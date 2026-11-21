@@ -169,7 +169,7 @@ where
         }
         // The block's own epoch, not the one this node runs on, so a backfill
         // labels each chunk with its own fork.
-        let epoch = block.slot() / preset::SLOTS_PER_EPOCH;
+        let epoch = block.slot() / preset::slots_per_epoch();
         let digest = compute_fork_digest(config, genesis_validators_root, epoch);
         write_success_chunk(io, label, &digest, encoded).await?;
     }
@@ -211,7 +211,7 @@ where
     read_chunked_response(io, protocol_label, limits, |context, payload| {
         let block = decode::decode_block(config, payload)
             .map_err(|err| invalid(format!("beacon block chunk: {err}")))?;
-        let epoch = block.slot() / preset::SLOTS_PER_EPOCH;
+        let epoch = block.slot() / preset::slots_per_epoch();
         let expected = compute_fork_digest(config, genesis_validators_root, epoch);
         if context != expected {
             warn!(
@@ -264,7 +264,7 @@ where
         }
         // The sidecar's own epoch rather than the one this node runs on, so a
         // backfill labels each chunk with its own fork.
-        let epoch = sidecar.slot() / preset::SLOTS_PER_EPOCH;
+        let epoch = sidecar.slot() / preset::slots_per_epoch();
         let digest = compute_fork_digest(config, genesis_validators_root, epoch);
         write_success_chunk(io, label, &digest, encoded).await?;
     }
@@ -318,7 +318,7 @@ where
         let sidecar = decode::decode_data_column_sidecar(fork, payload)
             .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
         let slot = sidecar.slot();
-        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
+        let expected = schedule.digest_at(slot / preset::slots_per_epoch());
         if context != expected {
             warn!(
                 slot,
@@ -371,7 +371,7 @@ where
         let digest = compute_fork_digest(
             config,
             genesis_validators_root,
-            slot / preset::SLOTS_PER_EPOCH,
+            slot / preset::slots_per_epoch(),
         );
         write_success_chunk(io, label, &digest, encoded).await?;
     }
@@ -421,7 +421,7 @@ where
         let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
             .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
         let slot = envelope.message.payload.slot_number;
-        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
+        let expected = schedule.digest_at(slot / preset::slots_per_epoch());
         if context != expected {
             warn!(
                 slot,

@@ -80,11 +80,11 @@ fn random_state(rng: &mut SplitMix64, fork: ForkName) -> BeaconState {
     // A non-zero offset lets the block root lookups for the current epoch
     // succeed; zero exercises their error.
     let offset = if rng.chance(90) {
-        1 + rng.below(preset::SLOTS_PER_EPOCH - 1)
+        1 + rng.below(preset::slots_per_epoch() - 1)
     } else {
         0
     };
-    *state.slot_mut() = epoch * preset::SLOTS_PER_EPOCH + offset;
+    *state.slot_mut() = epoch * preset::slots_per_epoch() + offset;
 
     let extreme = rng.chance(15);
     let participation_density = rng.pick(&[0, 30, 70, 95, 100]);

@@ -74,7 +74,7 @@ pub fn compute_subnet_for_attestation(
     committee_index: CommitteeIndex,
     config: &Config,
 ) -> u64 {
-    let slots_since_epoch_start = slot % preset::SLOTS_PER_EPOCH;
+    let slots_since_epoch_start = slot % preset::slots_per_epoch();
     let committees_since_epoch_start = committees_per_slot.saturating_mul(slots_since_epoch_start);
     committees_since_epoch_start.saturating_add(committee_index) % config.attestation_subnet_count
 }
@@ -368,7 +368,7 @@ mod tests {
         // 64 committees per slot at slot 1 is 64 committees since the epoch
         // began, which wraps to 0.
         assert_eq!(compute_subnet_for_attestation(count, 1, 0, &config), 0);
-        for slot in 0..preset::SLOTS_PER_EPOCH {
+        for slot in 0..preset::slots_per_epoch() {
             for index in 0..4 {
                 assert!(compute_subnet_for_attestation(4, slot, index, &config) < count);
             }

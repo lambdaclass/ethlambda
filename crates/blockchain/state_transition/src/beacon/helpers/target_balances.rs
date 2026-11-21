@@ -289,7 +289,7 @@ mod tests {
         let block = |proposer_slashings| {
             SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
                 message: gloas::BeaconBlock {
-                    slot: 5 * preset::SLOTS_PER_EPOCH + 3,
+                    slot: 5 * preset::slots_per_epoch() + 3,
                     parent_root: parent,
                     body: gloas::BeaconBlockBody {
                         proposer_slashings,

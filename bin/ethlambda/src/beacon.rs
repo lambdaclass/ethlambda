@@ -38,12 +38,12 @@ use tracing::{info, warn};
 /// Before genesis this is 0 rather than an error: a node started early should
 /// pick the genesis fork's topics and wait, not refuse to boot.
 pub fn epoch_at(config: &Config, genesis_time: u64, now: u64) -> Epoch {
-    now.saturating_sub(genesis_time) / (config.seconds_per_slot * preset::SLOTS_PER_EPOCH)
+    now.saturating_sub(genesis_time) / (config.seconds_per_slot * preset::slots_per_epoch())
 }
 
 /// The wall-clock second `epoch` begins at.
 pub fn time_at_epoch(config: &Config, genesis_time: u64, epoch: Epoch) -> u64 {
-    genesis_time + epoch * config.seconds_per_slot * preset::SLOTS_PER_EPOCH
+    genesis_time + epoch * config.seconds_per_slot * preset::slots_per_epoch()
 }
 
 /// The `eth2` ENR entry for this chain at this epoch, from the same schedule
@@ -87,7 +87,7 @@ impl Genesis {
 ///
 /// The fork is `Phase0` because this is *genesis*, not the current head: the
 /// state predates altair by definition, whatever fork the chain is on now.
-/// A build with `ethlambda-types/preset-minimal` on fails here: the minimal
+/// A process running the minimal preset fails here: the minimal
 /// preset shortens the state's fixed-size vectors, so mainnet's encoding no
 /// longer fits the container.
 #[cfg(test)]
@@ -381,7 +381,7 @@ mod tests {
             0
         );
         // One epoch is SLOTS_PER_EPOCH slots of seconds_per_slot each.
-        let one_epoch = config.seconds_per_slot * preset::SLOTS_PER_EPOCH;
+        let one_epoch = config.seconds_per_slot * preset::slots_per_epoch();
         assert_eq!(
             epoch_at(
                 &config,

@@ -243,6 +243,7 @@ samples nothing and publishes no series here.
 | `lean_peers_by_direction` | Gauge | Connected peers by the direction the connection was opened in | On every connection established and closed | direction=inbound,outbound |
 | `lean_swarm_established_connections` | Gauge | Established connections as libp2p itself counts them | On the swarm's own metric tick | direction=inbound,outbound |
 | `lean_custody_column_peers` | Gauge | Connected peers known to custody each data column this node samples | On every connection established and closed, and whenever a peer's custody is recorded from its `metadata/3` answer or its ENR `cgc` | column=`<index>` |
+| `lean_sync_peers_held_back` | Gauge | Peers whose `Status` head does not count towards the sync gate's network head: suspects (range blocks that never imported, or range requests that kept failing) peers cooling down from a failed range request, and connected peers whose latest `Status` head sat past the wall clock (each peer under one reason). Suspects and cooling peers include peers since disconnected, whose history outlives the connection. A count that keeps climbing while the node reads as syncing is fresh identities claiming a lead; `future` for most connected peers points at this node's own clock running slow | On every publish of the network head, at least once a slot | reason=suspect,cooling,future |
 
 ### Block Import Timing
 
@@ -428,7 +429,15 @@ it; of the gloas topics only `execution_payload` answers it, for an envelope
 whose block is not known yet (`block_unknown`), has no post-state yet
 (`block_not_ready`), or has one that is not in the cache the checks read
 (`state_not_cached`, as when the block was imported moments ago; the actor
-verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+verifies the signature itself, so the envelope is forwarded rather than dropped).
+`beacon_block` answers `queue` for an unknown parent (`parent_unknown`), a
+parent without a cached post-state (`parent_not_ready`), a slot past the parent
+state's lookahead (`shuffling_unavailable`) and, from gloas, a block built on
+its parent's FULL payload before the parent's envelope is verified
+(`parent_payload_unverified`): the chain actor holds that block until the
+envelope verifies. When the execution client has found that parent's payload
+invalid, nothing will verify it, and the block is ignored instead
+(`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
 topics never answer `queue`, since the vote
 block's post-state is either cached or it is not
@@ -757,6 +766,19 @@ spec.
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
+| `lean_engine_get_blobs_total` | Counter | `engine_getBlobsV2` attempts for held fulu blocks, by outcome | On each answer of the one attempt made at a block's first hold | outcome=hit,miss,error | |
+| `lean_engine_get_blobs_skipped_total` | Counter | Held fulu blocks not asked about because the ask budget was spent | On a hold that would otherwise ask, before its precheck | reason=slot_budget,in_flight | |
+| `lean_engine_get_blobs_duration_seconds` | Histogram | Time for one `engine_getBlobsV2` round trip | On each attempt, whatever its outcome | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_engine_blobs_to_columns_seconds` | Histogram | Time to build custody data column sidecars from execution-client blobs | On each build that reaches the cell computation, off the actor thread | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0 |
+| `lean_engine_blob_columns_refused_total` | Counter | Data columns built from execution-client blobs that the chain checks refused, so neither published nor stored | On each built column refused, once; a column another route stored meanwhile is not counted | reason=kzg,wrong_proposer,inclusion_proof,... (the refusing rule's label) | |
+| `lean_data_columns_from_execution_layer_total` | Counter | Data column sidecars built from the execution client's blobs, by what p2p did with them | On each hand-over, once per result, incremented by the column count | result=published,no_digest,already_seen,not_custody | |
+
+`lean_engine_get_blobs_total` and its siblings cover the execution-client path
+(`docs/beacon_engine.md`, "Blobs from the execution client"). A high `miss`
+share means the execution client's blob pool lacks the blobs, which is normal
+for a syncing execution client; `already_seen` in
+`lean_data_columns_from_execution_layer_total` counts columns gossip delivered
+first.
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a

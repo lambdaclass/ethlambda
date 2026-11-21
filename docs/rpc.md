@@ -243,7 +243,7 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 { "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
 ```
 
-`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+`is_syncing` is the node's own stateful sync decision, updated each tick and after each block arrival: true while the head trails the wall clock and the head the node's peers report in `Status` is ahead of it, with hysteresis. With no peer ahead (a stalled network, or no peers, including right after startup before any peer has reported) it is false. It is also false once peers have claimed a lead for a whole stall window in all (`SyncThresholds::LEAN.stall_window`, 16 slots) while the head stayed flat, until the head next advances, and a peer that has just failed to serve a range request does not count towards the lead while it cools down. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
 
 `sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
@@ -845,7 +845,15 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
   under a fulu head, is answered from a copy of the head state advanced to the
   epoch's first slot, crossing the gloas upgrade where it falls, on a blocking
   thread. A gloas epoch more than one before the head state's is a `400`.
-  `dependent_root` is defined as for attester duties. There is no `503`.
+  The gloas fork epoch is a `400` until its first slot has started by the wall
+  clock, allowing `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms), while the head is
+  still before it: its committee is computed at the fork from the effective
+  balances the last pre-gloas epoch ends with, so it can change until then
+  (Lighthouse refuses it the same way). `dependent_root` is defined as for
+  attester duties, except for the fork epoch, whose root is the block root at
+  the last slot before the fork (the genesis block's when gloas starts at
+  genesis).
+  There is no `503`.
 - **`GET /eth/v1/validator/payload_attestation_data?slot=`** answers
   `{version: "gloas", data: {beacon_block_root, slot, payload_present,
   blob_data_available}}` as JSON, or the SSZ `PayloadAttestationData` on
@@ -967,7 +975,7 @@ with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
-One flat object holding the network's configuration, the compiled preset, and
+One flat object holding the network's configuration, the active preset's values, and
 the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.

@@ -42,17 +42,19 @@ pub enum Error {
          wipe the data directory and resync"
     )]
     DbVersionMismatch { found: u64, expected: u64 },
-    /// The data directory was written by a build compiled against the other
-    /// SSZ preset. Every container bound is a compile-time constant, so the
-    /// states already written have a different shape than this build would
+    /// The data directory was written by a process running the other SSZ
+    /// preset. The preset sets every preset-sized container bound, so the
+    /// states already written have a different shape than this process would
     /// give them, and their hash tree roots differ too. There is no migration
     /// for the same reason there is none for [`Error::DbVersionMismatch`].
+    /// In practice this is a data directory reused across networks: the
+    /// preset follows the network's `PRESET_BASE`.
     ///
     /// `found` is `None` for a directory written before the preset was
     /// recorded, or carrying a selector byte this build does not know.
     #[error(
-        "data directory was written against the {} preset, this build is {expected}; \
-         wipe the data directory or rebuild against that preset",
+        "data directory was written for the {} preset, but this network runs {expected}; \
+         wipe the data directory or point --data-dir at one for this network",
         .found.unwrap_or("unknown")
     )]
     PresetMismatch {

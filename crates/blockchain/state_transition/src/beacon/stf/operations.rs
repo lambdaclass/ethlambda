@@ -439,7 +439,7 @@ pub fn process_attestation(
         ))?;
     let max_slot = data
         .slot
-        .checked_add(preset::SLOTS_PER_EPOCH)
+        .checked_add(preset::slots_per_epoch())
         .ok_or(Error::ArithmeticOverflow("data.slot + SLOTS_PER_EPOCH"))?;
     verify(
         min_slot <= state.slot() && state.slot() <= max_slot,
@@ -818,7 +818,7 @@ mod tests {
 
         let target_epoch = 1;
         let data_1 = AttestationData {
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             index: 0,
             beacon_block_root: Root::repeat_byte(1),
             source: Checkpoint::default(),

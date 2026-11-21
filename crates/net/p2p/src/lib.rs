@@ -27,19 +27,22 @@ pub mod muxers {
 }
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     fmt, io,
     net::{IpAddr, SocketAddr},
     num::{NonZeroU8, NonZeroUsize},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use either::Either;
 use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
-    P2PToBlockChainRef, PeerDirection, PeerTableController,
+    P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
@@ -52,7 +55,7 @@ use ethlambda_network_api::{
         SubscribeSyncCommitteeSubnets,
     },
 };
-use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::aggregate::max_aggregates_per_slot;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlockColumns, SeenBlocks, SeenColumns,
     aggregate::SeenAggregates,
@@ -67,8 +70,9 @@ use ethlambda_state_transition::beacon::{
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
-use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
+use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, slots_per_epoch};
 use ethlambda_types::primitives::H256;
+use ethlambda_types::time::unix_now_ms;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
@@ -102,7 +106,7 @@ use crate::{
         publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
         publish_beacon_block, publish_beacon_operation, publish_block,
     },
-    lean::protocols::MAX_REQUEST_BLOCKS,
+    lean::{messages::Status, protocols::MAX_REQUEST_BLOCKS},
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
         fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
@@ -116,6 +120,7 @@ pub mod discovery;
 mod gossipsub;
 pub mod lean;
 pub mod metrics;
+mod peer_heads;
 mod req_resp;
 pub(crate) mod swarm_adapter;
 
@@ -229,6 +234,23 @@ const DIAL_ADDRESS_CONCURRENCY: NonZeroU8 = NonZeroU8::new(1).expect("1 > 0");
 
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 
+// `status_sync_target` measures a refresh's lead on a target this caps, so a
+// cap at or under a chain's peer lead would stop refreshes from ever
+// starting a range sync on it.
+const _: () = assert!(
+    MAX_SYNC_RANGE > ethlambda_network_api::sync::SyncThresholds::LEAN.peer_lead
+        && MAX_SYNC_RANGE
+            > ethlambda_network_api::sync::SyncThresholds::beacon_for(
+                ethlambda_types::beacon::preset::mainnet::SLOTS_PER_EPOCH,
+            )
+            .peer_lead
+        && MAX_SYNC_RANGE
+            > ethlambda_network_api::sync::SyncThresholds::beacon_for(
+                ethlambda_types::beacon::preset::minimal::SLOTS_PER_EPOCH,
+            )
+            .peer_lead
+);
+
 /// How many beacon gossip messages may be in stateful validation at once. A
 /// message arriving with none free is ignored rather than queued. Revisit once
 /// `lean_beacon_gossip_validation_seconds` has data from a follower.
@@ -324,8 +346,10 @@ const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096)
 /// never asked about again; sizing for two epochs of that per-slot bound is
 /// generous headroom rather than a tight derivation, in the same spirit
 /// [`SEEN_BLOCKS_CAPACITY`] and [`SEEN_COLUMNS_CAPACITY`] are sized in.
-const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
-    NonZeroUsize::new((MAX_AGGREGATES_PER_SLOT * SLOTS_PER_EPOCH * 2) as usize).expect("non-zero");
+fn seen_aggregates_capacity() -> NonZeroUsize {
+    NonZeroUsize::new((max_aggregates_per_slot() * slots_per_epoch() * 2) as usize)
+        .expect("non-zero")
+}
 
 /// Capacity of the accepted-attestation cache, keyed by `(target_epoch,
 /// attester_index)`, for a node relaying `backbone_subnets` attestation
@@ -357,7 +381,7 @@ const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
 /// so this bound costs memory only under that load.
 fn seen_attestations_capacity(backbone_subnets: usize) -> NonZeroUsize {
     let subnets = backbone_subnets.max(1);
-    let capacity = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
+    let capacity = 2 * slots_per_epoch() as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
     NonZeroUsize::new(capacity).expect("positive factors give a positive capacity")
 }
 
@@ -488,6 +512,9 @@ pub(crate) enum PendingRequestKind {
     EnvelopeRange {
         start_slot: u64,
         end_slot: u64,
+        /// The range session that asked, whose gate the answer (or its
+        /// failure) releases; see [`RangeSyncState::id`].
+        session: Option<u64>,
     },
 }
 
@@ -542,7 +569,278 @@ pub struct ReqRespRequestId {
     pub id: OutboundRequestId,
 }
 
+/// How long the store's head has stayed where it is while blocks were being
+/// handed over above it, as the once-a-slot refresh timer sees it; see
+/// [`P2PServer::expire_range_watermark`].
+#[derive(Debug, Default)]
+pub(crate) struct HeadWatch {
+    /// The head slot last seen, and the wall-clock slot it was first seen at.
+    seen: Option<(u64, u64)>,
+    /// The wall-clock slot of the first tick, since the head last moved, that
+    /// saw blocks being handed over. Later deliveries do not move it: blocks
+    /// that a whole window of deliveries has not moved the head with are not
+    /// importing, however many more keep coming.
+    delivering_since: Option<u64>,
+    /// The peers that handed blocks over, each with the last slot of every
+    /// batch the head has not reached yet (the most recent
+    /// [`Self::MAX_TRACKED_BATCHES`]).
+    deliverers: HashMap<PeerId, VecDeque<u64>>,
+    /// Watermark drops at the current head, each of which doubles the wait
+    /// before the next one.
+    drops: u32,
+    /// The watermark as the last tick saw it. A watermark that has moved
+    /// since means blocks were handed over, by a range session the once-a-slot
+    /// tick may never have seen running.
+    watermark: u64,
+    /// The wall-clock slot of the last [`Self::flat_for`], to tell a tick
+    /// from a resume after the process was not running, or from a wall clock
+    /// stepped back.
+    ticked_at: Option<u64>,
+    /// The batch handed over last, when its blocks stopped short of the end
+    /// it was asked for; see [`Self::note_delivery`].
+    short_tail: Option<ShortTail>,
+}
+
+/// A batch whose last block handed over sits below the end it was asked for:
+/// either the chain has no block in the slots between (missed slots), or its
+/// sender withheld them. The next batch's first block tells which.
+#[derive(Debug, Clone, Copy)]
+struct ShortTail {
+    peer: PeerId,
+    /// The last slot the batch was asked for, which its sender answers for.
+    end: u64,
+    /// The last block it handed over.
+    last: BatchBlock,
+}
+
+/// A block at one edge of a range batch, as [`HeadWatch::note_delivery`]
+/// links batches by.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BatchBlock {
+    pub(crate) slot: u64,
+    /// Its own root for the batch's last block; its parent's for the first.
+    pub(crate) root: H256,
+}
+
+impl HeadWatch {
+    /// Most doublings of the wait: 16 windows, about 17 minutes on lean and
+    /// under two hours on beacon.
+    const MAX_BACKOFF: u32 = 4;
+
+    /// Batches kept per deliverer; older ones are forgotten.
+    const MAX_TRACKED_BATCHES: usize = 16;
+
+    /// Most wall-clock slots one tick counts. The timer ticks once a slot, so
+    /// a longer gap is time the process was not running (a `docker pause`, a
+    /// host suspend): the chain actor imported nothing then either, and a
+    /// resume must not find the head flat for longer than it was watched.
+    const MAX_TICK_STEP: u64 = 2;
+
+    /// Note the head at `wall_slot`, and whether blocks are being handed over,
+    /// returning how many slots it has stayed at `head_slot` since the first
+    /// delivery after it last moved (since it moved, with none). Zero
+    /// whenever it has just moved, in either direction. A gap since the last
+    /// call counts as [`Self::MAX_TICK_STEP`] slots at most, and a wall clock
+    /// stepped back since counts nothing.
+    pub(crate) fn flat_for(&mut self, head_slot: u64, wall_slot: u64, delivering: bool) -> u64 {
+        // Slots not watched are not counted: the starts move forward by them.
+        // A wall clock stepped back (one that ran ahead, corrected) moves them
+        // back by the step, or the count would stop until the clock passed
+        // them again.
+        if let Some(ticked_at) = self.ticked_at.replace(wall_slot) {
+            let unwatched = wall_slot
+                .saturating_sub(ticked_at)
+                .saturating_sub(Self::MAX_TICK_STEP);
+            let stepped_back = ticked_at.saturating_sub(wall_slot);
+            for since in self
+                .seen
+                .as_mut()
+                .map(|(_, since)| since)
+                .into_iter()
+                .chain(self.delivering_since.as_mut())
+            {
+                *since = since.saturating_add(unwatched).saturating_sub(stepped_back);
+            }
+        }
+        if self.seen.is_none_or(|(slot, _)| slot != head_slot) {
+            self.seen = Some((head_slot, wall_slot));
+            self.delivering_since = None;
+            // A peer whose blocks the head has not reached yet is still
+            // answerable for them: a valid prefix that moved the head must
+            // not clear the invalid rest.
+            self.deliverers.retain(|_, ends| {
+                ends.retain(|end| *end > head_slot);
+                !ends.is_empty()
+            });
+            self.drops = 0;
+        }
+        if delivering {
+            self.delivering_since.get_or_insert(wall_slot);
+        }
+        let since = self
+            .delivering_since
+            .or(self.seen.map(|(_, since)| since))
+            .unwrap_or(wall_slot);
+        wall_slot.saturating_sub(since)
+    }
+
+    /// Forget every delivery, held against nobody: what was handed over is
+    /// off the chain the head now follows.
+    pub(crate) fn forget_deliveries(&mut self) {
+        self.deliverers.clear();
+        self.delivering_since = None;
+        self.short_tail = None;
+    }
+
+    /// Forget when deliveries started, nothing being above the head.
+    pub(crate) fn clear_delivery(&mut self) {
+        self.delivering_since = None;
+    }
+
+    /// The head slot last seen.
+    pub(crate) fn last_head(&self) -> Option<u64> {
+        self.seen.map(|(head_slot, _)| head_slot)
+    }
+
+    /// The deliverers the head at `head_slot` has reached a batch of: they
+    /// served what they claimed, whatever else of theirs is still queued.
+    /// Batches reached are forgotten.
+    pub(crate) fn reached(&mut self, head_slot: u64) -> Vec<PeerId> {
+        let mut reached = Vec::new();
+        self.deliverers.retain(|peer, ends| {
+            let before = ends.len();
+            ends.retain(|end| *end > head_slot);
+            if ends.len() != before {
+                reached.push(*peer);
+            }
+            !ends.is_empty()
+        });
+        reached
+    }
+
+    /// Note that `peer` handed over a batch it was asked for through slot
+    /// `end`. Over the cap, a batch end is forgotten, never the lowest (which
+    /// a drop blames by) or the highest (which a suspicion runs through).
+    ///
+    /// A batch is held to the end it was asked for, not to its last block:
+    /// one cut short of a real gap is what the batches above it fail to
+    /// connect through. But a batch whose tail is empty on the chain (missed
+    /// slots) would then wait for the head to pass blocks that do not exist,
+    /// and take the blame for the next batch if that one never imports. The
+    /// next batch tells the two apart: when its first block sits past the
+    /// short batch's end and names the short batch's last block as its parent,
+    /// the slots between are empty on that chain, and the short batch is held
+    /// only to its last block.
+    ///
+    /// The link is the upper batch's sender's word: it chooses the parent its
+    /// first block names. A match only ever credits the peer below, so a liar
+    /// gains nothing by faking one. A mismatch leaves the peer below held to
+    /// its requested end, so a liar above an honest short batch can still push
+    /// a drop's blame down onto it by naming a parent it never delivered.
+    /// Holding both senders on a mismatch would close that, but blames an
+    /// honest upper peer whenever the batch below is the bad one, which is
+    /// the case the lowest-batch rule exists for.
+    ///
+    /// `first` is the batch's lowest block, with its parent's root;
+    /// `short_tail` its highest block handed over, with its own root, when
+    /// that sits below `end` (`None` otherwise).
+    pub(crate) fn note_delivery(
+        &mut self,
+        peer: PeerId,
+        end: u64,
+        first: BatchBlock,
+        short_tail: Option<BatchBlock>,
+    ) {
+        if let Some(below) = self.short_tail.take()
+            && first.slot > below.end
+            && first.root == below.last.root
+            && let Some(ends) = self.deliverers.get_mut(&below.peer)
+            && let Some(held_to) = ends.iter_mut().find(|held_to| **held_to == below.end)
+        {
+            *held_to = below.last.slot;
+        }
+        self.short_tail = short_tail
+            .filter(|last| last.slot < end)
+            .map(|last| ShortTail { peer, end, last });
+        let ends = self.deliverers.entry(peer).or_default();
+        ends.push_back(end);
+        if ends.len() > Self::MAX_TRACKED_BATCHES {
+            // One copy of the lowest and one of the highest stay, whatever
+            // order the ends came in: the one at index 1 may be the only copy
+            // of either.
+            let lowest = ends.iter().copied().min();
+            let highest = ends.iter().copied().max();
+            let kept_lowest = ends.iter().position(|end| Some(*end) == lowest);
+            let kept_highest = ends.iter().rposition(|end| Some(*end) == highest);
+            let forgettable = (0..ends.len())
+                .find(|index| Some(*index) != kept_lowest && Some(*index) != kept_highest);
+            // Over the cap there are more than two ends, so one is found.
+            ends.remove(forgettable.unwrap_or(1));
+        }
+    }
+
+    /// [`Self::note_delivery`] for a batch whose last block sits at its end,
+    /// linking to no batch below it.
+    #[cfg(test)]
+    pub(crate) fn note_whole_batch(&mut self, peer: PeerId, end: u64) {
+        let first = BatchBlock {
+            slot: end,
+            root: H256::ZERO,
+        };
+        self.note_delivery(peer, end, first, None);
+    }
+
+    /// How long the head must stay flat before the next drop: `window`,
+    /// doubled for every drop already made at this head.
+    pub(crate) fn patience(&self, window: u64) -> u64 {
+        window.saturating_mul(1 << self.drops.min(Self::MAX_BACKOFF))
+    }
+
+    /// Note `watermark`, returning whether it has moved since the last call.
+    pub(crate) fn watermark_moved(&mut self, watermark: u64) -> bool {
+        std::mem::replace(&mut self.watermark, watermark) != watermark
+    }
+
+    /// Note a drop of the watermark to `head_slot` at `wall_slot`, starting
+    /// the count over, and return the peers to blame, each with the highest
+    /// slot it handed over: those that handed over the lowest batch the head
+    /// never reached. Batches above it could not connect without it, so
+    /// their senders are forgotten, held against no one.
+    pub(crate) fn note_drop(&mut self, head_slot: u64, wall_slot: u64) -> Vec<(PeerId, u64)> {
+        self.seen = Some((head_slot, wall_slot));
+        self.delivering_since = None;
+        self.short_tail = None;
+        self.watermark = head_slot;
+        self.drops = self.drops.saturating_add(1);
+        let lowest = self.deliverers.values().flatten().copied().min();
+        self.deliverers
+            .drain()
+            .filter(|(_, ends)| ends.iter().copied().min() == lowest)
+            .filter_map(|(peer, ends)| Some((peer, ends.into_iter().max()?)))
+            .collect()
+    }
+}
+
+/// What a cached beacon `Status` was built from (see
+/// [`P2PServer::beacon_status_v2`]), all of it read without the head block.
+/// Nothing else in a `Status` can change under it: the fork digest is
+/// compared off the `Status` itself, and `earliest_available_slot` is the
+/// store's anchor, fixed for its life (a backfill that moved it would need
+/// it here).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatusKey {
+    wall_slot: u64,
+    head: Option<H256>,
+    finalized: Option<ethlambda_types::checkpoint::Checkpoint>,
+}
+
+/// The next [`RangeSyncState::id`].
+static NEXT_RANGE_SESSION: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct RangeSyncState {
+    /// This session's identity, carried by what is scheduled for it, so that
+    /// something outliving the session is not taken for a later one's.
+    pub(crate) id: u64,
     /// Remaining slots to request, with an exclusive end.
     pub(crate) current_range: Range<u64>,
     /// Latest advertised head slot for each peer.
@@ -577,6 +875,7 @@ pub(crate) enum CustodyWait {
 impl RangeSyncState {
     pub(crate) fn new(current_range: Range<u64>, peer: PeerId, peer_head: u64) -> Self {
         Self {
+            id: NEXT_RANGE_SESSION.fetch_add(1, Ordering::Relaxed),
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
@@ -1273,7 +1572,8 @@ impl P2P {
 
         // Seeded from the anchor the store was bootstrapped at, so the first
         // range request starts where the chain does rather than at slot 0.
-        let beacon_fetched_through = match store.chain() {
+        // Lean reads its head beside it, which is the same floor.
+        let range_fetched_through = match store.chain() {
             Chain::Beacon => store.beacon_head().map_or(0, |(slot, _)| slot),
             Chain::Lean => 0,
         };
@@ -1288,6 +1588,7 @@ impl P2P {
             .beacon()
             .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
+        let first_status_refresh = status_refresh_tick(&store);
         let peer_table = PeerTableController::default();
 
         let server = P2PServer {
@@ -1303,20 +1604,26 @@ impl P2P {
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
-            beacon_fetched_through,
+            range_fetched_through,
+            beacon_status: None,
+            head_watch: HeadWatch::default(),
+            peer_heads: Default::default(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            engine_published_columns: beacon::engine_columns::PublishedColumns::new(
+                SEEN_COLUMNS_CAPACITY,
+            ),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
             seen_payload_attestations: SeenPayloadAttestations::new(
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
             ),
             seen_aggregates: SeenAggregates::new(
-                SEEN_AGGREGATES_CAPACITY,
-                SEEN_AGGREGATES_CAPACITY,
+                seen_aggregates_capacity(),
+                seen_aggregates_capacity(),
             ),
             seen_attestations: SeenAttestations::new(seen_attestations_capacity(
                 backbone_attestation_subnets,
@@ -1361,6 +1668,13 @@ impl P2P {
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        // The refresh timer's first tick. A peer is first due an interval
+        // after its handshake, which `peer_heads` tracks per peer.
+        send_after(
+            first_status_refresh,
+            handle.context(),
+            p2p_protocol::RefreshPeerStatus,
         );
         // The dial loop's first tick. Nothing else schedules one, so without
         // discovery the loop never runs.
@@ -1471,10 +1785,21 @@ pub struct P2PServer {
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
-    /// Highest beacon slot a range answer has handed to the chain actor,
-    /// whether or not it has been imported yet. Gossip never advances it, so
-    /// range sync reads it beside the store's head; see `beacon_sync_target`.
-    pub(crate) beacon_fetched_through: u64,
+    /// Highest slot a range answer has handed to the chain actor, whether or
+    /// not it has been imported yet, on either chain. Gossip never advances
+    /// it, so range sync reads it beside the store's head; see
+    /// `range_sync_target`. Dropped back to the head when the blocks above
+    /// the head never import; see [`Self::expire_range_watermark`].
+    pub(crate) range_fetched_through: u64,
+    /// This node's beacon `Status` (v2), with what it was built from; see
+    /// [`Self::beacon_status_v2`].
+    pub(crate) beacon_status: Option<(StatusKey, beacon::messages::StatusV2)>,
+    /// How long the store's head has stayed put, for
+    /// [`Self::expire_range_watermark`].
+    pub(crate) head_watch: HeadWatch,
+    /// Every connected peer's latest `Status` head, published on
+    /// `Store::network_head` for the sync tracker. See [`peer_heads`].
+    pub(crate) peer_heads: peer_heads::PeerHeads,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
@@ -1487,6 +1812,10 @@ pub struct P2PServer {
     /// The first valid sidecar per `(slot, proposer, index)` accepted from
     /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
     pub(crate) seen_columns: SeenColumns,
+    /// Gossipsub message ids of the columns the execution-layer path
+    /// published, so a gossip copy of one that was still in validation keeps
+    /// its `Accept`. See [`beacon::engine_columns::PublishedColumns`].
+    pub(crate) engine_published_columns: beacon::engine_columns::PublishedColumns,
     /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
     /// per `(block root, index)`, since a gloas sidecar names no proposer.
     pub(crate) seen_block_columns: SeenBlockColumns,
@@ -1683,7 +2012,7 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
-    fn resume_range_after_envelopes(&self) -> Result<(), ActorError>;
+    fn resume_range_after_envelopes(&self, session: u64) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -1698,6 +2027,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
+    /// Re-ask the connected peers that are due for their `Status`; see
+    /// [`peer_heads`].
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_peer_status(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1723,13 +2056,17 @@ impl P2PServer {
         }
     }
 
+    /// A range answer's envelopes are checked and forwarded. The check runs
+    /// on its own task, so the session that asked for them may have ended
+    /// meanwhile (`end_range_session`), and a later one may be waiting on
+    /// envelopes of its own, which this must not release.
     #[send_handler]
     async fn handle_resume_range_after_envelopes(
         &mut self,
-        _msg: p2p_protocol::ResumeRangeAfterEnvelopes,
+        msg: p2p_protocol::ResumeRangeAfterEnvelopes,
         ctx: &Context<Self>,
     ) {
-        req_resp::handlers::release_envelope_gate(self, ctx).await;
+        req_resp::handlers::release_envelope_gate(self, ctx, Some(msg.session)).await;
     }
 
     #[send_handler]
@@ -1866,8 +2203,30 @@ impl P2PServer {
         beacon::scoring::refresh(self);
     }
 
+    /// Re-ask the connected peers whose `Status` is an interval old, so the
+    /// head each one reported at the handshake does not go stale while it
+    /// stays connected. Ticks every slot and asks only that slot's share of
+    /// the peers, so the requests are spread over the interval rather than
+    /// sent to every peer at once. Both chains; see [`peer_heads`] for the
+    /// pace.
+    #[send_handler]
+    async fn handle_refresh_peer_status(
+        &mut self,
+        _msg: p2p_protocol::RefreshPeerStatus,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            status_refresh_tick(&self.store),
+            ctx.clone(),
+            p2p_protocol::RefreshPeerStatus,
+        );
+        self.refresh_due_peer_statuses().await;
+    }
+
     /// The deadline of a range batch held back for custody. Scheduled once,
-    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`]. One
+    /// that outlives its session only re-checks: a later session's batch
+    /// waits from its own start (`RangeSyncState::wait_for_custody`).
     #[send_handler]
     async fn handle_retry_beacon_range_batch(
         &mut self,
@@ -1985,11 +2344,18 @@ impl Handler<FetchBlock> for P2PServer {
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
     async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
-        beacon::column_checks::check_and_forward(
-            self,
-            msg.sidecars,
-            beacon::column_checks::ColumnArrival::Recheck,
-        );
+        match msg.origin {
+            // Parked sidecars handed back once their block imported: their
+            // arrival was recorded when they were parked.
+            SidecarOrigin::Parked => beacon::column_checks::check_and_forward(
+                self,
+                msg.sidecars,
+                beacon::column_checks::ColumnArrival::Recheck,
+            ),
+            SidecarOrigin::ExecutionLayer => {
+                beacon::engine_columns::publish_and_forward(self, msg.sidecars)
+            }
+        }
     }
 }
 
@@ -2077,6 +2443,278 @@ async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns
 
 // --- Manual Handler for swarm events ---
 
+/// The slot the wall clock is in, on the store's time grid. Zero before
+/// genesis.
+///
+/// The one p2p-wide answer: the builder market's gossip verdicts and the
+/// peer-head tracker all read "now" through it. [`beacon::BeaconWire::wall_slot`]
+/// is the same formula off the wire's copy of the config, for code that holds
+/// a wire rather than a store.
+pub(crate) fn wall_clock_slot(store: &Store) -> u64 {
+    let grid = store.config().time_grid();
+    unix_now_ms().saturating_sub(grid.genesis_time_ms()) / grid.milliseconds_per_slot.max(1)
+}
+
+/// The refresh timer's period: one slot, each tick asking that slot's share
+/// of the peers that are due.
+fn status_refresh_tick(store: &Store) -> Duration {
+    // The same slot length `wall_clock_slot` divides by, floored the same way.
+    Duration::from_millis(store.config().time_grid().milliseconds_per_slot.max(1))
+}
+
+/// The `Status` the periodic refresh sends, built once per refresh tick
+/// however many peers it asks: on beacon, building one decodes the head
+/// block.
+enum RefreshStatus {
+    Lean(Status),
+    /// Built in v2, the superset; a peer that speaks only v1 gets it with
+    /// `earliest_available_slot` dropped.
+    Beacon(beacon::messages::StatusV2),
+}
+
+impl RefreshStatus {
+    fn build(server: &mut P2PServer) -> Self {
+        match server.beacon_status_v2() {
+            Some(status) => Self::Beacon(status),
+            None => Self::Lean(build_status(&server.store)),
+        }
+    }
+}
+
+impl P2PServer {
+    /// The head slot: as the chain actor last published it
+    /// (`Store::judged_head_slot`), or read from the head while it publishes
+    /// none (before its first judgment, and while a beacon head names no
+    /// stored block yet). On beacon, reading the head decodes the whole head
+    /// block. The actor publishes it on every judgment, including once a
+    /// wall-clock slot within a long import cascade, so a cascade still
+    /// importing does not read here as a flat head.
+    ///
+    /// Read by the watermark expiry (both chains) and the beacon `Status`
+    /// handlers. Lean's own `Status` handling reads `Store::head_slot` instead,
+    /// a header read, to size its range requests on the head as it is at
+    /// that moment.
+    pub(crate) fn head_slot(&self) -> u64 {
+        self.store
+            .judged_head_slot()
+            .unwrap_or_else(|| match self.store.chain() {
+                Chain::Lean => self.store.head_slot(),
+                Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
+            })
+    }
+
+    /// This node's beacon `Status` in v2, shared by every inbound request, the
+    /// handshake and the refresh: building one decodes the head block, and
+    /// requests are not rate limited on the wire.
+    ///
+    /// Rebuilt whenever what it says can have changed: a new head root (a
+    /// reorg within the slot included), a new finalized checkpoint, a new
+    /// fork digest, and at least once a wall-clock slot. One built while the
+    /// head root names no stored block yet (the anchor, before the fork
+    /// choice inserts it) is not kept, since the block's arrival changes no
+    /// part of the key. The head root and the finalized checkpoint are
+    /// metadata reads; it is the head's slot that takes the decode. `None` on
+    /// a lean node.
+    pub(crate) fn beacon_status_v2(&mut self) -> Option<beacon::messages::StatusV2> {
+        let wire = self.wire.beacon()?;
+        let key = StatusKey {
+            wall_slot: wall_clock_slot(&self.store),
+            head: self.store.head().ok(),
+            finalized: self.store.latest_finalized().ok(),
+        };
+        // A fork-digest switch within the slot counts too: a peer that
+        // switched would take the old digest for another network.
+        if let Some((built_from, status)) = &self.beacon_status
+            && *built_from == key
+            && status.fork_digest == wire.fork_digest
+        {
+            return Some(status.clone());
+        }
+        let head = self.store.beacon_head();
+        let status = beacon::handler::status_at_head(&self.store, wire, head);
+        self.beacon_status = head.map(|_| (key, status.clone()));
+        Some(status)
+    }
+
+    /// Drop [`Self::range_fetched_through`] back to the store's head once the
+    /// head has stayed below it, without moving, for longer than the stall
+    /// window (`SyncThresholds::stall_window`) counted from the first
+    /// delivery since it last moved, whether or not a range session is still
+    /// running.
+    ///
+    /// The watermark measures every later `Status` from the highest slot a
+    /// range answer handed to the chain actor, which keeps a catch-up from
+    /// fetching blocks still queued for import again. Blocks that never
+    /// import (invalid ones, a fork the head did not follow) would otherwise
+    /// keep it above the head for good, and an honest peer's head below it
+    /// would never be synced from.
+    ///
+    /// The count starts at the first tick that sees blocks being handed over
+    /// (a range session running, or the watermark moved since the last tick)
+    /// after the head last moved, so the first batch gets a whole window to
+    /// import; later deliveries do not restart it, since a whole window of
+    /// them that has not moved the head is not importing. A head that is
+    /// still importing moves. A gap between ticks counts as two slots at
+    /// most (`HeadWatch::flat_for`), so a process that was paused does not
+    /// find the window spent at its first tick after the resume, and a wall
+    /// clock stepped back counts nothing, rather than stopping the count until
+    /// it passes its old reading again. On a drop,
+    /// the session running ends with its batch in flight, and the senders of
+    /// the lowest batch the head never reached become suspects until the head
+    /// passes what they handed over (see `PeerHeads::suspects`); batches
+    /// above it could not connect without it, so their senders are not held
+    /// to them. A batch is held to the end it was asked for unless the batch
+    /// above shows its tail empty (`HeadWatch::note_delivery`). Each drop at
+    /// the same head doubles the wait before the next one, so a head that
+    /// cannot move at all re-fetches the gap ever more rarely.
+    pub(crate) fn expire_range_watermark(&mut self, wall_slot: u64) {
+        let head_slot = self.head_slot();
+        // Peers whose blocks the head has reached served what they handed
+        // over: that, not an answer merely reaching the chain actor, ends
+        // their run of range failures. First, before a move back forgets the
+        // deliveries or `flat_for`'s clean-up on a head move drops them, so
+        // neither takes the credit away.
+        for peer in self.head_watch.reached(head_slot) {
+            self.peer_heads.note_range_success(&peer);
+        }
+        // A head that moved back below the watermark (an `INVALID` cut, a
+        // reorg onto a shorter branch) leaves what was handed over above it
+        // off the chain being followed: the watermark is no floor there any
+        // more, and goes at once. So does a running session, whose cursor is
+        // past the cut-out span and whose batch in flight would raise the
+        // watermark again; and what was delivered above the head is nobody's
+        // fault, so it is not held against its senders. Nothing is suspected
+        // and the backoff is not counted.
+        if self
+            .head_watch
+            .last_head()
+            .is_some_and(|last| head_slot < last)
+            && self.range_fetched_through > head_slot
+        {
+            debug!(
+                head_slot,
+                fetched_through = self.range_fetched_through,
+                "The head moved back below the range watermark; lowering it"
+            );
+            self.range_fetched_through = head_slot;
+            self.end_range_session();
+            self.head_watch.forget_deliveries();
+        }
+        // Blocks being handed over: a session running, or the watermark moved
+        // since the last tick (a short session can start and end between
+        // two), and only with blocks above the head to show for it. A session
+        // that has delivered nothing yet, or the watermark seeded at the
+        // anchor on startup, must not start the count the first real batch
+        // would then be measured from.
+        let watermark_moved = self.head_watch.watermark_moved(self.range_fetched_through);
+        let above_head = self.range_fetched_through > head_slot;
+        let delivering = above_head && (self.range_sync_state.is_some() || watermark_moved);
+        if !above_head {
+            self.head_watch.clear_delivery();
+        }
+        // Suspects the head has passed, or that have served their time.
+        peer_heads::clear_suspects(self, head_slot, wall_slot);
+        let flat_for = self.head_watch.flat_for(head_slot, wall_slot, delivering);
+        let window = peer_heads::thresholds(&self.store).stall_window;
+        if self.range_fetched_through <= head_slot || flat_for <= self.head_watch.patience(window) {
+            return;
+        }
+        debug!(
+            head_slot,
+            fetched_through = self.range_fetched_through,
+            flat_for,
+            "Blocks handed over above the head never imported; fetching them again"
+        );
+        self.range_fetched_through = head_slot;
+        // A session still running is fetching past blocks that never
+        // imported, and its batch in flight would raise the watermark again:
+        // both go, and an answer to that batch now matches no request (nor
+        // to its envelope request, for the same blocks). Whoever handed over
+        // the lowest batch the head never reached was not serving the chain
+        // the head can follow, and is a suspect until the head passes what it
+        // handed over; batches above it could not connect without it.
+        self.end_range_session();
+        let deliverers = self.head_watch.note_drop(head_slot, wall_slot);
+        peer_heads::suspect(self, deliverers, wall_slot);
+    }
+
+    /// End the range session, with its requests in flight: an answer to one
+    /// now matches no request, so it cannot raise the watermark again, and
+    /// its envelope requests go too, being for the blocks given up on. The
+    /// envelope gate and a batch held for custody belong to the session and
+    /// go with it, so a later session starts with its gate open. Nor can
+    /// anything of this one's that outlives it act on a later one: an
+    /// envelope request names its session, and so does every release it
+    /// leads to (its answer, its failure, and the check after the answer),
+    /// and a custody deadline only re-checks a wait that runs from the later
+    /// session's own start.
+    pub(crate) fn end_range_session(&mut self) {
+        self.range_sync_state = None;
+        self.outbound_requests.retain(|_, kind| {
+            !matches!(
+                kind,
+                PendingRequestKind::Range { .. } | PendingRequestKind::EnvelopeRange { .. }
+            )
+        });
+    }
+
+    /// Re-ask this slot's share of the connected peers that are due for their
+    /// `Status`; see [`peer_heads`]. The half of
+    /// [`Self::handle_refresh_peer_status`] that needs no actor context.
+    ///
+    /// Asks each beacon peer in the version its last exchange ran on, so a
+    /// peer that has dropped `status/1` is not refused (and then retried) on
+    /// every refresh.
+    pub(crate) async fn refresh_due_peer_statuses(&mut self) {
+        let wall_slot = wall_clock_slot(&self.store);
+        self.refresh_due_peer_statuses_at(wall_slot).await;
+    }
+
+    /// [`Self::refresh_due_peer_statuses`] at `wall_slot`. Asks at most once
+    /// a slot: the timer drifting so that it fires twice in one would
+    /// otherwise ask two shares of the peers.
+    pub(crate) async fn refresh_due_peer_statuses_at(&mut self, wall_slot: u64) {
+        // Once a slot, the same cadence as the refresh: a report past its
+        // lifetime is no longer evidence of where the network is, and a
+        // watermark the head never reaches is no longer a floor.
+        peer_heads::publish(self);
+        self.expire_range_watermark(wall_slot);
+        if !self.peer_heads.begin_refresh_slot(wall_slot) {
+            return;
+        }
+        let interval = peer_heads::thresholds(&self.store).status_refresh_slots;
+        let peers = self.peer_heads.due_for_refresh(
+            self.connected_peers.keys().copied(),
+            wall_slot,
+            interval,
+        );
+        if peers.is_empty() {
+            return;
+        }
+        let status = RefreshStatus::build(self);
+        for peer in peers {
+            // One request in flight per peer: no refresh until this is over.
+            self.peer_heads.begin_status_request(peer, wall_slot);
+            match &status {
+                RefreshStatus::Beacon(v2) => {
+                    let version = self.peer_heads.status_version(&peer);
+                    let status = beacon::handler::status_in_version(v2, version);
+                    beacon::handler::send_status(self, peer, status).await;
+                }
+                RefreshStatus::Lean(status) => {
+                    self.swarm_handle
+                        .send_request(
+                            peer,
+                            Request::LeanStatus(status.clone()),
+                            ReqRespProtocol::LeanStatus,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 impl Handler<WrappedSwarmEvent> for P2PServer {
     async fn handle(&mut self, msg: WrappedSwarmEvent, ctx: &Context<Self>) {
         handle_swarm_event(self, msg.0, ctx).await;
@@ -2108,6 +2746,10 @@ async fn handle_swarm_event(
             metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
                 server.add_connected_peer(peer_id, direction, endpoint.get_remote_address());
+                // Both chains send the handshake below; no refresh until it
+                // is answered or fails.
+                let wall_slot = wall_clock_slot(&server.store);
+                server.peer_heads.begin_status_request(peer_id, wall_slot);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
@@ -2116,16 +2758,16 @@ async fn handle_swarm_event(
                     "success",
                 );
                 // Compute the beacon status and its log fields first, so no
-                // borrow of `server.wire` is alive across the send.
-                let beacon_status = server.wire.beacon().map(|wire| {
-                    (
-                        beacon::handler::build_status(
-                            &server.store,
-                            wire,
-                            beacon::handler::StatusVersion::V1,
-                        ),
-                        hex::encode(wire.fork_digest),
-                    )
+                // borrow of `server` is alive across the send. The cached
+                // `Status`, as an inbound request gets: a burst of connections
+                // would otherwise decode the head block once each.
+                let beacon_status = server.beacon_status_v2().map(|status| {
+                    let digest = hex::encode(status.fork_digest);
+                    let status = beacon::handler::status_in_version(
+                        &status,
+                        beacon::handler::StatusVersion::V1,
+                    );
+                    (status, digest)
                 });
                 match beacon_status {
                     Some((status, digest)) => {
@@ -2208,6 +2850,9 @@ async fn handle_swarm_event(
                     .remove_connected_peer(&peer_id)
                     .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
+                // Keeps the peer's suspicion and range-failure run: a reconnect
+                // must not shed them (see `PeerHeads::forget`).
+                peer_heads::forget(server, &peer_id);
                 server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
@@ -3131,14 +3776,30 @@ pub const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 pub const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
-    let mut hasher = sha2::Sha256::new();
     let decompressed = gossipsub::decompress_message(&message.data).ok();
+    match decompressed.as_deref() {
+        Some(data) => message_id(MESSAGE_DOMAIN_VALID_SNAPPY, &message.topic, data),
+        None => message_id(MESSAGE_DOMAIN_INVALID_SNAPPY, &message.topic, &message.data),
+    }
+}
 
-    let (domain, data) = match decompressed.as_deref() {
-        Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
-        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
-    };
-    let topic = message.topic.as_str().as_bytes();
+/// The id gossipsub gives a message this node publishes on `topic`, given its
+/// uncompressed payload: [`compute_message_id`] of what `publish` sends, which
+/// is always valid snappy.
+pub(crate) fn published_message_id(
+    topic: &libp2p::gossipsub::TopicHash,
+    uncompressed: &[u8],
+) -> libp2p::gossipsub::MessageId {
+    message_id(MESSAGE_DOMAIN_VALID_SNAPPY, topic, uncompressed)
+}
+
+fn message_id(
+    domain: [u8; 4],
+    topic: &libp2p::gossipsub::TopicHash,
+    data: &[u8],
+) -> libp2p::gossipsub::MessageId {
+    let mut hasher = sha2::Sha256::new();
+    let topic = topic.as_str().as_bytes();
     let topic_len = (topic.len() as u64).to_le_bytes();
     hasher.update(domain);
     hasher.update(topic_len);
@@ -3202,6 +3863,9 @@ pub(crate) mod test_support {
                 Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
             )>,
         >,
+        /// Each `new_data_column_sidecars` batch, in arrival order.
+        pub(crate) sidecar_batches:
+            std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
     }
 
     impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
@@ -3229,8 +3893,9 @@ pub(crate) mod test_support {
         }
         fn new_data_column_sidecars(
             &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sidecar_batches.lock().unwrap().push(sidecars);
             Ok(())
         }
         fn data_column_sidecars_awaiting_parent(
@@ -3410,7 +4075,10 @@ pub(crate) mod test_support {
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
-            beacon_fetched_through: 0,
+            range_fetched_through: 0,
+            beacon_status: None,
+            head_watch: crate::HeadWatch::default(),
+            peer_heads: Default::default(),
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
             discovery: Some(crate::discovery::dial::DiscoveryState::new(
@@ -3421,6 +4089,9 @@ pub(crate) mod test_support {
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            engine_published_columns: crate::beacon::engine_columns::PublishedColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
@@ -3435,8 +4106,8 @@ pub(crate) mod test_support {
                 ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
-                    crate::SEEN_AGGREGATES_CAPACITY,
-                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::seen_aggregates_capacity(),
+                    crate::seen_aggregates_capacity(),
                 ),
             seen_attestations:
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
@@ -3595,7 +4266,7 @@ mod tests {
     /// additional subnet scales it by the same per-subnet, per-epoch bound.
     #[test]
     fn seen_attestations_capacity_floors_at_one_subnet_and_scales_with_more() {
-        let per_subnet = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE;
+        let per_subnet = 2 * slots_per_epoch() as usize * MAX_VALIDATORS_PER_COMMITTEE;
         assert_eq!(seen_attestations_capacity(0).get(), per_subnet);
         assert_eq!(seen_attestations_capacity(1).get(), per_subnet);
         assert_eq!(seen_attestations_capacity(3).get(), per_subnet * 3);
@@ -4346,6 +5017,100 @@ mod tests {
         assert!(!state.in_flight);
         assert!(!state.peer_set.contains_key(&stale_peer));
         assert_eq!(state.peer_set.get(&current_peer), Some(&2999));
+    }
+
+    /// Finding: the cached `Status` was keyed on the head's slot, so a reorg
+    /// onto a sibling at the same slot, or finality moving under a head that
+    /// stayed, went on advertising the old roots until the next slot.
+    #[tokio::test]
+    async fn the_cached_status_follows_the_head_root_and_finality_within_a_slot() {
+        use ethlambda_storage::ForkCheckpoints;
+        use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
+        use ethlambda_types::beacon::primitives::Root;
+        use ethlambda_types::checkpoint::Checkpoint;
+
+        let mut server = crate::test_support::unconnected_beacon_server(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            0,
+        )
+        .await;
+        let block = |slot: u64, graffiti: u8| {
+            SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+                message: phase0::BeaconBlock {
+                    slot,
+                    proposer_index: 0,
+                    parent_root: Root::ZERO,
+                    state_root: Root::ZERO,
+                    body: phase0::BeaconBlockBody {
+                        randao_reveal: Default::default(),
+                        eth1_data: Default::default(),
+                        graffiti: Root::repeat_byte(graffiti),
+                        proposer_slashings: Default::default(),
+                        attester_slashings: Default::default(),
+                        attestations: Default::default(),
+                        deposits: Default::default(),
+                        voluntary_exits: Default::default(),
+                    },
+                },
+                signature: Default::default(),
+            })
+        };
+        // Before the anchor block the store was initialized with is stored,
+        // the head names no block: that all-zero `Status` is not kept past
+        // the block's arrival, which changes no part of the key.
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_slot, 0);
+        server
+            .store
+            .insert_signed_block(H256::ZERO, block(7, 0))
+            .expect("insert anchor");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_slot, 7);
+
+        // Two siblings at one slot, told apart by their graffiti.
+        let mut siblings = Vec::new();
+        for graffiti in [1, 2] {
+            let block = block(9, graffiti);
+            let root = block.message_hash_tree_root();
+            server
+                .store
+                .insert_signed_block(root, block)
+                .expect("insert");
+            siblings.push(root);
+        }
+        let head = ForkCheckpoints::head_only(siblings[0]);
+        server.store.update_checkpoints(head).expect("head");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_root, siblings[0]);
+
+        // Within the slot, and with the judged head slot never set (nor would it
+        // change: the slot is the same).
+        let head = ForkCheckpoints::head_only(siblings[1]);
+        server.store.update_checkpoints(head).expect("reorg");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.head_root, siblings[1]);
+        assert_eq!(status.head_slot, 9);
+
+        let finalized = Checkpoint {
+            root: siblings[1],
+            slot: 9,
+        };
+        let finality = ForkCheckpoints::new(siblings[1], None, Some(finalized));
+        server.store.update_checkpoints(finality).expect("finality");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.finalized_root, siblings[1]);
+        assert_eq!(status.finalized_epoch, 0);
+
+        // An epoch with no block finalizes on the same root: only the epoch
+        // moves.
+        let finalized = Checkpoint {
+            root: siblings[1],
+            slot: slots_per_epoch(),
+        };
+        let finality = ForkCheckpoints::new(siblings[1], None, Some(finalized));
+        server.store.update_checkpoints(finality).expect("finality");
+        let status = server.beacon_status_v2().expect("a beacon node");
+        assert_eq!(status.finalized_epoch, 1);
     }
 
     #[test]

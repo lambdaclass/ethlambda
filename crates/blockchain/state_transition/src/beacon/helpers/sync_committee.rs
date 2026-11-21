@@ -18,7 +18,7 @@ use ethlambda_types::beacon::containers::altair::{
 };
 
 pub use super::altair::compute_sync_committee_period;
-pub use ethlambda_types::beacon::containers::altair::SYNC_SUBCOMMITTEE_SIZE;
+pub use ethlambda_types::beacon::containers::altair::sync_subcommittee_size;
 
 use super::accessors::get_current_epoch;
 use super::math::bytes_to_uint64;
@@ -65,8 +65,8 @@ pub fn sync_committee_seats(committee: &SyncCommittee, pubkey: &BlsPubkey) -> Ve
         .filter(|(_, candidate)| *candidate == pubkey)
         .map(|(position, _)| {
             (
-                (position / SYNC_SUBCOMMITTEE_SIZE) as u64,
-                position % SYNC_SUBCOMMITTEE_SIZE,
+                (position / sync_subcommittee_size()) as u64,
+                position % sync_subcommittee_size(),
             )
         })
         .collect()
@@ -97,13 +97,14 @@ pub fn get_sync_subcommittee_pubkeys(
         "subcommittee_index < SYNC_COMMITTEE_SUBNET_COUNT",
     )?;
     let committee = sync_committee_for_slot(state, slot)?;
-    let start = subcommittee_index as usize * SYNC_SUBCOMMITTEE_SIZE;
-    Ok(&committee.pubkeys[start..start + SYNC_SUBCOMMITTEE_SIZE])
+    let start = subcommittee_index as usize * sync_subcommittee_size();
+    Ok(&committee.pubkeys[start..start + sync_subcommittee_size()])
 }
 
 /// `validator.md`'s `is_sync_committee_aggregator`.
 pub fn is_sync_committee_aggregator(selection_proof: &BlsSignature) -> bool {
-    let modulo = (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+    let modulo =
+        (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
     let digest = hash(selection_proof.as_ref());
     bytes_to_uint64(&digest.0[0..8]).is_multiple_of(modulo)
 }
@@ -188,7 +189,7 @@ pub(crate) mod tests {
         let mut state = with_signing_validators_at(ForkName::Fulu, validators);
         let pubkey = |index: usize| BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes());
         let committee = |shift: usize| SyncCommittee {
-            pubkeys: (0..preset::SYNC_COMMITTEE_SIZE)
+            pubkeys: (0..preset::sync_committee_size())
                 .map(|position| pubkey((position + shift) % validators))
                 .collect::<Vec<_>>()
                 .try_into()
@@ -203,7 +204,7 @@ pub(crate) mod tests {
     }
 
     fn last_slot_of_period_zero() -> Slot {
-        preset::SLOTS_PER_EPOCH * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD - 1
+        preset::slots_per_epoch() * preset::epochs_per_sync_committee_period() - 1
     }
 
     #[test]
@@ -224,7 +225,7 @@ pub(crate) mod tests {
     #[test]
     fn a_slot_two_periods_ahead_or_a_pre_altair_state_has_no_committee() {
         let state = state_with_committees(8);
-        let far = 2 * preset::SLOTS_PER_EPOCH * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let far = 2 * preset::slots_per_epoch() * preset::epochs_per_sync_committee_period();
         assert!(sync_committee_for_slot(&state, far).is_err());
         let phase0 = crate::beacon::helpers::test_state::with_validators(4);
         assert!(sync_committee_for_slot(&phase0, 5).is_err());
@@ -237,7 +238,7 @@ pub(crate) mod tests {
         let pubkey = state.validator(0).unwrap().pubkey;
         let seats = sync_committee_seats(committee, &pubkey);
         // Validator 0 holds every even position of a committee drawn from two.
-        assert_eq!(seats.len(), preset::SYNC_COMMITTEE_SIZE / 2);
+        assert_eq!(seats.len(), preset::sync_committee_size() / 2);
         assert_eq!(seats[0], (0, 0));
         assert_eq!(seats[1], (0, 2));
         assert!(seats.windows(2).all(|pair| pair[0] < pair[1]));
@@ -254,10 +255,10 @@ pub(crate) mod tests {
         let state = state_with_committees(8);
         let committee = sync_committee_for_slot(&state, 5).unwrap();
         for subcommittee in 0..SYNC_COMMITTEE_SUBNET_COUNT as u64 {
-            let start = subcommittee as usize * SYNC_SUBCOMMITTEE_SIZE;
+            let start = subcommittee as usize * sync_subcommittee_size();
             assert_eq!(
                 get_sync_subcommittee_pubkeys(&state, 5, subcommittee).unwrap(),
-                &committee.pubkeys[start..start + SYNC_SUBCOMMITTEE_SIZE]
+                &committee.pubkeys[start..start + sync_subcommittee_size()]
             );
         }
         assert!(get_sync_subcommittee_pubkeys(&state, 5, 4).is_err());
@@ -273,7 +274,7 @@ pub(crate) mod tests {
     #[test]
     fn the_aggregator_modulo_is_sized_from_the_subcommittee_and_read_little_endian() {
         let modulo =
-            (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+            (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
         let mut selected = 0;
         let total = 4000u64;
         for seed in 0..total {
@@ -300,13 +301,13 @@ pub(crate) mod tests {
             &config,
             gvr,
             DOMAIN_SYNC_COMMITTEE,
-            9 * preset::SLOTS_PER_EPOCH,
+            9 * preset::slots_per_epoch(),
         );
         let after = sync_committee_domain(
             &config,
             gvr,
             DOMAIN_SYNC_COMMITTEE,
-            10 * preset::SLOTS_PER_EPOCH,
+            10 * preset::slots_per_epoch(),
         );
         assert_ne!(before, after);
         assert_eq!(

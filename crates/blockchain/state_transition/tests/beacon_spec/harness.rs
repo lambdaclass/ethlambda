@@ -16,7 +16,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect, crypto_root, fixture_root};
+use super::{Case, collect, crypto_root, fixture_root, preset};
 
 #[derive(serde::Deserialize)]
 struct RootFile {
@@ -41,8 +41,9 @@ pub fn trials() -> Vec<Trial> {
         Trial::test("harness/fixture_tree_is_present", || {
             let root = fixture_root();
             assert!(
-                root.join(PRESET).is_dir(),
-                "no {PRESET} fixtures under {}",
+                root.join(preset()).is_dir(),
+                "no {} fixtures under {}",
+                preset(),
                 root.display()
             );
             // `crypto_root` panics on its own if the BLS/KZG vectors are
@@ -54,7 +55,7 @@ pub fn trials() -> Vec<Trial> {
         Trial::test("harness/discovery_finds_a_known_suite", || {
             // Checkpoint exists in every fork's ssz_static suite, and is the smallest
             // container that does, which makes it a stable canary for discovery.
-            let cases = collect(PRESET, "ssz_static", "Checkpoint");
+            let cases = collect(preset(), "ssz_static", "Checkpoint");
             assert!(!cases.is_empty(), "no ssz_static/Checkpoint cases found");
 
             for case in &cases {
@@ -68,7 +69,7 @@ pub fn trials() -> Vec<Trial> {
             Ok(())
         }),
         Trial::test("harness/discovery_covers_every_supported_fork", || {
-            let cases = collect(PRESET, "ssz_static", "Checkpoint");
+            let cases = collect(preset(), "ssz_static", "Checkpoint");
             for fork in ForkName::ALL {
                 assert!(
                     cases.iter().any(|case| case.fork == fork),
@@ -81,7 +82,7 @@ pub fn trials() -> Vec<Trial> {
         Trial::test("harness/discovery_skips_forks_out_of_scope", || {
             // The release ships suites for forks after fulu, and for standalone EIPs.
             // Those must not reach a runner, since this crate has no types for them.
-            let cases = collect(PRESET, "ssz_static", "Checkpoint");
+            let cases = collect(preset(), "ssz_static", "Checkpoint");
             for case in &cases {
                 assert!(
                     ForkName::ALL.contains(&case.fork),
@@ -92,7 +93,7 @@ pub fn trials() -> Vec<Trial> {
             Ok(())
         }),
         Trial::test("harness/snappy_decompression_yields_decodable_ssz", || {
-            let cases = collect(PRESET, "ssz_static", "Checkpoint");
+            let cases = collect(preset(), "ssz_static", "Checkpoint");
             let case: &Case = cases.first().expect("at least one Checkpoint case");
 
             // A Checkpoint is an epoch and a root, so its SSZ encoding is fixed-length.
@@ -110,7 +111,7 @@ pub fn trials() -> Vec<Trial> {
         Trial::test(
             "harness/container_round_trip_matches_the_fixture_root",
             || {
-                for case in collect(PRESET, "ssz_static", "Checkpoint") {
+                for case in collect(preset(), "ssz_static", "Checkpoint") {
                     let bytes = case.ssz_bytes("serialized");
                     let expected: RootFile = case.yaml("roots");
 

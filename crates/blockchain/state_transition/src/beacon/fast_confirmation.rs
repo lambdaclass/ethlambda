@@ -643,7 +643,7 @@ fn pulled_up_head_balances(fcr_store: &FastConfirmationStore) -> Result<Arc<Just
     let head_state = head_state(fcr_store)?;
     let slashed_this_epoch = target.root != head
         && get_current_epoch(&head_state) == epoch
-        && head_state.slashings()[epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR] != 0;
+        && head_state.slashings()[epoch as usize % preset::epochs_per_slashings_vector()] != 0;
     if !slashed_this_epoch {
         return fork_choice::checkpoint_balances(fcr_store.store, &target, fcr_store.config);
     }
@@ -772,7 +772,7 @@ pub fn get_node_support_between_slots(
 /// `is_full_validator_set_covered`: whether `[start_slot, end_slot]` includes
 /// an entire epoch.
 pub fn is_full_validator_set_covered(start_slot: Slot, end_slot: Slot) -> bool {
-    let start_full_epoch = compute_epoch_at_slot(start_slot + preset::SLOTS_PER_EPOCH - 1);
+    let start_full_epoch = compute_epoch_at_slot(start_slot + preset::slots_per_epoch() - 1);
     let end_full_epoch = compute_epoch_at_slot(end_slot + 1);
     start_full_epoch < end_full_epoch
 }
@@ -918,7 +918,7 @@ pub fn compute_committee_weight_between_slots(
     let later_start = boundary.max(start_slot);
     let later = (start_slot < boundary).then_some((later_start, end_slot));
     debug_assert!(
-        start_slot >= boundary.saturating_sub(preset::SLOTS_PER_EPOCH),
+        start_slot >= boundary.saturating_sub(preset::slots_per_epoch()),
         "a range covering no whole epoch spans one boundary at most"
     );
     let mut weight: Gwei = 0;
@@ -1675,7 +1675,7 @@ pub fn block_should_be_finalized(
     block_root: Root,
 ) -> Result<bool> {
     let block_slot = get_block_slot(fcr_store, block_root)?;
-    let next_checkpoint_epoch = compute_epoch_at_slot(block_slot + preset::SLOTS_PER_EPOCH - 1);
+    let next_checkpoint_epoch = compute_epoch_at_slot(block_slot + preset::slots_per_epoch() - 1);
     let earliest_finality_slot = compute_start_slot_at_epoch(next_checkpoint_epoch + 2);
     Ok(earliest_finality_slot <= fcr_store.run.current_slot)
 }
@@ -1913,12 +1913,14 @@ mod tests {
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::{ExecutionBlockHash, HashTreeRoot as _};
 
-    const SPE: u64 = preset::SLOTS_PER_EPOCH;
+    fn spe() -> u64 {
+        preset::slots_per_epoch()
+    }
 
     /// Validators in every test chain: 32 per slot, one committee per slot on
     /// either preset.
     fn validators() -> usize {
-        (32 * SPE) as usize
+        (32 * spe()) as usize
     }
 
     fn phase0_block(slot: Slot, parent_root: Root, graffiti: Root) -> SignedBeaconBlock {
@@ -1985,7 +1987,7 @@ mod tests {
         fn new() -> Self {
             let mut state = test_state::with_validators(validators());
             // Distinct shuffles per epoch, as a real chain's randao gives.
-            for index in 0..preset::EPOCHS_PER_HISTORICAL_VECTOR {
+            for index in 0..preset::epochs_per_historical_vector() {
                 state.randao_mixes_mut()[index] = Root::repeat_byte(index as u8 + 1);
             }
             Self::from_state(state)
@@ -2094,10 +2096,10 @@ mod tests {
         /// Whether `epoch`'s votes, over all of its slots, reach two thirds.
         fn justified_by_end_of(&self, epoch: Epoch) -> bool {
             let start = compute_start_slot_at_epoch(epoch);
-            let sum: u64 = (start..start + SPE)
+            let sum: u64 = (start..start + spe())
                 .map(|slot| self.participation.get(&slot).copied().unwrap_or(0))
                 .sum();
-            3 * sum >= 200 * SPE
+            3 * sum >= 200 * spe()
         }
 
         /// The `current_justified_checkpoint` a state of `epoch` on `tip`'s
@@ -2129,7 +2131,7 @@ mod tests {
             let sum: u64 = (start..slot)
                 .map(|slot| self.participation.get(&slot).copied().unwrap_or(0))
                 .sum();
-            if slot > start && 3 * sum >= 200 * SPE {
+            if slot > start && 3 * sum >= 200 * spe() {
                 Checkpoint {
                     epoch,
                     root: self.epoch_start_root(parent, epoch),
@@ -2298,7 +2300,7 @@ mod tests {
     /// to establish the balance source").
     fn chain_through_epoch_one() -> Chain {
         let mut chain = Chain::new();
-        chain.run_slots(2 * SPE, 100);
+        chain.run_slots(2 * spe(), 100);
         chain
     }
 
@@ -2307,7 +2309,7 @@ mod tests {
     #[test]
     fn fast_confirm_an_epoch() {
         let mut chain = Chain::new();
-        for _ in 0..SPE {
+        for _ in 0..spe() {
             chain.next_slot_with_block_and_fcr(100);
             // Ensure head is confirmed
             assert_eq!(chain.confirmed_root(), chain.head());
@@ -2317,7 +2319,7 @@ mod tests {
     #[test]
     fn fast_confirm_with_low_participation() {
         let mut chain = Chain::new();
-        for _ in 0..3 * SPE {
+        for _ in 0..3 * spe() {
             chain.next_slot_with_block_and_fcr(90);
             // Ensure confirmed block is being advanced
             let confirmed_epoch = get_block_epoch(&chain.fcr(), chain.confirmed_root()).unwrap();
@@ -2331,20 +2333,20 @@ mod tests {
         let first_epoch_start = chain.anchor_slot;
 
         // Move closer to epoch boundary
-        while chain.current_slot() < first_epoch_start + SPE - 2 {
+        while chain.current_slot() < first_epoch_start + spe() - 2 {
             chain.next_slot_with_block_and_fcr(100);
             assert_eq!(chain.confirmed_root(), chain.head());
         }
 
         // Run for a few slots with asynchrony
-        while chain.current_slot() < first_epoch_start + SPE + 2 {
+        while chain.current_slot() < first_epoch_start + spe() + 2 {
             chain.next_slot_with_block_and_fcr(75);
             // Confirmed block is behind the head
             assert_ne!(chain.confirmed_root(), chain.head());
         }
 
         // Restore participation and run for an epoch
-        for _ in 0..SPE {
+        for _ in 0..spe() {
             chain.next_slot_with_block_and_fcr(100);
             let confirmed_epoch = get_block_epoch(&chain.fcr(), chain.confirmed_root()).unwrap();
             assert!(confirmed_epoch + 1 >= chain.current_epoch());
@@ -2564,7 +2566,7 @@ mod tests {
     fn is_one_confirmed_epoch_crossing_block() {
         let mut chain = Chain::new();
         // Most of epoch 1, to its last slot
-        chain.run_slots(SPE - 1, 100);
+        chain.run_slots(spe() - 1, 100);
         let parent_root = chain.head();
 
         // Skip the first slot of epoch 2, then propose across the boundary
@@ -2624,7 +2626,7 @@ mod tests {
     fn is_confirmed_chain_safe_passes_full_chain() {
         let mut chain = Chain::new();
         // Up to the first slot of epoch 2
-        chain.run_slots(SPE, 100);
+        chain.run_slots(spe(), 100);
         assert_eq!(chain.current_slot(), compute_start_slot_at_epoch(2));
         let fcr = chain.fcr();
         assert!(is_confirmed_chain_safe(&fcr, chain.confirmed_root()).unwrap());
@@ -2661,7 +2663,7 @@ mod tests {
     #[test]
     fn the_cached_sums_match_the_specifications_set_based_definitions() {
         let mut chain = Chain::new();
-        chain.run_slots(2 * SPE + 3, 90);
+        chain.run_slots(2 * spe() + 3, 90);
         for index in (0..40).step_by(3) {
             chain.store.insert_equivocating_index(index);
         }
@@ -2703,7 +2705,7 @@ mod tests {
     #[test]
     fn the_cached_scores_match_the_fold() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE + 4, 80);
+        chain.run_slots(spe() + 4, 80);
         let fork_point = chain.head();
         let slot = chain.current_slot();
         let a = chain.add_block_with(fork_point, slot, Root::repeat_byte(1));
@@ -2756,7 +2758,7 @@ mod tests {
     fn the_pulled_up_balances_are_the_pulled_up_states() {
         let mut chain = Chain::new();
         // The head mid-epoch, past the epoch's first block (the target).
-        chain.run_slots(SPE + 3, 90);
+        chain.run_slots(spe() + 3, 90);
         let fcr = chain.fcr();
         assert_ne!(get_current_target(&fcr).unwrap().root, chain.head());
         let source = balance_source(&fcr, BalanceKey::PulledUpHead).unwrap();
@@ -2770,7 +2772,7 @@ mod tests {
         let epoch = chain.current_epoch();
         let effective_balance = chain.base.validator(slashed).unwrap().effective_balance;
         chain.base.validator_mut(slashed).unwrap().slashed = true;
-        chain.base.slashings_mut()[epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR] =
+        chain.base.slashings_mut()[epoch as usize % preset::epochs_per_slashings_vector()] =
             effective_balance;
         chain.next_slot_with_block_on(None, 90);
 
@@ -2815,19 +2817,19 @@ mod tests {
         let epochs = 3;
         let setup = Instant::now();
         let mut state = test_state::with_validators(validators);
-        for index in 0..preset::EPOCHS_PER_HISTORICAL_VECTOR {
+        for index in 0..preset::epochs_per_historical_vector() {
             state.randao_mixes_mut()[index] = Root::repeat_byte(index as u8 + 1);
         }
         let mut chain = Chain::from_state(state);
-        chain.run_slots(2 * SPE, 90);
+        chain.run_slots(2 * spe(), 90);
         eprintln!("setup {:?}", setup.elapsed());
 
         let mean = |runs: &[Duration]| runs.iter().sum::<Duration>() / runs.len().max(1) as u32;
         let max = |runs: &[Duration]| runs.iter().max().copied().unwrap_or_default();
         // (head, rule) per run, by slot of the epoch.
         let mut by_slot: Vec<(Vec<Duration>, Vec<Duration>)> =
-            vec![Default::default(); SPE as usize];
-        for _ in 0..epochs * SPE {
+            vec![Default::default(); spe() as usize];
+        for _ in 0..epochs * spe() {
             let block = chain.next_slot_with_block_on(None, 90);
             let block_slot = chain.slot_of(block);
             if is_start_slot_at_epoch(block_slot) {
@@ -2847,7 +2849,7 @@ mod tests {
                 .expect("the rule runs")
                 .expect("the first run of the slot");
             let rule_time = start.elapsed();
-            let (heads, rules) = &mut by_slot[(slot % SPE) as usize];
+            let (heads, rules) = &mut by_slot[(slot % spe()) as usize];
             heads.push(head_time);
             rules.push(rule_time);
         }
@@ -2890,7 +2892,7 @@ mod tests {
     #[test]
     fn the_target_score_matches_the_specifications_unfiltered_sum() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE + 3, 80);
+        chain.run_slots(spe() + 3, 80);
         let epoch_start = compute_start_slot_at_epoch(chain.current_epoch());
         let before_start = get_ancestor_root(&chain.fcr(), chain.head(), epoch_start - 1)
             .expect("the canonical chain is indexed");
@@ -2933,7 +2935,7 @@ mod tests {
     #[test]
     fn the_score_fold_matches_the_specifications_per_block_attestation_score() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE + 4, 80);
+        chain.run_slots(spe() + 4, 80);
         // A fork whose votes split the committee
         let fork_point = chain.head();
         let slot = chain.current_slot();
@@ -2968,11 +2970,11 @@ mod tests {
 
     #[test]
     fn a_full_epoch_is_covered_and_a_partial_one_is_not() {
-        assert!(is_full_validator_set_covered(0, SPE - 1));
-        assert!(is_full_validator_set_covered(SPE, 2 * SPE - 1));
-        assert!(!is_full_validator_set_covered(1, SPE - 1));
-        assert!(!is_full_validator_set_covered(1, SPE));
-        assert!(is_full_validator_set_covered(1, 2 * SPE - 1));
+        assert!(is_full_validator_set_covered(0, spe() - 1));
+        assert!(is_full_validator_set_covered(spe(), 2 * spe() - 1));
+        assert!(!is_full_validator_set_covered(1, spe() - 1));
+        assert!(!is_full_validator_set_covered(1, spe()));
+        assert!(is_full_validator_set_covered(1, 2 * spe() - 1));
     }
 
     #[test]
@@ -3019,7 +3021,7 @@ mod tests {
         let mut chain = Chain::new();
         // To the last slot of epoch 1: the greatest unrealized checkpoint is
         // sampled by the run there.
-        chain.run_slots(SPE - 1, 100);
+        chain.run_slots(spe() - 1, 100);
         assert_eq!(chain.current_slot() + 1, compute_start_slot_at_epoch(2));
         let before = chain.store.fast_confirmation().unwrap();
         assert_eq!(
@@ -3071,7 +3073,7 @@ mod tests {
     #[test]
     fn fcr_handles_a_single_empty_slot() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE / 2, 100);
+        chain.run_slots(spe() / 2, 100);
         // An empty slot: everyone attests to the head, no block
         chain.attest_and_next_slot_with_fcr(None, 100);
         let head = chain.head();
@@ -3086,7 +3088,7 @@ mod tests {
     #[test]
     fn fcr_reverts_to_finalized_when_confirmed_is_not_canonical_mid_epoch() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE / 2, 100);
+        chain.run_slots(spe() / 2, 100);
         let confirmed = chain.confirmed_root();
         assert_eq!(confirmed, chain.head());
         let finalized = chain.store.beacon_finalized_checkpoint().root;
@@ -3112,7 +3114,7 @@ mod tests {
     #[test]
     fn the_restart_resilient_root_follows_the_specifications_four_cases() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE / 2, 100);
+        chain.run_slots(spe() / 2, 100);
         let head = chain.head();
         let fcr = chain.fcr();
         let anchor = chain.anchor_root;
@@ -3150,14 +3152,14 @@ mod tests {
     #[test]
     fn a_block_should_be_finalized_two_epochs_after_its_checkpoint() {
         let mut chain = Chain::new();
-        chain.run_slots(SPE / 2, 100);
+        chain.run_slots(spe() / 2, 100);
         let block = chain.head();
         let fcr = chain.fcr();
         assert!(!block_should_be_finalized(&fcr, block).unwrap());
 
         // Far enough ahead that finality has had its two epochs
         let block_slot = chain.slot_of(block);
-        let due = compute_start_slot_at_epoch(compute_epoch_at_slot(block_slot + SPE - 1) + 2);
+        let due = compute_start_slot_at_epoch(compute_epoch_at_slot(block_slot + spe() - 1) + 2);
         chain.tick(due);
         let fcr = chain.fcr();
         assert!(block_should_be_finalized(&fcr, block).unwrap());
@@ -3175,7 +3177,7 @@ mod tests {
         let mut chain = Chain::new();
         // A chain nobody attests to, so the run itself confirms nothing
         // beyond the finalized anchor.
-        for _ in 0..SPE / 2 {
+        for _ in 0..spe() / 2 {
             chain.next_slot_with_block_on(None, 0);
         }
         let head = chain.head();
@@ -3236,7 +3238,7 @@ mod tests {
     #[test]
     fn a_run_after_a_missed_slot_starts_over_without_restoring_the_last_report() {
         let mut chain = Chain::new();
-        for _ in 0..SPE / 2 {
+        for _ in 0..spe() / 2 {
             chain.next_slot_with_block_on(None, 0);
         }
         let head = chain.head();
@@ -3274,7 +3276,7 @@ mod tests {
     #[test]
     fn without_a_persisted_root_an_unconfirmable_chain_stays_at_the_anchor() {
         let mut chain = Chain::new();
-        for _ in 0..SPE / 2 {
+        for _ in 0..spe() / 2 {
             chain.next_slot_with_block_on(None, 0);
         }
         assert_eq!(chain.run_fcr().block, chain.anchor_root);

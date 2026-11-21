@@ -381,7 +381,7 @@ fn apply_randao(
     }
 
     let mix = xor(get_randao_mix(state, epoch), hash(&randao_reveal.0));
-    let position = epoch as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+    let position = epoch as usize % preset::epochs_per_historical_vector();
     state.randao_mixes_mut()[position] = mix;
     Ok(())
 }
@@ -406,7 +406,7 @@ fn apply_eth1_data(state: &mut BeaconState, eth1_data: &Eth1Data) -> Result<()> 
         .iter()
         .filter(|vote| *vote == eth1_data)
         .count() as u64;
-    let voting_period_slots = preset::EPOCHS_PER_ETH1_VOTING_PERIOD * preset::SLOTS_PER_EPOCH;
+    let voting_period_slots = preset::epochs_per_eth1_voting_period() * preset::slots_per_epoch();
     if matching_votes * 2 > voting_period_slots {
         *state.eth1_data_mut() = eth1_data.clone();
     }

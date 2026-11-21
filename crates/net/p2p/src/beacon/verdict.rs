@@ -42,7 +42,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks};
+use crate::beacon::column_checks;
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -215,9 +215,10 @@ impl Validated {
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.builder_market.record_bid((**bid).clone())
             }
-            Self::ProposerPreferences(preferences) => server
-                .builder_market
-                .record_preferences((**preferences).clone(), builder_market::wall_slot(server)),
+            Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
+                (**preferences).clone(),
+                crate::wall_clock_slot(&server.store),
+            ),
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
@@ -615,6 +616,27 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
     }
 }
 
+/// [`settle`] for the gossip message delivered as `message_id`.
+///
+/// An accepted column the execution-layer path published under the same id
+/// keeps its `Accept` without being recorded: the key is taken by that very
+/// column, and that publish sent nothing, so this copy is the only one
+/// gossipsub can relay. See [`crate::beacon::engine_columns`]'s module doc.
+pub(crate) fn settle_message(
+    server: &mut P2PServer,
+    message_id: &MessageId,
+    outcome: Outcome,
+    object: &Validated,
+) -> Outcome {
+    if outcome == Outcome::Accept
+        && matches!(object, Validated::Column(_))
+        && server.engine_published_columns.take(message_id)
+    {
+        return Outcome::Accept;
+    }
+    settle(server, outcome, object)
+}
+
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict {
@@ -622,7 +644,7 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
+        let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
         if report(self, id, outcome) {
             object.forward(self, received_at, outcome);

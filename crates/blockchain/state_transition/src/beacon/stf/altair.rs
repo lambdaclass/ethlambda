@@ -124,7 +124,7 @@ pub fn process_attestation(
         ))?;
     let max_slot = data
         .slot
-        .checked_add(preset::SLOTS_PER_EPOCH)
+        .checked_add(preset::slots_per_epoch())
         .ok_or(Error::ArithmeticOverflow("data.slot + SLOTS_PER_EPOCH"))?;
     verify(
         min_slot <= state.slot() && state.slot() <= max_slot,
@@ -336,7 +336,7 @@ pub fn process_attestation(
 ///
 /// Takes no [`crate::beacon::config::Config`]: [`constants::DOMAIN_SYNC_COMMITTEE`]
 /// and the weight constants are fixed, and [`preset::SYNC_COMMITTEE_SIZE`],
-/// [`preset::EFFECTIVE_BALANCE_INCREMENT`], and [`preset::SLOTS_PER_EPOCH`]
+/// [`preset::EFFECTIVE_BALANCE_INCREMENT`], and [`preset::slots_per_epoch()`]
 /// are preset values; the specification lists none of them under a network's
 /// "Configuration" table.
 pub fn process_sync_aggregate(
@@ -444,8 +444,8 @@ fn apply_sync_aggregate(
             "total_base_rewards * SYNC_REWARD_WEIGHT",
         ))?
         / constants::WEIGHT_DENOMINATOR
-        / preset::SLOTS_PER_EPOCH;
-    let participant_reward = max_participant_rewards / preset::SYNC_COMMITTEE_SIZE as u64;
+        / preset::slots_per_epoch();
+    let participant_reward = max_participant_rewards / preset::sync_committee_size() as u64;
 
     const NON_PROPOSER_WEIGHT: u64 = constants::WEIGHT_DENOMINATOR - constants::PROPOSER_WEIGHT;
     let proposer_reward = participant_reward
@@ -567,7 +567,7 @@ mod tests {
             .collect();
 
         let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
+            pubkeys: vec![BlsPubkey::default(); preset::sync_committee_size()]
                 .try_into()
                 .expect("built at exactly SYNC_COMMITTEE_SIZE"),
             aggregate_pubkey: BlsPubkey::default(),
@@ -576,13 +576,13 @@ mod tests {
         let state = BeaconState::Altair(altair::BeaconState {
             genesis_time: 0,
             genesis_validators_root: Root::ZERO,
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             fork: Default::default(),
             latest_block_header: Default::default(),
-            block_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             historical_roots: Default::default(),
@@ -595,10 +595,10 @@ mod tests {
             balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
                 .try_into()
                 .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_participation: vec![0; count]
@@ -639,7 +639,7 @@ mod tests {
         // so an attestation for this slot has an inclusion delay of exactly
         // `MIN_ATTESTATION_INCLUSION_DELAY`, which is what makes it eligible
         // for all three timeliness flags rather than just source and target.
-        let data_slot = preset::SLOTS_PER_EPOCH - 1;
+        let data_slot = preset::slots_per_epoch() - 1;
         let target_epoch = compute_epoch_at_slot(data_slot);
         assert_eq!(target_epoch, 0, "the previous epoch, by construction");
 
@@ -813,9 +813,9 @@ mod tests {
         let (mut state, secret_keys) = altair_state_with_keypairs(64);
         // Slot after the first slot of epoch 1: both the previous epoch's last
         // slot and the current epoch's first slot are attestable.
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH + 1;
-        let previous_slot = preset::SLOTS_PER_EPOCH - 1;
-        let current_slot = preset::SLOTS_PER_EPOCH;
+        *state.slot_mut() = preset::slots_per_epoch() + 1;
+        let previous_slot = preset::slots_per_epoch() - 1;
+        let current_slot = preset::slots_per_epoch();
 
         let previous_committee = get_beacon_committee(&state, previous_slot, 0).unwrap();
         state.validator_mut(previous_committee[0]).unwrap().slashed = true;
@@ -882,7 +882,7 @@ mod tests {
         let filler_pubkey = BlsPubkey(secret_keys[4].sk_to_pk().to_bytes());
 
         let mut pubkeys_vec = participant_pubkeys.clone();
-        pubkeys_vec.resize(preset::SYNC_COMMITTEE_SIZE, filler_pubkey);
+        pubkeys_vec.resize(preset::sync_committee_size(), filler_pubkey);
         let aggregate_pubkey = bls::eth_aggregate_pubkeys(&pubkeys_vec).unwrap();
         let pubkeys = pubkeys_vec
             .try_into()
@@ -954,12 +954,12 @@ mod tests {
             get_base_reward_per_increment(&state).unwrap() * total_active_increments;
         let max_participant_rewards = total_base_rewards * constants::SYNC_REWARD_WEIGHT
             / constants::WEIGHT_DENOMINATOR
-            / preset::SLOTS_PER_EPOCH;
-        let participant_reward = max_participant_rewards / preset::SYNC_COMMITTEE_SIZE as u64;
+            / preset::slots_per_epoch();
+        let participant_reward = max_participant_rewards / preset::sync_committee_size() as u64;
         let proposer_reward = participant_reward * constants::PROPOSER_WEIGHT
             / (constants::WEIGHT_DENOMINATOR - constants::PROPOSER_WEIGHT);
 
-        let filler_seats = (preset::SYNC_COMMITTEE_SIZE - 4) as u64;
+        let filler_seats = (preset::sync_committee_size() - 4) as u64;
         for index in 0..5u64 {
             let mut expected = balances_before[index as usize] as i128;
             if index < 4 {
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn process_sync_aggregate_scans_for_an_unverifiable_seat_and_records_it() {
         let (mut state, secret_keys) = altair_state_with_keypairs(3);
-        let pubkeys_vec: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE)
+        let pubkeys_vec: Vec<BlsPubkey> = (0..preset::sync_committee_size())
             .map(|seat| BlsPubkey(secret_keys[seat % 3].sk_to_pk().to_bytes()))
             .collect();
         let aggregate_pubkey = bls::eth_aggregate_pubkeys(&pubkeys_vec).unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
     fn process_sync_aggregate_rejects_a_non_infinity_signature_for_zero_participants() {
         let (mut state, secret_keys) = altair_state_with_keypairs(1);
         let filler_pubkey = BlsPubkey(secret_keys[0].sk_to_pk().to_bytes());
-        let pubkeys_vec = vec![filler_pubkey; preset::SYNC_COMMITTEE_SIZE];
+        let pubkeys_vec = vec![filler_pubkey; preset::sync_committee_size()];
         let aggregate_pubkey = bls::eth_aggregate_pubkeys(&pubkeys_vec).unwrap();
         let pubkeys = pubkeys_vec
             .try_into()
@@ -1101,9 +1101,9 @@ mod tests {
             get_base_reward_per_increment(&state).unwrap() * total_active_increments;
         let max_participant_rewards = total_base_rewards * constants::SYNC_REWARD_WEIGHT
             / constants::WEIGHT_DENOMINATOR
-            / preset::SLOTS_PER_EPOCH;
-        let participant_reward = max_participant_rewards / preset::SYNC_COMMITTEE_SIZE as u64;
-        let expected_penalty = participant_reward * preset::SYNC_COMMITTEE_SIZE as u64;
+            / preset::slots_per_epoch();
+        let participant_reward = max_participant_rewards / preset::sync_committee_size() as u64;
+        let expected_penalty = participant_reward * preset::sync_committee_size() as u64;
 
         assert_eq!(
             state.balance(0).unwrap(),
