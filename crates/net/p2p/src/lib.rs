@@ -89,6 +89,8 @@ use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
+use spawned_concurrency::send_handler;
+use spawned_concurrency::system::{ExecutionGroup, SystemError};
 use spawned_concurrency::tasks::{
     Actor, ActorRef, ActorStart, Context, Handler, send_after, spawn_listener,
 };
@@ -96,10 +98,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
+        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryHandle,
         dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
-        spawn_discovery,
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
@@ -298,6 +299,14 @@ const BUILDER_VALIDATION_PERMITS: usize = 32;
 /// [`ATTESTATION_VALIDATION_PERMITS`] would let each starve the other. A
 /// message arriving with none free is ignored, like every other kind.
 const SYNC_VALIDATION_PERMITS: usize = 64;
+
+/// The p2p actor's native-job budget (`MAX_NATIVE_JOBS`): every stateful
+/// check runs as one blocking job holding a permit from one of the pools
+/// above, so the pools, not this budget, bound how many run at once.
+const STATEFUL_CHECK_PERMITS: usize = GOSSIP_VALIDATION_PERMITS
+    + ATTESTATION_VALIDATION_PERMITS
+    + BUILDER_VALIDATION_PERMITS
+    + SYNC_VALIDATION_PERMITS;
 
 /// Capacity of the first-valid-sync-message cache, keyed by `(slot, validator
 /// index, subnet)`. A subnet carries one message per member per slot, at most
@@ -1531,40 +1540,37 @@ pub struct P2P {
 }
 
 impl P2P {
-    /// Start discovery, start the I/O adapter, spawn the actor, and wire the
-    /// swarm event stream.
+    /// Start the I/O adapter, spawn the actor on `group`, and wire the swarm
+    /// event stream.
     ///
-    /// `discovery` is `Some` when discv5 runs: the server is started here, and
-    /// its handle seeds the dial loop's state and schedules its first tick. It
-    /// is started before the swarm adapter so a fatal discovery failure (a busy
-    /// UDP port, say) surfaces before any actor is running. `None` leaves the
-    /// dial loop unscheduled, so peering relies solely on the static bootnode
-    /// list `build_swarm` dialed.
+    /// `discovery` is `Some` when discv5 runs: the caller starts the server
+    /// with [`discovery::spawn_discovery`] before any actor, so a fatal
+    /// discovery failure (a busy UDP port, say) surfaces before anything is
+    /// running, and its handle seeds the dial loop's state and schedules its
+    /// first tick here. `None` leaves the dial loop unscheduled, so peering
+    /// relies solely on the static bootnode list `build_swarm` dialed.
     ///
     /// Always `Some` on beacon, which has no other way to find a peer:
     /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
     /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
     /// and co-located devnet nodes would otherwise all claim one UDP port.
     #[allow(clippy::too_many_arguments)]
-    pub async fn spawn(
+    pub fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: Option<DiscoverySpawnConfig>,
+        discovery: Option<DiscoveryHandle>,
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
         gossip_events: Option<Arc<dyn GossipEventSink>>,
-    ) -> Result<P2P, DiscoveryError> {
-        let (discovery, local_enr) = match discovery {
-            Some(config) => {
-                let discovery = spawn_discovery(config).await?;
-                let local_enr = discovery.local_enr.clone();
-                (Some(discovery), Some(local_enr))
-            }
+        group: &ExecutionGroup,
+    ) -> Result<P2P, SystemError> {
+        let local_enr = match &discovery {
+            Some(discovery) => Some(discovery.local_enr.clone()),
             None => {
                 info!("discv5 discovery disabled; peering from the static bootnode list only");
-                (None, None)
+                None
             }
         };
         let (swarm_stream, swarm_handle) =
@@ -1654,7 +1660,7 @@ impl P2P {
         };
         let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
-        let handle = server.start();
+        let handle = server.start_on(group)?;
         // At once rather than a slot in: the swarm starts on placeholder
         // topic scores, and the head's are already known.
         if scores_peers {
@@ -2033,7 +2039,7 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn refresh_peer_status(&self) -> Result<(), ActorError>;
 }
 
-#[actor(protocol = P2PProtocol)]
+#[actor(protocol = P2PProtocol, max_native_jobs = STATEFUL_CHECK_PERMITS)]
 impl P2PServer {
     #[send_handler]
     async fn handle_retry_block_fetch(
@@ -2239,6 +2245,7 @@ impl P2PServer {
 
 // --- Manual Handler impls for network-api messages ---
 
+#[send_handler]
 impl Handler<InitBlockChain> for P2PServer {
     async fn handle(&mut self, msg: InitBlockChain, _ctx: &Context<Self>) {
         self.blockchain = Some(msg.blockchain);
@@ -2246,102 +2253,119 @@ impl Handler<InitBlockChain> for P2PServer {
     }
 }
 
+#[send_handler]
 impl Handler<PublishBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBlock, _ctx: &Context<Self>) {
         publish_block(self, msg.block).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAttestation, _ctx: &Context<Self>) {
         publish_attestation(self, msg.attestation).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishBeaconAggregate> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
         publish_beacon_aggregate(self, msg.aggregate, msg.attesting_indices).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishBeaconOperation> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconOperation, _ctx: &Context<Self>) {
         publish_beacon_operation(self, msg.operation).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
         publish_beacon_block(self, msg.block, msg.sidecars).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
     async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _ctx: &Context<Self>) {
         gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
     }
 }
 
+#[send_handler]
 impl Handler<PublishExecutionPayloadBid> for P2PServer {
     async fn handle(&mut self, msg: PublishExecutionPayloadBid, _ctx: &Context<Self>) {
         beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
     }
 }
 
+#[send_handler]
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
         beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
     }
 }
 
+#[send_handler]
 impl Handler<PublishPayloadAttestationMessage> for P2PServer {
     async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _ctx: &Context<Self>) {
         gossipsub::publish_payload_attestation_message(self, msg.message).await;
     }
 }
 
+#[send_handler]
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
     }
 }
 
+#[send_handler]
 impl Handler<PublishSyncCommitteeMessage> for P2PServer {
     async fn handle(&mut self, msg: PublishSyncCommitteeMessage, _ctx: &Context<Self>) {
         beacon::sync_committee::publish_sync_committee_message(self, msg.subnet_ids, msg.message);
     }
 }
 
+#[send_handler]
 impl Handler<PublishSyncCommitteeContribution> for P2PServer {
     async fn handle(&mut self, msg: PublishSyncCommitteeContribution, _ctx: &Context<Self>) {
         beacon::sync_committee::publish_sync_committee_contribution(self, msg.contribution);
     }
 }
 
+#[send_handler]
 impl Handler<SubscribeSyncCommitteeSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeSyncCommitteeSubnets, _ctx: &Context<Self>) {
         beacon::sync_committee::join_sync_committee_subnets(self, msg.subnets);
     }
 }
 
+#[send_handler]
 impl Handler<PublishBeaconAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconAttestation, _ctx: &Context<Self>) {
         publish_beacon_attestation(self, msg.subnet_id, msg.attestation).await;
     }
 }
 
+#[send_handler]
 impl Handler<FetchBlock> for P2PServer {
     async fn handle(&mut self, msg: FetchBlock, _ctx: &Context<Self>) {
         fetch_missing(self, msg.request).await;
     }
 }
 
+#[send_handler]
 impl Handler<CheckDataColumnSidecars> for P2PServer {
     async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
         match msg.origin {
@@ -2715,6 +2739,7 @@ impl P2PServer {
     }
 }
 
+#[send_handler]
 impl Handler<WrappedSwarmEvent> for P2PServer {
     async fn handle(&mut self, msg: WrappedSwarmEvent, ctx: &Context<Self>) {
         handle_swarm_event(self, msg.0, ctx).await;
@@ -3850,95 +3875,6 @@ pub(crate) mod test_support {
 
     use crate::beacon::swarm::BeaconWireConfig;
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
-
-    /// A chain actor stand-in recording what reaches it: each block's
-    /// announcement and each aggregate with its attesting indices. The rest
-    /// of the protocol is accepted and dropped.
-    #[derive(Default)]
-    pub(crate) struct RecordingChain {
-        pub(crate) announcements: std::sync::Mutex<Vec<ethlambda_network_api::BlockAnnouncement>>,
-        pub(crate) aggregates: std::sync::Mutex<
-            Vec<(
-                ethlambda_types::beacon::containers::SignedAggregateAndProof,
-                Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
-            )>,
-        >,
-        /// Each `new_data_column_sidecars` batch, in arrival order.
-        pub(crate) sidecar_batches:
-            std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
-    }
-
-    impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
-        fn new_block(
-            &self,
-            _block: ethlambda_types::beacon::containers::SignedBeaconBlock,
-            _source: ethlambda_network_api::BlockSource,
-            _arrival: ethlambda_network_api::BlockArrival,
-            announcement: ethlambda_network_api::BlockAnnouncement,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.announcements.lock().unwrap().push(announcement);
-            Ok(())
-        }
-        fn new_attestation(
-            &self,
-            _attestation: ethlambda_types::attestation::SignedAttestation,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: ethlambda_types::attestation::SignedAggregatedAttestation,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.sidecar_batches.lock().unwrap().push(sidecars);
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            aggregate: Box<ethlambda_types::beacon::containers::SignedAggregateAndProof>,
-            attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
-            _arrival: ethlambda_network_api::AggregateArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.aggregates
-                .lock()
-                .unwrap()
-                .push((*aggregate, attesting_indices));
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
-            _arrival: ethlambda_network_api::BlockArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
-            _arrival: ethlambda_network_api::BlockArrival,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-        fn new_proposer_preferences(
-            &self,
-            _proposal_slot: u64,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            Ok(())
-        }
-    }
 
     /// A gloas envelope for `(root_byte, builder)` at slot `slot_number`
     /// zero. Only what the cheap gossip checks and the seen cache read is

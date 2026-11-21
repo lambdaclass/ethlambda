@@ -25,6 +25,9 @@ ethlambda-test-fixtures.workspace = true
 libssz.workspace = true
 
 spawned-concurrency.workspace = true
+# Blocking helpers (`spawn_blocking`): Tokio in production, one inline
+# step under the deterministic simulator.
+spawned-rt.workspace = true
 
 tokio.workspace = true
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
@@ -36,6 +39,8 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+# sim_tests: the stub aggregation prover (Shadow integration), see src/sim_tests.rs.
+ethlambda-crypto = { workspace = true, features = ["shadow-integration"] }
 # `test_state`'s validator keys, so a test can sign a block that has to pass
 # the proposer-signature precheck before its blobs are asked for.
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
@@ -47,6 +52,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 datatest-stable = "0.3.3"
 serde_json.workspace = true
 snap = "1.1.1"
+# `in_actor`: run a closure in the chain actor's turn (the job tests).
+spawned-test.workspace = true
 
 [features]
 # Run the fork choice fixture cases the actor tests read from
@@ -71,3 +78,7 @@ harness = false
 # leanVM key format and fail to decode. Run on demand with
 # `cargo test --profile release-fast --test <name>`.
 test = false
+
+# `sim_tests`: built with RUSTFLAGS="--cfg spawned_sim --cfg tokio_unstable".
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(spawned_sim)"] }

@@ -67,13 +67,19 @@ rand = "0.8"
 
 # Required for NodeEnr parsing.
 #
-# Pinned to an ethrex release tag, for the unified discovery module, the peer
-# table, and the `PeerFilter` seam this crate builds on. A tag rather than a
+# Pinned to an exact ethrex commit, for the unified discovery module, the peer
+# table, and the `PeerFilter` seam this crate builds on. A pin rather than a
 # branch: a `main` that moves under us would change what this crate builds
 # against with nothing in the manifest saying so.
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+#
+# The commit is lambdaclass/ethrex#7518 (ethrex on Spawned 0.8.0), not a release
+# tag: every ethrex tag so far (through v31.0.0) is on Spawned 0.5.0, and the
+# discovery server and peer table this crate starts are Spawned actors, so a tag
+# would run a second, older actor runtime beside ours. Move back to a tag once
+# ethrex releases on Spawned 0.8.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }
 
 # `rand` seeds the throwaway signing keys the ENR tests build records with.
 secp256k1.workspace = true
@@ -88,6 +94,9 @@ sha2 = "0.10"
 hex.workspace = true
 
 [dev-dependencies]
+# Mock chain actors for the forwarding tests: an `ActorRef<Mock>` stands in for
+# any protocol ref, so tests need no hand-written protocol stubs.
+spawned-test.workspace = true
 # `test-utils` for `helpers::test_state`: a test that needs a stored post-state
 # builds one with it.
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }

@@ -15,13 +15,14 @@ pub mod enr;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
-use ethrex_p2p::types::Node;
+use ethrex_p2p::types::{LocalNode, Node};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
@@ -231,6 +232,17 @@ pub async fn spawn_discovery(
     // lean peer applying our own admission rules to it admits us. ethrex
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
+    //
+    // `nat_extip_set: false` keeps IP voting live even with an advertise IP, as
+    // before ethrex grew the lock. The shared identity is ethrex's live copy of
+    // the record for its own RPC, which this crate does not read. The fork id
+    // channel feeds ethrex's EIP-2124 `eth` entry for execution chains: a
+    // consensus ENR must not carry one, so it is seeded `None` with the sender
+    // dropped, which ethrex treats as nothing to republish.
+    let shared_local_node = Arc::new(RwLock::new(LocalNode {
+        node: local_node.clone(),
+        record: local_record.clone(),
+    }));
     DiscoveryServer::spawn(
         local_node,
         local_record,
@@ -241,7 +253,10 @@ pub async fn spawn_discovery(
         DiscoveryConfig {
             discv4_enabled: false,
             discv5_enabled: true,
+            nat_extip_set: false,
         },
+        shared_local_node,
+        watch::channel(None).1,
     )
     .await
     .map_err(|err| DiscoveryError::Server(err.to_string()))?;

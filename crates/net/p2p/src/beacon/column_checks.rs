@@ -763,7 +763,7 @@ pub(crate) mod tests {
         ) -> Result<(), ActorError> {
             self.0
                 .send(Forwarded::Checked(sidecars))
-                .map_err(|_| ActorError::ActorStopped)
+                .map_err(|_| ActorError::NoProc)
         }
         fn data_column_sidecars_awaiting_parent(
             &self,

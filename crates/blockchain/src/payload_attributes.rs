@@ -57,6 +57,7 @@ use ethlambda_types::beacon::primitives::{ExecutionAddress, Slot, ValidatorIndex
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use ethlambda_types::primitives::H256;
 use spawned_concurrency::message::Message;
+use spawned_concurrency::send_handler;
 use spawned_concurrency::tasks::{Context, Handler, send_after};
 use tracing::{debug, warn};
 
@@ -731,7 +732,7 @@ impl BlockChainServer {
         self.payload_attributes.in_flight = Some(key);
         let store = self.store.clone();
         let actor = ctx.actor_ref();
-        tokio::task::spawn_blocking(move || {
+        spawned_rt::tasks::spawn_blocking(move || {
             let result = payload_attributes_event(
                 &store,
                 &preparation,
@@ -745,12 +746,14 @@ impl BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<PayloadAttributesCheck> for BlockChainServer {
     async fn handle(&mut self, _msg: PayloadAttributesCheck, ctx: &Context<Self>) {
         self.maybe_prepare_payload_attributes(ctx);
     }
 }
 
+#[send_handler]
 impl Handler<PayloadAttributesComputed> for BlockChainServer {
     async fn handle(&mut self, msg: PayloadAttributesComputed, ctx: &Context<Self>) {
         let PayloadAttributesComputed { key, result } = msg;
