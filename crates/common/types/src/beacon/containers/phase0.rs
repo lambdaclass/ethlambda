@@ -19,6 +19,7 @@ use super::shared::{
     Validators,
 };
 use crate::beacon::preset;
+use crate::beacon::preset_sized::PresetList;
 use crate::beacon::primitives::{BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
 
 /// The attesters covered by one aggregate, as a bit per committee member.
@@ -33,7 +34,7 @@ pub type AggregationBits = SszBitlist<{ preset::MAX_VALIDATORS_PER_COMMITTEE }>;
 pub type AttestingIndices = SszList<ValidatorIndex, { preset::MAX_VALIDATORS_PER_COMMITTEE }>;
 
 /// Attestations retained in the state, awaiting the epoch boundary.
-pub type PendingAttestations = SszList<PendingAttestation, { preset::MAX_PENDING_ATTESTATIONS }>;
+pub type PendingAttestations = PresetList<PendingAttestation, preset::MaxPendingAttestations>;
 
 // ---------------------------------------------------------------------------
 // Attestations

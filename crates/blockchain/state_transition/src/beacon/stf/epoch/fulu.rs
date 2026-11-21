@@ -167,10 +167,10 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
         ForkName::Lean => lean_state_unreachable("process_proposer_lookahead"),
     };
 
-    let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+    let slots_per_epoch = preset::slots_per_epoch() as usize;
     let lookahead = proposer_lookahead_mut(state, "process_proposer_lookahead")?;
 
-    let mut window = Vec::with_capacity(preset::PROPOSER_LOOKAHEAD_LENGTH);
+    let mut window = Vec::with_capacity(preset::proposer_lookahead_length());
     window.extend_from_slice(&lookahead[slots_per_epoch..]);
     window.extend(new_epoch_proposers);
 
@@ -231,7 +231,7 @@ mod tests {
         process_proposer_lookahead(&mut state).unwrap();
 
         let after = lookahead_of(&state);
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
         // Everything but the oldest and newest epoch's worth of entries must
         // carry over unchanged, just shifted down by one epoch's length.
         assert_eq!(
@@ -251,7 +251,7 @@ mod tests {
         process_proposer_lookahead(&mut state).unwrap();
 
         let after = lookahead_of(&state);
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
         assert_eq!(after[after.len() - slots_per_epoch..], expected[..]);
     }
 
@@ -261,7 +261,7 @@ mod tests {
         process_proposer_lookahead(&mut state).unwrap();
         assert_eq!(
             lookahead_of(&state).len(),
-            preset::PROPOSER_LOOKAHEAD_LENGTH
+            preset::proposer_lookahead_length()
         );
     }
 

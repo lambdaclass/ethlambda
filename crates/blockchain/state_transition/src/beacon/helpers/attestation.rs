@@ -126,7 +126,7 @@ pub(crate) fn attesters_signature_set(
     domain: Option<Domain>,
 ) -> Option<SignatureSet> {
     if attesting_indices.is_empty()
-        || attesting_indices.len() > preset::MAX_VALIDATORS_PER_SLOT
+        || attesting_indices.len() > preset::max_validators_per_slot()
         || !are_indices_sorted_and_unique(attesting_indices)
     {
         return None;

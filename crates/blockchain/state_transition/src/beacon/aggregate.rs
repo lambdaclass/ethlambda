@@ -43,8 +43,9 @@ pub fn is_non_strict_superset(seen: &[bool], candidate: &[bool]) -> bool {
 /// bound rather than a forecast: a chain with fewer active validators has
 /// fewer committees per slot, and selection is probabilistic around the
 /// target rather than exact.
-pub const MAX_AGGREGATES_PER_SLOT: u64 =
-    preset::MAX_COMMITTEES_PER_SLOT as u64 * constants::TARGET_AGGREGATORS_PER_COMMITTEE;
+pub fn max_aggregates_per_slot() -> u64 {
+    preset::max_committees_per_slot() as u64 * constants::TARGET_AGGREGATORS_PER_COMMITTEE
+}
 
 #[cfg(test)]
 mod tests {
@@ -91,9 +92,10 @@ mod tests {
     /// is worth having written down.
     #[test]
     fn the_per_slot_bound_is_committees_times_aggregators() {
-        #[cfg(not(feature = "preset-minimal"))]
-        assert_eq!(MAX_AGGREGATES_PER_SLOT, 1024);
-        #[cfg(feature = "preset-minimal")]
-        assert_eq!(MAX_AGGREGATES_PER_SLOT, 64);
+        let expected = match crate::beacon::preset::Preset::active() {
+            crate::beacon::preset::Preset::Mainnet => 1024,
+            crate::beacon::preset::Preset::Minimal => 64,
+        };
+        assert_eq!(max_aggregates_per_slot(), expected);
     }
 }

@@ -146,7 +146,7 @@ use ethlambda_state_transition::beacon::stf::signatures::SignatureBatch;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{Case, collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -776,7 +776,7 @@ fn run(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "operations");
+    let cases = collect_all_handlers(preset(), "operations");
     let mut trials = vec![super::discovery_trial("operations", cases.len())];
 
     for (handler, case) in cases {
@@ -850,7 +850,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "withdrawals",
     ];
 
-    let mut unknown: Vec<String> = collect_all_handlers(PRESET, "operations")
+    let mut unknown: Vec<String> = collect_all_handlers(preset(), "operations")
         .into_iter()
         .filter(|(_, case): &(String, Case)| case.in_scope())
         .map(|(handler, _)| handler)

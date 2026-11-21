@@ -727,8 +727,8 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
     let seed = get_seed(state, epoch, constants::DOMAIN_SYNC_COMMITTEE);
 
     let mut i: u64 = 0;
-    let mut sync_committee_indices = Vec::with_capacity(preset::SYNC_COMMITTEE_SIZE);
-    while sync_committee_indices.len() < preset::SYNC_COMMITTEE_SIZE {
+    let mut sync_committee_indices = Vec::with_capacity(preset::sync_committee_size());
+    while sync_committee_indices.len() < preset::sync_committee_size() {
         let shuffled_index =
             compute_shuffled_index(i % active_validator_count, active_validator_count, seed)?;
         let candidate_index = active_validator_indices[shuffled_index as usize];
@@ -1758,7 +1758,7 @@ mod tests {
         // highest index this vector actually holds has to come from the
         // constant itself: a literal high enough to be interesting under
         // mainnet (e.g. 4) is out of bounds under minimal.
-        let last = preset::MAX_COMMITTEES_PER_SLOT - 1;
+        let last = preset::max_committees_per_slot() - 1;
         bits.set(last, true).unwrap();
         bits.set(1, true).unwrap();
         assert_eq!(
@@ -1940,7 +1940,7 @@ mod tests {
     fn next_sync_committee_indices_are_exactly_sync_committee_size() {
         let state = electra_state_with_validators(4);
         let indices = get_next_sync_committee_indices(&state).unwrap();
-        assert_eq!(indices.len(), preset::SYNC_COMMITTEE_SIZE);
+        assert_eq!(indices.len(), preset::sync_committee_size());
         assert!(indices.iter().all(|index| *index < 4));
     }
 
@@ -2199,7 +2199,7 @@ mod tests {
     /// member positions are derived from the preset rather than hardcoded:
     /// minimal's epoch is 8 slots and its committees here hold 4 members.
     fn two_committees_per_slot_state() -> BeaconState {
-        let count = (preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2) as usize;
+        let count = (preset::slots_per_epoch() * preset::target_committee_size() * 2) as usize;
         with_signing_validators_at(ForkName::Electra, count)
     }
 
@@ -2248,7 +2248,7 @@ mod tests {
         assert!(warm.key_sums(&state, epoch).is_some());
         assert!(cold.key_sums(&state, epoch).is_none());
 
-        for slot_offset in [0u64, 7, preset::SLOTS_PER_EPOCH - 1] {
+        for slot_offset in [0u64, 7, preset::slots_per_epoch() - 1] {
             let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
             let committee_sets: [&[usize]; 3] = [&[0], &[1], &[0, 1]];
             for named in committee_sets {

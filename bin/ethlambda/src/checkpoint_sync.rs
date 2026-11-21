@@ -619,7 +619,7 @@ fn verify_beacon_checkpoint_state(state: &BeaconState) -> Result<(), CheckpointS
         return Err(CheckpointSyncError::NoValidators);
     }
 
-    let current_epoch = state.slot() / preset::SLOTS_PER_EPOCH;
+    let current_epoch = state.slot() / preset::slots_per_epoch();
     if state.finalized_checkpoint().epoch > current_epoch {
         return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
     }
@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn a_beacon_anchor_with_finalized_epoch_beyond_state_is_rejected() {
         let mut state = beacon_anchor_state();
-        let current_epoch = state.slot() / preset::SLOTS_PER_EPOCH;
+        let current_epoch = state.slot() / preset::slots_per_epoch();
         state.finalized_checkpoint_mut().epoch = current_epoch + 1;
 
         assert!(matches!(

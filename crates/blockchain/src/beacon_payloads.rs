@@ -453,7 +453,7 @@ impl BlockChainServer {
 
         // Children held for this payload build on it by construction.
         if let Some(held) = self.envelopes.blocks_awaiting_parent_payload.remove(&root) {
-            for (child_root, _slot) in held {
+            for child_root in held.into_keys() {
                 self.discard_pending_subtree(child_root);
             }
             self.publish_envelope_queues();

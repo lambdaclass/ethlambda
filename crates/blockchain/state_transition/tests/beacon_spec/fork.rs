@@ -37,7 +37,7 @@ use ethlambda_state_transition::beacon::containers::BeaconState;
 use ethlambda_state_transition::beacon::upgrade::upgrade_state;
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect};
+use super::{Case, collect, preset};
 
 /// Runs one case: decode `pre` in the source fork's shape, upgrade it, and
 /// compare against `post` by `hash_tree_root`.
@@ -78,7 +78,7 @@ fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
 
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect(PRESET, "fork", "fork");
+    let cases = collect(preset(), "fork", "fork");
     let mut trials = vec![super::discovery_trial("fork", cases.len())];
 
     for case in cases {

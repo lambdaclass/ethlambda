@@ -166,12 +166,31 @@ flag unset on a placement that does not cover every subnet.
 
 ### Sync gate
 
-`sync_status.rs` tracks how far the local head lags the slot clock. Past the threshold the
-node reports itself syncing and stops attesting and proposing, since a head derived from a
-partial view is not worth voting for. A hysteresis band stops the state from flapping at the
-boundary, and a network-wide stall (nobody else is ahead either) leaves the node synced so
-its validators can help the chain recover. The same status feeds the `lean_node_sync_status`
-metric and, through a shared controller, the `/lean/v0/node/syncing` endpoint.
+`sync_status.rs` decides whether the node is behind. It is syncing, and stops attesting
+and proposing, when its head trails the slot clock **and** the head its peers report is
+ahead of its own, since a head derived from a partial view is not worth voting for. The
+peers' head is the highest of each connected peer's latest `Status`, re-requested every few
+slots per peer (spread over the interval, so a node with hundreds of peers never asks them
+all at once), not counting a head the node has already imported, nor a report older than
+four refresh intervals, which p2p publishes on `Store::network_head`
+(`crates/net/p2p/src/peer_heads.rs`). The thresholds, and the refresh
+cadence they depend on, are `SyncThresholds` in `crates/net/api/src/sync.rs`, shared by both
+actors. A hysteresis band stops the state from flapping at the boundary, and a network-wide
+stall (nobody else is ahead either) leaves the node synced so its validators can help the
+chain recover. So does starting up before any peer has reported, as in Lighthouse: assuming
+the network is at the clock would idle every node at once whenever all of them are behind it.
+A lead the head does not advance towards for a whole stall window reads as a
+stall too, so a peer claiming a head it never serves cannot idle the node for longer than
+that at one head (two windows around an outage). This departs from leanSpec's rule; see `docs/spec_deviations.md`. The gate is judged
+on every tick and again whenever the head can move between ticks (every lean block arrival,
+every beacon head recompute, `INVALID` `forkchoiceUpdated` verdicts included): on a
+catch-up, range sync puts the whole span into the actor's mailbox at once and the tick
+waits behind all of it, so a gate judged only on the tick kept reading synced until the
+catch-up was over. An import cascade that runs into a new wall-clock slot is judged between
+its blocks as well, beacon running fork choice for it, since each judgment also publishes the
+head slot p2p's range watermark reads (`Store::judged_head_slot`) and a long cascade would
+otherwise look like a flat head there. The same status feeds the `lean_node_sync_status` metric and, through a
+shared controller, the `/lean/v0/node/syncing` endpoint.
 `--disable-duty-sync-gate` reduces the gate to observe-only.
 
 ### Missing parents

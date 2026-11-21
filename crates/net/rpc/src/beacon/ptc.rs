@@ -598,7 +598,9 @@ mod tests {
     use libssz::SszDecode;
     use tower::ServiceExt as _;
 
-    const COUNT: usize = preset::PTC_WINDOW_LENGTH;
+    fn count() -> usize {
+        preset::ptc_window_length()
+    }
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -611,7 +613,7 @@ mod tests {
     /// as the whole committee, so the validator a slot's committee holds is
     /// readable straight off the window layout.
     fn gloas_state() -> BeaconState {
-        let mut state = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let mut state = with_signing_validators_at(ForkName::Gloas, count());
         let BeaconState::Gloas(inner) = &mut state else {
             unreachable!("built as gloas")
         };
@@ -620,8 +622,8 @@ mod tests {
         for slot in 0..inner.block_roots.len() {
             inner.block_roots[slot] = slot_root(slot as u64);
         }
-        for index in 0..preset::PTC_WINDOW_LENGTH {
-            inner.ptc_window[index] = vec![index as u64; preset::PTC_SIZE]
+        for index in 0..preset::ptc_window_length() {
+            inner.ptc_window[index] = vec![index as u64; preset::ptc_size()]
                 .try_into()
                 .expect("built at exactly PTC_SIZE");
         }
@@ -631,7 +633,7 @@ mod tests {
     /// The window index (and so the validator, see [`gloas_state`]) of the
     /// `offset`th slot of `epoch`, for a state in `state_epoch`.
     fn window_index(state_epoch: Epoch, epoch: Epoch, offset: u64) -> u64 {
-        (epoch + 1 - state_epoch) * preset::SLOTS_PER_EPOCH + offset
+        (epoch + 1 - state_epoch) * preset::slots_per_epoch() + offset
     }
 
     /// A store whose head is a gloas block at `state`'s slot with
@@ -893,7 +895,7 @@ mod tests {
         let first_slot = compute_start_slot_at_epoch(head_epoch + 1);
         for duty in &duties {
             let slot: u64 = duty["slot"].as_str().unwrap().parse().unwrap();
-            assert!((first_slot..first_slot + preset::SLOTS_PER_EPOCH).contains(&slot));
+            assert!((first_slot..first_slot + preset::slots_per_epoch()).contains(&slot));
         }
         // The fulu epoch itself has none.
         let reply = request(store, duties_request(head_epoch, &everyone)).await;
@@ -904,7 +906,7 @@ mod tests {
     /// to cross the gloas upgrade) and distinct `block_roots`.
     fn fulu_state() -> BeaconState {
         use ethlambda_state_transition::beacon::helpers::fulu::initialize_proposer_lookahead;
-        let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
+        let mut state = with_signing_validators_at(ForkName::Fulu, count());
         let lookahead = initialize_proposer_lookahead(&state).unwrap();
         let BeaconState::Fulu(fulu) = &mut state else {
             unreachable!("built as fulu")
@@ -932,8 +934,12 @@ mod tests {
     }
 
     fn everyone() -> String {
-        serde_json::to_string(&(0..COUNT as u64).map(|i| i.to_string()).collect::<Vec<_>>())
-            .unwrap()
+        serde_json::to_string(
+            &(0..count() as u64)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     /// The fork epoch's committee is fixed by the last state before the fork,
@@ -1002,7 +1008,7 @@ mod tests {
         );
         for duty in duties {
             let slot: u64 = duty["slot"].as_str().unwrap().parse().unwrap();
-            assert!((fork_start..fork_start + preset::SLOTS_PER_EPOCH).contains(&slot));
+            assert!((fork_start..fork_start + preset::slots_per_epoch()).contains(&slot));
         }
     }
 
@@ -1404,7 +1410,7 @@ mod tests {
             unreachable!("built as gloas")
         };
         inner.slot -= 1;
-        let earlier_member = earlier_state.slot() % preset::SLOTS_PER_EPOCH;
+        let earlier_member = earlier_state.slot() % preset::slots_per_epoch();
         let older = vote(&earlier_state, root, earlier_member, true);
 
         // Not in the head slot's committee: nothing to aggregate it into.
@@ -1445,7 +1451,7 @@ mod tests {
             assert!(aggregate.get("validator_index").is_none());
             // The single seat-holder fills every position of the committee.
             let bits = aggregate["aggregation_bits"].as_str().unwrap();
-            assert_eq!(bits, format!("0x{}", "ff".repeat(preset::PTC_SIZE / 8)));
+            assert_eq!(bits, format!("0x{}", "ff".repeat(preset::ptc_size() / 8)));
         }
 
         // It is the aggregate block production would pack, which only keeps

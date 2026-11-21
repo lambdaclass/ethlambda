@@ -912,7 +912,7 @@ fn attestation_participation_flag_indices(
     verify(is_matching_source, "is_matching_source")?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
     // [EIP-7045]: no `inclusion_delay` bound, unlike altair's own
@@ -961,8 +961,8 @@ pub(crate) fn get_pending_partial_withdrawals(
 ) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
     let epoch = get_current_epoch(state);
     let withdrawals_limit = (prior_withdrawals.len()
-        + preset::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP as usize)
-        .min(preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1);
+        + preset::max_pending_partials_per_withdrawals_sweep() as usize)
+        .min(preset::max_withdrawals_per_payload() - 1);
     verify(
         prior_withdrawals.len() <= withdrawals_limit,
         "get_pending_partial_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
@@ -1042,8 +1042,8 @@ pub(crate) fn get_validators_sweep_withdrawals(
 ) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
     let epoch = get_current_epoch(state);
     let validator_count = state.validator_count() as u64;
-    let validators_limit = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
-    let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD;
+    let validators_limit = validator_count.min(preset::max_validators_per_withdrawals_sweep());
+    let withdrawals_limit = preset::max_withdrawals_per_payload();
     verify(
         prior_withdrawals.len() < withdrawals_limit,
         "get_validators_sweep_withdrawals: len(prior_withdrawals) < withdrawals_limit",
@@ -1189,28 +1189,28 @@ pub fn process_withdrawals(
     }
 
     let validator_count = state.validator_count() as u64;
-    let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
-    {
-        let latest_withdrawal = expected_withdrawals
-            .last()
-            .expect("MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty");
-        latest_withdrawal
-            .validator_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "latest_withdrawal.validator_index + 1",
-            ))?
-            % validator_count
-    } else {
-        let current_cursor =
-            block_ref(state, "process_withdrawals")?.next_withdrawal_validator_index();
-        current_cursor
-            .checked_add(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
-            .ok_or(Error::ArithmeticOverflow(
-                "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
-            ))?
-            % validator_count
-    };
+    let next_validator_index =
+        if expected_withdrawals.len() == preset::max_withdrawals_per_payload() {
+            let latest_withdrawal = expected_withdrawals.last().expect(
+                "MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty",
+            );
+            latest_withdrawal
+                .validator_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow(
+                    "latest_withdrawal.validator_index + 1",
+                ))?
+                % validator_count
+        } else {
+            let current_cursor =
+                block_ref(state, "process_withdrawals")?.next_withdrawal_validator_index();
+            current_cursor
+                .checked_add(preset::max_validators_per_withdrawals_sweep())
+                .ok_or(Error::ArithmeticOverflow(
+                    "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
+                ))?
+                % validator_count
+        };
     *block_mut(state, "process_withdrawals")?.next_withdrawal_validator_index_mut() =
         next_validator_index;
 
@@ -1375,7 +1375,7 @@ pub fn process_withdrawal_request(
         pending_queue_fields(state, "process_withdrawal_request")?
             .pending_partial_withdrawals()
             .len();
-    if pending_partial_withdrawals_len == preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT
+    if pending_partial_withdrawals_len == preset::pending_partial_withdrawals_limit()
         && !is_full_exit_request
     {
         return Ok(());
@@ -1553,7 +1553,7 @@ pub fn process_consolidation_request(
     let pending_consolidations_len = pending_queue_fields(state, "process_consolidation_request")?
         .pending_consolidations()
         .len();
-    if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
+    if pending_consolidations_len == preset::pending_consolidations_limit() {
         return Ok(());
     }
     if get_consolidation_churn_limit_for_fork(state, config, Some(active_balances))?
@@ -2019,7 +2019,7 @@ mod tests {
         // already eligible for an exit or a consolidation by the time a test
         // runs one against it.
         const EPOCHS_PAST_GENESIS: u64 = 300;
-        *state.slot_mut() = EPOCHS_PAST_GENESIS * preset::SLOTS_PER_EPOCH;
+        *state.slot_mut() = EPOCHS_PAST_GENESIS * preset::slots_per_epoch();
 
         for index in 0..count as ValidatorIndex {
             let validator = state.validator_mut(index).unwrap();
@@ -2125,7 +2125,9 @@ mod tests {
         );
     }
 
-    /// Gated to `preset-minimal` only: mainnet's own
+    /// Runs under the minimal preset only (`preset-minimal` makes it the
+    /// preset of a test process that selects none) and returns at once under
+    /// mainnet: mainnet's own
     /// `PENDING_PARTIAL_WITHDRAWALS_LIMIT` is large enough (a fraction over
     /// a hundred million) that actually building a queue at that literal
     /// size would allocate several gigabytes and take seconds, for a check
@@ -2135,9 +2137,14 @@ mod tests {
     /// which is why `preset::MIN_ACTIVATION_BALANCE` and friends throughout
     /// this file are written against whichever preset is active rather than
     /// hardcoded, the same as everywhere else in this module.
+    ///
+    /// A runtime skip rather than a `cfg`, so the default build compiles and
+    /// lints it.
     #[test]
-    #[cfg(feature = "preset-minimal")]
     fn a_full_queue_silently_drops_a_partial_request_but_not_a_full_exit() {
+        if preset::Preset::active() != preset::Preset::Minimal {
+            return;
+        }
         let mut state = electra_state_with_validators(2);
         let config = Config::mainnet();
 
@@ -2148,7 +2155,7 @@ mod tests {
         {
             let mut fields = block_mut(&mut state, "test setup").unwrap();
             let queue = fields.pending_partial_withdrawals_mut();
-            for _ in 0..preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT {
+            for _ in 0..preset::pending_partial_withdrawals_limit() {
                 queue
                     .push(electra::PendingPartialWithdrawal {
                         validator_index: 0,
@@ -2165,7 +2172,7 @@ mod tests {
             .len();
         assert_eq!(
             before_full_queue_len,
-            preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT
+            preset::pending_partial_withdrawals_limit()
         );
 
         // A partial request against the full queue: silently dropped.
@@ -2187,7 +2194,7 @@ mod tests {
                 .unwrap()
                 .pending_partial_withdrawals_mut()
                 .len(),
-            preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT,
+            preset::pending_partial_withdrawals_limit(),
             "the queue must not have grown"
         );
 
@@ -2388,7 +2395,7 @@ mod tests {
         let config = Config::mainnet();
         {
             let mut fields = pending_queue_fields(&mut state, "test setup").unwrap();
-            for _ in 0..preset::PENDING_CONSOLIDATIONS_LIMIT {
+            for _ in 0..preset::pending_consolidations_limit() {
                 fields
                     .push_pending_consolidation(electra::PendingConsolidation {
                         source_index: 0,
@@ -2624,7 +2631,7 @@ mod tests {
         use crate::beacon::helpers::misc::compute_signing_root;
         use crate::beacon::helpers::test_state::sign_for;
 
-        let slot = preset::SLOTS_PER_EPOCH - 1;
+        let slot = preset::slots_per_epoch() - 1;
         let committee = get_beacon_committee(state, slot, 0).unwrap();
         let data = AttestationData {
             slot,

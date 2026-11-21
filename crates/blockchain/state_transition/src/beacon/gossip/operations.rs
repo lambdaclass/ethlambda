@@ -491,7 +491,7 @@ mod tests {
         );
         let at_capella = slot_start_ms(
             &store,
-            config.capella_fork_epoch * crate::beacon::preset::SLOTS_PER_EPOCH,
+            config.capella_fork_epoch * crate::beacon::preset::slots_per_epoch(),
         );
         assert_eq!(cheap_checks(&seen, &store, &change, at_capella), Ok(()));
     }
@@ -520,7 +520,7 @@ mod tests {
         // Past `SHARD_COMMITTEE_PERIOD` epochs since activation.
         let config = crate::beacon::config::Config::mainnet();
         *state.slot_mut() =
-            (config.shard_committee_period + 1) * crate::beacon::preset::SLOTS_PER_EPOCH;
+            (config.shard_committee_period + 1) * crate::beacon::preset::slots_per_epoch();
         let message = shared::VoluntaryExit {
             epoch: 0,
             validator_index: 2,

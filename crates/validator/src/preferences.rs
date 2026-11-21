@@ -783,7 +783,7 @@ mod tests {
     }
 
     fn slot_in(epoch: Epoch, offset: Slot) -> Slot {
-        epoch * preset::SLOTS_PER_EPOCH + offset
+        epoch * preset::slots_per_epoch() + offset
     }
 
     fn submitted(node: &MockBeaconNode) -> Vec<(ForkName, Vec<SignedProposerPreferences>)> {
@@ -1385,7 +1385,7 @@ mod tests {
         let duties = (0..400)
             .map(|position| {
                 let slot = if position % 2 == 0 {
-                    slot_in(GLOAS_EPOCH, (position / 2) % preset::SLOTS_PER_EPOCH)
+                    slot_in(GLOAS_EPOCH, (position / 2) % preset::slots_per_epoch())
                 } else {
                     slot_in(GLOAS_EPOCH + 1 + position, 0)
                 };
@@ -1398,7 +1398,7 @@ mod tests {
 
         // The last slot before gloas: the current epoch is skipped, and every
         // slot of the gloas epoch is still ahead.
-        let current = slot_in(GLOAS_EPOCH - 1, preset::SLOTS_PER_EPOCH - 1);
+        let current = slot_in(GLOAS_EPOCH - 1, preset::slots_per_epoch() - 1);
         service.poll(current, store).await;
 
         let mut sent: Vec<(Slot, u64)> = submitted(&node)
@@ -1410,7 +1410,7 @@ mod tests {
             })
             .collect();
         sent.sort();
-        let first_listed: Vec<(Slot, u64)> = (0..preset::SLOTS_PER_EPOCH)
+        let first_listed: Vec<(Slot, u64)> = (0..preset::slots_per_epoch())
             .map(|offset| (slot_in(GLOAS_EPOCH, offset), 2 * offset))
             .collect();
         assert_eq!(sent, first_listed);
@@ -1573,7 +1573,7 @@ mod tests {
                     .await
             }
         };
-        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1);
+        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::slots_per_epoch() - 1);
         let sent_slots = |from: usize| -> Vec<Slot> {
             let mut slots: Vec<Slot> = submitted(&node)[from..]
                 .iter()
@@ -1636,7 +1636,7 @@ mod tests {
             vec![duty(&pubkeys[0], 3, first_slot)],
         );
         let (service, node) = service(node, settings(Some(FEE_RECIPIENT)));
-        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1);
+        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::slots_per_epoch() - 1);
 
         let published = service
             .publish_epoch(slot_in(GLOAS_EPOCH, 1), GLOAS_EPOCH + 1, &snapshot, &store)
@@ -1683,7 +1683,7 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("submit_proposer_preferences", "syncing".to_string());
-        publish(slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1)).await;
+        publish(slot_in(GLOAS_EPOCH, preset::slots_per_epoch() - 1)).await;
         let key = (slot, root);
         assert_eq!(stages(&service), HashMap::from([(key, "partly")]));
         assert_eq!(
@@ -1746,7 +1746,7 @@ mod tests {
         assert_eq!(stages(&service), HashMap::from([(key, "everywhere")]));
 
         refusing(true);
-        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::SLOTS_PER_EPOCH - 1);
+        let last_of_epoch = slot_in(GLOAS_EPOCH, preset::slots_per_epoch() - 1);
         let counted = service
             .publish_epoch(last_of_epoch, GLOAS_EPOCH + 1, &snapshot, &store)
             .await;

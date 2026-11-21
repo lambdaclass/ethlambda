@@ -17,6 +17,7 @@ pub mod fork_choice;
 pub mod fork_digest;
 pub mod operation;
 pub mod preset;
+pub mod preset_sized;
 pub mod primitives;
 pub mod serde_helpers;
 pub mod signing;
@@ -124,10 +125,11 @@ mod tests {
 
     #[test]
     fn preset_slots_per_epoch_matches_the_selected_preset() {
-        #[cfg(not(feature = "preset-minimal"))]
-        assert_eq!(super::preset::SLOTS_PER_EPOCH, 32);
-        #[cfg(feature = "preset-minimal")]
-        assert_eq!(super::preset::SLOTS_PER_EPOCH, 8);
+        let expected = match super::preset::Preset::active() {
+            super::preset::Preset::Mainnet => 32,
+            super::preset::Preset::Minimal => 8,
+        };
+        assert_eq!(super::preset::slots_per_epoch(), expected);
     }
 
     #[test]

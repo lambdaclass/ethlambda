@@ -182,7 +182,7 @@ pub fn attester_slashing_slot(bytes: &[u8]) -> Result<Slot, DecodeError> {
 
 /// The fork whose rules apply to `slot`.
 pub fn fork_at_slot(config: &Config, slot: Slot) -> ForkName {
-    config.fork_at_epoch(slot / preset::SLOTS_PER_EPOCH)
+    config.fork_at_epoch(slot / preset::slots_per_epoch())
 }
 
 /// Decode a `beacon_block` payload, at the fork its own slot names.
@@ -420,7 +420,7 @@ mod tests {
 
     /// The first slot of `epoch`.
     fn slot_of(epoch: u64) -> Slot {
-        epoch * preset::SLOTS_PER_EPOCH
+        epoch * preset::slots_per_epoch()
     }
 
     fn phase0_block(slot: Slot) -> phase0::SignedBeaconBlock {
@@ -447,10 +447,12 @@ mod tests {
 
     #[test]
     fn the_preset_is_mainnet() {
-        // Every epoch computed here divides by this. If `preset-minimal` ever
-        // leaks into ethlambda-p2p's feature resolution, the beacon wire would
-        // silently compute epochs eight slots wide and pick the wrong fork.
-        assert_eq!(preset::SLOTS_PER_EPOCH, 32);
+        // Every epoch computed in these tests divides by this, and they are
+        // written against mainnet's width. Nothing in this test binary selects
+        // a preset, so if `preset-minimal` ever leaks into ethlambda-p2p's
+        // feature resolution, the default would silently become eight slots
+        // wide and these tests would check the wrong fork boundaries.
+        assert_eq!(preset::slots_per_epoch(), 32);
     }
 
     #[test]

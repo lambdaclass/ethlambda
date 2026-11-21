@@ -1408,7 +1408,7 @@ mod tests {
     async fn an_undecodable_block_at_a_gloas_slot_is_rejected() {
         let mut config = Config::mainnet();
         config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
-        let slot = config.gloas_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let slot = config.gloas_fork_epoch * preset::slots_per_epoch();
 
         assert!(matches!(
             triage_block_under(config, &mismatched_block_bytes(slot)).await,
@@ -1430,7 +1430,7 @@ mod tests {
     async fn an_undecodable_block_at_a_fulu_slot_is_still_rejected_after_the_fork() {
         let mut config = Config::mainnet();
         config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
-        let slot = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let slot = config.fulu_fork_epoch * preset::slots_per_epoch();
 
         assert!(matches!(
             triage_block_under(config, &mismatched_block_bytes(slot)).await,

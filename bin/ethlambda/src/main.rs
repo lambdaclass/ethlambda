@@ -452,6 +452,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let (network_source, bootnodes) = match &network {
         Network::Lean(lean) => (None, lean_bootnodes(lean.bootnodes.as_deref())?),
         Network::Mainnet { mainnet, .. } => {
+            // Resolving selects the preset. A preset value read above this
+            // line would pass unnoticed on mainnet and fail on a minimal
+            // network, so it is refused on both.
+            ethlambda_types::beacon::preset::Preset::require_unread()?;
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
             let source = network::NetworkSource::resolve(&spec)?;
             let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes(), discovery_ip)?;
@@ -1960,8 +1964,8 @@ fn first_config_difference(
     // `persisted`/`supplied` directly); it exists purely to force that
     // choice.
     let Config {
-        // Identity. `preset_base` is compared below: `check_preset` and the
-        // directory's preset byte already pin the compiled preset, and this
+        // Identity. `preset_base` is compared below: `select_preset` and the
+        // directory's preset byte already pin the active preset, and this
         // also pins the stored string, which `/eth/v1/config/spec` reports, to
         // the file's. `config_name` is only a label with no consensus effect,
         // so the caller warns about a changed one rather than refusing it:

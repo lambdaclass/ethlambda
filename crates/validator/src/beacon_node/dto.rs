@@ -34,6 +34,7 @@ use ethlambda_types::beacon::containers::electra::{
 };
 use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
 use ethlambda_types::beacon::fork::ForkName;
+use ethlambda_types::beacon::preset::Preset;
 use ethlambda_types::beacon::primitives::{
     BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, CommitteeIndex, Epoch, Root,
     Slot, ValidatorIndex, Version,
@@ -543,10 +544,11 @@ fn spec_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
 
 /// Build a [`Config`] from a `GET /eth/v1/config/spec` response.
 ///
-/// Starts from the mainnet defaults and overrides only what the response
+/// Starts from the configuration of the preset the node reports
+/// (`PRESET_BASE`, mainnet when absent) and overrides only what the response
 /// names, because a validator client has to work against a network whose fork
-/// schedule differs while the compile-time presets, which fix SSZ list bounds,
-/// necessarily do not.
+/// schedule differs from its preset's defaults. The preset itself is adopted
+/// separately, by [`crate::adopt_preset`].
 ///
 /// Only the keys read below are overridden: the slot length, the duty
 /// offsets, `SHARD_COMMITTEE_PERIOD` and the fork schedule. Every other
@@ -562,7 +564,24 @@ fn spec_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
 /// `GENESIS_FORK_VERSION` rather than `PHASE0_FORK_VERSION`, and it has no
 /// `PHASE0_FORK_EPOCH` at all, since phase0's activation is always epoch 0.
 pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
-    let mut config = Config::mainnet();
+    // The base is the node's preset's own configuration, so a key the node
+    // leaves out keeps that preset's default rather than mainnet's. A node
+    // that names no preset is taken to run mainnet, as every client did
+    // before minimal-preset networks were followed.
+    let preset = match value.get("PRESET_BASE") {
+        None => Preset::Mainnet,
+        Some(field) => {
+            let name = field
+                .as_str()
+                .ok_or_else(|| Error::Decode("config/spec: PRESET_BASE is not a string".into()))?;
+            name.parse().map_err(|_| {
+                Error::Preset(format!(
+                    "the node reports PRESET_BASE: {name}, which this client has no values for"
+                ))
+            })?
+        }
+    };
+    let mut config = Config::for_preset(preset);
 
     // `SLOT_DURATION_MS` first, `SECONDS_PER_SLOT` only as a fallback.
     //

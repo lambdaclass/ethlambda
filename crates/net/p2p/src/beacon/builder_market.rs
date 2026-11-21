@@ -180,19 +180,12 @@ pub(crate) fn publish_proposer_preferences(
     );
 }
 
-/// The wall-clock slot, from the store's config.
-pub(crate) fn wall_slot(server: &P2PServer) -> Slot {
-    let config = server.store.config();
-    let genesis_ms = config.genesis_time_ms();
-    unix_now_ms().saturating_sub(genesis_ms) / config.slot_duration_ms.max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome, RejectReason};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::{Epoch, ExecutionBlockHash};
     use libssz::SszEncode;
 
@@ -273,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn a_far_slot_bid_is_not_current_or_next() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let bid = bid_at(wall_slot(&server) + 1_000);
+        let bid = bid_at(crate::wall_clock_slot(&server.store) + 1_000);
         assert!(matches!(
             triage_execution_payload_bid(&server, &bid.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NotCurrentOrNextSlot))
@@ -283,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn a_bid_with_a_nonzero_payment_is_rejected() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let mut bid = bid_at(wall_slot(&server) + 1);
+        let mut bid = bid_at(crate::wall_clock_slot(&server.store) + 1);
         bid.message.execution_payment = 1;
         assert!(matches!(
             triage_execution_payload_bid(&server, &bid.to_ssz()),
@@ -297,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn a_valid_shaped_bid_is_validated_unless_its_builder_key_was_seen() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let bid = bid_at(wall_slot(&server) + 1);
+        let bid = bid_at(crate::wall_clock_slot(&server.store) + 1);
         let payload = bid.to_ssz();
         match triage_execution_payload_bid(&server, &payload) {
             Dispatch::Validate(Validated::ExecutionPayloadBid {
@@ -320,13 +313,14 @@ mod tests {
     #[tokio::test]
     async fn preferences_are_judged_on_the_clock() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let wall = wall_slot(&server);
+        let wall = crate::wall_clock_slot(&server.store);
         let past = preferences_at(wall.saturating_sub(5));
         assert!(matches!(
             triage_proposer_preferences(&server, &past.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::SlotStarted))
         ));
-        let two_epochs_ahead = preferences_at((wall / SLOTS_PER_EPOCH + 2) * SLOTS_PER_EPOCH + 1);
+        let two_epochs_ahead =
+            preferences_at((wall / slots_per_epoch() + 2) * slots_per_epoch() + 1);
         assert!(matches!(
             triage_proposer_preferences(&server, &two_epochs_ahead.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::BeyondLookahead))
@@ -336,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn preferences_for_a_cached_key_are_already_seen() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let wall = wall_slot(&server);
+        let wall = crate::wall_clock_slot(&server.store);
         let preferences = preferences_at(wall + 2);
         let payload = preferences.to_ssz();
         assert!(matches!(
@@ -389,7 +383,7 @@ mod tests {
         assert_ne!(gloas_digest, fulu_digest);
 
         let kind = beacon_topics::PROPOSER_PREFERENCES;
-        let first_gloas_slot = GLOAS * SLOTS_PER_EPOCH;
+        let first_gloas_slot = GLOAS * slots_per_epoch();
         assert_eq!(
             topic_of(&server, kind, first_gloas_slot),
             Some(beacon_topics::topic_name(gloas_digest, kind))
@@ -409,6 +403,6 @@ mod tests {
         let mut server = unconnected_beacon_server(rollover_config(), 0).await;
         apply(&mut server, GLOAS - 3);
         let kind = beacon_topics::EXECUTION_PAYLOAD_BID;
-        assert_eq!(topic_of(&server, kind, GLOAS * SLOTS_PER_EPOCH), None);
+        assert_eq!(topic_of(&server, kind, GLOAS * slots_per_epoch()), None);
     }
 }

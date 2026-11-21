@@ -62,18 +62,38 @@ use std::path::{Path, PathBuf};
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::BeaconState;
+use ethlambda_state_transition::beacon::preset::Preset;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 use serde::de::DeserializeOwned;
 
-/// The configuration directory whose fixtures match the compiled-in preset.
-pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
-    "minimal"
-} else {
-    "mainnet"
-};
+/// The environment variable naming the preset a run tests: `mainnet` or
+/// `minimal`. Unset runs [`Preset::DEFAULT`].
+pub const PRESET_VAR: &str = "BEACON_SPEC_PRESET";
 
-/// The compiled-in preset with every fork up to and including `case.fork`
+/// Run this process on the preset [`PRESET_VAR`] names, before any runner
+/// reads one.
+///
+/// One build serves both fixture trees: the preset is a runtime choice, so
+/// testing minimal is this selection, not a second compilation. A run is
+/// still one preset, since a process runs one.
+pub fn select_preset() {
+    let Ok(name) = std::env::var(PRESET_VAR) else {
+        return;
+    };
+    let preset: Preset = name
+        .parse()
+        .unwrap_or_else(|_| panic!("{PRESET_VAR}={name} names neither mainnet nor minimal"));
+    Preset::select(preset).expect("the harness selects before anything reads a preset");
+}
+
+/// The configuration directory whose fixtures match the preset this run
+/// tests.
+pub fn preset() -> &'static str {
+    Preset::active().name()
+}
+
+/// The active preset's configuration with every fork up to and including `case.fork`
 /// pulled back to genesis, never a later one.
 ///
 /// The fallback [`case_config`] uses when a case carries no `config.yaml` of
@@ -306,7 +326,7 @@ impl Case {
 
 /// Collects every case for one runner and handler across all supported forks.
 ///
-/// `config` selects the fixture tree; every caller here passes [`PRESET`], since
+/// `config` selects the fixture tree; every caller here passes [`preset`], since
 /// consensus-spec-tests no longer ships a preset-independent `general` tree (see
 /// the module doc). Forks this crate does not implement are skipped, so an
 /// upstream release that adds a fork does not break the build.
@@ -455,7 +475,7 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
     // config now that the BLS/KZG vectors live in `cryptography-specs`, whose
     // flat `<kind>/<handler>/<case>` layout has no fork level for this check
     // to walk in the first place.
-    for config in [PRESET] {
+    for config in [preset()] {
         for entry in read_dir_sorted(&fixture_root().join(config)) {
             if !entry.path().is_dir() {
                 continue;
