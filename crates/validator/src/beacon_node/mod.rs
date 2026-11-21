@@ -375,6 +375,12 @@ pub struct ValidatorDetails {
 
 #[async_trait]
 pub trait BeaconNodeApi: Send + Sync {
+    /// Who this node is, for a log line that names it: its URL for an HTTP
+    /// node, empty for an implementation with nothing to say.
+    fn describe(&self) -> String {
+        String::new()
+    }
+
     /// The chain's genesis time and validators root, needed to compute slots
     /// and signing domains before any duty can be served.
     async fn genesis(&self) -> Result<Genesis>;

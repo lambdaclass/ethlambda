@@ -28,6 +28,7 @@ pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
+pub mod chain_check;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
 pub mod secure_fs;
+pub mod shared_config;
 pub mod signing;
 pub mod slashing_protection;
 pub mod slot_clock;
@@ -102,6 +104,7 @@ use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
+use crate::chain_check::ChainId;
 use crate::duties::DutiesService;
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
@@ -110,6 +113,7 @@ use crate::preferences::PreferencesService;
 use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
+use crate::shared_config::SharedConfig;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -278,10 +282,22 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
 
-    let genesis = beacon_node.genesis().await?;
-    let spec = beacon_node.spec().await?;
-    require_unread_preset()?;
-    adopt_preset(&spec)?;
+    // The chain the client runs on is the first node's that answers; every
+    // other node is checked against it, and a node on another chain is not
+    // used. A fork still in the future is already the compatible nodes'
+    // here, as after every later epoch check. See `chain_check`.
+    let ChainId {
+        genesis,
+        config: spec,
+    } = beacon_node
+        .establish(|reference| {
+            // Right after the reference is chosen and before anything reads a
+            // preset value, which the epoch below does.
+            require_unread_preset()?;
+            adopt_preset(&reference.config)?;
+            Ok(chain_check::current_epoch_of(reference))
+        })
+        .await?;
     info!(
         preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
@@ -293,7 +309,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         "Validator client starting"
     );
 
-    let clock = SlotClock::from_config(genesis.genesis_time, &spec);
+    // One handle for the slot clock and every signing domain, so the chain
+    // check moves them together when the network schedules a fork.
+    let shared_config = SharedConfig::new(spec.clone());
+    let clock = SlotClock::from_shared(genesis.genesis_time, shared_config.clone());
 
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
@@ -341,7 +360,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         doppelganger
     });
 
-    let mut context = SigningContext::new(spec, genesis.genesis_validators_root);
+    let mut context = SigningContext::with_shared(shared_config, genesis.genesis_validators_root);
     if let Some(doppelganger) = &doppelganger {
         context = context.with_doppelganger(doppelganger.clone());
     }
@@ -399,6 +418,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // keymanager server then stops accepting requests and finishes the ones
     // in flight, and `run` waits for it before returning.
     let shutdown = CancellationToken::new();
+    // The per-node chain check and the schedule follower, on a task of their
+    // own so a node that hangs until its timeout never delays a duty.
+    tokio::spawn(chain_check::run(
+        beacon_node.clone(),
+        genesis,
+        clock.clone(),
+        context.clone(),
+        shutdown.clone(),
+    ));
     let mut keymanager = None;
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
@@ -1450,11 +1478,12 @@ async fn refresh_ptc<B: BeaconNodeApi>(
     epoch: u64,
     context: &SigningContext,
 ) {
+    let config = context.config();
     for target in [epoch, epoch + 1] {
-        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+        if config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
             continue;
         }
-        if target == context.config.gloas_fork_epoch && epoch < target {
+        if target == config.gloas_fork_epoch && epoch < target {
             continue;
         }
         if let Err(err) = duties.refresh_ptc(target).await {
@@ -1483,7 +1512,7 @@ async fn retry_missing_ptc<B: BeaconNodeApi>(
     budget: std::time::Duration,
     context: &SigningContext,
 ) {
-    if context.config.fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
+    if context.config().fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
         || duties.holds_ptc(epoch)
     {
         return;
@@ -1524,7 +1553,7 @@ async fn refresh_sync<B: BeaconNodeApi>(
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
-    if context.config.fork_at_epoch(epoch) < ForkName::Altair {
+    if context.config().fork_at_epoch(epoch) < ForkName::Altair {
         return;
     }
     let period = crate::duties::sync_committee_period(epoch);

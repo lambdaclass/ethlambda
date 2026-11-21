@@ -944,7 +944,20 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded. `--enable-doppelganger-protection` (`crate::doppelganger`,
+  unguarded. The client checks every beacon node against the chain it runs on
+  (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
+  the first node that answers at startup, and a node whose genesis, preset, slot
+  duration or any active fork's epoch and version differs is skipped by every call
+  until a later check finds it compatible again. A background task re-asks the
+  unusable nodes, and the ones that missed their last check, every slot and
+  every node each epoch. The startup check, the epoch check and any round that
+  finds a node compatible follow a fork the compatible nodes newly schedule,
+  merged from what each usable node last served
+  (`FallbackBeaconNode::served_configs`; only a fork still in the future may change),
+  into the `SharedConfig` the slot clock and signing domains read, logging the
+  change at `warn`. The spec parser requires the slot duration and every altair
+  to fulu epoch and version rather than defaulting them to mainnet.
+  `--enable-doppelganger-protection` (`crate::doppelganger`,
   Lighthouse's rule) withholds a key's attestations, blocks, RANDAO reveals and
   aggregates from its registration epoch `E` (startup or keymanager import)
   until `/eth/v1/validator/liveness` shows `E + 1` clean at the last slot of

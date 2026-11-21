@@ -369,6 +369,42 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > or in the same keymanager API request that imports the key. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
+### Several beacon nodes: the chain check
+
+The client learns its chain, the preset, genesis, slot duration and fork
+schedule, from `--beacon-nodes` at startup: the reference is the first node in
+list order that answers both `/eth/v1/beacon/genesis` and
+`/eth/v1/config/spec`. Startup fails when none does. A response without the slot
+duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
+altair to fulu is refused rather than filled in from mainnet; only gloas may be
+absent, meaning unscheduled.
+
+Every other node is compared with the reference, and one that differs is not
+used: not for a duty, not for failover, not for a subscription. The comparison
+names the first field that differs: `PRESET_BASE`, `genesis_time`,
+`genesis_validators_root`, the slot duration, `GENESIS_FORK_VERSION`, or the
+epoch or version of a fork. A fork may differ only while it is still in the
+future under both schedules, which is how a node upgraded ahead of the others
+stays in use. A node that did not answer at startup is not used until a check
+has verified it. The warning names the node and the field, when the state
+changes and then at most once per epoch. If no node is usable, every request
+fails with an error that says no configured node is on the client's chain.
+
+A background task, separate from the duty loop, repeats the check: every slot for
+the nodes not in use and the ones that did not answer their last check, and for
+every node at the first slot of each epoch. After the startup check, each epoch
+check, and any check in between that finds a node on the client's chain, a fork
+the compatible nodes schedule and the client does not have yet is adopted by the
+slot clock and every signing domain together, and the client logs at `warn`
+which fields moved. A fork scheduled by one node and not another takes the
+lowest epoch, with a warning naming the nodes; the node without it stops being
+used when the fork's epoch arrives. A node that stops answering keeps its say in
+that for one more epoch and then loses it, so an unreachable node cannot hold a
+fork at an epoch the network has postponed. A fork that is already active is never moved:
+a node that reports another epoch or version for it is on another chain. The
+client does not need a restart for a fork the network schedules after it
+started.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
