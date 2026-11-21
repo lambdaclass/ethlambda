@@ -470,6 +470,10 @@ pub(crate) fn payload_attributes_event(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Lean => return Ok(None),
+        // PQ blocks are produced through their own endpoint
+        // (`pq_blocks/{slot}`), which this preparation does not model, and
+        // EIP-8483 is not followed.
+        ForkName::Eip8483 | ForkName::Pq => return Ok(None),
     };
     Ok(Some(PayloadAttributesEvent::new(fork, data)))
 }

@@ -3006,6 +3006,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 0,
             slot: 3200,
+            is_aggregator: None,
         }
     }
 
