@@ -27,7 +27,7 @@ use crate::beacon_node::dto::{
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
     ValidatorEntry, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -225,6 +225,14 @@ pub struct MockBeaconNode {
     /// reason and records nothing: an exit the node judged invalid, as
     /// opposed to a node that could not be reached (`failures`).
     pub exit_refusal: Option<String>,
+    /// The (epoch, validator) pairs `liveness` answers live; every other pair
+    /// it is asked about is answered not live.
+    pub live: Mutex<Vec<(Epoch, ValidatorIndex)>>,
+    /// Every `liveness` request that got past the configured failures and the
+    /// syncing check, as (epoch, indices), in call order.
+    pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
+    /// How long `liveness` takes before it answers, as a hung node would.
+    pub liveness_delay: Option<std::time::Duration>,
 }
 
 impl MockBeaconNode {
@@ -446,6 +454,12 @@ impl MockBeaconNode {
     /// Make `produce_block` wait for a permit from `gate` before it answers.
     pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.produce_gate = Some(gate);
+        self
+    }
+
+    /// Make `liveness` take `delay` before it answers.
+    pub fn with_liveness_delay(mut self, delay: std::time::Duration) -> Self {
+        self.liveness_delay = Some(delay);
         self
     }
 
@@ -766,6 +780,11 @@ impl MockBeaconNode {
     /// `fail_everything` rejects is not counted.
     pub fn proposer_duties_call_count(&self) -> usize {
         *self.proposer_duties_calls.lock().expect("lock")
+    }
+
+    /// The `liveness` requests answered so far, in call order.
+    pub fn liveness_requests(&self) -> Vec<(Epoch, Vec<ValidatorIndex>)> {
+        self.liveness_requests.lock().expect("lock").clone()
     }
 
     /// How many times `attestation_data` has been called, successes and
@@ -1373,5 +1392,43 @@ impl BeaconNodeApi for MockBeaconNode {
             self.set_validator_details(Some(details));
         }
         Ok(())
+    }
+
+    /// Honours the trait's contracts the way a real implementation does: an
+    /// empty request is answered without asking, and a syncing or optimistic
+    /// node answers `BeaconNodeSyncing`. Each epoch asked about is recorded
+    /// as its own request, as it is one on the wire.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        // Ahead of the configured failures: an empty request never reaches
+        // a node, so no node can fail it.
+        if indices.is_empty() {
+            return Ok(vec![Vec::new(); epochs.len()]);
+        }
+        if let Some(delay) = self.liveness_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.guard("liveness")?;
+        if self.syncing || self.optimistic {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        let live = self.live.lock().expect("lock");
+        let mut requests = self.liveness_requests.lock().expect("lock");
+        Ok(epochs
+            .iter()
+            .map(|&epoch| {
+                requests.push((epoch, indices.to_vec()));
+                indices
+                    .iter()
+                    .map(|&index| Liveness {
+                        index,
+                        is_live: live.contains(&(epoch, index)),
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
