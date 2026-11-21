@@ -97,7 +97,10 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     discovery::{
         DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
+        dial::{
+            DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer,
+            report_peer_connected, report_peer_disconnected,
+        },
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
@@ -2751,6 +2754,7 @@ async fn handle_swarm_event(
                 let wall_slot = wall_clock_slot(&server.store);
                 server.peer_heads.begin_status_request(peer_id, wall_slot);
                 server.refresh_peer_metrics();
+                report_peer_connected(server, &peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
                     server.resolve_node_name(Some(&peer_id)),
@@ -2849,6 +2853,7 @@ async fn handle_swarm_event(
                 let direction = server
                     .remove_connected_peer(&peer_id)
                     .unwrap_or(closed_direction);
+                report_peer_disconnected(server, &peer_id);
                 forget_discovered_peer(server, &peer_id);
                 // Keeps the peer's suspicion and range-failure run: a reconnect
                 // must not shed them (see `PeerHeads::forget`).
