@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-84108850.js";
+            window.path_to_searchindex_js = "searchindex-bcc78702.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -367,8 +367,9 @@ it again. Lowering a watermark is only safe for a key that has not signed
 past the value written. The same holds for a clock that jumps forward: the
 target is pinned to the slot the local clock asked for, so a beacon node
 that answers for a slot far ahead lets the record run ahead of the chain.
-A bound against the clock would be circular; the guard is the beacon
-node’s own view of the head, which doppelganger protection will bring.</li>
+A bound against the clock would be circular; the guard would be the beacon
+node’s own view of the head, which nothing here checks the clock against
+yet.</li>
 <li><strong>No checksum, and rewritten minimal at every start:</strong> the record is an
 EIP-3076 minimal interchange and nothing more, by design: readable by other
 tools and editable by the operator, which the hand edit above relies on. A
@@ -382,8 +383,11 @@ registers them as never having signed, and a key imported through the
 keymanager API with no history is registered the same way before it is
 loaded. Nothing here stops such a key from signing again what it signed
 elsewhere a moment ago, so the flag is only for keys that have signed nothing
-anywhere for at least two epochs; the migration window is doppelganger
-protection’s to close, which this client does not have yet.</li>
+anywhere for at least two epochs. <code>--enable-doppelganger-protection</code> narrows
+that migration window: with it on, such a key signs no attestation or block
+until the beacon network has seen it silent for a full epoch, though like any
+doppelganger check it cannot see a client that is down while it looks (see
+<a href="./cli.html#doppelganger-protection">Doppelganger protection</a>).</li>
 <li><strong>Messages outside the rule:</strong> sync committee messages and contributions
 are not slashable, and are not recorded. A gloas proposer also signs an
 execution payload envelope, and a payload timeliness committee member signs

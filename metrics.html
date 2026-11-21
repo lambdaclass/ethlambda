@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-84108850.js";
+            window.path_to_searchindex_js = "searchindex-bcc78702.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1196,6 +1196,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_sync_contributions_published_total</code></td><td>Counter</td><td>Sync committee contributions this client published as an aggregator. Bursty, like <code>aggregates_published_total</code></td></tr>
 <tr><td><code>ethlambda_validator_sync_contribution_failures_total</code></td><td>Counter</td><td>Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted</td></tr>
 <tr><td><code>ethlambda_validator_sync_duties_held</code></td><td>Gauge</td><td>Sync committee duties held for the current period</td></tr>
+<tr><td><code>ethlambda_validator_doppelganger_detecting</code></td><td>Gauge</td><td>Keys doppelganger protection still withholds attestations and blocks for (<code>--enable-doppelganger-protection</code>). Non-zero for two to three epochs after a start or an import, then zero; a key that stays here has no validator index yet, or its beacon nodes keep failing the liveness query. Always zero with the protection off</td></tr>
+<tr><td><code>ethlambda_validator_doppelganger_check_failures_total</code></td><td>Counter</td><td>Doppelganger checks (one a slot while any key is withheld) that got no liveness answer, because a query failed or every beacon node was syncing. Only a failure at an epoch’s last slot costs anything: it pushes the withheld keys’ first signature back an epoch, and is logged at error. A count that climbs every slot is a beacon node that does not serve <code>/eth/v1/validator/liveness</code>, or one that is down</td></tr>
 <tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
 <tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
 <tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
