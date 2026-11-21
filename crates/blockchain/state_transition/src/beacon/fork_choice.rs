@@ -170,7 +170,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ethlambda_storage::{CacheKey, ForkCheckpoints, ProtoArrayError, StorageBackend, WeightRules};
+use ethlambda_storage::{
+    CacheKey, ForkCheckpoints, ProtoArrayError, StorageBackend, TargetBalances, WeightRules,
+};
 use ethlambda_types::ShortRoot;
 use tracing::{debug, error, warn};
 
@@ -182,7 +184,8 @@ use crate::beacon::containers::{bellatrix, deneb, electra, fulu, gloas, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch,
+    ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt, get_active_validator_indices,
+    get_block_root, get_current_epoch,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
@@ -191,6 +194,9 @@ use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_start_slot_at_epoch, is_valid_merkle_branch,
 };
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
+use crate::beacon::helpers::target_balances::{
+    TargetBalanceDelta, compute_target_balances, totals_from_parent, tracks_epoch,
+};
 use crate::beacon::kzg;
 use crate::beacon::lean_boundary::{lean_block_unreachable, lean_fork_unreachable};
 use crate::beacon::preset;
@@ -199,6 +205,7 @@ use crate::beacon::primitives::{
     ValidatorIndex,
 };
 use crate::beacon::stf;
+use crate::beacon::stf::epoch::justification::JustificationState;
 use crate::metrics;
 
 // ---------------------------------------------------------------------------
@@ -628,7 +635,27 @@ pub enum DataAvailability {
         proofs: Vec<KzgProof>,
     },
     /// Fulu's shape: the column sidecars sampled for this block.
+    ///
+    /// [`is_data_available_columns`] runs the specification's full check on
+    /// every one of them, KZG batch included. This is what the fixture suites
+    /// supply, so they keep exercising the real check.
     Columns(Vec<fulu::DataColumnSidecar>),
+    /// Fulu's shape, when the caller has already verified every sampled column
+    /// for this block and holds no sidecars to show for it.
+    ///
+    /// Constructing this is a promise: each sidecar this node samples for the
+    /// block passed [`verify_data_column_sidecar`], the inclusion proof and
+    /// [`verify_data_column_sidecar_kzg_proofs`], and was stored under the
+    /// block's own root. Only a caller that gates every write of those
+    /// sidecars on those checks may make it (the chain actor does, by storing
+    /// only what the p2p layer's column checks accepted and its own proposal's
+    /// columns, which [`crate::beacon::data_columns::verified_sidecars`]
+    /// checked before they were published), since
+    /// [`is_data_available_columns`] takes it on trust and runs nothing. It
+    /// exists so import does not decode every stored sidecar and repeat the
+    /// KZG batch the sidecar already paid for on arrival; a caller with
+    /// unchecked sidecars must pass [`Self::Columns`] instead.
+    ColumnsVerified,
 }
 
 /// What an execution client said about the payload of the block being imported
@@ -1054,11 +1081,14 @@ pub fn advance_to_epoch_start(
 /// the precomputed epoch-boundary state when the block crosses into an epoch
 /// and one is cached.
 ///
-/// Returns the copy with the transition's outcome, since a failed transition
-/// still leaves the caller a state to inspect. Both starting points reach the
-/// same post-state: the precomputed one is what `process_slots` would produce
-/// from the parent. Either way the copy is independent, so a failing block
-/// cannot corrupt a cached entry.
+/// Returns the post-state, or the error and no state: a failed transition
+/// leaves its copy partly applied (the operations before the failing check,
+/// and the attestations and sync aggregate whose signatures were deferred to
+/// the end of the block; see `stf::signatures`), and dropping it here is what
+/// keeps any caller from reading one. Both starting points reach the same
+/// post-state: the precomputed one is what `process_slots` would produce from
+/// the parent. Either way the copy is independent, so a failing block cannot
+/// corrupt a cached entry.
 ///
 /// This is also where the epoch-boundary balances of a crossing block are
 /// built (see [`cache_boundary_balances`]): a block with empty slots between
@@ -1080,7 +1110,14 @@ fn transition_block(
     config: &Config,
     engine: &stf::ExecutionEngine,
     caches: stf::BlockCaches<'_>,
-) -> (BeaconState, Result<()>) {
+    options: stf::block::BlockProcessingOptions,
+) -> Result<BeaconState> {
+    // Every STF phase observed below is the import's, and none of it belongs
+    // to the epoch precompute worker, which runs `process_epoch` on its own
+    // thread at the same time and so never sees this guard. See
+    // `metrics::StfContext` for why the series is split by caller.
+    let _import_context = metrics::import_context();
+
     let block_slot = signed_block.slot();
     let epoch = compute_epoch_at_slot(block_slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -1098,32 +1135,32 @@ fn transition_block(
     else {
         let mut state = parent_state.clone();
         if !crosses_with_empty_slots {
-            let outcome = stf::state_transition(
+            stf::state_transition_with_options(
                 &mut state,
                 signed_block,
                 validate_result,
                 config,
                 engine,
                 caches,
-            );
-            return (state, outcome);
+                options,
+            )?;
+            return Ok(state);
         }
         // The same `process_slots` steps `state_transition` would run, split
         // at the epoch start so the boundary state can be read in between.
-        let outcome = stf::process_slots(&mut state, epoch_start, config)
-            .inspect(|()| cache_boundary_balances(store, boundary, &state))
-            .and_then(|()| stf::process_slots(&mut state, block_slot, config))
-            .and_then(|()| {
-                stf::apply_block(
-                    &mut state,
-                    signed_block,
-                    validate_result,
-                    config,
-                    engine,
-                    caches,
-                )
-            });
-        return (state, outcome);
+        stf::process_slots(&mut state, epoch_start, config)?;
+        cache_boundary_balances(store, boundary, &state);
+        stf::process_slots(&mut state, block_slot, config)?;
+        stf::apply_block_with_options(
+            &mut state,
+            signed_block,
+            validate_result,
+            config,
+            engine,
+            caches,
+            options,
+        )?;
+        return Ok(state);
     };
 
     if crosses_with_empty_slots {
@@ -1132,22 +1169,19 @@ fn transition_block(
     let mut state = (*precomputed).clone();
     // Only the slots skipped past the boundary are left to advance; none when
     // the block sits on the boundary itself.
-    let outcome = if state.slot() < block_slot {
-        stf::process_slots(&mut state, block_slot, config)
-    } else {
-        Ok(())
+    if state.slot() < block_slot {
+        stf::process_slots(&mut state, block_slot, config)?;
     }
-    .and_then(|()| {
-        stf::apply_block(
-            &mut state,
-            signed_block,
-            validate_result,
-            config,
-            engine,
-            caches,
-        )
-    });
-    (state, outcome)
+    stf::apply_block_with_options(
+        &mut state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        options,
+    )?;
+    Ok(state)
 }
 
 /// The precomputed epoch-boundary state an import can resume from, if any.
@@ -1339,8 +1373,8 @@ pub fn get_forkchoice_store(
     match anchor_rules {
         ForkRules::Gloas => {
             store.set_gloas_block_timeliness(anchor_root, [true, true]);
-            store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(anchor_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(anchor_root, vec![None; preset::ptc_size()]);
         }
         ForkRules::PreGloas => {}
     }
@@ -1463,7 +1497,7 @@ pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64)
 /// The arithmetic of [`calculate_committee_fraction`], for a caller that
 /// already holds the total (the [`JustifiedBalances`] snapshot's own).
 pub fn committee_fraction(total_balance: Gwei, committee_percent: u64) -> Gwei {
-    let committee_weight = total_balance / preset::SLOTS_PER_EPOCH;
+    let committee_weight = total_balance / preset::slots_per_epoch();
     committee_weight.saturating_mul(committee_percent) / 100
 }
 
@@ -1560,21 +1594,51 @@ fn cache_first_slot_balances(store: &Store, post_state: &BeaconState, block_root
     cache_boundary_balances(store, checkpoint, post_state);
 }
 
+/// The flat balances of `checkpoint`'s state, from the same per-checkpoint
+/// cache [`justified_balances`] reads, built from [`checkpoint_state`] and
+/// cached on a miss.
+///
+/// For the Fast Confirmation Rule, whose balance sources are checkpoint
+/// states too (the observed justified checkpoints and the current target):
+/// reading them here means a registry pass once per checkpoint, usually
+/// already paid at the boundary import, rather than once per run. Not counted
+/// in the justified-balances lookup metric, which is about the head's reads.
+pub fn checkpoint_balances(
+    store: &Store,
+    checkpoint: &Checkpoint,
+    config: &Config,
+) -> Result<Arc<JustifiedBalances>> {
+    if let Some(balances) = store.justified_balances(checkpoint) {
+        return Ok(balances);
+    }
+    let state = checkpoint_state(store, checkpoint, config)?;
+    let balances = Arc::new(build_justified_balances(*checkpoint, &state));
+    store.insert_justified_balances(Arc::clone(&balances));
+    Ok(balances)
+}
+
 /// One in-order pass over `state`'s registry: each validator's vote weight
 /// (zero if inactive or slashed), its raw effective balance in increments, and,
 /// in the same pass, the sum of the vote weights, which is the total
 /// [`calculate_committee_fraction`] divides (saturating, floored at one
-/// increment).
-fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> JustifiedBalances {
+/// increment), plus the active set's own figures: the active validators the
+/// vote weight zeroes for being slashed, and the total active balance.
+pub(crate) fn build_justified_balances(
+    checkpoint: Checkpoint,
+    state: &BeaconState,
+) -> JustifiedBalances {
     let _timing = metrics::time_justified_balances_build();
     // Activity at the state's own epoch, as `get_weight` reads it; not asserted
     // equal to `checkpoint.epoch`, which the unit-test stores do not keep.
     let epoch = get_current_epoch(state);
     let mut total: Gwei = 0;
+    let mut total_active: Gwei = 0;
+    let mut active_slashed: Vec<ValidatorIndex> = Vec::new();
     let mut increments: Vec<u16> = Vec::new();
     let balances = state
         .iter_validators()
-        .map(|validator| {
+        .enumerate()
+        .map(|(index, validator)| {
             // An effective balance is a whole number of increments no larger
             // than `MAX_EFFECTIVE_BALANCE_ELECTRA`; the snapshot's exactness
             // depends on it.
@@ -1587,6 +1651,12 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
                 u16::try_from(validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT)
                     .expect("effective balance fits u16 increments"),
             );
+            if is_active_validator(validator, epoch) {
+                total_active = total_active.saturating_add(validator.effective_balance);
+                if validator.slashed {
+                    active_slashed.push(index as ValidatorIndex);
+                }
+            }
             let balance = vote_balance(validator, epoch);
             total = total.saturating_add(balance);
             balance
@@ -1597,6 +1667,8 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
         balances,
         total.max(preset::EFFECTIVE_BALANCE_INCREMENT),
         increments.into(),
+        active_slashed.into(),
+        total_active,
     )
 }
 
@@ -2313,7 +2385,11 @@ fn boost_reaches_the_descent(
 /// blocks, which weighs everything. Why each term is there, and why the least
 /// is the finalized block's slot on a live node, is argued once, in
 /// [`compute_node_weights`]'s `# The bound` section.
-fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
+///
+/// The Fast Confirmation Rule reads the cached weights over the same window,
+/// which holds every block it scores (all at or above the finalized one), and
+/// which the head's own read has just shown readable.
+pub(crate) fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
     let slot_of = |root: Root| index.get(&root).map_or(0, |&(slot, _)| slot);
     let mut bound = slot_of(store.beacon_finalized_checkpoint().root)
         .min(slot_of(store.beacon_justified_checkpoint().root));
@@ -2781,11 +2857,22 @@ fn walk_head(
 /// the committees of a weak parent's slot, and this runs every slot, so a
 /// cache of its own would recompute every committee on every call.
 pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
+    get_head_node_with_index(store, config, &store.block_index())
+}
+
+/// [`get_head_node`] over an `index` the caller built
+/// ([`Store::block_index`]), so a caller that needs the index again afterwards
+/// (the Fast Confirmation Rule, run right after the head) scans `LiveChain`
+/// once.
+pub fn get_head_node_with_index(
+    store: &Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<ForkChoiceNode> {
     let current_slot = get_current_slot(store, config);
     let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
-    let index = store.block_index();
     let committees = store.committee_cache();
-    walk_head(store, &index, config, &committees, rules)
+    walk_head(store, index, config, &committees, rules)
 }
 
 /// [`get_head_node`], recorded as the store's own head.
@@ -2807,7 +2894,18 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// that is empty whenever the head did not move, set against a whole weighted
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
-    let head = get_head_node(store, config)?;
+    let index = store.block_index();
+    get_head_with_index(store, config, &index)
+}
+
+/// [`get_head`] over an `index` the caller built; see
+/// [`get_head_node_with_index`].
+pub fn get_head_with_index(
+    store: &mut Store,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<Root> {
+    let head = get_head_node_with_index(store, config, index)?;
     // Recorded with its root, so a reader can tell which head the status is
     // for whichever of the two writes it sees first.
     store.set_head_payload_status(head.root, head.payload_status);
@@ -2935,7 +3033,7 @@ pub fn is_head_late(store: &Store, head_root: Root) -> Result<bool> {
 /// Whether `slot` is not the first slot of its epoch, i.e. the proposer
 /// shuffling in effect for it cannot change from reorging one slot.
 pub fn is_shuffling_stable(slot: Slot) -> bool {
-    !slot.is_multiple_of(preset::SLOTS_PER_EPOCH)
+    !slot.is_multiple_of(preset::slots_per_epoch())
 }
 
 /// Whether `head_root` and `parent_root` would cast the same FFG vote if
@@ -3453,7 +3551,7 @@ pub fn payload_timeliness(store: &Store, root: Root, timely: bool) -> Result<boo
 
     let votes: Vec<bool> = vote.into_iter().flatten().collect();
     let matching = votes.iter().filter(|&&v| v == timely).count() as u64;
-    Ok(matching > preset::PAYLOAD_TIMELY_THRESHOLD)
+    Ok(matching > preset::payload_timely_threshold())
 }
 
 /// `payload_data_availability` (gloas `fork-choice.md`): whether `root`'s
@@ -3480,7 +3578,7 @@ pub fn payload_data_availability(store: &Store, root: Root, available: bool) -> 
 
     let votes: Vec<bool> = vote.into_iter().flatten().collect();
     let matching = votes.iter().filter(|&&v| v == available).count() as u64;
-    Ok(matching > preset::DATA_AVAILABILITY_TIMELY_THRESHOLD)
+    Ok(matching > preset::data_availability_timely_threshold())
 }
 
 /// `get_parent_payload_status` (gloas `fork-choice.md`): whether `block`
@@ -3629,19 +3727,29 @@ pub fn get_supported_node(store: &Store, message: LatestMessage) -> Result<ForkC
         .get_signed_block(&message.root)
         .expect("get")
         .ok_or(Error::SpecAssert("message.root in store.blocks"))?;
-    let payload_status = if block.slot() < message.slot {
-        if is_pre_gloas(&block) || message.payload_present {
+    Ok(ForkChoiceNode {
+        root: message.root,
+        payload_status: supported_payload_status(block.slot(), is_pre_gloas(&block), &message),
+    })
+}
+
+/// [`get_supported_node`]'s payload status, given the voted-for block's slot
+/// and whether it is pre-gloas, for a caller that already has both and should
+/// not decode the block to get them.
+pub fn supported_payload_status(
+    block_slot: Slot,
+    block_is_pre_gloas: bool,
+    message: &LatestMessage,
+) -> PayloadStatus {
+    if block_slot < message.slot {
+        if block_is_pre_gloas || message.payload_present {
             PayloadStatus::Full
         } else {
             PayloadStatus::Empty
         }
     } else {
         PayloadStatus::Pending
-    };
-    Ok(ForkChoiceNode {
-        root: message.root,
-        payload_status,
-    })
+    }
 }
 
 /// `is_previous_slot_payload_decision` (gloas `fork-choice.md`): whether
@@ -4278,7 +4386,7 @@ pub fn is_data_available_blobs(
     let (blobs, proofs) = match evidence {
         DataAvailability::Blobs { blobs, proofs } => (blobs.as_slice(), proofs.as_slice()),
         DataAvailability::NotRequired => (&[][..], &[][..]),
-        DataAvailability::Columns(_) => {
+        DataAvailability::Columns(_) | DataAvailability::ColumnsVerified => {
             return Err(Error::SpecAssert(
                 "a deneb or electra block's data availability is judged on blobs",
             ));
@@ -4493,10 +4601,13 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// required columns have been sampled" must reject the block itself rather
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
+///
+/// [`DataAvailability::ColumnsVerified`] is accepted without running anything:
+/// its constructor promised the same checks already ran on each sidecar.
 pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
     let sidecars = match evidence {
         DataAvailability::Columns(sidecars) => sidecars,
-        DataAvailability::NotRequired => return Ok(true),
+        DataAvailability::NotRequired | DataAvailability::ColumnsVerified => return Ok(true),
         DataAvailability::Blobs { .. } => {
             return Err(Error::SpecAssert(
                 "a fulu block's data availability is judged on column sidecars",
@@ -4552,31 +4663,25 @@ pub fn is_data_available_gloas_columns(
 /// already having the checkpoint its own chain is clearly heading towards,
 /// rather than being stuck with whatever its post-state's
 /// `current_justified_checkpoint` was at the moment it was imported.
+///
+/// `extended_totals` is the block's unslashed target balances when the caller
+/// derived them from its parent's cached totals (see
+/// [`totals_from_parent`]); `None` makes this scan the registry once and
+/// cache the result.
 pub fn compute_pulled_up_tip(
     store: &mut Store,
     block_root: Root,
     block_slot: Slot,
     config: &Config,
+    extended_totals: Option<TargetBalances>,
 ) -> Result<()> {
-    // `get_state` hands back a shared `Arc`, so this clones out of it,
-    // matching the specification's own `.copy()`: the clone advances to the
-    // next epoch boundary as a throwaway, and the store's own cached entry
-    // for `block_root` must be left exactly as the block itself produced it.
     let state = store
         .get_state(&block_root)
         .expect("get")
         .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
-    let mut state = (*state).clone();
 
-    // Through the fork-dispatching wrapper rather than phase0's version
-    // directly. Altair rewrote this step to read participation flags instead of
-    // replaying stored attestations, so calling phase0's against an altair or
-    // later state fails outright, which is what made every `fork_choice` case
-    // that crosses an epoch boundary fail.
-    stf::epoch::process_justification_and_finalization(&mut state, config)?;
-
-    let current_justified = state.current_justified_checkpoint();
-    let finalized = state.finalized_checkpoint();
+    let (current_justified, finalized) =
+        pulled_up_checkpoints(store, &state, block_root, config, extended_totals)?;
 
     store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
@@ -4591,6 +4696,96 @@ pub fn compute_pulled_up_tip(
         update_checkpoints(store, current_justified, finalized);
     }
     Ok(())
+}
+
+/// The `(current_justified, finalized)` checkpoints `state` heads towards, the
+/// specification's `process_justification_and_finalization` run on a copy.
+///
+/// From altair on this clones nothing: the step reads and writes a handful of
+/// fields, so it runs on a [`JustificationState`] extracted from `state` and
+/// reads the total active balance from the store's cache. The registry is
+/// scanned only when `extended_totals` could not supply the two target
+/// balances. Phase0 keeps the specification's own shape, since it replays
+/// stored pending attestations instead of reading flags.
+///
+/// In debug builds every call also runs the full path and asserts it agrees,
+/// totals included, so the fork choice fixtures check the incremental ones on
+/// each block.
+fn pulled_up_checkpoints(
+    store: &Store,
+    state: &BeaconState,
+    block_root: Root,
+    config: &Config,
+    extended_totals: Option<TargetBalances>,
+) -> Result<(Checkpoint, Checkpoint)> {
+    if state.fork_name() == ForkName::Phase0 {
+        return full_pulled_up_checkpoints(state, config);
+    }
+
+    let mut justification = JustificationState::from_state(state);
+    if tracks_epoch(justification.current_epoch) {
+        let totals = match extended_totals {
+            Some(totals) => {
+                // Only an extended total is checked: a scanned one would be
+                // compared with a second copy of the same scan.
+                #[cfg(debug_assertions)]
+                assert_eq!(
+                    totals,
+                    compute_target_balances(state)?,
+                    "incremental target balances diverged from a full scan"
+                );
+                totals
+            }
+            None => compute_target_balances(state)?,
+        };
+        store.target_balance_cache().insert(block_root, totals);
+
+        // Floored exactly as `ParticipationTotals` floors its three totals;
+        // the cached total active balance is floored already.
+        let floor = |total: Gwei| total.max(preset::EFFECTIVE_BALANCE_INCREMENT);
+        let total_active_balance = store.active_balance_cache().total_active_balance(state)?;
+        justification.weigh(
+            total_active_balance,
+            floor(totals.previous),
+            floor(totals.current),
+            |epoch| get_block_root(state, epoch),
+        )?;
+    }
+
+    let outcome = (
+        justification.current_justified_checkpoint,
+        justification.finalized_checkpoint,
+    );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        outcome,
+        full_pulled_up_checkpoints(state, config)?,
+        "state-free pulled-up tip diverged from the specification's copy"
+    );
+    Ok(outcome)
+}
+
+/// [`pulled_up_checkpoints`] the way the specification states it: advance a
+/// copy of `state` through `process_justification_and_finalization`.
+///
+/// `get_state` hands back a shared `Arc`, so the copy matches the
+/// specification's own `.copy()`: the store's cached entry for the block must
+/// be left exactly as the block itself produced it. Through the
+/// fork-dispatching wrapper rather than phase0's version directly: altair
+/// rewrote this step to read participation flags instead of replaying stored
+/// attestations, so calling phase0's against an altair or later state fails
+/// outright, which is what made every `fork_choice` case that crosses an epoch
+/// boundary fail.
+fn full_pulled_up_checkpoints(
+    state: &BeaconState,
+    config: &Config,
+) -> Result<(Checkpoint, Checkpoint)> {
+    let mut state = state.clone();
+    stf::epoch::process_justification_and_finalization(&mut state, config)?;
+    Ok((
+        state.current_justified_checkpoint(),
+        state.finalized_checkpoint(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -5086,7 +5281,7 @@ pub fn on_block(
 /// builds with debug assertions (the test suite's `release-fast` included)
 /// check it: whenever [`on_block_speculative`] uses a speculation it also runs
 /// the transition itself and panics unless both agree on the outcome and, for
-/// a success, on the post-state root.
+/// a success, on the post-state root and the target-balance delta.
 pub struct SpeculativeTransition {
     block_root: Root,
     parent_root: Root,
@@ -5094,8 +5289,14 @@ pub struct SpeculativeTransition {
     /// [`Self::stands_in_for`] compares it with the one `on_block` would pick
     /// rather than restating which verdicts that is.
     engine: stf::ExecutionEngine,
-    state: BeaconState,
-    outcome: Result<()>,
+    /// What [`transition_block`] returned: the post-state, or the error alone.
+    transition: Result<BeaconState>,
+    /// What the transition's attestations added to the unslashed target
+    /// balances, which the import reads after the transition to extend the
+    /// parent's cached totals (see `helpers::target_balances`). A used
+    /// speculation's transition never runs again, so its delta has to come
+    /// with it.
+    target_delta: TargetBalanceDelta,
 }
 
 impl SpeculativeTransition {
@@ -5124,25 +5325,30 @@ impl SpeculativeTransition {
 
     /// Panics unless `fresh`, the transition `on_block` computed itself, agrees
     /// with this speculation: the same outcome and, when it succeeded, the same
-    /// post-state root.
+    /// post-state root and the same target-balance delta (`fresh_delta`, what
+    /// that transition collected).
     ///
     /// Outcomes are compared through their `Debug` rendering, since the error
-    /// type carries no `PartialEq`, and roots only on success, since a failed
-    /// transition's partial state is never used. Debug builds only: it doubles
-    /// the transition, which is the cost the speculation exists to hide.
+    /// type carries no `PartialEq`, and roots and deltas only on success, since
+    /// a failed transition has no state. Debug builds only: it doubles the
+    /// transition, which is the cost the speculation exists to hide.
     #[cfg(debug_assertions)]
-    fn assert_agrees_with(&self, fresh: &(BeaconState, Result<()>)) {
-        let (fresh_state, fresh_outcome) = fresh;
+    fn assert_agrees_with(&self, fresh: &Result<BeaconState>, fresh_delta: &TargetBalanceDelta) {
+        let outcome = |transition: &Result<BeaconState>| format!("{:?}", transition.as_ref().err());
         assert_eq!(
-            format!("{:?}", self.outcome),
-            format!("{fresh_outcome:?}"),
+            outcome(&self.transition),
+            outcome(fresh),
             "the speculative transition disagrees with on_block's own on the outcome"
         );
-        if self.outcome.is_ok() {
+        if let (Ok(speculated), Ok(fresh)) = (&self.transition, fresh) {
             assert_eq!(
-                self.state.hash_tree_root(),
-                fresh_state.hash_tree_root(),
+                speculated.hash_tree_root(),
+                fresh.hash_tree_root(),
                 "the speculative transition disagrees with on_block's own on the post-state root"
+            );
+            assert_eq!(
+                &self.target_delta, fresh_delta,
+                "the speculative transition disagrees with on_block's own on the target-balance delta"
             );
         }
     }
@@ -5253,7 +5459,10 @@ pub fn speculate_transition(
         pubkey_indices: &pubkey_indices,
     };
     let engine = stf::ExecutionEngine::valid();
-    let (state, outcome) = transition_block(
+    // Collected as `on_block_speculative`'s own transition would, since the
+    // import reads it after the transition whichever one ran.
+    let target_delta = TargetBalanceDelta::default();
+    let transition = transition_block(
         store,
         &parent_state,
         parent_root,
@@ -5262,13 +5471,17 @@ pub fn speculate_transition(
         config,
         &engine,
         caches,
+        stf::block::BlockProcessingOptions {
+            target_delta: Some(&target_delta),
+            ..Default::default()
+        },
     );
     Some(SpeculativeTransition {
         block_root,
         parent_root,
         engine,
-        state,
-        outcome,
+        transition,
+        target_delta,
     })
 }
 
@@ -5448,7 +5661,10 @@ pub fn on_block_speculative(
     };
     let usable = speculation
         .filter(|speculation| speculation.stands_in_for(block_root, parent_root, payload_validity));
-    let fresh_transition = || {
+    // `target_delta` collects what the block's attestations add to the
+    // unslashed target balances; with the parent's cached totals it spares
+    // `compute_pulled_up_tip` a registry scan. See `helpers::target_balances`.
+    let fresh_transition = |target_delta: &TargetBalanceDelta| {
         transition_block(
             store,
             &parent_state,
@@ -5458,15 +5674,27 @@ pub fn on_block_speculative(
             config,
             &engine,
             caches,
+            stf::block::BlockProcessingOptions {
+                target_delta: Some(target_delta),
+                ..Default::default()
+            },
         )
     };
-    let (mut state, transition) = match usable {
+    // A used speculation brings the delta its own transition collected.
+    let (transition, target_delta) = match usable {
         Some(speculation) => {
             #[cfg(debug_assertions)]
-            speculation.assert_agrees_with(&fresh_transition());
-            (speculation.state, speculation.outcome)
+            {
+                let fresh_delta = TargetBalanceDelta::default();
+                speculation.assert_agrees_with(&fresh_transition(&fresh_delta), &fresh_delta);
+            }
+            (speculation.transition, speculation.target_delta)
         }
-        None => fresh_transition(),
+        None => {
+            let target_delta = TargetBalanceDelta::default();
+            let transition = fresh_transition(&target_delta);
+            (transition, target_delta)
+        }
     };
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
@@ -5509,7 +5737,17 @@ pub fn on_block_speculative(
         )));
     }
 
-    transition?;
+    let mut state = transition?;
+
+    // The block's target balances when its parent's are cached for this epoch
+    // and the block slashes no one. Read before `signed_block` moves into the
+    // store.
+    let extended_totals = totals_from_parent(
+        &store.target_balance_cache(),
+        &parent_root,
+        &signed_block,
+        &target_delta,
+    );
 
     // A block at its epoch's first slot is its own epoch-boundary block: its
     // post-state is the checkpoint state. Cached at import so the tick that
@@ -5604,8 +5842,8 @@ pub fn on_block_speculative(
     // block, for each of the two questions it votes on.
     match rules {
         ForkRules::Gloas => {
-            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::ptc_size()]);
         }
         ForkRules::PreGloas => {}
     }
@@ -5654,7 +5892,7 @@ pub fn on_block_speculative(
     update_checkpoints(store, current_justified, finalized);
 
     // Eagerly compute unrealized justification and finality.
-    compute_pulled_up_tip(store, block_root, block_slot, config)?;
+    compute_pulled_up_tip(store, block_root, block_slot, config, extended_totals)?;
 
     Ok(())
 }
@@ -5912,11 +6150,47 @@ pub fn on_execution_payload_envelope(
 /// `engine` argument still answers the engine's part of
 /// `verify_execution_payload_envelope`; such a caller passes
 /// [`stf::ExecutionEngine::valid`] and consults the real engine itself.
+///
+/// The chain actor is such a caller, but holds no sidecars to pass: the
+/// sampled columns it stores were verified before they were stored, so it
+/// calls [`check_execution_payload_envelope_columns_verified`] instead. This
+/// one is for a caller with sidecars nothing has checked yet, which is what
+/// the fixture runner hands [`on_execution_payload_envelope`].
 pub fn check_execution_payload_envelope(
     store: &Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
     config: &Config,
     sidecars: &[gloas::DataColumnSidecar],
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    check_envelope(store, signed_envelope, config, Some(sidecars), engine)
+}
+
+/// [`check_execution_payload_envelope`] for a caller that has already verified
+/// every sampled column of the block, and so holds no sidecars to pass.
+///
+/// The caller promises what [`DataAvailability::ColumnsVerified`] promises,
+/// against the commitments of this block's bid: each sampled sidecar passed
+/// the gloas structural check and the KZG batch, and is stored under the
+/// block's own root. Everything else is checked exactly as in
+/// [`check_execution_payload_envelope`]; only the data-availability step is
+/// taken on trust, so the KZG batch is not repeated on every envelope.
+pub fn check_execution_payload_envelope_columns_verified(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    check_envelope(store, signed_envelope, config, None, engine)
+}
+
+/// The body of both public checks. `sidecars` is `None` when the caller has
+/// vouched for every sampled column, which skips only the availability step.
+fn check_envelope(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: Option<&[gloas::DataColumnSidecar]>,
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
     let envelope = &signed_envelope.message;
@@ -5938,11 +6212,13 @@ pub fn check_execution_payload_envelope(
         .ok_or(Error::SpecAssert(
             "envelope.beacon_block_root in store.blocks",
         ))?;
-    let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
-    verify(
-        is_data_available_gloas_columns(sidecars, kzg_commitments)?,
-        "is_data_available(envelope.beacon_block_root)",
-    )?;
+    if let Some(sidecars) = sidecars {
+        let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
+        verify(
+            is_data_available_gloas_columns(sidecars, kzg_commitments)?,
+            "is_data_available(envelope.beacon_block_root)",
+        )?;
+    }
 
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
@@ -5954,8 +6230,9 @@ pub fn check_execution_payload_envelope(
 /// envelope to the store. Persisted, so a restarted follower keeps the full
 /// branch of this block.
 ///
-/// The caller must have run [`check_execution_payload_envelope`] on the same
-/// envelope; a block the store does not hold is the only case this refuses.
+/// The caller must have run [`check_execution_payload_envelope`] or
+/// [`check_execution_payload_envelope_columns_verified`] on the same envelope;
+/// a block the store does not hold is the only case this refuses.
 pub fn accept_execution_payload_envelope(
     store: &mut Store,
     signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
@@ -6689,8 +6966,8 @@ mod tests {
     #[test]
     fn a_slashed_equivocator_still_counts_toward_head_weakness_from_the_snapshot() {
         let config = Config::active();
-        let mut state = test_state::with_validators(preset::SLOTS_PER_EPOCH as usize);
-        for index in 0..preset::SLOTS_PER_EPOCH {
+        let mut state = test_state::with_validators(preset::slots_per_epoch() as usize);
+        for index in 0..preset::slots_per_epoch() {
             state.validator_mut(index).expect("registered").slashed = true;
         }
         state.apply_pending_mutations();
@@ -6806,7 +7083,7 @@ mod tests {
         let (signed, _) = block_on(&parent, first_slot);
 
         let mut store = empty_store();
-        let (mut post, outcome) = transition_block(
+        let mut post = transition_block(
             &store,
             &parent,
             parent_root,
@@ -6815,8 +7092,9 @@ mod tests {
             &config,
             &stf::ExecutionEngine::valid(),
             stf::OwnedBlockCaches::default().caches(),
-        );
-        outcome.expect("applies");
+            Default::default(),
+        )
+        .expect("applies");
         post.apply_pending_mutations();
         assert!(
             store
@@ -7067,8 +7345,8 @@ mod tests {
         assert_eq!(compute_slots_since_epoch_start(epoch_start), 0);
         assert_eq!(compute_slots_since_epoch_start(epoch_start + 1), 1);
         assert_eq!(
-            compute_slots_since_epoch_start(epoch_start + preset::SLOTS_PER_EPOCH - 1),
-            preset::SLOTS_PER_EPOCH - 1
+            compute_slots_since_epoch_start(epoch_start + preset::slots_per_epoch() - 1),
+            preset::slots_per_epoch() - 1
         );
     }
 
@@ -7164,7 +7442,7 @@ mod tests {
         // committee 0, so which index the shuffle picks does not matter to
         // this test: it asks the same cache `is_head_weak` will.
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         assert!(
@@ -7257,7 +7535,7 @@ mod tests {
         // post-state directly.
         store
             .set_time_ms(seconds_to_milliseconds(
-                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+                config.seconds_per_slot * preset::slots_per_epoch() * 2,
             ))
             .unwrap();
 
@@ -7306,7 +7584,7 @@ mod tests {
         // takes the same `current_epoch > block_epoch` branch.
         store
             .set_time_ms(seconds_to_milliseconds(
-                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+                config.seconds_per_slot * preset::slots_per_epoch() * 2,
             ))
             .unwrap();
 
@@ -7369,7 +7647,7 @@ mod tests {
         post_state.latest_block_header_mut().slot = slot;
         store.insert_signed_block(root, block).unwrap();
         store.insert_state(root, post_state).unwrap();
-        compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");
+        compute_pulled_up_tip(store, root, slot, config, None).expect("pulled-up tip");
         root
     }
 
@@ -7404,7 +7682,7 @@ mod tests {
     /// The store clock two epochs past the anchor's, the first tick a node
     /// restarted into a later epoch runs.
     fn two_epochs_past(anchor_slot: Slot, config: &Config) -> u64 {
-        (anchor_slot + 2 * preset::SLOTS_PER_EPOCH) * config.seconds_per_slot
+        (anchor_slot + 2 * preset::slots_per_epoch()) * config.seconds_per_slot
     }
 
     /// Reproduces the unrealized-justification loss on resume: the
@@ -7870,7 +8148,7 @@ mod tests {
         config: &Config,
     ) -> Option<SpeculativeTransition> {
         let mut speculation = honest_speculation(store, block, config)?;
-        speculation.outcome = Err(Error::SpecAssert(POISON));
+        speculation.transition = Err(Error::SpecAssert(POISON));
         Some(speculation)
     }
 
@@ -7917,10 +8195,11 @@ mod tests {
             import_valid_child(&PayloadValidity::Validated, |store, block, config| {
                 let mut speculation = honest_speculation(store, block, config)?;
                 speculation
-                    .outcome
-                    .as_ref()
-                    .expect("the transition succeeds");
-                speculation.state.latest_block_header_mut().body_root = Root::repeat_byte(0xab);
+                    .transition
+                    .as_mut()
+                    .expect("the transition succeeds")
+                    .latest_block_header_mut()
+                    .body_root = Root::repeat_byte(0xab);
                 Some(speculation)
             });
         result.expect("the import takes the speculation's outcome");
@@ -8656,7 +8935,7 @@ mod tests {
         );
 
         verify_payload(&mut store, a_root);
-        let strong_votes = vec![Some(true); preset::PTC_SIZE];
+        let strong_votes = vec![Some(true); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
 
@@ -8686,7 +8965,7 @@ mod tests {
             .unwrap();
         verify_payload(&mut store, a_root);
 
-        let exactly_threshold = vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize];
+        let exactly_threshold = vec![Some(true); preset::payload_timely_threshold() as usize];
         store.set_payload_timeliness_vote(a_root, exactly_threshold.clone());
         assert!(
             !payload_timeliness(&store, a_root, true).unwrap(),
@@ -8694,7 +8973,7 @@ mod tests {
         );
         store.set_payload_timeliness_vote(
             a_root,
-            vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize + 1],
+            vec![Some(true); preset::payload_timely_threshold() as usize + 1],
         );
         assert!(
             payload_timeliness(&store, a_root, true).unwrap(),
@@ -8708,7 +8987,7 @@ mod tests {
         );
         store.set_payload_data_availability_vote(
             a_root,
-            vec![Some(true); preset::DATA_AVAILABILITY_TIMELY_THRESHOLD as usize + 1],
+            vec![Some(true); preset::data_availability_timely_threshold() as usize + 1],
         );
         assert!(payload_data_availability(&store, a_root, true).unwrap());
     }
@@ -8754,7 +9033,7 @@ mod tests {
         );
 
         verify_payload(&mut store, a_root);
-        let weak_votes = vec![Some(false); preset::PTC_SIZE];
+        let weak_votes = vec![Some(false); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, weak_votes.clone());
         store.set_payload_data_availability_vote(a_root, weak_votes);
         assert!(
@@ -8765,14 +9044,14 @@ mod tests {
 
         // Timely but not available: both conditions are required (`&&`, not
         // `||`), so this must not extend either.
-        store.set_payload_timeliness_vote(a_root, vec![Some(true); preset::PTC_SIZE]);
-        store.set_payload_data_availability_vote(a_root, vec![Some(false); preset::PTC_SIZE]);
+        store.set_payload_timeliness_vote(a_root, vec![Some(true); preset::ptc_size()]);
+        store.set_payload_data_availability_vote(a_root, vec![Some(false); preset::ptc_size()]);
         assert!(
             !should_extend_payload(&store, a_root, &config).unwrap(),
             "timely alone, without availability, must not extend"
         );
 
-        let strong_votes = vec![Some(true); preset::PTC_SIZE];
+        let strong_votes = vec![Some(true); preset::ptc_size()];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
         assert!(
@@ -9272,7 +9551,7 @@ mod tests {
     fn should_apply_proposer_boost_applies_when_the_parent_is_not_weak() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let b_root = Root::repeat_byte(0xb0);
@@ -9535,7 +9814,7 @@ mod tests {
     fn is_head_weak_succeeds_with_a_pruned_vote() {
         let config = Config::active();
         let (mut store, anchor_root, _anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         // A vote for a root the store never indexed at all (pruned below
@@ -9563,7 +9842,7 @@ mod tests {
     fn is_head_weak_succeeds_when_a_vote_walks_onto_a_pruned_parent() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let orphan_root = Root::repeat_byte(0xd1);
@@ -9597,7 +9876,7 @@ mod tests {
     fn gloas_get_weight_tolerates_a_pruned_vote_reached_through_should_apply_proposer_boost() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         let b_root = Root::repeat_byte(0xb0);
@@ -9607,7 +9886,7 @@ mod tests {
         store
             .insert_state(
                 b_root,
-                test_state::with_validators(preset::SLOTS_PER_EPOCH as usize),
+                test_state::with_validators(preset::slots_per_epoch() as usize),
             )
             .unwrap();
         store.set_unrealized_justification(b_root, anchor_slot + 1, Checkpoint::default());
@@ -9647,7 +9926,7 @@ mod tests {
     fn a_boost_outside_the_justified_subtree_is_skipped_without_its_gate() {
         let config = Config::active();
         let (mut store, anchor_root, anchor_slot) =
-            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+            anchored_store(preset::slots_per_epoch() as usize);
         let committees = CommitteeCache::default();
 
         // anchor ─┬─ justified (anchor + 1)
@@ -9920,14 +10199,14 @@ mod tests {
             unreachable!("with_validators_at(Gloas) builds a gloas state");
         };
         inner.slot = 1;
-        let mut committee = vec![0; preset::PTC_SIZE];
+        let mut committee = vec![0; preset::ptc_size()];
         committee[2] = 3;
         committee[7] = 3;
-        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        let window_index = (preset::slots_per_epoch() + 1) as usize;
         inner.ptc_window[window_index] = committee.try_into().unwrap();
         store.insert_state(root, state).unwrap();
-        store.set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
-        store.set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+        store.set_payload_timeliness_vote(root, vec![None; preset::ptc_size()]);
+        store.set_payload_data_availability_vote(root, vec![None; preset::ptc_size()]);
         store
     }
 
@@ -10108,16 +10387,16 @@ mod tests {
         inner.slot = 1;
         // The state is keyed by its block's slot, which is the header's.
         inner.latest_block_header.slot = 1;
-        let mut committee = vec![0; preset::PTC_SIZE];
+        let mut committee = vec![0; preset::ptc_size()];
         committee[2] = 3;
-        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        let window_index = (preset::slots_per_epoch() + 1) as usize;
         inner.ptc_window[window_index] = committee.try_into().unwrap();
         store.insert_state(root, state).unwrap();
         // What `on_block` records for each gloas block, then the envelope.
         for block_root in [anchor_root, root] {
             store.set_gloas_block_timeliness(block_root, [true, true]);
-            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
-            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::ptc_size()]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::ptc_size()]);
         }
         verify_payload(&mut store, root);
         // Dropping the last handle lets the state writer finish its queue.
@@ -10190,11 +10469,11 @@ mod tests {
         assert_eq!(store.block_timeliness(&anchor_root), Some([true, true]));
         assert_eq!(
             store.payload_timeliness_vote(&anchor_root),
-            Some(vec![None; preset::PTC_SIZE])
+            Some(vec![None; preset::ptc_size()])
         );
         assert_eq!(
             store.payload_data_availability_vote(&anchor_root),
-            Some(vec![None; preset::PTC_SIZE])
+            Some(vec![None; preset::ptc_size()])
         );
         assert!(!store.has_verified_payload(&anchor_root));
         // A gloas block carries a bid, not a payload: nothing to cache.
@@ -10317,7 +10596,7 @@ mod tests {
         let mut rng = TestRng(seed);
         let config = Config::active().with_fork_epoch(ForkName::Gloas, 1);
         let first_gloas_slot = compute_start_slot_at_epoch(1);
-        let slot_cap = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let slot_cap = 2 * preset::slots_per_epoch() - 1;
         // The anchor stays at slot 0, the finalized slot every walk stops at;
         // the first block after it jumps to just before the fork epoch, so a
         // short chain crosses the boundary.
@@ -10380,10 +10659,10 @@ mod tests {
                 }
                 for timely_votes in [true, false] {
                     let votes = match rng.below(4) {
-                        0 => vec![None; preset::PTC_SIZE],
-                        1 => vec![Some(true); preset::PTC_SIZE],
-                        2 => vec![Some(false); preset::PTC_SIZE],
-                        _ => (0..preset::PTC_SIZE)
+                        0 => vec![None; preset::ptc_size()],
+                        1 => vec![Some(true); preset::ptc_size()],
+                        2 => vec![Some(false); preset::ptc_size()],
+                        _ => (0..preset::ptc_size())
                             .map(|_| rng.chance(2, 3).then(|| rng.chance(1, 2)))
                             .collect(),
                     };
@@ -10693,7 +10972,7 @@ mod tests {
             if tree.justified_moved {
                 // Far enough past every block that a branch whose voting
                 // source is stale is dropped from the filtered tree.
-                current_slots.push(first + 3 * preset::SLOTS_PER_EPOCH);
+                current_slots.push(first + 3 * preset::slots_per_epoch());
             }
             for current_slot in current_slots {
                 check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
@@ -10811,9 +11090,11 @@ mod tests {
                         tree.store.insert_state(root, gloas_state.clone()).unwrap();
                         tree.store.set_payload_link(root, slot, link);
                         tree.store
-                            .set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
-                        tree.store
-                            .set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+                            .set_payload_timeliness_vote(root, vec![None; preset::ptc_size()]);
+                        tree.store.set_payload_data_availability_vote(
+                            root,
+                            vec![None; preset::ptc_size()],
+                        );
                         tree.store
                             .set_unrealized_justification(root, slot, Checkpoint::default());
                         if rng.chance(1, 2) {
@@ -10935,6 +11216,8 @@ mod tests {
             vec![32 * increment; VALIDATORS as usize].into(),
             VALIDATORS * 32 * increment,
             vec![32; VALIDATORS as usize].into(),
+            Box::default(),
+            VALIDATORS * 32 * increment,
         )));
         let config = Config::active();
         store
@@ -11066,7 +11349,7 @@ mod tests {
             let max_slot = tree.slots.iter().copied().max().unwrap();
             let mut current_slots = vec![max_slot + 1];
             if tree.justified_moved {
-                current_slots.push(tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH);
+                current_slots.push(tree.first_gloas_slot + 3 * preset::slots_per_epoch());
             }
             for current_slot in current_slots {
                 tree.store
@@ -11156,7 +11439,7 @@ mod tests {
                 }
                 // Past every block's epoch, so the leaf reads its stored
                 // unrealized justification rather than a state.
-                let current_slot = DEPTH + 2 * preset::SLOTS_PER_EPOCH;
+                let current_slot = DEPTH + 2 * preset::slots_per_epoch();
                 store
                     .set_time_ms(current_slot * config.slot_duration_ms)
                     .unwrap();
@@ -11377,7 +11660,7 @@ mod tests {
         let justified = tree.store.beacon_justified_checkpoint();
         let (justified_slot, _) = tree.store.block_index()[&justified.root];
         let finalized = Checkpoint {
-            epoch: justified_slot.div_ceil(preset::SLOTS_PER_EPOCH),
+            epoch: justified_slot.div_ceil(preset::slots_per_epoch()),
             root: justified.root,
         };
         let before = tree.store.beacon_finalized_checkpoint();
@@ -11415,7 +11698,7 @@ mod tests {
             tree.first_gloas_slot - 1,
             latest + 1,
             latest + 2,
-            tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH,
+            tree.first_gloas_slot + 3 * preset::slots_per_epoch(),
         ]
     }
 
@@ -11611,7 +11894,7 @@ mod tests {
         inner.proposer_lookahead = lookahead.try_into().expect("lookahead length");
         inner.current_sync_committee = sync_committee.clone();
         inner.next_sync_committee = sync_committee;
-        let last_slot = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let last_slot = 2 * preset::slots_per_epoch() - 1;
         advance_to_slot(&state, last_slot, &Config::mainnet()).expect("advance")
     }
 
@@ -11666,7 +11949,7 @@ mod tests {
         parent_root: Root,
         block: &SignedBeaconBlock,
     ) -> Root {
-        let (mut state, outcome) = transition_block(
+        let mut state = transition_block(
             store,
             parent,
             parent_root,
@@ -11675,8 +11958,9 @@ mod tests {
             &Config::mainnet(),
             &stf::ExecutionEngine::valid(),
             stf::OwnedBlockCaches::default().caches(),
-        );
-        outcome.expect("the block applies");
+            Default::default(),
+        )
+        .expect("the block applies");
         state.apply_pending_mutations();
         state.hash_tree_root()
     }
@@ -11766,7 +12050,7 @@ mod tests {
     /// epoch-crossing cases below.
     fn gloas_last_slot_parent() -> BeaconState {
         let state = test_state::with_validators_at(crate::beacon::ForkName::Gloas, 64);
-        let last_slot = 2 * preset::SLOTS_PER_EPOCH - 1;
+        let last_slot = 2 * preset::slots_per_epoch() - 1;
         advance_to_slot(&state, last_slot, &Config::mainnet()).expect("advance")
     }
 

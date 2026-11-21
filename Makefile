@@ -86,37 +86,47 @@ test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run t
 	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
 	$(TEST) -p ethlambda-validator --test interchange_vectors
 
-# --lib as well as the spec target: the BLS and KZG modules keep their fixture
-# vectors as unit tests, which are `ignore`d unless this feature is on.
-BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_tests --profile release-fast
+# The spec binary selects its preset at runtime from BEACON_SPEC_PRESET, so both
+# presets run off one build of it.
+#
+# `ethlambda-blockchain` is selected as well, in both targets, although only
+# `test-beacon-mainnet` runs its tests. Cargo resolves features per invocation,
+# over the packages it selects, and the two CI jobs share one cache entry that
+# only the mainnet job saves (`run-beacon-spec-tests`). Selecting the spec
+# suite's package alone resolves the shared dependency graph differently, from
+# `libc` up, so the minimal job would rebuild most of it on every run. Both
+# targets select the same packages and features, which makes the minimal
+# build a subset of the mainnet one. Package-qualified features, since an
+# unqualified one would have to exist in both packages.
+#
+# Selecting both also unifies `ethlambda-blockchain`'s dependency and
+# dev-dependency features into the spec suite's build. Today the one feature of
+# an ethlambda crate among them is `ethlambda-state-transition/test-utils`,
+# which only makes test helpers public; the rest are tokio's. A feature that
+# changes what the state transition or the crypto does (a mock, a skipped
+# verification) must therefore never be enabled from `ethlambda-blockchain`, or
+# the spec suite would run with it and still pass.
+BEACON_SPEC_TEST=cargo test -p ethlambda-state-transition -p ethlambda-blockchain --test beacon_spec_tests --profile release-fast --features ethlambda-state-transition/beacon-spec-tests,ethlambda-blockchain/beacon-spec-tests
 
-# The preset fixes SSZ container bounds at compile time, so each preset needs its
-# own build, and a run walks its own preset's fixture tree and nothing else; the
-# BLS and KZG vectors are a separate, preset-independent download
-# (`cryptography-specs`). Hence a target per preset rather than one recipe
-# running both: CI gives each its own job, so the two build and run
-# concurrently and each downloads only the trees its preset reads.
+# A run walks its own preset's fixture tree and nothing else; the BLS and KZG
+# vectors are a separate, preset-independent download (`cryptography-specs`).
+# Hence a target per preset rather than one recipe running both: CI gives each
+# its own job, so the two run concurrently and each downloads only the trees
+# its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
-# The chain actor's fixture-driven tests (`ethlambda-blockchain --lib`) ride in
-# the same cargo invocation as the spec suite rather than a second one. Cargo
-# resolves features per invocation, over the packages it selects, so a separate
-# `cargo test -p ethlambda-blockchain` resolved the shared dependency graph
-# differently and rebuilt most of it, from `libc` up, for tests that run in 5 s.
-# Package-qualified features, since an unqualified one would have to exist in
-# both packages.
-#
-# One invocation also unifies `ethlambda-blockchain`'s dependency and
-# dev-dependency features into the spec suite's build. Today none of them
-# enables a feature of an ethlambda crate (its dev-dependencies add only tokio
-# features). A feature that changes what the state transition or the crypto
-# does (a mock, a skipped verification) must therefore never be enabled from
-# `ethlambda-blockchain`, or the spec suite would run with it and still pass.
+# --lib as well, in the same invocation: the BLS and KZG modules keep their
+# fixture vectors as unit tests, which are `ignore`d unless `beacon-spec-tests`
+# is on, and so do the chain actor's fixture-driven tests
+# (`ethlambda-blockchain --lib`). They are preset-independent, so only this
+# target runs them. A cargo invocation of their own would select other packages
+# and so rebuild most of the dependency graph (see above), for tests that run
+# in seconds.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
-	$(BEACON_TEST) -p ethlambda-blockchain --features ethlambda-state-transition/beacon-spec-tests,ethlambda-blockchain/beacon-spec-tests
+	BEACON_SPEC_PRESET=mainnet $(BEACON_SPEC_TEST) --lib
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
-	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal
+	BEACON_SPEC_PRESET=minimal $(BEACON_SPEC_TEST)
 
 # Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
 # is nightly-only, everything else runs on the stable toolchain pinned in

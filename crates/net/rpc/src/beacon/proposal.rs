@@ -576,7 +576,10 @@ async fn get_block(
         query.builder_boost_factor.unwrap_or(DEFAULT_BOOST_FACTOR),
         slot,
         query.randao_reveal,
-        BlockProcessingOptions { randao },
+        BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
         graffiti,
     )
     .await;
@@ -693,7 +696,7 @@ async fn produce(
     boost_factor: u64,
     slot: Slot,
     randao_reveal: BlsSignature,
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
     graffiti: Bytes32,
 ) -> Result<(Produced, String, ForkName), ApiError> {
     let config = store.config();
@@ -2390,7 +2393,7 @@ mod tests {
 
         let (mut store, head_slot) = fulu_store();
         let (head_root, head_state) = super::super::validator::head(&store).unwrap();
-        let next_epoch_start = head_slot + preset::SLOTS_PER_EPOCH;
+        let next_epoch_start = head_slot + preset::slots_per_epoch();
         let finalized = Checkpoint {
             root: head_root,
             slot: next_epoch_start,

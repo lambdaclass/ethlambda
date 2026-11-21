@@ -14,7 +14,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_blockchain::EventBus;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     builder_market::SharedBuilderMarket,
     gossip::{IgnoreReason, Outcome, proposer_preferences::validate},
@@ -28,12 +29,14 @@ use tracing::{debug, warn};
 use crate::beacon::{
     ApiError,
     bids::{describe, require_version, unix_ms},
-    decode_list,
+    copy_if_listened, decode_list, emit_accepted,
 };
 
 /// The most entries one request may carry: the SSZ list's bound,
 /// `(MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH`.
-const MAX_ENTRIES: usize = preset::PROPOSER_LOOKAHEAD_LENGTH;
+fn max_entries() -> usize {
+    preset::proposer_lookahead_length()
+}
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new().route(
@@ -62,6 +65,7 @@ async fn post_proposer_preferences(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(market): Extension<SharedBuilderMarket>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -76,12 +80,15 @@ async fn post_proposer_preferences(
         Ok(preferences) => preferences,
         Err(err) => return err.into_response(),
     };
-    if preferences.len() > MAX_ENTRIES {
+    if preferences.len() > max_entries() {
         return ApiError::BadRequest("too many signed proposer preferences").into_response();
     }
 
-    let validated =
-        tokio::task::spawn_blocking(move || submit(&store, &p2p, &market, preferences)).await;
+    let events = events.map(|Extension(events)| events);
+    let validated = tokio::task::spawn_blocking(move || {
+        submit(&store, &p2p, &market, events.as_ref(), preferences)
+    })
+    .await;
     let failures = match validated {
         Ok(failures) => failures,
         Err(_) => return ApiError::Internal("validating the preferences failed").into_response(),
@@ -112,6 +119,7 @@ fn submit(
     store: &Store,
     p2p: &RpcToP2PRef,
     market: &SharedBuilderMarket,
+    events: Option<&EventBus>,
     preferences: Vec<SignedProposerPreferences>,
 ) -> Vec<Failure> {
     let now_ms = unix_ms();
@@ -157,8 +165,16 @@ fn submit(
             });
             continue;
         }
+        let for_event = copy_if_listened(events, &signed);
         match p2p.publish_proposer_preferences(signed) {
-            Ok(()) => debug!(%slot, validator, "Accepted proposer preferences for gossip"),
+            Ok(()) => {
+                if let Some(signed) = for_event {
+                    emit_accepted(events, || {
+                        GossipEvent::ProposerPreferences(Box::new(signed))
+                    });
+                }
+                debug!(%slot, validator, "Accepted proposer preferences for gossip")
+            }
             Err(_) => failures.push(Failure {
                 index,
                 message: "the network actor is not running".to_string(),

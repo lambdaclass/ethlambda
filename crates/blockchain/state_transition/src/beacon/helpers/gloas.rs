@@ -86,7 +86,7 @@
 //! doc), read through [`super::fulu::get_beacon_proposer_index`] rather
 //! than a copy of it here.
 
-use crate::beacon::bls;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
@@ -95,8 +95,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, Domain, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot,
-    ValidatorIndex,
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -105,7 +104,6 @@ use super::accessors::{
 };
 use super::math::{bytes_to_uint64, integer_squareroot};
 use super::misc::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch};
-use super::predicates::are_indices_sorted_and_unique;
 use super::shuffling::compute_shuffled_index;
 
 // ---------------------------------------------------------------------------
@@ -118,47 +116,54 @@ use super::shuffling::compute_shuffled_index;
 /// Modified from [`super::electra::is_valid_indexed_attestation`] (EIP-7688):
 /// [`gloas::IndexedAttestation::attesting_indices`] is now the unbounded
 /// [`gloas::AttestingIndices`], so the length that used to be enforced by the
-/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked here
-/// explicitly instead.
+/// container's own SSZ bound (`MAX_VALIDATORS_PER_SLOT`) is checked
+/// explicitly instead, in [`super::attestation::attesters_signature_set`].
 pub fn is_valid_indexed_attestation(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
 ) -> bool {
-    let domain = get_domain(
-        state,
-        constants::DOMAIN_BEACON_ATTESTER,
-        Some(indexed_attestation.data.target.epoch),
-    );
-    is_valid_indexed_attestation_with_domain(state, indexed_attestation, domain)
+    indexed_attestation_signature_set(state, indexed_attestation).is_some_and(|set| set.verify())
 }
 
-/// [`is_valid_indexed_attestation`] under a signing domain the caller chose.
-///
-/// For gossip, which checks against a state that may not have reached the
-/// attestation's fork: see [`super::accessors::get_domain_from_schedule`].
-pub fn is_valid_indexed_attestation_with_domain(
+/// The signature check [`is_valid_indexed_attestation`] makes, resolved but
+/// not yet run, so a block can verify every attestation's signature in one
+/// batch. See [`super::attestation::attesters_signature_set`], which holds the
+/// checks every fork shares, the length bound included.
+pub fn indexed_attestation_signature_set(
     state: &BeaconState,
     indexed_attestation: &gloas::IndexedAttestation,
-    domain: Domain,
-) -> bool {
-    let indices: &[ValidatorIndex] = &indexed_attestation.attesting_indices;
-    if indices.is_empty()
-        || indices.len() > preset::MAX_VALIDATORS_PER_SLOT
-        || !are_indices_sorted_and_unique(indices)
-    {
-        return false;
-    }
+) -> Option<SignatureSet> {
+    super::attestation::attesters_signature_set(
+        state,
+        &indexed_attestation.attesting_indices,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        None,
+    )
+}
 
-    let mut pubkeys = Vec::with_capacity(indices.len());
-    for index in indices {
-        match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
-        }
+/// [`super::electra::electra_attestation_signature_set`] for a gloas
+/// attestation: the same checks, plus the length bound the container no longer
+/// enforces (`MAX_VALIDATORS_PER_SLOT`), checked first as
+/// [`super::attestation::attesters_signature_set`] does.
+pub fn gloas_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    indexed_attestation: &gloas::IndexedAttestation,
+    committees: &CommitteeCache,
+) -> Option<SignatureSet> {
+    if indexed_attestation.attesting_indices.len() > preset::max_validators_per_slot() {
+        return None;
     }
-
-    let signing_root = compute_signing_root(indexed_attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
+    super::electra::attestation_signature_set(
+        state,
+        &indexed_attestation.data,
+        &indexed_attestation.signature,
+        &indexed_attestation.attesting_indices,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -284,16 +289,33 @@ pub fn is_valid_indexed_payload_attestation(
     state: &BeaconState,
     attestation: &gloas::IndexedPayloadAttestation,
 ) -> bool {
+    indexed_payload_attestation_signature_set(state, attestation).is_some_and(|set| set.verify())
+}
+
+/// The signature check [`is_valid_indexed_payload_attestation`] makes,
+/// resolved but not yet run. The structural checks (non-empty, sorted, every
+/// index in range) happen here, at once; `None` means the attestation is
+/// invalid without needing a pairing.
+pub fn indexed_payload_attestation_signature_set(
+    state: &BeaconState,
+    attestation: &gloas::IndexedPayloadAttestation,
+) -> Option<SignatureSet> {
     let indices: &[ValidatorIndex] = &attestation.attesting_indices;
+    // `<=`, not the `<` of the other attestation kinds: the spec checks only
+    // `indices == sorted(indices)`, since the PTC is drawn with replacement
+    // and a member can repeat, so duplicates are valid.
     if indices.is_empty() || !indices.windows(2).all(|pair| pair[0] <= pair[1]) {
-        return false;
+        return None;
     }
 
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
-            Err(_) => return false,
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
+            Err(_) => return None,
         }
     }
 
@@ -303,7 +325,7 @@ pub fn is_valid_indexed_payload_attestation(
         Some(compute_epoch_at_slot(attestation.data.slot)),
     );
     let signing_root = compute_signing_root(attestation.data.hash_tree_root(), domain);
-    bls::fast_aggregate_verify(&pubkeys, signing_root, &attestation.signature)
+    SignatureSet::fast_aggregate(&pubkeys, signing_root, &attestation.signature)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +495,8 @@ pub fn compute_proposer_indices(
 ) -> Result<Vec<ValidatorIndex>> {
     let start_slot = compute_start_slot_at_epoch(epoch);
 
-    let mut proposer_indices = Vec::with_capacity(preset::SLOTS_PER_EPOCH as usize);
-    for offset in 0..preset::SLOTS_PER_EPOCH {
+    let mut proposer_indices = Vec::with_capacity(preset::slots_per_epoch() as usize);
+    for offset in 0..preset::slots_per_epoch() {
         let slot = start_slot
             .checked_add(offset)
             .ok_or(Error::ArithmeticOverflow(
@@ -531,8 +553,13 @@ pub fn compute_ptc(
         indices.extend(epoch_committees.committee(slot, committee_index)?);
     }
 
-    let selected =
-        compute_balance_weighted_selection(state, &indices, seed, preset::PTC_SIZE as u64, false)?;
+    let selected = compute_balance_weighted_selection(
+        state,
+        &indices,
+        seed,
+        preset::ptc_size() as u64,
+        false,
+    )?;
     Ok(selected.try_into()?)
 }
 
@@ -578,7 +605,7 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
         state,
         &indices,
         seed,
-        preset::SYNC_COMMITTEE_SIZE as u64,
+        preset::sync_committee_size() as u64,
         true,
     )
 }
@@ -629,7 +656,7 @@ pub fn get_attestation_participation_flag_indices(
         true
     } else {
         let inner = gloas_state_ref(state, "get_attestation_participation_flag_indices")?;
-        let slot_index = (parent_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+        let slot_index = (parent_slot % preset::slots_per_historical_root() as u64) as usize;
         let payload_index = inner.execution_payload_availability.get(slot_index).ok_or(
             Error::IndexOutOfBounds {
                 index: slot_index,
@@ -650,7 +677,7 @@ pub fn get_attestation_participation_flag_indices(
     )?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
     if is_matching_target {
@@ -693,7 +720,7 @@ pub fn get_ptc(
                 next_epoch == state_epoch,
                 "get_ptc: epoch + 1 == state_epoch",
             )?;
-            (slot % preset::SLOTS_PER_EPOCH) as usize
+            (slot % preset::slots_per_epoch()) as usize
         } else {
             let lookahead_bound = state_epoch.checked_add(preset::MIN_SEED_LOOKAHEAD).ok_or(
                 Error::ArithmeticOverflow("get_ptc: state_epoch + MIN_SEED_LOOKAHEAD"),
@@ -708,14 +735,12 @@ pub fn get_ptc(
                 .ok_or(Error::ArithmeticOverflow(
                     "get_ptc: epoch - state_epoch + 1",
                 ))?;
-            let offset = epoch_offset.checked_mul(preset::SLOTS_PER_EPOCH).ok_or(
+            let offset = epoch_offset.checked_mul(preset::slots_per_epoch()).ok_or(
                 Error::ArithmeticOverflow("get_ptc: (epoch - state_epoch + 1) * SLOTS_PER_EPOCH"),
             )?;
-            offset
-                .checked_add(slot % preset::SLOTS_PER_EPOCH)
-                .ok_or(Error::ArithmeticOverflow(
-                    "get_ptc: offset + slot % SLOTS_PER_EPOCH",
-                ))? as usize
+            offset.checked_add(slot % preset::slots_per_epoch()).ok_or(
+                Error::ArithmeticOverflow("get_ptc: offset + slot % SLOTS_PER_EPOCH"),
+            )? as usize
         };
 
     inner
@@ -744,7 +769,7 @@ pub fn get_ptc_assignments(
 ) -> Result<std::collections::HashMap<ValidatorIndex, Slot>> {
     let mut assignments = std::collections::HashMap::new();
     let first_slot = compute_start_slot_at_epoch(epoch);
-    for slot in first_slot..first_slot + preset::SLOTS_PER_EPOCH {
+    for slot in first_slot..first_slot + preset::slots_per_epoch() {
         for validator_index in get_ptc(state, slot, config)? {
             if validators.contains(&validator_index) {
                 assignments.entry(validator_index).or_insert(slot);
@@ -787,7 +812,7 @@ pub fn get_indexed_payload_attestation(
 /// `/` [`constants::BUILDER_PAYMENT_THRESHOLD_DENOMINATOR`] of one slot's
 /// share of the total active balance.
 pub fn get_builder_payment_quorum_threshold(state: &BeaconState) -> Result<Gwei> {
-    let per_slot_balance = get_total_active_balance(state)? / preset::SLOTS_PER_EPOCH;
+    let per_slot_balance = get_total_active_balance(state)? / preset::slots_per_epoch();
     let quorum = per_slot_balance
         .checked_mul(constants::BUILDER_PAYMENT_THRESHOLD_NUMERATOR)
         .ok_or(Error::ArithmeticOverflow(
@@ -1066,7 +1091,7 @@ mod tests {
         let first = compute_ptc(&state, slot, &committees).unwrap();
         let second = compute_ptc(&state, slot, &committees).unwrap();
 
-        assert_eq!(first.len(), preset::PTC_SIZE);
+        assert_eq!(first.len(), preset::ptc_size());
         assert_eq!(&first[..], &second[..]);
         assert!(first.iter().all(|index| (*index as usize) < count));
     }
@@ -1160,7 +1185,7 @@ mod tests {
         let committee = get_ptc(&state, current_epoch_slot, &config).unwrap();
         assert_eq!(
             committee[0],
-            preset::SLOTS_PER_EPOCH,
+            preset::slots_per_epoch(),
             "window index SLOTS_PER_EPOCH starts the current-epoch slice"
         );
     }
@@ -1172,8 +1197,8 @@ mod tests {
         let BeaconState::Gloas(inner) = state else {
             unreachable!("built as Gloas");
         };
-        for window_index in 0..preset::PTC_WINDOW_LENGTH {
-            inner.ptc_window[window_index] = vec![window_index as u64; preset::PTC_SIZE]
+        for window_index in 0..preset::ptc_window_length() {
+            inner.ptc_window[window_index] = vec![window_index as u64; preset::ptc_size()]
                 .try_into()
                 .expect("built at exactly PTC_SIZE");
         }

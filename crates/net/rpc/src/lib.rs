@@ -291,8 +291,9 @@ pub struct BeaconApiHandles {
     /// makes block production, attestation data and aggregation answer 503:
     /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
-    /// The chain-event bus `/eth/v1/events` streams from. Read only there:
-    /// the chain actor is its only publisher, so no endpoint here writes to it.
+    /// The chain-event bus `/eth/v1/events` streams from. Besides the chain
+    /// actor and p2p, the submission endpoints publish to it: what they accept
+    /// is an event of its own (see `beacon::emit_accepted`).
     pub events: EventBus,
     /// This build as the Engine API identifies it. Block production appends
     /// its code and commit, with the execution client's, to every block's
@@ -493,10 +494,10 @@ pub(crate) mod test_utils {
                 state_root: H256::ZERO,
                 body_root: H256::ZERO,
             },
-            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("exactly N elements by construction"),
-            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("exactly N elements by construction"),
             historical_roots: Default::default(),
@@ -505,10 +506,10 @@ pub(crate) mod test_utils {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![H256::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("exactly N elements by construction"),
-            slashings: vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0u64; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("exactly N elements by construction"),
             previous_epoch_attestations: Default::default(),

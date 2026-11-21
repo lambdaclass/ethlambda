@@ -44,13 +44,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::{SyncStatusController, checkpoint_hash, metrics::SyncStatus};
+use ethlambda_blockchain::{EventBus, SyncStatusController, checkpoint_hash, metrics::SyncStatus};
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
     building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
     types::ClientVersionV1,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
@@ -108,6 +108,7 @@ use crate::beacon::{
     ApiError, BodyEncoding,
     bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
     builder_config::{BuilderConfig, decode_builder_config},
+    emit_accepted,
     graffiti::{self, OwnVersion},
     proposal::{
         Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
@@ -442,7 +443,7 @@ struct Prepared {
     preferences: Option<SignedProposerPreferences>,
     /// What the block's state transition may leave unchecked: the reveal, when
     /// the caller set `skip_randao_verification`.
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
     /// The store's shared pubkey table, which every state transition of the
     /// proposal resolves execution requests and the sync committee through
     /// (a fresh one would ingest the whole registry each time).
@@ -728,7 +729,10 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
-        options: BlockProcessingOptions { randao },
+        options: BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
         pubkey_indices,
     })
 }
@@ -743,10 +747,13 @@ fn verify_randao_reveal(
     let epoch = compute_epoch_at_slot(state.slot());
     let domain = get_domain(state, constants::DOMAIN_RANDAO, Some(epoch));
     let signing_root = compute_signing_root(epoch.hash_tree_root(), domain);
-    let pubkey = state
-        .validator(proposer)
-        .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
-        .pubkey;
+    let pubkey = bls::IndexedPubkey {
+        index: proposer,
+        pubkey: state
+            .validator(proposer)
+            .map_err(|_| ApiError::Internal("the proposer is not in the registry"))?
+            .pubkey,
+    };
     if bls::verify(&pubkey, signing_root, &randao_reveal) {
         Ok(())
     } else {
@@ -1054,16 +1061,40 @@ async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(cache): Extension<PayloadCache>,
+    events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    post_envelope_waiting(&store, &p2p, &cache, &headers, &body, BLOCK_WAIT).await
+    post_envelope_emitting(
+        &store,
+        &p2p,
+        &cache,
+        events.as_deref(),
+        &headers,
+        &body,
+        BLOCK_WAIT,
+    )
+    .await
 }
 
+/// [`post_envelope_emitting`] without an event bus, for the handler's tests.
+#[cfg(test)]
 async fn post_envelope_waiting(
     store: &Store,
     p2p: &RpcToP2PRef,
     cache: &PayloadCache,
+    headers: &HeaderMap,
+    body: &[u8],
+    block_wait: Duration,
+) -> Response {
+    post_envelope_emitting(store, p2p, cache, None, headers, body, block_wait).await
+}
+
+async fn post_envelope_emitting(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    cache: &PayloadCache,
+    events: Option<&EventBus>,
     headers: &HeaderMap,
     body: &[u8],
     block_wait: Duration,
@@ -1192,12 +1223,19 @@ async fn post_envelope_waiting(
 
     let sidecars: Vec<DataColumnSidecar> =
         sidecars.into_iter().map(DataColumnSidecar::Gloas).collect();
+    let accepted = GossipEvent::ExecutionPayloadGossip {
+        slot: block_slot,
+        builder_index: signed.message.builder_index,
+        block_hash: signed.message.payload.block_hash,
+        block_root,
+    };
     if p2p
         .publish_execution_payload_envelope(Box::new(signed), sidecars)
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();
     }
+    emit_accepted(events, || accepted);
     StatusCode::OK.into_response()
 }
 

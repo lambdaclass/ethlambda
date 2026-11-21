@@ -131,86 +131,96 @@ fn spec(config: &Config) -> Map<String, Value> {
 /// A key must not also be a `Config` field, or it would silently replace that
 /// field's value; `no_key_is_reported_twice` checks this.
 fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
-    // Phase0 through fulu, in the order of `preset.rs`.
-    let preset = entries!(decimal; preset:
-        MAX_COMMITTEES_PER_SLOT,
-        TARGET_COMMITTEE_SIZE,
-        MAX_VALIDATORS_PER_COMMITTEE,
-        SHUFFLE_ROUND_COUNT,
-        HYSTERESIS_QUOTIENT,
-        HYSTERESIS_DOWNWARD_MULTIPLIER,
-        HYSTERESIS_UPWARD_MULTIPLIER,
-        MIN_DEPOSIT_AMOUNT,
-        MAX_EFFECTIVE_BALANCE,
-        EFFECTIVE_BALANCE_INCREMENT,
-        MIN_ATTESTATION_INCLUSION_DELAY,
-        SLOTS_PER_EPOCH,
-        MIN_SEED_LOOKAHEAD,
-        MAX_SEED_LOOKAHEAD,
-        EPOCHS_PER_ETH1_VOTING_PERIOD,
-        SLOTS_PER_HISTORICAL_ROOT,
-        MIN_EPOCHS_TO_INACTIVITY_PENALTY,
-        EPOCHS_PER_HISTORICAL_VECTOR,
-        EPOCHS_PER_SLASHINGS_VECTOR,
-        HISTORICAL_ROOTS_LIMIT,
-        VALIDATOR_REGISTRY_LIMIT,
-        BASE_REWARD_FACTOR,
-        WHISTLEBLOWER_REWARD_QUOTIENT,
-        PROPOSER_REWARD_QUOTIENT,
-        INACTIVITY_PENALTY_QUOTIENT,
-        MIN_SLASHING_PENALTY_QUOTIENT,
-        PROPORTIONAL_SLASHING_MULTIPLIER,
-        MAX_PROPOSER_SLASHINGS,
-        MAX_ATTESTER_SLASHINGS,
-        MAX_ATTESTATIONS,
-        MAX_DEPOSITS,
-        MAX_VOLUNTARY_EXITS,
-        INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
-        MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR,
-        PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
-        SYNC_COMMITTEE_SIZE,
-        EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
-        MIN_SYNC_COMMITTEE_PARTICIPANTS,
-        UPDATE_TIMEOUT,
-        INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
-        MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX,
-        PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
-        MAX_BYTES_PER_TRANSACTION,
-        MAX_TRANSACTIONS_PER_PAYLOAD,
-        BYTES_PER_LOGS_BLOOM,
-        MAX_EXTRA_DATA_BYTES,
-        MAX_BLS_TO_EXECUTION_CHANGES,
-        MAX_WITHDRAWALS_PER_PAYLOAD,
-        MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP,
-        MAX_BLOB_COMMITMENTS_PER_BLOCK,
-        KZG_COMMITMENT_INCLUSION_PROOF_DEPTH,
-        FIELD_ELEMENTS_PER_BLOB,
-        MIN_ACTIVATION_BALANCE,
-        MAX_EFFECTIVE_BALANCE_ELECTRA,
-        MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
-        WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
-        PENDING_DEPOSITS_LIMIT,
-        PENDING_PARTIAL_WITHDRAWALS_LIMIT,
-        PENDING_CONSOLIDATIONS_LIMIT,
-        MAX_ATTESTER_SLASHINGS_ELECTRA,
-        MAX_ATTESTATIONS_ELECTRA,
-        MAX_DEPOSIT_REQUESTS_PER_PAYLOAD,
-        MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
-        MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
-        MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP,
-        MAX_PENDING_DEPOSITS_PER_EPOCH,
-        KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH,
-        FIELD_ELEMENTS_PER_CELL,
-        FIELD_ELEMENTS_PER_EXT_BLOB,
-        CELLS_PER_EXT_BLOB,
-        NUMBER_OF_COLUMNS,
-        // Gloas, in the order of the specification's `presets/*/gloas.yaml`.
-        PTC_SIZE,
-        MAX_PAYLOAD_ATTESTATIONS,
-        MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
-        MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
-        MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
-    );
+    // Phase0 through fulu, in the order of `preset.rs`, read from the preset
+    // this process runs: both modules carry every name, at its own value.
+    use preset::{mainnet, minimal};
+    macro_rules! preset_entries {
+        ($module:ident) => {
+            entries!(decimal; $module:
+                MAX_COMMITTEES_PER_SLOT,
+                TARGET_COMMITTEE_SIZE,
+                MAX_VALIDATORS_PER_COMMITTEE,
+                SHUFFLE_ROUND_COUNT,
+                HYSTERESIS_QUOTIENT,
+                HYSTERESIS_DOWNWARD_MULTIPLIER,
+                HYSTERESIS_UPWARD_MULTIPLIER,
+                MIN_DEPOSIT_AMOUNT,
+                MAX_EFFECTIVE_BALANCE,
+                EFFECTIVE_BALANCE_INCREMENT,
+                MIN_ATTESTATION_INCLUSION_DELAY,
+                SLOTS_PER_EPOCH,
+                MIN_SEED_LOOKAHEAD,
+                MAX_SEED_LOOKAHEAD,
+                EPOCHS_PER_ETH1_VOTING_PERIOD,
+                SLOTS_PER_HISTORICAL_ROOT,
+                MIN_EPOCHS_TO_INACTIVITY_PENALTY,
+                EPOCHS_PER_HISTORICAL_VECTOR,
+                EPOCHS_PER_SLASHINGS_VECTOR,
+                HISTORICAL_ROOTS_LIMIT,
+                VALIDATOR_REGISTRY_LIMIT,
+                BASE_REWARD_FACTOR,
+                WHISTLEBLOWER_REWARD_QUOTIENT,
+                PROPOSER_REWARD_QUOTIENT,
+                INACTIVITY_PENALTY_QUOTIENT,
+                MIN_SLASHING_PENALTY_QUOTIENT,
+                PROPORTIONAL_SLASHING_MULTIPLIER,
+                MAX_PROPOSER_SLASHINGS,
+                MAX_ATTESTER_SLASHINGS,
+                MAX_ATTESTATIONS,
+                MAX_DEPOSITS,
+                MAX_VOLUNTARY_EXITS,
+                INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
+                MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR,
+                PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
+                SYNC_COMMITTEE_SIZE,
+                EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+                MIN_SYNC_COMMITTEE_PARTICIPANTS,
+                UPDATE_TIMEOUT,
+                INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+                MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX,
+                PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+                MAX_BYTES_PER_TRANSACTION,
+                MAX_TRANSACTIONS_PER_PAYLOAD,
+                BYTES_PER_LOGS_BLOOM,
+                MAX_EXTRA_DATA_BYTES,
+                MAX_BLS_TO_EXECUTION_CHANGES,
+                MAX_WITHDRAWALS_PER_PAYLOAD,
+                MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP,
+                MAX_BLOB_COMMITMENTS_PER_BLOCK,
+                KZG_COMMITMENT_INCLUSION_PROOF_DEPTH,
+                FIELD_ELEMENTS_PER_BLOB,
+                MIN_ACTIVATION_BALANCE,
+                MAX_EFFECTIVE_BALANCE_ELECTRA,
+                MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
+                WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+                PENDING_DEPOSITS_LIMIT,
+                PENDING_PARTIAL_WITHDRAWALS_LIMIT,
+                PENDING_CONSOLIDATIONS_LIMIT,
+                MAX_ATTESTER_SLASHINGS_ELECTRA,
+                MAX_ATTESTATIONS_ELECTRA,
+                MAX_DEPOSIT_REQUESTS_PER_PAYLOAD,
+                MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
+                MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
+                MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP,
+                MAX_PENDING_DEPOSITS_PER_EPOCH,
+                KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH,
+                FIELD_ELEMENTS_PER_CELL,
+                FIELD_ELEMENTS_PER_EXT_BLOB,
+                CELLS_PER_EXT_BLOB,
+                NUMBER_OF_COLUMNS,
+                // Gloas, in the order of the specification's `presets/*/gloas.yaml`.
+                PTC_SIZE,
+                MAX_PAYLOAD_ATTESTATIONS,
+                MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
+                MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
+                MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
+            )
+        };
+    }
+    let preset = match preset::Preset::active() {
+        preset::Preset::Mainnet => preset_entries!(mainnet),
+        preset::Preset::Minimal => preset_entries!(minimal),
+    };
 
     let domains = entries!(hex_string; constants:
         DOMAIN_BEACON_PROPOSER,
@@ -349,7 +359,10 @@ mod tests {
         assert_eq!(data["PRESET_BASE"], "mainnet");
         assert_eq!(data["CONFIG_NAME"], "mainnet");
 
-        assert_eq!(data["SLOTS_PER_EPOCH"], preset::SLOTS_PER_EPOCH.to_string());
+        assert_eq!(
+            data["SLOTS_PER_EPOCH"],
+            preset::slots_per_epoch().to_string()
+        );
         assert_eq!(data["DOMAIN_BEACON_ATTESTER"], "0x01000000");
         assert_eq!(data["DOMAIN_APPLICATION_MASK"], "0x00000001");
         assert_eq!(data["COMPOUNDING_WITHDRAWAL_PREFIX"], "0x02");
@@ -373,22 +386,22 @@ mod tests {
                 "MAX_VALIDATORS_PER_COMMITTEE",
                 preset::MAX_VALIDATORS_PER_COMMITTEE.to_string(),
             ),
-            ("SLOTS_PER_EPOCH", preset::SLOTS_PER_EPOCH.to_string()),
+            ("SLOTS_PER_EPOCH", preset::slots_per_epoch().to_string()),
             (
                 "EPOCHS_PER_ETH1_VOTING_PERIOD",
-                preset::EPOCHS_PER_ETH1_VOTING_PERIOD.to_string(),
+                preset::epochs_per_eth1_voting_period().to_string(),
             ),
             (
                 "SLOTS_PER_HISTORICAL_ROOT",
-                preset::SLOTS_PER_HISTORICAL_ROOT.to_string(),
+                preset::slots_per_historical_root().to_string(),
             ),
             (
                 "EPOCHS_PER_HISTORICAL_VECTOR",
-                preset::EPOCHS_PER_HISTORICAL_VECTOR.to_string(),
+                preset::epochs_per_historical_vector().to_string(),
             ),
             (
                 "EPOCHS_PER_SLASHINGS_VECTOR",
-                preset::EPOCHS_PER_SLASHINGS_VECTOR.to_string(),
+                preset::epochs_per_slashings_vector().to_string(),
             ),
             (
                 "HISTORICAL_ROOTS_LIMIT",
@@ -455,14 +468,14 @@ mod tests {
         let json = get_spec_json().await;
         let data = &json["data"];
 
-        assert_eq!(data["PTC_SIZE"], preset::PTC_SIZE.to_string());
+        assert_eq!(data["PTC_SIZE"], preset::ptc_size().to_string());
         assert_eq!(
             data["MAX_PAYLOAD_ATTESTATIONS"],
             preset::MAX_PAYLOAD_ATTESTATIONS.to_string()
         );
         assert_eq!(
             data["MAX_BUILDERS_PER_WITHDRAWALS_SWEEP"],
-            preset::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP.to_string()
+            preset::max_builders_per_withdrawals_sweep().to_string()
         );
         assert_eq!(data["DOMAIN_BEACON_BUILDER"], "0x0b000000");
         assert_eq!(data["DOMAIN_PTC_ATTESTER"], "0x0c000000");

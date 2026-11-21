@@ -58,7 +58,7 @@ use ethlambda_state_transition::beacon::fork_choice::{
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, gloas};
+use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
@@ -116,8 +116,25 @@ pub(crate) const ENVELOPE_AWAITING_BLOCK_TTL_SLOTS: u64 = 2;
 /// How many blocks may wait on one parent's payload.
 ///
 /// The children of a block that all name it as a FULL parent: one per slot the
-/// chain skipped past it, plus equivocations.
+/// chain skipped past it. Equivocations do not count against it: one block
+/// per slot and proposer is held, so a proposer signing several cannot crowd
+/// out another proposer's child (see [`HeldChild`]).
 pub(crate) const MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD: usize = 4;
+
+/// A block held for its parent's payload, as
+/// [`EnvelopeQueues::blocks_awaiting_parent_payload`] records it.
+///
+/// The proposer is kept beside the slot so a second block for the same
+/// parent, slot and proposer is refused rather than held. Gossip only records
+/// a `(slot, proposer)` as seen on `Accept`, and such a block is `Queue`d, so
+/// without this a proposer signing four blocks on an unverified FULL parent
+/// would fill [`MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD`], and every other child of
+/// that parent would be dropped until its envelope verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldChild {
+    pub(crate) slot: u64,
+    pub(crate) proposer_index: u64,
+}
 
 /// How many envelope roots the execution client refused for their own
 /// contents are remembered.
@@ -188,9 +205,9 @@ pub(crate) struct EnvelopeQueues {
     /// payload being verified, so the head is recomputed.
     pub(crate) head_dirty: bool,
     /// Blocks whose parent is FULL with a payload not yet verified, by the
-    /// parent's root, each with its own slot. The block's bytes are in
-    /// `Table::BlockHeaders`/`BlockBodies` as for any other held block.
-    pub(crate) blocks_awaiting_parent_payload: HashMap<H256, HashMap<H256, u64>>,
+    /// parent's root, each with its own slot and proposer. The block's bytes
+    /// are in `Table::BlockHeaders`/`BlockBodies` as for any other held block.
+    pub(crate) blocks_awaiting_parent_payload: HashMap<H256, HashMap<H256, HeldChild>>,
     /// Roots to look at in [`BlockChainServer::settle_envelopes`].
     pub(crate) work: VecDeque<H256>,
     /// Roots whose envelope was verified since the last settle, whose waiting
@@ -416,40 +433,22 @@ impl BlockChainServer {
             return false;
         }
 
-        let sidecars = if commitment_count == 0 {
-            Vec::new()
-        } else {
-            match self.stored_gloas_columns(slot, &root) {
-                Some(sidecars) => sidecars,
-                None => {
-                    // Every sampled column was listed as stored a moment ago,
-                    // so failing to read one back is a storage or decode
-                    // fault, not a wait. Holding would name nothing missing
-                    // and be redriven every slot for as long as the fault
-                    // lasts, so the envelope is dropped (and asked for again
-                    // if children wait on it).
-                    warn!(
-                        %slot,
-                        block_root = %ShortRoot(&root.0),
-                        "Dropping an envelope: a stored sampled column could not be read back"
-                    );
-                    self.refetch_envelope_if_children_wait(root);
-                    return false;
-                }
-            }
-        };
-
+        // Every sampled column is stored, and a stored column has passed the
+        // slot match, the structural check and the KZG batch against this
+        // block's bid's commitments in the p2p layer (gossip validation, or
+        // `chain_checks_gloas` for any other, this node's own included), so
+        // none is read back and verified a second time here. With no commitments there
+        // is nothing to sample and nothing to verify.
         // The consensus checks come first, as `verify_execution_payload_envelope`
         // orders them, so the execution client is only ever asked about an
         // envelope this node would accept: signed by the builder, matching
         // the bid and the state, and with its data available.
         self.advance_beacon_clock_to(held.event_ms);
         let config = self.store.config();
-        if let Err(err) = fork_choice::check_execution_payload_envelope(
+        if let Err(err) = fork_choice::check_execution_payload_envelope_columns_verified(
             &self.store,
             &held.envelope,
             &config,
-            &sidecars,
             &ExecutionEngine::valid(),
         ) {
             // p2p judged the envelope before it got here, so no peer is
@@ -574,6 +573,14 @@ impl BlockChainServer {
             held.envelope.message.payload.block_hash,
         );
         self.envelopes.verified.push_back(root);
+        let message = &held.envelope.message;
+        self.events.publish_envelope_imported(
+            slot,
+            message.builder_index,
+            message.payload.block_hash,
+            root,
+            status,
+        );
         true
     }
 
@@ -605,28 +612,6 @@ impl BlockChainServer {
     fn release_envelopes_awaiting_engine(&mut self) {
         let roots: Vec<H256> = self.envelopes.awaiting_engine.keys().copied().collect();
         self.envelopes.work.extend(roots);
-    }
-
-    /// Every sampled column stored for `root`, decoded as gloas sidecars, or
-    /// `None` if any is missing or not one.
-    fn stored_gloas_columns(
-        &self,
-        slot: u64,
-        root: &H256,
-    ) -> Option<Vec<gloas::DataColumnSidecar>> {
-        self.custody_columns
-            .iter()
-            .map(
-                |&index| match self.store.get_data_column(slot, root, index) {
-                    Ok(Some(DataColumnSidecar::Gloas(sidecar))) => Some(sidecar),
-                    Ok(Some(DataColumnSidecar::Fulu(_))) | Ok(None) => None,
-                    Err(err) => {
-                        error!(%err, "Failed to read back a stored data column sidecar");
-                        None
-                    }
-                },
-            )
-            .collect()
     }
 
     /// Hold `held` for a block that is in the store but has no post-state yet,
@@ -989,6 +974,21 @@ impl BlockChainServer {
         if held_for_parent.is_some_and(|held| held.contains_key(&block_root)) {
             return;
         }
+        let child = HeldChild {
+            slot,
+            proposer_index: block.proposer_index(),
+        };
+        if held_for_parent.is_some_and(|held| held.values().any(|other| *other == child)) {
+            warn!(
+                %slot,
+                proposer = child.proposer_index,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                "Dropping a block: its proposer already has a block held for this parent and slot"
+            );
+            self.discard_pending_subtree(block_root);
+            return;
+        }
         if held_for_parent.is_some_and(|held| held.len() >= MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD) {
             warn!(
                 %slot,
@@ -1015,7 +1015,7 @@ impl BlockChainServer {
             .blocks_awaiting_parent_payload
             .entry(parent_root)
             .or_default()
-            .insert(block_root, slot);
+            .insert(block_root, child);
         self.held_timings.insert(block_root, timings);
         self.publish_envelope_queues();
         // Asked at once whatever the block's source. A synced block is not
@@ -1073,7 +1073,7 @@ impl BlockChainServer {
             return;
         };
         self.publish_envelope_queues();
-        for (block_root, slot) in children {
+        for (block_root, HeldChild { slot, .. }) in children {
             let timings = self
                 .held_timings
                 .remove(&block_root)
@@ -1166,7 +1166,7 @@ impl BlockChainServer {
             .blocks_awaiting_parent_payload
             .values()
             .flat_map(|children| children.iter())
-            .filter(|&(_, &slot)| slot <= finalized_slot)
+            .filter(|&(_, child)| child.slot <= finalized_slot)
             .map(|(&root, _)| root)
             .collect();
         for root in stale {
@@ -1203,6 +1203,14 @@ pub(crate) mod tests {
     use crate::tests::{GENESIS_TIME, beacon_server, beacon_store};
     use ethlambda_network_api::BlockSource;
     use ethlambda_state_transition::beacon::fork::ForkName;
+
+    /// A held child at `slot`, proposed by validator 0.
+    fn held_child(slot: u64) -> HeldChild {
+        HeldChild {
+            slot,
+            proposer_index: 0,
+        }
+    }
 
     /// The mainnet preset with every fork active from genesis, as the fork
     /// choice fixtures that carry no `config.yaml` of their own are run.
@@ -1594,6 +1602,56 @@ pub(crate) mod tests {
         );
     }
 
+    /// A proposer signing several blocks for one slot on an unverified FULL
+    /// parent gets one of them held, not one per copy: gossip queues each of
+    /// them, so without this they would fill the cap, and a block another
+    /// proposer built on the same parent would be dropped.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn one_block_per_slot_and_proposer_is_held_for_a_parents_payload() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let child = case.block(CHILD);
+        let SignedBeaconBlock::Gloas(inner) = &child else {
+            panic!("the fixture's child is a gloas block");
+        };
+        let (slot, proposer) = (inner.message.slot, inner.message.proposer_index);
+        for byte in 0..MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD as u8 + 2 {
+            let mut equivocation = child.clone();
+            if let SignedBeaconBlock::Gloas(inner) = &mut equivocation {
+                inner.message.state_root = H256::repeat_byte(byte);
+            }
+            server.hold_block_for_parent_payload(equivocation, ImportTimings::default());
+        }
+        let mut other_proposer = child.clone();
+        if let SignedBeaconBlock::Gloas(inner) = &mut other_proposer {
+            inner.message.slot += 1;
+            inner.message.proposer_index += 1;
+        }
+        server.hold_block_for_parent_payload(other_proposer, ImportTimings::default());
+
+        let held = &server.envelopes.blocks_awaiting_parent_payload[&child.parent_root()];
+        let mut children: Vec<HeldChild> = held.values().copied().collect();
+        children.sort_by_key(|child| child.slot);
+        assert_eq!(
+            children,
+            vec![
+                HeldChild {
+                    slot,
+                    proposer_index: proposer,
+                },
+                HeldChild {
+                    slot: slot + 1,
+                    proposer_index: proposer + 1,
+                },
+            ]
+        );
+        assert_eq!(server.held_timings.len(), 2);
+    }
+
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
@@ -1621,7 +1679,10 @@ pub(crate) mod tests {
         let parent = H256::repeat_byte(5);
         queues.blocks_awaiting_parent_payload.insert(
             parent,
-            HashMap::from([(H256::repeat_byte(6), 10), (H256::repeat_byte(7), 11)]),
+            HashMap::from([
+                (H256::repeat_byte(6), held_child(10)),
+                (H256::repeat_byte(7), held_child(11)),
+            ]),
         );
         server
             .held_timings
@@ -1641,7 +1702,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             queues.blocks_awaiting_parent_payload[&parent],
-            HashMap::from([(H256::repeat_byte(7), 11)])
+            HashMap::from([(H256::repeat_byte(7), held_child(11))])
         );
         assert!(!server.held_timings.contains_key(&H256::repeat_byte(6)));
     }
@@ -2037,10 +2098,10 @@ pub(crate) mod tests {
         let (mut server, p2p) =
             crate::tests::beacon_server_recording(beacon_store(GENESIS_TIME, 0));
         let parent = H256::repeat_byte(5);
-        server
-            .envelopes
-            .blocks_awaiting_parent_payload
-            .insert(parent, HashMap::from([(H256::repeat_byte(6), 3)]));
+        server.envelopes.blocks_awaiting_parent_payload.insert(
+            parent,
+            HashMap::from([(H256::repeat_byte(6), held_child(3))]),
+        );
 
         server.redrive_missing_envelopes();
         server.redrive_missing_envelopes();
@@ -2062,10 +2123,10 @@ pub(crate) mod tests {
             crate::tests::beacon_server_recording(beacon_store(GENESIS_TIME, 0));
         let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
         let parent = H256::repeat_byte(5);
-        server
-            .envelopes
-            .blocks_awaiting_parent_payload
-            .insert(parent, HashMap::from([(H256::repeat_byte(6), 3)]));
+        server.envelopes.blocks_awaiting_parent_payload.insert(
+            parent,
+            HashMap::from([(H256::repeat_byte(6), held_child(3))]),
+        );
         server
             .envelopes
             .awaiting_block
@@ -2333,6 +2394,60 @@ pub(crate) mod tests {
         envelope.message.payload.block_hash
     }
 
+    /// The actor's import of an envelope is what publishes `execution_payload`,
+    /// and `execution_payload_available` right after it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_imported_envelope_emits_execution_payload_then_available() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        let mut rx = server.events.subscribe();
+        let envelope = valid_envelope_for_full_parent();
+        let builder_index = envelope.message.builder_index;
+        let block_hash = payload_hash(&envelope);
+
+        server.receive_envelope(envelope, 0).await;
+
+        let payload_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::ChainEvent::ExecutionPayload(_)
+                        | crate::ChainEvent::ExecutionPayloadAvailable(_)
+                )
+            })
+            .collect();
+        let slot = server
+            .store
+            .block_slot_and_state_root(&root(FULL_PARENT))
+            .expect("the parent is imported")
+            .0;
+        match payload_events.as_slice() {
+            [
+                crate::ChainEvent::ExecutionPayload(payload),
+                crate::ChainEvent::ExecutionPayloadAvailable(available),
+            ] => {
+                assert_eq!(
+                    (payload.slot, payload.builder_index, payload.block_hash),
+                    (slot, builder_index, block_hash)
+                );
+                assert_eq!(payload.block_root, root(FULL_PARENT));
+                assert!(!payload.execution_optimistic);
+                assert_eq!(
+                    (available.slot, available.block_root),
+                    (slot, root(FULL_PARENT))
+                );
+            }
+            other => panic!("expected execution_payload then available, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
@@ -2379,6 +2494,7 @@ pub(crate) mod tests {
         let (client, _mock) =
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
+        let mut rx = server.events.subscribe();
 
         server
             .receive_envelope(valid_envelope_for_full_parent(), 0)
@@ -2390,6 +2506,14 @@ pub(crate) mod tests {
         assert_eq!(status, PayloadStatusEnum::Syncing);
         assert!(status.is_not_validated());
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        // The `execution_payload` event says the payload is not vouched for.
+        let imported: Vec<bool> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::ChainEvent::ExecutionPayload(payload) => Some(payload.execution_optimistic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imported, [true]);
     }
 
     #[tokio::test]

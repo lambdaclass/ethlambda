@@ -1,5 +1,5 @@
 //! Spec constants: values the specification fixes outright, as opposed to
-//! preset values (compile-time, see [`crate::beacon::preset`]) or configuration
+//! preset values (one preset per process, see [`crate::beacon::preset`]) or configuration
 //! values (runtime, per network, see [`crate::beacon::config`]).
 //!
 //! A value lives here only if the spec's own `.md` files list it under a

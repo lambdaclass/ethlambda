@@ -52,7 +52,7 @@ use ethlambda_state_transition::beacon::containers::BeaconState;
 use ethlambda_state_transition::beacon::stf::epoch;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{Case, collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// Runs the single epoch-processing step the handler names.
 fn apply(
@@ -82,10 +82,10 @@ fn apply(
         "rewards_and_penalties" => match fork {
             ForkName::Phase0 => epoch::rewards::process_rewards_and_penalties(state, config),
             // `BeaconState::altair_validator_lists` now reaches a gloas
-            // state's participation and inactivity lists too, as plain
-            // slices (progressive rather than `SszList`, EIP-7688, but both
-            // `Deref` to `[T]`), so this one copy serves gloas as well; see
-            // that accessor's own doc.
+            // state's participation and inactivity lists too, as
+            // `ParticipationRef` and `InactivityScoresRef`, which read a
+            // bounded and a progressive list alike (EIP-7688), so this one
+            // copy serves gloas as well; see that accessor's own doc.
             ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
@@ -312,7 +312,7 @@ fn apply(
 
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect_all_handlers(PRESET, "epoch_processing");
+    let cases = collect_all_handlers(preset(), "epoch_processing");
     let mut trials = vec![super::discovery_trial("epoch_processing", cases.len())];
 
     for (handler, case) in cases {
@@ -371,7 +371,7 @@ fn every_shipped_handler_is_dispatched() -> Trial {
                 "ptc_window",
             ];
 
-            let mut unknown: Vec<String> = collect_all_handlers(PRESET, "epoch_processing")
+            let mut unknown: Vec<String> = collect_all_handlers(preset(), "epoch_processing")
                 .into_iter()
                 .filter(|(_, case): &(String, Case)| case.in_scope())
                 .map(|(handler, _)| handler)

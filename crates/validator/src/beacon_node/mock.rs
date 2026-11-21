@@ -184,7 +184,8 @@ pub struct MockBeaconNode {
     /// Every published gloas aggregate batch.
     pub published_gloas_aggregates: Mutex<Vec<(ForkName, Vec<gloas::SignedAggregateAndProof>)>>,
     pub ptc: Mutex<Vec<(Epoch, PtcDuties)>>,
-    pub ptc_calls: Mutex<usize>,
+    /// The epoch of every `ptc_duties` request, in call order.
+    pub ptc_requests: Mutex<Vec<Epoch>>,
     /// What `payload_attestation_data` answers with. `None` is the 204.
     pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
     pub payload_attestation_data_calls: Mutex<usize>,
@@ -594,7 +595,12 @@ impl MockBeaconNode {
     }
 
     pub fn ptc_call_count(&self) -> usize {
-        *self.ptc_calls.lock().expect("lock")
+        self.ptc_requests.lock().expect("lock").len()
+    }
+
+    /// The epochs `ptc_duties` was asked for, in call order.
+    pub fn ptc_requested_epochs(&self) -> Vec<Epoch> {
+        self.ptc_requests.lock().expect("lock").clone()
     }
 
     /// Answer `payload_attestation_data` with `data`.
@@ -1100,7 +1106,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn ptc_duties(&self, epoch: Epoch, _indices: &[ValidatorIndex]) -> Result<PtcDuties> {
         self.guard("ptc_duties")?;
-        *self.ptc_calls.lock().expect("lock") += 1;
+        self.ptc_requests.lock().expect("lock").push(epoch);
         self.ptc
             .lock()
             .expect("lock")

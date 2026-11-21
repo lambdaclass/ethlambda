@@ -70,7 +70,7 @@ impl BuiltInNetwork {
         let chain = self.chain();
         let parsed = ConfigFile::parse(chain.config_yaml)
             .wrap_err_with(|| format!("the built-in {} config.yaml did not parse", self.name()))?;
-        super::check_preset(parsed.config.preset_base.as_str())?;
+        super::select_preset(parsed.config.preset_base.as_str())?;
         super::check_constants(&parsed.config)?;
         // A built-in config can carry a fork whose keys this build does not
         // even claim (heze), which the ignored-keys warning below says. A fork

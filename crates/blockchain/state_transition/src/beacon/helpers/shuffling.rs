@@ -28,7 +28,7 @@ pub fn compute_shuffled_index(index: u64, index_count: u64, seed: Bytes32) -> Re
     crate::beacon::verify(index < index_count, "index < index_count")?;
 
     let mut index = index;
-    for round in 0..preset::SHUFFLE_ROUND_COUNT {
+    for round in 0..preset::shuffle_round_count() {
         let round_byte = round as u8;
 
         // The pivot for this round, derived from the seed and the round number.
@@ -116,7 +116,7 @@ pub fn shuffle_list(mut list: Vec<ValidatorIndex>, seed: Bytes32) -> Vec<Validat
         hash(&input[..]).0
     };
 
-    for round in (0..preset::SHUFFLE_ROUND_COUNT).rev() {
+    for round in (0..preset::shuffle_round_count()).rev() {
         input[32] = round as u8;
         let pivot = (bytes_to_uint64(&hash(&input[..33]).0[0..8]) % n as u64) as usize;
 

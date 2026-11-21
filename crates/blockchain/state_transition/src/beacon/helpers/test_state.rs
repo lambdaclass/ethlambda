@@ -86,13 +86,13 @@ pub fn with_validators(count: usize) -> BeaconState {
     BeaconState::Phase0(phase0::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
-        block_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        block_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("the vector is built at its exact length"),
-        state_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        state_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("the vector is built at its exact length"),
         historical_roots: Default::default(),
@@ -105,10 +105,10 @@ pub fn with_validators(count: usize) -> BeaconState {
         balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
             .try_into()
             .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-        randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+        randao_mixes: vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
             .try_into()
             .expect("the vector is built at its exact length"),
-        slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+        slashings: vec![0; preset::epochs_per_slashings_vector()]
             .try_into()
             .expect("the vector is built at its exact length"),
         previous_epoch_attestations: Default::default(),
@@ -229,19 +229,19 @@ fn full_balances(count: usize, effective_balance: Gwei) -> Balances {
 /// An all-zero `block_roots`/`state_roots` vector: both fields share this
 /// exact type, so one builder serves either.
 fn zero_root_vector() -> BlockRoots {
-    vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+    vec![Root::ZERO; preset::slots_per_historical_root()]
         .try_into()
         .expect("the vector is built at its exact length")
 }
 
 fn zero_randao_mixes() -> RandaoMixes {
-    vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+    vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
         .try_into()
         .expect("the vector is built at its exact length")
 }
 
 fn zero_slashings() -> Slashings {
-    vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+    vec![0; preset::epochs_per_slashings_vector()]
         .try_into()
         .expect("the vector is built at its exact length")
 }
@@ -265,7 +265,7 @@ fn zero_inactivity_scores(count: usize) -> InactivityScores {
 /// the right length, not for anything that aggregates or verifies against it.
 fn empty_sync_committee() -> altair::SyncCommittee {
     altair::SyncCommittee {
-        pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
+        pubkeys: vec![BlsPubkey::default(); preset::sync_committee_size()]
             .try_into()
             .expect("built at exactly SYNC_COMMITTEE_SIZE"),
         aggregate_pubkey: BlsPubkey::default(),
@@ -352,7 +352,7 @@ fn altair_state(count: usize) -> altair::BeaconState {
     altair::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -381,7 +381,7 @@ fn bellatrix_state(count: usize) -> bellatrix::BeaconState {
     bellatrix::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -414,7 +414,7 @@ fn capella_state(count: usize) -> capella::BeaconState {
     capella::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -447,7 +447,7 @@ fn deneb_state(count: usize) -> deneb::BeaconState {
     deneb::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -480,7 +480,7 @@ fn electra_state(count: usize) -> electra::BeaconState {
     electra::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -522,7 +522,7 @@ fn fulu_state(count: usize) -> fulu::BeaconState {
     fulu::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -561,7 +561,7 @@ fn fulu_state(count: usize) -> fulu::BeaconState {
         // that is a derived value a fulu-specific test can compute for itself
         // and override (see `crate::beacon::helpers::fulu::tests::fulu_state_with_validators`),
         // and this builder has no fulu-specific import to spare for it.
-        proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+        proposer_lookahead: vec![0; preset::proposer_lookahead_length()]
             .try_into()
             .expect("the vector is built at its exact length"),
     }
@@ -590,14 +590,14 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
             ..Default::default()
         })
         .collect();
-    let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::PTC_SIZE]
+    let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::ptc_size()]
         .try_into()
         .expect("built at exactly PTC_SIZE");
 
     gloas::BeaconState {
         genesis_time: 0,
         genesis_validators_root: Root::ZERO,
-        slot: preset::SLOTS_PER_EPOCH,
+        slot: preset::slots_per_epoch(),
         fork: Default::default(),
         latest_block_header: Default::default(),
         block_roots: zero_root_vector(),
@@ -632,7 +632,7 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
         pending_deposits: Default::default(),
         pending_partial_withdrawals: Default::default(),
         pending_consolidations: Default::default(),
-        proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+        proposer_lookahead: vec![0; preset::proposer_lookahead_length()]
             .try_into()
             .expect("the vector is built at its exact length"),
         builders: Default::default(),
@@ -640,14 +640,14 @@ fn gloas_state(count: usize) -> gloas::BeaconState {
         execution_payload_availability: Default::default(),
         builder_pending_payments: vec![
             gloas::BuilderPendingPayment::default();
-            preset::BUILDER_PENDING_PAYMENTS_LENGTH
+            preset::builder_pending_payments_length()
         ]
         .try_into()
         .expect("the vector is built at its exact length"),
         builder_pending_withdrawals: Default::default(),
         latest_execution_payload_bid: Default::default(),
         payload_expected_withdrawals: Default::default(),
-        ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
+        ptc_window: vec![empty_ptc; preset::ptc_window_length()]
             .try_into()
             .expect("the vector is built at its exact length"),
     }

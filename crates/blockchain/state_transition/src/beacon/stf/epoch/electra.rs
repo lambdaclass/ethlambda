@@ -341,7 +341,7 @@ impl SlashingsContext {
     /// The penalty due from `validator` this epoch, or `None` when its
     /// slashing does not fall due now.
     pub(super) fn penalty(&self, validator: &Validator) -> Result<Option<Gwei>> {
-        let withdrawable_offset = (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+        let withdrawable_offset = (preset::epochs_per_slashings_vector() / 2) as Epoch;
         if !(validator.slashed && self.epoch + withdrawable_offset == validator.withdrawable_epoch)
         {
             return Ok(None);
@@ -1308,7 +1308,7 @@ mod tests {
 
         let validator = state.validator_mut(1).unwrap();
         validator.slashed = true;
-        validator.withdrawable_epoch = epoch + (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+        validator.withdrawable_epoch = epoch + (preset::epochs_per_slashings_vector() / 2) as Epoch;
         let effective_balance_increments =
             validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
 
