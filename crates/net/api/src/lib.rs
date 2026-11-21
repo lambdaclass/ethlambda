@@ -356,6 +356,12 @@ pub trait P2PToBlockChain: Send + Sync {
         message: PayloadAttestationMessage,
         arrival: BlockArrival,
     ) -> Result<(), ActorError>;
+    /// Signed proposer preferences for `proposal_slot` were recorded in the
+    /// shared builder market, accepted from gossip or submitted through the
+    /// Beacon API. The market holds them; this only tells the chain actor,
+    /// whose `payload_attributes` event carries the fee recipient and gas
+    /// target they name, that the next slot's attributes may have changed.
+    fn new_proposer_preferences(&self, proposal_slot: u64) -> Result<(), ActorError>;
 }
 
 /// When an aggregate reached this node, for the one metric that cannot be

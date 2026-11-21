@@ -330,12 +330,7 @@ async fn post_committee_subscriptions(
     axum::http::StatusCode::OK.into_response()
 }
 
-/// Each validator's execution-layer fee recipient, as its validator client
-/// last named it. Read by block production, which puts the proposer's into
-/// the payload attributes. In memory only: a validator client repeats the
-/// call (ethlambda's and Lighthouse's every slot), so a restarted node
-/// relearns the map from its next one.
-pub(crate) type FeeRecipients = Arc<std::sync::Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>;
+pub(crate) use ethlambda_blockchain::FeeRecipients;
 
 /// One entry of `prepare_beacon_proposer`.
 #[derive(Debug, Deserialize)]

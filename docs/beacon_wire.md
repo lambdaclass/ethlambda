@@ -96,7 +96,10 @@ and on `Queue`, since the actor holds an envelope whose block is not imported
 yet. A payload attestation is validated on the attestation permit pool and goes
 to the actor on `Accept` only: a vote for a block not imported here is dropped,
 since it is valid only within its own slot. Bids and preferences are the
-builder market: they never reach the chain actor. Their rules live in
+builder market: they never reach the chain actor, which only hears, by
+proposal slot, that preferences were accepted (from gossip or the Beacon API),
+since its `payload_attributes` event carries the fee recipient and gas target
+they name. Their rules live in
 `state_transition::beacon::gossip::{execution_payload_bid, proposer_preferences}`,
 the cheap half runs in p2p's triage (`p2p/src/beacon/builder_market.rs`) and the
 stateful half on a permit pool of their own (`builder_validation_permits`), so
