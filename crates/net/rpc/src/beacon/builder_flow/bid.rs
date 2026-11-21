@@ -190,6 +190,7 @@ mod tests {
                 amount: 5,
             }],
             parent_hash: ExecutionBlockHash::repeat_byte(3),
+            parent_block_number: PARENT_BLOCK_NUMBER,
         }
     }
 

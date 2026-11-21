@@ -124,6 +124,7 @@ from a normal build.
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
+| `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). Lighthouse's flag of the same name |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
@@ -386,6 +387,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--prefer-builder-proposals` | off | Take the builder's block whenever there is a valid bid: this client sends `builder_boost_factor = u64::MAX`. The beacon node still keeps its local payload when its execution client sets `shouldOverrideBuilder`. Requires `--builder-proposals`; conflicts with `--builder-boost-factor` |
 | `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Taken with or without `--builder-proposals`: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
+| `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
 
 ### What it does today
 
@@ -521,9 +523,68 @@ for wall slot `S` are those of the period containing `S + 1`, since members
 assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
-Not implemented: doppelganger protection. Voluntary exits are signed by the
-keymanager API's `voluntary_exit` route and by
-[`ethlambda voluntary-exit`](#voluntary-exit).
+Voluntary exits are signed by the keymanager API's `voluntary_exit` route and
+by [`ethlambda voluntary-exit`](#voluntary-exit).
+
+### Doppelganger protection
+
+Off unless `--enable-doppelganger-protection` is passed. A doppelganger is a
+second validator client running the same key, usually a key moved to a new
+machine while the old one still runs. Slashing protection cannot see it, since
+each client's record holds only what that client signed. With the flag on, a
+key signs no attestation or block until its beacon node has watched it stay
+silent for a full epoch, through the standard
+`POST /eth/v1/validator/liveness/{epoch}`. The rule is Lighthouse's:
+
+- A key loaded at startup, or imported through the keymanager API, in epoch
+  `E` is watched from `E + 1`. Activity in `E` is not held against it, since it
+  is most likely this client's own previous process, restarted within the
+  epoch.
+- Three quarters into every slot the client asks about the previous epoch and
+  the current one. A key found live in an epoch it is watched for stops the
+  client with an error naming the validators.
+- An epoch counts as clean at the last slot of the epoch after it, once its
+  attestations have had their full inclusion window, and only when both
+  questions were answered and the key was explicitly reported not live. A
+  failed query, or a beacon node reporting itself syncing or optimistic, makes
+  no progress. With several `--beacon-nodes`, a syncing one is skipped for the
+  next.
+- So a key registered in `E` signs from `E + 3`, missing two to three epochs of
+  attestations. A key registered in epoch 0 (before genesis or during the
+  chain's first epoch, at startup or by import) signs at once, as Lighthouse's
+  do: every validator missing those epochs together could stall a new chain.
+- An epoch that could not be counted clean (no beacon node answered at its
+  deciding slot) is not asked about again, since a node answers only for the
+  previous, current and next epoch: the key waits for the next epoch instead,
+  and the miss is logged at error.
+
+Withheld while a key is checked: attestations, blocks (with the RANDAO reveal)
+and aggregates, the last because a node marks an aggregator live and would
+report this client as a doppelganger of itself. Everything else goes on: duties
+are fetched and subnets subscribed, so the key is ready the moment it is
+cleared, and sync committee messages and contributions, payload timeliness
+votes, builder registrations, proposer preferences and voluntary exits are
+signed as usual, as Lighthouse's client signs them during its own check. None
+of them is slashable, and an ethlambda beacon node counts none of them as
+liveness: it counts attestations, aggregates and block proposers. A beacon node
+that did count one of them (a sync committee message, say) would report this
+client's own message back as a doppelganger and stop it; against such a node,
+leave the flag off.
+
+A key with no validator index yet is not asked about and stays withheld; with
+no index it has no duties either. A key deleted through the keymanager API is
+no longer checked, so a copy the operator now runs elsewhere on purpose does
+not stop this client, and importing it again starts the check again.
+
+Under a supervisor that restarts the client (`Restart=on-failure`), a detection
+becomes a restart loop: each start checks again and stops again for as long as
+the other client runs. That is safe, since a key under the check signs nothing,
+but the loop does not end until the other client is found and stopped. The
+check is not foolproof either: two clients with the same key started together
+both see silence and both start signing, and a doppelganger that is down for
+the epochs checked goes unseen until it comes back, when nothing is checking any
+more. `ethlambda_validator_doppelganger_detecting` counts the keys still
+withheld.
 
 ### Duty offsets come from the network
 
