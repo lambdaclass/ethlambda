@@ -44,8 +44,12 @@ pub(crate) fn spawn(store: Store, shutdown: CancellationToken) {
         return;
     }
     tokio::spawn(async move {
+        // Never a slot already sealed, even if the wall clock reads a hair
+        // short of the cutoff it just slept until.
+        let mut next = 0;
         loop {
-            let slot = wall_slot(&config) + 1;
+            let slot = next_slot_to_seal(&config, now_ms()).max(next);
+            next = slot + 1;
             let cutoff = collection_cutoff_ms(&config, slot);
             let wait = Duration::from_millis(cutoff.saturating_sub(now_ms()));
             tokio::select! {
@@ -244,10 +248,22 @@ fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
         .saturating_add(slot.saturating_mul(config.slot_duration_ms))
 }
 
-/// The wall clock's slot (`0` before genesis).
-fn wall_slot(config: &Config) -> Slot {
-    now_ms().saturating_sub(config.genesis_time.saturating_mul(1000))
-        / config.slot_duration_ms.max(1)
+/// The first slot whose signatures are still being collected at `now_ms`:
+/// slot 0 before genesis, then the wall clock's slot until its collection
+/// cutoff and the next one after it. Taking the wall clock's slot plus one
+/// skipped slot 0 on a node started before genesis, whose aggregators' votes
+/// were then never proved.
+fn next_slot_to_seal(config: &Config, now_ms: u64) -> Slot {
+    let genesis_ms = config.genesis_time.saturating_mul(1000);
+    let Some(elapsed) = now_ms.checked_sub(genesis_ms) else {
+        return 0;
+    };
+    let slot = elapsed / config.slot_duration_ms.max(1);
+    if now_ms < collection_cutoff_ms(config, slot) {
+        slot
+    } else {
+        slot + 1
+    }
 }
 
 /// How far into `slot` its aggregates are due.
@@ -283,5 +299,22 @@ mod tests {
         assert_eq!(slot_start_ms(&config, 2), 100_000 + 24_000);
         assert_eq!(aggregate_due_ms(&config, 2), 6_000);
         assert_eq!(collection_cutoff_ms(&config, 2), 124_000 + 3_000 + 1_500);
+    }
+
+    #[test]
+    fn the_next_slot_to_seal_starts_at_genesis() {
+        let mut config = Config::mainnet();
+        config.genesis_time = 100;
+        config.gloas_fork_epoch = 0;
+        // Before genesis: slot 0, whose cutoff is 4.5 s into it.
+        assert_eq!(next_slot_to_seal(&config, 0), 0);
+        assert_eq!(next_slot_to_seal(&config, 99_999), 0);
+        assert_eq!(next_slot_to_seal(&config, 104_499), 0);
+        assert_eq!(next_slot_to_seal(&config, 104_500), 1);
+        // Mid-slot: that slot until its cutoff, the next one from then on.
+        assert_eq!(next_slot_to_seal(&config, 124_000), 2);
+        assert_eq!(next_slot_to_seal(&config, 128_499), 2);
+        assert_eq!(next_slot_to_seal(&config, 128_500), 3);
+        assert_eq!(next_slot_to_seal(&config, 135_999), 3);
     }
 }
