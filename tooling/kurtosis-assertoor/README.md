@@ -23,11 +23,11 @@ in `network_params.yaml`; bump them together.
 
 ## Run it locally
 
-Needs Docker and the kurtosis CLI (CI uses 1.20.0). From the repository root:
+Needs Docker and the kurtosis CLI (CI uses 1.23.0). From the repository root:
 
 ```bash
 git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
-git -C /tmp/ethereum-package checkout 67cb0e02dc0bd49ec9461cbf2ef7ac4a3232755f
+git -C /tmp/ethereum-package checkout 8378c1e3030ef4d41306aea9a0ba13d19372d125
 
 kurtosis run /tmp/ethereum-package --enclave ethlambda-assertoor \
   --args-file tooling/kurtosis-assertoor/network_params.yaml

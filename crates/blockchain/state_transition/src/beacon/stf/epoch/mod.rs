@@ -124,10 +124,10 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// serves everything from altair on, gloas included: nothing in gloas's own
 /// `beacon-chain.md` touches this step either, and
 /// [`crate::beacon::containers::BeaconState::altair_validator_lists`] now reaches
-/// a gloas state's participation lists too (as plain slices, since gloas's are
-/// progressive rather than `SszList`; see that accessor's own doc), which is
-/// what lets this one copy serve every fork from altair on without a
-/// gloas-specific one.
+/// a gloas state's participation lists too (as
+/// [`crate::beacon::containers::ParticipationRef`]s, which read a bounded and a
+/// progressive list alike; see that accessor's own doc), which is what lets
+/// this one copy serve every fork from altair on without a gloas-specific one.
 pub fn process_justification_and_finalization(
     state: &mut BeaconState,
     config: &Config,
@@ -277,7 +277,7 @@ pub fn get_attesting_balance(
 /// Clears the eth1 vote tally at the end of each voting period.
 pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
-    if next_epoch.is_multiple_of(preset::EPOCHS_PER_ETH1_VOTING_PERIOD) {
+    if next_epoch.is_multiple_of(preset::epochs_per_eth1_voting_period()) {
         *state.eth1_data_votes_mut() = Default::default();
     }
     Ok(())
@@ -352,7 +352,7 @@ pub(super) fn leaves_hysteresis_band(effective_balance: Gwei, balance: Gwei) -> 
 /// Zeroes the slot the slashings ring buffer is about to reuse.
 pub fn process_slashings_reset(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
-    let position = next_epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR;
+    let position = next_epoch as usize % preset::epochs_per_slashings_vector();
     state.slashings_mut()[position] = 0;
     Ok(())
 }
@@ -361,7 +361,7 @@ pub fn process_slashings_reset(state: &mut BeaconState) -> Result<()> {
 pub fn process_randao_mixes_reset(state: &mut BeaconState) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let mix = get_randao_mix(state, current_epoch);
-    let position = (current_epoch + 1) as usize % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+    let position = (current_epoch + 1) as usize % preset::epochs_per_historical_vector();
     state.randao_mixes_mut()[position] = mix;
     Ok(())
 }
@@ -374,7 +374,7 @@ pub fn process_randao_mixes_reset(state: &mut BeaconState) -> Result<()> {
 pub fn process_historical_roots_update(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
     let epochs_per_historical_root =
-        (preset::SLOTS_PER_HISTORICAL_ROOT / preset::SLOTS_PER_EPOCH as usize) as Epoch;
+        (preset::slots_per_historical_root() / preset::slots_per_epoch() as usize) as Epoch;
     if next_epoch.is_multiple_of(epochs_per_historical_root) {
         let batch = HistoricalBatch {
             block_roots: state.block_roots().clone(),

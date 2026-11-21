@@ -34,7 +34,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use ethlambda_state_transition::beacon::aggregate::{
-    MAX_AGGREGATES_PER_SLOT, is_non_strict_superset,
+    is_non_strict_superset, max_aggregates_per_slot,
 };
 use ethlambda_types::beacon::containers::SignedAggregateAndProof;
 use ethlambda_types::beacon::primitives::{
@@ -50,7 +50,9 @@ use ethlambda_types::beacon::primitives::{
 const DEFERRED_SLOTS: u64 = 2;
 
 /// The deferral queue's hard cap.
-const MAX_DEFERRED: usize = (MAX_AGGREGATES_PER_SLOT * DEFERRED_SLOTS) as usize;
+fn max_deferred() -> usize {
+    (max_aggregates_per_slot() * DEFERRED_SLOTS) as usize
+}
 
 /// One aggregate held for a slot that has not passed yet.
 pub(crate) struct Deferred {
@@ -164,7 +166,7 @@ impl AggregateGossip {
         aggregate: Box<SignedAggregateAndProof>,
         attesting_indices: Vec<ValidatorIndex>,
     ) -> Option<Dropped> {
-        if self.deferred.len() >= MAX_DEFERRED {
+        if self.deferred.len() >= max_deferred() {
             return Some(Dropped::QueueFull);
         }
         let applicable_at = aggregate.slot().saturating_add(1);
@@ -346,7 +348,7 @@ mod tests {
     #[test]
     fn the_queue_refuses_rather_than_growing_without_bound() {
         let mut gossip = AggregateGossip::default();
-        for index in 0..MAX_DEFERRED {
+        for index in 0..max_deferred() {
             assert_eq!(
                 gossip.defer(Box::new(aggregate(9, index as u64, [true; 4])), vec![]),
                 None
@@ -356,7 +358,7 @@ mod tests {
             gossip.defer(Box::new(aggregate(9, 0, [true; 4])), vec![]),
             Some(Dropped::QueueFull)
         );
-        assert_eq!(gossip.deferred_len(), MAX_DEFERRED);
+        assert_eq!(gossip.deferred_len(), max_deferred());
     }
 
     #[test]

@@ -51,6 +51,7 @@ use super::shared::{
     ProposerSlashing, RandaoMixes, SignedVoluntaryExit, Slashings, StateRoots, Validators,
 };
 use crate::beacon::preset;
+use crate::beacon::preset_sized::PresetList;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Slot,
     Uint256, ValidatorIndex, WithdrawalIndex,
@@ -62,7 +63,7 @@ use crate::beacon::primitives::{
 /// Unlike the other lists in [`BeaconBlockBody`], a proposer does not choose
 /// these: `process_withdrawals` recomputes the expected set from the sweep
 /// cursor and rejects a block whose `withdrawals` does not match exactly.
-pub type Withdrawals = SszList<Withdrawal, { preset::MAX_WITHDRAWALS_PER_PAYLOAD }>;
+pub type Withdrawals = PresetList<Withdrawal, preset::MaxWithdrawalsPerPayload>;
 
 // ---------------------------------------------------------------------------
 // New containers

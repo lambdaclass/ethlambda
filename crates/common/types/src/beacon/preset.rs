@@ -1,5 +1,5 @@
-//! Preset constants: the compile-time-selectable half of the specification's
-//! tunables.
+//! Preset values: the half of the specification's tunables that shapes its
+//! containers, selected once per process at runtime.
 //!
 //! The specification splits its numeric parameters into two kinds. *Configuration*
 //! values (genesis time, fork-activation epochs, network-specific limits) can
@@ -9,20 +9,35 @@
 //! roots vector holds, how many attestations fit in a block, how many field
 //! elements make up a blob. Two networks that disagree on a preset value are
 //! running different, mutually unintelligible protocols, because every hash tree
-//! root over a preset-bounded list or vector depends on that bound. That is also
-//! why the values below are Rust constants rather than fields on a struct: a
-//! container's SSZ shape is a type-level property (`SszList<T, { preset::X }>`),
-//! decided once when the crate is compiled, not something a running node could
-//! switch at runtime without also swapping out its state's memory layout.
+//! root over a preset-bounded list or vector depends on that bound.
 //!
 //! The specification defines exactly two presets, `mainnet` and `minimal`
 //! (`minimal` exists to keep spec test fixtures and local devnets fast). This
 //! crate mirrors that: [`mainnet`] and [`minimal`] each define every preset
-//! constant the specification uses from phase0 through gloas, and the top-level
-//! re-export picks one at compile time, gated on the `preset-minimal` feature.
-//! Downstream code should import from here (`preset::SLOTS_PER_EPOCH`, not
-//! `preset::mainnet::SLOTS_PER_EPOCH`), so that it automatically follows whichever
-//! preset the crate was built against.
+//! constant the specification uses from phase0 through gloas.
+//!
+//! # One binary, either preset
+//!
+//! A process runs one preset, chosen at startup ([`Preset::select`]) from the
+//! network's `PRESET_BASE` and frozen by its first read, the way Lighthouse
+//! and Teku pick theirs. What downstream code reads from here depends on
+//! whether the two presets agree:
+//!
+//! - A value both presets share (`MAX_ATTESTATIONS`, `VALIDATOR_REGISTRY_LIMIT`,
+//!   ...) is a constant of this module, `preset::MAX_ATTESTATIONS`, usable as a
+//!   const-generic bound. The build asserts each one equal in both presets.
+//! - A value they disagree on is a function returning it under
+//!   [`Preset::active`]: `preset::slots_per_epoch()` is `SLOTS_PER_EPOCH`.
+//!   There are 29 of these, every one listed in `per_preset!` below.
+//! - A container bounded by such a value cannot carry the bound as a const
+//!   generic, since it is not known when the crate is compiled. It takes a
+//!   [`Length`] marker instead (`preset::SyncCommitteeSize`), through the
+//!   collections in [`crate::beacon::preset_sized`] and `ethlambda_ssz_tree`'s
+//!   `ListOf`/`VectorOf`.
+//!
+//! Downstream code should read through here (`preset::slots_per_epoch()`, not
+//! `preset::mainnet::SLOTS_PER_EPOCH`), so that it follows whichever preset the
+//! process runs.
 //!
 //! # Why some constants are `usize` and others are `u64`
 //!
@@ -30,7 +45,8 @@
 //! `Bitvector`) in some container, in any fork from phase0 through gloas, is typed
 //! `usize` here, because it gets threaded through this crate as a const-generic
 //! parameter on that collection's Rust representation, and const generics require
-//! `usize`. Every other preset constant (reward/penalty divisors, Gwei amounts,
+//! `usize` (a bound the presets disagree on goes through [`Length::get`], which
+//! returns `usize` for the same reason). Every other preset constant (reward/penalty divisors, Gwei amounts,
 //! epoch/slot durations that never size a container by themselves) is typed `u64`,
 //! matching the `uint64` the specification gives it. A few constants are factors
 //! of a container bound without being one themselves (`SLOTS_PER_EPOCH` is the
@@ -55,6 +71,8 @@
 //! container or feed one of the formulas above; they belong to this crate's
 //! `constants` module instead, since they cannot vary between `mainnet` and
 //! `minimal` in the first place.
+
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// The mainnet preset: the values that secure the real Ethereum network.
 ///
@@ -1071,32 +1089,129 @@ pub mod minimal {
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
 }
 
-#[cfg(not(feature = "preset-minimal"))]
-pub use mainnet::*;
-#[cfg(feature = "preset-minimal")]
-pub use minimal::*;
+// ================================================================
+// The active preset
+// ================================================================
 
-/// Which of the two presets the constants above were taken from.
+/// Which of the two presets this process runs.
 ///
-/// The re-export just below the two modules picks one at compile time, so
-/// nothing in this crate can ask *which* one it got. A persisted artifact can:
-/// every SSZ container in this crate is bounded by these constants, so a state
-/// written by one preset's build is a different shape from the same state
-/// written by the other's, and a data directory has to say which it holds.
-/// [`Preset::ACTIVE`] is what a writer records and a reader compares against.
+/// Chosen once per process, at runtime: `ethlambda beacon` selects the preset
+/// its network's `config.yaml` names in `PRESET_BASE`, and the validator
+/// client the one its beacon node reports. One binary therefore follows
+/// mainnet and a minimal-preset devnet alike.
+///
+/// The choice cannot change once anything has read it. Every SSZ container
+/// bounded by a preset value checks lengths, decodes and merkleizes against
+/// [`Preset::active`] (see [`Length`]), so a state built under one preset and
+/// hashed under the other would give a root neither recognizes. The first
+/// read therefore freezes the choice: [`Preset::select`] after it succeeds
+/// only when it names the preset already in force, and an entry point that
+/// reads a preset value before selecting fails loudly at the select instead
+/// of running with mixed shapes.
+///
+/// A persisted artifact records which preset wrote it: a data directory
+/// stores [`Preset::selector`], and a resume compares it with
+/// [`Preset::active`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     Mainnet,
     Minimal,
 }
 
+/// The active preset, and how it came to be: 0 while nothing has selected or
+/// read one, `selector() + 1` once [`Preset::select`] chose it, and
+/// `selector() + 1 + READ_OFFSET` when a read froze [`Preset::DEFAULT`] before
+/// anything selected.
+///
+/// `Relaxed` throughout: the byte is the whole of the published data, and no
+/// other memory is read on the strength of having seen it.
+static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// What [`ACTIVE`] adds to a preset that was frozen by a read rather than
+/// selected. See [`Preset::require_unread`].
+const READ_OFFSET: u8 = 2;
+
 impl Preset {
-    /// The preset this build compiles its containers against.
-    pub const ACTIVE: Preset = if cfg!(feature = "preset-minimal") {
+    /// The preset a process runs when nothing selects one before its first
+    /// read: mainnet, or minimal with this crate's `preset-minimal` feature.
+    ///
+    /// The feature exists for test targets, which have no network to read a
+    /// preset from: it is how the minimal-preset unit tests run. The binary
+    /// never enables it, and every entry point that touches a beacon
+    /// container selects explicitly, so the default never decides what a
+    /// node runs.
+    pub const DEFAULT: Preset = if cfg!(feature = "preset-minimal") {
         Preset::Minimal
     } else {
         Preset::Mainnet
     };
+
+    /// The preset this process runs. The first call freezes
+    /// [`Preset::DEFAULT`] when nothing selected one before it.
+    #[inline]
+    pub fn active() -> Preset {
+        match ACTIVE.load(Ordering::Relaxed) {
+            0 => Self::freeze_default(),
+            stored => Self::from_stored(stored),
+        }
+    }
+
+    #[cold]
+    fn freeze_default() -> Preset {
+        let default = Self::DEFAULT;
+        let frozen = default.stored() + READ_OFFSET;
+        match ACTIVE.compare_exchange(0, frozen, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => default,
+            Err(stored) => Self::from_stored(stored),
+        }
+    }
+
+    /// Make `preset` the one this process runs.
+    ///
+    /// Succeeds when nothing has selected or read a preset yet, and when
+    /// `preset` is already the active one, so an entry point may select what a
+    /// shared helper already selected. Fails when a different preset is in
+    /// force, whether selected or frozen by an earlier read.
+    pub fn select(preset: Preset) -> Result<(), PresetAlreadyActive> {
+        match ACTIVE.compare_exchange(0, preset.stored(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => Ok(()),
+            Err(stored) if Self::from_stored(stored) == preset => Ok(()),
+            Err(stored) => Err(PresetAlreadyActive {
+                active: Self::from_stored(stored),
+                requested: preset,
+            }),
+        }
+    }
+
+    /// Fails when a read froze [`Preset::DEFAULT`] before anything selected a
+    /// preset.
+    ///
+    /// [`Preset::select`] accepts the preset already in force, so on a
+    /// mainnet network a preset value read ahead of the select goes
+    /// unnoticed: the read froze mainnet and the select then names mainnet.
+    /// The same startup on a minimal network fails. An entry point calls this
+    /// right before it selects, so the ordering bug fails on every network,
+    /// mainnet's tests included, and not only on the first minimal devnet.
+    ///
+    /// Only for an entry point that owns its process. A test binary shares
+    /// one process between tests, any of which may read first.
+    pub fn require_unread() -> Result<(), PresetReadBeforeSelect> {
+        match ACTIVE.load(Ordering::Relaxed) {
+            stored if stored > READ_OFFSET => Err(PresetReadBeforeSelect {
+                frozen: Self::from_stored(stored),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    const fn stored(self) -> u8 {
+        self.selector() + 1
+    }
+
+    fn from_stored(stored: u8) -> Preset {
+        Self::from_selector((stored - 1) % READ_OFFSET)
+            .expect("ACTIVE only ever holds a stored preset")
+    }
 
     /// The byte this preset is stored under. Spelled out rather than derived
     /// from the variant order, because it is a storage format and not a
@@ -1118,7 +1233,7 @@ impl Preset {
     }
 
     /// The specification's own name for this preset, as it appears in a
-    /// configuration directory or a fixture tree.
+    /// configuration's `PRESET_BASE` or a fixture tree.
     pub const fn name(self) -> &'static str {
         match self {
             Preset::Mainnet => "mainnet",
@@ -1127,10 +1242,247 @@ impl Preset {
     }
 }
 
+/// The inverse of [`Preset::name`]. Fails for any other `PRESET_BASE`, such as
+/// `gnosis`, whose values this crate does not carry.
+impl core::str::FromStr for Preset {
+    type Err = UnknownPreset;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        [Preset::Mainnet, Preset::Minimal]
+            .into_iter()
+            .find(|preset| preset.name() == name)
+            .ok_or(UnknownPreset)
+    }
+}
+
+/// A name that is neither `mainnet` nor `minimal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a preset this crate has values for: it carries mainnet and minimal")]
+pub struct UnknownPreset;
+
 impl core::fmt::Display for Preset {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// [`Preset::select`] named a preset other than the one already in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "cannot run the {requested} preset: this process already runs {active}, \
+     selected or read before {requested} was asked for"
+)]
+pub struct PresetAlreadyActive {
+    pub active: Preset,
+    pub requested: Preset,
+}
+
+/// [`Preset::require_unread`] found the preset frozen by a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a preset value was read before this process selected its preset, which froze {frozen}; \
+     this is a startup ordering bug, not a configuration error"
+)]
+pub struct PresetReadBeforeSelect {
+    pub frozen: Preset,
+}
+
+// ================================================================
+// Values the two presets agree on: compile-time constants
+// ================================================================
+
+/// Re-exports each name from [`mainnet`] as a constant of this module, and
+/// fails the build if [`minimal`] gives it a different value.
+///
+/// A value both presets agree on cannot depend on which one is active, so it
+/// stays a constant: usable in a const context and as a const-generic bound.
+/// The assertion is what keeps that true. Should a later specification
+/// release move one of these in either preset, the build breaks here and the
+/// name has to move to `per_preset!` below.
+macro_rules! shared {
+    ($($name:ident: $ty:ty),+ $(,)?) => {
+        $(
+            #[doc = concat!(
+                "[`mainnet::", stringify!($name), "`], which both presets agree on."
+            )]
+            pub const $name: $ty = mainnet::$name;
+            const _: () = assert!(
+                mainnet::$name == minimal::$name,
+                concat!(
+                    stringify!($name),
+                    " differs between the presets: read it through `per_preset!`"
+                ),
+            );
+        )+
+    };
+}
+
+shared! {
+    MAX_VALIDATORS_PER_COMMITTEE: usize,
+    HYSTERESIS_QUOTIENT: u64,
+    HYSTERESIS_DOWNWARD_MULTIPLIER: u64,
+    HYSTERESIS_UPWARD_MULTIPLIER: u64,
+    MIN_DEPOSIT_AMOUNT: u64,
+    MAX_EFFECTIVE_BALANCE: u64,
+    EFFECTIVE_BALANCE_INCREMENT: u64,
+    MIN_ATTESTATION_INCLUSION_DELAY: u64,
+    MIN_SEED_LOOKAHEAD: u64,
+    MAX_SEED_LOOKAHEAD: u64,
+    MIN_EPOCHS_TO_INACTIVITY_PENALTY: u64,
+    HISTORICAL_ROOTS_LIMIT: usize,
+    VALIDATOR_REGISTRY_LIMIT: usize,
+    BASE_REWARD_FACTOR: u64,
+    WHISTLEBLOWER_REWARD_QUOTIENT: u64,
+    PROPOSER_REWARD_QUOTIENT: u64,
+    MAX_PROPOSER_SLASHINGS: usize,
+    MAX_ATTESTER_SLASHINGS: usize,
+    MAX_ATTESTATIONS: usize,
+    MAX_DEPOSITS: usize,
+    MAX_VOLUNTARY_EXITS: usize,
+    INACTIVITY_PENALTY_QUOTIENT_ALTAIR: u64,
+    MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR: u64,
+    PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR: u64,
+    MIN_SYNC_COMMITTEE_PARTICIPANTS: u64,
+    INACTIVITY_PENALTY_QUOTIENT_BELLATRIX: u64,
+    MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX: u64,
+    PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX: u64,
+    MAX_BYTES_PER_TRANSACTION: usize,
+    MAX_TRANSACTIONS_PER_PAYLOAD: usize,
+    BYTES_PER_LOGS_BLOOM: usize,
+    MAX_EXTRA_DATA_BYTES: usize,
+    MAX_BLS_TO_EXECUTION_CHANGES: usize,
+    MAX_BLOB_COMMITMENTS_PER_BLOCK: usize,
+    KZG_COMMITMENT_INCLUSION_PROOF_DEPTH: usize,
+    FIELD_ELEMENTS_PER_BLOB: usize,
+    BYTES_PER_BLOB: usize,
+    MIN_ACTIVATION_BALANCE: u64,
+    MAX_EFFECTIVE_BALANCE_ELECTRA: u64,
+    MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA: u64,
+    WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA: u64,
+    PENDING_DEPOSITS_LIMIT: usize,
+    MAX_ATTESTER_SLASHINGS_ELECTRA: usize,
+    MAX_ATTESTATIONS_ELECTRA: usize,
+    MAX_DEPOSIT_REQUESTS_PER_PAYLOAD: usize,
+    MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD: usize,
+    MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD: usize,
+    MAX_PENDING_DEPOSITS_PER_EPOCH: u64,
+    KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH: usize,
+    FIELD_ELEMENTS_PER_CELL: usize,
+    FIELD_ELEMENTS_PER_EXT_BLOB: usize,
+    CELLS_PER_EXT_BLOB: usize,
+    NUMBER_OF_COLUMNS: usize,
+    BYTES_PER_CELL: usize,
+    MAX_PAYLOAD_ATTESTATIONS: u64,
+    MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64,
+}
+
+// ================================================================
+// Values the presets disagree on: read from the active preset
+// ================================================================
+
+/// Defines, for each name, a function returning that value under
+/// [`Preset::active`].
+///
+/// These are functions and not constants because their value is not known
+/// until the process selects a preset. The names follow the specification's
+/// own, lowercased: `slots_per_epoch()` is `SLOTS_PER_EPOCH`. The values
+/// themselves stay in [`mainnet`] and [`minimal`], for code (such as
+/// `Config::mainnet`) that wants one preset's value regardless of which is
+/// running.
+macro_rules! per_preset {
+    ($($accessor:ident => $name:ident: $ty:ty),+ $(,)?) => {
+        $(
+            #[doc = concat!(
+                "`", stringify!($name), "` under [`Preset::active`]: [`mainnet::",
+                stringify!($name), "`] or [`minimal::", stringify!($name), "`]."
+            )]
+            #[inline]
+            pub fn $accessor() -> $ty {
+                match Preset::active() {
+                    Preset::Mainnet => mainnet::$name,
+                    Preset::Minimal => minimal::$name,
+                }
+            }
+        )+
+    };
+}
+
+per_preset! {
+    max_committees_per_slot => MAX_COMMITTEES_PER_SLOT: usize,
+    target_committee_size => TARGET_COMMITTEE_SIZE: u64,
+    shuffle_round_count => SHUFFLE_ROUND_COUNT: u64,
+    slots_per_epoch => SLOTS_PER_EPOCH: u64,
+    epochs_per_eth1_voting_period => EPOCHS_PER_ETH1_VOTING_PERIOD: u64,
+    slots_per_eth1_voting_period => SLOTS_PER_ETH1_VOTING_PERIOD: usize,
+    slots_per_historical_root => SLOTS_PER_HISTORICAL_ROOT: usize,
+    epochs_per_historical_vector => EPOCHS_PER_HISTORICAL_VECTOR: usize,
+    epochs_per_slashings_vector => EPOCHS_PER_SLASHINGS_VECTOR: usize,
+    inactivity_penalty_quotient => INACTIVITY_PENALTY_QUOTIENT: u64,
+    min_slashing_penalty_quotient => MIN_SLASHING_PENALTY_QUOTIENT: u64,
+    proportional_slashing_multiplier => PROPORTIONAL_SLASHING_MULTIPLIER: u64,
+    max_pending_attestations => MAX_PENDING_ATTESTATIONS: usize,
+    sync_committee_size => SYNC_COMMITTEE_SIZE: usize,
+    epochs_per_sync_committee_period => EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64,
+    update_timeout => UPDATE_TIMEOUT: u64,
+    max_withdrawals_per_payload => MAX_WITHDRAWALS_PER_PAYLOAD: usize,
+    max_validators_per_withdrawals_sweep => MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP: u64,
+    pending_partial_withdrawals_limit => PENDING_PARTIAL_WITHDRAWALS_LIMIT: usize,
+    pending_consolidations_limit => PENDING_CONSOLIDATIONS_LIMIT: usize,
+    max_validators_per_slot => MAX_VALIDATORS_PER_SLOT: usize,
+    max_pending_partials_per_withdrawals_sweep => MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP: u64,
+    proposer_lookahead_length => PROPOSER_LOOKAHEAD_LENGTH: usize,
+    ptc_size => PTC_SIZE: usize,
+    payload_timely_threshold => PAYLOAD_TIMELY_THRESHOLD: u64,
+    data_availability_timely_threshold => DATA_AVAILABILITY_TIMELY_THRESHOLD: u64,
+    max_builders_per_withdrawals_sweep => MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64,
+    ptc_window_length => PTC_WINDOW_LENGTH: usize,
+    builder_pending_payments_length => BUILDER_PENDING_PAYMENTS_LENGTH: usize,
+}
+
+// ================================================================
+// Container bounds the presets disagree on
+// ================================================================
+
+pub use ethlambda_ssz_tree::{Const, Length};
+
+/// Defines, for each accessor, a marker type whose [`Length`] is that
+/// accessor's value, for use as the bound of a preset-sized SSZ collection
+/// (`PresetVector<Root, SlotsPerHistoricalRoot>` is the specification's
+/// `Vector[Root, SLOTS_PER_HISTORICAL_ROOT]`).
+macro_rules! length_markers {
+    ($($marker:ident => $accessor:path),+ $(,)?) => {
+        $(
+            #[doc = concat!("The [`Length`] [`", stringify!($accessor), "`] returns.")]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+            pub struct $marker;
+
+            impl Length for $marker {
+                #[inline]
+                fn get() -> usize {
+                    $accessor()
+                }
+            }
+        )+
+    };
+}
+
+length_markers! {
+    MaxCommitteesPerSlot => max_committees_per_slot,
+    MaxValidatorsPerSlot => max_validators_per_slot,
+    SlotsPerEth1VotingPeriod => slots_per_eth1_voting_period,
+    SlotsPerHistoricalRoot => slots_per_historical_root,
+    EpochsPerHistoricalVector => epochs_per_historical_vector,
+    EpochsPerSlashingsVector => epochs_per_slashings_vector,
+    MaxPendingAttestations => max_pending_attestations,
+    SyncCommitteeSize => sync_committee_size,
+    MaxWithdrawalsPerPayload => max_withdrawals_per_payload,
+    PendingPartialWithdrawalsLimit => pending_partial_withdrawals_limit,
+    PendingConsolidationsLimit => pending_consolidations_limit,
+    ProposerLookaheadLength => proposer_lookahead_length,
+    PtcSize => ptc_size,
+    PtcWindowLength => ptc_window_length,
+    BuilderPendingPaymentsLength => builder_pending_payments_length,
 }
 
 /// Preset values that a later fork retunes without changing any container's
@@ -1188,7 +1540,7 @@ pub mod retuned {
     /// used to.
     pub fn proportional_slashing_multiplier(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Phase0 => super::PROPORTIONAL_SLASHING_MULTIPLIER,
+            ForkName::Phase0 => super::proportional_slashing_multiplier(),
             ForkName::Altair => super::PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
             ForkName::Bellatrix
             | ForkName::Capella
@@ -1212,7 +1564,7 @@ pub mod retuned {
     /// balance ceiling.
     pub fn min_slashing_penalty_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Phase0 => super::MIN_SLASHING_PENALTY_QUOTIENT,
+            ForkName::Phase0 => super::min_slashing_penalty_quotient(),
             ForkName::Altair => super::MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR,
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
@@ -1254,7 +1606,7 @@ pub mod retuned {
     /// asking for a fork's value gets the right answer rather than phase0's.
     pub fn inactivity_penalty_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Phase0 => super::INACTIVITY_PENALTY_QUOTIENT,
+            ForkName::Phase0 => super::inactivity_penalty_quotient(),
             ForkName::Altair => super::INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
             ForkName::Bellatrix
             | ForkName::Capella
@@ -1271,12 +1623,19 @@ pub mod retuned {
         use super::*;
 
         use super::super::{
-            INACTIVITY_PENALTY_QUOTIENT, INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
-            INACTIVITY_PENALTY_QUOTIENT_BELLATRIX, MIN_SLASHING_PENALTY_QUOTIENT,
+            INACTIVITY_PENALTY_QUOTIENT_ALTAIR, INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR, MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX,
-            MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA, PROPORTIONAL_SLASHING_MULTIPLIER,
-            PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR, PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
-            WHISTLEBLOWER_REWARD_QUOTIENT, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+            MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA, PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
+            PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX, WHISTLEBLOWER_REWARD_QUOTIENT,
+            WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+        };
+
+        // Phase0's values differ between the presets, so they are accessors of
+        // the outer module, which share their names with the selectors here.
+        use super::super::{
+            inactivity_penalty_quotient as phase0_inactivity_penalty_quotient,
+            min_slashing_penalty_quotient as phase0_min_slashing_penalty_quotient,
+            proportional_slashing_multiplier as phase0_proportional_slashing_multiplier,
         };
 
         /// Pins which constant each fork selects.
@@ -1302,7 +1661,7 @@ pub mod retuned {
 
             assert_eq!(
                 proportional_slashing_multiplier(ForkName::Phase0),
-                PROPORTIONAL_SLASHING_MULTIPLIER
+                phase0_proportional_slashing_multiplier()
             );
             assert_eq!(
                 proportional_slashing_multiplier(ForkName::Altair),
@@ -1318,7 +1677,7 @@ pub mod retuned {
 
             assert_eq!(
                 inactivity_penalty_quotient(ForkName::Phase0),
-                INACTIVITY_PENALTY_QUOTIENT
+                phase0_inactivity_penalty_quotient()
             );
             assert_eq!(
                 inactivity_penalty_quotient(ForkName::Altair),
@@ -1334,7 +1693,7 @@ pub mod retuned {
 
             assert_eq!(
                 min_slashing_penalty_quotient(ForkName::Phase0),
-                MIN_SLASHING_PENALTY_QUOTIENT
+                phase0_min_slashing_penalty_quotient()
             );
             assert_eq!(
                 min_slashing_penalty_quotient(ForkName::Altair),
@@ -1410,15 +1769,46 @@ mod tests {
     }
 
     #[test]
-    fn the_active_preset_matches_the_constants_that_were_re_exported() {
-        // The point of `ACTIVE` is that it cannot drift from the `pub use`
-        // above it, which is what a persisted selector is trusted to describe.
-        let (expected, slots_per_epoch) = match Preset::ACTIVE {
-            Preset::Mainnet => (Preset::Mainnet, mainnet::SLOTS_PER_EPOCH),
-            Preset::Minimal => (Preset::Minimal, minimal::SLOTS_PER_EPOCH),
+    fn the_accessors_and_markers_read_the_active_preset() {
+        let (slots_per_epoch, sync_committee_size) = match Preset::active() {
+            Preset::Mainnet => (mainnet::SLOTS_PER_EPOCH, mainnet::SYNC_COMMITTEE_SIZE),
+            Preset::Minimal => (minimal::SLOTS_PER_EPOCH, minimal::SYNC_COMMITTEE_SIZE),
         };
-        assert_eq!(Preset::ACTIVE, expected);
-        assert_eq!(super::SLOTS_PER_EPOCH, slots_per_epoch);
+        assert_eq!(super::slots_per_epoch(), slots_per_epoch);
+        assert_eq!(super::sync_committee_size(), sync_committee_size);
+        assert_eq!(
+            <super::SyncCommitteeSize as super::Length>::get(),
+            sync_committee_size
+        );
+    }
+
+    /// Whatever froze the preset first in this process (another test's read,
+    /// or the read below), the rule is the same: selecting the preset in
+    /// force succeeds, selecting the other one fails and changes nothing.
+    #[test]
+    fn a_preset_cannot_change_once_read() {
+        let active = Preset::active();
+        let other = match active {
+            Preset::Mainnet => Preset::Minimal,
+            Preset::Minimal => Preset::Mainnet,
+        };
+        assert_eq!(Preset::select(active), Ok(()));
+        assert_eq!(
+            Preset::select(other),
+            Err(super::PresetAlreadyActive {
+                active,
+                requested: other,
+            })
+        );
+        assert_eq!(Preset::active(), active);
+    }
+
+    #[test]
+    fn names_round_trip() {
+        for preset in [Preset::Mainnet, Preset::Minimal] {
+            assert_eq!(preset.name().parse(), Ok(preset));
+        }
+        assert_eq!("gnosis".parse::<Preset>(), Err(super::UnknownPreset));
     }
 
     /// Values pinned directly from the specification, so a typo or an accidental

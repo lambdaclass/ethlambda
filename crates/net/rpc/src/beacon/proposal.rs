@@ -26,10 +26,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+use ethlambda_blockchain::{
+    SyncStatusController,
+    metrics::SyncStatus,
+    payload_attributes::{
+        advance_for_proposal, building_forkchoice_state, payload_attributes_v3,
+        prepared_fee_recipient,
+    },
+};
 use ethlambda_engine::{
-    EngineClient, ForkchoiceStateV1,
-    building::{BuiltPayload, PayloadAttributesV3},
+    EngineClient,
+    building::BuiltPayload,
     types::{ClientVersionV1, uint256},
 };
 use ethlambda_network_api::RpcToP2PRef;
@@ -576,7 +583,10 @@ async fn get_block(
         query.builder_boost_factor.unwrap_or(DEFAULT_BOOST_FACTOR),
         slot,
         query.randao_reveal,
-        BlockProcessingOptions { randao },
+        BlockProcessingOptions {
+            randao,
+            ..Default::default()
+        },
         graffiti,
     )
     .await;
@@ -693,7 +703,7 @@ async fn produce(
     boost_factor: u64,
     slot: Slot,
     randao_reveal: BlsSignature,
-    options: BlockProcessingOptions,
+    options: BlockProcessingOptions<'static>,
     graffiti: Bytes32,
 ) -> Result<(Produced, String, ForkName), ApiError> {
     let config = store.config();
@@ -704,7 +714,14 @@ async fn produce(
         if slot <= head_state.slot() {
             return Err(ApiError::BadRequest("slot is not after the head block"));
         }
-        let state = advance_to_slot(&head_state, slot, &advance_config).map_err(|err| {
+        let state = advance_for_proposal(
+            &advance_store,
+            head_root,
+            &head_state,
+            slot,
+            &advance_config,
+        )
+        .map_err(|err| {
             warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
             ApiError::Internal("advancing the head state failed")
         })?;
@@ -1221,38 +1238,15 @@ async fn build_payload(
     let config = store.config();
     let inputs = payload_inputs(state, &config)
         .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
-    let fee_recipient = fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&proposer)
-        .copied()
-        .unwrap_or_else(|| {
-            warn!(
-                proposer,
-                "No fee recipient prepared for the proposer; using the zero address"
-            );
-            ExecutionAddress::ZERO
-        });
-    // The same rule `forkchoiceUpdated` uses for a checkpoint block (a gloas
-    // one is its bid's parent hash), so the two calls never disagree.
-    let forkchoice = ForkchoiceStateV1 {
-        head_block_hash: inputs.parent_hash,
-        safe_block_hash: ethlambda_blockchain::checkpoint_hash(
-            store,
-            store.beacon_justified_checkpoint().root,
-        ),
-        finalized_block_hash: ethlambda_blockchain::checkpoint_hash(
-            store,
-            store.beacon_finalized_checkpoint().root,
-        ),
-    };
-    let attributes = PayloadAttributesV3 {
-        timestamp: inputs.timestamp,
-        prev_randao: inputs.prev_randao,
-        suggested_fee_recipient: fee_recipient,
-        withdrawals: inputs.withdrawals,
-        parent_beacon_block_root: head_root,
-    };
+    let fee_recipient = prepared_fee_recipient(fee_recipients, proposer).unwrap_or_else(|| {
+        warn!(
+            proposer,
+            "No fee recipient prepared for the proposer; using the zero address"
+        );
+        ExecutionAddress::ZERO
+    });
+    let forkchoice = building_forkchoice_state(store, inputs.parent_hash);
+    let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
     let (status, payload_id) = engine
         .forkchoice_updated_with_attributes(&forkchoice, &attributes)
         .await
@@ -2390,7 +2384,7 @@ mod tests {
 
         let (mut store, head_slot) = fulu_store();
         let (head_root, head_state) = super::super::validator::head(&store).unwrap();
-        let next_epoch_start = head_slot + preset::SLOTS_PER_EPOCH;
+        let next_epoch_start = head_slot + preset::slots_per_epoch();
         let finalized = Checkpoint {
             root: head_root,
             slot: next_epoch_start,

@@ -38,7 +38,7 @@ use ethlambda_types::beacon::operation::BeaconOperation;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect, collect_all_handlers};
+use super::{Case, collect, collect_all_handlers, preset};
 
 /// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
@@ -860,7 +860,7 @@ fn run_builder_market_message(
 pub fn trials() -> Vec<Trial> {
     let mut trials = Vec::new();
     for handler in HANDLERS {
-        let cases = collect(PRESET, "networking", handler);
+        let cases = collect(preset(), "networking", handler);
         trials.push(super::discovery_trial(
             &format!("gossip/{handler}"),
             cases.len(),
@@ -881,7 +881,7 @@ pub fn trials() -> Vec<Trial> {
     // nor listed here fail loudly instead of vanishing. Mirrors
     // `fixture_fork_trials`'s treatment of `UNMODELED_FORKS`.
     let mut unknown: BTreeSet<String> = BTreeSet::new();
-    for (handler, case) in collect_all_handlers(PRESET, "networking") {
+    for (handler, case) in collect_all_handlers(preset(), "networking") {
         if !handler.starts_with("gossip_") || HANDLERS.contains(&handler.as_str()) {
             continue;
         }

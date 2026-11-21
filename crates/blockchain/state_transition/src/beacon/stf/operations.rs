@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use crate::beacon::bls;
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::BeaconState;
@@ -26,7 +26,9 @@ use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index,
     get_current_epoch, get_domain, get_previous_epoch,
 };
-use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::beacon::helpers::attestation::{
+    get_indexed_attestation, indexed_attestation_signature_set,
+};
 use crate::beacon::helpers::misc::{
     compute_deposit_domain, compute_epoch_at_slot, compute_signing_root, is_valid_merkle_branch,
 };
@@ -36,9 +38,12 @@ use crate::beacon::helpers::mutators::{
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
 };
+use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::stf::signatures::SignatureBatch;
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
 /// Runs every operation in a block, in the specification's order.
 ///
@@ -74,6 +79,8 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    target_delta: Option<&TargetBalanceDelta>,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     // Checked before anything below can mutate `state`, and unconditionally
     // rather than only when `attestations` is non-empty: a refused fork must
@@ -117,12 +124,16 @@ pub fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        process_proposer_slashing(state, proposer_slashing, config, active_balances)?;
-    }
-    for attester_slashing in attester_slashings {
-        process_attester_slashing(state, attester_slashing, config, active_balances)?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| process_proposer_slashing(state, slashing, config, active_balances, signatures),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| process_attester_slashing(state, slashing, config, active_balances, signatures),
+    )?;
     // The proposer every attestation below pays (phase0: records), resolved
     // once for the list where the specification's `process_attestation` reads
     // `get_beacon_proposer_index(state)` each time. Before fulu that lookup
@@ -137,39 +148,53 @@ pub fn process_operations(
     // of which is among them.
     //
     // An empty list asks nothing, as it did when the lookup was per
-    // attestation.
+    // attestation, and observes nothing. A non-empty one is timed as one
+    // `attestations` observation that includes the lookup, which is work the
+    // step did when the lookup was per attestation.
     if !attestations.is_empty() {
-        let proposer_index = get_beacon_proposer_index(state)?;
-        for attestation in attestations {
-            // Phase0 defers an attestation's reward to the epoch boundary, so
-            // it needs its own version of this step; altair scores one the
-            // moment it is processed instead, and nothing about that changed
-            // through capella, so every later fork this signature serves
-            // shares altair's version rather than getting one of its own.
-            // This is the same coexisting-by-fork pattern
-            // `crate::beacon::helpers::altair` and
-            // `crate::beacon::stf::epoch::rewards` already use for the two
-            // `get_base_reward` implementations: neither is renamed, and the
-            // call site picks between them by fully-qualified path.
-            if altair_attestations {
-                crate::beacon::stf::altair::process_attestation(
-                    state,
-                    attestation,
-                    proposer_index,
-                    committees,
-                    active_balances,
-                )?;
-            } else {
-                process_attestation(state, attestation, proposer_index, config, committees)?;
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in attestations {
+                // Phase0 defers an attestation's reward to the epoch boundary,
+                // so it needs its own version of this step; altair scores one
+                // the moment it is processed instead, and nothing about that
+                // changed through capella, so every later fork this signature
+                // serves shares altair's version rather than getting one of
+                // its own. This is the same coexisting-by-fork pattern
+                // `crate::beacon::helpers::altair` and
+                // `crate::beacon::stf::epoch::rewards` already use for the two
+                // `get_base_reward` implementations: neither is renamed, and
+                // the call site picks between them by fully-qualified path.
+                if altair_attestations {
+                    crate::beacon::stf::altair::process_attestation(
+                        state,
+                        attestation,
+                        proposer_index,
+                        committees,
+                        active_balances,
+                        target_delta,
+                        signatures,
+                    )?;
+                } else {
+                    process_attestation(
+                        state,
+                        attestation,
+                        proposer_index,
+                        config,
+                        committees,
+                        signatures,
+                    )?;
+                }
             }
-        }
+            Ok(())
+        })?;
     }
-    for deposit in deposits {
-        process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config, signatures)
+    })?;
 
     Ok(())
 }
@@ -180,7 +205,10 @@ pub fn process_operations(
 
 /// Checks a proposer slashing's evidence without slashing anyone: the two
 /// headers agree on slot and proposer, differ from each other, name a
-/// still-slashable proposer, and both signatures check out.
+/// still-slashable proposer, and both signatures check out. The signatures go
+/// through `signatures` and are verified, with every set still pending, before
+/// this returns, since the caller slashes on the strength of them (see
+/// [`SignatureBatch::verify_pending`]).
 ///
 /// Shared between phase0's own [`process_proposer_slashing`] below and
 /// `crate::beacon::stf::gloas::process_proposer_slashing`: gloas's own
@@ -197,6 +225,7 @@ pub fn process_operations(
 pub(crate) fn verify_proposer_slashing(
     state: &BeaconState,
     proposer_slashing: &ProposerSlashing,
+    signatures: &mut SignatureBatch,
 ) -> Result<(ValidatorIndex, Epoch)> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
@@ -221,7 +250,10 @@ pub(crate) fn verify_proposer_slashing(
     // Copied out rather than re-borrowed per iteration below: both signatures
     // are checked against the same proposer, and holding the borrow across
     // the loop would conflict with `get_domain`'s borrow of `state`.
-    let pubkey = proposer.pubkey;
+    let pubkey = IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
 
     for signed_header in [
         &proposer_slashing.signed_header_1,
@@ -230,11 +262,12 @@ pub(crate) fn verify_proposer_slashing(
         let epoch = compute_epoch_at_slot(signed_header.message.slot);
         let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, Some(epoch));
         let signing_root = compute_signing_root(signed_header.message.hash_tree_root(), domain);
-        verify(
-            bls::verify(&pubkey, signing_root, &signed_header.signature),
+        signatures.push(
+            SignatureSet::single(&pubkey, signing_root, &signed_header.signature),
             "bls.Verify(proposer.pubkey, signing_root, signed_header.signature)",
         )?;
     }
+    signatures.verify_pending()?;
 
     Ok((proposer_index, current_epoch))
 }
@@ -247,8 +280,10 @@ pub fn process_proposer_slashing(
     proposer_slashing: &ProposerSlashing,
     config: &Config,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    let (proposer_index, _current_epoch) = verify_proposer_slashing(state, proposer_slashing)?;
+    let (proposer_index, _current_epoch) =
+        verify_proposer_slashing(state, proposer_slashing, signatures)?;
     slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }
@@ -318,6 +353,7 @@ pub fn process_attester_slashing(
     attester_slashing: &phase0::AttesterSlashing,
     config: &Config,
     active_balances: &ActiveBalanceCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
@@ -326,14 +362,16 @@ pub fn process_attester_slashing(
         is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
         "is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_1),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_1),
         "is_valid_indexed_attestation(state, attestation_1)",
     )?;
-    verify(
-        is_valid_indexed_attestation(state, attestation_2),
+    signatures.push(
+        indexed_attestation_signature_set(state, attestation_2),
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
+    // Before anyone is slashed on the strength of them.
+    signatures.verify_pending()?;
 
     slash_attesting_index_intersection(
         state,
@@ -375,6 +413,7 @@ pub fn process_attestation(
     proposer_index: ValidatorIndex,
     _config: &Config,
     committees: &CommitteeCache,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -400,7 +439,7 @@ pub fn process_attestation(
         ))?;
     let max_slot = data
         .slot
-        .checked_add(preset::SLOTS_PER_EPOCH)
+        .checked_add(preset::slots_per_epoch())
         .ok_or(Error::ArithmeticOverflow("data.slot + SLOTS_PER_EPOCH"))?;
     verify(
         min_slot <= state.slot() && state.slot() <= max_slot,
@@ -449,8 +488,8 @@ pub fn process_attestation(
     }
 
     let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
-    verify(
-        is_valid_indexed_attestation(state, &indexed_attestation),
+    signatures.push(
+        indexed_attestation_signature_set(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
     )?;
 
@@ -651,6 +690,7 @@ pub fn process_voluntary_exit(
     state: &mut BeaconState,
     signed_voluntary_exit: &SignedVoluntaryExit,
     config: &Config,
+    signatures: &mut SignatureBatch,
 ) -> Result<()> {
     let voluntary_exit = signed_voluntary_exit.message;
     let current_epoch = get_current_epoch(state);
@@ -689,14 +729,19 @@ pub fn process_voluntary_exit(
         Some(voluntary_exit.epoch),
     );
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
-    verify(
-        bls::verify(
-            &validator.pubkey,
+    signatures.push(
+        SignatureSet::single(
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
         "bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)",
     )?;
+    // Before the exit is initiated on the strength of it.
+    signatures.verify_pending()?;
 
     initiate_validator_exit(state, voluntary_exit.validator_index, config)?;
     Ok(())
@@ -712,6 +757,7 @@ mod tests {
         AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader,
     };
     use crate::beacon::primitives::{BlsPubkey, BlsSignature, Root};
+    use crate::beacon::stf::signatures::checked;
 
     #[test]
     fn identical_proposer_slashing_headers_are_rejected() {
@@ -736,12 +782,15 @@ mod tests {
         };
 
         assert!(
-            process_proposer_slashing(
-                &mut state,
-                &slashing,
-                &config,
-                &ActiveBalanceCache::default()
-            )
+            checked(|s| {
+                process_proposer_slashing(
+                    &mut state,
+                    &slashing,
+                    &config,
+                    &ActiveBalanceCache::default(),
+                    s,
+                )
+            })
             .is_err()
         );
     }
@@ -769,7 +818,7 @@ mod tests {
 
         let target_epoch = 1;
         let data_1 = AttestationData {
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             index: 0,
             beacon_block_root: Root::repeat_byte(1),
             source: Checkpoint::default(),
@@ -829,12 +878,15 @@ mod tests {
         };
 
         assert!(
-            process_attester_slashing(
-                &mut state,
-                &slashing,
-                &config,
-                &ActiveBalanceCache::default()
-            )
+            checked(|s| {
+                process_attester_slashing(
+                    &mut state,
+                    &slashing,
+                    &config,
+                    &ActiveBalanceCache::default(),
+                    s,
+                )
+            })
             .is_err()
         );
     }

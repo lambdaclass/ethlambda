@@ -60,9 +60,9 @@
 //!
 //! # Presets
 //!
-//! Container bounds are compile-time constants, so the preset is a compile-time
-//! choice: mainnet by default, minimal with the `preset-minimal` feature. See
-//! [`crate::beacon::preset`]. Values that only affect fork *scheduling* are runtime
+//! The preset is selected once per process at runtime, from the network's
+//! `PRESET_BASE`, and every container bound the two presets disagree on reads
+//! it. See [`crate::beacon::preset`]. Values that only affect fork *scheduling* are runtime
 //! configuration instead, in [`crate::beacon::config`], because the `transition` fixture suite
 //! sets fork epochs per case.
 //!
@@ -78,6 +78,7 @@ pub use ethlambda_crypto::bls;
 mod bls_fixtures;
 pub mod das;
 pub mod data_columns;
+pub mod fast_confirmation;
 pub mod fork_choice;
 pub mod genesis;
 pub mod gloas_block_production;

@@ -63,7 +63,7 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 pub fn process_historical_summaries_update(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
     let epochs_per_historical_root =
-        (preset::SLOTS_PER_HISTORICAL_ROOT / preset::SLOTS_PER_EPOCH as usize) as Epoch;
+        (preset::slots_per_historical_root() / preset::slots_per_epoch() as usize) as Epoch;
     if next_epoch.is_multiple_of(epochs_per_historical_root) {
         let summary = HistoricalSummary {
             block_summary_root: state.block_roots().hash_tree_root(),
@@ -134,10 +134,10 @@ mod tests {
     #[test]
     fn historical_summaries_update_appends_at_the_boundary_instead_of_historical_roots() {
         let epochs_per_historical_root =
-            preset::SLOTS_PER_HISTORICAL_ROOT as u64 / preset::SLOTS_PER_EPOCH;
+            preset::slots_per_historical_root() as u64 / preset::slots_per_epoch();
         let mut state = capella_state_with_validators(4);
         // One epoch before the boundary, so `next_epoch` lands exactly on it.
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * (epochs_per_historical_root - 1);
+        *state.slot_mut() = preset::slots_per_epoch() * (epochs_per_historical_root - 1);
 
         let expected_block_summary_root = state.block_roots().hash_tree_root();
         let expected_state_summary_root = state.state_roots().hash_tree_root();
@@ -164,7 +164,7 @@ mod tests {
             crate::beacon::containers::deneb::BeaconState {
                 genesis_time: inner.genesis_time,
                 genesis_validators_root: inner.genesis_validators_root,
-                slot: preset::SLOTS_PER_HISTORICAL_ROOT as u64 - preset::SLOTS_PER_EPOCH,
+                slot: preset::slots_per_historical_root() as u64 - preset::slots_per_epoch(),
                 fork: inner.fork,
                 latest_block_header: inner.latest_block_header,
                 block_roots: inner.block_roots,

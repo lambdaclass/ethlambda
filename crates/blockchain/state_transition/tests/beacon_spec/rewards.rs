@@ -53,7 +53,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 use libtest_mimic::Trial;
 
-use super::{PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// One component's reward and penalty per validator, as the fixtures encode it.
 ///
@@ -131,9 +131,10 @@ fn components(
         // through fulu reuse this same list; see this module's doc for why
         // none of them changes it. Gloas reuses it too:
         // `BeaconState::altair_validator_lists` now reaches a gloas state's
-        // participation and inactivity lists as plain slices (progressive
-        // rather than `SszList`, EIP-7688, but both `Deref` to `[T]`), which
-        // is all `altair_helpers::get_flag_index_deltas`/
+        // participation and inactivity lists too, as `ParticipationRef` and
+        // `InactivityScoresRef`, which read a bounded and a progressive list
+        // alike (EIP-7688). That read access is all
+        // `altair_helpers::get_flag_index_deltas`/
         // `get_inactivity_penalty_deltas` ever need; see that accessor's own
         // doc.
         ForkName::Altair
@@ -174,7 +175,7 @@ fn components(
 
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect_all_handlers(PRESET, "rewards");
+    let cases = collect_all_handlers(preset(), "rewards");
     let mut trials = vec![super::discovery_trial("rewards", cases.len())];
 
     for (_handler, case) in cases {

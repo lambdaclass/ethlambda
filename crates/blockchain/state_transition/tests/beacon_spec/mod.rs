@@ -62,18 +62,38 @@ use std::path::{Path, PathBuf};
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::BeaconState;
+use ethlambda_state_transition::beacon::preset::Preset;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 use serde::de::DeserializeOwned;
 
-/// The configuration directory whose fixtures match the compiled-in preset.
-pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
-    "minimal"
-} else {
-    "mainnet"
-};
+/// The environment variable naming the preset a run tests: `mainnet` or
+/// `minimal`. Unset runs [`Preset::DEFAULT`].
+pub const PRESET_VAR: &str = "BEACON_SPEC_PRESET";
 
-/// The compiled-in preset with every fork up to and including `case.fork`
+/// Run this process on the preset [`PRESET_VAR`] names, before any runner
+/// reads one.
+///
+/// One build serves both fixture trees: the preset is a runtime choice, so
+/// testing minimal is this selection, not a second compilation. A run is
+/// still one preset, since a process runs one.
+pub fn select_preset() {
+    let Ok(name) = std::env::var(PRESET_VAR) else {
+        return;
+    };
+    let preset: Preset = name
+        .parse()
+        .unwrap_or_else(|_| panic!("{PRESET_VAR}={name} names neither mainnet nor minimal"));
+    Preset::select(preset).expect("the harness selects before anything reads a preset");
+}
+
+/// The configuration directory whose fixtures match the preset this run
+/// tests.
+pub fn preset() -> &'static str {
+    Preset::active().name()
+}
+
+/// The active preset's configuration with every fork up to and including `case.fork`
 /// pulled back to genesis, never a later one.
 ///
 /// The fallback [`case_config`] uses when a case carries no `config.yaml` of
@@ -306,7 +326,7 @@ impl Case {
 
 /// Collects every case for one runner and handler across all supported forks.
 ///
-/// `config` selects the fixture tree; every caller here passes [`PRESET`], since
+/// `config` selects the fixture tree; every caller here passes [`preset`], since
 /// consensus-spec-tests no longer ships a preset-independent `general` tree (see
 /// the module doc). Forks this crate does not implement are skipped, so an
 /// upstream release that adds a fork does not break the build.
@@ -455,7 +475,7 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
     // config now that the BLS/KZG vectors live in `cryptography-specs`, whose
     // flat `<kind>/<handler>/<case>` layout has no fork level for this check
     // to walk in the first place.
-    for config in [PRESET] {
+    for config in [preset()] {
         for entry in read_dir_sorted(&fixture_root().join(config)) {
             if !entry.path().is_dir() {
                 continue;
@@ -593,5 +613,27 @@ pub fn check_transition(
             Err("accepted, but the case has no post-state, so it must be rejected".to_string())
         }
         (false, Err(_)) => Ok(()),
+    }
+}
+
+/// Warms `committees`' key sums for the epochs a block applied to `state` can
+/// reach: its previous, current and next epochs, the same three the node pins
+/// for its head. A case that crosses an epoch boundary asks the next epoch's
+/// shuffling after `process_slots`, whose key `state` already names.
+///
+/// The fixture runners run an electra-or-later attestation twice, once with a
+/// fresh cache and once after this, because a fresh cache only ever exercises
+/// the cold branch of the attestation key builder. Both runs must reach the
+/// same verdict and the same post-state.
+pub fn warm_key_sums_around(
+    committees: &ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache,
+    state: &BeaconState,
+) {
+    use ethlambda_state_transition::beacon::helpers::accessors::{
+        CommitteeCacheExt as _, get_current_epoch, get_previous_epoch,
+    };
+    let current = get_current_epoch(state);
+    for epoch in [get_previous_epoch(state), current, current + 1] {
+        committees.warm_key_sums(state, epoch);
     }
 }
