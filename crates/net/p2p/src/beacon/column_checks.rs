@@ -796,6 +796,9 @@ pub(crate) mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_proposer_preferences(&self, _proposal_slot: u64) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to

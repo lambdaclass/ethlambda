@@ -260,6 +260,9 @@ impl Validated {
     /// actor checks it before it parks one. Any other outcome keeps it away. A
     /// payload attestation goes on only when accepted: it is only valid within
     /// its own slot, and the specification makes queueing one optional.
+    /// Accepted preferences go on as their proposal slot alone, for the
+    /// actor's `payload_attributes` event; the market already holds them. A
+    /// bid never does.
     ///
     /// What an accepted subnet attestation does feed is the attestation pool,
     /// when its subnet is one a validator client's aggregator had this node
@@ -409,6 +412,14 @@ impl Validated {
                     .new_payload_attestation_message(message, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a payload attestation"));
             }
+            Self::ProposerPreferences(preferences) if outcome == Outcome::Accept => {
+                // The market recorded them in `settle`; the actor only hears
+                // that they exist, for its `payload_attributes` event.
+                let proposal_slot = preferences.message.proposal_slot;
+                let _ = blockchain
+                    .new_proposer_preferences(proposal_slot)
+                    .inspect_err(|err| warn!(%err, "Failed to report proposer preferences"));
+            }
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
@@ -425,8 +436,9 @@ impl Validated {
 
 /// Report an accepted object on the Beacon API's event stream, for the topics
 /// whose objects never reach the chain actor that publishes the rest (bids
-/// and preferences stop here, a payload attestation message only ever feeds
-/// fork choice, and a subnet attestation is relayed and nothing more).
+/// and preferences stop here, the actor hearing only a preference's slot; a
+/// payload attestation message only ever feeds fork choice, and a subnet
+/// attestation is relayed and nothing more).
 ///
 /// Only on `Accept`, since each event names objects that passed the topic's
 /// rules. A queued envelope has not, so `execution_payload_gossip` waits for
@@ -844,7 +856,7 @@ mod tests {
 
     use ethlambda_network_api::ToP2PToBlockChainRef as _;
     use ethlambda_network_api::p2p_to_block_chain::{
-        NewBlock, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
+        NewBlock, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage, NewProposerPreferences,
     };
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
     use ethlambda_types::beacon::config::Config;
@@ -1603,12 +1615,13 @@ mod tests {
         assert!(server.builder_market.preferences(40, Root::ZERO).is_some());
     }
 
-    /// Neither builder market type has a consumer on the chain actor, on any
-    /// outcome.
+    /// A bid never reaches the chain actor, on any outcome. Preferences reach
+    /// it on `Accept` alone, and only as their proposal slot: the market holds
+    /// them, and the actor's `payload_attributes` event reads them there.
     #[tokio::test]
-    async fn bids_and_preferences_never_reach_the_chain_actor() {
+    async fn only_accepted_preferences_reach_the_chain_actor_and_only_as_a_slot() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = silent_chain(&mut server);
+        let chain = recording_chain(&mut server);
 
         for outcome in [
             Outcome::Accept,
@@ -1616,14 +1629,32 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         ] {
             bid_object(&server, bid(5, 3, 10)).forward(&server, Instant::now(), outcome);
+        }
+        assert_nothing_sent(&chain).await;
+
+        for outcome in [
+            Outcome::Queue(QueueReason::BlockUnknown),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+            Outcome::Reject(RejectReason::BadSignature),
+        ] {
             Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
                 &server,
                 Instant::now(),
                 outcome,
             );
         }
-
         assert_nothing_sent(&chain).await;
+
+        Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
+            &server,
+            Instant::now(),
+            Outcome::Accept,
+        );
+        chain.settle().await;
+        assert_eq!(chain.received().len(), 1);
+        let sent: Vec<NewProposerPreferences> = chain.take_all();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].proposal_slot, 40);
     }
 
     /// Bids and preferences draw from a pool of their own, so a burst of them

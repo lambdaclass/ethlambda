@@ -61,6 +61,7 @@ use crate::import_timing::{
 use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
+pub use payload_attributes::{FeeRecipients, PayloadPreparation};
 
 pub mod aggregation;
 mod beacon_aggregates;
@@ -79,6 +80,7 @@ mod glamsterdam;
 pub mod import_timing;
 pub mod key_manager;
 pub mod metrics;
+pub mod payload_attributes;
 pub mod reaggregate;
 #[cfg(test)]
 mod sim_tests;
@@ -327,6 +329,7 @@ impl BlockChain {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            Default::default(),
             group,
         )
     }
@@ -355,6 +358,11 @@ impl BlockChain {
     /// when `--execution-endpoint` was not given, and
     /// `safe_slots_to_import_optimistically` is
     /// `--safe-slots-to-import-optimistically`.
+    ///
+    /// `preparation` says which proposers the `payload_attributes` event is
+    /// published for: the fee recipients the Beacon API records, shared with
+    /// it, and `--always-prepare-payload`.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_beacon(
         store: Store,
         sync_status_controller: SyncStatusController,
@@ -362,6 +370,7 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        preparation: PayloadPreparation,
         group: &ExecutionGroup,
     ) -> Result<BlockChain, SystemError> {
         assert_eq!(
@@ -381,6 +390,7 @@ impl BlockChain {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            payload_attributes::PayloadAttributesPublisher::new(preparation),
             group,
         )
     }
@@ -398,7 +408,8 @@ impl BlockChain {
     /// `DataAvailability::Columns` evidence to gate on and has no execution
     /// layer, so [`BlockChain::spawn`] passes an empty vector and `None`. It
     /// passes the specification's own default for
-    /// `safe_slots_to_import_optimistically`, which nothing on that arm reads.
+    /// `safe_slots_to_import_optimistically`, which nothing on that arm reads,
+    /// and an inert `payload_attributes` publisher.
     ///
     /// `group` must give the actor a thread of its own: its handlers are long
     /// synchronous CPU (block import, state transition, signing) that would
@@ -416,6 +427,7 @@ impl BlockChain {
         custody_columns: Vec<u64>,
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        payload_attributes: payload_attributes::PayloadAttributesPublisher,
         group: &ExecutionGroup,
     ) -> Result<BlockChain, SystemError> {
         let genesis_time = store.config().genesis_time;
@@ -448,6 +460,7 @@ impl BlockChain {
             envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
+            payload_attributes,
             custody_columns,
             blob_asks: beacon_blobs::AskBudget::default(),
             engine,
@@ -626,6 +639,11 @@ pub struct BlockChainServer {
     /// Whether the Glamsterdam banner may still be logged. Beacon-only; see
     /// [`crate::glamsterdam`].
     glamsterdam_banner: crate::glamsterdam::GlamsterdamBanner,
+
+    /// What the `payload_attributes` event is published for, and the last
+    /// one published. Beacon-only, inert on lean; see
+    /// [`crate::payload_attributes`].
+    payload_attributes: payload_attributes::PayloadAttributesPublisher,
 
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
@@ -1172,6 +1190,10 @@ impl BlockChainServer {
         // last-slot block the head without passing through the block handler.
         self.arm_epoch_precompute_check(slot, ctx);
         self.maybe_start_epoch_precompute(epoch_precompute::Trigger::Head, ctx);
+        // Beacon only: the next slot's `payload_attributes`, at this slot's
+        // lookahead point, and now if a catch-up tick lands past it.
+        self.arm_payload_attributes_check(slot, ctx);
+        self.maybe_prepare_payload_attributes(ctx);
 
         // Per-interval duties for this tick. Lean-only, so this is where a
         // beacon follower's tick ends: it has no validator duties (see
@@ -2311,6 +2333,7 @@ impl BlockChainServer {
             duties: ChainDuties::Beacon,
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
+            payload_attributes: Default::default(),
             store,
         }
     }
@@ -4357,6 +4380,7 @@ impl BlockChainServer {
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
     NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
+    NewProposerPreferences,
 };
 
 #[send_handler]
@@ -4476,12 +4500,14 @@ impl Handler<NewBlock> for BlockChainServer {
         // The import above may have left a last-slot block as head: the
         // moment to start the next epoch's transition (no-op on lean).
         self.maybe_start_epoch_precompute(epoch_precompute::Trigger::Head, ctx);
+        // A head that moved past the lookahead point gets its own attributes.
+        self.maybe_prepare_payload_attributes(ctx);
     }
 }
 
 #[send_handler]
 impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
-    async fn handle(&mut self, msg: NewExecutionPayloadEnvelope, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewExecutionPayloadEnvelope, ctx: &Context<Self>) {
         // Beacon-only: lean has no execution payload envelopes.
         let ChainDuties::Beacon = &self.duties else {
             return;
@@ -4491,6 +4517,9 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
         self.receive_envelope(*msg.envelope, msg.arrival.wire_ms(picked_up, arrival_ms))
             .await;
         self.settle_envelopes().await;
+        // A verified envelope can turn the head FULL, which changes the
+        // execution block the next proposal extends.
+        self.maybe_prepare_payload_attributes(ctx);
     }
 }
 
@@ -4512,6 +4541,23 @@ impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
             self.on_tick(unix_now_ms(), ctx).await;
         }
         self.apply_payload_attestation_message(&msg.message, &msg.arrival);
+        // The PTC's votes on the head's payload decide whether the next
+        // proposal extends it, and they arrive after the lookahead point.
+        self.maybe_prepare_payload_attributes(ctx);
+    }
+}
+
+#[send_handler]
+impl Handler<NewProposerPreferences> for BlockChainServer {
+    async fn handle(&mut self, msg: NewProposerPreferences, ctx: &Context<Self>) {
+        // Beacon-only, and only the next slot's preferences change an event:
+        // they name its fee recipient and gas target.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        if msg.proposal_slot == self.wall_clock_slot() + 1 {
+            self.maybe_prepare_payload_attributes(ctx);
+        }
     }
 }
 
@@ -4563,9 +4609,12 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 
 #[send_handler]
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
-    async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewDataColumnSidecars, ctx: &Context<Self>) {
         self.on_checked_data_columns(msg.sidecars).await;
         self.settle_envelopes().await;
+        // The last column a held block or a parked envelope waited for imports
+        // it, which can move the head or turn it FULL.
+        self.maybe_prepare_payload_attributes(ctx);
     }
 }
 
@@ -5052,6 +5101,7 @@ mod tests {
             Vec::new(),
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+            PayloadPreparation::default(),
             &group,
         );
     }
@@ -5089,6 +5139,7 @@ mod tests {
             envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
             glamsterdam_banner: Default::default(),
+            payload_attributes: Default::default(),
             custody_columns: Vec::new(),
             blob_asks: beacon_blobs::AskBudget::default(),
             engine: None,

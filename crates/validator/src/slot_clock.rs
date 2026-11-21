@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::{Epoch, Slot};
+use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
 /// Basis points in a whole, which is what the duty offsets are expressed in.
 const BASIS_POINTS: u64 = 10_000;
@@ -107,7 +107,13 @@ impl SlotClock {
 
     /// The epoch containing `slot`.
     pub fn epoch_of(&self, slot: Slot) -> Epoch {
-        slot / slots_per_epoch()
+        compute_epoch_at_slot(slot)
+    }
+
+    /// The current epoch, or `None` before genesis. Each caller picks what
+    /// "before genesis" means for it.
+    pub fn current_epoch(&self) -> Option<Epoch> {
+        self.now().map(|slot| self.epoch_of(slot))
     }
 
     /// How long one slot lasts.
@@ -347,6 +353,7 @@ impl SlotClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
 
     const GENESIS: u64 = 1_000_000;
     const SECONDS_PER_SLOT: u64 = 12;

@@ -282,6 +282,10 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the sync committee endpoints, read by block
     /// production and the contribution endpoint.
     pub sync_committee_pool: SharedSyncCommitteePool,
+    /// Filled by `prepare_beacon_proposer` and builder registrations, read by
+    /// block production and by the chain actor, which publishes
+    /// `payload_attributes` for the proposers named here.
+    pub fee_recipients: ethlambda_blockchain::FeeRecipients,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -337,7 +341,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.builder_market))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
-        .layer(Extension(beacon::validator::FeeRecipients::default()))
+        .layer(Extension(handles.fee_recipients))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))

@@ -421,6 +421,27 @@ static SYNC_DUTIES_HELD: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Keys doppelganger protection still withholds attestations and blocks for.
+/// Zero with the protection off, and once every key has passed.
+static DOPPELGANGER_DETECTING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_doppelganger_detecting",
+        "Validator keys doppelganger protection has not yet cleared to sign"
+    )
+    .unwrap()
+});
+
+/// Doppelganger checks (one a slot while a key is withheld) that got no
+/// liveness answer: a query failed, or every beacon node was syncing. Only a
+/// failure at an epoch's last slot costs anything, an epoch of signing.
+static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_doppelganger_check_failures_total",
+        "Doppelganger checks, one a slot while a key is withheld, that got no liveness answer"
+    )
+    .unwrap()
+});
+
 /// Register every series with the Prometheus registry so `/metrics` lists them
 /// at zero from startup, rather than only after whatever first touches them.
 ///
@@ -458,6 +479,8 @@ pub fn init() {
     LazyLock::force(&SYNC_CONTRIBUTIONS_PUBLISHED_TOTAL);
     LazyLock::force(&SYNC_CONTRIBUTION_FAILURES_TOTAL);
     LazyLock::force(&SYNC_DUTIES_HELD);
+    LazyLock::force(&DOPPELGANGER_DETECTING);
+    LazyLock::force(&DOPPELGANGER_CHECK_FAILURES_TOTAL);
     LazyLock::force(&BLOCK_PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&AGGREGATES_PUBLISHED_TOTAL);
     LazyLock::force(&AGGREGATION_FAILURES_TOTAL);
@@ -605,6 +628,14 @@ pub fn inc_fee_recipient_mismatches() {
 
 pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
+}
+
+pub fn set_doppelganger_detecting(count: u64) {
+    DOPPELGANGER_DETECTING.set(count as i64);
+}
+
+pub fn inc_doppelganger_check_failures() {
+    DOPPELGANGER_CHECK_FAILURES_TOTAL.inc();
 }
 
 /// Time one duty's batch of signatures. The returned guard records to
