@@ -294,6 +294,14 @@ pub struct ValidatorInnerDto {
     pub pubkey: String,
 }
 
+/// One entry of `POST /eth/v1/validator/liveness/{epoch}`'s answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LivenessDto {
+    #[serde(with = "quoted_u64")]
+    pub index: ValidatorIndex,
+    pub is_live: bool,
+}
+
 /// `GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}`: one
 /// `ValidatorResponse`, with the epochs a voluntary exit is checked against.
 #[derive(Debug, Clone, Deserialize)]

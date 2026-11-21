@@ -295,6 +295,8 @@ enum ChainActor {
         /// `--execution-endpoint` was not given.
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        /// `--always-prepare-payload`.
+        always_prepare_payload: bool,
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
@@ -784,6 +786,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine,
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
+                    always_prepare_payload: mainnet.always_prepare_payload,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
                 },
             }
@@ -842,6 +845,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production and the contribution endpoint.
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
+    // Filled by `prepare_beacon_proposer` and builder registrations, read by
+    // block production and by the chain actor's `payload_attributes` event.
+    let fee_recipients = ethlambda_blockchain::FeeRecipients::default();
     // Before the P2P actor starts, so its first column rows are not lost.
     if let Some(url) = telemetry_url {
         let url = url.into_inner();
@@ -898,6 +904,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_aggregator = aggregator.clone();
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
+    let rpc_builder_market = builder_market.clone();
+    let rpc_fee_recipients = fee_recipients.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
@@ -939,8 +947,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
                     payload_attestation_pool: payload_attestation_pool.clone(),
-                    builder_market: builder_market.clone(),
+                    builder_market: rpc_builder_market,
                     sync_committee_pool: sync_committee_pool.clone(),
+                    fee_recipients: rpc_fee_recipients,
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,
@@ -977,6 +986,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            always_prepare_payload,
             anchor_envelope_urls,
         } => {
             check_custody_set(&custody_columns)?;
@@ -990,6 +1000,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 custody_columns,
                 engine,
                 safe_slots_to_import_optimistically,
+                ethlambda_blockchain::PayloadPreparation {
+                    fee_recipients,
+                    builder_market,
+                    always_prepare: always_prepare_payload,
+                },
             )
         }
     };

@@ -350,6 +350,14 @@ pub struct ValidatorEntry {
     pub status: String,
 }
 
+/// Whether the node saw one validator act in the epoch asked about. See
+/// [`BeaconNodeApi::liveness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Liveness {
+    pub index: ValidatorIndex,
+    pub is_live: bool,
+}
+
 /// One validator's registry entry, as much of it as a voluntary exit needs.
 ///
 /// `status` is the Beacon API's own string (`active_ongoing`,
@@ -837,6 +845,73 @@ pub trait BeaconNodeApi: Send + Sync {
     /// against its head state and gossips it. A refusal (400) surfaces as
     /// [`crate::error::Error::BeaconNodeStatus`] carrying the node's reason.
     async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()>;
+
+    /// Whether the node saw each of `indices` act in each of `epochs`:
+    /// `POST /eth/v1/validator/liveness/{epoch}` once per epoch, which
+    /// doppelganger protection reads (see [`crate::doppelganger`]). What
+    /// counts as acting is the node's own view; nodes count attestations,
+    /// aggregates and blocks, whether seen on gossip or included on chain.
+    ///
+    /// The answer holds one list per epoch, in the order `epochs` names them.
+    /// Every epoch is answered by the same node, so a caller combining them
+    /// reads one node's view rather than two nodes' halves; a failure on any
+    /// of them fails the whole call, and failover asks the next node about
+    /// all of them.
+    ///
+    /// An empty `indices` answers an empty list per epoch without asking:
+    /// some nodes refuse the request.
+    ///
+    /// # Contract: a syncing node's answer is `Err(BeaconNodeSyncing)`
+    ///
+    /// A node that has not caught up has not seen what the network did, so
+    /// its "nobody is live" would clear a key it should not. An
+    /// implementation must ask the node it is about to ask this of whether
+    /// it is syncing or optimistic (once for the whole call, not once per
+    /// epoch), and answer [`crate::error::Error::BeaconNodeSyncing`] instead
+    /// when it is, so failover moves to a node that can answer. Asking any
+    /// other node, as [`Self::is_optimistic_or_syncing`] through failover
+    /// would, says nothing about the one that answers.
+    ///
+    /// # Contract: one answer per index asked, and no other
+    ///
+    /// Checked by [`validate_liveness`] in the implementation, for each
+    /// epoch, for the reason [`Self::attestation_data`] states: a key the
+    /// answer leaves out has not been shown silent, and must not be read as
+    /// if it had.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>>;
+}
+
+/// Check that `answers` names every one of `asked` exactly once and nothing
+/// else, as the contract on [`BeaconNodeApi::liveness`] requires.
+pub fn validate_liveness(asked: &[ValidatorIndex], answers: &[Liveness]) -> Result<()> {
+    let asked: std::collections::HashSet<ValidatorIndex> = asked.iter().copied().collect();
+    let mut answered = std::collections::HashSet::with_capacity(answers.len());
+    for answer in answers {
+        if !asked.contains(&answer.index) {
+            return Err(Error::InconsistentResponse(format!(
+                "liveness answer names validator {}, which was not asked about",
+                answer.index
+            )));
+        }
+        if !answered.insert(answer.index) {
+            return Err(Error::InconsistentResponse(format!(
+                "liveness answer names validator {} twice",
+                answer.index
+            )));
+        }
+    }
+    if answered.len() != asked.len() {
+        return Err(Error::InconsistentResponse(format!(
+            "liveness answer covers {} of the {} validators asked about",
+            answered.len(),
+            asked.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Check that `contribution` is the one asked for, as the contract on
@@ -955,5 +1030,32 @@ mod tests {
     #[should_panic(expected = "lean is not a Beacon Chain fork")]
     fn the_lean_fork_is_a_bug_in_the_caller() {
         let _ = validate_attestation_data(100, ForkName::Lean, &with_index(0));
+    }
+
+    fn liveness(answers: &[(ValidatorIndex, bool)]) -> Vec<Liveness> {
+        answers
+            .iter()
+            .map(|&(index, is_live)| Liveness { index, is_live })
+            .collect()
+    }
+
+    /// Every index asked about, once each, in any order, is an answer.
+    /// Anything else is a node to fail over from, never a key to clear.
+    #[test]
+    fn a_liveness_answer_must_cover_exactly_the_indices_asked() {
+        let asked = [3, 5];
+        assert!(validate_liveness(&asked, &liveness(&[(5, false), (3, true)])).is_ok());
+        for wrong in [
+            liveness(&[(3, false)]),
+            liveness(&[(3, false), (5, false), (9, false)]),
+            liveness(&[(3, false), (3, false)]),
+            liveness(&[(3, false), (9, false)]),
+        ] {
+            let err = validate_liveness(&asked, &wrong).expect_err("not an answer");
+            assert!(
+                matches!(err, crate::error::Error::InconsistentResponse(_)),
+                "got {err}"
+            );
+        }
     }
 }

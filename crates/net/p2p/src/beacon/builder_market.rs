@@ -164,6 +164,14 @@ pub(crate) fn publish_proposer_preferences(
     preferences: SignedProposerPreferences,
 ) {
     let proposal_slot = preferences.message.proposal_slot;
+    // The Beacon API recorded these in the market before asking for the
+    // publication, which gossip never delivers back to this node: the chain
+    // actor hears of them here, as it does of gossip's in `forward`.
+    if let Some(blockchain) = &server.blockchain {
+        let _ = blockchain
+            .new_proposer_preferences(proposal_slot)
+            .inspect_err(|err| warn!(%err, "Failed to report proposer preferences"));
+    }
     let Some((topic, data)) = publication(
         server,
         beacon_topics::PROPOSER_PREFERENCES,
