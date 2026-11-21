@@ -22,7 +22,7 @@ use tracing::{error, info};
 
 use super::BeaconWire;
 use super::topics::{self, BeaconTopics};
-use crate::{P2PServer, Wire, discovery, metrics};
+use crate::{P2PServer, Wire, metrics};
 
 /// How far before a boundary a peer may already be on the next digest and still
 /// count as current: clocks disagree by up to the gossip clock disparity.
@@ -114,9 +114,9 @@ pub(crate) fn advance(server: &mut P2PServer) -> Option<Duration> {
 ///    aggregator-subnet topics already held for the current slot.
 /// 3. Leave the topics of every digest the window no longer covers.
 /// 4. If the current digest changed, switch what this node publishes and
-///    advertises: digest, fork, metadata sequence number, metric, and the
-///    `eth2` entry.
-/// 5. Point the admission filter at the new entry, admitting every held digest.
+///    advertises: digest, fork, metadata sequence number and metric.
+/// 5. Point the admission filter at the `eth2` entry the schedule prescribes at
+///    `epoch`, admitting every held digest, and serve that entry in the ENR.
 pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
     let mut changes = Changes::default();
     let Wire::Beacon(wire) = &mut server.wire else {
@@ -244,12 +244,13 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         .iter()
         .map(|topics| topics.fork_digest)
         .collect();
-    // Without discovery there is no admission policy to update.
+    // Without discovery there is no admission policy to update and no ENR to
+    // serve. The ENR is offered the entry on every call, not only on a switch:
+    // it skips one it already carries, so this costs nothing between
+    // boundaries and keeps the served record on the schedule's answer.
     if let Some(state) = &server.discovery {
         state.filter().set_fork_id(fork_id, also_admitted);
-    }
-    if switched {
-        discovery::update_served_enr(&fork_id);
+        state.local_enr_writer().publish_fork_id(&fork_id);
     }
     changes
 }
@@ -265,6 +266,7 @@ fn sync_committee_topic(digest: ForkDigest, subnet_id: u64) -> IdentTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::enr::{ETH2_ENR_KEY, EnrForkId};
     use crate::test_support::unconnected_beacon_server;
     use ethlambda_types::beacon::fork::ForkName;
     use libssz_types::SszList;
@@ -377,6 +379,43 @@ mod tests {
         assert_eq!(server.wire.beacon().unwrap().fork, ForkName::Fulu);
         apply(&mut server, GLOAS);
         assert_eq!(server.wire.beacon().unwrap().fork, ForkName::Gloas);
+    }
+
+    /// The `eth2` entry discovery serves, and the `seq` it is served under.
+    fn served_eth2(server: &P2PServer) -> (EnrForkId, u64) {
+        use libssz::SszDecode;
+        let record = server
+            .discovery
+            .as_ref()
+            .expect("the test server runs discovery")
+            .local_enr_writer()
+            .served_record();
+        let raw = record.pairs().extra(ETH2_ENR_KEY).expect("eth2 entry");
+        let fork_id = EnrForkId::from_ssz_bytes(&raw).expect("a valid ENRForkID");
+        (fork_id, record.seq)
+    }
+
+    #[tokio::test]
+    async fn a_crossing_moves_the_served_eth2_entry_once() {
+        let mut server = unconnected_beacon_server(config(), 0).await;
+        let schedule = server.wire.beacon().expect("beacon").schedule.clone();
+
+        apply(&mut server, BPO - 1);
+        let (served, seq) = served_eth2(&server);
+        assert_eq!(served, schedule.enr_fork_id(BPO - 1));
+
+        // Between boundaries the entry is already right, so the record is left
+        // alone: a bumped `seq` would send peers back for an identical record.
+        apply(&mut server, BPO - 1);
+        assert_eq!(served_eth2(&server), (served, seq));
+
+        // At the boundary peers discovering the node read the new digest, under
+        // one new `seq`.
+        apply(&mut server, BPO);
+        let (crossed, crossed_seq) = served_eth2(&server);
+        assert_eq!(crossed, schedule.enr_fork_id(BPO));
+        assert_eq!(crossed.fork_digest, schedule.digest_at(BPO));
+        assert_eq!(crossed_seq, seq + 1);
     }
 
     #[tokio::test]
