@@ -1016,6 +1016,10 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
   `server_shutdown` against `crates/execution/ethrex/src/lib.rs`, which repeats them
 - `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
   it plus the engine and binary with the feature on
+- Releases ship both builds per platform (`release.yaml`'s `build-binaries`
+  matrix): `ethlambda-<platform>` and `ethlambda-ethrex-<platform>`, the second
+  checked for the `--ethrex.*` flags before upload. Docker images and the
+  Homebrew bottle stay ethlambda-only
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
