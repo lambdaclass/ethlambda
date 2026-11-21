@@ -1342,11 +1342,12 @@ async fn refresh_ptc<B: BeaconNodeApi>(
     epoch: u64,
     context: &SigningContext,
 ) {
+    let config = context.config();
     for target in [epoch, epoch + 1] {
-        if context.config().fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+        if config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
             continue;
         }
-        if target == context.config.gloas_fork_epoch && epoch < target {
+        if target == config.gloas_fork_epoch && epoch < target {
             continue;
         }
         if let Err(err) = duties.refresh_ptc(target).await {
@@ -1375,7 +1376,7 @@ async fn retry_missing_ptc<B: BeaconNodeApi>(
     budget: std::time::Duration,
     context: &SigningContext,
 ) {
-    if context.config.fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
+    if context.config().fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
         || duties.holds_ptc(epoch)
     {
         return;
