@@ -1134,8 +1134,8 @@ Two more:
 The specification's `stark.VerifyAggregates` checks each signature at its
 statement's leaf index, and its reference implementation does (a proof is
 the signatures concatenated). The PQ devnet's clients prove with leanVM
-instead, through a `leanvm-sidecar` (`--pq-prover-binary` or
-`--pq-prover-socket`, `ethlambda_crypto::stark::sidecar`), and a leanVM proof attests only
+instead, through a `leanvm-sidecar` (`--pq-prover-socket`,
+`ethlambda_crypto::stark::sidecar`), and a leanVM proof attests only
 `(public key, message)` claims (leanEthereum/leanVM#787). So under the
 sidecar backend a proof shows each key signed the message at *some* leaf,
 not at the statement's. Proving still refuses a signature made at another

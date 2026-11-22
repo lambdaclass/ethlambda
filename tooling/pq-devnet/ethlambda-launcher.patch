@@ -1,16 +1,16 @@
 diff --git a/src/cl/ethlambda/ethlambda_launcher.star b/src/cl/ethlambda/ethlambda_launcher.star
-index 477e74f..158d344 100644
 --- a/src/cl/ethlambda/ethlambda_launcher.star
 +++ b/src/cl/ethlambda/ethlambda_launcher.star
-@@ -215,6 +215,12 @@ def get_beacon_config(
+@@ -215,6 +215,13 @@
              )
          )
  
 +    # A network on the consensus-specs pq fork needs the leanVM prover sidecar
-+    # its other clients prove with: the image ships one, and the node starts
-+    # it, as Teku does.
++    # its other clients prove with: the image's ethlambda-pq supervisor starts
++    # one and runs the node on its socket, as lighthouse-pq-bn does.
++    # LEANVM_THREADS (cl_extra_env_vars) caps its threads.
 +    if network_params.pq_fork_epoch != constants.FAR_FUTURE_EPOCH:
-+        cmd.append("--pq-prover-binary=leanvm-sidecar")
++        cmd[0] = "ethlambda-pq"
 +
      cmd_str = " && ".join(setup_cmds + ["exec " + " ".join(cmd)])
  

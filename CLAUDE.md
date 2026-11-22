@@ -303,9 +303,13 @@ actual_slot = finalized_slot + 1 + relative_index
   signatures concatenated) by default, or real leanVM proofs from a
   `leanvm-sidecar` process (leanVM `c5ee9d239`, bindings v0.15.0, the
   release pq-devnet-0 runs for its signer, prover, verifier and sidecar),
-  which is what the PQ devnet runs. The node starts the sidecar itself with
-  `--pq-prover-binary` (as Teku does; the image ships `leanvm-sidecar`), or
-  connects to one already listening with `--pq-prover-socket`.
+  which is what the PQ devnet runs. The node only connects to a sidecar
+  (`--pq-prover-socket`); as for Lighthouse, something else starts it: the
+  image's `ethlambda-pq` supervisor (`bin/ethlambda/pq/`), run as
+  `ethlambda-pq beacon <flags>`. The image builds `leanvm-sidecar` from the
+  revision in the root `leanvm-revision` file (or `--build-arg LEANVM_REV`),
+  so which prover a devnet runs is chosen outside the node; the node's client
+  only refuses a sidecar with another protocol version or verifier tag.
   The two encodings do not verify each other's proofs. Never pass one
   scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`

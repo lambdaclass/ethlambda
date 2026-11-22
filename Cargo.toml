@@ -135,16 +135,15 @@ keccak = "0.1.6"
 # over leanXMSS signatures rather than the specification's concatenation
 # (`ethlambda_crypto::stark`); and leanVM's leanXMSS, which signs and verifies.
 # Pinned to bindings v0.15.0, the release pq-devnet-0 runs for its signer,
-# prover, verifier and sidecar: nothing on the wire detects a mismatch, a
-# proof from another revision just fails to verify. Not the `leanvm` revision
-# below, which lean consensus proves with.
+# prover, verifier and sidecar. The sidecar binary is built and started
+# outside the node (the image's `leanvm-revision` file and `ethlambda-pq`
+# supervisor), and the client refuses one whose hello names another protocol
+# version or verifier tag; beyond that nothing on the wire detects a
+# mismatch, a proof from an incompatible revision just fails to verify. Not
+# the `leanvm` revision below, which lean consensus proves with.
 leanvm_sidecar = { package = "sidecar", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 leanvm_claims = { package = "claims", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 leanvm_lean_xmss = { package = "lean_xmss", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
-# leanVM's own Rust bindings, for their sidecar launcher only (`Sidecar::start`,
-# what Teku's Java bindings run): the node starts `leanvm-sidecar` itself,
-# waits for it to warm up, and the sidecar exits with the node.
-leanvm_pq = { package = "lean-pq", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the

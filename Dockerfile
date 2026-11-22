@@ -1,23 +1,31 @@
 # syntax=docker.io/docker/dockerfile:1.7-labs
 
-# leanVM's prover sidecar, which `--pq-prover-binary leanvm-sidecar` starts on
-# a network scheduling the PQ fork. Built from the revision ethlambda's client
-# crate pins (`ethlambda_crypto::stark::sidecar::LEANVM_REV`, bindings v0.15.0,
-# the release pq-devnet-0 runs): a proof only verifies with the same verifier.
+# leanVM's prover sidecar, which the `ethlambda-pq` supervisor starts beside
+# the node on a network scheduling the PQ fork, as Lighthouse's image does.
+# Built from the revision in `leanvm-revision` (bindings v0.15.0, the release
+# pq-devnet-0 runs), or from `--build-arg LEANVM_REV=<commit, tag or branch>`:
+# which prover a devnet runs is chosen here, not by the node, whose client
+# only requires the sidecar's protocol version and verifier tag to be its own.
+# The commit built is recorded at /usr/local/share/ethlambda/leanvm-revision.
 # leanVM's own .cargo/config.toml builds with `-C target-cpu=native`, which on
 # CI's arm64 runner (Neoverse, with SVE) gives a binary that dies with SIGILL
 # on Apple silicon, and on an amd64 runner with AVX-512 one that dies on hosts
 # without it. ethlambda's config replaces it, so the sidecar gets the node's
 # own portable CPU baseline (and the carryless-multiply features leanVM needs).
 FROM rust:1.97-bookworm AS sidecar
-ARG LEANVM_REV=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764
+ARG LEANVM_REV=""
+COPY leanvm-revision /leanvm-revision
 COPY .cargo/config.toml /ethlambda-cargo-config.toml
-RUN git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
+RUN rev="${LEANVM_REV:-$(tr -d '[:space:]' < /leanvm-revision)}" \
+    && test -n "$rev" \
+    && git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
     && cd /leanVM \
-    && git checkout -q ${LEANVM_REV} \
+    && git checkout -q "$rev" \
+    && mkdir -p .cargo \
     && cp /ethlambda-cargo-config.toml .cargo/config.toml \
     && cargo build --release -p leanvm-sidecar --features experimental_prover \
-    && cp target/release/leanvm-sidecar /leanvm-sidecar
+    && cp target/release/leanvm-sidecar /leanvm-sidecar \
+    && git rev-parse HEAD > /leanvm-revision-built
 
 FROM rust:1.97-bookworm AS chef
 WORKDIR /app
@@ -98,7 +106,10 @@ LABEL org.opencontainers.image.version=$VERSION
 
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
+# The PQ prover sidecar and its supervisor, `ethlambda-pq beacon <flags>`
 COPY --from=sidecar /leanvm-sidecar /usr/local/bin/leanvm-sidecar
+COPY --from=sidecar /leanvm-revision-built /usr/local/share/ethlambda/leanvm-revision
+COPY --chmod=755 bin/ethlambda/pq/ethlambda-pq /usr/local/bin/ethlambda-pq
 
 # Copy licenses
 COPY LICENSE ./

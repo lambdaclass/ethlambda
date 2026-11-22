@@ -11,9 +11,10 @@ of the fork.
 > **Lighthouse must be on leanVM bindings v0.15.0 too.** pq-devnet-0 moved
 > its signer, prover, verifier and sidecar to leanVM's bindings v0.15.0
 > (`c5ee9d239`) at once, and a proof from the previous pin (`283686575c`)
-> does not verify under it. ethlambda's image builds its sidecar at v0.15.0;
-> use a Lighthouse `pq-devnet-0` image built after the move. Interop was
-> last checked on 2026-11-20, at the previous pin.
+> does not verify under it. ethlambda's image builds its sidecar at v0.15.0
+> (`leanvm-revision`); use a Lighthouse `pq-devnet-0` image built after the
+> move. Interop was last checked on 2026-11-22, with Lighthouse and Teku and
+> with Lighthouse and Prysm (see the pull request that added the PQ fork).
 
 ## What runs
 
@@ -28,12 +29,16 @@ of the fork.
 - **Lighthouse**: `ethpandaops/lighthouse:pq-devnet-0` (last run at
   `sha256:f571048f`), which proves attestation aggregates with leanVM through
   a `leanvm-sidecar` (`lighthouse-pq-bn`).
-- **ethlambda**: this repository's image, which ships `leanvm-sidecar`. The
-  launcher patch passes `--pq-prover-binary=leanvm-sidecar`, so the node
-  starts the sidecar itself, waits for it to warm up, and the sidecar exits
-  with the node (its log is `<data-dir>/pq-prover/sidecar.sock.log`). Without
-  the sidecar ethlambda checks proofs with the specification's reference
-  encoding, which rejects every Lighthouse block that carries attestations.
+- **ethlambda**: this repository's image, which ships `leanvm-sidecar`
+  (built from the commit in `leanvm-revision`, or `--build-arg LEANVM_REV`)
+  and the `ethlambda-pq` supervisor. The launcher patch runs the node as
+  `ethlambda-pq beacon <flags>`, as Lighthouse's is run through
+  `lighthouse-pq-bn`: it starts the sidecar on a private socket, waits for
+  it to listen, and runs the node on it, either exiting stopping the other.
+  `LEANVM_THREADS` (through `cl_extra_env_vars`) caps the sidecar's threads.
+  Without the sidecar ethlambda checks proofs with the specification's
+  reference encoding, which rejects every Lighthouse block that carries
+  attestations.
 - **Execution**: geth (`ethereum/client-go:latest`).
 - **Dora**: `ethpandaops/dora:pq`.
 
@@ -54,6 +59,10 @@ git fetch https://github.com/ethpandaops/ethereum-package.git \
   87788250ac957609e4826705421d59ea924ba69f                  # pq
 git merge --no-edit FETCH_HEAD
 git apply <ethlambda>/tooling/pq-devnet/ethlambda-launcher.patch
+# This pin's launcher writes the bootnodes to a file, which `beacon
+# --bootnodes` no longer takes: in src/cl/ethlambda/ethlambda_launcher.star,
+# drop the `echo ... > BOOTNODES_FILEPATH_ON_SERVICE_CONTAINER` setup command
+# and pass `"--bootnodes=" + bootnode_arg` itself (add-ethlambda's head does).
 cd ..
 
 # 3. For network_params_validators.yaml: the package's published VRF tree
@@ -140,7 +149,7 @@ kurtosis run --enclave pq "$PWD/ethereum-package" \
 - **Memory.** Every `leanvm-sidecar` warms up by proving twice and stays
   large. In Docker Desktop's default 8 GB VM, starting a second sidecar next
   to Lighthouse's has had the kernel kill Lighthouse's. Set
-  `--pq-prover-threads` (through `cl_extra_params`) on ethlambda nodes that
+  `LEANVM_THREADS` (through `cl_extra_env_vars`) on ethlambda nodes that
   only verify.
 
 ## What to check

@@ -50,7 +50,7 @@ changes.
 | Layer | Where | Status |
 | --- | --- | --- |
 | leanXMSS sign/verify | `ethlambda_crypto::lean_xmss` | KAT-pinned against consensus-specs and leanVM |
-| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs through a `leanvm-sidecar` the node starts (`--pq-prover-binary`) or one already listening (`--pq-prover-socket`) (see [Proofs](#proofs)) |
+| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs through a running `leanvm-sidecar` (`--pq-prover-socket`), which the image's `ethlambda-pq` supervisor starts (see [Proofs](#proofs)) |
 | Containers | `ethlambda_types::beacon::containers::{eip8483, pq}` | SSZ round trips, gaps per the spec; the maximal aggregate, attester slashing and bid encode to `pq.yaml`'s size bounds |
 | Fork upgrades | `upgrade::{upgrade_to_eip8483, upgrade_to_pq}` | unit-tested |
 | Block processing | `stf::{eip8483, pq}` | unit-tested with real XMSS keys |
@@ -144,20 +144,29 @@ proofs through one of two backends, chosen once per process:
   verification checks each, plus the exact length. It is capped by
   `MAX_STARK_PROOF_SIZE` (1 MiB), about 436 signatures per block. The
   specification's fixtures use it.
-- **Sidecar** (`--pq-prover-binary`, `stark::launch_sidecar`, or
-  `--pq-prover-socket`, `stark::install_sidecar`): real leanVM
+- **Sidecar** (`--pq-prover-socket`, `stark::install_sidecar`): real leanVM
   proofs, made and checked by a `leanvm-sidecar` process over a Unix socket,
   through leanVM's own client crate at `c5ee9d239` (bindings v0.15.0,
   `sidecar::LEANVM_REV`), the release pq-devnet-0 runs for its signer,
-  prover, verifier and sidecar: a proof from another revision does not
-  verify. A statement list maps to leanVM
+  prover, verifier and sidecar. A statement list maps to leanVM
   claims as Lighthouse maps it: the sorted, deduplicated
   `(public key, message)` pairs, the empty proof for no claims, and merges
-  folded sixteen children at a time. With `--pq-prover-binary` the node
-  starts the sidecar itself, as Teku does, through leanVM's own launcher
-  (`lean_pq::Sidecar::start`): it waits for the warm-up, logs to
-  `<socket>.log`, and the sidecar exits with the node. The image ships
-  `leanvm-sidecar` for it.
+  folded sixteen children at a time.
+- **Who starts the sidecar**: not the node, as for Lighthouse. The image's
+  `ethlambda-pq` supervisor (`bin/ethlambda/pq/ethlambda-pq`, Lighthouse's
+  `lighthouse-pq-bn` adapted) starts it on a private socket, waits for it to
+  listen, runs `ethlambda <flags> --pq-prover-socket <socket>`, and stops
+  either when the other exits. `LEANVM_THREADS` sets its proving threads,
+  `LEANVM_SIDECAR` another executable. The image builds `leanvm-sidecar`
+  from the commit in the root `leanvm-revision` file, or from
+  `--build-arg LEANVM_REV` (the publish workflow's `leanvm_rev` input), and
+  records the commit at `/usr/local/share/ethlambda/leanvm-revision`. The
+  node's client refuses a sidecar whose hello names another protocol version
+  or verifier tag; any other revision is accepted, and its proofs only have
+  to verify with the other clients' verifiers (Teku's v0.16.0 sidecar and
+  ethlambda's v0.15.0 one verified each other's on the interop devnet). A
+  verifier-tag change needs `sidecar::LEANVM_REV` and the client crates
+  moved with it.
 
 The encodings are not interchangeable, so every node of a network must use
 the same backend; the PQ devnet's Lighthouse accepts only the sidecar. A

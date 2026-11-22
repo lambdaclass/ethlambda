@@ -405,29 +405,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // one used stays installed.
     if let Network::Mainnet { mainnet, .. } = &network {
         use ethlambda_crypto::stark::{self, sidecar::SidecarConfig};
-        match (&mainnet.pq_prover_binary, &mainnet.pq_prover_socket) {
-            (Some(binary), socket) => {
-                let socket = socket
-                    .clone()
-                    .unwrap_or_else(|| common.data_dir.join("pq-prover").join("sidecar.sock"));
-                let socket = std::path::absolute(&socket).unwrap_or(socket);
-                let threads = mainnet.pq_prover_threads.unwrap_or(0);
-                info!(binary = %binary.display(), socket = %socket.display(), threads, "Starting the leanVM prover sidecar");
-                let binary = binary.clone();
-                // Blocks for the sidecar's warm-up, so off the runtime's
-                // threads.
-                tokio::task::spawn_blocking(move || {
-                    stark::launch_sidecar(&binary, threads, SidecarConfig::new(socket))
-                })
-                .await
-                .wrap_err("the leanVM prover sidecar task failed")?
-                .wrap_err("cannot start the leanVM prover sidecar")?;
-            }
-            (None, Some(socket)) => {
-                stark::install_sidecar(SidecarConfig::new(socket.clone()))
-                    .wrap_err("cannot use the leanVM prover sidecar")?;
-            }
-            (None, None) => {}
+        if let Some(socket) = &mainnet.pq_prover_socket {
+            stark::install_sidecar(SidecarConfig::new(socket.clone()))
+                .wrap_err("cannot use the leanVM prover sidecar")?;
         }
     }
 

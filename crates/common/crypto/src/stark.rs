@@ -7,9 +7,9 @@
 //!   of every statement's public keys, in statement order and within a
 //!   statement in public-key order, and verification checks each in turn. It
 //!   is what the specification's fixtures use.
-//! - **Sidecar** ([`install_sidecar`], or [`launch_sidecar`] to start one):
-//!   real leanVM proofs, made and checked by a `leanvm-sidecar` process over a
-//!   Unix socket, as the PQ devnet's other clients make them. See [`sidecar`].
+//! - **Sidecar** ([`install_sidecar`]): real leanVM proofs, made and checked
+//!   by a `leanvm-sidecar` process over a Unix socket, as the PQ devnet's
+//!   other clients make them. See [`sidecar`].
 //!
 //! The two encodings are not interchangeable: a node verifies only the proofs
 //! its own backend makes, so every node of a network must run the same one.
@@ -45,25 +45,6 @@ fn backend() -> &'static Backend {
 /// whichever backend is first used stays for the life of the process.
 pub fn install_sidecar(config: sidecar::SidecarConfig) -> Result<(), sidecar::Error> {
     let backend = sidecar::SidecarBackend::connect(config)?;
-    BACKEND
-        .set(Backend::Sidecar(backend))
-        .map_err(|_| sidecar::Error::AlreadyInstalled)
-}
-
-/// Starts the `leanvm-sidecar` executable at `binary` on `config.socket` with
-/// `threads` proving threads (0: one per core), waits until it is ready, and
-/// makes every proof of this process a leanVM proof from it, as
-/// [`install_sidecar`] does. The sidecar exits with this process. Call once,
-/// at startup; blocks until the sidecar has warmed up.
-pub fn launch_sidecar(
-    binary: &std::path::Path,
-    threads: usize,
-    config: sidecar::SidecarConfig,
-) -> Result<(), sidecar::Error> {
-    if BACKEND.get().is_some() {
-        return Err(sidecar::Error::AlreadyInstalled);
-    }
-    let backend = sidecar::SidecarBackend::launch(binary, threads, config)?;
     BACKEND
         .set(Backend::Sidecar(backend))
         .map_err(|_| sidecar::Error::AlreadyInstalled)
