@@ -41,6 +41,8 @@ pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
+#[cfg(test)]
+mod scale_tests;
 pub mod secure_fs;
 pub mod signing;
 pub mod slashing_protection;
