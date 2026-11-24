@@ -14,7 +14,7 @@
 //! node answers every forkchoice update `SYNCING` until its first sync ends.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4};
@@ -69,23 +69,6 @@ async fn embedded(genesis: &str, extra_flags: &[&str]) -> EmbeddedEthrex {
     ethlambda_ethrex::start(config)
         .await
         .expect("the embedded node starts")
-}
-
-/// Drops the test's client, then stops the node: the order `run_node` keeps.
-///
-/// With no clone of the RPC context left, ethrex's block executor thread exits
-/// and shutdown is over well inside its five-second grace. Were the executor
-/// still running, shutdown would wait out the whole grace before flushing, so
-/// the bound below is what shows it exited.
-async fn stop(node: EmbeddedEthrex, engine: EngineClient) {
-    drop(engine);
-    let started = Instant::now();
-    node.shutdown().await;
-    let took = started.elapsed();
-    assert!(
-        took < Duration::from_secs(4),
-        "shutdown took {took:?}: it waited out its grace"
-    );
 }
 
 fn head(hash: H256) -> ForkchoiceStateV1 {
@@ -193,7 +176,7 @@ async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    stop(node, engine).await;
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -231,7 +214,7 @@ async fn a_payload_with_an_undecodable_transaction_gets_ethrexs_own_verdict() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Invalid, "{status:?}");
 
-    stop(node, engine).await;
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -283,7 +266,7 @@ async fn an_amsterdam_payload_round_trips_through_the_v4_v5_v6_methods() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    stop(node, engine).await;
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -338,7 +321,7 @@ async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
         "{err:?}"
     );
 
-    stop(node, engine).await;
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

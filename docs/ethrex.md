@@ -96,14 +96,14 @@ it, so the steps are repeated and the context is assembled from the same parts.
 `server_shutdown` against `crates/execution/ethrex/src/lib.rs`.**
 
 Shutdown runs after the chain actor has joined, so no Engine API call is in
-flight: cancel ethrex's tasks, wait for them and then for the block executor
-thread (up to 5 s for both), flush the store, then write `node_config.json`
-(identity and known peers). The executor exits once the last in-process client
-is gone, after finishing the blocks it holds, a timed-out `newPayload`'s among
-them; flushing first would leave such a block out. Once shutdown begins, the
+flight: cancel ethrex's tasks, wait up to 5 s for them, flush the store, then
+write `node_config.json` (identity and known peers). Once shutdown begins, the
 execution JSON-RPC server refuses every request it has not dispatched and drops
-any still running, so none reaches the store while it flushes. Both waits, and
-the refusal, are additions to ethrex's own `server_shutdown`. If an ethrex subsystem
+any still running, so none reaches the store while it flushes. The wait and the
+refusal are additions to ethrex's own `server_shutdown`. ethrex's block
+executor thread is not waited for: a block it is still on is executed again on
+the next start, as every recent block is, since ethrex's flush keeps only the
+state it has committed to disk and a restart re-executes the newest blocks. If an ethrex subsystem
 cancels the node on its own, the beacon node shuts down the same way and exits
 with an error.
 
