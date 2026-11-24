@@ -49,7 +49,11 @@ here wins over both.
 
 Every ethrex port is checked against the beacon node's own (`--gossipsub-port`,
 `--api-port`, `--metrics-port`, `--discovery.port`) and against each other
-before anything binds.
+before anything binds. Two sockets on one port clash only when their addresses
+can overlap: the same address, a wildcard covering the other (`::` covers IPv4
+too), or devp2p's address when `ETHREX_P2P_ADDR` leaves ethrex to pick it. So
+`--ethrex.http-port` may equal `--api-port` when `--ethrex.http-addr` and
+`--http-address` are different addresses, neither of them a wildcard.
 
 ## How a call works
 
@@ -72,9 +76,16 @@ EngineClient::new_payload(&deneb::ExecutionPayload, ..)
 - **Answers and errors.** A handler answers with the JSON value it would send,
   decoded by the same types the HTTP transport uses. An `RpcErr` becomes
   `EngineError::Rpc` with the wire's code (`-38005`, `-38006`, ...).
-- **No retry ladder, same timeouts.** An in-process error is always ethrex's
-  answer, so retrying would only repeat it. The per-method timeouts stay (8 s,
-  6 s for `newPayloadV5`), because the chain actor awaits `newPayload` inline.
+- **Same timeouts, and a timeout is asked again.** A handler's error is
+  ethrex's answer, so it is never retried, as an RPC error is not over HTTP. A
+  timeout is not an answer, and is asked again on the HTTP transport's ladder
+  (three attempts at the method's timeout, 8 s or 6 s for `newPayloadV5`,
+  backing off from 500 ms), with the same one-attempt exceptions, `getPayload`
+  and `getBlobsV2`. The chain actor awaits `newPayload` inline, so a payload
+  that keeps timing out holds it for about 25 s, as an external client can.
+  Giving up on an attempt does not stop ethrex's execution of the block: it
+  records the verdict on its own, and asking again joins the execution already
+  running.
 
 ## Lifecycle
 
@@ -85,8 +96,14 @@ it, so the steps are repeated and the context is assembled from the same parts.
 `server_shutdown` against `crates/execution/ethrex/src/lib.rs`.**
 
 Shutdown runs after the chain actor has joined, so no Engine API call is in
-flight: cancel ethrex's tasks, wait up to 5 s for them, flush the store, then
-write `node_config.json` (identity and known peers). If an ethrex subsystem
+flight: cancel ethrex's tasks, wait for them and then for the block executor
+thread (up to 5 s for both), flush the store, then write `node_config.json`
+(identity and known peers). The executor exits once the last in-process client
+is gone, after finishing the blocks it holds, a timed-out `newPayload`'s among
+them; flushing first would leave such a block out. Once shutdown begins, the
+execution JSON-RPC server refuses every request it has not dispatched and drops
+any still running, so none reaches the store while it flushes. Both waits, and
+the refusal, are additions to ethrex's own `server_shutdown`. If an ethrex subsystem
 cancels the node on its own, the beacon node shuts down the same way and exits
 with an error.
 
