@@ -80,7 +80,7 @@ use std::time::Duration;
 use ethlambda_state_transition::beacon::helpers::accessors::committee_count_per_slot;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::TARGET_AGGREGATORS_PER_COMMITTEE;
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::gossipsub::{IdentTopic, PeerScoreParams, PeerScoreThresholds, TopicScoreParams};
 use tracing::info;
@@ -124,7 +124,9 @@ pub const GRAYLIST_THRESHOLD: f64 = -16000.0;
 
 /// The active validator count the parameters are built for before the head
 /// has named one: lighthouse's `minimum_validator_count`, one per slot.
-pub const PLACEHOLDER_ACTIVE_VALIDATORS: u64 = SLOTS_PER_EPOCH;
+pub fn placeholder_active_validators() -> u64 {
+    slots_per_epoch()
+}
 
 /// Head lag, in slots, beyond which [`MeshDeliveryGate`] switches mesh-delivery
 /// scoring off.
@@ -147,7 +149,9 @@ pub const MESH_DELIVERY_MAX_HEAD_LAG: u64 = 4;
 /// head catches up would score the whole mesh on that empty history. Every
 /// scored topic refills to its threshold within a few slots of accepted
 /// traffic, so one epoch leaves ample margin.
-pub const MESH_DELIVERY_WARMUP_SLOTS: u64 = SLOTS_PER_EPOCH;
+pub fn mesh_delivery_warmup_slots() -> u64 {
+    slots_per_epoch()
+}
 
 /// The score thresholds, which do not depend on the chain.
 pub fn thresholds() -> PeerScoreThresholds {
@@ -180,7 +184,7 @@ impl ScoreInputs {
     /// placeholder validator count, and no mesh-delivery scoring.
     pub fn placeholder() -> Self {
         Self {
-            active_validators: PLACEHOLDER_ACTIVE_VALIDATORS,
+            active_validators: placeholder_active_validators(),
             current_slot: 0,
             mesh_deliveries_scored: false,
         }
@@ -240,7 +244,7 @@ impl ScoreSettings {
                 + ATTESTER_SLASHING_WEIGHT);
         Self {
             slot,
-            epoch: slot * SLOTS_PER_EPOCH as u32,
+            epoch: slot * slots_per_epoch() as u32,
             // One decay tick per slot, which is what every expected rate
             // below is stated per.
             decay_interval: slot.max(Duration::from_secs(1)),
@@ -263,7 +267,7 @@ impl ScoreSettings {
         // an epoch exactly at the gossip threshold once its counter settles.
         let behaviour_penalty_threshold = 6.0;
         let settled_excess =
-            decay_convergence(behaviour_penalty_decay, 10.0 / SLOTS_PER_EPOCH as f64)
+            decay_convergence(behaviour_penalty_decay, 10.0 / slots_per_epoch() as f64)
                 - behaviour_penalty_threshold;
         let topic_score_cap = self.max_positive_score * 0.5;
 
@@ -327,7 +331,7 @@ impl ScoreSettings {
     /// Exits and slashings: rare enough that their rates do not depend on
     /// the validator count, and never mesh-delivery scored.
     fn fixed_topic_params(&self, fork_digest: ForkDigest) -> Vec<(IdentTopic, TopicScoreParams)> {
-        let per_slot = |per_epoch: f64| per_epoch / SLOTS_PER_EPOCH as f64;
+        let per_slot = |per_epoch: f64| per_epoch / slots_per_epoch() as f64;
         [
             (VOLUNTARY_EXIT, VOLUNTARY_EXIT_WEIGHT, per_slot(4.0)),
             (
@@ -360,12 +364,14 @@ impl ScoreSettings {
     ) -> Vec<(IdentTopic, TopicScoreParams)> {
         // Zero would leave every rate zero and every first-delivery cap with
         // it, which gossipsub rejects.
-        let active = inputs.active_validators.max(PLACEHOLDER_ACTIVE_VALIDATORS);
+        let active = inputs
+            .active_validators
+            .max(placeholder_active_validators());
         let (aggregators_per_slot, committees_per_slot) = expected_aggregators_per_slot(active);
         // Whether each subnet sees more than one committee's burst an epoch,
         // which shortens its decay windows.
         let multiple_bursts_per_subnet_per_epoch =
-            committees_per_slot >= 2 * ATTESTATION_SUBNET_COUNT / SLOTS_PER_EPOCH;
+            committees_per_slot >= 2 * ATTESTATION_SUBNET_COUNT / slots_per_epoch();
         // Lighthouse's young-chain rule and this node's sync gate: P3 needs
         // both a chain older than the topic's decay window and a node that
         // has kept up with it.
@@ -373,7 +379,7 @@ impl ScoreSettings {
             |decay_slots: u64| inputs.mesh_deliveries_scored && inputs.current_slot > decay_slots;
 
         let block_mesh = MeshDeliveries {
-            decay_slots: SLOTS_PER_EPOCH * 5,
+            decay_slots: slots_per_epoch() * 5,
             cap_factor: 3.0,
             activation: self.epoch,
         };
@@ -386,7 +392,7 @@ impl ScoreSettings {
         );
 
         let aggregate_mesh = MeshDeliveries {
-            decay_slots: SLOTS_PER_EPOCH * 2,
+            decay_slots: slots_per_epoch() * 2,
             cap_factor: 4.0,
             activation: self.epoch,
         };
@@ -400,13 +406,13 @@ impl ScoreSettings {
 
         let attestation_mesh = if multiple_bursts_per_subnet_per_epoch {
             MeshDeliveries {
-                decay_slots: SLOTS_PER_EPOCH * 4,
+                decay_slots: slots_per_epoch() * 4,
                 cap_factor: 16.0,
-                activation: self.slot * (SLOTS_PER_EPOCH as u32 / 2 + 1),
+                activation: self.slot * (slots_per_epoch() as u32 / 2 + 1),
             }
         } else {
             MeshDeliveries {
-                decay_slots: SLOTS_PER_EPOCH * 16,
+                decay_slots: slots_per_epoch() * 16,
                 cap_factor: 16.0,
                 activation: self.epoch * 3,
             }
@@ -418,7 +424,7 @@ impl ScoreSettings {
         };
         let attestation = self.topic_params(
             self.attestation_subnet_weight,
-            active as f64 / ATTESTATION_SUBNET_COUNT as f64 / SLOTS_PER_EPOCH as f64,
+            active as f64 / ATTESTATION_SUBNET_COUNT as f64 / slots_per_epoch() as f64,
             attestation_fmd_decay_time,
             Some(&attestation_mesh),
             scored(attestation_mesh.decay_slots),
@@ -529,14 +535,14 @@ fn decay_convergence(decay: f64, rate: f64) -> f64 {
 /// committees differ in size by at most one member.
 fn expected_aggregators_per_slot(active: u64) -> (f64, u64) {
     let committees_per_slot = committee_count_per_slot(active);
-    let committees = committees_per_slot * SLOTS_PER_EPOCH;
+    let committees = committees_per_slot * slots_per_epoch();
     let smaller = active / committees;
     let larger_count = active - smaller * committees;
     let smaller_modulo = (smaller / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
     let larger_modulo = ((smaller + 1) / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
     let per_epoch = ((committees - larger_count) * smaller) as f64 / smaller_modulo as f64
         + (larger_count * (smaller + 1)) as f64 / larger_modulo as f64;
-    (per_epoch / SLOTS_PER_EPOCH as f64, committees_per_slot)
+    (per_epoch / slots_per_epoch() as f64, committees_per_slot)
 }
 
 /// Whether mesh-delivery scoring (P3) is safe to switch on: the head has
@@ -571,7 +577,7 @@ impl MeshDeliveryGate {
         }
         let since = *self.keeping_up_since.get_or_insert(wall_slot);
         // Saturating: the wall clock can step backwards under an NTP correction.
-        wall_slot.saturating_sub(since) >= MESH_DELIVERY_WARMUP_SLOTS
+        wall_slot.saturating_sub(since) >= mesh_delivery_warmup_slots()
     }
 
     /// Start the warmup over, as if the head had just caught up: the
@@ -603,7 +609,7 @@ impl PeerScoring {
         Self {
             settings: ScoreSettings::new(config, crate::MESH_N),
             gate: MeshDeliveryGate::default(),
-            active_validators: PLACEHOLDER_ACTIVE_VALIDATORS,
+            active_validators: placeholder_active_validators(),
             mesh_deliveries_scored: false,
             held: vec![fork_digest],
             current: fork_digest,
@@ -865,7 +871,7 @@ mod tests {
         for active in [
             0,
             1,
-            PLACEHOLDER_ACTIVE_VALIDATORS,
+            placeholder_active_validators(),
             1_000,
             100_000,
             1_000_000,
@@ -926,7 +932,7 @@ mod tests {
     #[test]
     fn a_young_chain_leaves_mesh_deliveries_unscored() {
         let young = ScoreInputs {
-            current_slot: SLOTS_PER_EPOCH * 2,
+            current_slot: slots_per_epoch() * 2,
             ..inputs(1_000_000, true)
         };
         let topics = settings(crate::MESH_N).dynamic_topic_params(DIGEST, young);
@@ -977,18 +983,18 @@ mod tests {
         // Caught up, but the counters have not refilled yet.
         assert!(!gate.update(1_001, 1_000));
         assert!(!gate.update(
-            1_000 + MESH_DELIVERY_WARMUP_SLOTS,
-            1_000 + MESH_DELIVERY_WARMUP_SLOTS
+            1_000 + mesh_delivery_warmup_slots(),
+            1_000 + mesh_delivery_warmup_slots()
         ));
         assert!(gate.update(
-            1_001 + MESH_DELIVERY_WARMUP_SLOTS,
-            1_000 + MESH_DELIVERY_WARMUP_SLOTS
+            1_001 + mesh_delivery_warmup_slots(),
+            1_000 + mesh_delivery_warmup_slots()
         ));
         // A lag within the bound, empty slots say, keeps it open.
-        let wall = 1_001 + MESH_DELIVERY_WARMUP_SLOTS + MESH_DELIVERY_MAX_HEAD_LAG;
-        assert!(gate.update(wall, 1_001 + MESH_DELIVERY_WARMUP_SLOTS));
+        let wall = 1_001 + mesh_delivery_warmup_slots() + MESH_DELIVERY_MAX_HEAD_LAG;
+        assert!(gate.update(wall, 1_001 + mesh_delivery_warmup_slots()));
         // Falling further behind closes it at once, and restarts the warmup.
-        assert!(!gate.update(wall + 1, 1_001 + MESH_DELIVERY_WARMUP_SLOTS));
+        assert!(!gate.update(wall + 1, 1_001 + mesh_delivery_warmup_slots()));
         assert!(!gate.update(wall + 2, wall + 2));
     }
 
@@ -998,12 +1004,12 @@ mod tests {
     fn a_restarted_gate_warms_up_again() {
         let mut gate = MeshDeliveryGate::default();
         assert!(!gate.update(1_000, 1_000));
-        let open = 1_000 + MESH_DELIVERY_WARMUP_SLOTS;
+        let open = 1_000 + mesh_delivery_warmup_slots();
         assert!(gate.update(open, open));
 
         gate.restart();
         assert!(!gate.update(open + 1, open + 1));
-        let warm = open + 1 + MESH_DELIVERY_WARMUP_SLOTS;
+        let warm = open + 1 + mesh_delivery_warmup_slots();
         assert!(!gate.update(warm - 1, warm - 1));
         assert!(gate.update(warm, warm));
     }
@@ -1070,7 +1076,7 @@ mod tests {
         let deficit =
             |deliveries: f64| (params.mesh_message_deliveries_threshold - deliveries).max(0.0);
         let mut deliveries = params.mesh_message_deliveries_cap;
-        let p3 = (0..UNSUBSCRIBE_LAG_EPOCHS * SLOTS_PER_EPOCH)
+        let p3 = (0..UNSUBSCRIBE_LAG_EPOCHS * slots_per_epoch())
             .map(|_| {
                 deliveries *= params.mesh_message_deliveries_decay;
                 if deliveries < DECAY_TO_ZERO {

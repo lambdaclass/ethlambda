@@ -107,8 +107,8 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
     let seed = get_seed(state, epoch, constants::DOMAIN_SYNC_COMMITTEE);
 
     let mut i: u64 = 0;
-    let mut sync_committee_indices = Vec::with_capacity(preset::SYNC_COMMITTEE_SIZE);
-    while sync_committee_indices.len() < preset::SYNC_COMMITTEE_SIZE {
+    let mut sync_committee_indices = Vec::with_capacity(preset::sync_committee_size());
+    while sync_committee_indices.len() < preset::sync_committee_size() {
         let shuffled_index =
             compute_shuffled_index(i % active_validator_count, active_validator_count, seed)?;
         // `shuffled_index` is mathematically guaranteed to be within
@@ -189,7 +189,7 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
 /// the one after, so this is what tells a caller which of the two answers for
 /// a given epoch.
 pub fn compute_sync_committee_period(epoch: Epoch) -> u64 {
-    epoch / preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+    epoch / preset::epochs_per_sync_committee_period()
 }
 
 /// The reward every one-increment slice of a validator's effective balance
@@ -318,10 +318,10 @@ pub fn get_attestation_participation_flag_indices(
     crate::beacon::verify(is_matching_source, "is_matching_source")?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
-    if is_matching_target && inclusion_delay <= preset::SLOTS_PER_EPOCH {
+    if is_matching_target && inclusion_delay <= preset::slots_per_epoch() {
         participation_flag_indices.push(constants::TIMELY_TARGET_FLAG_INDEX);
     }
     if is_matching_head && inclusion_delay == preset::MIN_ATTESTATION_INCLUSION_DELAY {
@@ -507,7 +507,7 @@ mod tests {
         let state = altair_state_with_validators(4);
         let indices = get_next_sync_committee_indices(&state).unwrap();
 
-        assert_eq!(indices.len(), preset::SYNC_COMMITTEE_SIZE);
+        assert_eq!(indices.len(), preset::sync_committee_size());
         assert!(indices.iter().all(|index| *index < 4));
 
         let mut seen = std::collections::HashSet::new();
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn a_sync_committee_period_spans_its_epochs_and_no_more() {
-        let period = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let period = preset::epochs_per_sync_committee_period();
         assert_eq!(compute_sync_committee_period(0), 0);
         assert_eq!(compute_sync_committee_period(period - 1), 0);
         assert_eq!(compute_sync_committee_period(period), 1);

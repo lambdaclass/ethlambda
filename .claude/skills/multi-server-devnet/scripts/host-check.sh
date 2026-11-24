@@ -15,10 +15,16 @@
 #          as MISSING. Omit to probe only the containers that exist.
 #
 # Exit status: 0 all good, 1 something needs attention (container not running or
-# missing, metrics unreachable, or a head lagging this host's best by more than the
-# sync-gate threshold -- past which the node stops attesting and proposing).
+# missing, metrics unreachable, or a head lagging this host's best by more than
+# LAG_THRESHOLD slots).
+#
+# Lag alone does not mean duties are off. ethlambda skips attesting and proposing
+# only while its SYNC column reads `syncing`: its head trails the clock by more than
+# 4 slots AND a peer reports a head ahead (SyncThresholds::LEAN,
+# crates/net/api/src/sync.rs), for at most 16 flat slots (the stall window). A node
+# far behind with no peer ahead reads `synced` and keeps its duties on a stale head.
 set -u
-LAG_THRESHOLD=${LAG_THRESHOLD:-4}   # SYNC_LAG_THRESHOLD, crates/blockchain/src/sync_status.rs
+LAG_THRESHOLD=${LAG_THRESHOLD:-4}   # SyncThresholds::LEAN.clock_lag, crates/net/api/src/sync.rs
 EXPECTED=${1:-}
 
 # Scrape one node's own metrics port. lean_connected_peers is one series PER PEER,
@@ -73,13 +79,15 @@ while IFS=$'\t' read -r idx nm status rs vals; do
   case "$h" in
     ''|-|*[!0-9]*) [ "$nm" != "-" ] && flag="  <- no metrics"; bad=1 ;;
     *) [ $((best - h)) -gt "$LAG_THRESHOLD" ] && {
-         flag="  <- lags best head by $((best - h)) (>$LAG_THRESHOLD: duties suppressed)"; bad=1; } ;;
+         flag="  <- lags best head by $((best - h)) (>$LAG_THRESHOLD)"; bad=1; } ;;
   esac
+  # The node's own verdict, whatever the lag: only `syncing` suppresses duties.
+  [ "$s" = "syncing" ] && { flag="$flag  <- syncing: duties suppressed"; bad=1; }
   printf '%-5s %-14s %-22s %3s %9s %9s %9s %-8s %4s %5s%s\n' \
          "$idx" "$nm" "${status:0:22}" "$rs" "$h" "$j" "$f" "$s" "$a" "$p" "$flag"
 done <<<"$records"
 
 echo
 echo "best head on this host: $best  (cross-devnet view: sweep.sh / Grafana)"
-[ "$bad" = 0 ] && echo "OK: all nodes up, reporting, and within $LAG_THRESHOLD slots of the best head"
+[ "$bad" = 0 ] && echo "OK: all nodes up, reporting, none syncing, and within $LAG_THRESHOLD slots of the best head"
 exit "$bad"

@@ -14,7 +14,7 @@ use ethlambda_state_transition::beacon::helpers::shuffling::compute_shuffled_ind
 use ethlambda_state_transition::beacon::primitives::Root;
 use libtest_mimic::Trial;
 
-use super::{PRESET, collect};
+use super::{collect, preset};
 
 #[derive(serde::Deserialize)]
 struct Mapping {
@@ -27,7 +27,7 @@ struct Mapping {
 /// [`super::Case::in_scope`]'s gate itself, so every case collected below is
 /// simply handed to it.
 pub fn trials() -> Vec<Trial> {
-    let cases = collect(PRESET, "shuffling", "core");
+    let cases = collect(preset(), "shuffling", "core");
     let mut trials = vec![super::discovery_trial("shuffling", cases.len())];
 
     for case in cases {

@@ -15,6 +15,15 @@ inputs:
       build that runs from two workflows (`ci.yml` and `daily_ci.yml` both run
       the test halves) the same one, so the two share an entry.
     required: true
+  save-cache:
+    description: >-
+      Whether this job may save the entry (on main; no other ref ever saves).
+      Set it to `false` on all but one of several jobs that share a
+      `cache-key` without building the same thing: the entry is whatever the
+      first job to finish saved, so the job that builds the most must be the
+      one that saves.
+    required: false
+    default: "true"
   components:
     description: "Rust components to install (e.g. rustfmt, clippy)"
     required: false
@@ -82,5 +91,5 @@ runs:
       with:
         key: ${{ inputs.cache-key }}-${{ steps.env.outputs.image }}
         add-job-id-key: false
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && inputs.save-cache == 'true' }}
         workspaces: ${{ inputs.workspaces }}

@@ -47,7 +47,7 @@
 //! entirely, and `PartialDataColumnGroupID` gains `slot`.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{ProgressiveBitlist, ProgressiveList, SszBitvector, SszList, SszVector};
+use libssz_types::{ProgressiveBitlist, ProgressiveList};
 
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::bellatrix::{ExtraData, LogsBloom};
@@ -65,10 +65,10 @@ use super::shared::{
     StateRoots,
 };
 use crate::beacon::preset;
+use crate::beacon::preset_sized::{PresetBitvector, PresetList, PresetVector};
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ColumnIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
-    Gwei, KzgCommitment, KzgProof, ParticipationFlags, Root, Slot, Uint256, ValidatorIndex,
-    WithdrawalIndex,
+    Gwei, KzgCommitment, KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,11 +123,14 @@ pub type BuilderDepositRequests = ProgressiveList<BuilderDepositRequest>;
 pub type BuilderExitRequests = ProgressiveList<BuilderExitRequest>;
 /// Per-validator participation flags for one epoch, positionally parallel to
 /// the registry.
-pub type EpochParticipation = ProgressiveList<ParticipationFlags>;
+pub type EpochParticipation = super::shared::ProgressiveEpochParticipation;
 /// Per-validator inactivity scores, positionally parallel to the registry.
 pub type InactivityScores = ProgressiveList<u64>;
 /// Deposits known but not yet credited to the validator registry.
-pub type PendingDeposits = ProgressiveList<PendingDeposit>;
+pub type PendingDeposits = ethlambda_ssz_tree::ProgressiveList<
+    PendingDeposit,
+    std::collections::BTreeMap<usize, PendingDeposit>,
+>;
 /// Partial withdrawals known but not yet paid out.
 pub type PendingPartialWithdrawals = ProgressiveList<PendingPartialWithdrawal>;
 /// Validator consolidations known but not yet applied.
@@ -143,26 +146,26 @@ pub type BuilderPendingWithdrawals = ProgressiveList<BuilderPendingWithdrawal>;
 /// exactly two epochs' worth, since a payment is settled well before a third
 /// epoch could accumulate.
 pub type BuilderPendingPayments =
-    SszVector<BuilderPendingPayment, { preset::BUILDER_PENDING_PAYMENTS_LENGTH }>;
+    PresetVector<BuilderPendingPayment, preset::BuilderPendingPaymentsLength>;
 /// Bits tracking payload availability for recent slots, indexed by slot
 /// modulo `SLOTS_PER_HISTORICAL_ROOT`, the same indexing [`BlockRoots`] uses.
-pub type ExecutionPayloadAvailability = SszBitvector<{ preset::SLOTS_PER_HISTORICAL_ROOT }>;
+pub type ExecutionPayloadAvailability = PresetBitvector<preset::SlotsPerHistoricalRoot>;
 /// Payload attestations included in a block.
 pub type PayloadAttestations = ProgressiveList<PayloadAttestation>;
 /// The payload timeliness committee of a slot, named explicitly.
-pub type PayloadTimelinessCommittee = SszVector<ValidatorIndex, { preset::PTC_SIZE }>;
+pub type PayloadTimelinessCommittee = PresetVector<ValidatorIndex, preset::PtcSize>;
 /// The payload timeliness committee members an [`IndexedPayloadAttestation`]
 /// names, as a bounded list rather than the fixed-size
 /// [`PayloadTimelinessCommittee`]: an attester subset, not the whole
 /// committee.
-pub type PayloadTimelinessCommitteeIndices = SszList<ValidatorIndex, { preset::PTC_SIZE }>;
+pub type PayloadTimelinessCommitteeIndices = PresetList<ValidatorIndex, preset::PtcSize>;
 /// One bit per payload timeliness committee member, in committee order.
-pub type PayloadTimelinessCommitteeBits = SszBitvector<{ preset::PTC_SIZE }>;
+pub type PayloadTimelinessCommitteeBits = PresetBitvector<preset::PtcSize>;
 /// The cached window of payload timeliness committees
 /// [`BeaconState::ptc_window`] holds: the previous, current, and lookahead
 /// epochs.
 pub type PayloadTimelinessCommitteeWindow =
-    SszVector<PayloadTimelinessCommittee, { preset::PTC_WINDOW_LENGTH }>;
+    PresetVector<PayloadTimelinessCommittee, preset::PtcWindowLength>;
 /// One data column, with at most one cell per blob. Unbounded from gloas on,
 /// unlike fulu's `SszList<Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK>`.
 pub type DataColumn = ProgressiveList<Cell>;
@@ -1222,17 +1225,17 @@ mod tests {
     /// none of which has a meaningful empty value.
     fn zero_state() -> BeaconState {
         let zero_root_vector = || -> BlockRoots {
-            vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            vec![Root::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length")
         };
         let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+            pubkeys: vec![Default::default(); preset::sync_committee_size()]
                 .try_into()
                 .expect("built at exactly SYNC_COMMITTEE_SIZE"),
             aggregate_pubkey: Default::default(),
         };
-        let empty_ptc: PayloadTimelinessCommittee = vec![0u64; preset::PTC_SIZE]
+        let empty_ptc: PayloadTimelinessCommittee = vec![0u64; preset::ptc_size()]
             .try_into()
             .expect("built at exactly PTC_SIZE");
 
@@ -1250,10 +1253,10 @@ mod tests {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_participation: Default::default(),
@@ -1279,7 +1282,7 @@ mod tests {
             pending_deposits: Default::default(),
             pending_partial_withdrawals: Default::default(),
             pending_consolidations: Default::default(),
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+            proposer_lookahead: vec![0; preset::proposer_lookahead_length()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             builders: Default::default(),
@@ -1287,14 +1290,14 @@ mod tests {
             execution_payload_availability: Default::default(),
             builder_pending_payments: vec![
                 BuilderPendingPayment::default();
-                preset::BUILDER_PENDING_PAYMENTS_LENGTH
+                preset::builder_pending_payments_length()
             ]
             .try_into()
             .expect("the vector is built at its exact length"),
             builder_pending_withdrawals: Default::default(),
             latest_execution_payload_bid: Default::default(),
             payload_expected_withdrawals: Default::default(),
-            ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
+            ptc_window: vec![empty_ptc; preset::ptc_window_length()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
         }

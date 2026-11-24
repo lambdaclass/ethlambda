@@ -5,8 +5,9 @@
 //! accessors, and state mutators.
 //!
 //! One systematic difference from the spec's own signatures: the spec reads its
-//! parameters from global scope, whereas here preset values are compile-time
-//! constants but configuration values are not, so any function needing a
+//! parameters from global scope, whereas here only preset values are global
+//! (constants, or accessors of the process's one preset) and configuration
+//! values are not, so any function needing a
 //! configuration value takes a [`crate::beacon::config::Config`]. Everything else keeps
 //! the spec's name and argument order, so a call site can be checked against the
 //! spec line by line.
@@ -28,5 +29,6 @@ pub mod participation_reference;
 pub mod predicates;
 pub mod shuffling;
 pub mod sync_committee;
+pub mod target_balances;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_state;

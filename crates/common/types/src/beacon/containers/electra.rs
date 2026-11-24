@@ -42,7 +42,7 @@
 //! for the generalized-index table this implies.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitlist, SszBitvector, SszList};
+use libssz_types::SszList;
 
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::bellatrix::LogsBloom;
@@ -55,6 +55,7 @@ use super::shared::{
     Slashings, StateRoots, Validators,
 };
 use crate::beacon::preset;
+use crate::beacon::preset_sized::{PresetBitlist, PresetBitvector, PresetList};
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
     Gwei, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
@@ -71,7 +72,7 @@ use crate::beacon::primitives::{
 /// Bounded by `MAX_VALIDATORS_PER_SLOT`, the product of `MAX_COMMITTEES_PER_SLOT`
 /// and `MAX_VALIDATORS_PER_COMMITTEE`, since one attestation can now span
 /// every committee in the slot.
-pub type AggregationBits = SszBitlist<{ preset::MAX_VALIDATORS_PER_SLOT }>;
+pub type AggregationBits = PresetBitlist<preset::MaxValidatorsPerSlot>;
 
 /// Which of a slot's committees an [`Attestation`] covers, one bit per
 /// committee index.
@@ -81,7 +82,7 @@ pub type AggregationBits = SszBitlist<{ preset::MAX_VALIDATORS_PER_SLOT }>;
 /// committee's member bits in that same ascending order, so `committee_bits`
 /// is what tells a reader where one committee's segment ends and the next
 /// begins.
-pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT }>;
+pub type CommitteeBits = PresetBitvector<preset::MaxCommitteesPerSlot>;
 
 /// The attesters covered by one aggregate, named explicitly rather than as a
 /// bitfield, which is the form signature verification needs.
@@ -89,7 +90,7 @@ pub type CommitteeBits = SszBitvector<{ preset::MAX_COMMITTEES_PER_SLOT }>;
 /// Bounded the same way as [`AggregationBits`], for the same reason: one
 /// [`IndexedAttestation`] can now name attesters from every committee in a
 /// slot.
-pub type AttestingIndices = SszList<ValidatorIndex, { preset::MAX_VALIDATORS_PER_SLOT }>;
+pub type AttestingIndices = PresetList<ValidatorIndex, preset::MaxValidatorsPerSlot>;
 
 /// Attestations included in a block.
 ///
@@ -108,15 +109,24 @@ pub type Attestations = SszList<Attestation, { preset::MAX_ATTESTATIONS_ELECTRA 
 pub type AttesterSlashings = SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS_ELECTRA }>;
 
 /// Deposits queued in the state, not yet credited to the validator registry.
-pub type PendingDeposits = SszList<PendingDeposit, { preset::PENDING_DEPOSITS_LIMIT }>;
+///
+/// Tree-backed: a block only appends (deposit requests) and the epoch drops a
+/// prefix, so every other block leaves the list untouched and the state root
+/// reuses its cached hash instead of re-merkleizing every queued deposit.
+/// Writes are buffered in a `BTreeMap`, since they are a handful of pushes.
+pub type PendingDeposits = ethlambda_ssz_tree::List<
+    PendingDeposit,
+    { preset::PENDING_DEPOSITS_LIMIT },
+    std::collections::BTreeMap<usize, PendingDeposit>,
+>;
 
 /// Partial withdrawals queued in the state, not yet paid out.
 pub type PendingPartialWithdrawals =
-    SszList<PendingPartialWithdrawal, { preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT }>;
+    PresetList<PendingPartialWithdrawal, preset::PendingPartialWithdrawalsLimit>;
 
 /// Validator consolidations queued in the state, not yet applied.
 pub type PendingConsolidations =
-    SszList<PendingConsolidation, { preset::PENDING_CONSOLIDATIONS_LIMIT }>;
+    PresetList<PendingConsolidation, preset::PendingConsolidationsLimit>;
 
 // ---------------------------------------------------------------------------
 // Attestations
@@ -873,5 +883,71 @@ mod tests {
         assert!(!<BeaconState as libssz::SszEncode>::is_fixed_size());
         assert!(!<AggregateAndProof as libssz::SszEncode>::is_fixed_size());
         assert!(!<SignedAggregateAndProof as libssz::SszEncode>::is_fixed_size());
+    }
+
+    fn pending_deposit(i: u64) -> PendingDeposit {
+        PendingDeposit {
+            pubkey: BlsPubkey([i as u8; 48]),
+            withdrawal_credentials: [(i >> 8) as u8; 32].into(),
+            amount: i,
+            signature: BlsSignature([i as u8; 96]),
+            slot: i,
+        }
+    }
+
+    /// Run with `--ignored --nocapture`. What `process_pending_deposits` costs
+    /// once per epoch on a queue of `len` deposits when it takes the queue out
+    /// as a `Vec`, drops a prefix and rebuilds the list from the rest: the
+    /// copy out, the rebuild, and the root that follows.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pending_deposits_epoch_rebuild_bench() {
+        use crate::primitives::HashTreeRoot as _;
+        use std::time::Instant;
+
+        for len in [1_000usize, 20_000, 200_000] {
+            let values: Vec<_> = (0..len as u64).map(pending_deposit).collect();
+            let mut queue = PendingDeposits::try_from(values).unwrap();
+            queue.apply_updates();
+            let _ = queue.hash_tree_root();
+
+            let start = Instant::now();
+            let all = queue.to_vec();
+            let copy = start.elapsed();
+            let start = Instant::now();
+            let remaining: Vec<_> = all.into_iter().skip(16).collect();
+            let rebuilt = PendingDeposits::try_from(remaining).unwrap();
+            let build = start.elapsed();
+            let start = Instant::now();
+            let _ = rebuilt.hash_tree_root();
+            let hash = start.elapsed();
+            println!("{len} deposits: copy out {copy:?}, rebuild {build:?}, hash {hash:?}");
+        }
+    }
+
+    #[test]
+    fn tree_backed_pending_deposits_hash_like_the_flat_list() {
+        use crate::primitives::HashTreeRoot as _;
+        type Flat = SszList<PendingDeposit, { preset::PENDING_DEPOSITS_LIMIT }>;
+
+        for len in [0usize, 1, 2, 3, 17, 1000] {
+            let values: Vec<_> = (0..len as u64).map(pending_deposit).collect();
+            let flat = Flat::try_from(values.clone()).unwrap();
+            let mut tree = PendingDeposits::try_from(values).unwrap();
+            assert_eq!(tree.hash_tree_root(), flat.hash_tree_root(), "len {len}");
+            assert_eq!(tree.to_ssz(), flat.to_ssz(), "len {len}");
+
+            // An append, the one per-block write, rehashes like a rebuild.
+            tree.push(pending_deposit(9_999)).unwrap();
+            tree.apply_updates();
+            let mut grown: Vec<_> = flat.iter().cloned().collect();
+            grown.push(pending_deposit(9_999));
+            let flat = Flat::try_from(grown).unwrap();
+            assert_eq!(
+                tree.hash_tree_root(),
+                flat.hash_tree_root(),
+                "len {len} + 1"
+            );
+        }
     }
 }

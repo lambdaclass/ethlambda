@@ -25,13 +25,14 @@
 //! next, replaced when the `dependent_root` changes. They are narrowed to this
 //! client's indices on arrival, and are not part of subnet subscriptions
 //! either. Whether an epoch is a gloas one is the caller's to decide, since
-//! this service holds no fork schedule.
+//! this service holds no fork schedule, and so is holding off the gloas fork
+//! epoch's until the fork, before which a node cannot know them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ethlambda_types::beacon::constants::GENESIS_SLOT;
-use ethlambda_types::beacon::preset::{EPOCHS_PER_SYNC_COMMITTEE_PERIOD, SLOTS_PER_EPOCH};
+use ethlambda_types::beacon::preset::{epochs_per_sync_committee_period, slots_per_epoch};
 use ethlambda_types::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 use tracing::{info, warn};
 
@@ -41,7 +42,7 @@ use crate::error::Result;
 
 /// The sync committee period `epoch` belongs to.
 pub fn sync_committee_period(epoch: Epoch) -> u64 {
-    epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+    epoch / epochs_per_sync_committee_period()
 }
 
 /// One epoch's schedule of some kind, and the block root it is derived from.
@@ -224,7 +225,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// changed.
     ///
     /// Only to be called for a gloas epoch: an earlier one answers with no
-    /// duties, which is harmless but a request wasted every epoch.
+    /// duties, which is harmless but a request wasted every epoch. Nor for the
+    /// gloas fork epoch before it has begun, which a node refuses.
     pub async fn refresh_ptc(&mut self, epoch: Epoch) -> Result<()> {
         if self.indices.is_empty() {
             return Ok(());
@@ -276,7 +278,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         if self.indices.is_empty() {
             return Ok(());
         }
-        let epoch = period * EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let epoch = period * epochs_per_sync_committee_period();
         let fetched = self.beacon_node.sync_duties(epoch, &self.indices).await?;
         let mine: Vec<SyncDutyDto> = fetched
             .into_iter()
@@ -303,13 +305,19 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// `S` signs for `S - 1` and the message is included at `S`, so at the
     /// last slot of a period the next committee is the one that signs.
     pub fn sync_at_slot(&self, slot: Slot) -> Vec<SyncDutyDto> {
-        let period = sync_committee_period((slot + 1) / SLOTS_PER_EPOCH);
+        let period = sync_committee_period((slot + 1) / slots_per_epoch());
         self.sync_for_period(period)
     }
 
     /// Forget sync committee duties of periods before `period`.
     pub fn prune_sync_before(&mut self, period: u64) {
         self.sync.retain(|held, _| *held >= period);
+    }
+
+    /// Whether a payload timeliness committee schedule is held for `epoch`,
+    /// an empty one included: a fetch that found no duties still answered.
+    pub fn holds_ptc(&self, epoch: Epoch) -> bool {
+        self.ptc.contains_key(&epoch)
     }
 
     /// Forget payload timeliness committee duties for epochs before `epoch`.
@@ -826,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn sync_duties_are_fetched_at_the_periods_first_epoch_and_narrowed() {
         let node = Arc::new(MockBeaconNode::new().with_sync_duties(
-            EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+            epochs_per_sync_committee_period(),
             vec![sync_duty(7, vec![3]), sync_duty(99, vec![4])],
         ));
         let mut service = DutiesService::new(node, vec![7]);
@@ -847,7 +855,7 @@ mod tests {
             MockBeaconNode::new()
                 .with_sync_duties(0, vec![sync_duty(7, vec![1])])
                 .with_sync_duties(
-                    EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+                    epochs_per_sync_committee_period(),
                     vec![sync_duty(7, vec![200])],
                 ),
         );
@@ -855,7 +863,7 @@ mod tests {
         service.refresh_sync(0).await.expect("0");
         service.refresh_sync(1).await.expect("1");
 
-        let period_slots = EPOCHS_PER_SYNC_COMMITTEE_PERIOD * SLOTS_PER_EPOCH;
+        let period_slots = epochs_per_sync_committee_period() * slots_per_epoch();
         assert_eq!(
             service.sync_at_slot(period_slots - 2)[0].validator_sync_committee_indices,
             vec![1]
@@ -872,7 +880,7 @@ mod tests {
             MockBeaconNode::new()
                 .with_sync_duties(0, vec![sync_duty(7, vec![1])])
                 .with_sync_duties(
-                    EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+                    epochs_per_sync_committee_period(),
                     vec![sync_duty(7, vec![2])],
                 ),
         );

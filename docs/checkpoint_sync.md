@@ -32,7 +32,7 @@ State already on disk takes precedence over both checkpoint sync and genesis: if
 
 ### `ethlambda beacon`
 
-`beacon` takes no genesis config, validator registry, or bootnode file of its own: it takes `--network` instead, naming a built-in network or a directory of published network files (see [`cli.md`](cli.md)). `genesis_time`, `genesis_validators_root`, and the bootnode list all come from whichever network `--network` resolves to; for the built-in networks (`mainnet`, the default, plus `sepolia`, `hoodi` and `plataberget`), they are built into the binary (see `CLAUDE.md`'s "Built-in networks").
+`beacon` takes no genesis config, validator registry, or bootnode file of its own: it takes `--network` instead, naming a built-in network or a directory of published network files (see [`cli.md`](cli.md)). `genesis_time`, `genesis_validators_root`, and the bootnode list all come from whichever network `--network` resolves to, plus, for the bootnode list, any entries `--bootnodes` adds to it (a list of ENRs and multiaddrs, not a file; see [`cli.md`](cli.md#bootnodes-on-beacon)). For the built-in networks (`mainnet`, the default, plus `sepolia`, `hoodi` and `plataberget`), the network's own values are built into the binary (see `CLAUDE.md`'s "Built-in networks").
 
 ```bash
 ethlambda beacon --network <network> --checkpoint-sync-url <URL>

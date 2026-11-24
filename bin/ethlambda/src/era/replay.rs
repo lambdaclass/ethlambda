@@ -33,7 +33,9 @@ use super::report::{EraReport, Outcome};
 const PROGRESS_EVERY: u64 = 512;
 
 /// Slots per era file.
-pub(super) const SLOTS_PER_ERA: u64 = preset::SLOTS_PER_HISTORICAL_ROOT as u64;
+pub(super) fn slots_per_era() -> u64 {
+    preset::slots_per_historical_root() as u64
+}
 
 fn hex(root: H256) -> String {
     format!("0x{}", hex::encode(root.0))
@@ -103,19 +105,20 @@ impl<'a> Replay<'a> {
         report: &mut EraReport,
     ) -> eyre::Result<()> {
         ensure!(era >= 1, "era 0 holds no blocks to replay");
-        let first_slot = (era - 1) * SLOTS_PER_ERA;
-        let end_slot = era * SLOTS_PER_ERA;
+        let first_slot = (era - 1) * slots_per_era();
+        let end_slot = era * slots_per_era();
 
         let mut file = EraFile::open(current)?;
         let block_index = file
             .block_index()
             .ok_or_else(|| eyre!("{} has no block index", current.display()))?;
         ensure!(
-            block_index.start_slot == first_slot && block_index.count() as u64 == SLOTS_PER_ERA,
-            "{} indexes {} slots from {}, expected {SLOTS_PER_ERA} from {first_slot}",
+            block_index.start_slot == first_slot && block_index.count() as u64 == slots_per_era(),
+            "{} indexes {} slots from {}, expected {} from {first_slot}",
             current.display(),
             block_index.count(),
-            block_index.start_slot
+            block_index.start_slot,
+            slots_per_era()
         );
 
         let mut state = match self.carried.take() {
@@ -134,7 +137,7 @@ impl<'a> Replay<'a> {
                 report.skipped_empty_slots += 1;
                 continue;
             };
-            let fork = self.config.fork_at_epoch(slot / preset::SLOTS_PER_EPOCH);
+            let fork = self.config.fork_at_epoch(slot / preset::slots_per_epoch());
             let block = SignedBeaconBlock::from_ssz(fork, &bytes).map_err(|err| {
                 eyre!("era {era} slot {slot}: block does not decode as {fork:?}: {err:?}")
             })?;
@@ -215,7 +218,7 @@ impl<'a> Replay<'a> {
             "{} holds a state at slot {slot}, expected {expected_slot}",
             path.display()
         );
-        let fork = self.config.fork_at_epoch(slot / preset::SLOTS_PER_EPOCH);
+        let fork = self.config.fork_at_epoch(slot / preset::slots_per_epoch());
         BeaconState::from_ssz(fork, &bytes).map_err(|err| {
             eyre!(
                 "{}: state does not decode as {fork:?}: {err:?}",
@@ -247,7 +250,7 @@ impl<'a> Replay<'a> {
         file: &mut EraFile,
         report: &mut EraReport,
     ) -> eyre::Result<()> {
-        let end_slot = era * SLOTS_PER_ERA;
+        let end_slot = era * slots_per_era();
         let bytes = file.state_bytes()?;
         let slot = BeaconState::slot_from_ssz(&bytes)
             .map_err(|err| eyre!("era {era}: stored state has no readable slot: {err:?}"))?;
@@ -255,7 +258,7 @@ impl<'a> Replay<'a> {
             slot == end_slot,
             "era {era}: the stored state is at slot {slot}, expected {end_slot}"
         );
-        let fork = self.config.fork_at_epoch(slot / preset::SLOTS_PER_EPOCH);
+        let fork = self.config.fork_at_epoch(slot / preset::slots_per_epoch());
         let stored = BeaconState::from_ssz(fork, &bytes)
             .map_err(|err| eyre!("era {era}: stored state does not decode as {fork:?}: {err:?}"))?;
         drop(bytes);
@@ -271,7 +274,7 @@ impl<'a> Replay<'a> {
             "era {era}: state is at slot {} after the era's blocks, expected {last_slot}",
             state.slot()
         );
-        let expected = stored.state_roots()[(last_slot % SLOTS_PER_ERA) as usize];
+        let expected = stored.state_roots()[(last_slot % slots_per_era()) as usize];
         let actual = state.hash_tree_root();
         let result = compare(
             "state_roots[last slot]",
@@ -285,7 +288,7 @@ impl<'a> Replay<'a> {
 
         // 2. block roots.
         for &(slot, root) in block_roots {
-            let expected = stored.block_roots()[(slot % SLOTS_PER_ERA) as usize];
+            let expected = stored.block_roots()[(slot % slots_per_era()) as usize];
             compare("block_roots", era, slot, expected, root, report)?;
         }
         report.check(

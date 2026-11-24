@@ -786,11 +786,11 @@ mod tests {
     }
 
     fn fulu_slot() -> u64 {
-        Config::mainnet().fulu_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+        Config::mainnet().fulu_fork_epoch * preset::slots_per_epoch() + 1
     }
 
     fn gloas_slot() -> u64 {
-        gloas_config().gloas_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+        gloas_config().gloas_fork_epoch * preset::slots_per_epoch() + 1
     }
 
     fn gloas_data_column_sidecar(slot: u64, index: u64) -> gloas::DataColumnSidecar {

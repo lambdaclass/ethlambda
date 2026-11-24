@@ -110,8 +110,11 @@ pub fn precheck_block(
         Reference::Recent(state) => state,
     };
 
-    let pubkey = match (state.validator(proposer), reference) {
-        (Ok(validator), _) => &validator.pubkey,
+    let proposer_key = match (state.validator(proposer), reference) {
+        (Ok(validator), _) => bls::IndexedPubkey {
+            index: proposer,
+            pubkey: validator.pubkey,
+        },
         (Err(_), Reference::Parent(_)) => {
             return Err(PrecheckError::UnknownProposer { proposer });
         }
@@ -125,7 +128,7 @@ pub fn precheck_block(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(block_root, domain);
-    if !bls::verify(pubkey, signing_root, &signed_block.signature()) {
+    if !bls::verify(&proposer_key, signing_root, &signed_block.signature()) {
         return Err(PrecheckError::BadSignature);
     }
     Ok(())
@@ -273,7 +276,7 @@ mod tests {
             fixed_proposer(&parent, slot),
             Some((slot - window_start) as ValidatorIndex)
         );
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         assert_eq!(fixed_proposer(&parent, beyond), None);
     }
 
@@ -330,7 +333,7 @@ mod tests {
         let config = Config::mainnet();
         let parent = fulu_parent(3);
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         let block = signed_block(&parent, &config, beyond, 5);
         assert_eq!(check(&block, Reference::Parent(&parent), &config), Ok(()));
     }

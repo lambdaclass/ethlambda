@@ -195,7 +195,7 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
         ))?;
     let adjusted_total_slashing_balance = scaled_slashings.min(total_balance);
 
-    let withdrawable_offset = (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+    let withdrawable_offset = (preset::epochs_per_slashings_vector() / 2) as Epoch;
 
     // Collecting the penalties before applying any of them keeps this pass
     // reading a stable registry: `decrease_balance` only touches the balances
@@ -387,7 +387,7 @@ mod tests {
 
         let validator = state.validator_mut(1).unwrap();
         validator.slashed = true;
-        validator.withdrawable_epoch = epoch + (preset::EPOCHS_PER_SLASHINGS_VECTOR / 2) as Epoch;
+        validator.withdrawable_epoch = epoch + (preset::epochs_per_slashings_vector() / 2) as Epoch;
         state.slashings_mut()[0] = preset::MAX_EFFECTIVE_BALANCE;
 
         process_slashings(&mut state, &config).unwrap();

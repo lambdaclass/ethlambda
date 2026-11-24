@@ -112,10 +112,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             });
         }
 
-        // The fork of the slot, by this client's own schedule, tells the node
-        // which form of the query to answer: from gloas the `committee_index`
-        // is omitted and the answer's `index` is the payload signal. It is
-        // signed as received, never reset to zero.
+        // The fork of the slot, by this client's own schedule, decides which
+        // `index` the answer may carry: from gloas it is the payload signal.
+        // It is signed as received, never reset to zero.
         let slot_fork = self
             .context
             .config
@@ -846,8 +845,8 @@ mod tests {
         let store = RwLock::new(store);
 
         let altair_fork_epoch = Config::mainnet().altair_fork_epoch;
-        let last_phase0_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH - 1;
-        let first_altair_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let last_phase0_slot = altair_fork_epoch * preset::slots_per_epoch() - 1;
+        let first_altair_slot = altair_fork_epoch * preset::slots_per_epoch();
 
         let phase0_node = Arc::new(MockBeaconNode::new().with_attestation_data(last_phase0_slot));
         AttestationService::new(
@@ -907,7 +906,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 10 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 10 * preset::slots_per_epoch() + 3;
         let node = Arc::new(
             MockBeaconNode::new()
                 .with_attestation_data(slot)
@@ -960,8 +959,8 @@ mod tests {
         );
     }
 
-    /// Slots before gloas are asked about under their own fork, so the HTTP
-    /// client keeps sending `committee_index=0` there.
+    /// Slots before gloas are asked about under their own fork, so the answer
+    /// is held to that fork's `index` rule (0 only), not gloas's.
     #[tokio::test]
     async fn a_pre_gloas_slot_is_asked_about_under_its_own_fork() {
         use ethlambda_types::beacon::fork::ForkName;
@@ -971,7 +970,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 9 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 9 * preset::slots_per_epoch() + 3;
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(slot));
         AttestationService::new(
             node.clone(),
