@@ -68,7 +68,7 @@ use ethlambda_types::{
         BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
-    beacon::primitives::Epoch,
+    beacon::primitives::{Epoch, ExecutionAddress},
     beacon::signing::compute_epoch_at_slot,
     genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
@@ -529,6 +529,19 @@ async fn run_node(
             })
             .transpose()?,
     };
+    let fallback_fee_recipient = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet.fallback_fee_recipient,
+    };
+    // Accepted, like the validator client's `--suggested-fee-recipient`, but
+    // said loudly: a proposal that falls back to it logs only at debug, so
+    // this is the one place the burned fees are mentioned.
+    if fallback_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--fallback-fee-recipient is the zero address. Every locally built payload \
+             for a proposer no validator client named a fee recipient for burns its fees."
+        );
+    }
     let builder_fallback = match &network {
         Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
         Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
@@ -914,7 +927,7 @@ async fn run_node(
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
     // Filled by `prepare_beacon_proposer` and builder registrations, read by
     // block production and by the chain actor's `payload_attributes` event.
-    let fee_recipients = ethlambda_blockchain::FeeRecipients::default();
+    let fee_recipients = ethlambda_blockchain::FeeRecipients::with_fallback(fallback_fee_recipient);
     // Before the P2P actor starts, so its first column rows are not lost.
     if let Some(url) = telemetry_url {
         let url = url.into_inner();

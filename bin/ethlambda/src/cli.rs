@@ -2,6 +2,7 @@
 
 use ethlambda_p2p::discovery::DEFAULT_DISCOVERY_TARGET_PEERS;
 use ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY;
+use ethlambda_types::beacon::primitives::ExecutionAddress;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -414,6 +415,19 @@ pub(crate) struct MainnetOptions {
     #[arg(long)]
     pub(crate) always_prepare_payload: bool,
 
+    /// Execution address a locally built payload pays when no validator
+    /// client has named a fee recipient for the proposer (through
+    /// `prepare_beacon_proposer` or a builder registration), and, on gloas,
+    /// the proposer's signed preferences name none either. 20 bytes of hex,
+    /// with or without `0x`.
+    ///
+    /// Without it such a payload pays the zero address, and the priority
+    /// fees are lost. Lighthouse's beacon-node `--suggested-fee-recipient`.
+    /// It never makes the node prepare payload attributes for a proposer no
+    /// validator client registered: that is still `--always-prepare-payload`.
+    #[arg(long, value_name = "ADDRESS", value_parser = parse_execution_address)]
+    pub(crate) fallback_fee_recipient: Option<ExecutionAddress>,
+
     /// Which network to follow: a built-in name (`mainnet`, `sepolia`,
     /// `hoodi` or `plataberget`), or a path to a directory of published
     /// network files.
@@ -502,6 +516,18 @@ fn parse_builder_url(value: &str) -> Result<String, String> {
     ethlambda_rpc::BuilderClient::check_url(value)
         .map(|()| value.to_owned())
         .map_err(|err| err.to_string())
+}
+
+/// An execution address: 20 bytes of hex, with or without the `0x` prefix.
+/// Refused while the flags are parsed, so a typo stops the node at startup
+/// rather than surfacing at its first proposal.
+fn parse_execution_address(value: &str) -> Result<ExecutionAddress, String> {
+    let digits = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(digits).map_err(|err| format!("not hex: {err}"))?;
+    let bytes: [u8; 20] = bytes
+        .try_into()
+        .map_err(|got: Vec<u8>| format!("{} bytes, expected 20", got.len()))?;
+    Ok(ExecutionAddress::from(bytes))
 }
 
 /// Flags only the lean chain takes.
@@ -1326,6 +1352,43 @@ mod tests {
             Command::Beacon(options) => options,
             other => panic!("the beacon argv must resolve to the beacon subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_fallback_fee_recipient_is_optional_and_read_with_or_without_0x() {
+        assert_eq!(
+            parse_beacon(beacon_args()).mainnet.fallback_fee_recipient,
+            None
+        );
+        let expected = Some(ExecutionAddress::repeat_byte(0xab));
+        let unprefixed = "ab".repeat(20);
+        let prefixed = format!("0x{unprefixed}");
+        for value in [prefixed.as_str(), unprefixed.as_str()] {
+            let mut args = beacon_args();
+            args.extend(["--fallback-fee-recipient", value]);
+            assert_eq!(parse_beacon(args).mainnet.fallback_fee_recipient, expected);
+        }
+    }
+
+    /// A malformed address stops the node at startup, not at its first
+    /// proposal.
+    #[test]
+    fn a_malformed_fallback_fee_recipient_is_a_usage_error() {
+        for value in ["0xabab", "0xzz", ""] {
+            let mut args = beacon_args();
+            args.extend(["--fallback-fee-recipient", value]);
+            let err = try_parse_from(args).expect_err("a malformed address is refused");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
+
+    /// Lean nodes build no execution payloads, so the flag is beacon-only.
+    #[test]
+    fn node_has_no_fallback_fee_recipient_flag() {
+        let mut args = base_args();
+        args.extend(["--fallback-fee-recipient", "0x"]);
+        let err = try_parse_from(args).expect_err("--fallback-fee-recipient is beacon-only");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     /// A client name alone configures nothing, so it is a usage error rather

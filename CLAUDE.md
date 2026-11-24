@@ -103,11 +103,13 @@ make test                                    # All tests + forkchoice spec tests
 ```
 
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
-jobs because together they no longer fit a runner's disk, plus `test-ethrex`, the
-embedded execution client's tests with the `include-ethrex` feature on (a third
-job). `CONSENSUS_CRATES` in the Makefile names the first half; `test-node` is the
+jobs so they build and run in parallel (the split was first forced by an older
+runner's disk, which no longer binds), plus `test-ethrex`, the embedded execution
+client's tests with the `include-ethrex` feature on (a third job).
+`CONSENSUS_CRATES` in the Makefile names the first half; `test-node` is the
 workspace minus it and `ETHREX_CRATES`. Run one part directly when iterating on
-it.
+it. `test-node` also runs the benchmark smoke test
+(`bin/ethlambda/tests/benchmark_smoke.rs`), which drives the built binary.
 
 ### Docs-only changes skip CI
 
@@ -116,8 +118,16 @@ group whose changed files are all documentation or repository metadata
 (`docs/**`, `theme/**`, `book.toml`, `**/*.md`, `LICENSE`, `**/.gitignore`,
 `.claude/**`; the list lives in `.github/actions/detect-changes`). That rests on
 nothing in a build or a test reading those paths. A crate that starts to (a
-`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture) must
-take the path off the list, or a change to that file merges untested.
+`#![doc = include_str!("../README.md")]`, a test that loads a `.md` fixture, a
+`build.rs` that reads one or names it in `cargo:rerun-if-changed`) must take the
+path off the list, or a change to that file merges untested. The one build
+script today, `bin/ethlambda/build.rs`, reads git and `Cargo.lock` only.
+`make inert-paths-check` (run by `make lint` and CI's Lint job) enforces the
+compile-time half: it fails on an `include_str!`/`include_bytes!` naming one of
+those paths. It reads the macro line and the two after it, so rustfmt's split
+form is caught; a path assembled further away (a long `concat!`, a
+`macro_rules!` argument), read by a build script or opened at run time gets
+past it.
 
 ### Common Operations
 ```bash

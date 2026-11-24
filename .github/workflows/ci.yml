@@ -23,8 +23,8 @@ env:
   # Incremental state is pure cost on a runner: `Swatinem/rust-cache` deletes
   # `target/*/incremental` before saving, so it is never restored, and every job
   # here starts from whatever the cache holds rather than from its own previous
-  # build. Nothing reads it, and it is comparable in size to the build output
-  # itself, on a filesystem that a cold workspace build has already outgrown.
+  # build. Nothing reads it, yet writing it costs about as much disk as the
+  # build output itself.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -67,10 +67,18 @@ jobs:
       - uses: $/.github/actions/detect-changes
         id: changes
 
+  # No job here deletes the runner's preinstalled toolchains first (the
+  # free-disk action, which kurtosis_assertoor.yml still uses). It took 1.5-3.5
+  # min per job, and hosted runners now have a 145 GB root disk: the daily run,
+  # which never freed anything, ended each test half at 65-70 GB used. The test
+  # jobs (both halves and `include-ethrex`) and the beacon jobs still print
+  # `df -h /` after their build, so a runner change that leaves too little room
+  # shows up there. If one does, a full disk reaches `rust-lld` through `mmap`,
+  # so it is reported as `ld terminated with signal 7 [Bus error]` rather than
+  # as ENOSPC.
+  #
   # `lint`, `presets` and `tooling` were one job. Split because serially they
-  # took 34 minutes and, between them, more disk than a runner has: a full disk
-  # reaches `rust-lld` through `mmap`, so it is reported as
-  # `ld terminated with signal 7 [Bus error]` rather than as ENOSPC.
+  # took 34 minutes and, at the time, more disk than a runner had.
   lint:
     name: Lint
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
@@ -78,8 +86,6 @@ jobs:
     if: ${{ !cancelled() && needs.detect-changes.outputs.run_tests != 'false' }}
     steps:
       - uses: actions/checkout@v6.1.0
-
-      - uses: $/.github/actions/free-disk
 
       - name: Setup Rust
         uses: $/.github/actions/setup-rust
@@ -89,6 +95,12 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      # The compile-time half of what the docs-only skip in `detect-changes`
+      # assumes. The Makefile target says what it checks and what it cannot;
+      # `make lint` runs it too.
+      - name: No build reads a docs-only path
+        run: make inert-paths-check
 
       - name: Cargo check
         run: cargo check --locked --workspace --all-targets
@@ -117,6 +129,15 @@ jobs:
       - name: Clippy (storage without RocksDB)
         run: cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
 
+      # The binary alone, with the features it ships with. Every other build of
+      # it in this workflow, `Cargo check` above and `Test (node)` included,
+      # unifies the dev-dependencies' features in (`bin/ethlambda` enables
+      # tokio's `test-util`), so code that compiles only because of one would
+      # pass them all and break `cargo build --release`. The `Benchmark smoke`
+      # job's `cargo run` used to be the build that caught it.
+      - name: Cargo check (binary, shipped features)
+        run: cargo check --locked -p ethlambda
+
   # The embedded execution client, in a job of its own: `make test-ethrex`
   # (the third part of `make test`) says why it is kept out of
   # `test-consensus` and `test-node`. No leanSpec fixtures:
@@ -132,8 +153,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
-      - uses: $/.github/actions/free-disk
-
       - name: Setup Rust
         uses: $/.github/actions/setup-rust
         with:
@@ -141,6 +160,12 @@ jobs:
 
       - name: Run tests
         run: make test-ethrex
+
+      # Frees nothing first either, so it reports its disk use like the test
+      # halves do (`run-fixture-tests` says why, and why `always()`).
+      - name: Report disk usage after the build
+        if: always()
+        run: df -h /
 
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.
@@ -170,8 +195,6 @@ jobs:
     if: ${{ !cancelled() && needs.detect-changes.outputs.run_tests != 'false' }}
     steps:
       - uses: actions/checkout@v6.1.0
-
-      - uses: $/.github/actions/free-disk
 
       # Its own entry. These builds share almost no artifacts with `lint`'s,
       # so on one key each run would evict the other's.
@@ -234,8 +257,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
-      - uses: $/.github/actions/free-disk
-
       - name: Run fixture-based tests
         uses: $/.github/actions/run-fixture-tests
         with:
@@ -249,43 +270,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
-      - uses: $/.github/actions/free-disk
-
       - name: Run fixture-based tests
         uses: $/.github/actions/run-fixture-tests
         with:
           make-target: test-node
 
-  # Validates the benchmark harness and its JSON contract. This used to be a
-  # step in `Test (node)`, on the theory that the binary was already built there.
-  # It was not: `cargo test` never links the plain binary, and it builds with the
-  # dev-dependencies' features unified in (`bin/ethlambda` enables tokio's
-  # `test-util`), which `cargo run` leaves out. So the step rebuilt tokio and
-  # everything above it (libp2p, hyper, axum, the ethrex crates) into a target
-  # dir the test build had already brought to the disk ceiling, and the job then
-  # failed at random in the cache save step with ENOSPC. Here it builds only the
-  # binary's own graph. No fixtures: with `--mock-crypto` the synthetic benchmark
-  # generates its chain and reads no files.
-  benchmark-smoke:
-    name: Benchmark smoke
-    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
-    needs: detect-changes
-    if: ${{ !cancelled() && needs.detect-changes.outputs.run_tests != 'false' }}
-    steps:
-      - uses: actions/checkout@v6.1.0
-
-      - uses: $/.github/actions/free-disk
-
-      - name: Setup Rust
-        uses: $/.github/actions/setup-rust
-        with:
-          cache-key: benchmark-smoke
-
-      - name: Benchmark smoke (mock crypto)
-        run: |
-          cargo run --locked --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
-            --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
-            | jq -e '.schema_version == 1 and (.samples | length == 3)'
+  # The benchmark smoke check (the harness and its JSON report contract) used to
+  # be a job of its own here, running `cargo run ... benchmark synthetic` under
+  # `jq -e`. It is an integration test now, `bin/ethlambda/tests/
+  # benchmark_smoke.rs`, which `Test (node)` runs. A `cargo run` step inside the
+  # test job would have rebuilt tokio and everything above it, because `cargo
+  # run` resolves features without the dev-dependencies' (`bin/ethlambda`
+  # enables tokio's `test-util`). An integration test does not: cargo builds the
+  # binary for it with the test build's own features, so the only extra work is
+  # the binary crate itself. That retires a job which compiled the whole node a
+  # second time, and its 1.8 GB cache entry.
 
   # Stable cargo ignores the publish-age cooldown in .cargo/config.toml, so the
   # lockfile can pin too-young crates. Fail the build when either lockfile does.
@@ -345,8 +344,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
 
-      - uses: $/.github/actions/free-disk
-
       - name: Run the Beacon Chain spec tests
         uses: $/.github/actions/run-beacon-spec-tests
         with:
@@ -360,8 +357,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6.1.0
-
-      - uses: $/.github/actions/free-disk
 
       - name: Run the Beacon Chain spec tests
         uses: $/.github/actions/run-beacon-spec-tests

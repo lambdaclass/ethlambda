@@ -8,8 +8,9 @@
 //!   Suitable for testing and ephemeral nodes. Data is lost on restart.
 //!
 //! - `RocksDBBackend` (requires the `rocksdb` feature): Persistent storage using RocksDB.
-//!   Suitable for production nodes. (Not a link: without the feature the type does not
-//!   exist, so the link would not resolve.)
+//!   Suitable for production nodes.
+// `RocksDBBackend` above is plain code rather than an intra-doc link: without the
+// feature the type does not exist, and the link would not resolve.
 
 mod in_memory;
 #[cfg(feature = "rocksdb")]

@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-ethrex test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
+.PHONY: help fmt lint inert-paths-check bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-ethrex test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -6,7 +6,7 @@ help: ## 📚 Show help for each of the Makefile recipes
 fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
-lint: ## 🔍 Run clippy on all workspace crates
+lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
@@ -18,6 +18,44 @@ lint: ## 🔍 Run clippy on all workspace crates
 	# and break a plain `cargo test -p ethlambda-storage`. Same as CI's Lint
 	cargo clippy --locked -p ethlambda-storage --all-targets -- -D warnings
 
+# The docs-only CI skip (.github/actions/detect-changes) assumes no build or test
+# reads the paths it treats as inert: docs/, theme/, book.toml, Markdown files,
+# .claude/, LICENSE and .gitignore. This checks the compile-time half of that: it
+# fails if an `include_str!` or `include_bytes!` names one of them. CI's Lint job
+# runs this target too.
+#
+# - Every tracked `.rs` file (`git ls-files`), wherever it lives, so a crate
+#   added outside crates/ and bin/ is covered too. If git lists none (not a
+#   checkout, or git refusing the directory) the check fails rather than read
+#   the empty scan as a pass.
+# - Each macro line plus the two after it, which catches the form rustfmt
+#   produces for a long path: `include_str!(` with the path on the next line. A
+#   path assembled further away (`concat!` across many lines) or a file opened
+#   at run time still gets past it; CLAUDE.md ("Docs-only changes skip CI")
+#   states the rule for those. A line after the macro that is not its path (a
+#   comment naming `docs/`, say) can match too: a false positive, see below.
+# - Only the source lines are matched (`grep -h`), not the file name grep would
+#   put in front of each, so a `.rs` file that itself lives under a `docs/`
+#   directory is not a hit for its own path. The second scan, run only on a
+#   hit, adds the names and line numbers back for the message, so the list it
+#   prints can also show such a file's lines next to the real hit.
+# - The pattern is unanchored on purpose: `docs/` anywhere in a path, even
+#   `fixtures/docs/x.ssz`, fails. A false positive fails loudly, while a
+#   narrower pattern can miss the real thing, so widen the list rather than
+#   anchoring it. Keep it in step with the action's `inert` list.
+# - A tracked file grep cannot open (deleted, not yet committed) is reported on
+#   stderr and skipped, not a failure: nothing builds it either.
+inert-paths-check: ## 🔎 Fail if a crate compiles in a path the docs-only CI skip treats as unread
+	@pattern='\.md"|docs/|theme/|book\.toml|\.claude/|LICENSE|\.gitignore'; \
+	git ls-files --error-unmatch '*.rs' > /dev/null || { echo "ERROR: git listed no tracked .rs files to scan."; exit 1; }; \
+	scan() { git ls-files -z '*.rs' | xargs -0 grep -E -A2 "$$@" -- 'include_(str|bytes)!'; }; \
+	if scan -h | grep -E "$$pattern" > /dev/null; then \
+		echo "ERROR: these compile in a path .github/actions/detect-changes treats as docs-only."; \
+		echo "Take the path off that action's inert list, or stop reading it:"; \
+		scan -Hn | grep -E "$$pattern"; \
+		exit 1; \
+	fi
+
 # release-fast: release-grade opt-level to avoid stack overflows during
 # signature verification/aggregation, without paying for LTO on every rebuild
 #
@@ -28,10 +66,12 @@ lint: ## 🔍 Run clippy on all workspace crates
 # it without excluding anything.
 TEST=cargo test --locked --profile release-fast
 
-# Two halves, one CI job each: undivided, a release-grade build of every test
-# target measured 14 GiB against the 13-14 GiB a stock runner has free. Both
-# halves build the shared dependency graph, so what the split halves is the
-# linked test binaries.
+# Two halves, one CI job each. The split was first forced by disk: undivided, a
+# release-grade build of every test target measured 14 GiB against the 13-14
+# GiB a stock runner then had free. Today's hosted runners have a 145 GB root
+# disk, so that no longer binds; the halves stay split because they build and
+# run in parallel. Both halves build the shared dependency graph, so what the
+# split halves is the linked test binaries.
 #
 # Named once, and `test-node` is the workspace minus this list, so the two are
 # exhaustive by construction and a crate added later cannot silently go
@@ -40,8 +80,8 @@ TEST=cargo test --locked --profile release-fast
 CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto ethlambda-ssz-tree
 
 # The embedded execution client, tested apart from both halves: ethrex's RPC
-# and node crates are a large build neither half otherwise needs, and the node
-# half already sits at the runner's disk ceiling. `test-node` excludes it.
+# and node crates are a large build neither half otherwise needs, so it runs as
+# a third part, in parallel with them. `test-node` excludes it.
 ETHREX_CRATES=ethlambda-ethrex
 
 test: test-consensus test-node test-ethrex ## 🧪 Run all tests
@@ -60,7 +100,25 @@ test-ethrex: ## 🧪 Run the embedded-ethrex tests (include-ethrex feature)
 
 # The spec binary selects its preset at runtime from BEACON_SPEC_PRESET, so both
 # presets run off one build of it.
-BEACON_SPEC_TEST=cargo test -p ethlambda-state-transition --test beacon_spec_tests --profile release-fast --features beacon-spec-tests
+#
+# `ethlambda-blockchain` is selected as well, in both targets, although only
+# `test-beacon-mainnet` runs its tests. Cargo resolves features per invocation,
+# over the packages it selects, and the two CI jobs share one cache entry that
+# only the mainnet job saves (`run-beacon-spec-tests`). Selecting the spec
+# suite's package alone resolves the shared dependency graph differently, from
+# `libc` up, so the minimal job would rebuild most of it on every run. Both
+# targets select the same packages and features, which makes the minimal
+# build a subset of the mainnet one. Package-qualified features, since an
+# unqualified one would have to exist in both packages.
+#
+# Selecting both also unifies `ethlambda-blockchain`'s dependency and
+# dev-dependency features into the spec suite's build. Today the one feature of
+# an ethlambda crate among them is `ethlambda-state-transition/test-utils`,
+# which only makes test helpers public; the rest are tokio's. A feature that
+# changes what the state transition or the crypto does (a mock, a skipped
+# verification) must therefore never be enabled from `ethlambda-blockchain`, or
+# the spec suite would run with it and still pass.
+BEACON_SPEC_TEST=cargo test -p ethlambda-state-transition -p ethlambda-blockchain --test beacon_spec_tests --profile release-fast --features ethlambda-state-transition/beacon-spec-tests,ethlambda-blockchain/beacon-spec-tests
 
 # A run walks its own preset's fixture tree and nothing else; the BLS and KZG
 # vectors are a separate, preset-independent download (`cryptography-specs`).
@@ -69,13 +127,15 @@ BEACON_SPEC_TEST=cargo test -p ethlambda-state-transition --test beacon_spec_tes
 # its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
-# --lib as well: the BLS and KZG modules keep their fixture vectors as unit
-# tests, which are `ignore`d unless `beacon-spec-tests` is on. They are
-# preset-independent, so only this target runs them.
+# --lib as well, in the same invocation: the BLS and KZG modules keep their
+# fixture vectors as unit tests, which are `ignore`d unless `beacon-spec-tests`
+# is on, and so do the chain actor's fixture-driven tests
+# (`ethlambda-blockchain --lib`). They are preset-independent, so only this
+# target runs them. A cargo invocation of their own would select other packages
+# and so rebuild most of the dependency graph (see above), for tests that run
+# in seconds.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
-	cargo test -p ethlambda-state-transition --lib --profile release-fast --features beacon-spec-tests
-	BEACON_SPEC_PRESET=mainnet $(BEACON_SPEC_TEST)
-	cargo test -p ethlambda-blockchain --lib --profile release-fast --features beacon-spec-tests
+	BEACON_SPEC_PRESET=mainnet $(BEACON_SPEC_TEST) --lib
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	BEACON_SPEC_PRESET=minimal $(BEACON_SPEC_TEST)
