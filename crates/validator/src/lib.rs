@@ -642,6 +642,18 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 }
             }
 
+            // Whether a reorg moved a held schedule since it was fetched, so
+            // the next slot's duties run on the chain the node follows now.
+            // After the slot's duties and bounded by the slot's end, so it
+            // delays none of them. Not on a slot whose refresh was due: that
+            // refresh compared every root itself, or failed and runs again.
+            if !refresh_due {
+                let budget = clock.remaining_in(slot, SystemTime::now());
+                if follow_dependent_roots(&mut duties, epoch, budget, &context.config).await {
+                    resubscribe(epoch, &beacon_node, &duties, &store, &context);
+                }
+            }
+
             // Off the slot loop, like the epoch's full send: a keymanager change
             // to a fee recipient or gas limit reaches the builder within a slot,
             // and a slow node cannot delay the next slot's duties.
@@ -1330,20 +1342,93 @@ fn send_owed<B: BeaconNodeApi + 'static>(
     registration: &Option<Arc<RegistrationService<B>>>,
 ) {
     if owed.moved {
-        let (beacon_node, store, context) = (beacon_node.clone(), store.clone(), context.clone());
-        let schedule = duties.all();
-        tokio::spawn(async move {
-            let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
-            let _ = subscribed.await.inspect_err(|err| {
-                warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
-                metrics::set_beacon_node_available(false);
-            });
-        });
+        resubscribe(epoch, beacon_node, duties, store, context);
     }
     if let Some(registration) = registration {
         let registration = registration.clone();
         tokio::spawn(registration.register_all(epoch, owed.registrable, store.clone()));
     }
+}
+
+/// Send the subnet subscriptions of every attester duty held, from a task of
+/// its own, after the attester schedule moved. See [`send_owed`] for why
+/// nothing waits on it.
+fn resubscribe<B: BeaconNodeApi + 'static>(
+    epoch: u64,
+    beacon_node: &Arc<B>,
+    duties: &DutiesService<B>,
+    store: &Arc<RwLock<ValidatorStore>>,
+    context: &Arc<SigningContext>,
+) {
+    let (beacon_node, store, context) = (beacon_node.clone(), store.clone(), context.clone());
+    let schedule = duties.all();
+    tokio::spawn(async move {
+        let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
+        let _ = subscribed.await.inspect_err(|err| {
+            warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
+            metrics::set_beacon_node_available(false);
+        });
+    });
+}
+
+/// Check this epoch's and the next one's held schedules against the node's
+/// dependent roots, within `budget`, and refetch those a reorg moved. Returns
+/// whether the attester schedule moved, which owes the node this client's
+/// subnet subscriptions again.
+///
+/// # Why every slot
+///
+/// The epoch refresh compares roots once an epoch, and nothing else noticed a
+/// reorg between two refreshes: the next epoch's attester and payload
+/// committee schedules go stale on an ordinary one-slot reorg at the epoch
+/// boundary, and the subscriptions computed from them with it; this epoch's,
+/// on a reorg deeper than an epoch, which long non-finality makes ordinary.
+/// One v2 proposer duties request per epoch checked, and the refetch only
+/// when a root moved (see [`DutiesService::follow_dependent_root`]), so a
+/// held schedule is never more than a slot behind the chain the node
+/// follows. Polled rather than driven by `head` events: no event stream to
+/// keep, reconnect and pick a node for, and a node more than 32 slots behind
+/// sends no `head` at all.
+///
+/// # Only from fulu
+///
+/// Before fulu the next epoch's proposers are not fixed in advance, so no
+/// cheap request names the next epoch's root, and this epoch's attester root
+/// moves only on a reorg deeper than an epoch. Such an epoch is checked at
+/// its refresh alone, as before.
+///
+/// Failures are logged at debug: this runs every slot, and the slot's duties
+/// already report a node that is down. Cut off at `budget` with whatever it
+/// had done kept, since each fetch answers in full before it changes its
+/// schedule.
+async fn follow_dependent_roots<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    budget: std::time::Duration,
+    config: &ethlambda_types::beacon::config::Config,
+) -> bool {
+    use ethlambda_types::beacon::fork::ForkName;
+
+    let mut moved = false;
+    let probe = async {
+        for target in [epoch, epoch + 1] {
+            if !ProposerDutiesVersion::fixed_ahead(config, target) {
+                continue;
+            }
+            let ptc = config.fork_at_epoch(target) >= ForkName::Gloas
+                && target != config.gloas_fork_epoch;
+            match duties.follow_dependent_root(target, ptc).await {
+                Ok(target_moved) => moved |= target_moved,
+                Err(err) => {
+                    debug!(epoch = target, %err, "Dependent root check failed; trying again next slot");
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(budget, probe).await.is_err() {
+        debug!(%epoch, "Dependent root check ran out of slot; trying again next slot");
+    }
+    moved
 }
 
 /// Resolve any newly activated validators and refresh the duty schedule.
@@ -2410,6 +2495,74 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert!(owed.moved, "the first schedule is a move");
         assert_eq!(owed.registrable.len(), 2);
+    }
+
+    // ---- following dependent roots between refreshes (#827) ---------------
+
+    /// Before fulu no cheap request names the next epoch's root, so nothing
+    /// is checked between refreshes.
+    #[tokio::test]
+    async fn before_fulu_no_root_is_checked_between_refreshes() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), vec![11]);
+        let budget = std::time::Duration::from_secs(1);
+
+        let moved = follow_dependent_roots(&mut duties, 3, budget, &context().config).await;
+
+        assert!(!moved);
+        assert_eq!(requests(&node), [0; 6]);
+    }
+
+    /// The lookahead's root moving between two slots is caught within the
+    /// slot and reported, which is what makes the duty loop send the
+    /// subscriptions again.
+    #[tokio::test]
+    async fn a_moved_lookahead_is_refetched_and_reported_for_resubscription() {
+        let node = Arc::new(
+            node()
+                .with_proposers_v2(3, Root::repeat_byte(1), Vec::new())
+                .with_proposers_v2(4, Root::repeat_byte(2), Vec::new()),
+        );
+        let context = fulu_context();
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context)
+            .await
+            .expect("refreshes");
+        let budget = std::time::Duration::from_secs(1);
+        assert!(!follow_dependent_roots(&mut duties, 3, budget, &context.config).await);
+
+        node.set_duties(4, Root::repeat_byte(9), Vec::new());
+        node.set_proposers_v2(4, Root::repeat_byte(9), Vec::new());
+        assert!(follow_dependent_roots(&mut duties, 3, budget, &context.config).await);
+        assert!(
+            !follow_dependent_roots(&mut duties, 3, budget, &context.config).await,
+            "once replaced, the schedule matches again"
+        );
+    }
+
+    /// The gloas fork epoch's payload committee has a dependent root of its
+    /// own, so it is never checked against the v2 one (it would never match);
+    /// the epoch after it is.
+    #[tokio::test]
+    async fn the_gloas_fork_epochs_committee_is_not_checked_against_v2() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_proposers_v2(5, Root::repeat_byte(5), Vec::new())
+                .with_proposers_v2(6, Root::repeat_byte(6), Vec::new())
+                .with_duties(5, Root::repeat_byte(5), Vec::new())
+                .with_duties(6, Root::repeat_byte(6), Vec::new())
+                .with_ptc_duties(6, Root::repeat_byte(6), Vec::new()),
+        );
+        let config = fulu_context()
+            .config
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 5);
+        let mut duties = DutiesService::new(node.clone(), vec![11]);
+        let budget = std::time::Duration::from_secs(1);
+
+        follow_dependent_roots(&mut duties, 5, budget, &config).await;
+
+        assert_eq!(node.ptc_requested_epochs(), vec![6]);
     }
 
     // ---- gloas ----------------------------------------------------------
