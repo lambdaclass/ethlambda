@@ -1592,23 +1592,26 @@ fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
                 let indices = runtime.block_on(resolve_indices(beacon_node.as_ref(), &pending));
                 let states =
                     pq::RecordFile::new(reqwest::Client::new(), source, ethlambda_crypto::vrf::STATE_RECORD_SIZE);
+                let mut fetched = runtime.block_on(fetch_vrf_states(&states, &pending, &indices));
                 pending.retain(|pubkey| {
                     let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
                     let Some(&index) = indices.get(pubkey) else {
                         warn!(pubkey = %encoded, "No validator index for this key; hashing its VRF tree");
                         return true;
                     };
-                    let fetched = runtime.block_on(states.fetch(index));
-                    let record = match fetched {
-                        Ok(Some(record)) => record,
-                        Ok(None) => {
+                    let record = match fetched.remove(pubkey) {
+                        Some(Ok(Some(record))) => record,
+                        Some(Ok(None)) => {
                             warn!(pubkey = %encoded, index, "The VRF state file has no record for this validator; hashing its tree");
                             return true;
                         }
-                        Err(err) => {
+                        Some(Err(err)) => {
                             warn!(pubkey = %encoded, index, %err, "Could not fetch this validator's VRF state; hashing its tree");
                             return true;
                         }
+                        // Not fetched: the source failed its first record,
+                        // which `fetch_vrf_states` reported.
+                        None => return true,
                     };
                     match pq::adopt_vrf_state(pubkey, &record, &validators_dir) {
                         Ok(()) => {
@@ -1760,12 +1763,19 @@ fn prepare_bottom_trees(clock: SlotClock, current_slot: Slot) {
 }
 
 /// How long [`load_xmss_cache`] waits for the beacon node's registry before
-/// building every key instead: [`REGISTRY_ATTEMPTS`] tries this far apart.
-const REGISTRY_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
-const REGISTRY_ATTEMPTS: u32 = 12;
+/// building every key instead: [`REGISTRY_ATTEMPTS`] tries this far apart,
+/// about two minutes. [`resolve_indices`] retries as often.
+///
+/// Short, because nothing waits on the node more than this: no key signs
+/// until the cache is read, and no proposal is made until the VRF trees
+/// loaded after it. A node answers "syncing" for its first slots at genesis,
+/// and at ten seconds apart a client started then missed a proposal at slot 2
+/// on the PQ devnet (its trees were ready three seconds late).
+const REGISTRY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const REGISTRY_ATTEMPTS: u32 = 60;
 
-/// How many cache records are fetched at once.
-const XMSS_CACHE_FETCHES: usize = 16;
+/// How many leanXMSS cache or VRF state records are fetched at once.
+const RECORD_FETCHES: usize = 16;
 
 /// Each of `keys`' leanXMSS cache record from `source` (ethereum-package's
 /// `xmss_cache_url`: [`pq::XMSS_CACHE_RECORD_SIZE`]-byte records indexed by
@@ -1793,7 +1803,9 @@ async fn load_xmss_cache<B: BeaconNodeApi>(
                 break;
             }
             Err(err) if attempt < REGISTRY_ATTEMPTS => {
-                warn!(attempt, %err, "Could not read the registry for the leanXMSS cache; retrying");
+                if worth_a_warning(attempt) {
+                    warn!(attempt, %err, "Could not read the registry for the leanXMSS cache; retrying");
+                }
                 tokio::time::sleep(REGISTRY_RETRY).await;
             }
             Err(err) => {
@@ -1829,7 +1841,7 @@ async fn load_xmss_cache<B: BeaconNodeApi>(
     }
     let fetched: Vec<_> = futures_util::stream::iter(wanted)
         .map(fetch)
-        .buffer_unordered(XMSS_CACHE_FETCHES)
+        .buffer_unordered(RECORD_FETCHES)
         .collect()
         .await;
     let (mut missing, mut failed) = (0usize, 0usize);
@@ -1865,14 +1877,15 @@ async fn load_xmss_cache<B: BeaconNodeApi>(
     records
 }
 
-/// Each of `pubkeys`' validator index, from the beacon node, retried for a
-/// few minutes while the node is not answering (a validator client may start
-/// before its node). Keys the node does not know are left out.
+/// Each of `pubkeys`' validator index, from the beacon node, retried as
+/// [`load_xmss_cache`] retries the registry while the node is not answering
+/// (a validator client may start before its node). Keys the node does not
+/// know are left out.
 async fn resolve_indices<B: BeaconNodeApi>(
     beacon_node: &B,
     pubkeys: &[BlsPubkey],
 ) -> std::collections::HashMap<BlsPubkey, u64> {
-    for attempt in 1..=20u32 {
+    for attempt in 1..=REGISTRY_ATTEMPTS {
         match beacon_node.validator_indices(pubkeys).await {
             Ok(entries) => {
                 return entries
@@ -1881,12 +1894,57 @@ async fn resolve_indices<B: BeaconNodeApi>(
                     .collect();
             }
             Err(err) => {
-                warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if worth_a_warning(attempt) {
+                    warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
+                }
+                tokio::time::sleep(REGISTRY_RETRY).await;
             }
         }
     }
     std::collections::HashMap::new()
+}
+
+/// Whether a startup retry's `attempt` is logged: the first and every fifth,
+/// so a node that answers "syncing" for a minute is not a warning every
+/// [`REGISTRY_RETRY`].
+fn worth_a_warning(attempt: u32) -> bool {
+    attempt == 1 || attempt.is_multiple_of(5)
+}
+
+/// Each of `pubkeys`' VRF state record from `states`, at the validator index
+/// `indices` gives it (a key with none is left out), [`RECORD_FETCHES`] at a
+/// time: sixteen fetched one after another took longer than a slot.
+///
+/// The first record is fetched alone, as [`load_xmss_cache`] does: a server
+/// that ignores the range sends the whole file, which `states` then keeps
+/// rather than being sent it once per key. A source that fails it is
+/// reported here, once, and nothing else is fetched.
+async fn fetch_vrf_states(
+    states: &pq::RecordFile,
+    pubkeys: &[BlsPubkey],
+    indices: &HashMap<BlsPubkey, u64>,
+) -> HashMap<BlsPubkey, std::result::Result<Option<Vec<u8>>, String>> {
+    use futures_util::StreamExt as _;
+
+    let fetch =
+        |(pubkey, index): (BlsPubkey, u64)| async move { (pubkey, states.fetch(index).await) };
+    let mut wanted = pubkeys
+        .iter()
+        .filter_map(|pubkey| Some((*pubkey, *indices.get(pubkey)?)));
+    let Some(first) = wanted.next() else {
+        return HashMap::new();
+    };
+    let (pubkey, first) = fetch(first).await;
+    if let Err(err) = &first {
+        warn!(source = states.source(), %err, "Could not read the VRF states; hashing every tree");
+        return HashMap::new();
+    }
+    let rest: Vec<_> = futures_util::stream::iter(wanted)
+        .map(fetch)
+        .buffer_unordered(RECORD_FETCHES)
+        .collect()
+        .await;
+    std::iter::once((pubkey, first)).chain(rest).collect()
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
