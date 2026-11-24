@@ -58,15 +58,6 @@ uploads the enclave dump and assertoor results (`enclave-dump-<run id>`) before
 removing the enclave. A failure on `main` posts the commit, the failed tests and
 the run URL to Slack.
 
-## Known failure
-
-Until ethlambda's `/eth/v1/config/spec` reports `GLOAS_FORK_EPOCH`, every test
-fails after its 5-minute client health check. Assertoor compares each CL's spec
-field by field and marks a node whose spec differs offline (`invalid node
-specs: spec mismatch: GloasForkEpoch`); lighthouse reports the far-future
-value and ethlambda omits the key. The chain itself is healthy (all nodes share
-a head and finalize), so this is a spec-endpoint gap, not a harness problem.
-
 ## Commit-Boost check
 
 Starts the same three participants with `mev_type: commit-boost`
@@ -78,9 +69,9 @@ light load, since rbuilder submits no bid for a block without transactions and
 a heavy load slows the relay past Commit-Boost's getHeader timeout (see the
 comment in the params file). The package gives the ethlambda
 beacon node `--builder <pbs url>` and the ethlambda validator client
-`--builder-proposals`. There is no assertoor: the base battery's checks fail on
-the spec-endpoint gap above, so `scripts/check-builder-blocks.sh` polls the
-ethlambda services' Prometheus metrics instead, for up to the timeout it is given.
+`--builder-proposals`. There is no assertoor: the base battery already runs it on
+the same participants, so `scripts/check-builder-blocks.sh` polls only the
+ethlambda services' builder metrics, for up to the timeout it is given.
 
 | Service | Metric | Shows |
 |---|---|---|
