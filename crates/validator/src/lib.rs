@@ -135,6 +135,10 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// `--keymanager-token-file`: the file the keymanager API's bearer token
+    /// is read from, never written. `None` reads, or on first start generates,
+    /// [`http_api::API_TOKEN_FILE`] in `validators_dir`.
+    pub keymanager_token_file: Option<PathBuf>,
     /// `--web3signer-url`: the remote signer a key imported through
     /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
     /// Keys the definitions file already names a signer for need no default.
@@ -401,7 +405,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let shutdown = CancellationToken::new();
     let mut keymanager = None;
     if let Some(address) = config.keymanager {
-        let token = http_api::load_or_create_token(&config.validators_dir)?;
+        let token_file = config.keymanager_token_file.as_deref();
+        let token = http_api::load_token(&config.validators_dir, token_file)?;
         let context = http_api::KeymanagerContext {
             store: store.clone(),
             settings: settings.clone(),
