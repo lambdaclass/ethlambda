@@ -44,6 +44,11 @@ pub trait UpdateMap<T>: Default + Clone + Send + Sync {
 
     /// Every pending write, in ascending index order.
     fn into_sorted_vec(self) -> Vec<(usize, T)>;
+
+    /// Every pending write, in ascending index order, by reference: what an
+    /// in-order pass over the list merges in, so that it needs no lookup per
+    /// element.
+    fn sorted_refs(&self) -> Vec<(usize, &T)>;
 }
 
 impl<T: Clone + Send + Sync> UpdateMap<T> for BTreeMap<usize, T> {
@@ -69,6 +74,10 @@ impl<T: Clone + Send + Sync> UpdateMap<T> for BTreeMap<usize, T> {
 
     fn into_sorted_vec(self) -> Vec<(usize, T)> {
         self.into_iter().collect()
+    }
+
+    fn sorted_refs(&self) -> Vec<(usize, &T)> {
+        self.iter().map(|(&index, value)| (index, value)).collect()
     }
 }
 
@@ -132,6 +141,14 @@ impl<T: Clone + Send + Sync> UpdateMap<T> for VecMap<T> {
             .filter_map(|(index, slot)| slot.map(|value| (index, value)))
             .collect()
     }
+
+    fn sorted_refs(&self) -> Vec<(usize, &T)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|value| (index, value)))
+            .collect()
+    }
 }
 
 /// A sparse map: a hash table from index to pending value.
@@ -183,6 +200,16 @@ impl<T: Clone + Send + Sync> UpdateMap<T> for SparseMap<T> {
     fn into_sorted_vec(self) -> Vec<(usize, T)> {
         let mut entries: Vec<(usize, T)> = self.entries.into_iter().collect();
         // Every index appears once, so an unstable sort loses nothing.
+        entries.sort_unstable_by_key(|&(index, _)| index);
+        entries
+    }
+
+    fn sorted_refs(&self) -> Vec<(usize, &T)> {
+        let mut entries: Vec<(usize, &T)> = self
+            .entries
+            .iter()
+            .map(|(&index, value)| (index, value))
+            .collect();
         entries.sort_unstable_by_key(|&(index, _)| index);
         entries
     }
@@ -239,6 +266,7 @@ mod tests {
         *map.get_or_insert_with(7, || 70) += 1;
         *map.get_or_insert_with(5, || unreachable!("5 is pending")) += 1;
         assert_eq!(map.len(), 3);
+        assert_eq!(map.sorted_refs(), vec![(2, &21), (5, &56), (7, &71)]);
         assert_eq!(map.into_sorted_vec(), vec![(2, 21), (5, 56), (7, 71)]);
     }
 

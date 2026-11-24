@@ -97,12 +97,16 @@ impl<'a, T> Iterator for TreeIter<'a, T> {
 
 /// An iterator over the elements of a [`List`](crate::List) or
 /// [`Vector`](crate::Vector), pending writes included.
+///
+/// The pending writes are taken once, in index order, and merged into the
+/// walk, rather than looked up for every element: a pass over millions of
+/// elements with a few hundred writes pending would otherwise pay a lookup in
+/// the write buffer per element.
 pub struct Iter<'a, T, U> {
     pub(crate) tree: TreeIter<'a, T>,
-    pub(crate) updates: &'a U,
-    /// Whether `updates` is empty, so the common case skips a lookup per
-    /// element.
-    pub(crate) no_updates: bool,
+    /// The pending writes at or after the next index, ascending.
+    pub(crate) pending: std::iter::Peekable<std::vec::IntoIter<(usize, &'a T)>>,
+    pub(crate) buffer: std::marker::PhantomData<&'a U>,
     pub(crate) index: usize,
     /// Elements the tree holds; the rest up to `end` are pending pushes.
     pub(crate) committed_len: usize,
@@ -125,10 +129,13 @@ impl<'a, T: Value, U: UpdateMap<T>> Iterator for Iter<'a, T, U> {
         } else {
             None
         };
-        if self.no_updates {
-            return committed;
+        match self.pending.peek() {
+            Some(&(at, value)) if at == index => {
+                self.pending.next();
+                Some(value)
+            }
+            _ => committed,
         }
-        self.updates.get(index).or(committed)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

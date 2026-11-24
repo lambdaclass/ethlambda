@@ -140,10 +140,17 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
 
     pub(crate) fn iter_from(&self, start: usize) -> Iter<'_, T, U> {
         let start = start.min(self.len);
+        let mut pending = if self.updates.is_empty() {
+            Vec::new()
+        } else {
+            self.updates.sorted_refs()
+        };
+        let before = pending.partition_point(|&(index, _)| index < start);
+        pending.drain(..before);
         Iter {
             tree: TreeIter::new(&self.tree, self.depth, start),
-            updates: &self.updates,
-            no_updates: self.updates.is_empty(),
+            pending: pending.into_iter().peekable(),
+            buffer: std::marker::PhantomData,
             index: start,
             committed_len: self.committed_len,
             end: self.len,

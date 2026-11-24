@@ -737,6 +737,42 @@ fn progressive_writes_and_pushes_across_the_first_spanning_boundary() {
     }
 }
 
+// ── List: iteration with writes pending ──
+
+/// Iteration merges the pending writes in index order rather than looking each
+/// element up: from any start, writes before it are skipped, writes after it
+/// and pending pushes are yielded in place, and everything else comes from the
+/// tree.
+fn iterating_with_writes_pending<U: UpdateMap<u64>>() {
+    let mut model: Vec<u64> = (0..3000).collect();
+    let mut list = List::<u64, 4096, U>::try_from(model.clone()).unwrap();
+    for index in [0, 7, 127, 128, 129, 1000, 1999, 2999] {
+        *list.get_mut(index).unwrap() = 10_000 + index as u64;
+        model[index] = 10_000 + index as u64;
+    }
+    for value in [5, 6] {
+        list.push(value).unwrap();
+        model.push(value);
+    }
+    for start in [0, 1, 7, 8, 128, 1500, 2999, 3000, 3001, 3002] {
+        assert_eq!(
+            list.iter_from(start).copied().collect::<Vec<_>>(),
+            model[start..],
+            "start {start}"
+        );
+    }
+}
+
+#[test]
+fn iterating_with_writes_pending_in_a_sparse_map() {
+    iterating_with_writes_pending::<SparseMap<u64>>();
+}
+
+#[test]
+fn iterating_with_writes_pending_in_a_vec_map() {
+    iterating_with_writes_pending::<VecMap<u64>>();
+}
+
 // ── ProgressiveList: iter_from ──
 
 #[test]
