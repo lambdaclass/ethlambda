@@ -155,10 +155,19 @@ proofs through one of two backends, chosen once per process:
 - **Who starts the sidecar**: not the node, as for Lighthouse. The image's
   `ethlambda-pq` supervisor (`bin/ethlambda/pq/ethlambda-pq`, Lighthouse's
   `lighthouse-pq-bn` adapted) starts it on a private socket, waits for it to
-  listen, runs `ethlambda <flags> --pq-prover-socket <socket>`, and stops
-  either when the other exits. `LEANVM_THREADS` sets its proving threads,
-  `LEANVM_SIDECAR` another executable. The image builds `leanvm-sidecar`
-  from the commit in the root `leanvm-revision` file, or from
+  listen, and runs `ethlambda <flags> --pq-prover-socket <socket>`. The node
+  exiting stops the sidecar. The sidecar exiting does not stop the node
+  (Lighthouse's script stops it): the sidecar is started again on the same
+  socket after a pause (one second, doubling to 32 while it keeps dying
+  within a minute), and the node's client reconnects on its next request.
+  Until then the node proves nothing, gossip aggregates it cannot verify are
+  IGNOREd (`prover_unreachable`) rather than held against their senders, and
+  a block whose proof it could not check fails import and is fetched again
+  later (there is no bad-block cache). After `LEANVM_MAX_RESTARTS` (10) such
+  quick exits in a row it stops the node too. `LEANVM_THREADS` sets the
+  sidecar's proving threads, `LEANVM_SIDECAR` another executable. The image
+  builds `leanvm-sidecar` from the commit in the root `leanvm-revision` file,
+  or from
   `--build-arg LEANVM_REV` (the publish workflow's `leanvm_rev` input), and
   records the commit at `/usr/local/share/ethlambda/leanvm-revision`. The
   node's client refuses a sidecar whose hello names another protocol version
@@ -436,9 +445,8 @@ What the package does for ethlambda on a PQ network:
 
 - It runs the beacon node as `ethlambda-pq beacon <flags>`: the supervisor
   starts the sidecar on a private socket, waits for it to listen, and runs
-  the node on it, either exiting stopping the other, as `lighthouse-pq-bn`
-  does for Lighthouse. `LEANVM_THREADS` (through `cl_extra_env_vars`) caps
-  the sidecar's threads.
+  the node on it, restarting the sidecar if it exits (see [Proofs](#proofs)).
+  `LEANVM_THREADS` (through `cl_extra_env_vars`) caps the sidecar's threads.
 - It passes the validator client `--init-slashing-protection` and, for its
   default mnemonic, the leanXMSS tree caches and VRF tree states it
   publishes for that mnemonic's first 10000 validators (`--xmss-cache-url`,

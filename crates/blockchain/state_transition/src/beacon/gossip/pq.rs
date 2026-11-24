@@ -61,7 +61,7 @@ use crate::beacon::helpers::misc::{
 use crate::beacon::helpers::pq::{
     compute_xmss_attestation_leaf_index, compute_xmss_leaf_index, get_aggregation_committee,
     get_attestation_statements, get_attesting_indices, get_committee_indices,
-    is_valid_indexed_attestation, verify_aggregates, xmss_verify,
+    is_valid_indexed_attestation, try_verify_aggregates, xmss_verify,
 };
 use crate::beacon::helpers::predicates::{is_slashable_attestation_data, is_slashable_validator};
 use crate::beacon::lean_boundary::lean_block_unreachable;
@@ -331,11 +331,15 @@ pub fn aggregate_stateful_checks(
     if !aggregators.contains(&aggregator_index) {
         return Err(Outcome::Reject(RejectReason::NotAggregator));
     }
-    // [Modified in PQ] [REJECT] The aggregate stark is valid.
+    // [Modified in PQ] [REJECT] The aggregate stark is valid. A prover sidecar
+    // that did not answer (restarting, say) judged nothing, so the aggregate
+    // is IGNOREd rather than its sender penalized for it.
     let statements = get_attestation_statements(&state, aggregate, &committees)
         .map_err(|_| Outcome::Reject(RejectReason::AggregateProof))?;
-    if !verify_aggregates(&statements, &aggregate_and_proof.proof) {
-        return Err(Outcome::Reject(RejectReason::AggregateProof));
+    match try_verify_aggregates(&statements, &aggregate_and_proof.proof) {
+        Ok(true) => {}
+        Ok(false) => return Err(Outcome::Reject(RejectReason::AggregateProof)),
+        Err(_) => return Err(Outcome::Ignore(IgnoreReason::ProverUnreachable)),
     }
     let attesting_indices = get_attesting_indices(&state, aggregate, &committees)
         .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;

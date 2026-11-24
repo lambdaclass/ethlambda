@@ -105,6 +105,19 @@ pub fn verify_aggregates(statements: &[AggregateStatement], proof: &[u8]) -> boo
     stark::verify_aggregates(statements, proof)
 }
 
+/// [`verify_aggregates`], with a prover sidecar that could not be reached
+/// told apart from a proof that does not verify (`stark::try_verify_aggregates`),
+/// for gossip, which IGNOREs what it could not judge.
+pub fn try_verify_aggregates(
+    statements: &[AggregateStatement],
+    proof: &[u8],
+) -> std::result::Result<bool, stark::SidecarUnreachable> {
+    if !xmss_verification_enabled() {
+        return Ok(true);
+    }
+    stark::try_verify_aggregates(statements, proof)
+}
+
 // ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------

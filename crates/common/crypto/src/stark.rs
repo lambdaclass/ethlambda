@@ -137,14 +137,39 @@ pub fn merge_proofs<S: AsRef<[AggregateStatement]>, P: AsRef<[u8]>>(
 /// index and message, and nothing else. Under the sidecar, whether the leanVM
 /// proof proves every `(public key, message)` claim; it cannot check the leaf
 /// indices, which leanVM proofs do not attest. A sidecar that cannot answer
-/// reads as `false`, and is logged.
+/// reads as `false`, and is logged; [`try_verify_aggregates`] tells it apart.
 pub fn verify_aggregates(statements: &[AggregateStatement], proof: &[u8]) -> bool {
+    try_verify_aggregates(statements, proof).unwrap_or_else(|err| {
+        tracing::error!(%err, "The prover sidecar could not verify an attestation proof");
+        false
+    })
+}
+
+/// The sidecar could not be asked: no connection, or one that failed or timed
+/// out, as while `ethlambda-pq` restarts it. Says nothing about the proof.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the prover sidecar could not be reached: {0}")]
+pub struct SidecarUnreachable(pub String);
+
+/// [`verify_aggregates`], with a sidecar that could not be reached told apart
+/// from a proof that does not verify, so gossip can IGNORE a message it could
+/// not judge rather than penalize the peer that sent it. Only a connection
+/// failure is [`SidecarUnreachable`]: a sidecar that answered and refused the
+/// request is logged and reads as `false`, as an invalid proof does.
+pub fn try_verify_aggregates(
+    statements: &[AggregateStatement],
+    proof: &[u8],
+) -> Result<bool, SidecarUnreachable> {
     match backend() {
-        Backend::Reference => reference_verify(statements, proof),
-        Backend::Sidecar(sidecar) => sidecar.verify(statements, proof).unwrap_or_else(|err| {
-            tracing::error!(%err, "The prover sidecar could not verify an attestation proof");
-            false
-        }),
+        Backend::Reference => Ok(reference_verify(statements, proof)),
+        Backend::Sidecar(sidecar) => match sidecar.verify(statements, proof) {
+            Ok(valid) => Ok(valid),
+            Err(sidecar::Error::Io(err)) => Err(SidecarUnreachable(err.to_string())),
+            Err(err) => {
+                tracing::error!(%err, "The prover sidecar refused to verify an attestation proof");
+                Ok(false)
+            }
+        },
     }
 }
 
