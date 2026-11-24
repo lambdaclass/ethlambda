@@ -198,6 +198,11 @@ struct ExecutionPayloadJson {
     /// `ExecutionPayloadV4` only (Amsterdam).
     #[serde(default)]
     slot_number: Option<String>,
+    /// Not in the specification's `ExecutionPayloadV4`. An execution client
+    /// whose blocks have no dependency witnesses may leave the key out, which
+    /// reads as an empty list.
+    #[serde(default)]
+    dependency_witnesses: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +293,12 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             .slot_number
             .as_deref()
             .ok_or_else(|| decode("ExecutionPayloadV4 carries no slotNumber"))?;
+        let dependency_witnesses = payload
+            .dependency_witnesses
+            .iter()
+            .flatten()
+            .map(|witness| parse_data(witness).map(gloas::DependencyWitness::from))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let execution_payload = gloas::ExecutionPayload {
             parent_hash: H256(parse_fixed(&payload.parent_hash)?),
@@ -311,6 +322,7 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             excess_blob_gas: parse_quantity(&payload.excess_blob_gas)?,
             block_access_list: parse_data(block_access_list)?.into(),
             slot_number: parse_quantity(slot_number)?,
+            dependency_witnesses: dependency_witnesses.into(),
         };
 
         Ok(BuiltGloasPayload {
@@ -539,6 +551,8 @@ mod tests {
         assert_eq!(payload.block_hash, H256([0x55; 32]));
         assert_eq!(payload.transactions.len(), 1);
         assert_eq!(payload.withdrawals[0].amount, 3);
+        // `v6_json` has no `dependencyWitnesses` key.
+        assert!(payload.dependency_witnesses.is_empty());
         assert_eq!(uint256(&built.block_value), "0x1bc16d674ec80000");
         assert_eq!(built.blobs_bundle.commitments.len(), 1);
         assert_eq!(built.blobs_bundle.proofs.len(), 2);
@@ -585,6 +599,62 @@ mod tests {
             BuiltGloasPayload::try_from(response),
             Err(EngineError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn dependency_witnesses_survive_get_payload_then_new_payload() {
+        use crate::types::ExecutionPayloadV4;
+
+        let witnesses = [
+            format!("0x{}", "ab".repeat(7740)),
+            format!("0x{}", "cd".repeat(7740)),
+        ];
+        let mut json = v6_json();
+        json["executionPayload"]["dependencyWitnesses"] = serde_json::json!(witnesses);
+
+        let response: GetPayloadV6Response = serde_json::from_value(json.clone()).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        let payload = &built.execution_payload;
+        assert_eq!(payload.dependency_witnesses.len(), 2);
+        assert_eq!(payload.dependency_witnesses[0].as_ref(), &[0xab; 7740]);
+        assert_eq!(payload.dependency_witnesses[1].as_ref(), &[0xcd; 7740]);
+
+        // What `engine_newPayloadV5` is sent is what `engine_getPayloadV6`
+        // answered, key for key.
+        let sent = serde_json::to_value(ExecutionPayloadV4(payload)).unwrap();
+        assert_eq!(sent, json["executionPayload"]);
+
+        // And the sent form reads back as the same container.
+        json["executionPayload"] = sent;
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let reread = BuiltGloasPayload::try_from(response).unwrap();
+        assert_eq!(&reread.execution_payload, payload);
+    }
+
+    #[test]
+    fn null_dependency_witnesses_read_as_none() {
+        let mut json = v6_json();
+        json["executionPayload"]["dependencyWitnesses"] = serde_json::Value::Null;
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        assert!(built.execution_payload.dependency_witnesses.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_dependency_witness_is_a_decode_error() {
+        for malformed in ["0xzz", "abcd", "0xabc"] {
+            let mut json = v6_json();
+            json["executionPayload"]["dependencyWitnesses"] =
+                serde_json::json!(["0xabcd", malformed]);
+            let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+            assert!(
+                matches!(
+                    BuiltGloasPayload::try_from(response),
+                    Err(EngineError::Decode(_))
+                ),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

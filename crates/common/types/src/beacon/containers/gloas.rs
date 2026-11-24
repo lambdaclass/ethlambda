@@ -111,6 +111,11 @@ pub type Transactions = ProgressiveList<Transaction>;
 pub type Withdrawals = ProgressiveList<Withdrawal>;
 /// The serialized block access list of an [`ExecutionPayload`] (EIP-7928).
 pub type BlockAccessList = ProgressiveList<u8>;
+/// One dependency witness of an [`ExecutionPayload`]: a byte string only the
+/// execution layer interprets, like a [`Transaction`].
+pub type DependencyWitness = ProgressiveList<u8>;
+/// The dependency witnesses in an [`ExecutionPayload`].
+pub type DependencyWitnesses = ProgressiveList<DependencyWitness>;
 /// Execution-layer-triggered deposit requests.
 pub type DepositRequests = ProgressiveList<DepositRequest>;
 /// Execution-layer-triggered withdrawal requests.
@@ -475,9 +480,11 @@ pub struct ExecutionRequests {
 ///
 /// Bellatrix's fields through `block_hash`, unchanged; `transactions` and
 /// `withdrawals` become progressive (EIP-7688); `block_access_list`
-/// (EIP-7928) and `slot_number` (EIP-8061) are appended. Not
-/// `#[derive(Default)]`: `logs_bloom` is an [`SszVector`], which, like every
-/// earlier fork's payload, has no meaningful empty value.
+/// (EIP-7928) and `slot_number` (EIP-8061) are appended, and after them
+/// `dependency_witnesses`, which the specification's container does not
+/// have (see the field). Not `#[derive(Default)]`: `logs_bloom` is an
+/// [`SszVector`], which, like every earlier fork's payload, has no
+/// meaningful empty value.
 #[derive(
     Debug,
     Clone,
@@ -527,6 +534,21 @@ pub struct ExecutionPayload {
     /// slot, since a payload can be revealed a slot late).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot_number: u64,
+    /// The execution block's dependency witnesses: post-quantum signatures
+    /// the block carries outside its transactions, which the execution
+    /// client verifies and the execution block header commits to. Consensus
+    /// never reads their contents: it takes them from `engine_getPayloadV6`,
+    /// carries them in the envelope, and hands them to `engine_newPayloadV5`.
+    ///
+    /// Not a field of the specification's `ExecutionPayload`, so a payload's
+    /// encoding and root differ from the specification's. It is the last
+    /// field because a progressive container can only grow at its end
+    /// (EIP-7495): every field before it keeps its generalized index.
+    ///
+    /// `#[serde(default)]` so JSON written without the field still reads, as
+    /// a payload with no witnesses.
+    #[serde(default, with = "crate::beacon::serde_helpers::ssz_hex_seq")]
+    pub dependency_witnesses: DependencyWitnesses,
 }
 
 /// A builder-signed reveal of the payload it bid for: the payload itself,
@@ -1214,6 +1236,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
+            dependency_witnesses: Default::default(),
         }
     }
 

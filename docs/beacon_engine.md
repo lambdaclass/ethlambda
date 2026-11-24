@@ -43,8 +43,10 @@ Two method families a full client would have are deliberately absent:
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
-  `slotNumber`) from gloas on. The handshake warns when a gloas network's
-  execution client does not advertise `engine_getPayloadV6`.
+  `slotNumber`, and on this branch `dependencyWitnesses`: see
+  [Dependency witnesses](#dependency-witnesses)) from gloas on. The handshake
+  warns when a gloas network's execution client does not advertise
+  `engine_getPayloadV6`.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -314,6 +316,42 @@ only and releases the rest once that ask is answered, so an unreachable client
 costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
+
+### Dependency witnesses
+
+This branch pairs with an execution client whose blocks carry *dependency
+witnesses*: post-quantum signatures (leanSPHINCS, 7,740 bytes each) that sit in
+the block outside its transactions, and that the execution block header commits
+to with a field of its own. They travel in the payload, so `ExecutionPayloadV4`
+has one more member here than the specification gives it:
+
+| Method | Direction | `dependencyWitnesses` |
+|---|---|---|
+| `engine_getPayloadV6` | read | An array of `DATA`, one string per witness. An absent key, or `null`, is an empty list. An element that is not `0x`-prefixed hex fails the whole answer, like any other malformed field |
+| `engine_newPayloadV5` | written | An array of `DATA`, the payload's last member. Always present: `[]` when there are none |
+
+```json
+"dependencyWitnesses": ["0x<15480 hex digits>", "0x<15480 hex digits>"]
+```
+
+Between the two calls the list is `dependency_witnesses`, the last field of the
+gloas `ExecutionPayload` container, so the builder's signature covers it and it
+is gossiped, served and stored with the envelope, like the transactions. The
+Beacon API's JSON names it `dependency_witnesses`, an array of hex strings,
+and reads a payload without the key as one with no witnesses.
+
+The follower never rebuilds the execution header or its hash, so the header's
+commitment needs nothing on this side: `engine_newPayloadV5` hands the list to
+the execution client, which checks it against the header and verifies every
+signature. What the follower judges is each witness's length alone. An envelope
+with a witness that is not exactly 7,740 bytes long is rejected by the
+envelope's gossip rule (`gossip::envelope::cheap_checks`,
+`LEAN_SPHINCS_SIGNATURE_SIZE`), which gossiped and fetched envelopes both go
+through before one can be parked or the engine asked.
+
+The field changes the encoding and the root of every gloas payload, which is a
+departure from the specification:
+see [spec_deviations.md](./spec_deviations.md#the-gloas-execution-payload-carries-dependency-witnesses).
 
 ## Blobs from the execution client
 

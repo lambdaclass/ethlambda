@@ -23,6 +23,9 @@
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
+//! - [`cheap_checks`] rejects a payload whose `dependency_witnesses` holds an
+//!   item of any length but [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The
+//!   specification's payload has no such list, so it has no rule for it.
 
 use std::num::NonZeroUsize;
 
@@ -41,6 +44,13 @@ use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
 use crate::beacon::stf::gloas::verify_execution_payload_envelope_signature;
+
+/// The length in bytes of a leanSPHINCS signature, which is what each of a
+/// payload's dependency witnesses is.
+///
+/// Only the length is judged here: the execution client verifies the
+/// signatures themselves when it is asked about the payload.
+pub const LEAN_SPHINCS_SIGNATURE_SIZE: usize = 7_740;
 
 /// The first valid envelope per `(block root, builder index)`: the
 /// specification's `seen.execution_payload_envelopes`.
@@ -98,6 +108,17 @@ pub fn cheap_checks(
     }
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
+    }
+    // [REJECT] Every dependency witness is exactly one leanSPHINCS signature
+    // long. No block can make a witness of another length valid, so, like the
+    // limits above, this runs before anything can be queued, and before the
+    // execution client is asked to verify the signatures.
+    let witnesses = &message.payload.dependency_witnesses;
+    if witnesses
+        .iter()
+        .any(|witness| witness.len() != LEAN_SPHINCS_SIGNATURE_SIZE)
+    {
+        return Err(Outcome::Reject(RejectReason::DependencyWitnessSize));
     }
     Ok(())
 }
@@ -249,6 +270,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: slot,
+            dependency_witnesses: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {
@@ -288,6 +310,46 @@ mod tests {
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope),
             Outcome::Reject(RejectReason::OperationLimit)
+        );
+    }
+
+    #[test]
+    fn a_dependency_witness_of_the_wrong_size_is_rejected_before_any_block_lookup() {
+        let store = store(0);
+        let well_sized = gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]);
+        for wrong_size in [
+            0,
+            LEAN_SPHINCS_SIGNATURE_SIZE - 1,
+            LEAN_SPHINCS_SIGNATURE_SIZE + 1,
+        ] {
+            // The wrong-sized witness is the second of two, so one good item
+            // does not vouch for the list.
+            let mut envelope = envelope(5, 0);
+            envelope.message.payload.dependency_witnesses =
+                vec![well_sized.clone(), vec![0u8; wrong_size].into()].into();
+            assert_eq!(
+                cheap_checks(&seen_envelopes(), &store, &envelope),
+                Err(Outcome::Reject(RejectReason::DependencyWitnessSize)),
+                "a witness of {wrong_size} bytes"
+            );
+            // The block is unknown, which would queue a well-formed envelope.
+            assert_eq!(
+                validate(&seen_envelopes(), &store, &envelope),
+                Outcome::Reject(RejectReason::DependencyWitnessSize)
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_witnesses_of_the_signature_size_pass_the_cheap_checks() {
+        let store = store(0);
+        let mut envelope = envelope(5, 0);
+        envelope.message.payload.dependency_witnesses =
+            vec![gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]); 2].into();
+        assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
+        assert_eq!(
+            validate(&seen_envelopes(), &store, &envelope),
+            Outcome::Queue(QueueReason::BlockUnknown)
         );
     }
 

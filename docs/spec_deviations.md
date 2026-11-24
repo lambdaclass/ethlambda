@@ -800,6 +800,34 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
+## The gloas execution payload carries dependency witnesses
+
+- **The specification:** gloas's `ExecutionPayload` ends at `slot_number`, and
+  `ExecutionPayloadV4` at `slotNumber`.
+- **ethlambda, on this branch:** the container has one more field after
+  `slot_number`, `dependency_witnesses`, a progressive list of progressive byte
+  lists (the shape of `transactions`), and `ExecutionPayloadV4` one more member,
+  `dependencyWitnesses`. See
+  [beacon_engine.md](./beacon_engine.md#dependency-witnesses) for the wire
+  shape in each direction.
+- **Why:** the execution blocks of the network this branch runs on carry
+  post-quantum signatures outside their transactions, and the consensus layer
+  is what moves an execution block from its builder to every other node's
+  execution client. The field is the last one because a progressive container
+  (EIP-7495) can only grow at its end.
+- **Consequence:** `ExecutionPayload`, `ExecutionPayloadEnvelope`,
+  `SignedExecutionPayloadEnvelope` and `NewPayloadRequest` encode and
+  merkleize differently from the specification's, with or without witnesses
+  in the list. The envelope topic, the envelope req/resp protocols, the Beacon
+  API's envelope bodies and stored envelopes are therefore compatible only
+  among nodes that have the field. Blocks, bids and states are unchanged: a
+  block commits to its payload through the bid's `block_hash`, and no state
+  field holds a payload. The spec-test cases that decode or hash one of the
+  four containers are reported as ignored.
+- **One rule of its own:** the envelope's gossip rule rejects a witness that is
+  not exactly `LEAN_SPHINCS_SIGNATURE_SIZE` (7,740) bytes long. The signatures
+  themselves are verified by the execution client.
+
 ## Columns built from the execution client's blobs are verified
 
 - **The specification:** fulu `p2p-interface.md`, "Distributed blob publishing

@@ -260,6 +260,7 @@ fn gloas_payload() -> gloas::ExecutionPayload {
         excess_blob_gas: payload.excess_blob_gas,
         block_access_list: vec![0xca, 0xfe].into(),
         slot_number: 33,
+        dependency_witnesses: vec![gloas::DependencyWitness::from(vec![0xbe, 0xef])].into(),
     }
 }
 
@@ -397,6 +398,20 @@ fn a_gloas_envelope_round_trips_through_json() {
         },
         signature: signature(4),
     });
+}
+
+#[test]
+fn a_gloas_payload_writes_its_dependency_witnesses_as_hex_strings() {
+    let json = serde_json::to_value(gloas_payload()).unwrap();
+    assert_eq!(json["dependency_witnesses"], serde_json::json!(["0xbeef"]));
+}
+
+#[test]
+fn a_gloas_payload_without_dependency_witnesses_in_its_json_has_none() {
+    let mut json = serde_json::to_value(gloas_payload()).unwrap();
+    json.as_object_mut().unwrap().remove("dependency_witnesses");
+    let payload: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert!(payload.dependency_witnesses.is_empty());
 }
 
 #[test]

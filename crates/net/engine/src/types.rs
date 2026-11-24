@@ -141,6 +141,11 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// has progressive `transactions` and `withdrawals`, a different type from
 /// deneb's, so it needs its own serializer; the wire shape of those two is
 /// unchanged.
+///
+/// `dependencyWitnesses` comes last and is not in the specification's
+/// `ExecutionPayloadV4`: an array of `DATA`, written even when empty, so the
+/// execution client always reads the list its block header commits to rather
+/// than having to pick a meaning for an absent key.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 
 impl Serialize for ExecutionPayloadV4<'_> {
@@ -148,7 +153,7 @@ impl Serialize for ExecutionPayloadV4<'_> {
         use serde::ser::SerializeStruct as _;
 
         let payload = self.0;
-        let mut out = serializer.serialize_struct("ExecutionPayloadV4", 19)?;
+        let mut out = serializer.serialize_struct("ExecutionPayloadV4", 20)?;
         out.serialize_field("parentHash", &data(&payload.parent_hash.0))?;
         out.serialize_field("feeRecipient", &data(&payload.fee_recipient.0))?;
         out.serialize_field("stateRoot", &data(&payload.state_root.0))?;
@@ -178,6 +183,13 @@ impl Serialize for ExecutionPayloadV4<'_> {
         out.serialize_field("excessBlobGas", &quantity(payload.excess_blob_gas))?;
         out.serialize_field("blockAccessList", &data(payload.block_access_list.as_ref()))?;
         out.serialize_field("slotNumber", &quantity(payload.slot_number))?;
+
+        let dependency_witnesses: Vec<String> = payload
+            .dependency_witnesses
+            .iter()
+            .map(|witness| data(witness.as_ref()))
+            .collect();
+        out.serialize_field("dependencyWitnesses", &dependency_witnesses)?;
         out.end()
     }
 }
@@ -512,7 +524,14 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 4096,
+            dependency_witnesses: Default::default(),
         };
+
+        // No witnesses is an empty array, never an absent key.
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        assert_eq!(json["dependencyWitnesses"], serde_json::json!([]));
+        assert_eq!(json.as_object().expect("a JSON object").len(), 20);
+
         let transaction: gloas::Transaction = vec![0x02u8, 0xab].try_into().expect("fits");
         payload.transactions.push(transaction);
         payload.withdrawals.push(Withdrawal {
@@ -523,6 +542,9 @@ mod tests {
         });
         for byte in [0xc1u8, 0x80] {
             payload.block_access_list.push(byte);
+        }
+        for witness in [vec![0x01u8, 0x02], vec![0xff]] {
+            payload.dependency_witnesses.push(witness.into());
         }
 
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
@@ -552,12 +574,16 @@ mod tests {
             "excessBlobGas": "0x0",
             "blockAccessList": "0xc180",
             "slotNumber": "0x1000",
+            "dependencyWitnesses": ["0x0102", "0xff"],
         });
         assert_eq!(json, expected);
 
-        // The spec's order, with the two Amsterdam fields last.
+        // The spec's order, the two Amsterdam fields at its end, then the
+        // witnesses after everything the specification names.
         let text = serde_json::to_string(&ExecutionPayloadV4(&payload)).expect("serializes");
-        assert!(text.ends_with(r#""blockAccessList":"0xc180","slotNumber":"0x1000"}"#));
+        assert!(text.ends_with(
+            r#""blockAccessList":"0xc180","slotNumber":"0x1000","dependencyWitnesses":["0x0102","0xff"]}"#
+        ));
     }
 
     #[test]
