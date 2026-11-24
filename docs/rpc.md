@@ -1161,10 +1161,11 @@ How `payload_attributes` behaves:
 - **What it carries** is what `produceBlockV3`/`produceBlockV4` would send the
   execution client for a block at `proposal_slot` on the current head, from
   the same code: the head state advanced to the slot, the fee recipient
-  (gloas: the proposer's signed preferences, else `prepare_beacon_proposer`'s,
-  else `--fallback-fee-recipient`, else the zero address), and on gloas the parent payload fork choice selects
-  (the head's payload status, and for a head at the previous slot the PTC's
-  votes on its payload) and the preferences' gas target. `payload_attributes`
+  (on gloas the proposer's signed preferences first, then on every fork
+  `prepare_beacon_proposer`'s, else `--fallback-fee-recipient`, else the zero
+  address), and on gloas the parent payload fork choice selects (the head's
+  payload status, and for a head at the previous slot the PTC's votes on its
+  payload) and the preferences' gas target. `payload_attributes`
   is the execution API's `PayloadAttributesV3` (`V4` from gloas) in
   `snake_case` with quoted integers.
 - **When**: at two thirds of each slot (Lighthouse's default

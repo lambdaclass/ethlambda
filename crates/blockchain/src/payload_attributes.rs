@@ -108,11 +108,6 @@ impl FeeRecipients {
         self.prepared.lock()
     }
 
-    /// `--fallback-fee-recipient`, if the operator gave one.
-    pub fn fallback(&self) -> Option<ExecutionAddress> {
-        self.fallback
-    }
-
     /// The fee recipient a locally built payload for `proposer` pays when no
     /// signed preferences name one: `prepare_beacon_proposer`'s, else
     /// `--fallback-fee-recipient`, else the zero address.
@@ -246,7 +241,9 @@ pub enum ProposalError {
     Internal(&'static str),
 }
 
-/// Where a gloas payload's fee recipient came from.
+/// Where a locally built payload's fee recipient came from. `Preferences` is
+/// gloas-only ([`gloas_fee_recipient`]); [`FeeRecipients::for_proposer`]
+/// answers one of the other three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeeRecipientSource {
     /// The proposer's signed preferences.

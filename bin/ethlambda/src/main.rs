@@ -68,7 +68,7 @@ use ethlambda_types::{
         BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
-    beacon::primitives::Epoch,
+    beacon::primitives::{Epoch, ExecutionAddress},
     beacon::signing::compute_epoch_at_slot,
     genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
@@ -496,6 +496,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(_) => None,
         Network::Mainnet { mainnet, .. } => mainnet.fallback_fee_recipient,
     };
+    // Accepted, like the validator client's `--suggested-fee-recipient`, but
+    // said loudly: a proposal that falls back to it logs only at debug, so
+    // this is the one place the burned fees are mentioned.
+    if fallback_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--fallback-fee-recipient is the zero address. Every locally built payload \
+             for a proposer no validator client named a fee recipient for burns its fees."
+        );
+    }
     let builder_fallback = match &network {
         Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
         Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
