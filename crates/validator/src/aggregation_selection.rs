@@ -89,16 +89,18 @@ pub fn is_aggregator(committee_length: u64, selection_proof: &BlsSignature) -> b
 /// silent `None`. Both mean the duty cannot be served at all, and reporting
 /// them as "not an aggregator" would hide a misconfiguration behind a role
 /// this validator was never going to fill anyway.
+///
+/// With distributed mode on, the proof is the combined one the middleware
+/// returned, and a duty with none is `None`: see
+/// [`SigningContext::selection_proof`].
 pub async fn selection_for(
     context: &SigningContext,
     store: &RwLock<ValidatorStore>,
     duty: &AttesterDutyDto,
 ) -> Result<Option<BlsSignature>> {
     let pubkey = parse_pubkey(&duty.pubkey)?;
-    let proof = context
-        .sign_selection_proof(store, &pubkey, duty.slot)
-        .await?;
-    Ok(is_aggregator(duty.committee_length, &proof).then_some(proof))
+    let proof = context.selection_proof(store, &pubkey, duty.slot).await?;
+    Ok(proof.filter(|proof| is_aggregator(duty.committee_length, proof)))
 }
 
 #[cfg(test)]

@@ -43,6 +43,7 @@ use ethlambda_types::beacon::primitives::{
 use libssz::SszDecode as _;
 use serde::{Deserialize, Serialize};
 
+use crate::beacon_node::{BeaconCommitteeSelection, SyncCommitteeSelection};
 use crate::error::{Error, Result};
 
 /// The Beacon API quotes every 64-bit integer as a JSON string, so that a
@@ -463,6 +464,76 @@ pub struct CommitteeSubscriptionDto {
     #[serde(with = "quoted_u64")]
     pub slot: Slot,
     pub is_aggregator: bool,
+}
+
+/// One entry of `POST /eth/v1/validator/beacon_committee_selections`, in the
+/// request and in its answer alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconCommitteeSelectionDto {
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+    pub selection_proof: String,
+}
+
+impl From<&BeaconCommitteeSelection> for BeaconCommitteeSelectionDto {
+    fn from(selection: &BeaconCommitteeSelection) -> Self {
+        Self {
+            validator_index: selection.validator_index,
+            slot: selection.slot,
+            selection_proof: encode_hex(&selection.selection_proof.0),
+        }
+    }
+}
+
+impl TryFrom<BeaconCommitteeSelectionDto> for BeaconCommitteeSelection {
+    type Error = Error;
+
+    fn try_from(dto: BeaconCommitteeSelectionDto) -> Result<Self> {
+        Ok(Self {
+            validator_index: dto.validator_index,
+            slot: dto.slot,
+            selection_proof: parse_signature(&dto.selection_proof)?,
+        })
+    }
+}
+
+/// One entry of `POST /eth/v1/validator/sync_committee_selections`, in the
+/// request and in its answer alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCommitteeSelectionDto {
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+    #[serde(with = "quoted_u64")]
+    pub subcommittee_index: u64,
+    pub selection_proof: String,
+}
+
+impl From<&SyncCommitteeSelection> for SyncCommitteeSelectionDto {
+    fn from(selection: &SyncCommitteeSelection) -> Self {
+        Self {
+            validator_index: selection.validator_index,
+            slot: selection.slot,
+            subcommittee_index: selection.subcommittee_index,
+            selection_proof: encode_hex(&selection.selection_proof.0),
+        }
+    }
+}
+
+impl TryFrom<SyncCommitteeSelectionDto> for SyncCommitteeSelection {
+    type Error = Error;
+
+    fn try_from(dto: SyncCommitteeSelectionDto) -> Result<Self> {
+        Ok(Self {
+            validator_index: dto.validator_index,
+            slot: dto.slot,
+            subcommittee_index: dto.subcommittee_index,
+            selection_proof: parse_signature(&dto.selection_proof)?,
+        })
+    }
 }
 
 // -- Conversions -------------------------------------------------------------

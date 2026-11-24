@@ -189,6 +189,21 @@ pub(crate) struct ValidatorOptions {
     /// `/eth/v1/validator/liveness`.
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
+
+    /// Distributed validator mode, for keys that are shares behind
+    /// middleware such as Obol Charon: whether a validator aggregates
+    /// attestations or sync committee contributions is decided by the
+    /// combined selection proofs the middleware returns, not by this
+    /// client's own. `--beacon-nodes` must then point at the middleware.
+    ///
+    /// Refused with `--enable-doppelganger-protection`: the cluster's other
+    /// operators keep the validator live, so the check would stop this client.
+    #[arg(
+        long,
+        default_value = "false",
+        conflicts_with = "enable_doppelganger_protection"
+    )]
+    pub(crate) distributed: bool,
 }
 
 impl ValidatorOptions {
@@ -295,6 +310,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        distributed: options.distributed,
     })
     .await
     .map_err(Into::into)
@@ -324,6 +340,7 @@ mod tests {
             builder_min_bid: 0,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            distributed: false,
         }
     }
 
@@ -395,6 +412,15 @@ mod tests {
         assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
         let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
         assert!(options.enable_doppelganger_protection);
+    }
+
+    /// Opt-in, as in every other client, and refused with doppelganger
+    /// protection, which the cluster's other operators would trip.
+    #[test]
+    fn distributed_mode_is_off_unless_asked_for_and_excludes_doppelganger_protection() {
+        assert!(!parse(&[]).expect("parses").distributed);
+        assert!(parse(&["--distributed"]).expect("parses").distributed);
+        assert!(parse(&["--distributed", "--enable-doppelganger-protection"]).is_err());
     }
 
     #[test]

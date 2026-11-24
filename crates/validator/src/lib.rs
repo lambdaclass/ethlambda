@@ -29,6 +29,7 @@ pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
 pub mod chain_check;
+pub mod distributed;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -169,6 +170,10 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// The keys are shares of distributed validators, behind middleware
+    /// that combines their signatures: aggregation is decided by the
+    /// combined selection proofs it returns. See [`distributed`].
+    pub distributed: bool,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -370,7 +375,16 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     if let Some(doppelganger) = &doppelganger {
         context = context.with_doppelganger(doppelganger.clone());
     }
+    if config.distributed {
+        context = context.with_distributed();
+    }
     let context = Arc::new(context);
+    let distributed = config.distributed.then(|| {
+        Arc::new(distributed::Distributed::new(
+            beacon_node.clone(),
+            context.clone(),
+        ))
+    });
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -669,7 +683,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // next, so the duties that are near were subscribed an epoch ago,
             // and the proofs are remembered for the aggregation whenever they
             // land.
-            if resubscribe {
+            //
+            // In distributed mode the middleware's combined proofs are asked
+            // for first, from the same task, and every slot for those still
+            // missing; see `distributed`.
+            if let Some(distributed) = &distributed {
+                let (owed, sync_owed) = (duties.all(), duties.sync_at_slot(slot));
+                distributed.after_proposal(slot, resubscribe, owed, sync_owed, &store, &clock);
+            } else if resubscribe {
                 let (beacon_node, store, context) =
                     (beacon_node.clone(), store.clone(), context.clone());
                 let owed = duties.all();

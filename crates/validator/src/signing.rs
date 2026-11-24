@@ -95,11 +95,21 @@ pub struct SigningContext {
     /// fork schedule.
     pub genesis_validators_root: Root,
     /// Selection proofs already produced; see [`Self::sign_selection_proof`].
+    /// With distributed mode on, the combined proofs the middleware returned
+    /// instead, and never this client's own; see [`Self::selection_proof`].
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
     /// How many times the schedule has been replaced. Written with the
     /// selection proofs' lock held, so a proof signed across a swap can tell
     /// it was: see [`Self::sign_selection_proof`].
     schedule_generation: AtomicU64,
+    /// The combined sync committee selection proofs the middleware returned,
+    /// by key, slot and subcommittee. Empty with distributed mode off, where
+    /// a sync selection proof is signed when it is wanted.
+    sync_selection_proofs: Mutex<HashMap<(BlsPubkey, Slot, u64), BlsSignature>>,
+    /// Whether this client holds key shares of distributed validators, whose
+    /// aggregation is decided by the combined selection proofs a middleware
+    /// returns (see [`crate::distributed`]).
+    distributed: bool,
     /// One permit per remote signature being verified; see [`Self::verified`].
     verifications: Arc<Semaphore>,
     /// Which keys doppelganger protection lets sign an attestation, a block,
@@ -123,6 +133,12 @@ fn same_fork_schedule(a: &Config, b: &Config) -> bool {
 fn selection_proof_retention_slots() -> Slot {
     3 * slots_per_epoch()
 }
+
+/// How many slots before the newest a combined sync committee selection proof
+/// is kept for. It is read at its own slot's contribution deadline, before the
+/// next slot's exchange starts; the one extra slot is margin, so a newer
+/// exchange never prunes a proof whose slot's contribution step still runs.
+const SYNC_SELECTION_PROOF_RETENTION_SLOTS: Slot = 1;
 
 /// How long one duty's batch of signatures may take, from when it is asked
 /// for.
@@ -206,9 +222,24 @@ impl SigningContext {
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
             schedule_generation: AtomicU64::new(0),
+            sync_selection_proofs: Mutex::new(HashMap::new()),
+            distributed: false,
             verifications: Arc::new(Semaphore::new(cores)),
             doppelganger: None,
         }
+    }
+
+    /// Distributed mode: the keys are shares, and whether a validator
+    /// aggregates is decided by the combined selection proofs the middleware
+    /// returns, never by this client's own. See [`crate::distributed`].
+    pub fn with_distributed(mut self) -> Self {
+        self.distributed = true;
+        self
+    }
+
+    /// Whether distributed mode is on.
+    pub fn is_distributed(&self) -> bool {
+        self.distributed
     }
 
     /// Put the slashable signatures behind doppelganger protection.
@@ -740,6 +771,13 @@ impl SigningContext {
     /// deleted mid-epoch its selection: the aggregation would go on to fetch
     /// an aggregate it then cannot sign. A key this client no longer holds
     /// is [`Error::UnknownValidator`] here, as it is on every other path.
+    ///
+    /// With distributed mode on, this is the key share's partial proof, what
+    /// the middleware is sent. It neither reads nor writes the memory, which
+    /// there holds only the middleware's combined proofs: answering from it
+    /// would send the middleware a combined proof as if it were this share's,
+    /// and remembering a partial would have it decide a selection. What
+    /// decides one is [`Self::selection_proof`].
     pub async fn sign_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,
@@ -749,9 +787,11 @@ impl SigningContext {
         if !store.read().await.contains(pubkey) {
             return Err(Error::UnknownValidator(*pubkey));
         }
-        let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
-        if let Some(proof) = remembered {
-            return Ok(proof);
+        if !self.distributed {
+            let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
+            if let Some(proof) = remembered {
+                return Ok(proof);
+            }
         }
         loop {
             // Read before the signing root is computed, so a schedule swap
@@ -769,6 +809,10 @@ impl SigningContext {
                     },
                 )
                 .await?;
+            // The share's partial proof: never remembered, see above.
+            if self.distributed {
+                return Ok(proof);
+            }
             let mut proofs = self.selection_proofs();
             if self.schedule_generation.load(Ordering::Acquire) != generation {
                 // The schedule was replaced while this was being signed (a
@@ -781,6 +825,68 @@ impl SigningContext {
             proofs.insert((*pubkey, slot), proof);
             return Ok(proof);
         }
+    }
+
+    /// The selection proof that decides whether `pubkey` aggregates at
+    /// `slot`.
+    ///
+    /// With distributed mode off, this client's own, signed or remembered
+    /// ([`Self::sign_selection_proof`]). With it on, the combined proof the
+    /// middleware returned ([`Self::remember_combined_selection_proof`]), or
+    /// `None` while there is none: the share's own proof hashes to a
+    /// different value than the validator's, so deciding on it would be
+    /// wrong, and no proof means no aggregation.
+    ///
+    /// The store is asked first either way, for the reason
+    /// [`Self::sign_selection_proof`] gives.
+    pub async fn selection_proof(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+    ) -> Result<Option<BlsSignature>> {
+        if !self.distributed {
+            return self
+                .sign_selection_proof(store, pubkey, slot)
+                .await
+                .map(Some);
+        }
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        Ok(self.selection_proofs().get(&(*pubkey, slot)).copied())
+    }
+
+    /// Whether a combined selection proof is held for `pubkey` at `slot`.
+    pub fn holds_combined_selection_proof(&self, pubkey: &BlsPubkey, slot: Slot) -> bool {
+        self.distributed && self.selection_proofs().contains_key(&(*pubkey, slot))
+    }
+
+    /// Remember `proof`, the combined selection proof a distributed
+    /// validator middleware returned for `pubkey` at `slot`, in place of
+    /// whatever was held. Ignored with distributed mode off, where the
+    /// memory holds this client's own proofs and nothing else may replace
+    /// them.
+    ///
+    /// Not verified: it is a signature under the validator's key, which
+    /// this client never learns (it holds a share, and the middleware
+    /// presents the share's pubkey as the validator's). A wrong one costs an
+    /// aggregate every node refuses, nothing slashable.
+    pub fn remember_combined_selection_proof(
+        &self,
+        pubkey: BlsPubkey,
+        slot: Slot,
+        proof: BlsSignature,
+    ) {
+        if self.distributed {
+            self.remember_selection_proof(pubkey, slot, proof);
+        }
+    }
+
+    fn remember_selection_proof(&self, pubkey: BlsPubkey, slot: Slot, proof: BlsSignature) {
+        let mut proofs = self.selection_proofs();
+        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
+        proofs.insert((pubkey, slot), proof);
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of
@@ -999,9 +1105,61 @@ impl SigningContext {
         .await
     }
 
+    /// The sync committee selection proof that decides whether `pubkey`
+    /// contributes for `subcommittee_index` at `slot`: this client's own
+    /// ([`Self::sign_sync_selection_proof`]), or with distributed mode on the
+    /// combined one the middleware returned, `None` while there is none, for
+    /// the reason [`Self::selection_proof`] gives.
+    pub async fn sync_selection_proof(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+        subcommittee_index: u64,
+    ) -> Result<Option<BlsSignature>> {
+        if !self.distributed {
+            return self
+                .sign_sync_selection_proof(store, pubkey, slot, subcommittee_index)
+                .await
+                .map(Some);
+        }
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        let proofs = self
+            .sync_selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(proofs.get(&(*pubkey, slot, subcommittee_index)).copied())
+    }
+
+    /// Remember `proof`, the combined sync committee selection proof a
+    /// distributed validator middleware returned. Ignored with distributed
+    /// mode off, and not verified, as
+    /// [`Self::remember_combined_selection_proof`] says.
+    pub fn remember_combined_sync_selection_proof(
+        &self,
+        pubkey: BlsPubkey,
+        slot: Slot,
+        subcommittee_index: u64,
+        proof: BlsSignature,
+    ) {
+        if !self.distributed {
+            return;
+        }
+        let mut proofs = self
+            .sync_selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        proofs.retain(|(_, held, _), _| held + SYNC_SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.insert((pubkey, slot, subcommittee_index), proof);
+    }
+
     /// Sign the sync committee selection proof for `slot` and one
     /// subcommittee. Deterministic, so not guarded, for the reason
-    /// [`Self::sign_selection_proof`] is not.
+    /// [`Self::sign_selection_proof`] is not. Never remembered: with
+    /// distributed mode on it is the share's partial proof, which decides
+    /// nothing (see [`Self::sync_selection_proof`]).
     pub async fn sign_sync_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,

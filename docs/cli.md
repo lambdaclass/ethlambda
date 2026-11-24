@@ -461,6 +461,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Taken with or without `--builder-proposals`: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 | `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
+| `--distributed` | off | Distributed validator mode, for keys that are shares behind middleware such as Obol Charon: whether a validator aggregates attestations or sync committee contributions is decided by the combined selection proofs the middleware returns. `--beacon-nodes` must point at the middleware. Refused with `--enable-doppelganger-protection`. See [Distributed validators](#distributed-validators) |
 
 ### What it does today
 
@@ -666,6 +667,49 @@ both see silence and both start signing, and a doppelganger that is down for
 the epochs checked goes unseen until it comes back, when nothing is checking any
 more. `ethlambda_validator_doppelganger_detecting` counts the keys still
 withheld.
+
+### Distributed validators
+
+Off unless `--distributed` is passed. A distributed validator's key is split
+into shares across several operators, each running a validator client with
+one share in front of middleware such as Obol Charon, which speaks the Beacon
+API and combines a threshold of partial signatures into one under the
+validator's key. To run behind Charon, load the share keystores as usual
+(locally or in a Web3Signer), point `--beacon-nodes` at Charon's validator
+API (`http://charon:3600` by default) and pass `--distributed`. Charon
+presents each share's public key as the validator's, so duties, slashing
+protection and a remote signer's answers are keyed and checked by the share.
+
+Attestations and blocks need nothing more. Aggregation does: it is decided
+by hashing the selection proof, and a share's partial proof hashes to a
+different value than the combined one. So the client asks the middleware for
+the combined proofs and decides on those:
+
+- Each epoch, from the task the subnet subscriptions are sent from, it sends
+  the partial proof of every attester duty whose slot has not passed to
+  `POST /eth/v1/validator/beacon_committee_selections`, the current epoch's
+  and then the next epoch's in separate requests, as the Beacon API asks.
+  Each epoch's subscriptions follow its answer. The aggregation tick acts on
+  the same combined proofs and publishes them in the `AggregateAndProof`.
+- At the start of each slot it sends the partial proof of every sync
+  committee subnet its validators sit in to
+  `POST /eth/v1/validator/sync_committee_selections`, and the contribution
+  deadline acts on the answer.
+
+A duty with no combined proof aggregates for nobody: its subscription goes
+out without the role and no aggregate or contribution is asked for. The
+current epoch's attester duties still missing one are asked for again every
+slot, and subscribed again with the role once they have one. Charon answers
+a request only once it has combined every entry in it, so the next-epoch
+request can go unanswered when the other operators' clients do not look an
+epoch ahead; those duties are asked for again as the current epoch's.
+
+`--enable-doppelganger-protection` is refused with it: the other operators
+keep the validator live, so the check would stop the client. Not yet run
+against real middleware. Builder registrations (each signed with its client's
+own timestamp), gloas proposer preferences and payload envelopes, and
+voluntary exits are signed with the share as usual, and whether a middleware
+combines each of them is up to it.
 
 ### Duty offsets come from the network
 
