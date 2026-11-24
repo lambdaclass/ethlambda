@@ -49,6 +49,15 @@ struct Args {
     /// Also write every summary and per-step time to this JSON file.
     #[arg(long)]
     json: Option<PathBuf>,
+    /// Run one library only, for a quicker loop while working on it.
+    #[arg(long, value_enum)]
+    only: Option<Library>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Library {
+    Silver,
+    Ours,
 }
 
 /// Time per list, in [`LIST_NAMES`] order.
@@ -183,15 +192,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(threads) => threads,
         None => std::thread::available_parallelism()?.get(),
     };
-    let mut runners = vec![
-        Runner::new::<silver::Silver>("silver_state_hashing 0.2.0, 1 thread".into(), 1)?,
-        Runner::new::<ours::Ours>("ethlambda-ssz-tree, 1 thread".into(), 1)?,
-    ];
-    if threads > 1 {
-        runners.push(Runner::new::<ours::Ours>(
-            format!("ethlambda-ssz-tree, {threads} threads"),
-            threads,
+    let runs = |library| args.only.is_none_or(|only| only == library);
+    let mut runners = Vec::new();
+    if runs(Library::Silver) {
+        runners.push(Runner::new::<silver::Silver>(
+            "silver_state_hashing 0.2.0, 1 thread".into(),
+            1,
         )?);
+    }
+    if runs(Library::Ours) {
+        runners.push(Runner::new::<ours::Ours>(
+            "ethlambda-ssz-tree, 1 thread".into(),
+            1,
+        )?);
+        if threads > 1 {
+            runners.push(Runner::new::<ours::Ours>(
+                format!("ethlambda-ssz-tree, {threads} threads"),
+                threads,
+            )?);
+        }
     }
 
     // Rounds interleave the libraries, so a drift in the machine's speed

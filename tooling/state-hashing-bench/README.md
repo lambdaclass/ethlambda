@@ -84,6 +84,7 @@ hashes the same way and skips the per-page reference counts.
    | `--threads` | every core | threads for ethlambda's parallel run |
    | `--max-steps` | all | replay only the first N steps |
    | `--json` | none | also write every summary and per-step time |
+   | `--only` | both | `silver` or `ours`, for a quicker loop while working on one |
 
    It prints Markdown tables: per-block and per-epoch-transition times
    (median, mean, tail), the same split per list, build time, and memory.
