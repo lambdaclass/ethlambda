@@ -317,6 +317,36 @@ request holding the width it does not read: Lighthouse's PQ node refuses any
 48-byte id. Key generation builds two bottom
 trees per key, which takes under a minute for 16 validators.
 
+A key's leanXMSS trees come from the first source that has them, and no duty
+starts until every key has the bottom trees its current duties sign in:
+
+1. The trees a previous start stored in
+   `<validators-dir>/pq_xmss_trees/0x<bls pubkey>.bin`: a format header,
+   the key's public key, leanVM's `cache_to_bytes` (the top tree's cached
+   level and those of the bottom trees it last used, at most four; about
+   25 KB), and an HMAC-SHA256 tag under a key derived from the XMSS seed, so
+   only a file this client wrote for this seed loads. leanVM then checks the
+   trees against the public key and seed, and the public key must be the
+   registry's when that was read. The file is written whenever the key
+   builds a bottom tree: at startup, in the background lookahead, or at a
+   signature. Lighthouse's and Teku's PQ branches keep the same file
+   (`xmss_cache.rs`, `XmssTreeCacheFile`), authenticated the same way.
+2. With `--xmss-cache-url` (a URL or a path), the key's record in
+   ethereum-package's `xmss_cache_url` file, read at the validator index the
+   registry gives the key's public parameter (only for keys with nothing
+   stored, so a restart with every key stored does not wait for the
+   registry).
+3. The key, generated from its seed (about 2.4 s).
+
+Nothing lets a key skip a bottom tree. Each duty's leaf is fixed by the fork
+(see [Leaves](#leaves)), and the path from a leaf needs all `2^16` leaves of
+its tree. The attestation leaves stay in bottom tree 0 for 32768 epochs, but
+the per-slot leaves take eight leaves a slot whatever the validator's duties,
+so every key needs a new tree after slot 4096 and every 8192 slots after,
+past the two genesis-era trees the `xmss_cache_url` file holds. Without the
+store, every restart on the PQ devnet past slot 4096 built that tree again for
+every key before any duty ran: 13 minutes for 625 keys.
+
 The VRF tree takes minutes per key (see [The VRF tree](#the-vrf-tree)) and
 only a proposal reads it, so the keys attest at once and a background thread
 prepares the trees one after another, each from the first source that has

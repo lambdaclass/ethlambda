@@ -81,6 +81,173 @@ fn leaf_record_keep_slots() -> Slot {
 /// tree nodes, one file per validator, named by its BLS public key.
 pub const VRF_TREE_DIRECTORY: &str = "pq_vrf_trees";
 
+/// The directory under the validators directory that holds each key's
+/// leanXMSS trees, one file per validator, named by its BLS public key:
+/// [`TREE_FILE_MAGIC`], the key's public key, leanVM's `cache_to_bytes` (the
+/// top tree's cached level and that of every bottom tree the key holds, at
+/// most `MAX_CACHED_BOTTOM_TREES`; about 25 KB), then an HMAC-SHA256 tag over
+/// all of it under a key derived from the XMSS seed ([`tree_mac_key`]), so
+/// only a file this client wrote for this seed loads. Lighthouse's and
+/// Teku's PQ branches keep the same thing the same way. Written whenever a
+/// key builds a bottom tree, and read first at startup.
+///
+/// A bottom tree is `2^16` leaves, seconds of hashing per key, and nothing
+/// lets a key skip one: every duty's leaf is fixed by the specification, and
+/// the path from a leaf needs all the leaves of its tree. The per-slot leaves
+/// take eight leaves a slot whatever the validator's duties, so they need a
+/// new tree every 8192 slots (the first after 4096), past the two genesis-era
+/// trees ethereum-package's `xmss_cache_url` holds. Without this store every
+/// restart built the current one again for every key before any duty ran:
+/// thirteen minutes for 625 keys on the PQ devnet.
+pub const XMSS_TREE_DIRECTORY: &str = "pq_xmss_trees";
+
+/// Where [`store_trees`] writes and [`derive_and_register`] reads: the
+/// validators directory given to [`use_tree_store`], or nowhere, as in tests.
+fn tree_store() -> Option<&'static Path> {
+    TREE_STORE.get().map(PathBuf::as_path)
+}
+
+static TREE_STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep each key's leanXMSS trees under `validators_dir`
+/// ([`XMSS_TREE_DIRECTORY`]). Call once at startup, before
+/// [`derive_and_register`]; a second call is ignored.
+pub fn use_tree_store(validators_dir: &Path) {
+    let _ = TREE_STORE.set(validators_dir.to_path_buf());
+}
+
+/// Whether `pubkey` has a stored tree file under `validators_dir`, so that
+/// its `xmss_cache_url` record need not be fetched. Whether the file is
+/// usable is only known when [`derive_and_register`] loads it.
+pub fn has_stored_trees(validators_dir: &Path, pubkey: &BlsPubkey) -> bool {
+    xmss_tree_path(validators_dir, pubkey).is_file()
+}
+
+fn xmss_tree_path(validators_dir: &Path, pubkey: &BlsPubkey) -> PathBuf {
+    validators_dir
+        .join(XMSS_TREE_DIRECTORY)
+        .join(format!("0x{}.bin", hex::encode(pubkey.0)))
+}
+
+/// The first bytes of every [`XMSS_TREE_DIRECTORY`] file, naming its format
+/// and version: a later layout gets a new version, and a file of another one
+/// is rebuilt rather than misread.
+const TREE_FILE_MAGIC: &[u8; 8] = b"ELXMSS\x00\x01";
+
+/// The size of a tree file's HMAC-SHA256 tag.
+const TREE_FILE_TAG_SIZE: usize = 32;
+
+type TreeMac = hmac::Hmac<sha2::Sha256>;
+
+/// The key a tree file's tag is made under: derived from the XMSS seed with a
+/// domain of its own, so the tag says the file was written for this seed,
+/// and the seed itself never keys anything but leanVM.
+fn tree_mac_key(secret: &[u8; 32]) -> [u8; 32] {
+    use hmac::Mac as _;
+    let mut mac =
+        TreeMac::new_from_slice(&pq_keys::xmss_seed(secret)).expect("HMAC takes any key length");
+    mac.update(b"ethlambda leanXMSS tree store v1");
+    mac.finalize().into_bytes().into()
+}
+
+fn tree_file_tag(mac_key: &[u8; 32], content: &[u8]) -> TreeMac {
+    use hmac::Mac as _;
+    let mut mac = TreeMac::new_from_slice(mac_key).expect("HMAC takes any key length");
+    mac.update(content);
+    mac
+}
+
+/// The key stored at `path`, if the file is one this client wrote for this
+/// seed (its tag) and holds the key with its cached levels whole (leanVM's
+/// `from_cache_bytes` checks them against the public key, and the public
+/// key's parameter against the seed). When the registry's key for the
+/// validator is known (`registered`), the file must be for it too. A missing
+/// file is an ordinary first start; any other failure is logged, and the
+/// caller loads or builds the key instead.
+fn stored_key(
+    path: &Path,
+    secret: &[u8; 32],
+    registered: Option<&[u8; leanvm_lean_xmss::PUB_KEY_SIZE]>,
+) -> Option<LeanXmssExpandedSecretKey> {
+    use hmac::Mac as _;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn!(path = %path.display(), %err, "Could not read a key's stored leanXMSS trees; building them again");
+            return None;
+        }
+    };
+    let Some((content, tag)) = bytes.split_last_chunk::<TREE_FILE_TAG_SIZE>() else {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees are truncated; building them again");
+        return None;
+    };
+    let Some(payload) = content.strip_prefix(TREE_FILE_MAGIC) else {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees are in another format; building them again");
+        return None;
+    };
+    if tree_file_tag(&tree_mac_key(secret), content)
+        .verify_slice(tag)
+        .is_err()
+    {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees were not written for this key, or are damaged; building them again");
+        return None;
+    }
+    let Some((public, cache)) = payload.split_first_chunk::<{ leanvm_lean_xmss::PUB_KEY_SIZE }>()
+    else {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees are truncated; building them again");
+        return None;
+    };
+    if registered.is_some_and(|registered| registered != public) {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees are not for its registered key; building them again");
+        return None;
+    }
+    let public_key = leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(public);
+    let seed = pq_keys::xmss_seed(secret);
+    let key = LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &public_key, cache);
+    if key.is_none() {
+        warn!(path = %path.display(), "A key's stored leanXMSS trees are not this key's, or damaged; building them again");
+    }
+    key
+}
+
+/// Writes `key`'s trees where the next start reads them, when a store is in
+/// use ([`use_tree_store`]). A file that cannot be written is logged: the
+/// next start builds those trees again.
+fn store_trees(pubkey: &BlsPubkey, key: &PqKey) {
+    if let Some(validators_dir) = tree_store() {
+        store_trees_at(&xmss_tree_path(validators_dir, pubkey), key);
+    }
+}
+
+fn store_trees_at(path: &Path, key: &PqKey) {
+    // One writer per key at a time: the durable write stages through a fixed
+    // sibling file, and the startup, the lookahead and a signature can all
+    // build one key's trees.
+    let mac_key = key
+        .storing
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut bytes = TREE_FILE_MAGIC.to_vec();
+    bytes.extend(key.xmss.public_key().to_bytes());
+    bytes.extend(key.xmss.cache_to_bytes());
+    let tag = {
+        use hmac::Mac as _;
+        tree_file_tag(&mac_key, &bytes).finalize().into_bytes()
+    };
+    bytes.extend(tag);
+    let stored = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .map_err(|err| err.to_string())
+        .and_then(|()| {
+            crate::secure_fs::write_private_durably(path, bytes).map_err(|err| err.to_string())
+        });
+    if let Err(err) = stored {
+        warn!(path = %path.display(), %err, "Could not store a key's leanXMSS trees; the next start builds them again");
+    }
+}
+
 /// A validator's PQ key material.
 pub struct PqKey {
     /// leanVM's key: it caches the last few bottom trees it signed in.
@@ -90,6 +257,9 @@ pub struct PqKey {
     vrf: OnceLock<vrf::VrfTree>,
     /// The 48-byte form the PQ registry names the validator by.
     pub request_key: [u8; 48],
+    /// The key the tree file's tag is made under ([`tree_mac_key`]), held
+    /// while the key's trees are written ([`store_trees`]).
+    storing: Mutex<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -271,6 +441,8 @@ pub struct XmssCacheRecord {
 /// Where [`derive_and_register`] got a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
+    /// Loaded from the trees an earlier start stored ([`XMSS_TREE_DIRECTORY`]).
+    Stored,
     /// Loaded from its leanXMSS cache record.
     Cached,
     /// Built from its seed; no cache record was offered.
@@ -296,12 +468,15 @@ pub struct Derived {
 /// `pubkey` and secret key `secret` (32 bytes, big-endian, as a keystore
 /// holds it).
 ///
-/// With a `cached` record that is this key's, the key loads from it in
-/// milliseconds. Otherwise it is built: slow, and on the calling thread
-/// alone, leanVM's key generation (about 2.4 s). Either way the bottom trees
-/// its next attestation and per-slot signatures fall in are then built if the
-/// key lacks them (about 2.5 s each). Run it off the async runtime, and
-/// spread many keys across cores.
+/// With trees an earlier start stored ([`use_tree_store`]), or a `cached`
+/// record that is this key's, the key loads in milliseconds; stored trees
+/// come first, since they hold the bottom trees the key built since genesis.
+/// Otherwise it is built: slow, and on the calling thread alone, leanVM's key
+/// generation (about 2.4 s). Either way the bottom trees its next attestation
+/// and per-slot signatures fall in are then built if the key lacks them
+/// (about 2.5 s each), and the key's trees are stored when anything was
+/// loaded from elsewhere or built. Run it off the async runtime, and spread
+/// many keys across cores.
 ///
 /// The key signs from here on. Its VRF tree, which only a proposal reads, is
 /// [`prepare_vrf_tree`]'s to supply.
@@ -312,15 +487,25 @@ pub fn derive_and_register(
     cached: Option<&XmssCacheRecord>,
 ) -> Derived {
     let started = Instant::now();
-    let loaded = cached.map(|record| {
-        let registered = leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(&record.registered);
-        let seed = pq_keys::xmss_seed(secret);
-        LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &registered, &record.bytes)
+    let stored = tree_store().and_then(|validators_dir| {
+        let registered = cached.map(|record| &record.registered);
+        stored_key(&xmss_tree_path(validators_dir, &pubkey), secret, registered)
     });
-    let (xmss, source) = match loaded {
-        Some(Some(xmss)) => (xmss, KeySource::Cached),
-        Some(None) => (pq_keys::xmss_key(secret), KeySource::CacheRefused),
-        None => (pq_keys::xmss_key(secret), KeySource::Built),
+    let (xmss, source) = match stored {
+        Some(xmss) => (xmss, KeySource::Stored),
+        None => {
+            let loaded = cached.map(|record| {
+                let registered =
+                    leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(&record.registered);
+                let seed = pq_keys::xmss_seed(secret);
+                LeanXmssExpandedSecretKey::from_cache_bytes(&seed, &registered, &record.bytes)
+            });
+            match loaded {
+                Some(Some(xmss)) => (xmss, KeySource::Cached),
+                Some(None) => (pq_keys::xmss_key(secret), KeySource::CacheRefused),
+                None => (pq_keys::xmss_key(secret), KeySource::Built),
+            }
+        }
     };
     let key_time = started.elapsed();
     let mut request_key = [0u8; 48];
@@ -359,7 +544,11 @@ pub fn derive_and_register(
         vrf_seed: pq_keys::vrf_seed(secret),
         vrf: OnceLock::new(),
         request_key,
+        storing: Mutex::new(tree_mac_key(secret)),
     });
+    if source != KeySource::Stored || trees_built > 0 {
+        store_trees(&pubkey, &key);
+    }
     let mut registry = registry().write().expect("PQ key registry poisoned");
     registry.by_request.insert(request_key, pubkey);
     registry.by_bls.insert(pubkey, key);
@@ -494,6 +683,7 @@ pub fn prepare_bottom_tree(leaf: u64) -> TreeBuilds {
                 elapsed_ms = elapsed.as_millis() as u64,
                 "Built a validator's next leanXMSS bottom tree"
             );
+            store_trees(pubkey, key);
             Some(elapsed)
         })
         .collect();
@@ -850,6 +1040,7 @@ fn sign_claimed(request: &SignRequest, key: &PqKey, leaf_index: u32) -> XmssSign
             elapsed_ms = elapsed.as_millis() as u64,
             "Built a leanXMSS bottom tree at signing time"
         );
+        store_trees(&request.pubkey, key);
     }
     let signature = leanvm_lean_xmss::sign(&key.xmss, &request.root.0, leaf_index);
     XmssSignature(signature.to_bytes())
@@ -1047,6 +1238,62 @@ mod tests {
         assert!(matches!(claims[1], Ok(())), "already recorded");
         assert!(matches!(claims[2], Err(PqSignError::Record(_))));
         assert_eq!(record.roots.len(), 1);
+    }
+
+    /// A key's stored trees load back holding every bottom tree it built,
+    /// past the genesis-era ones, and sign what the key signs; a file for
+    /// another registered key or another seed, a damaged or truncated one,
+    /// and a missing one are not used.
+    #[test]
+    fn stored_trees_load_back_and_a_bad_file_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = [31u8; 32];
+        let pubkey = BlsPubkey([31; 48]);
+        let xmss = pq_keys::xmss_key(&secret);
+        // The PQ devnet's per-slot tree at slot 9400, which no cache record holds.
+        let leaf = slot_leaf(9_400, LEAF_OFFSET_PTC_ATTESTER) as u32;
+        xmss.prepare(leaf);
+        let public = xmss.public_key().to_bytes();
+        let key = PqKey {
+            xmss,
+            vrf_seed: pq_keys::vrf_seed(&secret),
+            vrf: OnceLock::new(),
+            request_key: [0; 48],
+            storing: Mutex::new(tree_mac_key(&secret)),
+        };
+        let path = xmss_tree_path(directory.path(), &pubkey);
+        store_trees_at(&path, &key);
+        assert!(has_stored_trees(directory.path(), &pubkey));
+
+        let loaded = stored_key(&path, &secret, Some(&public)).expect("the stored trees load");
+        assert_eq!(loaded.cache_to_bytes(), key.xmss.cache_to_bytes());
+        assert!(
+            prepare_tree(&loaded, leaf).is_none(),
+            "the loaded key holds the tree"
+        );
+        let expected = leanvm_lean_xmss::sign(&key.xmss, &[4; 32], leaf);
+        let signed = leanvm_lean_xmss::sign(&loaded, &[4; 32], leaf);
+        assert_eq!(signed.to_bytes(), expected.to_bytes());
+
+        let mut elsewhere = public;
+        elsewhere[0] ^= 1;
+        assert!(stored_key(&path, &secret, Some(&elsewhere)).is_none());
+        assert!(stored_key(&path, &[32u8; 32], None).is_none());
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut retagged = bytes.clone();
+        *retagged.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &retagged).unwrap();
+        assert!(stored_key(&path, &secret, None).is_none(), "a bad tag");
+        let untagged = &bytes[TREE_FILE_MAGIC.len()..bytes.len() - TREE_FILE_TAG_SIZE];
+        std::fs::write(&path, untagged).unwrap();
+        assert!(stored_key(&path, &secret, None).is_none(), "no header");
+        bytes[TREE_FILE_MAGIC.len() + leanvm_lean_xmss::PUB_KEY_SIZE + 100] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(stored_key(&path, &secret, None).is_none());
+        std::fs::write(&path, &bytes[..10]).unwrap();
+        assert!(stored_key(&path, &secret, None).is_none());
+        let missing = directory.path().join("missing.bin");
+        assert!(stored_key(&missing, &secret, None).is_none());
     }
 
     /// What ethereum-package's leanXMSS cache file holds for the key `secret`

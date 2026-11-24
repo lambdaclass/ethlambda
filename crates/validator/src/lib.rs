@@ -398,15 +398,23 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
         let pubkeys: Vec<BlsPubkey> = secrets.iter().map(|(pubkey, _)| *pubkey).collect();
         let current_slot = clock.now().unwrap_or(0);
         let started = std::time::Instant::now();
+        // The trees an earlier start built are read back first; only the keys
+        // with none stored need `xmss_cache_url`, and so the registry wait.
+        pq::use_tree_store(&config.validators_dir);
+        let (stored, unstored): (Vec<_>, Vec<_>) = secrets
+            .iter()
+            .partition(|(pubkey, _)| pq::has_stored_trees(&config.validators_dir, pubkey));
+        let unstored: Vec<(BlsPubkey, [u8; 32])> = unstored.into_iter().copied().collect();
         let cache = match &config.xmss_cache_url {
-            Some(source) if !secrets.is_empty() => {
-                load_xmss_cache(beacon_node.as_ref(), &secrets, source.clone()).await
+            Some(source) if !unstored.is_empty() => {
+                load_xmss_cache(beacon_node.as_ref(), &unstored, source.clone()).await
             }
             _ => HashMap::new(),
         };
         info!(
             count,
             pq_epoch,
+            stored_trees = stored.len(),
             cache_records = cache.len(),
             "Deriving the validators' PQ keys"
         );
@@ -450,6 +458,7 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
         };
         info!(
             count,
+            stored = tally(pq::KeySource::Stored),
             cached = tally(pq::KeySource::Cached),
             built = tally(pq::KeySource::Built) + tally(pq::KeySource::CacheRefused),
             refused = tally(pq::KeySource::CacheRefused),

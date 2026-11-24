@@ -906,7 +906,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (ethereum-package's `vrf_state_url` file, which the package publishes and
   `ethlambda pq-keys` writes along with the genesis key file), and every leaf
   signed is recorded durably in `<validators-dir>/pq_signed_leaves.bin`
-  before its signature exists. With Lighthouse, ethlambda's blocks, envelopes,
+  before its signature exists. Each key's leanXMSS trees (leanVM's
+  `cache_to_bytes`) are stored in `<validators-dir>/pq_xmss_trees/` whenever
+  it builds a bottom tree and read first at startup, so a restart past the
+  genesis-era trees `--xmss-cache-url` holds does not rebuild one per key
+  before any duty (13 minutes for 625 keys on the PQ devnet). With Lighthouse, ethlambda's blocks, envelopes,
   data columns, aggregates and PTC votes are accepted, and the validator
   client survives a restart. The beacon node builds PQ blocks through `POST
   /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
