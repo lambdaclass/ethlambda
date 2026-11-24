@@ -159,9 +159,12 @@ jobs:
           cargo test -p ethlambda-types --lib --features preset-minimal
           cargo test -p ethlambda-state-transition --lib --features preset-minimal
 
-  # tooling/event-monitor declares its own [workspace] table, so both jobs above
-  # stop at the root members and never reach it. Hence its own job, and the
-  # `workspaces` input below pointing the cache at its target dir.
+  # tooling/event-monitor and tooling/state-hashing-bench each declare their own
+  # [workspace] table, so both jobs above stop at the root members and never
+  # reach them. Hence their own job, and the `workspaces` input below pointing
+  # the cache at their target dirs. The bench has no tests of its own, but it
+  # compiles a node source file by path (the trace format), so linting it is
+  # what catches a node change that breaks it.
   #
   # `--locked` so the committed Cargo.lock is actually enforced: without it
   # cargo silently resolves and rewrites the lockfile in CI, and a stale or
@@ -179,7 +182,9 @@ jobs:
         with:
           cache-key: tooling
           components: rustfmt, clippy
-          workspaces: tooling/event-monitor
+          workspaces: |
+            tooling/event-monitor
+            tooling/state-hashing-bench
 
       - name: Lint tooling
         working-directory: tooling/event-monitor
@@ -190,6 +195,12 @@ jobs:
       - name: Test tooling
         working-directory: tooling/event-monitor
         run: cargo test --locked
+
+      - name: Lint the state-hashing bench
+        working-directory: tooling/state-hashing-bench
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
 
   # The workspace suite in two halves; `CONSENSUS_CRATES` in the Makefile
   # defines them and says why. Both need the leanSpec fixtures and share one
@@ -276,7 +287,7 @@ jobs:
             exit 0
           fi
           status=0
-          for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do
+          for manifest in Cargo.toml tooling/event-monitor/Cargo.toml tooling/state-hashing-bench/Cargo.toml; do
             if ! cargo +nightly-2026-06-21 update --dry-run -Z min-publish-age --manifest-path "$manifest" > cooldown.txt 2>&1; then
               # Drop the index/git refresh chatter so the excerpt is the actual error; %0A = newline in annotations
               msg=$(grep -v '^ *Updating ' cooldown.txt | head -20 | sed ':a;N;$!ba;s/\n/%0A/g')

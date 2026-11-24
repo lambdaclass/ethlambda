@@ -1,0 +1,40 @@
+# Its own workspace, like `tooling/event-monitor`: `silver_state_hashing`
+# builds C and assembly (hashtree) and has no place in the node's lockfile,
+# its tests or its CI.
+[workspace]
+
+[package]
+name = "state-hashing-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The tree the node keeps its beacon state lists in, and the state's own list
+# types (`Validators`, `Balances`, ...), so the bench drives exactly what the
+# node does, update buffers included. Their `workspace = true` dependencies
+# resolve against the node's workspace manifest.
+ethlambda-ssz-tree = { path = "../../crates/common/ssz-tree" }
+ethlambda-types = { path = "../../crates/common/types" }
+# `SszDecode` for the trace's validators. The same git source and rev as the
+# node's workspace, so it is one crate with the one `ethlambda-types` uses.
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
+
+# Pinned: the comparison is with this release.
+silver_state_hashing = { version = "=0.2.0", features = ["multi-owner"] }
+
+clap = { version = "4", features = ["derive"] }
+rayon = "1.11"
+# The trace's framing, as in the node's `era` module.
+snap = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The node's allocator, used for both libraries.
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+# The node ships with this profile; a separate workspace does not inherit it.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

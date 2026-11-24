@@ -15,7 +15,7 @@
 //! the state's), and the closing state may be one block short of what the next
 //! file would add. The oracle is written around that, see [`Replay::oracle`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
@@ -27,6 +27,7 @@ use eyre::{WrapErr as _, ensure, eyre};
 use tracing::info;
 
 use super::e2store::EraFile;
+use super::hashing_record::HashingRecorder;
 use super::report::{EraReport, Outcome};
 
 /// Blocks between progress lines.
@@ -55,17 +56,25 @@ pub(super) struct Replay<'a> {
     /// One for the whole run, as the node holds one across its imports.
     caches: OwnedBlockCaches,
     max_blocks: Option<u64>,
+    /// Where `--hashing-trace` records the era's writes, if it was given.
+    hashing_trace: Option<PathBuf>,
     carried: Option<Carried>,
 }
 
 impl<'a> Replay<'a> {
-    pub(super) fn new(network: &'a str, config: &'a Config, max_blocks: Option<u64>) -> Self {
+    pub(super) fn new(
+        network: &'a str,
+        config: &'a Config,
+        max_blocks: Option<u64>,
+        hashing_trace: Option<&Path>,
+    ) -> Self {
         Self {
             network,
             config,
             engine: ExecutionEngine::valid(),
             caches: OwnedBlockCaches::default(),
             max_blocks,
+            hashing_trace: hashing_trace.map(Path::to_path_buf),
             carried: None,
         }
     }
@@ -128,6 +137,11 @@ impl<'a> Replay<'a> {
             }
             _ => self.load_state(previous, first_slot)?,
         };
+        let mut recorder = self
+            .hashing_trace
+            .as_deref()
+            .map(|path| HashingRecorder::start(path, self.network, &state))
+            .transpose()?;
 
         let apply_started = Instant::now();
         let mut block_roots: Vec<(u64, H256)> = Vec::new();
@@ -161,21 +175,41 @@ impl<'a> Replay<'a> {
                 break;
             }
             let expected_state_root = block.state_root();
-            stf::state_transition(
-                &mut state,
-                &block,
-                true,
-                self.config,
-                &self.engine,
-                self.caches.caches(),
-            )
-            .map_err(|err| {
+            let rejected = |err| {
                 eyre!(
                     "era {era} slot {slot}: block rejected: {err:?} \
                      (block commits to state_root {})",
                     hex(expected_state_root)
                 )
-            })?;
+            };
+            match &mut recorder {
+                // `process_slots` and then `apply_block` is what
+                // `state_transition` runs; split, so that the recorder sees
+                // the state between them.
+                Some(recorder) => {
+                    recorder.advance(&mut state, slot, self.config)?;
+                    let parent = state.clone();
+                    stf::apply_block(
+                        &mut state,
+                        &block,
+                        true,
+                        self.config,
+                        &self.engine,
+                        self.caches.caches(),
+                    )
+                    .map_err(rejected)?;
+                    recorder.block(&parent, &state)?;
+                }
+                None => stf::state_transition(
+                    &mut state,
+                    &block,
+                    true,
+                    self.config,
+                    &self.engine,
+                    self.caches.caches(),
+                )
+                .map_err(rejected)?,
+            }
             report.blocks_applied += 1;
             if report.blocks_applied.is_multiple_of(PROGRESS_EVERY) {
                 info!(
@@ -188,6 +222,9 @@ impl<'a> Replay<'a> {
             }
         }
         report.apply_secs = apply_started.elapsed().as_secs_f64();
+        if let Some(recorder) = recorder {
+            recorder.finish()?;
+        }
         if report.blocks_applied > 0 {
             report.mean_ms_per_block = report.apply_secs * 1000.0 / report.blocks_applied as f64;
         }

@@ -89,7 +89,7 @@ update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS=
 cooldown-check: ## 🔎 Fail if a lockfile pins crates younger than the publish-age cooldown
 	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
 	status=0; \
-	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do \
+	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml tooling/state-hashing-bench/Cargo.toml; do \
 		if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age --manifest-path $$manifest 2>&1); then \
 			echo "WARNING: publish-age cooldown probe failed for $$manifest:"; echo "$$out" | grep -v "^ *Updating " | head -20; continue; \
 		fi; \

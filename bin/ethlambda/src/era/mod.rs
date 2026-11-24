@@ -8,6 +8,8 @@
 
 mod download;
 mod e2store;
+mod hashing_record;
+mod hashing_trace;
 mod replay;
 mod report;
 
@@ -62,6 +64,12 @@ pub(crate) struct ReplayEraOptions {
     /// Write a JSON report of every era to this path.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Record what each epoch transition and each block wrote to the state's
+    /// validator-indexed lists, with their roots, to this file: the input of
+    /// `tooling/state-hashing-bench`. Takes a single `--era`; combine it with
+    /// `--max-blocks` to bound the trace.
+    #[arg(long)]
+    hashing_trace: Option<PathBuf>,
 }
 
 /// `--max-blocks` leaves the state mid-era, so a second `--era` could only
@@ -76,8 +84,19 @@ fn check_max_blocks(eras: &[EraArg], max_blocks: Option<u64>) -> eyre::Result<()
     Ok(())
 }
 
+/// A trace is one unbroken run of steps from one starting state, which a
+/// second `--era` would not continue if it started fresh.
+fn check_hashing_trace(eras: &[EraArg], hashing_trace: Option<&Path>) -> eyre::Result<()> {
+    ensure!(
+        hashing_trace.is_none() || eras.len() <= 1,
+        "--hashing-trace records one era, so it cannot be combined with several --era values"
+    );
+    Ok(())
+}
+
 pub(crate) fn run(options: ReplayEraOptions) -> eyre::Result<()> {
     check_max_blocks(&options.eras, options.max_blocks)?;
+    check_hashing_trace(&options.eras, options.hashing_trace.as_deref())?;
     let spec = NetworkSpec::parse(&options.network)?;
     let source = NetworkSource::resolve(&spec)?;
     let config = source.config();
@@ -143,7 +162,12 @@ pub(crate) fn run(options: ReplayEraOptions) -> eyre::Result<()> {
         paths.insert(era, path);
     }
 
-    let mut replay = Replay::new(&name, config, options.max_blocks);
+    let mut replay = Replay::new(
+        &name,
+        config,
+        options.max_blocks,
+        options.hashing_trace.as_deref(),
+    );
     let mut reports: Vec<EraReport> = Vec::new();
     for &era in &eras {
         let report = replay.era(era, &paths[&(era - 1)], &paths[&era]);
@@ -259,6 +283,17 @@ mod tests {
         assert!(check_max_blocks(&two, None).is_ok());
         let err = check_max_blocks(&two, Some(512)).unwrap_err();
         assert!(err.to_string().contains("--max-blocks"), "{err}");
+    }
+
+    #[test]
+    fn hashing_trace_refuses_chained_eras() {
+        let trace = Path::new("trace.bin");
+        let one = [EraArg::Number(9)];
+        let two = [EraArg::Number(9), EraArg::Number(10)];
+        assert!(check_hashing_trace(&one, Some(trace)).is_ok());
+        assert!(check_hashing_trace(&two, None).is_ok());
+        let err = check_hashing_trace(&two, Some(trace)).unwrap_err();
+        assert!(err.to_string().contains("--hashing-trace"), "{err}");
     }
 
     #[test]

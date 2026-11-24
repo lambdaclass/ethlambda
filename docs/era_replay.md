@@ -78,6 +78,7 @@ ethlambda replay-era --network <mainnet|sepolia|hoodi|dir> --era-dir <dir> \
 | `--download` | Fetch missing files from `https://<network>.era.nimbus.team/`, matching the `<network>-<NNNNN>-` prefix in the index page. Written to `.part`, renamed on success |
 | `--max-blocks` | Smoke mode: stop the era after K applied blocks. Per-block checks still run; the end-of-era checks are skipped and reported as `skipped`. Takes a single `--era`; combining it with several is a CLI error, since a smoke run stops mid-era and cannot chain |
 | `--report` | JSON array with one entry per era: network, era, `blocks_applied`, `blocks_already_in_state`, `skipped_empty_slots`, `elapsed_secs`, `apply_secs`, `mean_ms_per_block`, the oracle checks with their outcome, and `error` |
+| `--hashing-trace` | Also record, to this file, what each epoch transition and each block wrote to the state's five validator-indexed lists (validators, balances, both participation lists, inactivity scores) and each list's root after it: the input of `tooling/state-hashing-bench`, which replays those writes through other Merkle-tree libraries. Takes a single `--era`; `--max-blocks` bounds it. Altair through fulu only. The format is described in `bin/ethlambda/src/era/hashing_trace.rs` |
 
 Every era needs two files, its own and its predecessor's: about 1.5 GB for a
 recent mainnet era. The command logs one line per era start and end and a
