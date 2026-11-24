@@ -232,9 +232,13 @@ pub fn wire_params(
     let attestation_subnets_pq =
         ethlambda_p2p::beacon::subnets::compute_subscribed_subnets_pq(node_id, epoch, &chain)
             .map_err(|err| eyre::eyre!("computing the PQ attestation subnet backbone: {err:?}"))?;
+    // Both sets when the network schedules PQ: the first is out of PQ's range,
+    // so logging it alone reads as a node backboning subnets that do not exist.
+    let pq_scheduled = chain.pq_fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
     info!(
         subnets_per_node = chain.subnets_per_node,
         subnets = ?attestation_subnets,
+        pq_subnets = ?pq_scheduled.then_some(&attestation_subnets_pq),
         "Backboning attestation subnets"
     );
 
