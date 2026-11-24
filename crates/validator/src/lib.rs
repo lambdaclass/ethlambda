@@ -102,7 +102,7 @@ use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
-use crate::duties::DutiesService;
+use crate::duties::{DutiesService, ProposerDutiesVersion};
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
@@ -466,73 +466,57 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // offset can never propose, because by the time it runs the slot it
             // would be proposing for is already a third gone.
             //
-            // Waking at the boundary and sleeping further in reaches both, and
-            // gives the epoch refresh below a third of a slot of headroom it did
-            // not have when it ran at the attester offset itself, where every
-            // second it took came straight out of the attestation's lateness.
+            // Waking at the boundary and sleeping further in reaches both. The
+            // epoch refresh no longer stands between the two (see below).
             let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
             tokio::time::sleep(delay).await;
             served = Some(slot);
 
             let epoch = clock.epoch_of(slot);
+            let refresh_due = last_epoch != Some(epoch);
 
-            // What the refresh below leaves owing once the slot's block is
-            // out: the subnet subscriptions when it moved the attester
-            // schedule, and the builder registrations of the validators it
-            // resolved.
-            let mut resubscribe = false;
-            let mut to_register = None;
-            if last_epoch != Some(epoch) {
-                // Snapshot the pubkeys and let the guard drop right here, before
-                // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
-                // validator lookup). Passing the guard itself in used to extend
-                // it across that whole call, because `&*store.read().await` as a
-                // match scrutinee has its temporary lifetime extended to the
-                // entire match. Holding a read lock that long lets the
-                // keymanager's write lock (`http_api::keystores::import`, held
-                // across slow EIP-2335 derivation) queue ahead of it, and since
-                // `tokio::sync::RwLock` is write-preferring, every read after
-                // that point, including this one next epoch, would starve until
-                // the import finished.
-                let pubkeys = store.read().await.pubkeys();
-                let refreshed = refresh_epoch(
-                    &beacon_node,
-                    &mut duties,
-                    &pubkeys,
-                    epoch,
-                    &settings,
-                    &context,
-                );
-                match refreshed.await {
-                    Ok(Refreshed {
-                        moved,
-                        registrable,
-                        resolved: refreshed_entries,
-                    }) => {
-                        last_epoch = Some(epoch);
-                        resubscribe = moved;
-                        to_register = Some(registrable);
-                        resolved = Arc::new(refreshed_entries);
-                    }
-                    // A beacon node that is down, syncing or answering badly will
-                    // likely answer next epoch, so keep the schedule already held
-                    // and try again. Anything else will not fix itself, and looping
-                    // on it would hide the cause behind a warning every slot.
-                    Err(err) if err.is_retryable() => {
-                        warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
-                        metrics::set_beacon_node_available(false);
-                    }
-                    // Unreachable today: every error `refresh_epoch` can produce
-                    // comes from a `BeaconNodeApi` call, and every variant those
-                    // raise is classified retryable (see `Error::is_retryable`).
-                    // Kept rather than deleted, since it is the only thing that
-                    // would stop the process if a future non-retryable failure
-                    // (a local config or key problem, say) ever reached this
-                    // point; do not remove it as unreachable dead code.
-                    Err(err) => {
-                        error!(%epoch, %err, "Cannot refresh duties; stopping");
-                        return err;
-                    }
+            // Snapshot the pubkeys and let the guard drop right here, before
+            // `refresh_epoch`'s awaits (a sync check, the duties fetches, a
+            // validator lookup). Passing the guard itself in used to extend it
+            // across that whole call, because `&*store.read().await` as a match
+            // scrutinee has its temporary lifetime extended to the entire
+            // match. Holding a read lock that long lets the keymanager's write
+            // lock (`http_api::keystores::import`, held across slow EIP-2335
+            // derivation) queue ahead of it, and since `tokio::sync::RwLock` is
+            // write-preferring, every read after that point, including this one
+            // next epoch, would starve until the import finished.
+            let pubkeys = if refresh_due {
+                store.read().await.pubkeys()
+            } else {
+                Vec::new()
+            };
+
+            // Only what the slot's block cannot go without, ahead of it: the
+            // whole refresh when nothing held says who acts this epoch (the
+            // first slot served, or a lookahead that failed), and otherwise at
+            // most this epoch's proposers when none are held. From fulu they
+            // are fetched an epoch ahead, so an epoch's first slot normally
+            // proposes with no request in front of its block. See
+            // `ahead_of_block`.
+            let early = ahead_of_block(
+                &beacon_node,
+                &mut duties,
+                &pubkeys,
+                &clock,
+                slot,
+                refresh_due,
+                &settings,
+                &context,
+            )
+            .await;
+            // The refresh still owed this slot: due, and not run above.
+            let defer_refresh = refresh_due && early.is_none();
+            // What a refresh leaves owing once the slot's block is out.
+            let mut owed = None;
+            if let Some(outcome) = early {
+                match settle_refresh(epoch, outcome, &mut last_epoch, &mut resolved) {
+                    Ok(settled) => owed = settled,
+                    Err(err) => return err,
                 }
             }
 
@@ -562,76 +546,101 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // slot's duties.
             tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
-            // The subscriptions the refresh above left owing, sent from a task
-            // of their own and only now, after the block.
-            //
-            // Each one needs a selection proof, and for a remote key that is a
-            // round trip to its signer: awaited here, or inside the refresh as
-            // they once were, a slow signer would stand between the slot
-            // boundary and this slot's block, a block from a local key
-            // included, for as long as the signing budget lets it. Started
-            // after the proposal rather than beside it so the proofs do not
-            // queue ahead of the block's own signatures at the same signer
-            // either (requests to one signer are capped, see `Web3Signer`).
-            //
-            // Nothing waits on them. The schedule covers this epoch and the
-            // next, so the duties that are near were subscribed an epoch ago,
-            // and the proofs are remembered for the aggregation whenever they
-            // land.
-            if resubscribe {
-                let (beacon_node, store, context) =
-                    (beacon_node.clone(), store.clone(), context.clone());
-                let owed = duties.all();
-                tokio::spawn(async move {
-                    let subscribed =
-                        subscriptions::subscribe(&beacon_node, &owed, &store, &context);
-                    let _ = subscribed.await.inspect_err(|err| {
-                        warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
-                        metrics::set_beacon_node_available(false);
-                    });
-                });
+            // What a refresh run ahead of the block left owing, now that the
+            // block is out. See `send_owed`.
+            if let Some(owed) = owed {
+                send_owed(
+                    owed,
+                    epoch,
+                    &beacon_node,
+                    &duties,
+                    &store,
+                    &context,
+                    &registration,
+                );
             }
 
-            // The epoch's full registration send, after the block for the
-            // subscriptions' reason: each registration it signs anew is a
-            // request to a remote key's signer, which must not queue ahead of
-            // the block's own. Only after a refresh that got all the way
-            // through, so a failing one does not respawn a full send every
-            // slot, and spawned so a slow or hung node never delays this
-            // epoch's duties: a missed registration costs at most a builder
-            // block, never a duty.
-            if let (Some(registration), Some(registrable)) = (&registration, to_register) {
-                let registration = registration.clone();
-                tokio::spawn(registration.register_all(epoch, registrable, store.clone()));
-            }
-
-            // The rest of the way to the first of the slot's remaining duties:
-            // the attester offset, or the sync committee offset when the network
-            // puts it earlier. Zero if the refresh or the proposal above already
-            // ran past it, in which case the duty is late rather than skipped.
-            // Each branch of `serve_slot_duties` waits for its own offset.
-            tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+            // This epoch's payload committee schedule, while none is held:
+            // the gloas fork epoch's cannot be fetched before the fork (see
+            // `refresh_ptc`), and any other epoch's lookahead can have failed.
+            // A single request, bounded by the first of the slot's own duties,
+            // so it delays none of them, and ahead of the committee lookup
+            // below so this slot's vote is not lost to it.
+            let budget = clock.until_first_slot_duty(slot, SystemTime::now());
+            retry_missing_ptc(&mut duties, epoch, budget, &context).await;
 
             // Attesting and aggregating both start from these, so a key
             // doppelganger protection still withholds does neither; its sync
             // committee and payload committee duties go on (see
-            // `doppelganger`).
+            // `doppelganger`). Read from the schedule held now, which the
+            // previous epoch's lookahead filled for an epoch's first slot, so
+            // they need nothing from the refresh below.
             let slot_duties = withhold_uncleared(&context, slot, duties.at_slot(slot, epoch));
             let committee = duties.ptc_at_slot(slot, epoch);
             let sync_duties = duties.sync_at_slot(slot);
-            serve_slot_duties(
-                &attestation,
-                &aggregation,
-                &payload_attestation,
-                &sync_committee,
-                &clock,
-                slot,
-                &slot_duties,
-                &committee,
-                &sync_duties,
-                &store,
-            )
-            .await;
+
+            // The epoch's refresh, when it is owed and did not run ahead of
+            // the block: after the block, beside the slot's duties rather than
+            // in front of them, and bounded by the end of the slot so a slow
+            // node holds the loop for one slot at most. A refresh cut off there
+            // is retried at the next slot, as a failed one is.
+            let refresh = async {
+                if !defer_refresh {
+                    return None;
+                }
+                let budget = clock.remaining_in(slot, SystemTime::now());
+                let refreshed = bounded_refresh(
+                    &beacon_node,
+                    &mut duties,
+                    &pubkeys,
+                    slot,
+                    epoch,
+                    &settings,
+                    &context,
+                    budget,
+                );
+                Some(refreshed.await)
+            };
+            let slot_work = async {
+                // The rest of the way to the first of the slot's remaining
+                // duties: the attester offset, or the sync committee offset
+                // when the network puts it earlier. Zero if the proposal above
+                // already ran past it, in which case the duty is late rather
+                // than skipped. Each branch of `serve_slot_duties` waits for
+                // its own offset.
+                tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+                serve_slot_duties(
+                    &attestation,
+                    &aggregation,
+                    &payload_attestation,
+                    &sync_committee,
+                    &clock,
+                    slot,
+                    &slot_duties,
+                    &committee,
+                    &sync_duties,
+                    &store,
+                )
+                .await;
+            };
+            let (deferred, ()) = tokio::join!(refresh, slot_work);
+            if let Some(outcome) = deferred {
+                match settle_refresh(epoch, outcome, &mut last_epoch, &mut resolved) {
+                    Ok(Some(owed)) => {
+                        send_owed(
+                            owed,
+                            epoch,
+                            &beacon_node,
+                            &duties,
+                            &store,
+                            &context,
+                            &registration,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => return err,
+                }
+            }
 
             // Off the slot loop, like the epoch's full send: a keymanager change
             // to a fee recipient or gas limit reaches the builder within a slot,
@@ -650,19 +659,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // loop like the sends above. The refresh's slot too, although its
             // refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
-
-            // This epoch's payload committee schedule again, while none is
-            // held. The gloas fork epoch's is fetched at its first slot only
-            // (see `refresh_ptc`), so without this one failed request there
-            // would cost the whole first gloas epoch's votes; for any other
-            // epoch it covers a lookahead and a refresh that both failed.
-            // After the slot's duties and bounded by the slot's end, so it
-            // never delays a duty. Only once this epoch's refresh got through:
-            // until then the refresh itself runs again every slot.
-            if last_epoch == Some(epoch) {
-                let budget = clock.remaining_in(slot, SystemTime::now());
-                retry_missing_ptc(&mut duties, epoch, budget, &context).await;
-            }
         }
     };
 
@@ -1160,7 +1156,7 @@ struct Refreshed {
     /// owed this client's subnet subscriptions, which the caller sends once
     /// the slot's block is out rather than having them sent from the refresh:
     /// each needs a selection proof, a round trip per remote key, and the
-    /// refresh runs ahead of the proposal. See the duty loop in [`run`].
+    /// refresh can run ahead of the proposal. See [`send_owed`].
     moved: bool,
     /// The pubkeys a builder registration is signed for: those the beacon
     /// node resolved to an index whose validator is pending or active (see
@@ -1170,6 +1166,184 @@ struct Refreshed {
     /// loop re-sends the proposer preparations of each slot until the next
     /// refresh (see [`Preparations`]).
     resolved: Vec<ValidatorEntry>,
+}
+
+/// What the duty loop runs at a slot boundary before it proposes, which is as
+/// little as the slot's block can do with.
+///
+/// An epoch's refresh is up to a dozen requests, and the block needs one
+/// thing from it: whether one of this client's validators proposes. So:
+///
+/// - **The whole refresh**, when it is due and the schedule held cannot say
+///   who acts this epoch: no validator index resolved yet (the first slot
+///   served) or no attester schedule for the epoch (its lookahead failed).
+///   Bounded by the end of the slot. Returned, for the caller to settle.
+/// - **This epoch's proposers alone**, when no proposer schedule is held for
+///   it: before fulu, where they cannot be fetched an epoch ahead, or after a
+///   prefetch that failed. Bounded by the proposal's own budget, the
+///   attester offset, since a block cannot be proposed past it anyway. A
+///   failure is logged, and the next slot asks again.
+/// - **Nothing**, otherwise: the case at every fulu epoch's first slot, whose
+///   proposers the previous epoch's refresh fetched. The refresh then runs
+///   after the block (see the duty loop in [`run`]).
+#[allow(clippy::too_many_arguments)]
+async fn ahead_of_block<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    duties: &mut DutiesService<B>,
+    pubkeys: &[BlsPubkey],
+    clock: &SlotClock,
+    slot: u64,
+    refresh_due: bool,
+    settings: &ProposerSettings,
+    context: &SigningContext,
+) -> Option<Result<Refreshed>> {
+    let epoch = clock.epoch_of(slot);
+    let schedule_held = !duties.indices().is_empty() && duties.holds_attesters(epoch);
+    if refresh_due && !schedule_held {
+        let budget = clock.remaining_in(slot, SystemTime::now());
+        let refreshed = bounded_refresh(
+            beacon_node,
+            duties,
+            pubkeys,
+            slot,
+            epoch,
+            settings,
+            context,
+            budget,
+        );
+        return Some(refreshed.await);
+    }
+
+    if !duties.holds_proposers(epoch) && !duties.indices().is_empty() {
+        let version = ProposerDutiesVersion::for_epoch(&context.config, epoch);
+        let budget = clock.until_attestation(slot, SystemTime::now());
+        let fetched = tokio::time::timeout(budget, duties.refresh_proposers(epoch, version));
+        match fetched.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(%slot, %err, "Proposer duties fetch failed; asking again next slot");
+                metrics::set_beacon_node_available(false);
+            }
+            Err(_) => {
+                warn!(
+                    %slot,
+                    budget_ms = budget.as_millis() as u64,
+                    "Proposer duties fetch ran past this slot's proposal budget; asking again \
+                     next slot"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// [`refresh_epoch`], abandoned once `budget` runs out.
+///
+/// Dropping it mid-way is safe: every fetch in it answers in full before it
+/// changes the schedule it fetched (see [`DutiesService::refresh_around`]), so
+/// an abandoned refresh leaves each schedule either refreshed or as it was,
+/// never half of one. It is retried at the next slot, as a failed one is.
+#[allow(clippy::too_many_arguments)]
+async fn bounded_refresh<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    duties: &mut DutiesService<B>,
+    pubkeys: &[BlsPubkey],
+    slot: u64,
+    epoch: u64,
+    settings: &ProposerSettings,
+    context: &SigningContext,
+    budget: std::time::Duration,
+) -> Result<Refreshed> {
+    let refreshed = refresh_epoch(beacon_node, duties, pubkeys, epoch, settings, context);
+    tokio::time::timeout(budget, refreshed)
+        .await
+        .unwrap_or(Err(Error::DutyRefreshDeadline { epoch, slot }))
+}
+
+/// Record a refresh's outcome in the duty loop's state, and hand back what it
+/// leaves owing for [`send_owed`].
+///
+/// One that got through marks `epoch` refreshed and replaces the validators
+/// whose preparations are re-sent every slot. One that failed leaves both as
+/// they were, so the held schedule stays in use and the next slot tries again.
+/// Only a failure that will not fix itself is returned, to stop the client.
+fn settle_refresh(
+    epoch: u64,
+    outcome: Result<Refreshed>,
+    last_epoch: &mut Option<u64>,
+    resolved: &mut Arc<Vec<ValidatorEntry>>,
+) -> std::result::Result<Option<Refreshed>, Error> {
+    match outcome {
+        Ok(mut refreshed) => {
+            *last_epoch = Some(epoch);
+            *resolved = Arc::new(std::mem::take(&mut refreshed.resolved));
+            Ok(Some(refreshed))
+        }
+        // A beacon node that is down, syncing, slow or answering badly will
+        // likely answer later, so keep the schedule already held and try
+        // again. Anything else will not fix itself, and looping on it would
+        // hide the cause behind a warning every slot.
+        Err(err) if err.is_retryable() => {
+            warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
+            metrics::set_beacon_node_available(false);
+            Ok(None)
+        }
+        // Unreachable today: every error `refresh_epoch` can produce comes
+        // from a `BeaconNodeApi` call or its deadline, and every variant those
+        // raise is classified retryable (see `Error::is_retryable`). Kept
+        // rather than deleted, since it is the only thing that would stop the
+        // process if a future non-retryable failure (a local config or key
+        // problem, say) ever reached this point; do not remove it as
+        // unreachable dead code.
+        Err(err) => {
+            error!(%epoch, %err, "Cannot refresh duties; stopping");
+            Err(err)
+        }
+    }
+}
+
+/// Send what a refresh left owing, from tasks of their own, once the slot's
+/// block is out: the subnet subscriptions when it moved the attester
+/// schedule, and the builder registrations of the validators it resolved.
+///
+/// Each subscription needs a selection proof, and each registration signed
+/// anew a signature: for a remote key, a round trip to its signer. Awaited
+/// on the duty loop, a slow signer would stand between the slot boundary and
+/// a block, a block from a local key included, for as long as the signing
+/// budget lets it; started before the proposal, they would queue ahead of the
+/// block's own signatures at the same signer (requests to one signer are
+/// capped, see `Web3Signer`).
+///
+/// Nothing waits on them. The schedule covers this epoch and the next, so the
+/// duties that are near were subscribed an epoch ago, and the proofs are
+/// remembered for the aggregation whenever they land. A missed registration
+/// costs at most a builder block, never a duty. Only a refresh that got all
+/// the way through leaves anything owing, so a failing one does not respawn a
+/// full registration send every slot.
+fn send_owed<B: BeaconNodeApi + 'static>(
+    owed: Refreshed,
+    epoch: u64,
+    beacon_node: &Arc<B>,
+    duties: &DutiesService<B>,
+    store: &Arc<RwLock<ValidatorStore>>,
+    context: &Arc<SigningContext>,
+    registration: &Option<Arc<RegistrationService<B>>>,
+) {
+    if owed.moved {
+        let (beacon_node, store, context) = (beacon_node.clone(), store.clone(), context.clone());
+        let schedule = duties.all();
+        tokio::spawn(async move {
+            let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
+            let _ = subscribed.await.inspect_err(|err| {
+                warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
+                metrics::set_beacon_node_available(false);
+            });
+        });
+    }
+    if let Some(registration) = registration {
+        let registration = registration.clone();
+        tokio::spawn(registration.register_all(epoch, owed.registrable, store.clone()));
+    }
 }
 
 /// Resolve any newly activated validators and refresh the duty schedule.
@@ -1216,8 +1390,10 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     metrics::set_validators_resolved(indices.len() as u64);
     duties.set_indices(indices);
 
-    // Sent here, ahead of the epoch's duties, and then again every slot by the
-    // duty loop (see `Preparations`).
+    // Sent here, with the epoch's duties, and then again every slot by the
+    // duty loop (see `Preparations`). Ahead of a block only on the refresh the
+    // loop runs before one (see `ahead_of_block`), the first slot served
+    // among them, when the node may not have heard from this client yet.
     //
     // A failure is logged rather than propagated. The consequence is a payload
     // built for the wrong address, which the check before signing catches; the
@@ -1234,7 +1410,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         );
     });
 
-    let changed = duties.refresh_around(epoch).await?;
+    let changed = duties.refresh_around(epoch, &context.config).await?;
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
@@ -1333,14 +1509,15 @@ fn preparations<'a>(
 /// at most every other one on 12 s slots, more on shorter ones, never all of
 /// them.
 ///
-/// The epoch refresh's send does not take part. It runs on the duty loop
-/// ahead of the epoch's first proposal, where skipping would cost that
-/// proposal its preparation, and waiting on a hung node would cost it up to
-/// that timeout. A re-send still in flight from the slot before can then land
-/// after it, which is why the refresh's slot re-sends too, once its duties are
-/// done, although its refresh just sent the same: the late send can then cost
-/// at most the epoch's first proposal. If it is still running at that point,
-/// that re-send skips and the next slot's puts the current address back.
+/// The epoch refresh's send does not take part. It is the first a node hears
+/// of a validator the refresh resolved for the first time, and on the first
+/// slot served it runs ahead of the slot's block (see `ahead_of_block`), where
+/// skipping would cost that proposal its preparation. A re-send still in
+/// flight from the slot before can then land after it, which is why the
+/// refresh's slot re-sends too, once its duties are done, although its
+/// refresh just sent the same: the late send can then cost at most the next
+/// proposal. If it is still running at that point, that re-send skips and the
+/// next slot's puts the current address back.
 ///
 /// # Quiet on failure
 ///
@@ -1445,7 +1622,7 @@ fn is_registrable(status: &str) -> bool {
 /// with the epoch after it as the lookahead. A failed fetch is logged and
 /// shrugged off, like the proposer and lookahead ones: it must not cost this
 /// epoch's attester schedule, which is already in hand. The current epoch's is
-/// then fetched again after each slot's duties until one is held
+/// then fetched again ahead of each slot's duties until one is held
 /// ([`retry_missing_ptc`]).
 async fn refresh_ptc<B: BeaconNodeApi>(
     duties: &mut DutiesService<B>,
@@ -1473,12 +1650,16 @@ async fn refresh_ptc<B: BeaconNodeApi>(
 /// Fetch this epoch's payload timeliness committee schedule again, within
 /// `budget`, when it is a gloas epoch and none is held.
 ///
-/// The duty loop calls it after every slot's duties, so a failed fetch costs
-/// the votes of the slots until the next one succeeds rather than the rest of
-/// the epoch. A failure here is logged at debug: `refresh_ptc` already warned
-/// once, and this runs again every slot until it succeeds. Dropping the fetch
-/// at the deadline is safe, since `DutiesService::refresh_ptc` changes nothing
-/// until its request has answered.
+/// The duty loop calls it every slot, after the block and ahead of reading the
+/// slot's committee, so a failed fetch costs the votes of the slots until the
+/// next one succeeds rather than the rest of the epoch. That is also how the
+/// gloas fork epoch's first slot gets its committee: the schedule cannot be
+/// fetched before the fork, and the epoch's refresh runs beside the slot's
+/// duties, too late for their committee lookup. A failure here is logged at
+/// debug: `refresh_ptc` already warned once, and this runs again every slot
+/// until it succeeds. Dropping the fetch at the deadline is safe, since
+/// `DutiesService::refresh_ptc` changes nothing until its request has
+/// answered.
 async fn retry_missing_ptc<B: BeaconNodeApi>(
     duties: &mut DutiesService<B>,
     epoch: u64,
@@ -1998,6 +2179,237 @@ mod tests {
 
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         assert!(node.preparations().is_empty());
+    }
+
+    // ---- what runs ahead of an epoch's first block (#826) -----------------
+
+    /// Mainnet's config with every fork through fulu at genesis, so every
+    /// epoch after the first has its proposers fixed an epoch ahead.
+    fn fulu_context() -> SigningContext {
+        use ethlambda_types::beacon::fork::ForkName;
+        let config = [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+        ]
+        .into_iter()
+        .fold(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            |config, fork| config.with_fork_epoch(fork, 0),
+        );
+        SigningContext::new(config, Root::ZERO)
+    }
+
+    /// A clock on `context`'s chain whose `slot` started at most a second ago.
+    fn clock_at(slot: u64, context: &SigningContext) -> SlotClock {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+        let genesis = now - slot * context.config.slot_duration_ms / 1000;
+        SlotClock::from_config(genesis, &context.config)
+    }
+
+    fn proposer_duty(index: u64, slot: u64) -> crate::beacon_node::dto::ProposerDutyDto {
+        crate::beacon_node::dto::ProposerDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&[0u8; 48]),
+            validator_index: index,
+            slot,
+        }
+    }
+
+    /// Every duty-related request `node` has answered so far, by kind.
+    fn requests(node: &MockBeaconNode) -> [usize; 6] {
+        [
+            node.validator_indices_call_count(),
+            node.duties_call_count(),
+            node.proposer_duties_call_count(),
+            node.proposer_duties_v2_call_count(),
+            node.preparations().len(),
+            node.sync_duty_requests().len(),
+        ]
+    }
+
+    /// From fulu the previous epoch's refresh fetched this epoch's proposers,
+    /// so at its first slot nothing stands between the boundary and the
+    /// block: the refresh is left for after it.
+    #[tokio::test]
+    async fn from_fulu_an_epochs_first_slot_asks_nothing_ahead_of_its_block() {
+        let node = Arc::new(
+            node()
+                .with_proposers_v2(3, Root::repeat_byte(1), Vec::new())
+                .with_proposers_v2(4, Root::repeat_byte(2), vec![proposer_duty(11, 128)]),
+        );
+        let context = fulu_context();
+        let settings = settings(Some(H160([0xab; 20])));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context)
+            .await
+            .expect("refreshes");
+        let before = requests(&node);
+
+        let clock = clock_at(128, &context);
+        let early = ahead_of_block(
+            &node,
+            &mut duties,
+            &keys,
+            &clock,
+            128,
+            true,
+            &settings,
+            &context,
+        )
+        .await;
+
+        assert!(early.is_none(), "the refresh is left for after the block");
+        assert_eq!(
+            requests(&node),
+            before,
+            "nothing is asked ahead of the block"
+        );
+        assert_eq!(
+            duties
+                .proposer_at_slot(128, 4)
+                .map(|duty| duty.validator_index),
+            Some(11)
+        );
+    }
+
+    /// Before fulu the next epoch's proposers cannot be known an epoch ahead,
+    /// so an epoch's first slot asks for them, and for nothing else, before
+    /// its block.
+    #[tokio::test]
+    async fn before_fulu_an_epochs_first_slot_asks_for_its_proposers_alone() {
+        let node =
+            Arc::new(node().with_proposers(4, Root::repeat_byte(2), vec![proposer_duty(11, 128)]));
+        let context = context();
+        let settings = settings(Some(H160([0xab; 20])));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context)
+            .await
+            .expect("refreshes");
+        assert!(!duties.holds_proposers(4), "not prefetched before fulu");
+        let [indices, attesters, v1, v2, preparations, sync] = requests(&node);
+
+        let clock = clock_at(128, &context);
+        let early = ahead_of_block(
+            &node,
+            &mut duties,
+            &keys,
+            &clock,
+            128,
+            true,
+            &settings,
+            &context,
+        )
+        .await;
+
+        assert!(early.is_none(), "the refresh is left for after the block");
+        assert_eq!(
+            requests(&node),
+            [indices, attesters, v1 + 1, v2, preparations, sync],
+            "one v1 proposer request and nothing else"
+        );
+        assert_eq!(
+            duties
+                .proposer_at_slot(128, 4)
+                .map(|duty| duty.validator_index),
+            Some(11)
+        );
+    }
+
+    /// The first slot served holds no schedule at all, so the whole refresh
+    /// runs before its block: nothing else can say whether this client
+    /// proposes there.
+    #[tokio::test]
+    async fn with_nothing_held_the_whole_refresh_runs_ahead_of_the_block() {
+        let node = Arc::new(node());
+        let context = context();
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+
+        let clock = clock_at(96, &context);
+        let early = ahead_of_block(
+            &node,
+            &mut duties,
+            &keys,
+            &clock,
+            96,
+            true,
+            &settings(None),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(early, Some(Ok(_))), "got {early:?}");
+        assert_eq!(node.validator_indices_call_count(), 1);
+        assert!(duties.holds_attesters(3) && duties.holds_proposers(3));
+    }
+
+    /// A refresh a node holds past the end of its slot is abandoned, so the
+    /// loop goes on to the next slot's duties on time, and retried there: the
+    /// epoch is not marked refreshed.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_held_past_the_end_of_its_slot_is_abandoned() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let node = Arc::new(node().with_preparation_gate(gate));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let budget = std::time::Duration::from_secs(12);
+
+        let started = tokio::time::Instant::now();
+        let outcome = bounded_refresh(
+            &node,
+            &mut duties,
+            &keys,
+            96,
+            3,
+            &settings(Some(H160([0xab; 20]))),
+            &context(),
+            budget,
+        )
+        .await;
+        assert_eq!(started.elapsed(), budget);
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::DutyRefreshDeadline { epoch: 3, slot: 96 })
+            ),
+            "got {outcome:?}"
+        );
+
+        let mut last_epoch = Some(2);
+        let mut resolved = Arc::default();
+        let owed = settle_refresh(3, outcome, &mut last_epoch, &mut resolved)
+            .expect("a deadline does not stop the client");
+        assert!(owed.is_none(), "an abandoned refresh owes nothing");
+        assert_eq!(last_epoch, Some(2), "the refresh runs again next slot");
+    }
+
+    /// A refresh that got through marks its epoch done and hands over the
+    /// validators whose preparations are re-sent every slot.
+    #[tokio::test]
+    async fn a_settled_refresh_marks_its_epoch_and_keeps_what_it_resolved() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let outcome =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context()).await;
+
+        let mut last_epoch = Some(2);
+        let mut resolved = Arc::default();
+        let owed = settle_refresh(3, outcome, &mut last_epoch, &mut resolved)
+            .expect("settles")
+            .expect("owes its sends");
+        assert_eq!(last_epoch, Some(3));
+        assert_eq!(resolved.len(), 2);
+        assert!(owed.moved, "the first schedule is a move");
+        assert_eq!(owed.registrable.len(), 2);
     }
 
     // ---- gloas ----------------------------------------------------------
