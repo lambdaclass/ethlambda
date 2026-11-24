@@ -438,6 +438,25 @@ static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+/// One `on_fast_confirmation` run of the beacon Fast Confirmation Rule: the
+/// balance and score reads (from the fork choice's caches, a fold on an
+/// epoch's first slot), the per-block safety checks and the variable
+/// bookkeeping, excluding the head computation that precedes it.
+///
+/// Buckets reach a whole mainnet slot, since a run that costs seconds is one
+/// the chain actor cannot afford at the start of a slot.
+static LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_fast_confirmation_time_seconds",
+            "Duration of one beacon Fast Confirmation Rule run",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -1217,6 +1236,12 @@ pub fn time_beacon_head_compute() -> TimingGuard {
     TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
 }
 
+/// Start timing one beacon Fast Confirmation Rule run. Records when the guard
+/// is dropped, including on the error path, like [`time_beacon_head_compute`].
+pub fn time_beacon_fast_confirmation() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_FAST_CONFIRMATION_TIME_SECONDS)
+}
+
 /// Increment the PQ aggregated signatures counter.
 pub fn inc_pq_sig_aggregated_signatures() {
     LEAN_PQ_SIG_AGGREGATED_SIGNATURES_TOTAL.inc();
@@ -1743,4 +1768,93 @@ pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
             .unwrap()
         });
     LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// Count one `engine_getBlobsV2` attempt for a held fulu block, by what came
+/// back: `hit` (every blob), `miss` (the execution client answered `null`, so
+/// at least one blob is not in its pool) or `error` (transport, timeout or a
+/// malformed answer).
+pub fn inc_engine_get_blobs(outcome: &str) {
+    static LEAN_ENGINE_GET_BLOBS_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_get_blobs_total",
+                "engine_getBlobsV2 attempts for held blocks by outcome (hit, miss, error)",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Held blocks not asked about because the execution-client ask budget was
+/// spent (`beacon_blobs::AskBudget`): `slot_budget` (the block's slot already
+/// had its share of asks) or `in_flight` (too many asks running).
+pub fn inc_engine_get_blobs_skipped(reason: &str) {
+    static LEAN_ENGINE_GET_BLOBS_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_get_blobs_skipped_total",
+                "Held blocks not asked about because the engine_getBlobsV2 ask budget was spent",
+                &["reason"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_SKIPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// How long one `engine_getBlobsV2` round trip took, whatever its outcome.
+///
+/// The buckets stop at the call's own timeout, so a mass in the last bucket
+/// means the execution client is not answering inside the window the
+/// specification gives it.
+pub fn observe_engine_get_blobs_duration(duration: Duration) {
+    static LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_get_blobs_duration_seconds",
+                "Time for one engine_getBlobsV2 round trip",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_GET_BLOBS_DURATION_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// How long turning an execution client's blobs into custody column sidecars
+/// took: the cell computation plus the sidecar build, off the actor thread.
+pub fn observe_engine_blobs_to_columns(duration: Duration) {
+    static LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_engine_blobs_to_columns_seconds",
+                "Time to build custody data column sidecars from execution-client blobs",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_BLOBS_TO_COLUMNS_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// One column built from the execution client's blobs that the chain checks
+/// refused, so it was neither published nor stored. `reason` is the refusing
+/// rule's label (`kzg`, `wrong_proposer`, `inclusion_proof`, ...); a column
+/// stored meanwhile by another route is not counted.
+pub fn inc_engine_blob_columns_refused(reason: &str) {
+    static LEAN_ENGINE_BLOB_COLUMNS_REFUSED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_engine_blob_columns_refused_total",
+                "Data columns built from execution-client blobs that the chain checks refused, by reason",
+                &["reason"]
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_BLOB_COLUMNS_REFUSED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
 }

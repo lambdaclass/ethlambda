@@ -18,7 +18,7 @@ use ethlambda_types::beacon::primitives::{
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::error::EngineError;
-use crate::types::{data, quantity};
+use crate::types::{data, parse_data, parse_fixed, quantity};
 
 /// `PayloadAttributesV3`: what the execution client needs to build the payload
 /// for one slot.
@@ -365,21 +365,6 @@ fn decode_requests(requests: &[String]) -> Result<Vec<Vec<u8>>, EngineError> {
 
 fn decode(message: &str) -> EngineError {
     EngineError::Decode(message.to_string())
-}
-
-/// A `DATA` of any length.
-fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
-    let digits = text
-        .strip_prefix("0x")
-        .ok_or_else(|| decode("DATA must be 0x-prefixed"))?;
-    hex::decode(digits).map_err(|err| EngineError::Decode(format!("DATA is not hex: {err}")))
-}
-
-/// A `DATA` of exactly `N` bytes.
-fn parse_fixed<const N: usize>(text: &str) -> Result<[u8; N], EngineError> {
-    parse_data(text)?.try_into().map_err(|bytes: Vec<u8>| {
-        EngineError::Decode(format!("expected {N} bytes, got {}", bytes.len()))
-    })
 }
 
 /// A `QUANTITY` that fits in 64 bits.

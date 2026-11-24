@@ -243,6 +243,7 @@ samples nothing and publishes no series here.
 | `lean_peers_by_direction` | Gauge | Connected peers by the direction the connection was opened in | On every connection established and closed | direction=inbound,outbound |
 | `lean_swarm_established_connections` | Gauge | Established connections as libp2p itself counts them | On the swarm's own metric tick | direction=inbound,outbound |
 | `lean_custody_column_peers` | Gauge | Connected peers known to custody each data column this node samples | On every connection established and closed, and whenever a peer's custody is recorded from its `metadata/3` answer or its ENR `cgc` | column=`<index>` |
+| `lean_sync_peers_held_back` | Gauge | Peers whose `Status` head does not count towards the sync gate's network head: suspects (range blocks that never imported, or range requests that kept failing) peers cooling down from a failed range request, and connected peers whose latest `Status` head sat past the wall clock (each peer under one reason). Suspects and cooling peers include peers since disconnected, whose history outlives the connection. A count that keeps climbing while the node reads as syncing is fresh identities claiming a lead; `future` for most connected peers points at this node's own clock running slow | On every publish of the network head, at least once a slot | reason=suspect,cooling,future |
 
 ### Block Import Timing
 
@@ -305,6 +306,15 @@ Per-arrival phases, charged once per arriving message however many blocks its ca
 | `prune` | `prune_old_data` after the cascade (lean) |
 | `get_head` | `fork_choice::get_head` (beacon) |
 | `fcu` | The `engine_forkchoiceUpdated` round trip (beacon) |
+
+### Block Telemetry
+
+Present only with `--telemetry.clickhouse-url`; see [Block telemetry](./telemetry.md). Both series are published at zero at startup, so a node whose inserts never succeed shows a rising failure count next to zero inserted rows instead of no series.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_telemetry_rows_total` | Counter | `block_events` rows, by what became of them | On every successful insert, and on every row dropped (channel full, backlog past its cap, a batch ClickHouse refused, or rows the shutdown flush could not deliver) | outcome=inserted,dropped |
+| `lean_telemetry_insert_failures_total` | Counter | Failed ClickHouse insert attempts, refusals included | On every failed insert; a failed best-effort schema statement alone is not counted | |
 
 ### Gossip Arrival Timing
 
@@ -419,7 +429,15 @@ it; of the gloas topics only `execution_payload` answers it, for an envelope
 whose block is not known yet (`block_unknown`), has no post-state yet
 (`block_not_ready`), or has one that is not in the cache the checks read
 (`state_not_cached`, as when the block was imported moments ago; the actor
-verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+verifies the signature itself, so the envelope is forwarded rather than dropped).
+`beacon_block` answers `queue` for an unknown parent (`parent_unknown`), a
+parent without a cached post-state (`parent_not_ready`), a slot past the parent
+state's lookahead (`shuffling_unavailable`) and, from gloas, a block built on
+its parent's FULL payload before the parent's envelope is verified
+(`parent_payload_unverified`): the chain actor holds that block until the
+envelope verifies. When the execution client has found that parent's payload
+invalid, nothing will verify it, and the block is ignored instead
+(`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
 topics never answer `queue`, since the vote
 block's post-state is either cached or it is not
@@ -654,6 +672,7 @@ leanMetrics spec.
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing block transitions, by whether a precomputed boundary state was cached | On each state transition of a block whose parent is before the block's epoch start and whose block is at or after it. Usually once per import; twice when the import runs the transition again (a speculation computed during the `engine_newPayload` round trip and then discarded for an `INVALIDATED` verdict, or re-checked in a debug build), and once for a block held after its speculation ran | result=hit,miss | |
 | `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_committee_key_sums_warm_seconds` | Histogram | Worker time to sum one epoch's committee keys, off the import path: the sums alone, not the committees they are built from | When a warm-up that built sums finishes; a warm-up that finds them resident records nothing | | 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16 |
 | `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
 
 **Read the hit ratio against epochs.** On a synced follower nearly every
@@ -662,25 +681,69 @@ block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
 duration), the node was syncing, or the entry was evicted from the state cache.
 A `timer` start with no matching `head` start means the last slot was skipped.
 
+### Beacon State Transition Phases
+
+Where the time of one beacon state transition goes. `lean_block_import_phase_seconds{phase="stf"}`
+says how long an import's transition took; this says which step.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_stf_phase_seconds` | Histogram | Time one step of the beacon state transition took | Once per step per transition, when the step finishes (a step that did not run writes nothing) | context=import,other; phase (see below) | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
+
+`phase` is one of `BEACON_STF_PHASES` (`crates/blockchain/state_transition/src/metrics.rs`):
+
+| Phase | Covers |
+|-------|--------|
+| `process_slots` | Advancing the state to the block's slot, **excluding** epoch work: per-slot root bookkeeping, fork upgrades, the closing flush |
+| `process_epoch` | The epoch transition, once per boundary crossed (a long skip observes it several times) |
+| `block_signature` | The proposer's signature over the block, when the caller asked for result validation |
+| `block_header` | The header check, including the hash of the block body it commits to |
+| `randao` | The mix update and the building of the reveal's signature set; the reveal (and, on gloas, the bid pending before it) is verified in `batch_signatures` |
+| `eth1_data` | The eth1 vote |
+| `execution_payload` | Withdrawals and the execution payload; gloas: the parent payload, then the withdrawals and the bid, two observations per block |
+| `proposer_slashings`, `attester_slashings`, `attestations`, `deposits`, `voluntary_exits`, `bls_to_execution_changes`, `payload_attestations` | One observation per block for the whole list, absent when the list is empty; the fork must have the list. Through fulu, `attestations` includes the one proposer lookup the whole list shares |
+| `execution_requests` | Electra and fulu's requests of the execution layer |
+| `sync_aggregate` | The sync aggregate, altair onward |
+| `batch_signatures` | The random-weight check of every signature the block's steps deferred (RANDAO reveal, attestations, slashings, exits, BLS changes, sync aggregate). The steps' own phases cover building those signature sets, not verifying them. Observed once per check, so a block can observe it more than once: the reveal's check also verifies whatever is still pending (gloas: the bid), and a slashing, exit or BLS change verifies before it writes. A check that runs inside another phase is taken out of that phase, so the phases do not double count |
+| `state_root` | The post-state flush and `hash_tree_root` that checks `block.state_root`; only observed when the caller validates the result |
+
+**`context` keeps background work out of an import's numbers.** The epoch
+precompute worker runs `process_epoch` on its own thread while an import runs,
+so one series would charge the worker's seconds to whichever import was in
+flight. `context="import"` is written only by the import path
+(`fork_choice::on_block`'s transition, including the speculative one an import
+runs while `engine_newPayload` is in flight; a build with debug assertions also
+observes the second transition that checks a used speculation); every other
+caller (the precompute worker, checkpoint-state advances, block production,
+gossip validation) writes `context="other"`. A dashboard that wants an
+import's cost reads `context="import"`; one that wants the precompute worker's
+reads `other`, which also holds the other callers, so
+`lean_beacon_epoch_precompute_seconds` is the cleaner series for the worker
+alone.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
 gossip validation) resolves its signers' compressed public keys to validated
-curve points through one process-wide cache, keyed by the compressed bytes. See
-`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+curve points through one process-wide cache: an index table for keys read from
+the registry by validator index, and a map keyed by the compressed bytes for
+every other key. See `PubkeyCache` in `crates/common/crypto/src/bls.rs`. This is
 ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
-| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds, by structure: `table` for keys looked up by validator index, `map` for keys looked up by bytes. A key reached both ways is counted in both. It was one unlabeled series before the label existed; a dashboard or alert reading it needs `sum(lean_beacon_pubkey_cache_entries)` now | On each key added; the cache never removes one | structure=map,table |
+| `lean_beacon_pubkey_cache_index_chunks` | Gauge | Chunks of the index table allocated. The table's memory follows this rather than its entry count, since a chunk is allocated in full on its first key | On each chunk allocated; chunks are never freed | |
 
 **Misses should fall to near zero within an epoch of a start**, once every
 active validator has signed something the node checked. A steady miss rate
 after that means keys the cache is refusing to hold: either the entry bound is
 reached (the gauge stops rising), or the keys are invalid, which are never
-cached and pay the full check every time. `entries` is also the cache's memory
-footprint, roughly a decompressed point plus its compressed key per entry.
+cached and pay the full check every time. `entries{structure="map"}` is the
+map's memory footprint, roughly a decompressed point plus its compressed key per
+entry. The table's is `index_chunks` times a chunk's size, since a chunk is
+allocated whole and a registry's exited validators leave slots in it empty.
 
 ### Data Column Sidecars (Fulu DAS)
 
@@ -703,6 +766,19 @@ spec.
 | `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
 | `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
+| `lean_engine_get_blobs_total` | Counter | `engine_getBlobsV2` attempts for held fulu blocks, by outcome | On each answer of the one attempt made at a block's first hold | outcome=hit,miss,error | |
+| `lean_engine_get_blobs_skipped_total` | Counter | Held fulu blocks not asked about because the ask budget was spent | On a hold that would otherwise ask, before its precheck | reason=slot_budget,in_flight | |
+| `lean_engine_get_blobs_duration_seconds` | Histogram | Time for one `engine_getBlobsV2` round trip | On each attempt, whatever its outcome | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_engine_blobs_to_columns_seconds` | Histogram | Time to build custody data column sidecars from execution-client blobs | On each build that reaches the cell computation, off the actor thread | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0 |
+| `lean_engine_blob_columns_refused_total` | Counter | Data columns built from execution-client blobs that the chain checks refused, so neither published nor stored | On each built column refused, once; a column another route stored meanwhile is not counted | reason=kzg,wrong_proposer,inclusion_proof,... (the refusing rule's label) | |
+| `lean_data_columns_from_execution_layer_total` | Counter | Data column sidecars built from the execution client's blobs, by what p2p did with them | On each hand-over, once per result, incremented by the column count | result=published,no_digest,already_seen,not_custody | |
+
+`lean_engine_get_blobs_total` and its siblings cover the execution-client path
+(`docs/beacon_engine.md`, "Blobs from the execution client"). A high `miss`
+share means the execution client's blob pool lacks the blobs, which is normal
+for a syncing execution client; `already_seen` in
+`lean_data_columns_from_execution_layer_total` counts columns gossip delivered
+first.
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
@@ -852,6 +928,8 @@ and absent is not the same as zero.
 | `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |
 | `ethlambda_validator_sync_contribution_failures_total` | Counter | Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted |
 | `ethlambda_validator_sync_duties_held` | Gauge | Sync committee duties held for the current period |
+| `ethlambda_validator_doppelganger_detecting` | Gauge | Keys doppelganger protection still withholds attestations and blocks for (`--enable-doppelganger-protection`). Non-zero for two to three epochs after a start or an import, then zero; a key that stays here has no validator index yet, or its beacon nodes keep failing the liveness query. Always zero with the protection off |
+| `ethlambda_validator_doppelganger_check_failures_total` | Counter | Doppelganger checks (one a slot while any key is withheld) that got no liveness answer, because a query failed or every beacon node was syncing. Only a failure at an epoch's last slot costs anything: it pushes the withheld keys' first signature back an epoch, and is logged at error. A count that climbs every slot is a beacon node that does not serve `/eth/v1/validator/liveness`, or one that is down |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |

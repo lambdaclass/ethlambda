@@ -24,7 +24,7 @@
 //! divisor and threshold they use (`BASE_REWARD_FACTOR`,
 //! `PROPOSER_REWARD_QUOTIENT`, `INACTIVITY_PENALTY_QUOTIENT`,
 //! `MIN_EPOCHS_TO_INACTIVITY_PENALTY`) is a preset, resolved through
-//! `crate::beacon::preset` at compile time with no argument needed. [`get_source_deltas`],
+//! `crate::beacon::preset` with no argument needed. [`get_source_deltas`],
 //! [`get_target_deltas`], [`get_head_deltas`], [`get_inclusion_delay_deltas`],
 //! and [`get_inactivity_penalty_deltas`] still take `config: &Config` (unused
 //! here, each parameter named `_config`), for two reasons: the `rewards`
@@ -263,7 +263,7 @@ pub fn get_inactivity_penalty_deltas(
                     "scaling effective balance by the finality delay for the inactivity penalty",
                 ))?;
                 penalties[index as usize] +=
-                    penalty_numerator / preset::INACTIVITY_PENALTY_QUOTIENT;
+                    penalty_numerator / preset::inactivity_penalty_quotient();
             }
         }
     }
@@ -360,7 +360,7 @@ mod tests {
         // slot far enough ahead pulls the previous epoch more than
         // `MIN_EPOCHS_TO_INACTIVITY_PENALTY` epochs ahead of it.
         *state.slot_mut() =
-            preset::SLOTS_PER_EPOCH * (preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY + 10);
+            preset::slots_per_epoch() * (preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY + 10);
         assert!(is_in_inactivity_leak(&state).unwrap());
     }
 

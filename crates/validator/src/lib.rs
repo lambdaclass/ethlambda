@@ -28,6 +28,7 @@ pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
+pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
@@ -50,6 +51,40 @@ pub mod sync_committee;
 mod test_support;
 
 pub use error::{Error, Result};
+
+/// Run this process on the preset the beacon node reports, before anything
+/// reads one.
+///
+/// A validator client has no network config of its own: the node's
+/// `/eth/v1/config/spec` is where it learns the chain, `PRESET_BASE`
+/// included. Every container this client decodes, builds or signs is bounded
+/// by that preset (a sync committee's bits, an attestation's committee bits,
+/// the slots in an epoch), so it is selected here, right after the spec is
+/// fetched and before any duty runs.
+pub fn adopt_preset(spec: &ethlambda_types::beacon::config::Config) -> Result<()> {
+    use ethlambda_types::beacon::preset::Preset;
+
+    let name = spec.preset_base.as_str();
+    let preset: Preset = name.parse().map_err(|_| {
+        Error::Preset(format!(
+            "PRESET_BASE: {name:?} names no preset this client has values for"
+        ))
+    })?;
+    Preset::select(preset).map_err(|err| Error::Preset(err.to_string()))
+}
+
+/// Refuse to go on when something in this process read a preset value before
+/// the beacon node's was adopted.
+///
+/// [`adopt_preset`] accepts the preset already in force, so against a mainnet
+/// node such a read goes unnoticed and only a minimal one fails. The two
+/// commands that own their process call this first, so the ordering bug fails
+/// against every node. Kept out of `adopt_preset` itself, which tests sharing
+/// one process also reach.
+pub(crate) fn require_unread_preset() -> Result<()> {
+    ethlambda_types::beacon::preset::Preset::require_unread()
+        .map_err(|err| Error::Preset(err.to_string()))
+}
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,6 +157,10 @@ pub struct ValidatorConfig {
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
     pub init_slashing_protection: bool,
+    /// Withhold every key's attestations and blocks until the beacon network
+    /// has seen it stay silent for a full epoch, and stop if it does not. See
+    /// [`doppelganger`].
+    pub doppelganger_protection: bool,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -241,7 +280,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
     let genesis = beacon_node.genesis().await?;
     let spec = beacon_node.spec().await?;
+    require_unread_preset()?;
+    adopt_preset(&spec)?;
     info!(
+        preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
         slot_duration_ms = spec.slot_duration_ms,
         attestation_due_bps = spec.attestation_due_bps,
@@ -273,7 +315,37 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     );
     let protection = slashing_protection::SharedProtection::new(protection);
 
-    let context = Arc::new(SigningContext::new(spec, genesis.genesis_validators_root));
+    // Every key loaded is registered before anything that signs exists, in
+    // the epoch the clock is in now, so this process's own activity before a
+    // restart within the epoch is never mistaken for a doppelganger.
+    let doppelganger = config.doppelganger_protection.then(|| {
+        let doppelganger = Arc::new(doppelganger::Doppelganger::new());
+        // Epoch 0 before genesis: a key registered then signs at once.
+        let epoch = clock.current_epoch().unwrap_or(0);
+        doppelganger.register_all(&keys, epoch);
+        let withheld = doppelganger.detecting();
+        if withheld > 0 {
+            info!(
+                validators = withheld,
+                %epoch,
+                earliest_signing_epoch = epoch + doppelganger::DETECTION_EPOCHS + 2,
+                "Doppelganger protection on: no attestation or block is signed until the beacon \
+                 network has seen none of these validators act for a full epoch"
+            );
+        } else if !keys.is_empty() {
+            info!(
+                "Doppelganger protection on; the chain is at genesis, so the loaded validators \
+                 sign at once"
+            );
+        }
+        doppelganger
+    });
+
+    let mut context = SigningContext::new(spec, genesis.genesis_validators_root);
+    if let Some(doppelganger) = &doppelganger {
+        context = context.with_doppelganger(doppelganger.clone());
+    }
+    let context = Arc::new(context);
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -358,6 +430,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             }
         }));
     }
+
+    // The check runs on its own clock, three quarters into each slot, so a
+    // slow duty never delays it and a slow liveness query never delays a
+    // duty. Its handle is kept: the duties race it below, and it is aborted
+    // once the client stops.
+    let mut check = doppelganger.as_ref().map(|doppelganger| {
+        tokio::spawn(doppelganger::run(
+            doppelganger.clone(),
+            beacon_node.clone(),
+            store.clone(),
+            clock.clone(),
+        ))
+    });
 
     // The duty loop, as a future that ends only with the error that stopped
     // it. Not awaited here: `run_until_stopped` races it against the
@@ -457,7 +542,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // is three small fields, and holding a borrow of the schedule across
             // the proposal would stop the next epoch's refresh from replacing it.
             if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
-                propose(&proposal, &clock, slot, &duty, &store).await;
+                if doppelganger_cleared(&context, &duty.pubkey) {
+                    propose(&proposal, &clock, slot, &duty, &store).await;
+                } else {
+                    warn!(
+                        %slot,
+                        validator = duty.validator_index,
+                        "Not proposing: doppelganger protection has not cleared this validator yet"
+                    );
+                }
             }
 
             // Right after the proposal and ahead of the slot's other duties: the
@@ -519,7 +612,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // Each branch of `serve_slot_duties` waits for its own offset.
             tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
 
-            let slot_duties = duties.at_slot(slot, epoch);
+            // Attesting and aggregating both start from these, so a key
+            // doppelganger protection still withholds does neither; its sync
+            // committee and payload committee duties go on (see
+            // `doppelganger`).
+            let slot_duties = withhold_uncleared(&context, slot, duties.at_slot(slot, epoch));
             let committee = duties.ptc_at_slot(slot, epoch);
             let sync_duties = duties.sync_at_slot(slot);
             serve_slot_duties(
@@ -552,10 +649,102 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // them. Off the slot loop like the sends above. The refresh's slot
             // too, although its refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
+
+            // This epoch's payload committee schedule again, while none is
+            // held. The gloas fork epoch's is fetched at its first slot only
+            // (see `refresh_ptc`), so without this one failed request there
+            // would cost the whole first gloas epoch's votes; for any other
+            // epoch it covers a lookahead and a refresh that both failed.
+            // After the slot's duties and bounded by the slot's end, so it
+            // never delays a duty. Only once this epoch's refresh got through:
+            // until then the refresh itself runs again every slot.
+            if last_epoch == Some(epoch) {
+                let budget = clock.remaining_in(slot, SystemTime::now());
+                retry_missing_ptc(&mut duties, epoch, budget, &context).await;
+            }
         }
     };
 
-    Err(run_until_stopped(duty_loop, &protection, shutdown, keymanager).await)
+    // A doppelganger stops the duties where they stand, as an unusable record
+    // does: what is left of them signs nothing slashable anyway (see
+    // `Doppelganger::allows_signing`), and the operator has to find the
+    // other client before this one runs again.
+    //
+    // The check's task ending stops them too. It loops for the life of the
+    // client, so it ends only by panicking, which would leave every key it
+    // had not cleared withheld for good with nothing to say why; stopping
+    // hands the supervisor the restart, as an unusable record does.
+    let duties = async {
+        let (Some(doppelganger), Some(check)) = (&doppelganger, &mut check) else {
+            return duty_loop.await;
+        };
+        tokio::select! {
+            // A sighting is reported as one even when the check's task ends
+            // in the same poll.
+            biased;
+            () = doppelganger.detected() => {
+                let validators = doppelganger
+                    .sightings()
+                    .iter()
+                    .map(|sighting| sighting.index)
+                    .collect();
+                Error::DoppelgangerDetected { validators }
+            }
+            ended = check => {
+                let reason = match ended {
+                    Err(err) => err.to_string(),
+                    Ok(()) => "its task returned".to_string(),
+                };
+                let err = Error::DoppelgangerCheckStopped { reason };
+                error!(%err, "Stopping so the validator client can be restarted");
+                err
+            }
+            err = duty_loop => err,
+        }
+    };
+
+    let stopped = run_until_stopped(duties, &protection, shutdown, keymanager).await;
+    // Whatever stopped the client, the check stops with it rather than
+    // polling the beacon node for a runtime that outlives `run`.
+    if let Some(check) = check {
+        check.abort();
+    }
+    Err(stopped)
+}
+
+/// Whether doppelganger protection lets the validator a duty names act on
+/// it. A pubkey that does not parse is not cleared: with the protection on,
+/// a key it cannot name is a key it cannot vouch for.
+fn doppelganger_cleared(context: &SigningContext, pubkey: &str) -> bool {
+    context.doppelganger().is_none()
+        || crate::beacon_node::dto::parse_pubkey(pubkey)
+            .is_ok_and(|pubkey| context.doppelganger_allows(&pubkey))
+}
+
+/// `duties`, less those of validators doppelganger protection has not
+/// cleared: dropped before the attestation service records or fetches
+/// anything for them.
+fn withhold_uncleared(
+    context: &SigningContext,
+    slot: ethlambda_types::beacon::primitives::Slot,
+    duties: Vec<crate::beacon_node::dto::AttesterDutyDto>,
+) -> Vec<crate::beacon_node::dto::AttesterDutyDto> {
+    if context.doppelganger().is_none() {
+        return duties;
+    }
+    let before = duties.len();
+    let cleared: Vec<_> = duties
+        .into_iter()
+        .filter(|duty| doppelganger_cleared(context, &duty.pubkey))
+        .collect();
+    if cleared.len() < before {
+        tracing::debug!(
+            %slot,
+            withheld = before - cleared.len(),
+            "Attester duties withheld by doppelganger protection"
+        );
+    }
+    cleared
 }
 
 /// How long the keymanager gets to finish its requests in flight once the
@@ -1243,13 +1432,19 @@ fn is_registrable(status: &str) -> bool {
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
-/// each only if it is a gloas epoch.
+/// each only if it is a gloas epoch, and the gloas fork epoch's only once it
+/// has begun.
 ///
 /// Gated per epoch rather than once, because the fork can activate between the
-/// two: the lookahead is the epoch the first gloas slots belong to when the
-/// current one is the last before the fork. A failed fetch is logged and
+/// two. The fork epoch is no lookahead, though: its committee is computed at
+/// the fork from the effective balances the last pre-gloas epoch ends with, so
+/// a node serves it only from the fork on (beacon-APIs `ptc.yaml`; Lighthouse
+/// answers `400` before). It is fetched at the fork epoch's own first slot,
+/// with the epoch after it as the lookahead. A failed fetch is logged and
 /// shrugged off, like the proposer and lookahead ones: it must not cost this
-/// epoch's attester schedule, which is already in hand.
+/// epoch's attester schedule, which is already in hand. The current epoch's is
+/// then fetched again after each slot's duties until one is held
+/// ([`retry_missing_ptc`]).
 async fn refresh_ptc<B: BeaconNodeApi>(
     duties: &mut DutiesService<B>,
     epoch: u64,
@@ -1257,6 +1452,9 @@ async fn refresh_ptc<B: BeaconNodeApi>(
 ) {
     for target in [epoch, epoch + 1] {
         if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+            continue;
+        }
+        if target == context.config.gloas_fork_epoch && epoch < target {
             continue;
         }
         if let Err(err) = duties.refresh_ptc(target).await {
@@ -1268,6 +1466,37 @@ async fn refresh_ptc<B: BeaconNodeApi>(
         }
     }
     duties.prune_ptc_before(epoch);
+}
+
+/// Fetch this epoch's payload timeliness committee schedule again, within
+/// `budget`, when it is a gloas epoch and none is held.
+///
+/// The duty loop calls it after every slot's duties, so a failed fetch costs
+/// the votes of the slots until the next one succeeds rather than the rest of
+/// the epoch. A failure here is logged at debug: `refresh_ptc` already warned
+/// once, and this runs again every slot until it succeeds. Dropping the fetch
+/// at the deadline is safe, since `DutiesService::refresh_ptc` changes nothing
+/// until its request has answered.
+async fn retry_missing_ptc<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    budget: std::time::Duration,
+    context: &SigningContext,
+) {
+    if context.config.fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
+        || duties.holds_ptc(epoch)
+    {
+        return;
+    }
+    match tokio::time::timeout(budget, duties.refresh_ptc(epoch)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            debug!(%epoch, %err, "Payload committee duties retry failed; trying again next slot");
+        }
+        Err(_) => {
+            debug!(%epoch, "Payload committee duties retry ran out of slot; trying again next slot");
+        }
+    }
 }
 
 /// How many epochs before a period boundary the next period's subnets are
@@ -1293,7 +1522,7 @@ async fn refresh_sync<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD_EPOCHS;
+    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
     if context.config.fork_at_epoch(epoch) < ForkName::Altair {
         return;
@@ -1313,14 +1542,14 @@ async fn refresh_sync<B: BeaconNodeApi>(
 
     let current = duties.sync_for_period(period);
     if let Err(err) =
-        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * PERIOD_EPOCHS).await
+        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * period_epochs()).await
     {
         warn!(%err, "Failed to subscribe to sync committee subnets");
     }
-    if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * PERIOD_EPOCHS {
+    if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * period_epochs() {
         let next = duties.sync_for_period(period + 1);
         if let Err(err) =
-            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * PERIOD_EPOCHS).await
+            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * period_epochs()).await
         {
             warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
         }
@@ -1787,35 +2016,39 @@ mod tests {
     }
 
     /// The committee schedule is fetched for gloas epochs only, so a chain that
-    /// has not forked is never asked, and the lookahead is gated on its own
-    /// epoch: the last pre-gloas epoch looks ahead into the first gloas one.
+    /// has not forked is never asked. The fork epoch's is not fetched as a
+    /// lookahead from the last pre-gloas epoch, since a node cannot know it
+    /// before the fork, but at the fork epoch itself, with the next as the
+    /// lookahead.
     #[tokio::test]
     async fn the_committee_schedule_is_fetched_for_gloas_epochs_only() {
         let node = Arc::new(
             node()
+                .with_duties(5, Root::repeat_byte(2), Vec::new())
+                .with_proposers(4, Root::repeat_byte(2), Vec::new())
                 .with_ptc_duties(4, Root::repeat_byte(1), vec![ptc_duty(11, 130)])
                 .with_ptc_duties(5, Root::repeat_byte(1), Vec::new()),
         );
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
+        let gloas_at_4 = gloas_context(4);
 
-        // Epoch 3 is the last before gloas at epoch 4: only the lookahead asks.
-        node.set_duties(3, Root::repeat_byte(1), Vec::new());
-        refresh_epoch(
-            &node,
-            &mut duties,
-            &keys,
-            3,
-            &settings(None),
-            &gloas_context(4),
-        )
-        .await
-        .expect("refreshes");
+        // Epoch 3 is the last before gloas at epoch 4: nothing is asked.
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &gloas_at_4)
+            .await
+            .expect("refreshes");
         assert_eq!(
-            node.ptc_call_count(),
-            1,
-            "only epoch 4, the first gloas one"
+            node.ptc_requested_epochs(),
+            Vec::<u64>::new(),
+            "the fork epoch's committee is not known before the fork"
         );
+        assert!(duties.ptc_at_slot(130, 4).is_empty());
+
+        // At the fork epoch, both it and the next are asked.
+        refresh_epoch(&node, &mut duties, &keys, 4, &settings(None), &gloas_at_4)
+            .await
+            .expect("refreshes");
+        assert_eq!(node.ptc_requested_epochs(), vec![4, 5]);
         assert_eq!(duties.ptc_at_slot(130, 4).len(), 1);
 
         // A chain with no gloas scheduled is never asked at all.
@@ -1829,6 +2062,51 @@ mod tests {
 
     fn node_without_ptc() -> MockBeaconNode {
         node()
+    }
+
+    /// The fork epoch's committee is fetched once, at its first slot, so a
+    /// fetch that failed there is retried after each slot until a schedule is
+    /// held, and then no more. A pre-gloas epoch is never asked.
+    #[tokio::test]
+    async fn a_missing_committee_schedule_is_fetched_again() {
+        // No duties stored for epoch 4 yet, so the mock refuses the request.
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        duties.set_indices(vec![11]);
+        let gloas_at_4 = gloas_context(4);
+        let budget = std::time::Duration::from_secs(1);
+
+        retry_missing_ptc(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![4]);
+        assert!(!duties.holds_ptc(4), "a failed retry holds nothing");
+
+        // The node answers now: the next slot's retry gets the schedule.
+        node.set_ptc_duties(4, Root::repeat_byte(1), vec![ptc_duty(11, 130)]);
+        retry_missing_ptc(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![4, 4]);
+        assert_eq!(duties.ptc_at_slot(130, 4).len(), 1);
+
+        // Held: no further request.
+        retry_missing_ptc(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![4, 4]);
+
+        // Before gloas there is no committee to ask about.
+        retry_missing_ptc(&mut duties, 3, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![4, 4]);
+    }
+
+    /// A schedule that came back empty is still a schedule: nothing to retry.
+    #[tokio::test]
+    async fn an_empty_committee_schedule_is_not_fetched_again() {
+        let node = Arc::new(node().with_ptc_duties(4, Root::repeat_byte(1), Vec::new()));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        duties.set_indices(vec![11]);
+        let gloas_at_4 = gloas_context(4);
+        let budget = std::time::Duration::from_secs(1);
+
+        retry_missing_ptc(&mut duties, 4, budget, &gloas_at_4).await;
+        retry_missing_ptc(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![4]);
     }
 
     /// A failed committee fetch must not cost the epoch's attester schedule.
@@ -1934,12 +2212,12 @@ mod tests {
     /// subscribed every refresh, to the period's end.
     #[tokio::test]
     async fn sync_duties_for_both_periods_are_fetched_and_subscribed() {
-        use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD;
+        use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period;
 
         let node = Arc::new(
             node()
                 .with_sync_duties(0, vec![sync_duty(11, vec![3, 130])])
-                .with_sync_duties(PERIOD, vec![sync_duty(11, vec![200])]),
+                .with_sync_duties(period(), vec![sync_duty(11, vec![200])]),
         );
         let mut duties = DutiesService::new(node.clone(), Vec::new());
         let keys = [pubkey(1), pubkey(2)];
@@ -1961,13 +2239,13 @@ mod tests {
             .iter()
             .map(|(epoch, _)| *epoch)
             .collect();
-        assert_eq!(requested, vec![0, PERIOD, 0, PERIOD]);
+        assert_eq!(requested, vec![0, period(), 0, period()]);
         assert_eq!(duties.sync_for_period(1).len(), 1);
 
         let sent = node.sync_subscriptions();
         assert_eq!(sent.len(), 2, "re-sent every epoch, current period only");
         assert_eq!(sent[0].sync_committee_indices, vec![3, 130]);
-        assert_eq!(sent[0].until_epoch, PERIOD);
+        assert_eq!(sent[0].until_epoch, period());
     }
 
     /// Not asked before altair.
@@ -2178,6 +2456,61 @@ mod tests {
         .await;
         assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
         assert_eq!(before.elapsed(), KEYMANAGER_DRAIN);
+    }
+
+    fn attester_duty(
+        pubkey: &BlsPubkey,
+        validator_index: u64,
+    ) -> beacon_node::dto::AttesterDutyDto {
+        beacon_node::dto::AttesterDutyDto {
+            pubkey: beacon_node::dto::encode_hex(&pubkey.0),
+            validator_index,
+            committee_index: 0,
+            committee_length: 128,
+            committees_at_slot: 64,
+            validator_committee_index: 0,
+            slot: 3200,
+        }
+    }
+
+    /// The duty loop drops a withheld key's attester duties, and with them
+    /// its aggregation, before anything is recorded or fetched for it; a
+    /// cleared key's duties go through.
+    #[test]
+    fn only_cleared_keys_keep_their_attester_and_proposer_duties() {
+        let doppelganger = Arc::new(doppelganger::Doppelganger::new());
+        doppelganger.register(pubkey(1), 0);
+        doppelganger.register(pubkey(2), 100);
+        let context = context().with_doppelganger(doppelganger);
+
+        let duties = vec![
+            attester_duty(&pubkey(1), 11),
+            attester_duty(&pubkey(2), 22),
+            attester_duty(&pubkey(3), 33),
+        ];
+        let kept: Vec<u64> = withhold_uncleared(&context, 3200, duties)
+            .iter()
+            .map(|duty| duty.validator_index)
+            .collect();
+        assert_eq!(kept, vec![11], "under the check, and never registered");
+
+        assert!(doppelganger_cleared(
+            &context,
+            &beacon_node::dto::encode_hex(&pubkey(1).0)
+        ));
+        assert!(!doppelganger_cleared(
+            &context,
+            &beacon_node::dto::encode_hex(&pubkey(2).0)
+        ));
+        assert!(!doppelganger_cleared(&context, "not a pubkey"));
+    }
+
+    /// With the protection off the filter is not there at all.
+    #[test]
+    fn without_doppelganger_protection_every_duty_is_kept() {
+        let duties = vec![attester_duty(&pubkey(1), 11), attester_duty(&pubkey(2), 22)];
+        assert_eq!(withhold_uncleared(&context(), 3200, duties).len(), 2);
+        assert!(doppelganger_cleared(&context(), "not a pubkey"));
     }
 
     /// With no keymanager there is nothing to wait for.

@@ -282,6 +282,10 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the sync committee endpoints, read by block
     /// production and the contribution endpoint.
     pub sync_committee_pool: SharedSyncCommitteePool,
+    /// Filled by `prepare_beacon_proposer` and builder registrations, read by
+    /// block production and by the chain actor, which publishes
+    /// `payload_attributes` for the proposers named here.
+    pub fee_recipients: ethlambda_blockchain::FeeRecipients,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -337,7 +341,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.builder_market))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
-        .layer(Extension(beacon::validator::FeeRecipients::default()))
+        .layer(Extension(handles.fee_recipients))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))
@@ -494,10 +498,10 @@ pub(crate) mod test_utils {
                 state_root: H256::ZERO,
                 body_root: H256::ZERO,
             },
-            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("exactly N elements by construction"),
-            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("exactly N elements by construction"),
             historical_roots: Default::default(),
@@ -506,10 +510,10 @@ pub(crate) mod test_utils {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![H256::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("exactly N elements by construction"),
-            slashings: vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0u64; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("exactly N elements by construction"),
             previous_epoch_attestations: Default::default(),

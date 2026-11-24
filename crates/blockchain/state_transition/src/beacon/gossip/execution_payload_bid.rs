@@ -477,7 +477,7 @@ mod tests {
     use crate::beacon::gossip::test_support::{slot_start_ms, store};
     use crate::beacon::helpers::accessors::get_current_epoch;
     use crate::beacon::precheck::fixed_proposer;
-    use crate::beacon::preset::SLOTS_PER_EPOCH;
+    use crate::beacon::preset::slots_per_epoch;
 
     fn ignore(reason: IgnoreReason) -> Outcome {
         Outcome::Ignore(reason)
@@ -584,7 +584,7 @@ mod tests {
     fn a_bid_is_timely_from_just_before_the_previous_slot_until_just_after_its_own() {
         let store = store(0);
         let config = store.config();
-        let slot = BID_SLOT;
+        let slot = scene_bid_slot();
         let earliest = slot_start_ms(&store, slot - 1) - 500;
         let latest = slot_start_ms(&store, slot + 1) + 500;
         assert!(is_current_or_next_slot(&config, slot, earliest));
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn a_bid_for_a_distant_slot_is_not_current_or_next() {
         let scene = scene();
-        let far = scene.signed(|bid| bid.slot = BID_SLOT + 6);
+        let far = scene.signed(|bid| bid.slot = scene_bid_slot() + 6);
         assert_eq!(
             cheap(&scene, &far),
             Err(ignore(IgnoreReason::NotCurrentOrNextSlot))
@@ -684,7 +684,7 @@ mod tests {
         // A fulu-only store has no gloas slot at all.
         let fulu = store(0);
         let scene = scene();
-        let now_ms = slot_start_ms(&fulu, BID_SLOT) + 100;
+        let now_ms = slot_start_ms(&fulu, scene_bid_slot()) + 100;
         assert_eq!(
             cheap_checks(&scene.market, &fulu, &scene.signed(|_| {}), now_ms),
             Err(ignore(IgnoreReason::PreGloasSlot))
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn a_bid_not_after_its_parent_is_rejected() {
         let scene = scene();
-        let bid = scene.signed(|bid| bid.slot = PARENT_SLOT);
+        let bid = scene.signed(|bid| bid.slot = scene_parent_slot());
         assert_eq!(stateful(&scene, &bid), reject(RejectReason::NotAfterParent));
     }
 
@@ -713,7 +713,7 @@ mod tests {
         let stateless = Root::repeat_byte(0x60);
         scene
             .store
-            .insert_pending_block(stateless, block_at(PARENT_SLOT))
+            .insert_pending_block(stateless, block_at(scene_parent_slot()))
             .expect("insert the block");
         let bid = scene.signed(|bid| bid.parent_block_root = stateless);
         assert_eq!(
@@ -726,7 +726,7 @@ mod tests {
     fn a_bid_beyond_the_parents_lookahead_is_ignored() {
         let scene = scene();
         // The parent is in epoch 1, so epoch 3 is past its lookahead.
-        let bid = scene.signed(|bid| bid.slot = 3 * SLOTS_PER_EPOCH);
+        let bid = scene.signed(|bid| bid.slot = 3 * slots_per_epoch());
         assert_eq!(
             stateful(&scene, &bid),
             ignore(IgnoreReason::BeyondLookahead)
@@ -898,7 +898,9 @@ mod tests {
             message: envelope_with_gas_limit(parent_block_hash(), PARENT_GAS_LIMIT, PARENT, exits),
             signature: Default::default(),
         };
-        scene.store.insert_verified_payload(PARENT_SLOT, &envelope);
+        scene
+            .store
+            .insert_verified_payload(scene_parent_slot(), &envelope);
         assert_eq!(
             stateful(&scene, &scene.bid),
             ignore(IgnoreReason::BuilderMayExit)
@@ -934,8 +936,8 @@ mod tests {
         let scene = scene();
         let config = scene.store.config();
         let mut advanced = scene.state.clone();
-        stf::process_slots(&mut advanced, BID_SLOT, &config).expect("advance");
-        assert_eq!(advanced.slot(), BID_SLOT);
+        stf::process_slots(&mut advanced, scene_bid_slot(), &config).expect("advance");
+        assert_eq!(advanced.slot(), scene_bid_slot());
         let (BeaconState::Gloas(before), BeaconState::Gloas(after)) = (&scene.state, &advanced)
         else {
             unreachable!("gloas states")
@@ -965,8 +967,8 @@ mod tests {
     fn a_bid_across_an_epoch_uses_and_caches_the_checkpoint_state() {
         // The parent is in epoch 2: a funded builder is active only after
         // finality passes its deposit epoch, which an epoch-1 chain cannot have.
-        let scene = scene_at(2 * SLOTS_PER_EPOCH, |_| {});
-        let slot = 3 * SLOTS_PER_EPOCH;
+        let scene = scene_at(2 * slots_per_epoch(), |_| {});
+        let slot = 3 * slots_per_epoch();
         // Preferences for the later epoch's proposer.
         let dependent = dependent_root_at(&scene.state, PARENT, slot).expect("in the window");
         let proposer = fixed_proposer(&scene.state, slot).expect("in the lookahead window");
@@ -1011,7 +1013,7 @@ mod tests {
             .with_fork_epoch(ForkName::Gloas, 2);
         let parent = Root::repeat_byte(0x70);
         let header_hash = ExecutionBlockHash::repeat_byte(0x41);
-        let parent_slot = 2 * SLOTS_PER_EPOCH - 2;
+        let parent_slot = 2 * slots_per_epoch() - 2;
         let mut state = with_signing_validators_at(ForkName::Fulu, 64);
         *state.slot_mut() = parent_slot;
         if let BeaconState::Fulu(fulu) = &mut state {
@@ -1044,7 +1046,7 @@ mod tests {
         // The status the chain actor records; a pre-gloas head has one node.
         store.set_head_payload_status(parent, PayloadStatus::Empty);
 
-        let slot = 2 * SLOTS_PER_EPOCH;
+        let slot = 2 * slots_per_epoch();
         let market = BuilderMarket::default();
         let proposer = fixed_proposer(&state, slot).expect("in the window");
         let dependent_root = dependent_root_at(&state, parent, slot).expect("in the window");

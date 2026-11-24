@@ -23,7 +23,7 @@ use crate::beacon_node::dto::{
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis,
+    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
 use crate::error::{Error, Result};
@@ -778,6 +778,45 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         })
         .await?
     }
+
+    /// Every node is asked at once, and the first to answer wins. A syncing
+    /// node answers `BeaconNodeSyncing` (see the trait's contract), which
+    /// counts as a failure, so a node that has not caught up never clears a
+    /// key while another has the chain. Each node answers every epoch, so the
+    /// answers combined into one decision all come from the same node.
+    ///
+    /// At once rather than in turn because of when the answer is needed: the
+    /// tick that can clear a key starts three quarters into an epoch's last
+    /// slot, and walking past a hung first node (up to the request timeout)
+    /// would reach a healthy second one in the next epoch, which no longer
+    /// answers for the older epoch asked about. Keys would then never clear
+    /// for as long as the first node hung, though the duties fail over to
+    /// the second in time. The cost is a query to every node per tick, only
+    /// while some key is under the check.
+    ///
+    /// Quiet: no duty depends on the answer, and the doppelganger check
+    /// reports its own failures, so a node without the endpoint must not
+    /// claim a missed duty every slot.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        // `select_ok` panics on no futures.
+        if self.nodes.is_empty() {
+            return Err(Error::AllBeaconNodesFailed(
+                "no nodes configured".to_string(),
+            ));
+        }
+        let queries = self.nodes.iter().map(|node| node.liveness(epochs, indices));
+        match futures_util::future::select_ok(queries).await {
+            Ok((answers, _slower)) => Ok(answers),
+            Err(err) => {
+                debug!(what = "liveness", %err, "Every beacon node failed the request");
+                Err(Error::AllBeaconNodesFailed(err.to_string()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -903,6 +942,61 @@ mod tests {
         assert!(
             !fallback.is_optimistic_or_syncing().await.expect("answers"),
             "a healthy node behind a syncing one must be found"
+        );
+    }
+
+    /// Liveness is answered by a node that has the chain: a syncing one
+    /// first in the list is asked nothing and walked past, so its empty
+    /// view never clears a key the second node saw act.
+    #[tokio::test]
+    async fn liveness_skips_a_syncing_node_for_one_that_has_the_chain() {
+        let syncing = MockBeaconNode {
+            syncing: true,
+            ..MockBeaconNode::new()
+        };
+        let seeing = MockBeaconNode::new();
+        seeing.live.lock().expect("lock").push((12, 7));
+        let fallback = FallbackBeaconNode::new(vec![syncing, seeing]);
+
+        let answers = fallback.liveness(&[12], &[7]).await.expect("answers");
+        assert_eq!(
+            answers,
+            vec![vec![Liveness {
+                index: 7,
+                is_live: true
+            }]]
+        );
+        assert!(fallback.nodes[0].liveness_requests().is_empty());
+        assert_eq!(fallback.nodes[1].liveness_requests(), vec![(12, vec![7])]);
+    }
+
+    /// A hung first node does not delay the answer: every node is asked at
+    /// once, so a healthy one answers within the tick's slot.
+    #[tokio::test(start_paused = true)]
+    async fn liveness_is_not_held_back_by_a_hung_node() {
+        use std::time::Duration;
+        let hung = MockBeaconNode::new().with_liveness_delay(Duration::from_secs(60));
+        let fallback = FallbackBeaconNode::new(vec![hung, MockBeaconNode::new()]);
+
+        let started = tokio::time::Instant::now();
+        let answers = fallback.liveness(&[11, 12], &[7]).await.expect("answers");
+        assert_eq!(answers.len(), 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Both epochs come from one node: a node that fails fails both, and
+    /// another node answers both.
+    #[tokio::test]
+    async fn liveness_answers_every_epoch_from_one_node() {
+        let flaky = MockBeaconNode::new().failing_call("liveness", "down");
+        let fallback = FallbackBeaconNode::new(vec![flaky, MockBeaconNode::new()]);
+
+        let answers = fallback.liveness(&[11, 12], &[7]).await.expect("answers");
+        assert_eq!(answers.len(), 2);
+        assert!(fallback.nodes[0].liveness_requests().is_empty());
+        assert_eq!(
+            fallback.nodes[1].liveness_requests(),
+            vec![(11, vec![7]), (12, vec![7])]
         );
     }
 

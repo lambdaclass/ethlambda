@@ -87,10 +87,10 @@ pub fn initialize_beacon_state_from_eth1(
         },
         // The rolling root windows start zeroed: nothing has been processed
         // yet for `process_slot` to have filled them with.
-        block_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        block_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("the vector is built at its exact length"),
-        state_roots: vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        state_roots: vec![Root::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("the vector is built at its exact length"),
         historical_roots: Default::default(),
@@ -107,10 +107,10 @@ pub fn initialize_beacon_state_from_eth1(
         // first. This is deliberate: it is what makes the very first epoch's
         // shuffling unpredictable before any validator has produced a randao
         // reveal of its own.
-        randao_mixes: vec![eth1_block_hash; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+        randao_mixes: vec![eth1_block_hash; preset::epochs_per_historical_vector()]
             .try_into()
             .expect("the vector is built at its exact length"),
-        slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+        slashings: vec![0; preset::epochs_per_slashings_vector()]
             .try_into()
             .expect("the vector is built at its exact length"),
         previous_epoch_attestations: Default::default(),

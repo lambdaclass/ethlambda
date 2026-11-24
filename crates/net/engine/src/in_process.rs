@@ -47,6 +47,7 @@ use ethrex_common::utils::keccak;
 use ethrex_common::{Address, Bloom, H256};
 use ethrex_rlp::decode::RLPDecode as _;
 use ethrex_rpc::engine::ExchangeCapabilitiesRequest;
+use ethrex_rpc::engine::blobs::BlobsV2Request;
 use ethrex_rpc::engine::client_version::GetClientVersionV1Request;
 use ethrex_rpc::engine::fork_choice::{ForkChoiceUpdatedV3, ForkChoiceUpdatedV4};
 use ethrex_rpc::engine::payload::{
@@ -59,12 +60,13 @@ use serde::de::DeserializeOwned;
 
 use crate::building::{self, PayloadId};
 use crate::client::{
-    ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_V5_TIMEOUT, ENGINE_TIMEOUT,
-    new_payload_v4_params, new_payload_v5_params,
+    ENGINE_GET_BLOBS_TIMEOUT, ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_V5_TIMEOUT,
+    ENGINE_TIMEOUT, new_payload_v4_params, new_payload_v5_params,
 };
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, CustodyColumns, ForkchoiceStateV1, ForkchoiceUpdatedResponse, PayloadStatusV1,
+    BlobAndProofV2Json, ClientVersionV1, CustodyColumns, ForkchoiceStateV1,
+    ForkchoiceUpdatedResponse, PayloadStatusV1,
 };
 
 /// A handle on an embedded ethrex's Engine API: its RPC context, which every
@@ -213,6 +215,20 @@ impl InProcessEngine {
             payload_id: payload_id_u64(payload_id),
         };
         self.run(request, ENGINE_GET_PAYLOAD_TIMEOUT).await
+    }
+
+    /// Under [`ENGINE_GET_BLOBS_TIMEOUT`], as over HTTP. The answer is the wire
+    /// shape, decoded and checked by the caller exactly as an HTTP answer is.
+    pub(crate) async fn get_blobs_v2(
+        &self,
+        versioned_hashes: &[Bytes32],
+    ) -> Result<Option<Vec<Option<BlobAndProofV2Json>>>, EngineError> {
+        // The request's only field is private, so it is built by its own
+        // `parse`, from the hashes as the HTTP transport would send them.
+        let param = serde_json::value::to_raw_value(&hashes(versioned_hashes))
+            .map_err(|err| EngineError::Decode(err.to_string()))?;
+        let request = BlobsV2Request::parse(&Some(vec![param])).map_err(rpc_error)?;
+        self.run(request, ENGINE_GET_BLOBS_TIMEOUT).await
     }
 
     pub(crate) async fn exchange_capabilities(

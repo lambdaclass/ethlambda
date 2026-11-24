@@ -39,9 +39,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::doppelganger::Doppelganger;
 use crate::error::{Error, Result};
 use crate::keys::web3signer::{
     AggregationSlot, ForkInfo, RandaoReveal, SigningBody, SigningRequest, SyncCommitteeMessage,
@@ -88,13 +89,19 @@ pub struct SigningContext {
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
     /// One permit per remote signature being verified; see [`Self::verified`].
     verifications: Arc<Semaphore>,
+    /// Which keys doppelganger protection lets sign an attestation, a block,
+    /// a RANDAO reveal or an aggregate, or `None` with the protection off.
+    /// See [`Self::doppelganger_allows`].
+    doppelganger: Option<Arc<Doppelganger>>,
 }
 
 /// How long a selection proof is remembered past its slot: the duty
 /// schedule holds the current epoch and the next, so a proof computed for a
 /// subscription at the start of an epoch is still wanted by the aggregation
 /// up to two epochs later.
-const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
+fn selection_proof_retention_slots() -> Slot {
+    3 * slots_per_epoch()
+}
 
 /// How long one duty's batch of signatures may take, from when it is asked
 /// for.
@@ -172,6 +179,40 @@ impl SigningContext {
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
             verifications: Arc::new(Semaphore::new(cores)),
+            doppelganger: None,
+        }
+    }
+
+    /// Put the slashable signatures behind doppelganger protection.
+    pub fn with_doppelganger(mut self, doppelganger: Arc<Doppelganger>) -> Self {
+        self.doppelganger = Some(doppelganger);
+        self
+    }
+
+    /// Doppelganger protection, when it is on: what a keymanager import
+    /// registers a new key with.
+    pub fn doppelganger(&self) -> Option<&Arc<Doppelganger>> {
+        self.doppelganger.as_ref()
+    }
+
+    /// Whether `pubkey` may sign an attestation, a block, a RANDAO reveal or
+    /// an aggregate: always, with doppelganger protection off, and otherwise
+    /// once it has passed the check (see [`crate::doppelganger`]).
+    ///
+    /// The duty loop asks this before a duty is recorded or the beacon node
+    /// asked anything for it; the four signing methods ask it again, so a
+    /// path that skipped the loop's filter still signs nothing.
+    pub fn doppelganger_allows(&self, pubkey: &BlsPubkey) -> bool {
+        self.doppelganger
+            .as_ref()
+            .is_none_or(|doppelganger| doppelganger.allows_signing(pubkey))
+    }
+
+    fn require_doppelganger_clear(&self, pubkey: &BlsPubkey) -> Result<()> {
+        if self.doppelganger_allows(pubkey) {
+            Ok(())
+        } else {
+            Err(Error::DoppelgangerProtected(*pubkey))
         }
     }
 
@@ -535,13 +576,15 @@ impl SigningContext {
         }
     }
 
-    /// Sign `data` on behalf of `pubkey`.
+    /// Sign `data` on behalf of `pubkey`. Refused for a key doppelganger
+    /// protection has not cleared.
     pub async fn sign_attestation(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &AttestationData,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         self.sign(
             store,
             pubkey,
@@ -557,13 +600,19 @@ impl SigningContext {
     /// Unlike the other two, this signature is not itself a slashable message:
     /// it commits to an epoch, not to a chain position, and producing one for
     /// an epoch a validator is not proposing in reveals nothing and risks
-    /// nothing. It is therefore not guarded, and does not need to be.
+    /// nothing. It is therefore not guarded by slashing protection, and does
+    /// not need to be.
+    ///
+    /// Doppelganger protection does withhold it, as Lighthouse's does: it is
+    /// only ever signed to ask for a block, which a key that has not passed
+    /// the check must not propose.
     pub async fn sign_randao(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         epoch: Epoch,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         self.sign(
             store,
             pubkey,
@@ -619,7 +668,7 @@ impl SigningContext {
             )
             .await?;
         let mut proofs = self.selection_proofs();
-        proofs.retain(|(_, held), _| held + SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
         proofs.insert((*pubkey, slot), proof);
         Ok(proof)
     }
@@ -644,12 +693,17 @@ impl SigningContext {
     ///
     /// Takes the whole wrapper rather than its root: a remote signer wants to
     /// read what it signs, and the wrapper's own fork decides its JSON shape.
+    ///
+    /// Withheld by doppelganger protection all the same: a node marks an
+    /// aggregate's aggregator live, so one published by a key under the
+    /// check would be read back as a doppelganger of itself.
     pub async fn sign_aggregate_and_proof(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         message: AggregateAndProofRef<'_>,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         let slot = message.slot();
         let epoch = compute_epoch_at_slot(slot);
         let version = match message {
@@ -921,13 +975,14 @@ impl SigningContext {
     /// validator to be caught, since the two signed headers are the whole
     /// evidence. Callers must have it allowed and recorded by
     /// [`crate::slashing_protection::SlashingProtection::check_and_record_block`]
-    /// first.
+    /// first. Refused for a key doppelganger protection has not cleared.
     pub async fn sign_block(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         header: &BeaconBlockHeader,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         let epoch = compute_epoch_at_slot(header.slot);
         self.sign(
             store,
@@ -1102,7 +1157,7 @@ mod tests {
         // number, since `domain()` only changes with the epoch insofar as the
         // epoch selects a different fork version.
         let mut data = attestation_data(context.config.altair_fork_epoch + 1);
-        data.slot = 3 * preset::SLOTS_PER_EPOCH;
+        data.slot = 3 * preset::slots_per_epoch();
 
         let from_target = compute_signing_root(
             data.hash_tree_root(),
@@ -1280,7 +1335,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+        let slot = gloas_epoch * preset::slots_per_epoch() + 2;
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1293,7 +1348,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+        let slot = (gloas_epoch + 1) * preset::slots_per_epoch();
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1369,7 +1424,7 @@ mod tests {
         let context = context();
         let epoch: Epoch = 100;
         let object = epoch.hash_tree_root();
-        let slot = epoch * preset::SLOTS_PER_EPOCH;
+        let slot = epoch * preset::slots_per_epoch();
 
         let roots = [
             compute_signing_root(object, context.domain(DOMAIN_BEACON_ATTESTER, epoch)),
@@ -1416,7 +1471,7 @@ mod tests {
     #[test]
     fn a_blocks_domain_comes_from_its_own_slots_epoch() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config.altair_fork_epoch * preset::slots_per_epoch();
         let before = after - 1;
 
         assert_ne!(
@@ -1513,7 +1568,7 @@ mod tests {
     #[test]
     fn a_sync_message_domain_follows_the_fork_schedule_at_its_slot() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config.altair_fork_epoch * preset::slots_per_epoch();
         assert_ne!(
             context.sync_committee_message_signing_root(after - 1, Root::ZERO),
             context.sync_committee_message_signing_root(after, Root::ZERO),
@@ -1995,7 +2050,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.electra_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config.electra_fork_epoch * preset::slots_per_epoch();
             let header = header(slot);
 
             context
@@ -2110,7 +2165,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let (context, gloas_epoch) = gloas_scheduled_context();
-            let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+            let slot = gloas_epoch * preset::slots_per_epoch() + 2;
             let preferences = preferences_for(slot);
 
             let signature = context
@@ -2189,7 +2244,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config.altair_fork_epoch * preset::slots_per_epoch();
 
             let err = context
                 .sign_block(&store, &pubkey, &header(slot))
@@ -2354,5 +2409,127 @@ mod tests {
                 .expect_err("must fail");
             assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod doppelganger_tests {
+    use super::*;
+    use ethlambda_types::beacon::containers::electra;
+    use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    fn secret() -> [u8; 32] {
+        hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    fn data() -> AttestationData {
+        AttestationData {
+            slot: 3200,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint {
+                epoch: 99,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: 100,
+                root: Root::ZERO,
+            },
+        }
+    }
+
+    /// A key registered after genesis, so still under the check.
+    fn withheld() -> (SigningContext, RwLock<ValidatorStore>, BlsPubkey) {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let doppelganger = Arc::new(Doppelganger::new());
+        doppelganger.register(pubkey, 100);
+        let context =
+            SigningContext::new(Config::mainnet(), Root::ZERO).with_doppelganger(doppelganger);
+        (context, RwLock::new(store), pubkey)
+    }
+
+    fn protected<T: std::fmt::Debug>(result: Result<T>) {
+        let err = result.expect_err("withheld");
+        assert!(
+            matches!(err, Error::DoppelgangerProtected(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The four signatures a doppelganger makes slashable, or that the node
+    /// reads as liveness, are refused while the key is checked.
+    #[tokio::test]
+    async fn the_slashable_signatures_are_refused_under_the_check() {
+        let (context, store, pubkey) = withheld();
+        assert!(!context.doppelganger_allows(&pubkey));
+
+        protected(context.sign_attestation(&store, &pubkey, &data()).await);
+        protected(context.sign_randao(&store, &pubkey, 100).await);
+        let header = BeaconBlockHeader {
+            slot: 3200,
+            proposer_index: 7,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body_root: Root::ZERO,
+        };
+        protected(context.sign_block(&store, &pubkey, &header).await);
+        let message = electra::AggregateAndProof {
+            aggregator_index: 9,
+            aggregate: electra::Attestation {
+                aggregation_bits: Default::default(),
+                data: data(),
+                signature: BlsSignature([2; 96]),
+                committee_bits: Default::default(),
+            },
+            selection_proof: BlsSignature([3; 96]),
+        };
+        let aggregate = AggregateAndProofRef::Electra(&message);
+        protected(
+            context
+                .sign_aggregate_and_proof(&store, &pubkey, aggregate)
+                .await,
+        );
+    }
+
+    /// Everything else goes on, as in Lighthouse: the key's subnets need
+    /// their selection proofs, and nothing here is slashable or counted as
+    /// liveness.
+    #[tokio::test]
+    async fn the_other_signatures_go_on_under_the_check() {
+        let (context, store, pubkey) = withheld();
+
+        context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect("a selection proof");
+        context
+            .sign_sync_committee_message(&store, &pubkey, 3200, Root::ZERO)
+            .await
+            .expect("a sync committee message");
+        let exit = VoluntaryExit {
+            epoch: context.config.deneb_fork_epoch + 10,
+            validator_index: 42,
+        };
+        context
+            .sign_voluntary_exit(&store, &pubkey, &exit, exit.epoch)
+            .await
+            .expect("a voluntary exit");
+    }
+
+    /// With the protection off nothing is withheld.
+    #[tokio::test]
+    async fn without_the_protection_every_key_signs() {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let context = SigningContext::new(Config::mainnet(), Root::ZERO);
+        assert!(context.doppelganger_allows(&pubkey));
+        context
+            .sign_attestation(&RwLock::new(store), &pubkey, &data())
+            .await
+            .expect("signs");
     }
 }

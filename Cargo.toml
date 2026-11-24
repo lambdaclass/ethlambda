@@ -9,6 +9,7 @@ members = [
     "crates/common/crypto",
     "crates/common/ssz-tree",
     "crates/common/metrics",
+    "crates/common/telemetry",
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/execution/ethrex",
@@ -73,6 +74,7 @@ ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
 ethlambda-ssz-tree = { path = "crates/common/ssz-tree" }
 ethlambda-metrics = { path = "crates/common/metrics" }
+ethlambda-telemetry = { path = "crates/common/telemetry" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
@@ -135,6 +137,9 @@ ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0
 # through to the pure-Rust backend. Selection stays at run time either way, so the
 # build remains portable to hardware lacking the extensions.
 sha2 = { version = "0.10.9", features = ["asm"] }
+# Inline byte storage for the preset-sized bitfields, as libssz-types' own
+# bitfields use, so decoding committee or sync bits does not allocate.
+smallvec = "1.15"
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the

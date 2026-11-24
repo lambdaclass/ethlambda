@@ -113,7 +113,7 @@ pub fn compute_subnet_for_attestation(
     committee_index: CommitteeIndex,
     config: &Config,
 ) -> u64 {
-    let slots_since_epoch_start = slot % preset::SLOTS_PER_EPOCH;
+    let slots_since_epoch_start = slot % preset::slots_per_epoch();
     let committees_since_epoch_start = committees_per_slot.saturating_mul(slots_since_epoch_start);
     committees_since_epoch_start.saturating_add(committee_index) % config.attestation_subnet_count
 }
@@ -190,7 +190,11 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
     };
     let domain = get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
-    if !bls::verify(&attester.pubkey, signing_root, &attestation.signature) {
+    let attester_key = bls::IndexedPubkey {
+        index: attestation.attester_index,
+        pubkey: attester.pubkey,
+    };
+    if !bls::verify(&attester_key, signing_root, &attestation.signature) {
         return Outcome::Reject(RejectReason::BadSignature);
     }
 
@@ -415,8 +419,8 @@ mod tests {
         let store = store(0);
         let seen = seen_attestations();
         let mut attestation = attestation_at(0, 1, 0);
-        attestation.data.slot = crate::beacon::preset::SLOTS_PER_EPOCH;
-        let now = slot_start_ms(&store, crate::beacon::preset::SLOTS_PER_EPOCH);
+        attestation.data.slot = crate::beacon::preset::slots_per_epoch();
+        let now = slot_start_ms(&store, crate::beacon::preset::slots_per_epoch());
         assert_eq!(
             cheap_checks(&seen, &store, &attestation, now),
             Err(Outcome::Reject(RejectReason::EpochMismatch))

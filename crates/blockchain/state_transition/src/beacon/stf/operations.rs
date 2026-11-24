@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use crate::beacon::bls::{self, SignatureSet};
+use crate::beacon::bls::{self, IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::BeaconState;
@@ -43,6 +43,7 @@ use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
 /// Runs every operation in a block, in the specification's order.
 ///
@@ -123,24 +124,16 @@ pub fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        process_proposer_slashing(
-            state,
-            proposer_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
-    for attester_slashing in attester_slashings {
-        process_attester_slashing(
-            state,
-            attester_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| process_proposer_slashing(state, slashing, config, active_balances, signatures),
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| process_attester_slashing(state, slashing, config, active_balances, signatures),
+    )?;
     // The proposer every attestation below pays (phase0: records), resolved
     // once for the list where the specification's `process_attestation` reads
     // `get_beacon_proposer_index(state)` each time. Before fulu that lookup
@@ -155,48 +148,53 @@ pub fn process_operations(
     // of which is among them.
     //
     // An empty list asks nothing, as it did when the lookup was per
-    // attestation.
+    // attestation, and observes nothing. A non-empty one is timed as one
+    // `attestations` observation that includes the lookup, which is work the
+    // step did when the lookup was per attestation.
     if !attestations.is_empty() {
-        let proposer_index = get_beacon_proposer_index(state)?;
-        for attestation in attestations {
-            // Phase0 defers an attestation's reward to the epoch boundary, so
-            // it needs its own version of this step; altair scores one the
-            // moment it is processed instead, and nothing about that changed
-            // through capella, so every later fork this signature serves
-            // shares altair's version rather than getting one of its own.
-            // This is the same coexisting-by-fork pattern
-            // `crate::beacon::helpers::altair` and
-            // `crate::beacon::stf::epoch::rewards` already use for the two
-            // `get_base_reward` implementations: neither is renamed, and the
-            // call site picks between them by fully-qualified path.
-            if altair_attestations {
-                crate::beacon::stf::altair::process_attestation(
-                    state,
-                    attestation,
-                    proposer_index,
-                    committees,
-                    active_balances,
-                    target_delta,
-                    signatures,
-                )?;
-            } else {
-                process_attestation(
-                    state,
-                    attestation,
-                    proposer_index,
-                    config,
-                    committees,
-                    signatures,
-                )?;
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in attestations {
+                // Phase0 defers an attestation's reward to the epoch boundary,
+                // so it needs its own version of this step; altair scores one
+                // the moment it is processed instead, and nothing about that
+                // changed through capella, so every later fork this signature
+                // serves shares altair's version rather than getting one of
+                // its own. This is the same coexisting-by-fork pattern
+                // `crate::beacon::helpers::altair` and
+                // `crate::beacon::stf::epoch::rewards` already use for the two
+                // `get_base_reward` implementations: neither is renamed, and
+                // the call site picks between them by fully-qualified path.
+                if altair_attestations {
+                    crate::beacon::stf::altair::process_attestation(
+                        state,
+                        attestation,
+                        proposer_index,
+                        committees,
+                        active_balances,
+                        target_delta,
+                        signatures,
+                    )?;
+                } else {
+                    process_attestation(
+                        state,
+                        attestation,
+                        proposer_index,
+                        config,
+                        committees,
+                        signatures,
+                    )?;
+                }
             }
-        }
+            Ok(())
+        })?;
     }
-    for deposit in deposits {
-        process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config, signatures)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config, signatures)
+    })?;
 
     Ok(())
 }
@@ -252,7 +250,10 @@ pub(crate) fn verify_proposer_slashing(
     // Copied out rather than re-borrowed per iteration below: both signatures
     // are checked against the same proposer, and holding the borrow across
     // the loop would conflict with `get_domain`'s borrow of `state`.
-    let pubkey = proposer.pubkey;
+    let pubkey = IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
 
     for signed_header in [
         &proposer_slashing.signed_header_1,
@@ -438,7 +439,7 @@ pub fn process_attestation(
         ))?;
     let max_slot = data
         .slot
-        .checked_add(preset::SLOTS_PER_EPOCH)
+        .checked_add(preset::slots_per_epoch())
         .ok_or(Error::ArithmeticOverflow("data.slot + SLOTS_PER_EPOCH"))?;
     verify(
         min_slot <= state.slot() && state.slot() <= max_slot,
@@ -730,7 +731,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),
@@ -814,7 +818,7 @@ mod tests {
 
         let target_epoch = 1;
         let data_1 = AttestationData {
-            slot: preset::SLOTS_PER_EPOCH,
+            slot: preset::slots_per_epoch(),
             index: 0,
             beacon_block_root: Root::repeat_byte(1),
             source: Checkpoint::default(),

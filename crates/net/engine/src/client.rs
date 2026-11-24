@@ -17,8 +17,9 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
-    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    BlobAndProofV2, BlobAndProofV2Json, ClientVersionV1, CustodyColumns, ExecutionPayloadV3,
+    ExecutionPayloadV4, ForkchoiceStateV1, ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    decode_blobs_v2,
 };
 
 /// Per-attempt timeout.
@@ -32,6 +33,10 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
 /// for the older methods.
 pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Per-attempt timeout for `engine_getBlobsV2`, the value `osaka.md` gives that
+/// method.
+pub const ENGINE_GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Timeout for `engine_getPayloadV5` and `engine_getPayloadV6`, which get this
 /// one attempt and no retry.
@@ -366,6 +371,42 @@ impl EngineClient {
             Transport::InProcess(engine) => engine.get_payload_v6(payload_id).await?,
         };
         response.try_into()
+    }
+
+    /// `engine_getBlobsV2`: every blob named by `versioned_hashes`, in order,
+    /// with its cell proofs, or `None` when the execution client is missing
+    /// any of them.
+    ///
+    /// One attempt, bounded by [`ENGINE_GET_BLOBS_TIMEOUT`], and deliberately
+    /// not through the retry ladder: this call races the gossip delivery of the
+    /// same data columns, and a retry after the ladder's first backoff would
+    /// land after that race is lost. A failure leaves the block to gossip and
+    /// peers, which is where it was anyway.
+    ///
+    /// An answer that is not shaped as the specification requires (wrong
+    /// length, blob size or proof count, or a `null` element) is a
+    /// [`EngineError::Decode`], over either transport.
+    pub async fn get_blobs_v2(
+        &self,
+        versioned_hashes: &[Bytes32],
+    ) -> Result<Option<Vec<BlobAndProofV2>>, EngineError> {
+        let result: Option<Vec<Option<BlobAndProofV2Json>>> = match &self.transport {
+            Transport::Http(http) => {
+                let hashes: Vec<String> = versioned_hashes
+                    .iter()
+                    .map(|hash| data(hash.as_slice()))
+                    .collect();
+                http.call_once(
+                    "engine_getBlobsV2",
+                    &json!([hashes]),
+                    ENGINE_GET_BLOBS_TIMEOUT,
+                )
+                .await?
+            }
+            #[cfg(feature = "include-ethrex")]
+            Transport::InProcess(engine) => engine.get_blobs_v2(versioned_hashes).await?,
+        };
+        decode_blobs_v2(result, versioned_hashes.len())
     }
 
     /// `engine_exchangeCapabilities`. Returns what the execution client says it
