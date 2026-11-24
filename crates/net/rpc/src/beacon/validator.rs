@@ -103,9 +103,10 @@ struct SyncDuty {
 /// the head's is refused rather than answered from a historical state, since
 /// a validator client only ever asks about the current and next period.
 ///
-/// A requested validator that holds no seat is left out of `data`. The
-/// answer is `503` while the node is syncing: the head state's committees are
-/// not yet the chain's.
+/// A requested validator that holds no seat is left out of `data`, so an epoch
+/// at or after the PQ fork, which removed sync committees, answers an empty
+/// `data`. The answer is `503` while the node is syncing: the head state's
+/// committees are not yet the chain's.
 async fn post_sync_duties(
     Path(epoch): Path<String>,
     State(store): State<Store>,
@@ -131,6 +132,16 @@ fn sync_duties(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
     let (head_root, head_state) = head(store)?;
+
+    // The PQ fork removed sync committees, so from it on no validator holds a
+    // seat. That is an empty answer, not an error: a validator client that
+    // still asks is told it has no duty rather than that its node failed.
+    if store.config().fork_at_epoch(epoch) >= ForkName::Pq {
+        return Ok(serde_json::json!({
+            "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, head_root),
+            "data": [],
+        }));
+    }
 
     // Bounded by the wall clock, as the Beacon API defines it: up to the
     // period after the current one. The head lags the clock at a period
