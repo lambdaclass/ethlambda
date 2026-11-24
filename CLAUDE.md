@@ -890,7 +890,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   every fork travel as the fork-tagged `containers::SignedExecutionPayloadEnvelope`
   (storage decodes one by its slot's fork, req/resp by the chunk's context
   bytes, the engine gets each fork's typed requests list). It runs next to
-  Lighthouse's PQ client on a PQ-at-genesis devnet (`tooling/pq-devnet/`),
+  other clients' PQ branches on PQ-at-genesis devnets (ethpandaops/ethereum-package's
+  `pq` branch, see `docs/beacon_pq.md`, "Running a devnet"),
   with its own validators: the validator client derives each
   validator's leanXMSS key and VRF seed from its BLS key
   (`ethlambda_crypto::pq_keys`) and attests, aggregates, casts PTC votes and

@@ -20,9 +20,9 @@ Both are `ForkName`s (`Eip8483`, `Pq`), between `Gloas` and `Lean`, on-disk
 selectors 8 and 9. Neither is scheduled on a public network. **The node
 follows PQ** (`ForkName::is_followed`): it imports PQ blocks and envelopes
 from gossip and req/resp, applies PQ aggregates and payload attestations to
-fork choice, and asks its execution client about PQ payloads. It was run
-next to Lighthouse's PQ client on a PQ-at-genesis devnet
-(`tooling/pq-devnet/README.md`). Its validator
+fork choice, and asks its execution client about PQ payloads. It has run
+next to other clients' PQ branches on PQ-at-genesis devnets (see
+[Running a devnet](#running-a-devnet)). Its validator
 client runs every PQ duty (attest, aggregate, the PTC vote, propose and
 reveal the payload), and the beacon node builds PQ blocks with their
 attestations' proofs merged: see [Validator duties](#validator-duties). It
@@ -64,7 +64,7 @@ changes.
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
 | Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; blobs, their columns gossiped with the envelope. Every block it built on the devnet was canonical on Lighthouse |
 | VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each `keccak256(vrf_seed \|\| le64(slot))`; known answers from ethereum-package's published state. Restorable from a compact state (root and leaf 0's branch), which the package publishes for its genesis validators and `ethlambda pq-keys` writes |
-| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on the devnet before the VRF change (see "Known limits" in `tooling/pq-devnet/README.md`) |
+| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on devnets next to other clients' (see [Running a devnet](#running-a-devnet)) |
 | Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
 | Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
@@ -383,6 +383,100 @@ asks for again.
   `GET aggregate_attestation` then answers the proved aggregate and its
   proof, or a 404 when the node proved none, and the client signs the
   `AggregateAndProof` at the slot's aggregate leaf.
+
+## Running a devnet
+
+ethpandaops/ethereum-package's `pq` branch runs PQ-at-genesis devnets with
+ethlambda as beacon node, validator client or both (its
+`.github/tests/cl-pq.yaml` names every client's `pq-devnet-0` image; the
+pq-devnet-0 notes, `notes.ethereum.org/@ethpandaops/pq-devnet-0`, pin the
+rest). Build the image from the repository root (`docker build -t
+ethlambda:pq-local .`: it ships `leanvm-sidecar`, built from the commit in
+`leanvm-revision`, and the `ethlambda-pq` supervisor), then `kurtosis run
+--enclave pq <ethereum-package at pq> --args-file params.yaml` with, for
+example, ethlambda next to Teku and Lodestar, and Silver's beacon node behind
+ethlambda's validator client (Silver has no client of its own):
+
+```yaml
+participants:
+  - el_type: geth
+    cl_type: ethlambda
+    cl_image: ethlambda:pq-local
+    cl_extra_env_vars:
+      LEANVM_THREADS: "2"
+    vc_type: ethlambda
+    vc_image: ethlambda:pq-local
+    validator_count: 16
+    supernode: true
+  - el_type: geth
+    cl_type: teku
+    cl_image: ethpandaops/teku:pq-devnet-0
+    vc_image: ethpandaops/teku:pq-devnet-0
+    validator_count: 16
+    supernode: true
+  - el_type: geth
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:pq-devnet-0
+    vc_image: ethpandaops/lodestar:pq-devnet-0
+    validator_count: 16
+  - el_type: geth
+    cl_type: silver
+    cl_image: ethpandaops/silver:pq-devnet-0
+    vc_type: ethlambda
+    vc_image: ethlambda:pq-local
+    validator_count: 16
+network_params:
+  preset: mainnet
+  gloas_fork_epoch: 0
+  pq_fork_epoch: 0
+  genesis_delay: 240
+```
+
+What the package does for ethlambda on a PQ network:
+
+- It runs the beacon node as `ethlambda-pq beacon <flags>`: the supervisor
+  starts the sidecar on a private socket, waits for it to listen, and runs
+  the node on it, either exiting stopping the other, as `lighthouse-pq-bn`
+  does for Lighthouse. `LEANVM_THREADS` (through `cl_extra_env_vars`) caps
+  the sidecar's threads.
+- It passes the validator client `--init-slashing-protection` and, for its
+  default mnemonic, the leanXMSS tree caches and VRF tree states it
+  publishes for that mnemonic's first 10000 validators (`--xmss-cache-url`,
+  `--vrf-state-url`). The client refuses a flag given twice, so
+  `vc_extra_params` must not repeat them.
+- Its genesis generator gives each validator the leanXMSS key and VRF seed
+  the validator client derives from the BLS key. For another mnemonic, or
+  past the published 10000, `ethlambda pq-keys --mnemonic ... --count N
+  --output-dir keys` writes the key file the generator reads
+  (`xmss_pubkey_url`) and the VRF states (`vrf_state_url`); every root
+  hashes a whole tree, minutes a validator, and the run is resumable.
+
+Limits worth knowing:
+
+- **At least 32 validators** on the mainnet preset: gloas's `compute_ptc`
+  asserts every slot has an attester, so with fewer, epoch processing fails
+  at the first epoch boundary (`compute_balance_weighted_selection: total >
+  0`) and the chain stops. The specification does the same.
+- **Memory.** Every `leanvm-sidecar` warms up by proving twice and stays
+  large. In Docker Desktop's default 8 GB VM a second sidecar next to
+  Lighthouse's has had the kernel kill Lighthouse's. Set `LEANVM_THREADS` on
+  nodes that only verify.
+- **Lighthouse's envelopes over req/resp.** Its `pq-devnet-0` image (last
+  checked at `sha256:f571048f`) answered
+  `execution_payload_envelopes_by_{range,root}` with a gloas-shaped envelope
+  under the PQ digest, which ethlambda refuses, so an ethlambda node that
+  fell behind could not catch up from Lighthouse alone (it can from another
+  ethlambda node). Gossip is unaffected.
+
+What shows interop working: the beacon APIs agree on the head and finality;
+ethlambda's `lean_beacon_gossip_validation_total` is all `accept` (blocks,
+envelopes, aggregates with their proofs checked through the sidecar,
+attestations, payload attestations, proposer preferences);
+`lean_beacon_aggregate_total{outcome="applied"}` rises; every envelope is
+`VALID` (`Execution payload envelope verified ... status=Valid`); every block
+ethlambda's validator client publishes (`Published a PQ block`) is canonical
+on the other clients, and their rejected-gossip counters stay empty for
+ethlambda's messages.
 
 ## Spec fixtures
 
