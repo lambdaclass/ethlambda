@@ -142,10 +142,11 @@ use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
 use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
+use ethlambda_state_transition::beacon::stf::signatures::SignatureBatch;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{Case, collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -174,11 +175,41 @@ fn apply(
     case: &Case,
     state: &mut BeaconState,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
-    // Only the `attestation` handler reads this. Bound up here so each of its
-    // calls fits on one line; a case processes a single attestation, so there
-    // is nothing for the cache to share between calls.
-    let committees = CommitteeCache::default();
+    // Every signature an operation defers is checked once the operation has
+    // run, which is how a block's own driver treats them: a case whose only
+    // defect is a bad signature is still rejected, only later.
+    //
+    // The closure turns `run`'s nesting inside out. The crate's own `Err` is
+    // the closure's error, which skips the batch as a block's driver does. A
+    // case no handler covers ran nothing, so it passes through the batch
+    // (empty, so it verifies) as the closure's `Ok(Err(..))`, and the last
+    // step hands that error back.
+    SignatureBatch::deferred(|signatures| {
+        match run(handler, case, state, config, committees, signatures) {
+            Ok(verdict) => verdict.map(Ok),
+            Err(unhandled) => Ok(Err(unhandled)),
+        }
+    })
+    .map_err(|err| format!("{err:?}"))
+    .and_then(|handled| handled)
+}
+
+/// [`apply`]'s dispatch, pushing every deferred signature into `signatures`.
+/// The outer `Err` is a case no handler here covers; the inner result is the
+/// crate's own verdict.
+fn run(
+    handler: &str,
+    case: &Case,
+    state: &mut BeaconState,
+    config: &Config,
+    committees: &CommitteeCache,
+    signatures: &mut SignatureBatch,
+) -> Result<Result<(), ethlambda_state_transition::beacon::Error>, String> {
+    // `committees` is only read by the `attestation` handler. The caller owns
+    // it so that an electra-or-later attestation can be run once with a cold
+    // cache and once with a warmed one; see [`trials`].
     let active_balances = ActiveBalanceCache::default();
     let pubkey_indices = PubkeyIndexCache::default();
     let outcome = match handler {
@@ -288,7 +319,8 @@ fn apply(
                         &attestation,
                         proposer,
                         config,
-                        &committees,
+                        committees,
+                        signatures,
                     )
                 })
             }
@@ -302,8 +334,10 @@ fn apply(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
+                        None,
+                        signatures,
                     )
                 })
             }
@@ -316,8 +350,10 @@ fn apply(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
+                        None,
+                        signatures,
                     )
                 })
             }
@@ -331,8 +367,10 @@ fn apply(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
+                        None,
+                        signatures,
                     )
                 })
             }
@@ -349,8 +387,10 @@ fn apply(
                     state,
                     &attestation,
                     meta.parent_slot,
-                    &committees,
+                    committees,
                     &active_balances,
+                    None,
+                    signatures,
                 )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
@@ -363,7 +403,13 @@ fn apply(
             | ForkName::Capella
             | ForkName::Deneb => {
                 let slashing: phase0::AttesterSlashing = case.ssz("attester_slashing");
-                operations::process_attester_slashing(state, &slashing, config, &active_balances)
+                operations::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Electra's container widens the same way `Attestation`'s does
             // (see the `attestation` arm above); the function itself is not
@@ -371,14 +417,26 @@ fn apply(
             // Fulu's specification changes neither.
             ForkName::Electra | ForkName::Fulu => {
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
-                electra_stf::process_attester_slashing(state, &slashing, config, &active_balances)
+                electra_stf::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             // Gloas's container widens again (EIP-7688's unbounded
             // `AttestingIndices`); the function is still not behaviorally
             // modified, only transcribed against gloas's own type.
             ForkName::Gloas => {
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
-                gloas_stf::process_attester_slashing(state, &slashing, config, &active_balances)
+                gloas_stf::process_attester_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
@@ -402,10 +460,15 @@ fn apply(
                     &slashing,
                     config,
                     &active_balances,
+                    signatures,
                 ),
-                ForkName::Gloas => {
-                    gloas_stf::process_proposer_slashing(state, &slashing, config, &active_balances)
-                }
+                ForkName::Gloas => gloas_stf::process_proposer_slashing(
+                    state,
+                    &slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                ),
                 ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
             }
         }
@@ -452,14 +515,14 @@ fn apply(
             // Unchanged through capella.
             ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                operations::process_voluntary_exit(state, &exit, config)
+                operations::process_voluntary_exit(state, &exit, config, signatures)
             }
             // Deneb pins the signature to `CAPELLA_FORK_VERSION` (EIP-7044),
             // so an exit signed long before it takes effect never expires
             // out from under its own signer at a later fork boundary.
             ForkName::Deneb => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                deneb_stf::process_voluntary_exit(state, &exit, config)
+                deneb_stf::process_voluntary_exit(state, &exit, config, signatures)
             }
             // Electra adds a pending-partial-withdrawal check and its own
             // balance-churn exit-queue accounting (EIP-7251); neither fulu's
@@ -469,7 +532,13 @@ fn apply(
             // `process_voluntary_exit`; see that function's own doc).
             ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
-                electra_stf::process_voluntary_exit(state, &exit, config, &active_balances)
+                electra_stf::process_voluntary_exit(
+                    state,
+                    &exit,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
@@ -482,6 +551,7 @@ fn apply(
                 &sync_aggregate,
                 &active_balances,
                 &pubkey_indices,
+                signatures,
             )
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
@@ -568,7 +638,7 @@ fn apply(
         // from here on.
         "bls_to_execution_change" => {
             let signed_change: capella::SignedBLSToExecutionChange = case.ssz("address_change");
-            capella_stf::process_bls_to_execution_change(state, &signed_change, config)
+            capella_stf::process_bls_to_execution_change(state, &signed_change, config, signatures)
         }
         "withdrawals" => match case.fork {
             ForkName::Capella => {
@@ -608,7 +678,7 @@ fn apply(
         // builder's payload.
         "execution_payload_bid" => {
             let signed_bid: gloas::SignedExecutionPayloadBid = case.ssz("execution_payload_bid");
-            gloas_stf::process_execution_payload_bid(state, &signed_bid, config)
+            gloas_stf::process_execution_payload_bid(state, &signed_bid, config, signatures)
         }
         // New in gloas (EIP-7732): the *next* block's processing of the
         // previous slot's payload, so the fixture's operation file is a whole
@@ -697,16 +767,16 @@ fn apply(
         // whether the *previous* slot's payload showed up on time.
         "payload_attestation" => {
             let payload_attestation: gloas::PayloadAttestation = case.ssz("payload_attestation");
-            gloas_stf::process_payload_attestation(state, &payload_attestation, config)
+            gloas_stf::process_payload_attestation(state, &payload_attestation, config, signatures)
         }
         other => return Err(format!("unhandled operation `{other}`")),
     };
 
-    outcome.map_err(|err| format!("{err:?}"))
+    Ok(outcome)
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "operations");
+    let cases = collect_all_handlers(preset(), "operations");
     let mut trials = vec![super::discovery_trial("operations", cases.len())];
 
     for (handler, case) in cases {
@@ -715,7 +785,26 @@ pub fn trials() -> Vec<Trial> {
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
             let config = super::case_config(case);
-            let outcome = apply(&handler, case, &mut state, &config);
+            // An electra-or-later attestation picks its aggregate key from the
+            // shuffling's committee key sums when they are warm, and a fresh
+            // cache is never warm, so the case runs a second time on a copy
+            // of the pre-state with the sums built. Both runs must agree.
+            let warm_run = (handler == "attestation" && case.fork >= ForkName::Electra)
+                .then(|| state.clone());
+
+            let outcome = apply(&handler, case, &mut state, &config, &CommitteeCache::default());
+            if let Some(mut warm_state) = warm_run {
+                let committees = CommitteeCache::default();
+                super::warm_key_sums_around(&committees, &warm_state);
+                let warm = apply(&handler, case, &mut warm_state, &config, &committees);
+                if warm != outcome {
+                    return Err(format!(
+                        "the warm-sums run answered {warm:?} where the cold run answered {outcome:?}"
+                    ));
+                }
+                super::check_transition(case, warm, &warm_state)
+                    .map_err(|err| format!("warm sums: {err}"))?;
+            }
             super::check_transition(case, outcome, &state)
         }));
     }
@@ -761,7 +850,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "withdrawals",
     ];
 
-    let mut unknown: Vec<String> = collect_all_handlers(PRESET, "operations")
+    let mut unknown: Vec<String> = collect_all_handlers(preset(), "operations")
         .into_iter()
         .filter(|(_, case): &(String, Case)| case.in_scope())
         .map(|(handler, _)| handler)

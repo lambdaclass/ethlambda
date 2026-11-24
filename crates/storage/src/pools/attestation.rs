@@ -130,9 +130,9 @@ impl AttestationPool {
     /// pool nothing is inserted into does not keep stale entries.
     pub fn prune_before(&mut self, slot: Slot) {
         self.votes
-            .retain(|_, votes| votes.data.slot + preset::SLOTS_PER_EPOCH > slot);
+            .retain(|_, votes| votes.data.slot + preset::slots_per_epoch() > slot);
         self.aggregates
-            .retain(|_, aggregate| aggregate.data.slot + preset::SLOTS_PER_EPOCH > slot);
+            .retain(|_, aggregate| aggregate.data.slot + preset::slots_per_epoch() > slot);
     }
 
     /// Every vote held for `data_root` from `committee_index`'s committee,
@@ -176,7 +176,7 @@ impl AttestationPool {
 /// The one committee a single-committee attestation names, `None` if it names
 /// none or several.
 pub fn single_committee(attestation: &Attestation) -> Option<CommitteeIndex> {
-    let mut named = (0..preset::MAX_COMMITTEES_PER_SLOT)
+    let mut named = (0..preset::max_committees_per_slot())
         .filter(|&index| attestation.committee_bits.get(index).unwrap_or(false));
     let first = named.next()?;
     named.next().is_none().then_some(first as CommitteeIndex)
@@ -292,7 +292,7 @@ mod tests {
     fn votes_an_epoch_old_are_dropped() {
         let mut pool = AttestationPool::default();
         pool.insert(&vote(5, 0, 10), 0, 2);
-        pool.insert(&vote(5 + preset::SLOTS_PER_EPOCH, 0, 11), 0, 2);
+        pool.insert(&vote(5 + preset::slots_per_epoch(), 0, 11), 0, 2);
         assert!(pool.aggregate(data(5).hash_tree_root(), 5, 0).is_none());
     }
 }

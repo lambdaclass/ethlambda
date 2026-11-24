@@ -1,6 +1,7 @@
 //! [`List`]: an SSZ `List[T, N]` kept in a persistent Merkle tree.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 use libssz::{DecodeError, SszDecode, SszEncode};
@@ -8,10 +9,10 @@ use libssz_merkle::{HashTreeRoot, Sha2Hasher, Sha256Hasher, mix_in_length};
 use libssz_types::TypeError;
 
 use crate::cursor::{ElemCow, IterCow};
-use crate::interface::Interface;
+use crate::interface::{Interface, SortedReader};
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
-use crate::{Hash256, Value, tree_depth};
+use crate::{Const, Hash256, Length, Value, tree_depth};
 
 /// An SSZ list of at most `N` elements, kept in a persistent Merkle tree.
 ///
@@ -22,20 +23,35 @@ use crate::{Hash256, Value, tree_depth};
 ///
 /// A clone is O(1) and shares the whole tree. Writes are buffered in `U` (see
 /// [`UpdateMap`]) until [`List::apply_updates`].
-#[derive(Clone)]
-pub struct List<T, const N: usize, U = VecMap<T>> {
+pub struct ListOf<T, L, U = VecMap<T>> {
     interface: Interface<T, U>,
+    length: PhantomData<fn() -> L>,
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
+/// A [`ListOf`] whose length bound is the compile-time constant `N`.
+pub type List<T, const N: usize, U = VecMap<T>> = ListOf<T, Const<N>, U>;
+
+/// By hand rather than derived, since a derive would require `L: Clone`
+/// of a marker type that is never instantiated.
+impl<T: Clone, L, U: Clone> Clone for ListOf<T, L, U> {
+    fn clone(&self) -> Self {
+        Self {
+            interface: self.interface.clone(),
+            length: PhantomData,
+        }
+    }
+}
+
+impl<T: Value, L: Length, U: UpdateMap<T>> ListOf<T, L, U> {
     fn depth() -> usize {
-        tree_depth::<T>(N)
+        tree_depth::<T>(L::get())
     }
 
     /// An empty list.
     pub fn empty() -> Self {
         Self {
             interface: Interface::from_values(std::iter::empty(), Self::depth()),
+            length: PhantomData,
         }
     }
 
@@ -51,7 +67,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
 
     /// The type's element limit, `N`.
     pub fn max_capacity(&self) -> usize {
-        N
+        L::get()
     }
 
     /// The element at `index`, or `None` past the end.
@@ -65,11 +81,43 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
         self.interface.get_mut(index)
     }
 
+    /// Buffers `value` as the new value of the element at `index`, without
+    /// reading the old one (unlike [`List::get_mut`], which copies it into the
+    /// buffer first). Returns `false`, writing nothing, past the end.
+    #[must_use = "a write past the end is refused"]
+    pub fn set(&mut self, index: usize, value: T) -> bool {
+        self.interface.set(index, value)
+    }
+
+    /// A reader for non-decreasing indices that descends the tree only when
+    /// an index leaves the leaf it last read. See [`SortedReader`].
+    pub fn sorted_reader(&self) -> SortedReader<'_, T, U> {
+        self.interface.sorted_reader()
+    }
+
+    /// A list of `len` copies of `value`, in which every identical subtree is
+    /// shared rather than built again, so building it and hashing it cost
+    /// about the tree's height plus a partial last leaf, not `len`. It behaves
+    /// as the list built from the equivalent `Vec`: writes copy the path they
+    /// touch and never change a shared node.
+    pub fn repeat(value: T, len: usize) -> Result<Self, TypeError> {
+        if len > L::get() {
+            return Err(TypeError::OverCapacity {
+                max: L::get(),
+                got: len,
+            });
+        }
+        Ok(Self {
+            interface: Interface::repeat(&value, len, Self::depth()),
+            length: PhantomData,
+        })
+    }
+
     /// Appends `value`, buffered until [`List::apply_updates`].
     pub fn push(&mut self, value: T) -> Result<(), TypeError> {
-        if self.len() >= N {
+        if self.len() >= L::get() {
             return Err(TypeError::OverCapacity {
-                max: N,
+                max: L::get(),
                 got: self.len() + 1,
             });
         }
@@ -137,39 +185,40 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> crate::Buffered for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> crate::Buffered for ListOf<T, L, U> {
     fn apply_updates(&mut self) {
-        List::apply_updates(self);
+        ListOf::apply_updates(self);
     }
 
     fn has_pending_updates(&self) -> bool {
-        List::has_pending_updates(self)
+        ListOf::has_pending_updates(self)
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Default for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> Default for ListOf<T, L, U> {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> TryFrom<Vec<T>> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> TryFrom<Vec<T>> for ListOf<T, L, U> {
     type Error = TypeError;
 
     fn try_from(values: Vec<T>) -> Result<Self, TypeError> {
-        if values.len() > N {
+        if values.len() > L::get() {
             return Err(TypeError::OverCapacity {
-                max: N,
+                max: L::get(),
                 got: values.len(),
             });
         }
         Ok(Self {
             interface: Interface::from_values(values, Self::depth()),
+            length: PhantomData,
         })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> Index<usize> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> Index<usize> for ListOf<T, L, U> {
     type Output = T;
 
     fn index(&self, index: usize) -> &T {
@@ -179,7 +228,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> Index<usize> for List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> IndexMut<usize> for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> IndexMut<usize> for ListOf<T, L, U> {
     fn index_mut(&mut self, index: usize) -> &mut T {
         let len = self.len();
         self.get_mut(index)
@@ -187,7 +236,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> IndexMut<usize> for List<T, N, U
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> PartialEq for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> PartialEq for ListOf<T, L, U> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
             return false;
@@ -197,15 +246,15 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> PartialEq for List<T, N, U> {
     }
 }
 
-impl<T: Value + Eq, const N: usize, U: UpdateMap<T>> Eq for List<T, N, U> {}
+impl<T: Value + Eq, L: Length, U: UpdateMap<T>> Eq for ListOf<T, L, U> {}
 
-impl<T: Value + fmt::Debug, const N: usize, U: UpdateMap<T>> fmt::Debug for List<T, N, U> {
+impl<T: Value + fmt::Debug, L: Length, U: UpdateMap<T>> fmt::Debug for ListOf<T, L, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a List<T, N, U> {
+impl<'a, T: Value, L: Length, U: UpdateMap<T>> IntoIterator for &'a ListOf<T, L, U> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T, U>;
 
@@ -214,7 +263,7 @@ impl<'a, T: Value, const N: usize, U: UpdateMap<T>> IntoIterator for &'a List<T,
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszEncode for ListOf<T, L, U> {
     fn is_fixed_size() -> bool {
         false
     }
@@ -232,7 +281,7 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszEncode for List<T, N, U> {
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> SszDecode for ListOf<T, L, U> {
     fn is_fixed_size() -> bool {
         false
     }
@@ -243,12 +292,13 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> SszDecode for List<T, N, U> {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         Ok(Self {
-            interface: Interface::from_ssz_bytes(bytes, N, Self::depth())?,
+            interface: Interface::from_ssz_bytes(bytes, L::get(), Self::depth())?,
+            length: PhantomData,
         })
     }
 }
 
-impl<T: Value, const N: usize, U: UpdateMap<T>> HashTreeRoot for List<T, N, U> {
+impl<T: Value, L: Length, U: UpdateMap<T>> HashTreeRoot for ListOf<T, L, U> {
     /// Ignores `hasher` and uses SHA-256: see the crate docs.
     fn hash_tree_root(&self, _hasher: &impl Sha256Hasher) -> Hash256 {
         mix_in_length(&Sha2Hasher, &self.interface.root(), self.len())
@@ -573,6 +623,171 @@ mod tests {
         let list_err = VarList::from_ssz_bytes(&bytes).unwrap_err();
         let ssz_err = VarModel::from_ssz_bytes(&bytes).unwrap_err();
         assert_eq!(list_err, ssz_err);
+    }
+
+    /// A registry-sized limit, so the tree has inner nodes above its leaves.
+    type Flags = List<u8, { 1 << 40 }>;
+
+    #[test]
+    fn set_writes_without_reading_and_refuses_past_the_end() {
+        let mut list = Balances::try_from(vec![1, 2, 3]).unwrap();
+        assert!(list.set(1, 20));
+        assert!(!list.set(3, 40));
+        assert_eq!(list.to_vec(), vec![1, 20, 3]);
+        list.push(4).unwrap();
+        // A pushed element is in range too.
+        assert!(list.set(3, 40));
+        let mut expected = Balances::try_from(vec![1, 2, 3, 4]).unwrap();
+        *expected.get_mut(1).unwrap() = 20;
+        *expected.get_mut(3).unwrap() = 40;
+        assert_eq!(list, expected);
+        list.apply_updates();
+        assert_eq!(root(&list), root(&expected));
+    }
+
+    #[test]
+    fn a_sorted_reader_agrees_with_get_at_every_index() {
+        for len in [0usize, 1, 31, 32, 4_095, 4_096, 4_097, 10_000, 70_000] {
+            let values: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut list = Flags::try_from(values).unwrap();
+            for index in [0usize, 5, 4_096, 9_999, 69_999] {
+                if index < len {
+                    assert!(list.set(index, 255));
+                }
+            }
+            list.push(9).unwrap();
+            for step in [1usize, 7, 5_000] {
+                let mut reader = list.sorted_reader();
+                for index in (0..list.len() + 2).step_by(step) {
+                    assert_eq!(
+                        reader.get(index),
+                        list.get(index),
+                        "len {len} index {index}"
+                    );
+                }
+            }
+            // Applied, the reader reads the tree alone.
+            list.apply_updates();
+            let mut reader = list.sorted_reader();
+            for index in 0..list.len() + 2 {
+                assert_eq!(
+                    reader.get(index),
+                    list.get(index),
+                    "len {len} index {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_hashes_like_the_list_built_from_a_vec_at_every_length() {
+        const LEAF: usize = 4096;
+        const NODE: usize = LEAF * 512;
+        let lengths = [
+            0,
+            1,
+            31,
+            32,
+            33,
+            LEAF - 1,
+            LEAF,
+            LEAF + 1,
+            3 * LEAF + 17,
+            NODE - 1,
+            NODE,
+            NODE + 1,
+            2 * NODE,
+            2 * NODE + LEAF,
+            2_400_000,
+        ];
+        for len in lengths {
+            for value in [0u8, 5] {
+                let repeated = Flags::repeat(value, len).unwrap();
+                let built = Flags::try_from(vec![value; len]).unwrap();
+                assert_eq!(repeated.len(), len, "len {len}");
+                assert_eq!(root(&repeated), root(&built), "len {len} value {value}");
+                assert_eq!(repeated.to_ssz(), built.to_ssz(), "len {len}");
+                assert_eq!(repeated.iter().count(), len, "len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_fits_trees_without_inner_nodes_and_composite_elements() {
+        // The whole tree is one leaf.
+        for len in [0usize, 1, 100, 1024] {
+            let repeated = List::<u64, 1024>::repeat(9, len).unwrap();
+            let built = List::<u64, 1024>::try_from(vec![9u64; len]).unwrap();
+            assert_eq!(root(&repeated), root(&built), "len {len}");
+        }
+        // One element per leaf.
+        for len in [0usize, 1, 2, 7, 100] {
+            let repeated = Items::repeat(item(3), len).unwrap();
+            let built = Items::try_from(vec![item(3); len]).unwrap();
+            assert_eq!(root(&repeated), root(&built), "len {len}");
+            assert_eq!(repeated, built);
+        }
+        assert_eq!(
+            Items::repeat(item(3), 101),
+            Err(TypeError::OverCapacity { max: 100, got: 101 })
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_repeated_list_never_touches_a_shared_leaf() {
+        // Three leaves, the last partial, all but that one the same allocation.
+        const LEN: usize = 4096 * 2 + 1808;
+        let mut list = Flags::repeat(0, LEN).unwrap();
+        let clone = list.clone();
+        let hashed_before = root(&list);
+
+        assert!(list.set(5_000, 3));
+        *list.get_mut(0).unwrap() = 1;
+        list.apply_updates();
+
+        let mut expected = vec![0u8; LEN];
+        expected[5_000] = 3;
+        expected[0] = 1;
+        assert_eq!(list.to_vec(), expected);
+        assert_eq!(
+            root(&list),
+            root(&Flags::try_from(expected.clone()).unwrap())
+        );
+        // The clone, and the leaves the writes did not land in, are unchanged.
+        assert_eq!(clone.to_vec(), vec![0u8; LEN]);
+        assert_eq!(root(&clone), hashed_before);
+        assert_eq!(list.get(4_096), Some(&0));
+        assert_eq!(list.get(8_192), Some(&0));
+
+        // The other write paths behave as on any list.
+        let mut cow = Flags::repeat(0, LEN).unwrap();
+        cow.try_update_each(|element| {
+            if element.index() % 1000 == 0 {
+                *element.make_mut() = 7;
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        let cow_expected: Vec<u8> = (0..LEN)
+            .map(|i| if i % 1000 == 0 { 7 } else { 0 })
+            .collect();
+        assert_eq!(cow.to_vec(), cow_expected);
+        assert_eq!(root(&cow), root(&Flags::try_from(cow_expected).unwrap()));
+
+        let mut rebased = Flags::try_from(vec![0u8; LEN]).unwrap();
+        rebased.rebase_on(&Flags::repeat(0, LEN).unwrap());
+        assert_eq!(rebased.to_vec(), vec![0u8; LEN]);
+
+        // Growing a repeated list past a full leaf.
+        let mut grown = Flags::repeat(0, 4096).unwrap();
+        grown.push(1).unwrap();
+        grown.apply_updates();
+        let mut grown_expected = vec![0u8; 4096];
+        grown_expected.push(1);
+        assert_eq!(
+            root(&grown),
+            root(&Flags::try_from(grown_expected).unwrap())
+        );
     }
 
     #[test]

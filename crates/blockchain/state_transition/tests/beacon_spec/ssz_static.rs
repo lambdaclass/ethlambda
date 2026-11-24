@@ -24,7 +24,7 @@ use ethlambda_state_transition::beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect_all_handlers};
+use super::{Case, collect_all_handlers, preset};
 
 /// Decodes a case, then checks its root and its re-encoding.
 fn check<T>(case: &Case) -> Result<(), String>
@@ -72,7 +72,7 @@ fn parse_root(hex_root: &str) -> Root {
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "ssz_static");
+    let cases = collect_all_handlers(preset(), "ssz_static");
     let mut trials = vec![super::discovery_trial("ssz_static", cases.len())];
 
     for (handler, case) in cases {

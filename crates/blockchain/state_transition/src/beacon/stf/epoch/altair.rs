@@ -18,7 +18,7 @@
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::BeaconState;
+use crate::beacon::containers::{BeaconState, EpochParticipation};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::get_current_epoch;
 use crate::beacon::helpers::altair::get_next_sync_committee;
@@ -400,7 +400,10 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
         state.altair_validator_lists_mut()?;
 
     *previous_epoch_participation = core::mem::take(current_epoch_participation);
-    *current_epoch_participation = vec![0; validator_count].try_into()?;
+    // `repeat` rather than a zeroed `Vec`: the `Vec` builds hundreds of
+    // separate leaves that the next state root then hashes one by one, while
+    // `repeat` shares one zero leaf and its cached hash among all of them.
+    *current_epoch_participation = EpochParticipation::repeat(0, validator_count)?;
 
     Ok(())
 }
@@ -418,7 +421,7 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
 /// before any mutation, leaving the state untouched if it errors.
 pub fn process_sync_committee_updates(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
-    if next_epoch.is_multiple_of(preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD) {
+    if next_epoch.is_multiple_of(preset::epochs_per_sync_committee_period()) {
         let next_committee = get_next_sync_committee(state)?;
         let (current_sync_committee, next_sync_committee) = state.sync_committees_mut()?;
         *current_sync_committee = core::mem::replace(next_sync_committee, next_committee);
@@ -492,13 +495,14 @@ mod tests {
     #[test]
     fn justification_reads_target_balance_from_participation_flags() {
         let mut state = altair_state_with_validators(4);
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * 2; // current epoch 2, previous epoch 1
+        *state.slot_mut() = preset::slots_per_epoch() * 2; // current epoch 2, previous epoch 1
 
         // Every validator cast a timely, correct target vote last epoch, but
         // none has yet this epoch: only the previous epoch should justify.
         {
             let (previous_epoch_participation, _, _) = state.altair_validator_lists_mut().unwrap();
-            for flags in previous_epoch_participation.iter_mut() {
+            for index in 0..previous_epoch_participation.len() {
+                let flags = &mut previous_epoch_participation[index];
                 *flags = add_flag(*flags, constants::TIMELY_TARGET_FLAG_INDEX);
             }
         }
@@ -541,7 +545,7 @@ mod tests {
         // `rewards.rs`'s `finality_stalled_past_the_threshold_is_a_leak` test
         // forces the same condition.
         *state.slot_mut() =
-            preset::SLOTS_PER_EPOCH * (preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY + 10);
+            preset::slots_per_epoch() * (preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY + 10);
 
         {
             let (previous_epoch_participation, _, inactivity_scores) =
@@ -709,7 +713,7 @@ mod tests {
         // One epoch before a period boundary, so `next_epoch` lands exactly on
         // it.
         *state.slot_mut() =
-            preset::SLOTS_PER_EPOCH * (preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD - 1);
+            preset::slots_per_epoch() * (preset::epochs_per_sync_committee_period() - 1);
 
         let old_next = state.sync_committees().unwrap().1.clone();
         let expected_next = get_next_sync_committee(&state).unwrap();

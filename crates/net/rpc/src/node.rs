@@ -24,8 +24,10 @@ struct IdentityResponse {
 /// Sync status for `/lean/v0/node/syncing`.
 ///
 /// `is_syncing` reads the node's own sync decision from the shared
-/// [`SyncStatusController`]: head-vs-wall-clock lag with hysteresis and a
-/// network-stall override, updated each tick by the blockchain actor. It is the
+/// [`SyncStatusController`]: syncing while the head trails the wall clock and
+/// the head the node's peers report in `Status` is ahead of it, with
+/// hysteresis and a stall window, judged by the blockchain actor on each tick
+/// and after each block arrival (see `SyncThresholds`). It is the
 /// same signal that gates validator duties and drives the `lean_node_sync_status`
 /// metric, so the endpoint agrees with both.
 ///

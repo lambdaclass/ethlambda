@@ -459,6 +459,7 @@ pub async fn import(
         .into_iter()
         .map(|result| match (result, &registration) {
             (Ok((pubkey, secret, _, overrides)), Ok(_)) => {
+                let held = store.contains(&pubkey);
                 let status = finish_import(&mut store, &secret);
                 // The file holds this key's entry, enabled, with these
                 // overrides, so the settings must hold them too. For a key
@@ -477,6 +478,14 @@ pub async fn import(
                 // found them.
                 if status.status == "imported" {
                     context.settings.seed(&pubkey, overrides);
+                    // Under the store's write guard with the insert, so the
+                    // duty loop never sees the key before it is checked. Not
+                    // for a key this process already held (a password
+                    // rotation re-imports one): it never left, and checking
+                    // it again would only cost it two to three epochs.
+                    if !held && let Some(doppelganger) = context.signing.doppelganger() {
+                        doppelganger.register_now(pubkey, &context.clock);
+                    }
                 }
                 status
             }
@@ -1100,6 +1109,12 @@ fn judge_delete(
     // with the key, so its overrides have nothing left to apply to. A key
     // imported again starts on the defaults.
     context.settings.forget(pubkey);
+    // Nor is it checked any more: the copy the operator may now run elsewhere
+    // is not a doppelganger of this client's. One imported again is checked
+    // from the start.
+    if in_memory && let Some(doppelganger) = context.signing.doppelganger() {
+        doppelganger.forget(pubkey);
+    }
 
     if entry != Some(Origin::Local) && !in_memory {
         return Judged::Absent;
@@ -1758,6 +1773,48 @@ mod tests {
             "the field is required even when empty"
         );
         assert!(store.read().await.is_empty());
+    }
+
+    /// With doppelganger protection on, an imported key is checked before it
+    /// signs, like every key loaded at startup; one this process already
+    /// holds (a password rotation) keeps the standing it has.
+    #[tokio::test]
+    async fn an_imported_key_is_withheld_by_doppelganger_protection() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::Root;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(RwLock::new(ValidatorStore::new()));
+        let doppelganger = Arc::new(crate::doppelganger::Doppelganger::new());
+        let mut context = context_with_dirs(store.clone(), dir.path());
+        context.signing = Arc::new(
+            crate::signing::SigningContext::new(Config::mainnet(), Root::ZERO)
+                .with_doppelganger(doppelganger.clone()),
+        );
+        let app = router(context, TOKEN.to_string());
+        let import = || {
+            authed(
+                "POST",
+                "/eth/v1/keystores",
+                serde_json::json!({
+                    "keystores": [keystore_json()],
+                    "passwords": [PASSWORD],
+                }),
+            )
+        };
+
+        let (status, body) = send(app.clone(), import()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+        assert!(store.read().await.contains(&keystore_pubkey()));
+        assert!(!doppelganger.allows_signing(&keystore_pubkey()));
+        assert_eq!(doppelganger.detecting(), 1);
+
+        // Cleared since, as at genesis; the same key imported again stays so.
+        doppelganger.register(keystore_pubkey(), 0);
+        let (_, body) = send(app, import()).await;
+        assert_eq!(body["data"][0]["status"], "imported", "got {body}");
+        assert!(doppelganger.allows_signing(&keystore_pubkey()));
     }
 
     /// Re-importing a key (a password rotation, or a retry) rebuilds its

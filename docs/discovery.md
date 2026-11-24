@@ -200,6 +200,13 @@ mainnet bootnode list is close to the mirror image, `udp` and no `quic`, and a
 discv5 seed only: four of the seventeen carry one. A record missing an `ip` or
 a `secp256k1` key is dropped regardless of its transports.
 
+Dropped means skipped with a warning for an entry in `node`'s `--bootnodes`
+file or in a network's own list, built-in or loaded. An entry given to
+`beacon`'s `--bootnodes` is held to a stricter rule: one that does not parse,
+or would be dropped here, is a startup error naming it, since the operator
+typed it to reach that peer (see
+[the CLI reference](./cli.md#bootnodes-on-beacon)).
+
 The ENR a node logs at startup is only useful to a peer if that node was
 started with a real `--discovery.advertise-ip`.
 Copying an ENR built from the default `0.0.0.0` into another node's bootnode
@@ -208,6 +215,47 @@ names no reachable host. Set `--discovery.advertise-ip` before pointing other
 nodes at this one's ENR: `127.0.0.1` on a local devnet, or the host's public
 address otherwise.
 
+### Multiaddrs
+
+`beacon`'s `--bootnodes` also takes multiaddrs, `/ip4/<ip>` or `/ip6/<ip>`
+followed by one transport and `/p2p/<peer-id>`. A multiaddr names a single
+transport, so it fills exactly one of the three entries above, the IP and the
+key coming from the address and the peer id:
+
+| Transport | Entry it fills | The peer is |
+| --- | --- | --- |
+| `tcp/<port>` | `tcp` | dialed over TCP |
+| `udp/<port>/quic-v1` | `quic` | dialed over QUIC |
+| `udp/<port>` | `udp` | seeded into discv5, not dialed directly |
+
+A UDP multiaddr names the peer's discovery port, not a libp2p listener, which
+is how Lighthouse reads one too. A peer reachable more than one way takes one
+entry per transport, and the entries are merged under its peer id. An `/ip6`
+UDP multiaddr is refused: discovery binds the IPv4 wildcard, and an IPv4
+socket cannot reach an IPv6 address. The parser is handed that bind address
+and refuses only against an IPv4 one, so an IPv6 bind would accept the entry
+([#853](https://github.com/lambdaclass/ethlambda/issues/853)). `/ip6` with `tcp` or `quic-v1` is dialed by the
+swarm and accepted.
+
+The form follows Lighthouse's `--boot-nodes`, with four deliberate departures:
+
+- **`/p2p/<peer-id>` is required**, and the peer id must embed its public key,
+  which every secp256k1 peer id does, in the key's canonical encoding (a
+  hand-built id with the key's fields reordered is refused). Every bootnode is keyed by its peer id
+  (its dial addresses are merged under it, and it is how this node skips its
+  own entry and redials the others), and discv5 is seeded with that key, so an
+  anonymous entry has no place to go. Lighthouse dials a TCP multiaddr with no peer id
+  anonymously.
+- **DNS multiaddrs are refused** (`/dns`, `/dns4`, `/dns6`, `/dnsaddr`): a
+  bootnode holds an address, and the swarm has no DNS transport to resolve a
+  name with. Write the address as `/ip4` or `/ip6`.
+- **QUIC multiaddrs are dialed.** Lighthouse dials only TCP multiaddr
+  bootnodes; this node prefers QUIC wherever a peer offers it (see
+  [Which peers get dialed](#which-peers-get-dialed)).
+- **A UDP multiaddr seeds discv5 directly**, with the key taken from the peer
+  id, rather than through a discv5 ENR request. The outcome is the same:
+  discovery learns the peer's record on first contact.
+
 ## Known limitations
 
 ### Static bootnodes bypass admission and are redialed indefinitely
@@ -215,8 +263,10 @@ address otherwise.
 Everything under [Which peers get dialed](#which-peers-get-dialed) applies to
 *discovered* peers. A static bootnode reaches the swarm by a different path:
 `parse_enr` reads `ip`, `secp256k1` and the three port entries and never looks at
-`eth2`, so a `--bootnodes` list is dialed as given. Now that a `tcp`-only record
-is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
+`eth2`, so a bootnode list is dialed as given: `node`'s `--bootnodes` file, or
+on `beacon` the network's own list plus any `--bootnodes` entries, whose
+multiaddrs carry no `eth2` to look at in the first place. Now that a `tcp`-only
+record is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
 handshake to a lighthouse node succeeds: the peer occupies a
 `--discovery.target-peers` slot, contributes no attestation subnets, and is
 eventually dropped by the remote for sharing no protocols. Each drop re-arms the

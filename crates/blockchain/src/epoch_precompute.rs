@@ -22,9 +22,11 @@
 //! inline; the late result is stored and simply goes unused by that block.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ethlambda_state_transition::beacon::fork_choice;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_state_transition::beacon::helpers::misc::compute_start_slot_at_epoch;
 use ethlambda_state_transition::metrics as stf_metrics;
 use ethlambda_storage::{CacheKey, Chain};
@@ -79,7 +81,7 @@ pub(crate) struct DecisionInputs {
 }
 
 fn is_last_slot_of_epoch(slot: u64) -> bool {
-    (slot + 1).is_multiple_of(preset::SLOTS_PER_EPOCH)
+    (slot + 1).is_multiple_of(preset::slots_per_epoch())
 }
 
 /// Whether to start a precompute, and for which key.
@@ -104,7 +106,7 @@ pub(crate) fn decide(inputs: &DecisionInputs) -> Option<PrecomputeKey> {
             {
                 return None;
             }
-            inputs.head_slot / preset::SLOTS_PER_EPOCH + 1
+            inputs.head_slot / preset::slots_per_epoch() + 1
         }
         Trigger::Timer { slot } => {
             // A head past the slot would be a stale message racing a newer
@@ -112,7 +114,7 @@ pub(crate) fn decide(inputs: &DecisionInputs) -> Option<PrecomputeKey> {
             // A head before the slot's own epoch is a stalled chain: advancing
             // it would replay every epoch it missed, and each later timer would
             // replay them again under a new key from the same head.
-            let slot_epoch = slot / preset::SLOTS_PER_EPOCH;
+            let slot_epoch = slot / preset::slots_per_epoch();
             if !is_last_slot_of_epoch(slot)
                 || inputs.head_slot > slot
                 || inputs.head_slot < compute_start_slot_at_epoch(slot_epoch)
@@ -179,16 +181,13 @@ impl BlockChainServer {
             return;
         };
         let candidate_epoch = match trigger {
-            Trigger::Head => head_slot / preset::SLOTS_PER_EPOCH + 1,
-            Trigger::Timer { slot } => slot / preset::SLOTS_PER_EPOCH + 1,
+            Trigger::Head => head_slot / preset::slots_per_epoch() + 1,
+            Trigger::Timer { slot } => slot / preset::slots_per_epoch() + 1,
         };
-        let already_cached = self
-            .store
-            .cached_state(CacheKey::CheckpointState {
-                epoch: candidate_epoch,
-                root: head_root,
-            })
-            .is_some();
+        let cached = self.store.cached_state(CacheKey::CheckpointState {
+            epoch: candidate_epoch,
+            root: head_root,
+        });
         let inputs = DecisionInputs {
             trigger,
             syncing: self.sync_status.is_syncing(),
@@ -196,9 +195,34 @@ impl BlockChainServer {
             head_root,
             current_slot: self.wall_clock_slot(),
             in_flight: self.epoch_precompute_in_flight,
-            already_cached,
+            already_cached: cached.is_some(),
         };
         let Some(key) = decide(&inputs) else {
+            // Another path already advanced the state to the epoch's start
+            // (validating a gloas bid for the epoch's first slot does), so no
+            // worker runs, and the worker is what warms the key sums. Asked
+            // again as if nothing were cached, `decide` says whether that cache
+            // hit is the only reason no worker runs; if so, warm the sums from
+            // the cached state, or the epoch would import without them.
+            let only_the_cache_stopped_the_worker = decide(&DecisionInputs {
+                already_cached: false,
+                ..inputs
+            })
+            .is_some();
+            // One warm-only task at a time. A second would not build the sums
+            // again (they sit behind a `OnceLock`), but it would hold a
+            // blocking thread waiting on the first.
+            if let Some(state) = cached
+                && only_the_cache_stopped_the_worker
+                && !self.key_sums_warming.swap(true, Ordering::AcqRel)
+            {
+                let committee_cache = self.store.committee_cache();
+                let warming = ClearOnDrop(Arc::clone(&self.key_sums_warming));
+                tokio::task::spawn_blocking(move || {
+                    let _warming = warming;
+                    warm_epoch_key_sums(&committee_cache, &state, candidate_epoch)
+                });
+            }
             return;
         };
         // The head's post-state is resident (it was just imported); a read that
@@ -220,14 +244,46 @@ impl BlockChainServer {
 
         let config = self.store.config();
         let actor = ctx.actor_ref();
+        let committee_cache = self.store.committee_cache();
         tokio::task::spawn_blocking(move || {
+            let _running = crate::metrics::EpochPrecomputeRunning::start();
             let result = {
                 let _timing = stf_metrics::time_epoch_precompute();
                 fork_choice::advance_to_epoch_start(&head_state, key.epoch, &config)
             };
             let result = result.map(Arc::new).map_err(|err| err.to_string());
+            let advanced = result.as_ref().ok().map(Arc::clone);
+            // The state goes to the actor first: the epoch's first block must
+            // not wait for key sums, which only make its attestations cheaper.
             let _ = actor.send(EpochPrecomputed { key, result });
+            if let Some(state) = advanced {
+                warm_epoch_key_sums(&committee_cache, &state, key.epoch);
+            }
         });
+    }
+}
+
+/// Warms the key sums `epoch`'s blocks read: `epoch`'s own, and the previous
+/// epoch's for the attestations those blocks carry from it. The previous
+/// epoch's are normally warm already, from the last boundary; after a restart
+/// mid-epoch, or a boundary whose worker did not run, they are not. Both calls
+/// return at once when the sums are resident.
+fn warm_epoch_key_sums(
+    committee_cache: &ethlambda_storage::CommitteeCache,
+    state: &BeaconState,
+    epoch: u64,
+) {
+    committee_cache.warm_key_sums(state, epoch);
+    committee_cache.warm_key_sums(state, epoch.saturating_sub(1));
+}
+
+/// Clears the flag it holds when dropped, so a warm-only task releases
+/// `key_sums_warming` however it ends, a panic included.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -271,7 +327,9 @@ impl Handler<EpochPrecomputed> for BlockChainServer {
 mod tests {
     use super::*;
 
-    const SPE: u64 = preset::SLOTS_PER_EPOCH;
+    fn spe() -> u64 {
+        preset::slots_per_epoch()
+    }
 
     fn inputs(trigger: Trigger, head_slot: u64) -> DecisionInputs {
         DecisionInputs {
@@ -287,34 +345,34 @@ mod tests {
 
     #[test]
     fn a_last_slot_head_precomputes_the_next_epoch() {
-        let key = decide(&inputs(Trigger::Head, 2 * SPE - 1)).expect("starts");
+        let key = decide(&inputs(Trigger::Head, 2 * spe() - 1)).expect("starts");
         assert_eq!(key.epoch, 2);
         assert_eq!(key.root, H256([7; 32]));
     }
 
     #[test]
     fn a_head_elsewhere_in_the_epoch_starts_nothing() {
-        assert!(decide(&inputs(Trigger::Head, SPE)).is_none());
-        assert!(decide(&inputs(Trigger::Head, 2 * SPE - 2)).is_none());
+        assert!(decide(&inputs(Trigger::Head, spe())).is_none());
+        assert!(decide(&inputs(Trigger::Head, 2 * spe() - 2)).is_none());
     }
 
     #[test]
     fn a_syncing_node_starts_nothing() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
         i.syncing = true;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn a_stale_head_trigger_starts_nothing() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
-        i.current_slot = 2 * SPE + 5;
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
+        i.current_slot = 2 * spe() + 5;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn a_running_worker_blocks_a_second_one() {
-        let mut i = inputs(Trigger::Head, 2 * SPE - 1);
+        let mut i = inputs(Trigger::Head, 2 * spe() - 1);
         i.in_flight = Some(PrecomputeKey {
             epoch: 2,
             root: H256([7; 32]),
@@ -324,21 +382,37 @@ mod tests {
 
     #[test]
     fn a_state_already_cached_is_not_recomputed() {
-        let mut i = inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE - 3);
+        let mut i = inputs(
+            Trigger::Timer {
+                slot: 2 * spe() - 1,
+            },
+            2 * spe() - 3,
+        );
         i.already_cached = true;
         assert!(decide(&i).is_none());
     }
 
     #[test]
     fn the_timer_covers_a_skipped_last_slot() {
-        let key =
-            decide(&inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE - 3)).expect("starts");
+        let key = decide(&inputs(
+            Trigger::Timer {
+                slot: 2 * spe() - 1,
+            },
+            2 * spe() - 3,
+        ))
+        .expect("starts");
         assert_eq!(key.epoch, 2);
     }
 
     #[test]
     fn the_timer_covers_an_epoch_whose_only_block_is_its_first() {
-        let key = decide(&inputs(Trigger::Timer { slot: 3 * SPE - 1 }, 2 * SPE)).expect("starts");
+        let key = decide(&inputs(
+            Trigger::Timer {
+                slot: 3 * spe() - 1,
+            },
+            2 * spe(),
+        ))
+        .expect("starts");
         assert_eq!(key.epoch, 3);
     }
 
@@ -346,19 +420,43 @@ mod tests {
     fn a_stale_timer_trigger_starts_nothing() {
         // The timer's epoch holds no block: the head is the previous epoch's
         // last slot.
-        assert!(decide(&inputs(Trigger::Timer { slot: 3 * SPE - 1 }, 2 * SPE - 1)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 3 * spe() - 1
+                },
+                2 * spe() - 1
+            ))
+            .is_none()
+        );
         // A stall several epochs long.
-        assert!(decide(&inputs(Trigger::Timer { slot: 6 * SPE - 1 }, 2 * SPE - 5)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 6 * spe() - 1
+                },
+                2 * spe() - 5
+            ))
+            .is_none()
+        );
     }
 
     #[test]
     fn the_timer_ignores_slots_that_are_not_the_last() {
-        assert!(decide(&inputs(Trigger::Timer { slot: SPE }, SPE - 1)).is_none());
+        assert!(decide(&inputs(Trigger::Timer { slot: spe() }, spe() - 1)).is_none());
     }
 
     #[test]
     fn the_timer_skips_a_head_already_at_the_boundary() {
-        assert!(decide(&inputs(Trigger::Timer { slot: 2 * SPE - 1 }, 2 * SPE)).is_none());
+        assert!(
+            decide(&inputs(
+                Trigger::Timer {
+                    slot: 2 * spe() - 1
+                },
+                2 * spe()
+            ))
+            .is_none()
+        );
     }
 
     #[test]

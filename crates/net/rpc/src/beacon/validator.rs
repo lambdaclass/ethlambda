@@ -151,7 +151,7 @@ fn sync_duties(
     let state = if requested_period <= head_period + 1 {
         head_state
     } else {
-        let first_epoch = (requested_period - 1) * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let first_epoch = (requested_period - 1) * preset::epochs_per_sync_committee_period();
         state_for_epoch(store, head_root, first_epoch)?
     };
     let state_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
@@ -330,12 +330,7 @@ async fn post_committee_subscriptions(
     axum::http::StatusCode::OK.into_response()
 }
 
-/// Each validator's execution-layer fee recipient, as its validator client
-/// last named it. Read by block production, which puts the proposer's into
-/// the payload attributes. In memory only: a validator client repeats the
-/// call (ethlambda's and Lighthouse's every slot), so a restarted node
-/// relearns the map from its next one.
-pub(crate) type FeeRecipients = Arc<std::sync::Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>;
+pub(crate) use ethlambda_blockchain::FeeRecipients;
 
 /// One entry of `prepare_beacon_proposer`.
 #[derive(Debug, Deserialize)]
@@ -351,9 +346,8 @@ async fn post_prepare_beacon_proposer(
     Extension(fee_recipients): Extension<FeeRecipients>,
     Json(preparations): Json<Vec<ProposerPreparation>>,
 ) -> Response {
-    let mut map = fee_recipients.lock().expect("fee recipient lock poisoned");
     for preparation in preparations {
-        map.insert(preparation.validator_index, preparation.fee_recipient);
+        fee_recipients.insert(preparation.validator_index, preparation.fee_recipient);
     }
     axum::http::StatusCode::OK.into_response()
 }
@@ -597,8 +591,8 @@ fn proposer_duties(
         .ok_or(ApiError::Internal("epoch is outside the state's lookahead"))?;
 
     let first_slot = compute_start_slot_at_epoch(epoch);
-    let window_start = (offset * preset::SLOTS_PER_EPOCH) as usize;
-    let proposers = &proposer_lookahead[window_start..][..preset::SLOTS_PER_EPOCH as usize];
+    let window_start = (offset * preset::slots_per_epoch()) as usize;
+    let proposers = &proposer_lookahead[window_start..][..preset::slots_per_epoch() as usize];
     let duties = proposers
         .iter()
         .zip(first_slot..)
@@ -704,7 +698,7 @@ fn attester_duties(
     let committees_at_slot = committees.committees_per_slot();
     let first_slot = compute_start_slot_at_epoch(epoch);
     let mut duties = Vec::new();
-    for slot in first_slot..first_slot + preset::SLOTS_PER_EPOCH {
+    for slot in first_slot..first_slot + preset::slots_per_epoch() {
         for committee_index in 0..committees_at_slot {
             let committee = committees
                 .committee(slot, committee_index)
@@ -891,7 +885,7 @@ mod tests {
     /// pass this node's own preference check and fail every other client's.
     #[test]
     fn each_dependent_root_names_the_slot_beacon_apis_defines() {
-        let slots = preset::SLOTS_PER_EPOCH;
+        let slots = preset::slots_per_epoch();
         assert_eq!(DependentRoot::V1.slot(0), 0);
         assert_eq!(DependentRoot::V1.slot(1), slots - 1);
         assert_eq!(DependentRoot::V1.slot(100), 100 * slots - 1);
@@ -943,7 +937,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
 
             let duties = json["data"].as_array().unwrap();
-            assert_eq!(duties.len(), preset::SLOTS_PER_EPOCH as usize);
+            assert_eq!(duties.len(), preset::slots_per_epoch() as usize);
             for (offset, duty) in duties.iter().enumerate() {
                 let index = expected[offset];
                 let slot = compute_start_slot_at_epoch(epoch) + offset as u64;
@@ -1268,7 +1262,7 @@ mod tests {
         .unwrap();
         let expected = get_beacon_proposer_indices(&advanced, epoch).unwrap();
         let data = json["data"].as_array().unwrap();
-        assert_eq!(data.len() as u64, preset::SLOTS_PER_EPOCH);
+        assert_eq!(data.len() as u64, preset::slots_per_epoch());
         for (duty, (slot, proposer)) in data
             .iter()
             .zip((compute_start_slot_at_epoch(epoch)..).zip(expected))
@@ -1360,7 +1354,7 @@ mod tests {
         // the head, and the source comes from the head state advanced across
         // the boundary (unchanged here, since epoch processing leaves the
         // current justified checkpoint alone without votes).
-        let state = fulu_state_at(preset::SLOTS_PER_EPOCH - 1);
+        let state = fulu_state_at(preset::slots_per_epoch() - 1);
         let slot = state.slot() + 1;
         let (status, json, head_root) = attestation_data_for(state, slot).await;
         assert_eq!(status, StatusCode::OK, "{json}");
@@ -1476,8 +1470,8 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&7),
-            Some(&ExecutionAddress::from_slice(&[0xab; 20]))
+            fee_recipients.prepared(7),
+            Some(ExecutionAddress::from_slice(&[0xab; 20]))
         );
     }
 
@@ -1613,7 +1607,7 @@ mod tests {
             .iter()
             .map(|duty| duty["validator_index"].as_str().unwrap().parse().unwrap())
             .collect();
-        assert_eq!(proposers, lookahead[..preset::SLOTS_PER_EPOCH as usize]);
+        assert_eq!(proposers, lookahead[..preset::slots_per_epoch() as usize]);
     }
 
     /// A store whose head is a gloas state `slots_past_boundary` into its
@@ -1715,7 +1709,7 @@ mod tests {
         /// each of those eight holds `SYNC_COMMITTEE_SIZE / 8` seats and every
         /// other validator holds none.
         fn committee_of(state: &BeaconState, first: u64) -> SyncCommittee {
-            let pubkeys: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE as u64)
+            let pubkeys: Vec<BlsPubkey> = (0..preset::sync_committee_size() as u64)
                 .map(|seat| state.validator(first + seat % 8).unwrap().pubkey)
                 .collect();
             SyncCommittee {
@@ -1759,7 +1753,7 @@ mod tests {
 
         /// The seats `validator` holds in [`committee_of`]`(_, first)`.
         fn seats(validator: u64, first: u64) -> Vec<String> {
-            (0..preset::SYNC_COMMITTEE_SIZE as u64)
+            (0..preset::sync_committee_size() as u64)
                 .filter(|seat| first + seat % 8 == validator)
                 .map(|seat| seat.to_string())
                 .collect()
@@ -1790,7 +1784,7 @@ mod tests {
         #[tokio::test]
         async fn the_next_period_reads_the_next_committee() {
             let state = state_with_committees();
-            let next_period_epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+            let next_period_epoch = preset::epochs_per_sync_committee_period()
                 * (compute_sync_committee_period(compute_epoch_at_slot(state.slot())) + 1);
             let (status, json) =
                 post_sync(state, next_period_epoch, &["3", "9"], Default::default()).await;
@@ -1833,7 +1827,7 @@ mod tests {
         async fn the_period_after_next_is_a_400() {
             let state = state_with_committees();
             let period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
-            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * (period + 2);
+            let epoch = preset::epochs_per_sync_committee_period() * (period + 2);
             let clock_slot = state.slot();
             let (status, _) = post_sync_at_clock(state, clock_slot, epoch, &["3"]).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1847,9 +1841,10 @@ mod tests {
             let BeaconState::Fulu(fulu) = &mut state else {
                 unreachable!("built as fulu")
             };
-            fulu.slot = (preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD - 1) * preset::SLOTS_PER_EPOCH;
+            fulu.slot =
+                (preset::epochs_per_sync_committee_period() - 1) * preset::slots_per_epoch();
             let boundary_slot =
-                compute_start_slot_at_epoch(preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+                compute_start_slot_at_epoch(preset::epochs_per_sync_committee_period());
             (state, boundary_slot)
         }
 
@@ -1870,7 +1865,7 @@ mod tests {
                 "the boundary must rotate the committee, or the test proves nothing"
             );
 
-            let period_after = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 2;
+            let period_after = preset::epochs_per_sync_committee_period() * 2;
             let indices: Vec<String> = (0..COUNT as u64).map(|i| i.to_string()).collect();
             let refs: Vec<&str> = indices.iter().map(String::as_str).collect();
             let (status, json) =
@@ -1912,7 +1907,7 @@ mod tests {
         #[tokio::test]
         async fn a_head_lagging_a_period_boundary_still_refuses_two_periods_past_the_clock() {
             let (state, boundary_slot) = lagging_head();
-            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 3;
+            let epoch = preset::epochs_per_sync_committee_period() * 3;
             let (status, _) = post_sync_at_clock(state, boundary_slot, epoch, &["3"]).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }
@@ -1920,7 +1915,7 @@ mod tests {
         #[tokio::test]
         async fn a_head_lagging_a_period_boundary_serves_the_clocks_own_period_from_the_head() {
             let (state, boundary_slot) = lagging_head();
-            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+            let epoch = preset::epochs_per_sync_committee_period();
             let (status, json) = post_sync_at_clock(state, boundary_slot, epoch, &["9"]).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(json["data"][0]["validator_index"], "9");
@@ -1934,7 +1929,7 @@ mod tests {
             let BeaconState::Fulu(fulu) = &mut state else {
                 unreachable!("built as fulu")
             };
-            fulu.slot = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * preset::SLOTS_PER_EPOCH;
+            fulu.slot = preset::epochs_per_sync_committee_period() * preset::slots_per_epoch();
             let (status, _) = post_sync(state, 0, &["3"], Default::default()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }

@@ -101,7 +101,8 @@ for is the fixture tree, not the code.
 
 | Module | Holds |
 |--------|-------|
-| `preset` | Compile-time constants, mainnet or minimal |
+| `preset` | Preset values, mainnet or minimal, selected once per process |
+| `preset_sized` | SSZ lists, vectors and bitfields bounded by a preset value |
 | `config` | Runtime configuration: fork schedule, churn limits, blob schedule |
 | `constants` | Values the spec fixes outright: domain types, flag weights, sentinels |
 | `fork` | `ForkName`, ordered oldest to newest |
@@ -116,7 +117,7 @@ for is the fixture tree, not the code.
 | `fork_choice` | The LMD GHOST store |
 | `lean_boundary` | The two `#[track_caller]` panics for the `Lean` arm of the shared enums |
 
-The first five come from `ethlambda_types::beacon` and are re-exported by
+The first six come from `ethlambda_types::beacon` and are re-exported by
 `beacon/mod.rs`; the rest are defined here.
 
 ## Three kinds of parameter
@@ -124,12 +125,29 @@ The first five come from `ethlambda_types::beacon` and are re-exported by
 The specification distinguishes constants, presets, and configuration, and so
 does this module, because they have genuinely different lifetimes.
 
-**Presets** (`preset`) set container sizes, so they must be compile-time
-constants: `SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>`. The preset
-therefore cannot be a runtime value or a type parameter. Stable Rust cannot take a
-const-generic argument from a trait's associated const, so the preset is selected
-by Cargo feature: mainnet by default, minimal with `preset-minimal`. The test
-target builds the crate twice and each run walks only its own fixture tree.
+**Presets** (`preset`) set container sizes, and they are selected once per
+process at runtime, from the network's `PRESET_BASE`: one binary runs mainnet
+and a minimal-preset devnet alike, as Lighthouse and Teku do.
+
+Lighthouse gets there by making every container generic over its preset
+(`BeaconState<E: EthSpec>`). That is not available here: stable Rust cannot
+take a const-generic argument from a trait's associated const, and libssz's
+collections take their bound as a const generic. So the preset is a
+process-wide value instead (`Preset::select`, frozen by the first read), and
+only what the two presets disagree on reads it:
+
+- A value both presets share stays a constant (`preset::MAX_ATTESTATIONS`),
+  compile-asserted equal in both, and keeps bounding its containers as a
+  const generic (`SszList<Attestation, { preset::MAX_ATTESTATIONS }>`).
+- A value they disagree on is a function, `preset::slots_per_epoch()`.
+- A container bounded by such a value takes a `Length` marker whose `get()`
+  reads the active preset: `VectorOf<Root, preset::SlotsPerHistoricalRoot>`
+  for the state's tree-backed vectors, and `preset_sized`'s `PresetList`,
+  `PresetVector`, `PresetBitlist` and `PresetBitvector` (libssz's four with
+  `N` read at runtime) for the rest.
+
+The test target is built once; `BEACON_SPEC_PRESET` picks which fixture tree a
+run walks.
 
 **Configuration** (`config`) is runtime, because the `transition` fixture suite
 moves a fork's activation epoch per test case. That is the concrete reason fork
@@ -360,8 +378,9 @@ mainnet era 1422 (deneb blocks) that took a block from about 1.7 s to about
 0.3 s. The header, RANDAO and sync-aggregate steps still look it up once each.
 
 Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
-through `helpers::participation`. One walk of `iter_validators()`, zipped with
-the flat participation slices, produces each validator's flags, its effective
+through `helpers::participation`. One walk of `iter_validators()`, in lockstep
+with both participation lists' iterators (`ParticipationRef`, since the lists
+are tree-backed), produces each validator's flags, its effective
 balance and the balance totals (an `EpochSummary`); the three steps then run
 over flat data and write back only the balances that changed. The summary lives
 for those three steps only, since registry updates change what it read. The
@@ -387,6 +406,28 @@ validator they name deferred until they are done. The genesis epoch and states
 whose registry-sized lists differ in length fall back to the step-by-step path.
 The debug oracle runs the specification-shaped steps on a clone and asserts the
 two full states hash equal.
+
+### Participation lists and pending deposits
+
+The two participation lists (one byte per validator, 2.4 MB each on mainnet)
+and `pending_deposits` are tree-backed too. As flat `SszList`s they were
+re-merkleized from scratch for every state root, which profiled at most of
+`BeaconState::hash_tree_root`; a block only flips flags for the validators it
+attests for, so the tree rehashes the leaves holding those. Writes to the
+participation lists are buffered densely (the default `VecMap`), unlike the
+registry's `BTreeMap`: a block writes tens of thousands of scattered entries, and
+measured at mainnet size the `BTreeMap`'s inserts cost several times the hashing
+they save, while the dense buffer is an indexed write. The epoch
+rotation does not buffer: it moves `current` into `previous` and builds a fresh
+zeroed list. `pending_deposits` only grows at the end during a block and is
+rebuilt from a `Vec` once per epoch, so a `BTreeMap` buffer fits it too.
+
+Reads go through `BeaconState::altair_validator_lists`, which returns
+`ParticipationRef`s (there is no slice to hand out); a full scan walks
+`ParticipationRef::iter` in lockstep with `iter_validators`, since each `get` is
+a tree descent. Element writes go through `epoch_participation_mut`, which
+returns a `ParticipationMut`. The SSZ encoding is unchanged, so `DB_VERSION` is
+too.
 
 ## Gloas
 
@@ -483,11 +524,12 @@ of keeping copies.
 EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
 chain of growing subtrees (EIP-7916), and makes the big containers progressive
 (EIP-7495); a progressive container has no fixed depth. The other progressive
-lists are libssz's `ProgressiveList`. The registry is the exception:
-`validators` and `balances` stay tree-backed, through
+lists are libssz's `ProgressiveList`. The exceptions stay tree-backed, through
 `ethlambda_ssz_tree::ProgressiveList`, which has the same persistent nodes,
 update buffer and rebase as the bounded `List` and the same method set, so a
-gloas state shares subtrees with its parent the way earlier ones do.
+gloas state shares subtrees with its parent the way earlier ones do: `validators`
+and `balances`, the two participation lists and `pending_deposits`. (The
+inactivity scores are still a flat progressive list.)
 
 The registry therefore has two list types across the forks, and an accessor
 cannot return either one. The whole-registry accessors were replaced by
@@ -575,6 +617,90 @@ index rather than a hash map, so the vote loop reads votes and snapshot
 balances in index order. The table grows to the highest voting index, which is
 why `set_latest_message` only takes indices from validated attestations (a
 debug assertion bounds it).
+
+## Fast Confirmation Rule
+
+`beacon::fast_confirmation` implements the Fast Confirmation Rule (FCR) of
+consensus-specs' `phase0`, `bellatrix` and `gloas` `fast-confirmation.md`, at
+**consensus-specs `master`, commit `f993cf2`** rather than the pinned
+`v1.7.0-beta.2`. The release ships no FCR fixtures, and `master` has fixes it
+lacks (the gloas empty-slot support discount, precise committee weight, the
+restart-resilient confirmed root, the `support_discount <= maximum_support`
+assertion). A later bump should diff those three files against that commit.
+
+- **Shape.** One Rust function per specification function, named as the
+  specification names it. `FastConfirmationStore` is the specification's own
+  store: a borrowed fork-choice `Store` plus the six variables. The variables
+  live in the `Store` between runs (`Store::fast_confirmation`, beside the rest
+  of the beacon fork-choice scratch), with the slot of the run that wrote
+  them; only the reported confirmed root is persisted.
+- **When it runs.** Once per slot, in the beacon actor's tick, after the clock
+  advance, the deferred aggregates and the head recompute (so past slots'
+  attestations are applied) and before `forkchoiceUpdated`, whose safe block it
+  decides. Not on imports, which recompute the head many times a slot. A
+  second run for a slot (a tick that fired while the wall clock still read the
+  slot before) is not run. It is skipped, and reset, while the head is more
+  than 32 slots behind the wall clock (the `head` event's gate): the rule
+  assumes synchrony from the start of the previous slot. It is skipped, too,
+  when the tick is handled past the slot's attestation deadline, which the
+  specification sets for `update_fast_confirmation_variables`.
+- **Missed slots.** The variables must be updated in every slot (the observed
+  checkpoints rotate only in an epoch boundary's own slot, and
+  `previous_slot_head` must be the previous slot's head), so a run whose
+  previous run was not in the slot before starts over from the finalized
+  checkpoint, as the rule's initialization does. The root last reported is
+  dropped, not handed to the restart rule below: a missed slot is itself a
+  sign the synchrony the rule assumes did not hold, so the safe block falls
+  back to the finalized one until the rule confirms again. A failed run resets
+  the rule the same way. How often that happens on a live node is not
+  measured; each one is logged.
+- **Outputs.** The `fast_confirmation` Beacon API event, after every run, and
+  the engine's safe block hash (`get_safe_execution_block_hash`), which falls
+  back to the finalized block while the confirmed one is off the head's chain
+  (an import can move the head between two runs).
+- **Cost.** A run reuses what the fork choice already keeps, so most runs cost
+  about what the head computation does:
+  - Balance sources are the store's per-checkpoint balances
+    (`fork_choice::checkpoint_balances`, the cache the head's justified
+    balances come from), which also carry the active set's figures
+    (`JustifiedBalances::active_balance`, `total_active_balance`). A registry
+    pass is paid once per checkpoint, at the boundary import, not per run. The
+    pulled-up head state's balances are the current target's, exact while no
+    validator was slashed in the current epoch (the head state's
+    `slashings[current_epoch % EPOCHS_PER_SLASHINGS_VECTOR]` is still zero);
+    otherwise they are built from the state for that run.
+  - Attestation scores are the proto-array's `PENDING` subtree totals
+    (`Store::proto_array_weights`) when the source is the justified
+    checkpoint's, read with the head's own snapshot, rule set and window so the
+    array never rebuilds for it. Only the previous epoch's source, at an epoch's
+    first slot, folds the latest messages (foldhash-keyed).
+  - Committee weights are per-slot sums memoized for the run; a range across an
+    epoch boundary sums its earlier epoch's slots less the members its later
+    part counts, and equivocators are a bitmap collected once per slot.
+  - `get_current_target_score`, reached only in an epoch's first slots, walks
+    only the roots voted for in the current epoch, once per run. Walking every
+    vote's root decoded a whole block per parent hop for votes below the live
+    index, and took over a second on mainnet; a vote from another epoch never
+    names the target, so skipping it changes no result.
+
+  At a million validators (`fast_confirmation_timing`, an ignored benchmark in
+  the module) a run takes about 0.5 ms mid-epoch against the head
+  computation's 0.08 ms, 2 to 3 ms in an epoch's second and third slots, and
+  about 14 ms in its first, as the head computation's once-an-epoch
+  proto-array rebuild does. `lean_beacon_fast_confirmation_time_seconds` times
+  a run.
+- **Restart.** The reported confirmed root is persisted when it changes. The
+  first synced run of a process holds the root the previous process
+  persisted (a restart within a process, after a missed or failed run, holds
+  nothing), and every run asks
+  `get_restart_resilient_confirmed_root` about it until the rule's own answer
+  wins, at which point it is dropped. As in the specification, that function
+  only decides what is reported (the event and the safe block); its answer is
+  never written into the rule's own `confirmed_root`, so the rule extends its
+  own confirmation chain with the observed checkpoints it actually has.
+- **Tests.** No fixtures exist; the pyspec scenarios are ported as unit tests in
+  the module, on a store built directly (see the comment above them for what
+  they emulate and which scenarios are not ported).
 
 ## Macros and traits
 
@@ -719,8 +845,8 @@ a timing measurement, not a fixture.
 
 Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
-The release ships no mainnet `genesis` fixtures, so that whole runner is gated
-behind the `preset-minimal` feature (`tests/beacon_spec/genesis.rs`).
+The release ships no mainnet `genesis` fixtures, so that whole runner is added
+to minimal runs only (`tests/beacon_spec/genesis.rs`).
 
 The gossip validation vectors this crate's `gossip.rs` runner covers come from
 the same tree as every other suite. The node validates four topics under fulu's

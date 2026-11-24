@@ -916,7 +916,11 @@ fn header_signature_is_valid(
         state.genesis_validators_root(),
     );
     let signing_root = compute_signing_root(header.hash_tree_root(), domain);
-    if !bls::verify(&proposer.pubkey, signing_root, &signed_header.signature) {
+    let proposer = bls::IndexedPubkey {
+        index: header.proposer_index,
+        pubkey: proposer.pubkey,
+    };
+    if !bls::verify(&proposer, signing_root, &signed_header.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -1302,7 +1306,7 @@ mod tests {
         assert_eq!(lookahead_covers(&parent, slot), Ok(()));
 
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         assert_eq!(
             lookahead_covers(&parent, beyond),
             Err(Outcome::Queue(QueueReason::ShufflingUnavailable))
@@ -1328,7 +1332,7 @@ mod tests {
         // (let alone the lookahead check at the very end) is ever reached.
 
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         let mut card = sidecar(beyond, proposer, 0);
         card.signed_block_header.message.parent_root = parent_root;
         // The default signature verifies against nobody.
@@ -1598,7 +1602,7 @@ mod tests {
         store.insert_live_chain_entry(0, Root::ZERO, Root::ZERO);
         let config = store.config();
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
-        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        let beyond = window_start + preset::proposer_lookahead_length() as Slot;
         let now = slot_start_ms(&store, beyond);
         let expected =
             advanced_proposer(&parent, beyond, &config).expect("the test state advances");
@@ -1771,7 +1775,7 @@ mod tests {
     #[test]
     fn a_well_shaped_custodied_gloas_sidecar_is_parkable() {
         let config = parkable_config();
-        let slot = preset::SLOTS_PER_EPOCH;
+        let slot = preset::slots_per_epoch();
         assert!(is_parkable_gloas(
             &config,
             &[3],
@@ -1782,7 +1786,7 @@ mod tests {
     #[test]
     fn a_gloas_sidecar_is_not_parkable_outside_gloas_or_off_the_custody_set_or_misshapen() {
         let config = parkable_config();
-        let slot = preset::SLOTS_PER_EPOCH;
+        let slot = preset::slots_per_epoch();
         let custody = [3u64];
         // A slot before gloas names another fork's shape.
         assert!(!is_parkable_gloas(

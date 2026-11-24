@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::containers::shared::{SignedVoluntaryExit, VoluntaryExit};
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -94,6 +94,8 @@ pub enum Outcome {
 /// Decrypt the keystore and run the exit against the configured node. Input
 /// for the confirmation phrase is the process's stdin.
 pub async fn run(config: ExitConfig) -> Result<Outcome> {
+    // `run_with` adopts the node's preset, which nothing may read before.
+    crate::require_unread_preset()?;
     let (store, pubkey) = load_keystore(&config.keystore, &config.password_file)?;
     let node = HttpBeaconNode::new(&config.beacon_node)?;
     // Behind the lock every signing method takes its store through. Nothing
@@ -127,6 +129,7 @@ pub async fn run_with<B: BeaconNodeApi + ?Sized>(
 ) -> Result<Outcome> {
     let genesis = node.genesis().await?;
     let spec = node.spec().await?;
+    crate::adopt_preset(&spec)?;
     let clock = SlotClock::from_config(genesis.genesis_time, &spec);
     let signing = SigningContext::new(spec, genesis.genesis_validators_root);
 
@@ -217,12 +220,11 @@ pub async fn run_with<B: BeaconNodeApi + ?Sized>(
 }
 
 fn current_epoch(clock: &SlotClock) -> Result<Epoch> {
-    let slot = clock.now().ok_or_else(|| {
+    clock.current_epoch().ok_or_else(|| {
         Error::InconsistentResponse(
             "the beacon node reports a genesis in the future; check the system clock".to_string(),
         )
-    })?;
-    Ok(clock.epoch_of(slot))
+    })
 }
 
 /// The validator's registry entry, if the chain would accept an exit for it
@@ -298,7 +300,7 @@ async fn wait_for_acceptance<B: BeaconNodeApi + ?Sized>(
     clock: &SlotClock,
 ) -> Option<ValidatorDetails> {
     let slot_duration = clock.slot_duration();
-    for _ in 0..WAIT_EPOCHS * SLOTS_PER_EPOCH {
+    for _ in 0..WAIT_EPOCHS * slots_per_epoch() {
         tokio::time::sleep(slot_duration).await;
         let details = match node.validator(pubkey).await {
             Ok(Some(details)) if details.exit_epoch != FAR_FUTURE_EPOCH => details,
@@ -319,7 +321,7 @@ async fn wait_for_acceptance<B: BeaconNodeApi + ?Sized>(
                 let slots_to_go = details
                     .exit_epoch
                     .saturating_sub(current_epoch)
-                    .saturating_mul(SLOTS_PER_EPOCH);
+                    .saturating_mul(slots_per_epoch());
                 let seconds_to_go = slot_duration
                     .saturating_mul(u32::try_from(slots_to_go).unwrap_or(u32::MAX))
                     .as_secs();
@@ -396,7 +398,7 @@ mod tests {
     fn genesis() -> Genesis {
         let config = Config::mainnet();
         let epochs_back = config.shard_committee_period + 10;
-        let seconds_back = epochs_back * SLOTS_PER_EPOCH * config.slot_duration_ms / 1000;
+        let seconds_back = epochs_back * slots_per_epoch() * config.slot_duration_ms / 1000;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
@@ -706,7 +708,7 @@ mod tests {
         assert_eq!(node.submitted_exits().len(), 1);
 
         let slot = Duration::from_millis(Config::mainnet().slot_duration_ms);
-        let waited = slot.saturating_mul((WAIT_EPOCHS * SLOTS_PER_EPOCH) as u32);
+        let waited = slot.saturating_mul((WAIT_EPOCHS * slots_per_epoch()) as u32);
         assert_eq!(started.elapsed(), waited);
     }
 
