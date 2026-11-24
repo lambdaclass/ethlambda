@@ -769,13 +769,26 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
     recipient
 }
 
-/// Ask the execution client to build on the chosen parent payload for the
-/// prepared slot, then collect what it built.
+/// The share of a slot the execution client is given to fill a payload before
+/// it is collected: one twelfth, 500 ms of a 6-second slot.
+const PAYLOAD_BUILD_WINDOW_SLOT_FRACTION: u64 = 12;
+
+/// How long to wait between asking the execution client to build and collecting
+/// what it built.
 ///
-/// Collected straight away rather than after waiting, as the fulu path does: the
-/// execution client starts with a valid payload and improves it, so an early
-/// `getPayload` always answers, and the validator client asks at the start of
-/// the slot, when the block is due.
+/// The execution client starts from an empty payload and adds transactions as
+/// it executes them, so a payload collected the moment the build starts is empty
+/// or nearly so, however many transactions are pending. The validator client
+/// asks for the block at the start of the slot and attestations are due a
+/// quarter of the way in, which leaves room for this wait and for the block to
+/// reach the other nodes.
+fn payload_build_window(config: &Config) -> Duration {
+    Duration::from_millis(config.slot_duration_ms / PAYLOAD_BUILD_WINDOW_SLOT_FRACTION)
+}
+
+/// Ask the execution client to build on the chosen parent payload for the
+/// prepared slot, give it [`payload_build_window`] to fill the payload, then
+/// collect what it built.
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
@@ -800,6 +813,7 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(payload_build_window(&store.config())).await;
     engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
