@@ -32,6 +32,7 @@ pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
+pub mod head_monitor;
 pub mod http_api;
 pub(crate) mod in_flight;
 pub mod keys;
@@ -103,6 +104,7 @@ use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
 use crate::duties::DutiesService;
+use crate::head_monitor::DutyTriggers;
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
@@ -161,6 +163,11 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// Read the beacon nodes' event streams, so attestations and sync
+    /// committee messages go out when the slot's block arrives and payload
+    /// votes when its payload does, rather than only at their deadlines. See
+    /// [`head_monitor`].
+    pub event_stream: bool,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -346,6 +353,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         context = context.with_doppelganger(doppelganger.clone());
     }
     let context = Arc::new(context);
+
+    // Every node's stream, read until `run` returns and `_monitor` with it.
+    let (_monitor, triggers) =
+        head_monitor::start(&config.beacon_nodes, &context.config, config.event_stream)?;
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -607,10 +618,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
             // The rest of the way to the first of the slot's remaining duties:
             // the attester offset, or the sync committee offset when the network
-            // puts it earlier. Zero if the refresh or the proposal above already
-            // ran past it, in which case the duty is late rather than skipped.
-            // Each branch of `serve_slot_duties` waits for its own offset.
-            tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+            // puts it earlier, or the slot's block when a beacon node reports it
+            // first. Zero if the refresh or the proposal above already ran past
+            // it, in which case the duty is late rather than skipped. Each
+            // branch of `serve_slot_duties` waits for its own trigger.
+            let first_duty = clock.until_first_slot_duty(slot, SystemTime::now());
+            triggers.head_within(slot, first_duty).await;
 
             // Attesting and aggregating both start from these, so a key
             // doppelganger protection still withholds does neither; its sync
@@ -624,6 +637,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 &aggregation,
                 &payload_attestation,
                 &sync_committee,
+                &triggers,
                 &clock,
                 slot,
                 &slot_duties,
@@ -816,24 +830,29 @@ async fn run_until_stopped(
     stopped
 }
 
-/// Everything a slot owes after its proposal: attest and aggregate, then the
-/// payload timeliness committee vote.
+/// Everything a slot owes after its proposal: attest and aggregate, the
+/// payload timeliness committee vote, and the sync committee's work.
 ///
-/// The two halves are independent on purpose. Committee membership is drawn
+/// The parts are independent on purpose. Committee membership is drawn
 /// separately from attester duties, so a client can sit on a slot's committee
 /// with no attester duty in it at all, and an early return for "no attester
-/// duties" would skip exactly those votes. The committee half is also gated on
+/// duties" would skip exactly those votes. The committee part is also gated on
 /// the slot being a gloas one: before the fork there is no committee and no
 /// payload to vote on.
 ///
-/// Three quarters into the slot the committee sleeps until its own deadline,
-/// then runs bounded by the end of the slot like the other duties.
+/// Each part waits for its own trigger (see [`head_monitor`]): the slot's
+/// block or the attester offset, its payload or three quarters into the slot,
+/// the block or the sync message offset. They run side by side rather than
+/// one after another, so the committee vote, which the payload can start
+/// before the aggregation is due, is not held behind it. Each is bounded by
+/// the end of the slot.
 #[allow(clippy::too_many_arguments)]
 async fn serve_slot_duties<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
     payload_attestation: &PayloadAttestationService<B>,
     sync_committee: &SyncCommitteeService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
@@ -841,34 +860,42 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    // The sync committee work runs beside the attester and PTC work rather
-    // than after it: its deadline is not ordered against theirs (gloas moves
-    // it before the attestation) and each is bounded by the slot on its own.
-    let attest_then_ptc = async {
+    let attest = async {
         if !slot_duties.is_empty() {
-            tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
-            attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
+            attest_and_aggregate(
+                attestation,
+                aggregation,
+                triggers,
+                clock,
+                slot,
+                slot_duties,
+                store,
+            )
+            .await;
         }
-
+    };
+    let vote = async {
         if clock.is_gloas(slot) && !committee.is_empty() {
-            tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
-            payload_attest(payload_attestation, clock, slot, committee, store).await;
+            payload_attest(payload_attestation, triggers, clock, slot, committee, store).await;
         }
     };
     tokio::join!(
-        attest_then_ptc,
-        sync_committee_duty(sync_committee, clock, slot, sync_duties, store)
+        attest,
+        vote,
+        sync_committee_duty(sync_committee, triggers, clock, slot, sync_duties, store)
     );
 }
 
-/// Run one slot's sync committee duty: sign the head at the message deadline,
-/// then aggregate at the contribution deadline if a root was signed.
+/// Run one slot's sync committee duty: sign the head when the slot's block
+/// arrives or at the message deadline, whichever comes first, then aggregate
+/// at the contribution deadline if a root was signed.
 ///
 /// Each half is bounded by the end of the slot, like the other duties, and
 /// failures are logged and counted rather than propagated. Nothing here is
 /// slashable, so abandoning a half costs only that half.
 async fn sync_committee_duty<B: BeaconNodeApi>(
     service: &SyncCommitteeService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     duties: &[crate::beacon_node::dto::SyncDutyDto],
@@ -877,27 +904,30 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
     if duties.is_empty() {
         return;
     }
-    tokio::time::sleep(clock.until_sync_message(slot, SystemTime::now())).await;
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let root =
-        match tokio::time::timeout(budget, service.publish_messages(slot, duties, store)).await {
-            Ok(Ok(root)) => root,
-            Ok(Err(err)) => {
-                error!(%slot, %err, "Failed to publish sync committee messages for this slot");
-                metrics::inc_sync_committee_failures();
-                metrics::set_beacon_node_available(false);
-                return;
-            }
-            Err(_) => {
-                warn!(
-                    %slot,
-                    budget_ms = budget.as_millis() as u64,
-                    "Sync committee messages ran past the end of their slot and were abandoned"
-                );
-                metrics::inc_sync_committee_failures();
-                return;
-            }
-        };
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_sync_message(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let messages = triggers.publish_sync_messages(service, slot, wait, duties, store);
+    let root = match tokio::time::timeout(budget, messages).await {
+        Ok(Ok(root)) => root,
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to publish sync committee messages for this slot");
+            metrics::inc_sync_committee_failures();
+            metrics::set_beacon_node_available(false);
+            return;
+        }
+        Err(_) => {
+            warn!(
+                %slot,
+                budget_ms = budget.as_millis() as u64,
+                "Sync committee messages ran past the end of their slot and were abandoned"
+            );
+            metrics::inc_sync_committee_failures();
+            return;
+        }
+    };
     let Some(root) = root else {
         return;
     };
@@ -921,14 +951,16 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
     }
 }
 
-/// Run one slot's attestation duty and, when it produced data, the aggregation
-/// duty that follows it.
+/// Run one slot's attestation duty, when the slot's block arrives or at the
+/// attester offset, whichever comes first, and, when it produced data, the
+/// aggregation duty that follows it at its own offset.
 ///
 /// Split out of the loop so the loop can go on to the payload committee duty
 /// whether or not this client has an attester duty in the slot.
 async fn attest_and_aggregate<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
@@ -949,8 +981,13 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     // the same target. That is the intended outcome and matches `attest`'s
     // own "do not retry within a slot" rule; the attestation is simply
     // lost.
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, attestation.attest(slot, slot_duties, store));
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_attestation(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let attested = triggers.attest(attestation, slot, wait, slot_duties, store);
+    let attempt = tokio::time::timeout(budget, attested);
     match attempt.await.unwrap_or_else(|_| {
         warn!(
             %slot,
@@ -999,8 +1036,9 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     }
 }
 
-/// Run one slot's payload timeliness committee duty, bounded by what is left of
-/// the slot.
+/// Run one slot's payload timeliness committee duty, when the slot's payload
+/// and its blob data are available or three quarters into the slot,
+/// whichever comes first, bounded by what is left of the slot.
 ///
 /// The budget is the end of the slot, like the aggregation's and for the same
 /// reason: this is the last duty in its slot, so the only thing past its
@@ -1013,13 +1051,19 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
 /// and counted rather than propagated, like every other duty's.
 async fn payload_attest<B: BeaconNodeApi>(
     service: &PayloadAttestationService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     committee: &[crate::beacon_node::dto::PtcDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, service.attest(slot, committee, store));
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_payload_attestation(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let votes = triggers.attest_payload(service, slot, wait, committee, store);
+    let attempt = tokio::time::timeout(budget, votes);
     match attempt.await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
@@ -2182,6 +2226,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             slot,
             &[],
@@ -2319,6 +2364,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             slot,
             &[],
@@ -2356,6 +2402,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             5,
             &[],

@@ -1,7 +1,7 @@
 //! A `BeaconNodeApi` that answers from values a test sets, used by the duty
 //! service tests. Compiled only under `cfg(test)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::events::{EventSource, EventStream, NodeEvent, Topic};
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
     Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
@@ -233,6 +234,82 @@ pub struct MockBeaconNode {
     pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
     /// How long `liveness` takes before it answers, as a hung node would.
     pub liveness_delay: Option<std::time::Duration>,
+    /// The event streams `subscribe` hands out, one per call, in order: the
+    /// first one for any topic asked for, or scripted for any topic (`None`).
+    /// Once none fits, a subscription fails as an unreachable node's does.
+    pub event_streams: Mutex<VecDeque<(Option<Topic>, ScriptedStream)>>,
+    /// The topics of every `subscribe` call, in call order.
+    pub event_subscriptions: Mutex<Vec<Vec<Topic>>>,
+}
+
+/// One step of a scripted event stream.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamStep {
+    /// Send nothing for this long.
+    Wait(std::time::Duration),
+    /// Deliver this event.
+    Event(NodeEvent),
+}
+
+/// What a scripted stream does once its steps run out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The node closes it.
+    Close,
+    /// It breaks, as a dropped connection does.
+    Fail,
+    /// It stays open and sends nothing more.
+    Hang,
+}
+
+/// An event stream the mock hands out: its steps, then its end.
+#[derive(Debug, Clone)]
+pub struct ScriptedStream {
+    pub steps: VecDeque<StreamStep>,
+    pub end: StreamEnd,
+}
+
+#[async_trait]
+impl EventStream for ScriptedStream {
+    async fn next_event(&mut self) -> Result<Option<NodeEvent>> {
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                StreamStep::Wait(delay) => tokio::time::sleep(delay).await,
+                StreamStep::Event(event) => return Ok(Some(event)),
+            }
+        }
+        match self.end {
+            StreamEnd::Close => Ok(None),
+            StreamEnd::Fail => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Body,
+                detail: "the event stream broke".to_string(),
+            }),
+            StreamEnd::Hang => std::future::pending().await,
+        }
+    }
+}
+
+#[async_trait]
+impl EventSource for MockBeaconNode {
+    async fn subscribe(&self, topics: &[Topic]) -> Result<Box<dyn EventStream>> {
+        self.event_subscriptions
+            .lock()
+            .expect("lock")
+            .push(topics.to_vec());
+        let mut streams = self.event_streams.lock().expect("lock");
+        let fits = streams
+            .iter()
+            .position(|(topic, _)| topic.is_none_or(|topic| topics.contains(&topic)));
+        match fits.and_then(|position| streams.remove(position)) {
+            Some((_, stream)) => Ok(Box::new(stream)),
+            None => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Connect,
+                detail: "no event stream scripted".to_string(),
+            }),
+        }
+    }
 }
 
 impl MockBeaconNode {
@@ -385,6 +462,43 @@ impl MockBeaconNode {
             },
         });
         self
+    }
+
+    /// Answer `attestation_data` naming `root` as the head block. Over
+    /// [`Self::with_attestation_data`], which names the zero root.
+    pub fn with_attestation_block_root(mut self, root: Root) -> Self {
+        if let Some(data) = &mut self.attestation_data {
+            data.beacon_block_root = root;
+        }
+        self
+    }
+
+    /// Hand `steps`, then `end`, to the next `subscribe`, whatever its topic,
+    /// that no stream scripted before this one goes to.
+    pub fn with_event_stream(self, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(None, steps, end)
+    }
+
+    /// [`Self::with_event_stream`], for a subscription to `topic` only.
+    pub fn with_topic_stream(self, topic: Topic, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(Some(topic), steps, end)
+    }
+
+    fn script_stream(self, topic: Option<Topic>, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        let stream = ScriptedStream {
+            steps: steps.into(),
+            end,
+        };
+        self.event_streams
+            .lock()
+            .expect("lock")
+            .push_back((topic, stream));
+        self
+    }
+
+    /// The topics of every `subscribe` call, in call order.
+    pub fn event_subscriptions(&self) -> Vec<Vec<Topic>> {
+        self.event_subscriptions.lock().expect("lock").clone()
     }
 
     /// Answer `produce_block` with a minimal well-formed electra block for
