@@ -15,9 +15,9 @@ participant 3  ethlambda beacon + geth                 ethlambda validator
 | Block proposals | `stable/block-proposal-check` | Every client pair that holds validators proposed a block |
 | Sync | `dev/synchronized-check` | Every CL and EL, `cl-3-ethlambda-geth` included, reports synced |
 
-The devnet comes from `lambdaclass/ethereum-package`, a fork of ethpandaops'
-package that adds `cl_type: ethlambda` and `vc_type: ethlambda`. It is pinned to a
-commit in `.github/workflows/kurtosis_assertoor.yml` (`ETHEREUM_PACKAGE_REF`).
+The devnet comes from `ethpandaops/ethereum-package`, which has `cl_type: ethlambda`
+and `vc_type: ethlambda`. It is pinned to a commit in
+`.github/workflows/kurtosis_assertoor.yml` (`ETHEREUM_PACKAGE_REF`).
 Assertoor's image and the three playbook URLs are pinned to one assertoor commit
 in `network_params.yaml`; bump them together.
 
@@ -26,8 +26,8 @@ in `network_params.yaml`; bump them together.
 Needs Docker and the kurtosis CLI (CI uses 1.23.0). From the repository root:
 
 ```bash
-git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
-git -C /tmp/ethereum-package checkout 8378c1e3030ef4d41306aea9a0ba13d19372d125
+git clone https://github.com/ethpandaops/ethereum-package.git /tmp/ethereum-package
+git -C /tmp/ethereum-package checkout 90d0f4e795cd4c3298753b428bb588ed7999d4da
 
 kurtosis run /tmp/ethereum-package --enclave ethlambda-assertoor \
   --args-file tooling/kurtosis-assertoor/network_params.yaml
@@ -39,10 +39,8 @@ open "$url"                                   # assertoor web UI
 kurtosis enclave rm -f ethlambda-assertoor
 ```
 
-It runs from a clone because kurtosis refuses a remote package whose
-`kurtosis.yml` names another repository, and the fork's still says
-`ethpandaops/ethereum-package`. To test a local build, set the ethlambda entries'
-`cl_image` and `vc_image` in `network_params.yaml` (default `ghcr.io/lambdaclass/ethlambda:unstable`).
+To test a local build, set the ethlambda entries' `cl_image` and `vc_image` in
+`network_params.yaml` (default `ghcr.io/lambdaclass/ethlambda:unstable`).
 Expect about an hour: the stability check waits for finality at 12 s slots.
 
 ## In CI
