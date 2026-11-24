@@ -402,20 +402,20 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         );
         // leanVM derives a key on one thread, so the keys go across rayon's
         // pool: one per core, not one OS thread per validator.
-        let sources = tokio::task::spawn_blocking(move || {
+        let derived = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             secrets
                 .par_iter()
                 .map(|(pubkey, secret)| {
-                    let source =
+                    let derived =
                         pq::derive_and_register(*pubkey, secret, current_slot, cache.get(pubkey));
-                    if source == pq::KeySource::CacheRefused {
+                    if derived.source == pq::KeySource::CacheRefused {
                         warn!(
                             pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
                             "The leanXMSS cache record is not this key's; built it instead"
                         );
                     }
-                    source
+                    derived
                 })
                 .collect::<Vec<_>>()
         })
@@ -424,12 +424,31 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             path: "PQ key derivation".into(),
             source: std::io::Error::other(err.to_string()),
         })?;
-        let tally = |wanted| sources.iter().filter(|&&source| source == wanted).count();
+        let tally = |wanted| {
+            derived
+                .iter()
+                .filter(|derived| derived.source == wanted)
+                .count()
+        };
+        let slowest = |time: fn(&pq::Derived) -> std::time::Duration| {
+            derived
+                .iter()
+                .map(time)
+                .max()
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
         info!(
             count,
             cached = tally(pq::KeySource::Cached),
             built = tally(pq::KeySource::Built) + tally(pq::KeySource::CacheRefused),
             refused = tally(pq::KeySource::CacheRefused),
+            trees_built = derived
+                .iter()
+                .map(|derived| derived.trees_built)
+                .sum::<usize>(),
+            slowest_key_ms = slowest(|derived| derived.key_time),
+            slowest_trees_ms = slowest(|derived| derived.tree_time),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Derived the validators' PQ keys"
         );
@@ -1718,12 +1737,15 @@ fn prepare_bottom_trees(clock: SlotClock, current_slot: Slot) {
                         let tree = pq::bottom_tree_of(leaf);
                         info!(%slot, tree, leaf, "Building every key's next leanXMSS bottom tree");
                         let build = || pq::prepare_bottom_tree(leaf);
-                        match &pool {
+                        let builds = match &pool {
                             Some(pool) => pool.install(build),
                             None => build(),
-                        }
+                        };
                         info!(
                             tree,
+                            keys = builds.keys,
+                            built = builds.built,
+                            slowest_key_ms = builds.slowest.as_millis() as u64,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "Built every key's next leanXMSS bottom tree"
                         );

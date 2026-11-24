@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use ethlambda_crypto::leanvm_lean_xmss::{self, LeanXmssExpandedSecretKey};
 use ethlambda_crypto::{pq_keys, vrf};
@@ -48,7 +49,7 @@ use ethlambda_types::beacon::constants::{
     XMSS_ATTESTATION_LEAVES, XMSS_BUILDER_BID_LEAVES, XMSS_LEAVES_PER_SLOT, XMSS_RESERVED_LEAVES,
 };
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, XmssSignature};
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub use ethlambda_types::beacon::constants::{
     LEAF_OFFSET_AGGREGATE_AND_PROOF, LEAF_OFFSET_BEACON_PROPOSER,
@@ -230,6 +231,18 @@ pub enum KeySource {
     CacheRefused,
 }
 
+/// What [`derive_and_register`] did for one key, for the startup log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Derived {
+    pub source: KeySource,
+    /// Loading the key from its cache record, or generating it.
+    pub key_time: Duration,
+    /// The bottom trees the key had to build to warm its duties' trees (a
+    /// cache record may already hold them), and the time they took.
+    pub trees_built: usize,
+    pub tree_time: Duration,
+}
+
 /// Derives and registers the PQ key of the validator whose BLS key is
 /// `pubkey` and secret key `secret` (32 bytes, big-endian, as a keystore
 /// holds it).
@@ -248,7 +261,8 @@ pub fn derive_and_register(
     secret: &[u8; 32],
     current_slot: Slot,
     cached: Option<&XmssCacheRecord>,
-) -> KeySource {
+) -> Derived {
+    let started = Instant::now();
     let loaded = cached.map(|record| {
         let registered = leanvm_lean_xmss::LeanXmssPublicKey::from_bytes(&record.registered);
         let seed = pq_keys::xmss_seed(secret);
@@ -259,16 +273,38 @@ pub fn derive_and_register(
         Some(None) => (pq_keys::xmss_key(secret), KeySource::CacheRefused),
         None => (pq_keys::xmss_key(secret), KeySource::Built),
     };
+    let key_time = started.elapsed();
     let mut request_key = [0u8; 48];
     request_key[16..].copy_from_slice(&xmss.public_key().to_bytes());
     // Warm the two bottom trees duties sign in, so the first signature of each
     // kind does not pay for one at its deadline. Later ones are
     // `prepare_bottom_tree`'s.
+    let mut trees_built = 0;
+    let mut tree_time = Duration::ZERO;
     for leaf in duty_leaves(current_slot) {
-        if let Ok(leaf) = u32::try_from(leaf) {
-            xmss.prepare(leaf);
+        let Ok(leaf_index) = u32::try_from(leaf) else {
+            continue;
+        };
+        if let Some(elapsed) = prepare_tree(&xmss, leaf_index) {
+            debug!(
+                pubkey = %encode_pubkey(&pubkey),
+                tree = bottom_tree_of(leaf),
+                leaf,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Built a leanXMSS bottom tree for the current duties"
+            );
+            trees_built += 1;
+            tree_time += elapsed;
         }
     }
+    debug!(
+        pubkey = %encode_pubkey(&pubkey),
+        ?source,
+        key_ms = key_time.as_millis() as u64,
+        trees_built,
+        tree_ms = tree_time.as_millis() as u64,
+        "Derived a validator's PQ key"
+    );
     let key = Arc::new(PqKey {
         xmss,
         vrf_seed: pq_keys::vrf_seed(secret),
@@ -278,7 +314,32 @@ pub fn derive_and_register(
     let mut registry = registry().write().expect("PQ key registry poisoned");
     registry.by_request.insert(request_key, pubkey);
     registry.by_bls.insert(pubkey, key);
-    source
+    Derived {
+        source,
+        key_time,
+        trees_built,
+        tree_time,
+    }
+}
+
+/// The longest [`prepare_tree`] can take and still have found the tree in
+/// the key's cache: a hit is a lock and a scan of four entries, a build
+/// seconds of hashing. leanVM does not say which it was, so the time does.
+/// Only a log line rests on it: a hit slowed past this by a starved core
+/// costs one misleading line, never a signature.
+const TREE_BUILD_THRESHOLD: Duration = Duration::from_millis(50);
+
+/// Prepares `xmss`'s bottom tree for `leaf_index`, and how long that took
+/// when the key had to build it (`None` when it held it already).
+fn prepare_tree(xmss: &LeanXmssExpandedSecretKey, leaf_index: u32) -> Option<Duration> {
+    let started = Instant::now();
+    xmss.prepare(leaf_index);
+    let elapsed = started.elapsed();
+    (elapsed >= TREE_BUILD_THRESHOLD).then_some(elapsed)
+}
+
+fn encode_pubkey(pubkey: &BlsPubkey) -> String {
+    crate::beacon_node::dto::encode_hex(&pubkey.0)
 }
 
 /// The index of each of `keys`' registry entries: the one whose XMSS key's
@@ -362,19 +423,47 @@ pub fn duty_leaves(slot: Slot) -> [u64; 2] {
 ///
 /// Blocking: about 2.5 s for each key that builds, single-threaded, the keys
 /// across the current rayon pool. A key that holds the tree costs a lookup.
-pub fn prepare_bottom_tree(leaf: u64) {
+pub fn prepare_bottom_tree(leaf: u64) -> TreeBuilds {
     use rayon::prelude::*;
-    let Ok(leaf) = u32::try_from(leaf) else {
-        return;
+    let Ok(leaf_index) = u32::try_from(leaf) else {
+        return TreeBuilds::default();
     };
-    let keys: Vec<Arc<PqKey>> = registry()
+    let keys: Vec<(BlsPubkey, Arc<PqKey>)> = registry()
         .read()
         .expect("PQ key registry poisoned")
         .by_bls
-        .values()
-        .cloned()
+        .iter()
+        .map(|(pubkey, key)| (*pubkey, Arc::clone(key)))
         .collect();
-    keys.par_iter().for_each(|key| key.xmss.prepare(leaf));
+    let built: Vec<Duration> = keys
+        .par_iter()
+        .filter_map(|(pubkey, key)| {
+            let elapsed = prepare_tree(&key.xmss, leaf_index)?;
+            debug!(
+                pubkey = %encode_pubkey(pubkey),
+                tree = bottom_tree_of(leaf),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Built a validator's next leanXMSS bottom tree"
+            );
+            Some(elapsed)
+        })
+        .collect();
+    TreeBuilds {
+        keys: keys.len(),
+        built: built.len(),
+        slowest: built.iter().copied().max().unwrap_or_default(),
+    }
+}
+
+/// What [`prepare_bottom_tree`] did across the keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeBuilds {
+    /// The keys registered.
+    pub keys: usize,
+    /// The keys that had to build the tree; the others held it.
+    pub built: usize,
+    /// The longest one key's build took.
+    pub slowest: Duration,
 }
 
 /// `compute_xmss_attestation_leaf_index`.
@@ -621,6 +710,18 @@ pub fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, 
         .lock()
         .expect("PQ leaf record poisoned")
         .claim(pubkey, leaf, root)?;
+    // Signing builds the leaf's bottom tree if the key lacks it, seconds on
+    // the duty's own deadline; `prepare_bottom_tree` exists so that it never
+    // does. Prepared first, timed, so a build that still lands here is seen.
+    if let Some(elapsed) = prepare_tree(&key.xmss, leaf_index) {
+        warn!(
+            pubkey = %encode_pubkey(pubkey),
+            tree = bottom_tree_of(leaf),
+            leaf,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Built a leanXMSS bottom tree at signing time"
+        );
+    }
     let signature = leanvm_lean_xmss::sign(&key.xmss, &root.0, leaf_index);
     Ok(XmssSignature(signature.to_bytes()))
 }
@@ -718,7 +819,7 @@ mod tests {
             bytes: bytes.clone(),
         };
         assert_eq!(
-            derive_and_register(pubkey, &secret, 0, Some(&record)),
+            derive_and_register(pubkey, &secret, 0, Some(&record)).source,
             KeySource::Cached
         );
         assert_eq!(request_key(&pubkey), Some(request));
@@ -744,7 +845,7 @@ mod tests {
             bytes: damaged,
         };
         assert_eq!(
-            derive_and_register(BlsPubkey([16; 48]), &secret, 0, Some(&damaged)),
+            derive_and_register(BlsPubkey([16; 48]), &secret, 0, Some(&damaged)).source,
             KeySource::CacheRefused
         );
         let mut elsewhere = public;
@@ -754,7 +855,7 @@ mod tests {
             bytes,
         };
         assert_eq!(
-            derive_and_register(BlsPubkey([17; 48]), &secret, 0, Some(&misregistered)),
+            derive_and_register(BlsPubkey([17; 48]), &secret, 0, Some(&misregistered)).source,
             KeySource::CacheRefused
         );
     }
