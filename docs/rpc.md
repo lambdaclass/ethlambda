@@ -917,9 +917,9 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
 The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.
 
-A `cl_type: ethlambda` participant in our ethereum-package fork
-([`lambdaclass/ethereum-package`](https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda),
-branch `add-ethlambda`) runs an ethlambda validator client that, by default,
+A `cl_type: ethlambda` participant in
+[`ethpandaops/ethereum-package`](https://github.com/ethpandaops/ethereum-package)
+runs an ethlambda validator client that, by default,
 talks to this node alone, so every block its validators propose is one this
 node built.
 
