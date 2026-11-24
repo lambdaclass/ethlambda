@@ -32,4 +32,4 @@ ethlambda-engine = { workspace = true, features = ["include-ethrex"] }
 ethlambda-types.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }

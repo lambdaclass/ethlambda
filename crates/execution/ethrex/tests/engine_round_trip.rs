@@ -14,6 +14,7 @@
 //! node answers every forkchoice update `SYNCING` until its first sync ends.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4};
@@ -68,6 +69,23 @@ async fn embedded(genesis: &str, extra_flags: &[&str]) -> EmbeddedEthrex {
     ethlambda_ethrex::start(config)
         .await
         .expect("the embedded node starts")
+}
+
+/// Drops the test's client, then stops the node: the order `run_node` keeps.
+///
+/// With no clone of the RPC context left, ethrex's block executor thread exits
+/// and shutdown is over well inside its five-second grace. Were the executor
+/// still running, shutdown would wait out the whole grace before flushing, so
+/// the bound below is what shows it exited.
+async fn stop(node: EmbeddedEthrex, engine: EngineClient) {
+    drop(engine);
+    let started = Instant::now();
+    node.shutdown().await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(4),
+        "shutdown took {took:?}: it waited out its grace"
+    );
 }
 
 fn head(hash: H256) -> ForkchoiceStateV1 {
@@ -175,7 +193,7 @@ async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    node.shutdown().await;
+    stop(node, engine).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -213,7 +231,7 @@ async fn a_payload_with_an_undecodable_transaction_gets_ethrexs_own_verdict() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Invalid, "{status:?}");
 
-    node.shutdown().await;
+    stop(node, engine).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -265,7 +283,7 @@ async fn an_amsterdam_payload_round_trips_through_the_v4_v5_v6_methods() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    node.shutdown().await;
+    stop(node, engine).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -320,7 +338,7 @@ async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
         "{err:?}"
     );
 
-    node.shutdown().await;
+    stop(node, engine).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -376,4 +394,53 @@ async fn the_execution_json_rpc_server_answers_eth_and_refuses_engine() {
     assert!(empty["error"].is_object(), "{empty}");
 
     node.shutdown().await;
+}
+
+/// A request whose body is still arriving when shutdown begins is refused when
+/// it lands, not dispatched: by then the store may be flushing, or flushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_lands_after_shutdown_begins_is_refused() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let node = embedded("genesis-osaka.json", &["--ethrex.http-port", "0"]).await;
+    let addr = node.http_addr().expect("the server runs");
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
+    let (first, rest) = body.split_at(10);
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connects");
+    let length = body.len();
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {length}\r\nConnection: close\r\n\r\n{first}"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("sends the head");
+    // Let the server take the request in before shutdown begins.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let late_request = async {
+        // Cancelling is the first thing shutdown does.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stream
+            .write_all(rest.as_bytes())
+            .await
+            .expect("sends the rest");
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("the server closes the connection after answering")
+        .expect("reads the answer");
+        response
+    };
+    let ((), response) = tokio::join!(node.shutdown(), late_request);
+
+    assert!(response.contains("shutting down"), "{response}");
+    assert!(!response.contains("\"result\""), "{response}");
 }

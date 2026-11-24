@@ -12,13 +12,20 @@
 //!
 //! Left out, compared with ethrex's server: WebSocket subscriptions and the
 //! heap-profiling routes.
+//!
+//! Added: once shutdown begins, no request reaches the node. One arriving after
+//! it (a body that finishes uploading late, say) is refused without dispatch,
+//! and one still running is dropped, as it is when its client disconnects.
+//! Graceful shutdown waits for open connections, but the store is flushed after
+//! a bounded wait for this server, so without this a stalled connection could
+//! dispatch a request against a store that has already shut down.
 
 use std::net::SocketAddr;
 
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use ethrex_rpc::utils::RpcRequestId;
+use ethrex_rpc::utils::{RpcRequest, RpcRequestId};
 use ethrex_rpc::{
     RpcApiContext, RpcErr, RpcRequestWrapper, map_http_requests, rpc_response, validate_batch,
 };
@@ -41,7 +48,7 @@ pub(crate) async fn spawn(
 ) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    let router = router(context);
+    let router = router(context, cancel.clone());
     info!(%bound, "Execution JSON-RPC server listening");
     tracker.spawn(async move {
         axum::serve(listener, router)
@@ -52,11 +59,20 @@ pub(crate) async fn spawn(
     Ok(bound)
 }
 
-fn router(context: RpcApiContext) -> Router {
-    Router::new().route("/", post(handle)).with_state(context)
+/// What every request handler gets: the node's context, and the token whose
+/// cancellation starts its shutdown.
+#[derive(Clone)]
+struct ServerState {
+    context: RpcApiContext,
+    shutdown: CancellationToken,
 }
 
-async fn handle(State(context): State<RpcApiContext>, body: String) -> Json<Value> {
+fn router(context: RpcApiContext, shutdown: CancellationToken) -> Router {
+    let state = ServerState { context, shutdown };
+    Router::new().route("/", post(handle)).with_state(state)
+}
+
+async fn handle(State(state): State<ServerState>, body: String) -> Json<Value> {
     let wrapper: RpcRequestWrapper = match serde_json::from_str(&body) {
         Ok(wrapper) => wrapper,
         Err(_) => {
@@ -76,18 +92,34 @@ async fn handle(State(context): State<RpcApiContext>, body: String) -> Json<Valu
 
     match wrapper {
         RpcRequestWrapper::Single(request) => {
-            let answer = map_http_requests(&request, context).await;
+            let answer = dispatch(&request, &state).await;
             Json(envelope(request.id, answer))
         }
         RpcRequestWrapper::Multiple(requests) => {
             let mut answers = Vec::with_capacity(requests.len());
             for request in requests {
-                let answer = map_http_requests(&request, context.clone()).await;
+                let answer = dispatch(&request, &state).await;
                 answers.push(envelope(request.id, answer));
             }
             Json(Value::Array(answers))
         }
     }
+}
+
+/// Answers one request, unless shutdown has begun: then the request is refused
+/// without reaching the node, and a handler still running when it begins is
+/// dropped (see the module docs).
+async fn dispatch(request: &RpcRequest, state: &ServerState) -> Result<Value, RpcErr> {
+    let refusal = || Err(RpcErr::ServerError("the node is shutting down".to_string()));
+    if state.shutdown.is_cancelled() {
+        return refusal();
+    }
+    let call = map_http_requests(request, state.context.clone());
+    state
+        .shutdown
+        .run_until_cancelled(call)
+        .await
+        .unwrap_or_else(refusal)
 }
 
 /// A JSON-RPC response object for one request.

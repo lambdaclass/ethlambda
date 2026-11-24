@@ -14,6 +14,16 @@
 //! ethrex pin moves, diff `init_l1` and `init_rpc_api` (`cmd/ethrex/
 //! initializers.rs`) and the binary's `server_shutdown` (`cmd/ethrex/
 //! ethrex.rs`) against [`start`] and [`EmbeddedEthrex::shutdown`].
+//!
+//! Three differences are deliberate, and a re-diff should keep them:
+//! - [`start`] keeps the block executor thread's handle, which `bind_api`
+//!   drops.
+//! - [`EmbeddedEthrex::shutdown`] waits, bounded, for ethrex's tasks and for
+//!   that thread before flushing the store, where `server_shutdown` flushes
+//!   straight after cancelling. A block the executor is still on would
+//!   otherwise miss the flush.
+//! - The execution JSON-RPC server (`http.rs`) stops dispatching once shutdown
+//!   begins, so no request reaches the store while it flushes or after.
 
 mod config;
 mod http;
@@ -85,6 +95,8 @@ pub struct EmbeddedEthrex {
     context: RpcApiContext,
     cancel_token: CancellationToken,
     tracker: TaskTracker,
+    /// The block executor thread `newPayload` hands blocks to.
+    executor: std::thread::JoinHandle<()>,
     store: Store,
     peer_table: PeerTable,
     shared_local_node: SharedLocalNode,
@@ -219,9 +231,10 @@ pub async fn start(config: EthrexConfig) -> Result<EmbeddedEthrex, StartError> {
         tracker.clone(),
     )
     .await;
-    // Detached, as the node leaves it: the thread runs until every sender is
-    // dropped, which is when the last context clone goes.
-    let (block_worker_channel, _executor) = start_block_executor(blockchain.clone());
+    // The thread runs until every sender is dropped, which is when the last
+    // context clone goes. Kept rather than detached, as the node leaves it, so
+    // shutdown can wait for it to finish before flushing the store.
+    let (block_worker_channel, executor) = start_block_executor(blockchain.clone());
     let active_filters = Arc::new(Mutex::new(HashMap::new()));
     let context = RpcApiContext {
         storage: store.clone(),
@@ -282,6 +295,7 @@ pub async fn start(config: EthrexConfig) -> Result<EmbeddedEthrex, StartError> {
         context,
         cancel_token,
         tracker,
+        executor,
         store,
         peer_table,
         shared_local_node,
@@ -330,15 +344,40 @@ impl EmbeddedEthrex {
 
     /// Stops the node and flushes its database.
     ///
-    /// Call it only once nothing else drives the node, so no Engine API call
-    /// is in flight while the store flushes. The order is the `ethrex`
+    /// Call it only once nothing else drives the node: every `EngineClient`
+    /// made from [`Self::rpc_context`] dropped, so no Engine API call is in
+    /// flight and the block executor can wind down. The order is the `ethrex`
     /// binary's: stop the tasks that feed the store, flush it, then record the
     /// node's identity and known peers for the next start.
+    ///
+    /// Two waits come before the flush, under one [`SHUTDOWN_GRACE`], where the
+    /// binary flushes straight after cancelling:
+    /// - ethrex's tasks, the execution JSON-RPC server among them;
+    /// - the block executor thread. It exits once the last clone of the RPC
+    ///   context is gone, after finishing the blocks it holds, which include
+    ///   one whose `newPayload` timed out. `Store::shutdown` takes no write
+    ///   after it returns, so flushing under a running executor drops the
+    ///   block it is on.
+    ///
+    /// Past the grace the flush goes ahead anyway. It is what must not be
+    /// skipped; anything still running only loses work the next start redoes.
     pub async fn shutdown(self) {
+        let Self {
+            context,
+            cancel_token,
+            tracker,
+            executor,
+            store,
+            peer_table,
+            shared_local_node,
+            datadir,
+            http_addr: _,
+        } = self;
         info!("Stopping the embedded ethrex...");
-        self.cancel_token.cancel();
-        self.tracker.close();
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.tracker.wait())
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        cancel_token.cancel();
+        tracker.close();
+        if tokio::time::timeout_at(deadline, tracker.wait())
             .await
             .is_err()
         {
@@ -348,22 +387,49 @@ impl EmbeddedEthrex {
             );
         }
 
-        if let Err(err) = self.store.shutdown().await {
+        // This struct's own sender. A JSON-RPC server still running past the
+        // grace holds another, so the executor cannot exit and the wait below
+        // ends at once.
+        drop(context);
+        if tokio::time::timeout_at(deadline, thread_exit(&executor))
+            .await
+            .is_err()
+        {
+            warn!(
+                grace = ?SHUTDOWN_GRACE,
+                "Embedded ethrex block executor still running; flushing the database anyway"
+            );
+        }
+
+        if let Err(err) = store.shutdown().await {
             error!(%err, "Failed to flush the embedded ethrex database");
         }
 
-        if !is_memory_datadir(&self.datadir) {
-            let path = self.datadir.join("node_config.json");
+        if !is_memory_datadir(&datadir) {
+            let path = datadir.join("node_config.json");
             // Cloned out so the guard is dropped before the await below.
-            let record = self
-                .shared_local_node
+            let record = shared_local_node
                 .read()
                 .expect("shared_local_node poisoned")
                 .record
                 .clone();
-            let node_config = NodeConfigFile::new(self.peer_table, record).await;
+            let node_config = NodeConfigFile::new(peer_table, record).await;
             store_node_config_file(node_config, path);
         }
         info!("Embedded ethrex stopped");
+    }
+}
+
+/// How often shutdown looks at whether the block executor has exited.
+const EXECUTOR_EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Resolves once `thread` has exited.
+///
+/// Polled rather than joined: a join would park a blocking-pool thread on it,
+/// and the runtime waits for those when it shuts down, so an executor that
+/// never exits would hold the process open past the grace.
+async fn thread_exit(thread: &std::thread::JoinHandle<()>) {
+    while !thread.is_finished() {
+        tokio::time::sleep(EXECUTOR_EXIT_POLL).await;
     }
 }
