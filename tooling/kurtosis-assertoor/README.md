@@ -47,16 +47,20 @@ Expect about an hour: the stability check waits for finality at 12 s slots.
 
 `.github/workflows/kurtosis_assertoor.yml`:
 
-| Trigger | Image under test |
-|---|---|
-| push to `main` | `ghcr.io/lambdaclass/ethlambda:sha-<7>`, waited for up to 75 min until `docker_publish.yaml` pushes it |
-| pull request touching this directory or the workflow | `ghcr.io/lambdaclass/ethlambda:unstable` |
-| manual dispatch | the `image` input, else `unstable`; `battery` picks `assertoor`, `commit-boost` or `both` (default) |
+| Trigger | Image under test | Batteries |
+|---|---|---|
+| push to `main` | `ghcr.io/lambdaclass/ethlambda:sha-<7>`, waited for up to 75 min until `docker_publish.yaml` pushes it | assertoor and Commit-Boost |
+| pull request touching this directory or the workflow | `ghcr.io/lambdaclass/ethlambda:unstable` | Commit-Boost only |
+| manual dispatch | the `image` input, else `unstable` | `battery`: `assertoor`, `commit-boost` or `both` (default) |
+
+Assertoor does not run on pull requests because it takes about half an hour. To
+test a change to it before it merges, dispatch the workflow on the branch:
+`gh workflow run kurtosis_assertoor.yml --ref <branch> -f battery=assertoor`.
 
 The workflow rewrites the ethlambda images with `yq`, runs the battery, and always
 uploads the enclave dump and assertoor results (`enclave-dump-<run id>`) before
-removing the enclave. The Commit-Boost check below runs next to it on every
-trigger, on its own runner. A failure on `main` posts the commit, each failed
+removing the enclave. The Commit-Boost check below runs on its own runner, next
+to assertoor when both run. A failure on `main` posts the commit, each failed
 battery with its failed tests or unmet conditions, and the run URL to Slack.
 
 ## Commit-Boost check
@@ -120,10 +124,10 @@ kurtosis enclave rm -f ethlambda-commit-boost
 
 ### In CI
 
-The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on the
-base battery's triggers and image (see "In CI" above), in parallel with it, so
-it adds a runner but no wall-clock time. A dispatch runs it unless `battery` is
-`assertoor`. It runs the package at the base battery's pin
+The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on
+every trigger in the table under "In CI" above: in parallel with assertoor on a
+push to `main`, alone on a pull request (it takes 10 to 15 minutes), and on a
+dispatch unless `battery` is `assertoor`. It runs the package at the base battery's pin
 (`ETHEREUM_PACKAGE_REF`), which has ethlambda's builder flags
 (ethpandaops/ethereum-package#1515), and it uploads
 `commit-boost-enclave-dump-<run id>`.

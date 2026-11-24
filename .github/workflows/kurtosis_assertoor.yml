@@ -94,9 +94,11 @@ jobs:
   assertoor:
     name: Assertoor
     needs: image
-    # Every push and pull request, and every dispatch except one that asked for
-    # the commit-boost battery alone: `assertoor` and `both` both run this job.
-    if: github.event_name != 'workflow_dispatch' || inputs.battery != 'commit-boost'
+    # Every push to main, and every dispatch except one that asked for the
+    # commit-boost battery alone. Not on pull requests: it takes about half an
+    # hour. To test a change to this battery before it merges, dispatch the
+    # workflow on the branch with `battery: assertoor`.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.battery != 'commit-boost')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
