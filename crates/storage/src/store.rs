@@ -108,6 +108,24 @@ impl ForkCheckpoints {
     }
 }
 
+/// Which data columns a beacon directory holds: every column of
+/// `group_count` custody groups, from `since_slot` on.
+///
+/// A node that starts with more custody groups than its directory was last
+/// run with holds the new groups' columns only for blocks it imports from
+/// then on; nothing backfills the older ones. `since_slot` is what its
+/// `Status` `earliest_available_slot` reports, so peers do not ask it for
+/// columns it never stored. Persisted under [`KEY_CUSTODIED_GROUP_COUNT`] and
+/// [`KEY_CUSTODY_SINCE_SLOT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodyRecord {
+    /// How many custody groups' columns are held: the sampling size, which is
+    /// what the node stores and serves, not the count it advertises.
+    pub group_count: u64,
+    /// The first slot from which all of them are held.
+    pub since_slot: u64,
+}
+
 // ============ Metadata Keys ============
 
 /// Key for "time" field of the Store: a UNIX timestamp in **milliseconds**, on
@@ -192,6 +210,27 @@ const KEY_BEACON_FAST_CONFIRMED_ROOT: &[u8] = b"beacon_fast_confirmed_root";
 /// watermark and the tombstones can never disagree, and consecutive ranges
 /// stay adjacent rather than overlapping, across restarts included.
 const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
+/// The highest custody group count the validators attached to this node have
+/// required of it (fulu `validator.md`, "Validator custody"). Its value has
+/// type [`u64`] and it's SSZ-encoded; absent means no attached validator has
+/// required anything yet.
+///
+/// Only ever raised ([`Store::raise_validator_custody_count`]): the
+/// specification has a node keep custodying its highest count when its
+/// validators' balance falls, across restarts too, which is what this row is
+/// for. Startup reads it into the count the node custodies and advertises.
+/// Adding it did not bump [`DB_VERSION`]: an older directory simply has no row.
+const KEY_VALIDATOR_CUSTODY_COUNT: &[u8] = b"validator_custody_count";
+/// The number of custody groups whose columns this directory holds, as of the
+/// last startup: the sampling size the node ran with. Its value has type
+/// [`u64`] and it's SSZ-encoded. Written with [`KEY_CUSTODY_SINCE_SLOT`], in
+/// one batch; see [`CustodyRecord`].
+const KEY_CUSTODIED_GROUP_COUNT: &[u8] = b"custodied_group_count";
+/// The first slot from which this directory holds every column of
+/// [`KEY_CUSTODIED_GROUP_COUNT`]'s groups. Its value has type [`u64`] and
+/// it's SSZ-encoded. Both rows are absent in a directory written before they
+/// existed, which did not bump [`DB_VERSION`] either.
+const KEY_CUSTODY_SINCE_SLOT: &[u8] = b"custody_since_slot";
 /// The on-disk format this build reads and writes.
 ///
 /// Bumped whenever a table's key or value layout changes. `from_db_state`
@@ -5668,6 +5707,61 @@ impl Store {
     pub fn anchor_slot(&self) -> u64 {
         self.anchor_slot
     }
+
+    /// The highest custody group count attached validators have required of
+    /// this directory's node, from [`KEY_VALIDATOR_CUSTODY_COUNT`]. `None`
+    /// before any has, including in a directory written before the row
+    /// existed.
+    pub fn validator_custody_count(&self) -> Option<u64> {
+        self.read_optional_metadata(KEY_VALIDATOR_CUSTODY_COUNT)
+    }
+
+    /// Record that attached validators require `count` custody groups, and
+    /// answer the highest count recorded so far, this one included.
+    ///
+    /// Never lowers the row: a count below the recorded one leaves it as it
+    /// is, since the specification has a node keep custodying its highest
+    /// count when its validators' balance falls. Writes only when the count
+    /// rises. One writer (the p2p layer's once-an-epoch run), so the read and
+    /// the write need no lock between them.
+    pub fn raise_validator_custody_count(&self, count: u64) -> u64 {
+        match self.validator_custody_count() {
+            Some(recorded) if recorded >= count => recorded,
+            _ => {
+                self.set_metadata(KEY_VALIDATOR_CUSTODY_COUNT, &count);
+                count
+            }
+        }
+    }
+
+    /// The custody groups this directory holds columns for, and since when.
+    /// `None` until a startup has recorded it, including in a directory
+    /// written before the rows existed.
+    pub fn custody_record(&self) -> Option<CustodyRecord> {
+        let group_count = self.read_optional_metadata(KEY_CUSTODIED_GROUP_COUNT)?;
+        let since_slot = self.read_optional_metadata(KEY_CUSTODY_SINCE_SLOT)?;
+        Some(CustodyRecord {
+            group_count,
+            since_slot,
+        })
+    }
+
+    /// Persist `record`, both rows in one commit.
+    pub fn set_custody_record(&self, record: CustodyRecord) {
+        self.set_metadata_batch(&[
+            (KEY_CUSTODIED_GROUP_COUNT, &record.group_count),
+            (KEY_CUSTODY_SINCE_SLOT, &record.since_slot),
+        ]);
+    }
+
+    /// An SSZ `u64` metadata row that may be absent.
+    fn read_optional_metadata(&self, key: &[u8]) -> Option<u64> {
+        let view = self.backend.begin_read().expect("read view");
+        view.read_with(Table::Metadata, key, |bytes| {
+            u64::from_ssz_bytes(bytes).expect("valid encoding")
+        })
+        .expect("read")
+    }
 }
 
 /// Write a whole beacon signed block onto an existing batch, as one
@@ -5939,6 +6033,43 @@ mod tests {
             Checkpoint::default(),
             0,
         )
+    }
+
+    /// The validator custody count only ever rises: a lower requirement
+    /// leaves the recorded one in place and is answered with it.
+    #[test]
+    fn the_validator_custody_count_never_decreases() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        assert_eq!(store.validator_custody_count(), None);
+
+        assert_eq!(store.raise_validator_custody_count(8), 8);
+        assert_eq!(store.validator_custody_count(), Some(8));
+
+        assert_eq!(store.raise_validator_custody_count(32), 32);
+        assert_eq!(store.raise_validator_custody_count(16), 32);
+        assert_eq!(store.raise_validator_custody_count(8), 32);
+        assert_eq!(store.validator_custody_count(), Some(32));
+    }
+
+    /// The count and the custody record are on disk, not in this `Store`: a
+    /// second `Store` over the same backend, which is what a restart opens,
+    /// reads them back.
+    #[test]
+    fn the_custody_rows_survive_a_reopen() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let store = beacon_test_store(Arc::clone(&backend));
+        assert_eq!(store.custody_record(), None);
+
+        store.raise_validator_custody_count(64);
+        let record = CustodyRecord {
+            group_count: 64,
+            since_slot: 1_234,
+        };
+        store.set_custody_record(record);
+
+        let reopened = beacon_test_store(backend);
+        assert_eq!(reopened.validator_custody_count(), Some(64));
+        assert_eq!(reopened.custody_record(), Some(record));
     }
 
     #[test]

@@ -24,12 +24,16 @@
 //! all. `node`'s checkpoint sync is untouched: a lean node fetches a
 //! *finalized* anchor, which genuinely has no local source.
 
+use ethlambda_network_api::AttachedValidators;
 use ethlambda_p2p::beacon::fork_schedule::ForkSchedule;
 use ethlambda_p2p::beacon::swarm::BeaconWireConfig;
+use ethlambda_state_transition::beacon::das;
+use ethlambda_storage::{CustodyRecord, Store};
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::constants;
 use ethlambda_types::beacon::containers::BeaconState;
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::{Epoch, Root};
+use ethlambda_types::beacon::primitives::{Epoch, Root, Slot};
 use ethlambda_types::enr::EnrForkId;
 use tracing::{info, warn};
 
@@ -120,6 +124,97 @@ pub struct BeaconWireParams {
     pub fork_id: EnrForkId,
 }
 
+/// The custody a beacon node starts with: how many custody groups it
+/// advertises (the ENR's `cgc` and `MetaData` v3) and holds (their
+/// `sampling_size`), and the first slot from which its data directory holds
+/// every column of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupCustody {
+    pub group_count: u64,
+    pub since_slot: Slot,
+}
+
+/// Settle the custody this start runs with, from `--custody-group-count` and
+/// what `store`'s directory recorded, and record it.
+///
+/// The count is the larger of the flag and the highest count the attached
+/// validators have ever required (fulu `validator.md`, "Validator custody"),
+/// which the p2p layer records once an epoch and this applies: a requirement
+/// past what a running node holds waits for the next start. The recorded
+/// requirement is the validators' alone, so the flag stays the operator's own
+/// floor, lowered or raised freely above it.
+///
+/// The slot is [`custody_since_slot`]'s, persisted with the held count so the
+/// next start can tell whether its set grew.
+pub fn startup_custody(store: &Store, flag: u64) -> StartupCustody {
+    let required = store.validator_custody_count();
+    let group_count = flag
+        .max(required.unwrap_or(0))
+        .min(constants::NUMBER_OF_CUSTODY_GROUPS);
+    if group_count > flag {
+        info!(
+            custody_group_count = group_count,
+            flag,
+            "Custodying the most custody groups the attached validators have required, above \
+             --custody-group-count"
+        );
+    }
+
+    let held = das::sampling_size(group_count);
+    let anchor_slot = store.anchor_slot();
+    let next_slot = store
+        .beacon_head()
+        .map_or(anchor_slot, |(head_slot, _)| head_slot + 1);
+    let previous = store.custody_record();
+    let since_slot = custody_since_slot(previous, held, anchor_slot, next_slot);
+    if let Some(previous) = previous
+        && held > previous.group_count
+    {
+        info!(
+            previous_groups = previous.group_count,
+            groups = held,
+            since_slot,
+            "The custody set grew since the last start. The new groups' columns are held from \
+             this slot on, and Status reports it as earliest_available_slot (nothing backfills \
+             the older ones)"
+        );
+    }
+    store.set_custody_record(CustodyRecord {
+        group_count: held,
+        since_slot,
+    });
+
+    StartupCustody {
+        group_count,
+        since_slot,
+    }
+}
+
+/// The first slot from which a directory holds every column of `held`
+/// custody groups.
+///
+/// - No record: a fresh directory, or one written before the record existed.
+///   Either way the set is taken as held from the anchor on, which is what
+///   the node assumed before it kept a record.
+/// - More groups than recorded: the new groups' columns are held only for
+///   blocks imported from now on, so from `next_slot` (the slot after the
+///   head; range sync and the availability check fetch and require the whole
+///   new set for every block past it).
+/// - As many or fewer: the record's slot stands. Fewer groups are a subset of
+///   the recorded ones, since a larger count extends the same selection.
+pub fn custody_since_slot(
+    previous: Option<CustodyRecord>,
+    held: u64,
+    anchor_slot: Slot,
+    next_slot: Slot,
+) -> Slot {
+    match previous {
+        None => anchor_slot,
+        Some(record) if held > record.group_count => next_slot,
+        Some(record) => record.since_slot,
+    }
+}
+
 /// The discv5 node id for this process's node key bytes.
 ///
 /// A thin pass-through, kept as its own function so `run_node`'s exact
@@ -141,11 +236,17 @@ pub fn beacon_node_id(node_key: &[u8]) -> eyre::Result<[u8; 32]> {
 /// custody set off the identity we publish. The anchor state itself belongs to
 /// the anchor-and-follow work, and must be checked against the genesis values
 /// used here when it lands.
+///
+/// `custody` is [`startup_custody`]'s answer, and `attached_validators` the
+/// set the Beacon API records validator clients' validators into, which the
+/// p2p layer reads for validator custody.
 pub fn wire_params(
     source: &crate::network::NetworkSource,
     node_id: [u8; 32],
-    custody_group_count: u64,
+    custody: StartupCustody,
+    attached_validators: AttachedValidators,
 ) -> eyre::Result<BeaconWireParams> {
+    let custody_group_count = custody.group_count;
     let chain = source.config().clone();
     let genesis = source.genesis();
 
@@ -249,6 +350,9 @@ pub fn wire_params(
             genesis_time: genesis.genesis_time,
             genesis_validators_root: genesis.genesis_validators_root,
             custody_columns,
+            custody_group_count,
+            custody_since_slot: custody.since_slot,
+            attached_validators,
             attestation_subnets,
         },
         fork_id,
@@ -263,6 +367,96 @@ mod tests {
 
     /// Mainnet's genesis, 2020-12-01 12:00:23 UTC.
     const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
+
+    /// The custody of a fresh directory started at the default count.
+    fn fresh_custody() -> StartupCustody {
+        StartupCustody {
+            group_count: CUSTODY_REQUIREMENT,
+            since_slot: 0,
+        }
+    }
+
+    /// A beacon store anchored at `anchor_slot`, with no block inserted, so
+    /// it has no head: [`startup_custody`] then counts from the anchor.
+    fn store_anchored_at(anchor_slot: Slot) -> Store {
+        Store::init_beacon(
+            std::sync::Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
+            MAINNET_GENESIS_TIME,
+            Config::mainnet(),
+            Root::ZERO,
+            ethlambda_types::checkpoint::Checkpoint::default(),
+            anchor_slot,
+        )
+    }
+
+    #[test]
+    fn a_directory_without_a_custody_record_has_held_its_set_from_the_anchor() {
+        assert_eq!(custody_since_slot(None, 8, 100, 500), 100);
+    }
+
+    #[test]
+    fn a_grown_custody_set_is_held_from_the_slot_after_the_head() {
+        let previous = CustodyRecord {
+            group_count: 8,
+            since_slot: 100,
+        };
+        assert_eq!(custody_since_slot(Some(previous), 32, 100, 500), 500);
+    }
+
+    #[test]
+    fn an_unchanged_or_smaller_custody_set_keeps_its_slot() {
+        let previous = CustodyRecord {
+            group_count: 32,
+            since_slot: 300,
+        };
+        assert_eq!(custody_since_slot(Some(previous), 32, 100, 500), 300);
+        assert_eq!(custody_since_slot(Some(previous), 8, 100, 500), 300);
+    }
+
+    /// The count a start runs with is the larger of the flag and the recorded
+    /// requirement, and the record it leaves is what the next start compares
+    /// against.
+    #[test]
+    fn startup_applies_the_recorded_validator_custody_count() {
+        let store = store_anchored_at(64);
+
+        // Fresh directory, default flag: the flag's count, held since the
+        // anchor, and recorded at its sampling size.
+        let first = startup_custody(&store, CUSTODY_REQUIREMENT);
+        assert_eq!(
+            first,
+            StartupCustody {
+                group_count: CUSTODY_REQUIREMENT,
+                since_slot: 64,
+            }
+        );
+        assert_eq!(
+            store.custody_record(),
+            Some(CustodyRecord {
+                group_count: das::sampling_size(CUSTODY_REQUIREMENT),
+                since_slot: 64,
+            })
+        );
+
+        // Validators required 8: the count rises, but 8 groups were already
+        // held (the sampling size of 4), so the slot does not move.
+        store.raise_validator_custody_count(8);
+        let second = startup_custody(&store, CUSTODY_REQUIREMENT);
+        assert_eq!(second.group_count, 8);
+        assert_eq!(second.since_slot, 64);
+
+        // Validators required 64: more groups than held, so they are held
+        // from the slot after the head (here the anchor, with no head).
+        store.raise_validator_custody_count(64);
+        let third = startup_custody(&store, CUSTODY_REQUIREMENT);
+        assert_eq!(third.group_count, 64);
+        assert_eq!(third.since_slot, 64);
+        assert_eq!(store.custody_record().unwrap().group_count, 64);
+
+        // A flag above the requirement wins.
+        let fourth = startup_custody(&store, 128);
+        assert_eq!(fourth.group_count, 128);
+    }
 
     fn mainnet_gvr() -> Root {
         Root::from_slice(
@@ -327,8 +521,13 @@ mod tests {
     #[test]
     fn the_wire_parameters_are_derived_offline() {
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
-        let params =
-            wire_params(&source, [0x11; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
+        let params = wire_params(
+            &source,
+            [0x11; 32],
+            fresh_custody(),
+            AttachedValidators::default(),
+        )
+        .expect("no network is needed");
         assert_eq!(params.wire.genesis_time, MAINNET_GENESIS_TIME);
         // The digest is whatever fork the wall clock lands in, so it is not
         // pinned here; that it agrees with the ENR entry is the invariant.
@@ -349,12 +548,22 @@ mod tests {
 
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
 
-        let a =
-            wire_params(&source, [0x11; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
+        let a = wire_params(
+            &source,
+            [0x11; 32],
+            fresh_custody(),
+            AttachedValidators::default(),
+        )
+        .expect("no network is needed");
         assert_eq!(a.wire.custody_columns.len(), sampling as usize);
 
-        let b =
-            wire_params(&source, [0x22; 32], CUSTODY_REQUIREMENT).expect("no network is needed");
+        let b = wire_params(
+            &source,
+            [0x22; 32],
+            fresh_custody(),
+            AttachedValidators::default(),
+        )
+        .expect("no network is needed");
         assert_ne!(a.wire.custody_columns, b.wire.custody_columns);
     }
 
@@ -365,8 +574,13 @@ mod tests {
     fn beacon_node_id_feeds_wire_params_a_valid_identity() {
         let node_id = beacon_node_id(&[0x33; 32]).expect("a well-formed key");
         let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
-        let params =
-            wire_params(&source, node_id, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let params = wire_params(
+            &source,
+            node_id,
+            fresh_custody(),
+            AttachedValidators::default(),
+        )
+        .expect("no network is needed");
         let sampling = ethlambda_state_transition::beacon::das::sampling_size(
             ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
         );

@@ -337,7 +337,13 @@ pub(crate) struct BeaconOptions {
 #[derive(Debug, clap::Args)]
 pub(crate) struct MainnetOptions {
     /// How many custody groups this node custodies, advertised as the ENR's
-    /// `cgc` and used to size its own custody set.
+    /// `cgc` and `MetaData`'s `custody_group_count`, and used to size its own
+    /// custody set.
+    ///
+    /// A floor rather than the whole answer: with validators attached, fulu's
+    /// validator custody can require more. The node records the highest count
+    /// its validators have required in the data directory and starts at the
+    /// larger of that and this flag (see `beacon::startup_custody`).
     ///
     /// Raising it makes this node useful to more peers and costs it storage and
     /// bandwidth in proportion: a node at `NUMBER_OF_CUSTODY_GROUPS` is a

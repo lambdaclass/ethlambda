@@ -314,7 +314,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
 | `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
-| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
+| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet; every entry's validator counts as attached, for validator custody |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s (JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/pool/sync_committees` | *(status only)* | Validate, pool and gossip `SyncCommitteeMessage`s |
@@ -330,7 +330,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
-| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
+| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below), and that it is attached, for validator custody |
 | `POST` | `/eth/v1/validator/register_validator` | *(status only)* | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
@@ -433,6 +433,11 @@ the chain actor writes, so no request waits on the actor.
   attestation this node relays has passed the `beacon_attestation_{subnet_id}`
   checks first, and the ones accepted on a joined subnet are pooled. Joined
   subnets are left once their slot has passed, and never appear in `attnets`.
+  Every entry's validator, aggregator or not, is also recorded as attached to
+  this node, as `prepare_beacon_proposer`'s are: the p2p layer sizes its
+  custody by the attached validators' effective balance once an epoch, and
+  forgets a validator not named again for two epochs (see
+  [Validator custody](./beacon_wire.md#validator-custody)).
 - **`aggregate_attestation`** answers from the pool: every vote held for the
   data root and committee, as electra's `Attestation` with the BLS aggregate of
   their signatures; at a gloas slot the answer is `{version: "gloas", data}`
@@ -1035,6 +1040,10 @@ no IP. `metadata` is the `MetaData` the node answers peers with over req/resp,
 read at request time, so `syncnets` and `seq_number` follow the sync committee
 subnets a validator client asks for. That `seq_number` versions `MetaData`
 alone: the p2p specification counts it separately from the ENR's `seq`.
+`metadata.custody_group_count` is `MetaData` v3's: the count the node started
+with (the ENR's `cgc`), or higher once validator custody has raised it at
+runtime, which the ENR cannot follow until a restart (see
+[Validator custody](./beacon_wire.md#validator-custody)).
 
 `/eth/v1/node/peers`, `/eth/v1/node/peers/{peer_id}` and
 `/eth/v1/node/peer_count` read the p2p layer's table of connected peers at

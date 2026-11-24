@@ -392,6 +392,24 @@ actual_slot = finalized_slot + 1 + relative_index
     **Known gap**: ethrex's `DiscoveryServer` cannot replace the served ENR at runtime, so its
     `eth2` entry keeps the startup digest until a restart; peers discovering the node after a
     boundary reject the record
+  - Validator custody (fulu `validator.md`; `p2p/src/beacon/validator_custody.rs`): the Beacon
+    API records every validator index named to `beacon_committee_subscriptions` and
+    `prepare_beacon_proposer` in `AttachedValidators` (`net/api`; expires after two silent
+    epochs), and the p2p actor, once an epoch, has a `spawn_blocking` task compute
+    `das::get_validators_custody_requirement` off the latest finalized state, as the spec
+    says (not the head: the record never falls, so a reorged-out branch must not raise it;
+    the finalized state may need a rebuild, hence off the actor; the outcome returns as
+    `ValidatorCustodyComputed`). None with no attached validator in the registry, so a
+    plain follower is never raised to 8. It records the highest count in `Metadata`
+    (`Store::raise_validator_custody_count`, never lowered).
+    `beacon::startup_custody` starts the node at the larger of `--custody-group-count` and
+    that record. **The custody set is fixed per process** (`BeaconWire::custody_columns`, the
+    chain actor's, rpc's `CustodyColumns`): at runtime only `MetaData` v3's
+    `custody_group_count` rises (seq bump), never past the startup `sampling_size`, and a
+    larger requirement waits for a restart, so the node never advertises what it does not
+    hold. Same **known gap** as `eth2`: the ENR's `cgc` keeps its startup value. A start that
+    holds more groups than the directory's `CustodyRecord` moves `Status`'s
+    `earliest_available_slot` to the slot after its head (no backfill)
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
@@ -1122,6 +1140,10 @@ behavior.
   reloaded on resume for the unfinalized window; the PTC vote vectors are
   reseeded empty and each payload gets a verdict seeded for the execution
   client to promote. Adding them did not bump `DB_VERSION`.
+- `Metadata` keys `validator_custody_count`, `custodied_group_count` and
+  `custody_since_slot` (validator custody, see Networking) are optional rows:
+  absent in an older directory, read as nothing recorded. Adding them did not
+  bump `DB_VERSION` either.
 - A restart of a beacon data directory currently hits
   `SpecAssert("block_root in store.unrealized_justifications")` in head
   computation until lambdaclass/ethlambda#628 (persists unrealized

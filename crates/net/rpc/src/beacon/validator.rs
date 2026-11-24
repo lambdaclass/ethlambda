@@ -33,7 +33,7 @@ use ethlambda_types::{
 };
 use serde::{Deserialize, Serialize};
 
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{AttachedValidators, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     fork_choice::{
         checkpoint_state, compute_shuffling_dependent_slot, get_current_store_epoch, get_head_node,
@@ -282,11 +282,10 @@ fn liveness(store: &Store, epoch: &str, indices: &[String]) -> Result<serde_json
     Ok(serde_json::json!({ "data": data }))
 }
 
-/// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
-/// is refused, though `validator_index` is never read.
+/// One entry of `beacon_committee_subscriptions`.
 #[derive(Debug, Deserialize)]
 struct CommitteeSubscription {
-    #[allow(dead_code)]
+    /// Recorded as attached to this node, for validator custody.
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -305,11 +304,21 @@ struct CommitteeSubscription {
 /// the aggregate endpoint answers from (phase0 `validator.md`, "Attestation
 /// subnet subscription"). Non-aggregators' entries need nothing: publishing
 /// reaches a subnet through gossipsub fanout without joining it.
+///
+/// Every entry's validator, aggregator or not, is recorded as attached to
+/// this node: a validator client subscribes for each of its validators' duties
+/// every epoch, which is what fulu validator custody counts.
 async fn post_committee_subscriptions(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    attached: Option<Extension<AttachedValidators>>,
     Json(subscriptions): Json<Vec<CommitteeSubscription>>,
 ) -> Response {
+    record_attached(
+        &store,
+        attached,
+        subscriptions.iter().map(|entry| entry.validator_index),
+    );
     let config = store.config();
     let subnets: Vec<(u64, Slot)> = subscriptions
         .iter()
@@ -341,15 +350,39 @@ struct ProposerPreparation {
 }
 
 /// `POST /eth/v1/validator/prepare_beacon_proposer`: record where each
-/// validator's block rewards should be paid.
+/// validator's block rewards should be paid, and that each validator is
+/// attached to this node (for validator custody).
 async fn post_prepare_beacon_proposer(
+    State(store): State<Store>,
     Extension(fee_recipients): Extension<FeeRecipients>,
+    attached: Option<Extension<AttachedValidators>>,
     Json(preparations): Json<Vec<ProposerPreparation>>,
 ) -> Response {
+    record_attached(
+        &store,
+        attached,
+        preparations
+            .iter()
+            .map(|preparation| preparation.validator_index),
+    );
     for preparation in preparations {
         fee_recipients.insert(preparation.validator_index, preparation.fee_recipient);
     }
     axum::http::StatusCode::OK.into_response()
+}
+
+/// Record `indices` as attached to this node at the store clock's epoch.
+///
+/// The set is optional so a router built without it (a test's, say) still
+/// answers both endpoints: without the p2p layer that reads it, nothing would.
+fn record_attached(
+    store: &Store,
+    attached: Option<Extension<AttachedValidators>>,
+    indices: impl IntoIterator<Item = ValidatorIndex>,
+) {
+    if let Some(Extension(attached)) = attached {
+        attached.record(indices, compute_epoch_at_slot(store.current_slot()));
+    }
 }
 
 fn parse_epoch(epoch: &str) -> Result<Epoch, ApiError> {
@@ -1473,6 +1506,48 @@ mod tests {
             fee_recipients.prepared(7),
             Some(ExecutionAddress::from_slice(&[0xab; 20]))
         );
+    }
+
+    /// Both calls a validator client repeats every epoch record the validators
+    /// they name as attached, at the store clock's epoch: every subscription
+    /// (an aggregator's or not) and every preparation.
+    #[tokio::test]
+    async fn subscriptions_and_preparations_record_the_attached_validators() {
+        let (store, _) = beacon_store_at(fulu_state());
+        let epoch = compute_epoch_at_slot(store.current_slot());
+        let attached = AttachedValidators::default();
+        let p2p: RpcToP2PRef = Arc::new(crate::test_utils::RecordingNetwork::default());
+        let app = routes()
+            .with_state(store)
+            .layer(Extension(p2p))
+            .layer(Extension(FeeRecipients::default()))
+            .layer(Extension(attached.clone()));
+
+        let subscriptions = serde_json::json!([
+            { "validator_index": "4", "committee_index": "0", "committees_at_slot": "1",
+              "slot": "33", "is_aggregator": false },
+            { "validator_index": "2", "committee_index": "0", "committees_at_slot": "1",
+              "slot": "33", "is_aggregator": true },
+        ]);
+        let preparations = serde_json::json!([
+            { "validator_index": "9", "fee_recipient": format!("0x{}", "ab".repeat(20)) }
+        ]);
+        for (uri, body) in [
+            (
+                "/eth/v1/validator/beacon_committee_subscriptions",
+                subscriptions,
+            ),
+            ("/eth/v1/validator/prepare_beacon_proposer", preparations),
+        ] {
+            let request = Request::post(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+
+        assert_eq!(attached.at(epoch), vec![2, 4, 9]);
     }
 
     async fn post_raw(uri: &str, body: serde_json::Value) -> (StatusCode, axum::body::Bytes) {

@@ -293,6 +293,9 @@ different checkpoints.
 | `latest_finalized`             | `Checkpoint` | both   | Latest finalized checkpoint                                   |
 | `beacon_unrealized_justified`  | `Checkpoint` | beacon | Unrealized justified checkpoint (beacon `Checkpoint`)         |
 | `beacon_unrealized_finalized`  | `Checkpoint` | beacon | Unrealized finalized checkpoint (beacon `Checkpoint`)         |
+| `validator_custody_count`      | `u64`        | beacon | Highest custody group count attached validators have required; only ever raised, absent until one has (see [Validator custody](beacon_wire.md#validator-custody)) |
+| `custodied_group_count`        | `u64`        | beacon | Custody groups whose columns the last start held (its sampling size); written with `custody_since_slot` |
+| `custody_since_slot`           | `u64`        | beacon | First slot from which every column of `custodied_group_count` is held; `Status` reports it when later than the anchor |
 
 Rows marked for one chain are never written on the other, so reaching one
 through the wrong chain's accessor panics naming the key rather than reading a
