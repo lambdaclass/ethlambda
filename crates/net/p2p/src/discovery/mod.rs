@@ -254,8 +254,10 @@ pub async fn spawn_discovery(
             discv4_enabled: false,
             discv5_enabled: true,
             // An operator-supplied advertise IP is the address peers should
-            // reach us on, so IP voting must not replace it.
-            nat_extip_set: config.advertise_ip.is_some(),
+            // reach us on, so IP voting must not replace it. An unspecified
+            // one (`0.0.0.0`, `::`) names no address, so voting stays on to
+            // find one, as it does with no advertise IP at all.
+            nat_extip_set: config.advertise_ip.is_some_and(|ip| !ip.is_unspecified()),
         },
         shared_local_node,
         no_fork_id,

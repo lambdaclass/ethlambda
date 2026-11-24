@@ -127,7 +127,9 @@ pub(crate) fn node_id_from_peer_id(peer_id: &libp2p::PeerId) -> Option<[u8; 32]>
 /// Everything needed to build this node's ENR.
 pub(crate) struct LocalEnrParams {
     pub(crate) signer: SecretKey,
-    /// Address to advertise. discv5's PONG-based IP voting may replace it later.
+    /// Address to advertise. discv5's PONG-based IP voting may replace it
+    /// later, unless the operator supplied it and it is not the unspecified
+    /// address (see `spawn_discovery`).
     pub(crate) ip: IpAddr,
     /// UDP port the discv5 socket is bound to.
     pub(crate) discovery_port: u16,

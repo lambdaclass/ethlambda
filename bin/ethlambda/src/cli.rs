@@ -663,7 +663,8 @@ pub(crate) struct DiscoveryConfig {
     /// Defaults to the bind address, which is the wildcard `0.0.0.0` and is not
     /// dialable as published. Set this to the address peers should reach this
     /// node on: `127.0.0.1` for a local devnet, or the host's public address.
-    /// discv5's PONG-based IP voting may still replace it at runtime.
+    /// An address set here is kept: discv5's PONG-based IP voting replaces
+    /// only the default, or an unspecified address given here.
     #[arg(long = "discovery.advertise-ip")]
     pub(crate) advertise_ip: Option<IpAddr>,
     /// How many peers this node holds.
