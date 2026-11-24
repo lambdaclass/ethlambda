@@ -125,6 +125,7 @@ from a normal build.
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). Lighthouse's flag of the same name |
+| `--fallback-fee-recipient` | none | Execution address (20 bytes of hex, `0x` optional) a locally built payload pays when no validator client named a fee recipient for the proposer through `prepare_beacon_proposer` or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: `payload_attributes` events still need `prepare_beacon_proposer` or `--always-prepare-payload`. Lighthouse's beacon-node `--suggested-fee-recipient` |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
@@ -377,7 +378,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
-| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
+| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
@@ -479,10 +480,18 @@ and it would buy nothing: the attestations this client submits are electra's
 cannot serve whatever it does with blocks. A block from any earlier fork is
 refused by name rather than failing to decode.
 
-Blocks are fetched and published as SSZ rather than JSON. Signing a block means
-computing its `hash_tree_root`, which only the typed container can give; a
-hand-written JSON mapping of an execution payload would be a large surface on
+Blocks are fetched as SSZ by preference and published as SSZ. Signing a block
+means computing its `hash_tree_root`, which only the typed container can give;
+a hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.
+`produceBlockV3` (electra and fulu) is still asked for
+`application/octet-stream;q=1.0,application/json;q=0.9`, and a JSON answer is
+decoded into the same containers through their serde support in
+`ethlambda-types`, the one an ethlambda beacon node writes that answer with.
+That is for ethereum-package's blobber, which sits between the client and its
+node, rewrites `Accept` to `application/json` on block production, and relays
+the node's answer unchanged. Gloas's `produceBlockV4`, which blobber does not
+intercept, stays SSZ-only.
 
 From gloas on a proposal is two messages. The client asks for the block with
 `include_payload=true` (`produceBlockV4`), publishes the block bare, then signs
