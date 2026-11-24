@@ -39,6 +39,8 @@ runs:
         # That is an invariant the code has to keep (CLAUDE.md, "Docs-only
         # changes skip CI"): a crate that starts reading one of these paths,
         # e.g. `#![doc = include_str!("../README.md")]`, must take it off.
+        # `make inert-paths-check`, in Lint, catches the `include_str!` and
+        # `include_bytes!` cases; keep its pattern in step with this list.
         filters: |
           all_files:
             - '**'
