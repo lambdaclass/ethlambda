@@ -1088,7 +1088,8 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
   "no execution client" mode. See [`docs/ethrex.md`](docs/ethrex.md)
 - One ethrex tag for the whole workspace (`[workspace.dependencies]`), shared with
   p2p's discovery. Bumping it means re-diffing ethrex's `init_l1`/`init_rpc_api`/
-  `server_shutdown` against `crates/execution/ethrex/src/lib.rs`, which repeats them
+  `init_network`/`server_shutdown` against `crates/execution/ethrex/src/lib.rs`,
+  which repeats them
 - `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
   it plus the engine and binary with the feature on
 

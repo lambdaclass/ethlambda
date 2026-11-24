@@ -21,7 +21,7 @@ use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4};
 use ethlambda_engine::{
     ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, EngineError, ForkchoiceStateV1, PayloadStatusValue,
 };
-use ethlambda_ethrex::{EmbeddedEthrex, EthrexArgs};
+use ethlambda_ethrex::{EmbeddedEthrex, EthrexArgs, StartError};
 use ethlambda_types::beacon::containers::bellatrix;
 use ethlambda_types::beacon::primitives::{H160, H256};
 use ethrex_config::networks::Network;
@@ -69,6 +69,32 @@ async fn embedded(genesis: &str, extra_flags: &[&str]) -> EmbeddedEthrex {
     ethlambda_ethrex::start(config)
         .await
         .expect("the embedded node starts")
+}
+
+/// A node with devp2p on, its TCP and UDP sockets on `127.0.0.1:port`.
+async fn with_devp2p(port: u16) -> Result<EmbeddedEthrex, StartError> {
+    let network = fixture("genesis-osaka.json");
+    let network = network.to_str().expect("a UTF-8 fixture path");
+    let port = port.to_string();
+    let argv = [
+        "ethlambda",
+        "--ethrex.datadir",
+        "memory",
+        "--ethrex.network",
+        network,
+        "--ethrex.syncmode",
+        "full",
+        "--ethrex.p2p-port",
+        &port,
+        "--ethrex.discovery-port",
+        &port,
+    ];
+    let args = Harness::try_parse_from(argv).expect("valid flags").ethrex;
+    let mut config = args
+        .resolve(Path::new("unused"), "unused")
+        .expect("the flags name every derived value");
+    config.options.p2p_addr = Some("127.0.0.1".to_string());
+    ethlambda_ethrex::start(config).await
 }
 
 fn head(hash: H256) -> ForkchoiceStateV1 {
@@ -176,7 +202,7 @@ async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -214,7 +240,7 @@ async fn a_payload_with_an_undecodable_transaction_gets_ethrexs_own_verdict() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Invalid, "{status:?}");
 
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -266,7 +292,7 @@ async fn an_amsterdam_payload_round_trips_through_the_v4_v5_v6_methods() {
         .expect("an answer");
     assert_eq!(status.status, PayloadStatusValue::Valid, "{status:?}");
 
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -321,7 +347,7 @@ async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
         "{err:?}"
     );
 
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 }
 
 /// Once shutdown begins, an in-process call is refused before it reaches a
@@ -331,13 +357,47 @@ async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
 async fn an_engine_call_after_shutdown_begins_is_refused() {
     let node = embedded("genesis-osaka.json", &[]).await;
     let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 
     let err = engine
         .exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES)
         .await
         .expect_err("refused once shutdown has begun");
     assert!(matches!(err, EngineError::Transport(_)), "{err:?}");
+}
+
+/// A devp2p socket that cannot bind fails startup with an error, where
+/// ethrex's own `init_network` panics.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_devp2p_port_in_use_is_a_startup_error() {
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+    let port = taken.local_addr().expect("bound").port();
+
+    let Err(err) = with_devp2p(port).await else {
+        panic!("started on a UDP port another socket holds");
+    };
+    assert!(matches!(err, StartError::P2p(_)), "{err}");
+}
+
+/// Shutdown flushes at once with devp2p on, as with it off. Several of ethrex's
+/// devp2p tasks never watch the cancel token, so a shutdown that waited for
+/// ethrex's tasks waited out its whole bound on every such node.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_with_devp2p_on_waits_for_none_of_its_tasks() {
+    // A free port, released for the node to bind.
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|probe| probe.local_addr())
+        .expect("binds")
+        .port();
+    let node = match with_devp2p(port).await {
+        Ok(node) => node,
+        Err(err) => panic!("the embedded node starts with devp2p on: {err}"),
+    };
+
+    tokio::time::timeout(Duration::from_secs(3), node.shutdown())
+        .await
+        .expect("shutdown does not wait for devp2p's tasks")
+        .expect("the store flushes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -392,7 +452,7 @@ async fn the_execution_json_rpc_server_answers_eth_and_refuses_engine() {
         .expect("JSON");
     assert!(empty["error"].is_object(), "{empty}");
 
-    node.shutdown().await;
+    node.shutdown().await.expect("the store flushes");
 }
 
 /// A request whose body is still arriving when shutdown begins is refused when
@@ -438,7 +498,8 @@ async fn a_request_that_lands_after_shutdown_begins_is_refused() {
         .expect("reads the answer");
         response
     };
-    let ((), response) = tokio::join!(node.shutdown(), late_request);
+    let (flushed, response) = tokio::join!(node.shutdown(), late_request);
+    flushed.expect("the store flushes");
 
     assert!(response.contains("shutting down"), "{response}");
     assert!(!response.contains("\"result\""), "{response}");

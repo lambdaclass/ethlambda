@@ -91,11 +91,11 @@ fn main() -> eyre::Result<()> {
         // command line.
         Command::Node(options) => {
             init_node_logging()?;
-            run_node(options.into())
+            run(options.into())
         }
         Command::Beacon(options) => {
             init_node_logging()?;
-            run_node(options.into())
+            run(options.into())
         }
         // The benchmark is synchronous, CPU-bound work, so it runs on this
         // thread and the tokio runtime is never started — rather than parking
@@ -337,6 +337,37 @@ struct ChainSetup {
     chain: ChainActor,
 }
 
+/// Runs [`run_node`], and stops the embedded ethrex if a startup step fails
+/// after it started, so its database is flushed and its peers recorded all the
+/// same.
+//
+// Shadow single-steps execution in a discrete-event simulation, so the default
+// multi-threaded runtime's worker threads add only scheduling noise, never
+// parallelism. Use a single-threaded runtime under Shadow. This is an
+// optimization, not a correctness requirement.
+#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
+#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
+async fn run(options: Options) -> eyre::Result<()> {
+    // Filled by the beacon arm when it starts ethrex in-process, and taken
+    // into `RunningNode` once no startup step is left to fail.
+    #[cfg(feature = "include-ethrex")]
+    let mut embedded_ethrex = None;
+    let ran = run_node(
+        options,
+        #[cfg(feature = "include-ethrex")]
+        &mut embedded_ethrex,
+    )
+    .await;
+    #[cfg(feature = "include-ethrex")]
+    if let Some(embedded) = embedded_ethrex {
+        let _ = embedded
+            .shutdown()
+            .await
+            .inspect_err(|err| error!(%err, "Failed to flush the embedded ethrex database"));
+    }
+    ran
+}
+
 /// Boot the node, on whichever chain [`Options::network`] names.
 ///
 /// One startup path, in the order it has to happen: validate the port, register
@@ -358,14 +389,15 @@ struct ChainSetup {
 /// site serves both, but its endpoints still read metadata keys and state
 /// variants a beacon store does not carry, so they do not yet answer for a
 /// beacon directory; fixing that is its own change.
-//
-// Shadow single-steps execution in a discrete-event simulation, so the default
-// multi-threaded runtime's worker threads add only scheduling noise, never
-// parallelism. Use a single-threaded runtime under Shadow. This is an
-// optimization, not a correctness requirement.
-#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
-#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
-async fn run_node(options: Options) -> eyre::Result<()> {
+///
+/// The beacon arm puts an embedded ethrex it starts in `embedded_ethrex`,
+/// which [`run`] holds, so a step that fails after it can still be stopped.
+async fn run_node(
+    options: Options,
+    #[cfg(feature = "include-ethrex")] embedded_ethrex: &mut Option<
+        ethlambda_ethrex::EmbeddedEthrex,
+    >,
+) -> eyre::Result<()> {
     // Before any side effect, so a port collision aborts ahead of the metrics
     // registry, the fd limit and the data directory.
     options.validate_ports()?;
@@ -552,11 +584,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let node_p2p_key = resolve_node_key(common.node_key.as_deref(), &data_dir)?;
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
-
-    // Set by the beacon arm below when it starts ethrex in-process, so that
-    // `wait_for_shutdown` can stop it after the chain actor.
-    #[cfg(feature = "include-ethrex")]
-    let mut embedded_ethrex: Option<ethlambda_ethrex::EmbeddedEthrex> = None;
 
     // The one place the two chains diverge. Everything above is shared setup;
     // everything below is shared startup and, in `wait_for_shutdown`, shared
@@ -772,7 +799,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     let client =
                         EngineClient::in_process(started.rpc_context(), started.shutdown_token());
                     info!("Embedded ethrex configured as the execution client");
-                    embedded_ethrex = Some(started);
+                    *embedded_ethrex = Some(started);
                     Some(client)
                 }
             };
@@ -1077,7 +1104,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         http,
         shutdown,
         #[cfg(feature = "include-ethrex")]
-        embedded_ethrex,
+        embedded_ethrex: embedded_ethrex.take(),
     })
     .await
 }
@@ -1229,17 +1256,28 @@ async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     blockchain_ref.join().await;
     p2p_ref.join().await;
     let _ = node.http.await;
-    // After the actors, which are the only emitters, have stopped.
-    ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT).await;
 
-    // Last, once the chain actor has joined: no Engine API call can be in
-    // flight while ethrex flushes its database.
+    // After the actors, which are the only telemetry emitters, and after the
+    // HTTP server's drain, so a proposal still in it gets its payload: an
+    // Engine API call that begins later is refused. The two at once, so a
+    // slow ClickHouse cannot push the execution database's flush past a
+    // container's stop timeout.
+    let telemetry = ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT);
     #[cfg(feature = "include-ethrex")]
-    if let Some(embedded) = node.embedded_ethrex {
-        embedded.shutdown().await;
-    }
+    let ((), flushed) = tokio::join!(telemetry, async {
+        match node.embedded_ethrex {
+            Some(embedded) => embedded.shutdown().await,
+            None => Ok(()),
+        }
+    });
+    #[cfg(not(feature = "include-ethrex"))]
+    telemetry.await;
 
     info!("Shutdown complete");
+    // A failed flush first: when the client had also stopped itself, that
+    // was logged as it happened, and the flush error is the one left unsaid.
+    #[cfg(feature = "include-ethrex")]
+    flushed.wrap_err("flushing the embedded ethrex database")?;
     eyre::ensure!(
         !execution_client_stopped,
         "the embedded execution client stopped"
@@ -1247,9 +1285,9 @@ async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Resolves when the embedded execution client cancels itself, which an ethrex
-/// subsystem does on a failure the node cannot run past. Never resolves for a
-/// node without one.
+/// Resolves when the embedded execution client cancels itself, which its
+/// execution JSON-RPC server does on failing, as ethrex's own does. Never
+/// resolves for a node without one.
 async fn execution_client_stopped(node: &RunningNode) {
     #[cfg(feature = "include-ethrex")]
     if let Some(embedded) = &node.embedded_ethrex {

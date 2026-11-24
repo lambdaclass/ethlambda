@@ -13,23 +13,28 @@
 //! are repeated here and the context is assembled from the same parts. When the
 //! ethrex pin moves, diff `init_l1` and `init_rpc_api` (`cmd/ethrex/
 //! initializers.rs`) and the binary's `server_shutdown` (`cmd/ethrex/
-//! ethrex.rs`) against [`start`] and [`EmbeddedEthrex::shutdown`].
+//! ethrex.rs`) against [`start`] and [`EmbeddedEthrex::shutdown`]. [`start`]
+//! also inlines `init_network`, so diff that too.
 //!
-//! Two differences are deliberate, and a re-diff should keep them:
-//! - [`EmbeddedEthrex::shutdown`] waits, bounded, for ethrex's tasks before
-//!   flushing the store, where `server_shutdown` flushes straight after
-//!   cancelling.
-//! - The execution JSON-RPC server (`http.rs`) stops dispatching once shutdown
-//!   begins, so no request reaches the store while it flushes or after.
+//! The differences are deliberate, and a re-diff should keep them:
+//! - Requests stop at the start of shutdown. The execution JSON-RPC server
+//!   (`http.rs`) and the in-process Engine API (`EngineClient::in_process`,
+//!   given [`EmbeddedEthrex::shutdown_token`]) refuse every request once it
+//!   begins and cancel the ones still running, so none reaches the store while
+//!   it flushes or after. ethrex's own servers keep dispatching.
+//! - [`start`] calls `start_network` itself rather than through
+//!   `init_network`, which panics when the devp2p socket cannot bind, and stops
+//!   `init_network`'s peer-count log with the node rather than never. A
+//!   failure once the node's tasks are running stops them and flushes the
+//!   store before [`start`] returns it.
 //!
-//! The block executor thread is left detached, as `bind_api` leaves it, and
-//! shutdown does not wait for it. A block it is still on when the store
-//! flushes is executed again on the next start, which is the fate of every
-//! recent block anyway: `Store::shutdown` drops the newest in-memory state
-//! layers by design. Waiting would not be bounded by anything here either,
-//! since the thread exits only once every clone of the RPC context is gone,
-//! and a Beacon API connection still stalled past that server's drain keeps
-//! one.
+//! Shutdown waits for none of ethrex's tasks, as `server_shutdown` does not:
+//! several never watch the cancel token (that peer-count log, the fork-id
+//! publisher, the metrics server), so a wait on the tracker would always run
+//! out its bound. Nor for the block executor thread, which `bind_api` leaves
+//! detached too. A block it is still on when the store flushes is executed
+//! again on the next start, which is the fate of every recent block anyway:
+//! `Store::shutdown` drops the newest in-memory state layers by design.
 
 mod config;
 mod http;
@@ -38,12 +43,11 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
 
 use ethrex::cli::compute_effective_datadir;
 use ethrex::initializers::{
-    get_local_node_record, get_local_p2p_node, get_log_query_limits, get_signer, init_blockchain,
-    init_metrics, init_network, init_store_skip_validation_with_config, init_store_with_config,
+    get_bootnodes, get_local_node_record, get_local_p2p_node, get_log_query_limits, get_signer,
+    init_blockchain, init_metrics, init_store_skip_validation_with_config, init_store_with_config,
     migrate_datadir_if_needed, regenerate_head_state,
 };
 use ethrex::utils::{
@@ -52,6 +56,7 @@ use ethrex::utils::{
 };
 use ethrex_blockchain::{BlockchainOptions, BlockchainType};
 use ethrex_config::networks::Network;
+use ethrex_p2p::DiscoveryConfig;
 use ethrex_p2p::network::P2PContext;
 use ethrex_p2p::peer_handler::PeerHandler;
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
@@ -63,17 +68,13 @@ use ethrex_rpc::rpc::FILTER_DURATION;
 use ethrex_rpc::{
     GasTipEstimator, NodeData, RpcApiContext, clean_outdated_filters, start_block_executor,
 };
+use ethrex_storage::error::StoreError;
 use ethrex_storage::{Store, StoreConfig};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub use config::{ConfigError, EthrexArgs, EthrexConfig, Listener};
-
-/// How long shutdown waits for ethrex's tasks to wind down before flushing the
-/// store regardless. The flush is what must not be skipped; a task still
-/// running past this only loses work the next start redoes.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Why the embedded node could not start.
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +84,7 @@ pub enum StartError {
     #[error("opening the execution database at {datadir}: {source}")]
     Store {
         datadir: PathBuf,
-        source: ethrex_storage::error::StoreError,
+        source: StoreError,
     },
     #[error("restoring the execution head state: {0}")]
     HeadState(String),
@@ -100,7 +101,6 @@ pub enum StartError {
 pub struct EmbeddedEthrex {
     context: RpcApiContext,
     cancel_token: CancellationToken,
-    tracker: TaskTracker,
     store: Store,
     peer_table: PeerTable,
     shared_local_node: SharedLocalNode,
@@ -268,36 +268,60 @@ pub async fn start(config: EthrexConfig) -> Result<EmbeddedEthrex, StartError> {
         init_metrics(&opts, &network, tracker.clone());
     }
 
+    // Tasks run against the store from here on, so a failure stops them and
+    // flushes it before returning, as shutdown would.
+    let abandon = async |err: StartError| {
+        cancel_token.cancel();
+        let _ = store
+            .shutdown()
+            .await
+            .inspect_err(|err| error!(%err, "Failed to flush the embedded ethrex database"));
+        err
+    };
+
+    // Before devp2p, as `init_l1` binds its RPC listener before `init_network`
+    // runs: a taken port then fails startup before the network is up.
+    let http_addr = match http {
+        Some(addr) => {
+            match http::spawn(addr, context.clone(), &tracker, cancel_token.clone()).await {
+                Ok(bound) => Some(bound),
+                Err(source) => return Err(abandon(StartError::Http { addr, source }).await),
+            }
+        }
+        None => None,
+    };
+
     if opts.p2p_disabled {
         info!("Embedded ethrex: devp2p is disabled");
     } else {
-        init_network(
-            &opts,
-            &network,
-            &datadir,
-            peer_handler,
-            tracker.clone(),
-            blockchain,
+        // `init_network`, minus its `--dev` check (no such mode here), with a
+        // failure to start returned rather than `expect`ed.
+        let bootnodes = get_bootnodes(&opts, &network, &datadir);
+        let discovery_config = DiscoveryConfig {
+            discv4_enabled: opts.discv4_enabled,
+            discv5_enabled: opts.discv5_enabled,
+            nat_extip_set: opts.nat_extip.is_some(),
+        };
+        let started = ethrex_p2p::start_network(
             p2p_context,
+            bootnodes,
+            discovery_config,
             shared_local_node.clone(),
         )
         .await;
+        if let Err(err) = started {
+            return Err(abandon(StartError::P2p(err.to_string())).await);
+        }
+        let peer_stats =
+            ethrex_p2p::periodically_show_peer_stats(blockchain, peer_handler.peer_table);
+        let cancel = cancel_token.clone();
+        tracker.spawn(async move { cancel.run_until_cancelled(peer_stats).await });
     }
-
-    let http_addr = match http {
-        Some(addr) => Some(
-            http::spawn(addr, context.clone(), &tracker, cancel_token.clone())
-                .await
-                .map_err(|source| StartError::Http { addr, source })?,
-        ),
-        None => None,
-    };
 
     info!(%network, datadir = %datadir.display(), "Embedded ethrex started");
     Ok(EmbeddedEthrex {
         context,
         cancel_token,
-        tracker,
         store,
         peer_table,
         shared_local_node,
@@ -343,37 +367,23 @@ impl EmbeddedEthrex {
         self.http_addr
     }
 
-    /// Resolves once something cancels the node, which an ethrex subsystem
-    /// does when it fails in a way the node cannot run past. The beacon node
-    /// shuts down too: without its execution client it cannot validate a
-    /// payload.
+    /// Resolves once something cancels the node, which the execution JSON-RPC
+    /// server does when it fails, as ethrex's own does. The beacon node shuts
+    /// down too, as it would with a standalone ethrex gone.
     pub fn cancelled(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
         self.cancel_token.clone().cancelled_owned()
     }
 
-    /// Stops the node and flushes its database.
+    /// Stops the node and flushes its database, returning the flush's error.
     ///
-    /// Call it only once nothing else drives the node, so no Engine API call
-    /// is in flight while the store flushes. The order is the `ethrex`
-    /// binary's: stop the tasks that feed the store, flush it, then record the
-    /// node's identity and known peers for the next start.
-    pub async fn shutdown(self) {
+    /// The order is the `ethrex` binary's: cancel the node, which also stops
+    /// both request paths into it (see the crate docs), flush the store, then
+    /// record the node's identity and known peers for the next start, which
+    /// happens whether or not the flush worked.
+    pub async fn shutdown(self) -> Result<(), StoreError> {
         info!("Stopping the embedded ethrex...");
         self.cancel_token.cancel();
-        self.tracker.close();
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!(
-                grace = ?SHUTDOWN_GRACE,
-                "Embedded ethrex tasks still running; flushing the database anyway"
-            );
-        }
-
-        if let Err(err) = self.store.shutdown().await {
-            error!(%err, "Failed to flush the embedded ethrex database");
-        }
+        let flushed = self.store.shutdown().await;
 
         if !is_memory_datadir(&self.datadir) {
             let path = self.datadir.join("node_config.json");
@@ -388,5 +398,6 @@ impl EmbeddedEthrex {
             store_node_config_file(node_config, path);
         }
         info!("Embedded ethrex stopped");
+        flushed
     }
 }

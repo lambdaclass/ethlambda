@@ -115,9 +115,10 @@ secp256k1 = { version = "0.30.0", default-features = false, features = ["global-
 # `main` that moves under us would change what we build against with nothing in
 # the manifest saying so.
 #
-# Moving the tag means re-diffing ethrex's `init_l1`, `init_rpc_api` and the
-# binary's `server_shutdown` against `crates/execution/ethrex/src/lib.rs`, which
-# repeats them, then running `make test-ethrex`.
+# Moving the tag means re-diffing ethrex's `init_l1`, `init_rpc_api`,
+# `init_network` and the binary's `server_shutdown` against
+# `crates/execution/ethrex/src/lib.rs`, which repeats them, then running
+# `make test-ethrex`.
 ethrex = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0", default-features = false }
 ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }

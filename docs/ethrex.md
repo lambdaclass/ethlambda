@@ -99,20 +99,27 @@ EngineClient::new_payload(&deneb::ExecutionPayload, ..)
 Startup (`ethlambda_ethrex::start`) is ethrex's `init_l1` with its RPC servers
 left out: `init_l1` builds the RPC context inside `bind_api` and never returns
 it, so the steps are repeated and the context is assembled from the same parts.
-**When the ethrex pin moves, diff `init_l1`, `init_rpc_api` and the binary's
-`server_shutdown` against `crates/execution/ethrex/src/lib.rs`.**
+**When the ethrex pin moves, diff `init_l1`, `init_rpc_api`, `init_network`
+and the binary's `server_shutdown` against `crates/execution/ethrex/src/lib.rs`.**
+`init_network` is inlined so that a devp2p socket that cannot bind is a startup
+error rather than its `expect` panic. A startup step that fails once ethrex is
+running, in `start` or later in `run_node`, still stops it and flushes its
+store.
 
-Shutdown runs after the chain actor has joined, so no Engine API call is in
-flight: cancel ethrex's tasks, wait up to 5 s for them, flush the store, then
-write `node_config.json` (identity and known peers). Once shutdown begins, the
-execution JSON-RPC server refuses every request it has not dispatched and drops
-any still running, so none reaches the store while it flushes. The wait and the
-refusal are additions to ethrex's own `server_shutdown`. ethrex's block
-executor thread is not waited for: a block it is still on is executed again on
-the next start, as every recent block is, since ethrex's flush keeps only the
-state it has committed to disk and a restart re-executes the newest blocks. If an ethrex subsystem
-cancels the node on its own, the beacon node shuts down the same way and exits
-with an error.
+Shutdown begins once the chain actor has joined and the Beacon API server has
+drained: cancel ethrex, flush the store, then write `node_config.json` (identity
+and known peers), as ethrex's own `server_shutdown` does, alongside the final
+telemetry flush rather than after it. Once it begins, the in-process Engine API
+and the execution JSON-RPC server refuse every request and cancel any still
+running, so none reaches the store while it flushes; that refusal is the one
+addition to `server_shutdown`. Like it, shutdown waits for none of ethrex's
+tasks: several never watch the cancel token, so a wait would always run out.
+ethrex's block executor thread is not waited for either: a block it is still on
+is executed again on the next start, as every recent block is, since ethrex's
+flush keeps only the state it has committed to disk and a restart re-executes
+the newest blocks. A flush that fails makes the node exit with an error. If the
+execution JSON-RPC server fails, it stops ethrex, as ethrex's own does, and the
+beacon node shuts down the same way and exits with an error.
 
 ## Not included
 
