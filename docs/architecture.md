@@ -101,17 +101,21 @@ recomputes the head with [LMD GHOST](./lmd_ghost.md) (`crates/blockchain/fork_ch
 
 XMSS proving costs hundreds of milliseconds, so it cannot run on the actor loop: a blocked
 actor stops importing blocks. The actor instead snapshots aggregation inputs from the store,
-ranks candidates by consensus value, and hands a job list to a `spawn_blocking` worker
-(`crates/blockchain/src/aggregation.rs`). The worker holds no store access, streams one
-`AggregateProduced` message back per finished job, and ends with `AggregationDone`. The actor
-publishes each result on gossip when it arrives.
+ranks candidates by consensus value, and hands a job list to a worker that runs as a blocking
+job owned by the actor (`pipe_blocking`, `crates/blockchain/src/aggregation.rs`). The worker
+holds no store access, emits one `AggregateProduced` message back per finished job, and ends
+with `AggregationDone`, the job's terminal message. The actor publishes each result on gossip
+when it arrives.
 
-A soft deadline cancels the worker through a `CancellationToken`, so an overrunning slot
-cannot eat the next one. The session can also start up to `EARLY_AGGREGATION_WINDOW` before
-interval 2, once two thirds of the expected signatures are in. Either entry point counts as
-the slot's one session, so a slot aggregates once. Starting early buys proving time, not an
-earlier publication: the worker holds each finished aggregate until the interval-2 boundary
-before delivering it to the actor.
+Past a soft deadline (`aggregation_deadline`, one interval) the worker starts no new proof, so
+an overrunning slot cannot eat the next one; the proof in hand still finishes, since a proof
+cannot be interrupted. The job is keyed, so the next session's start cancels a session still
+running and fences its queued results, and a shutdown cancels it the same way. The session can
+also start up to `EARLY_AGGREGATION_WINDOW` before interval 2, once two thirds of the expected
+signatures are in. Either entry point counts as the slot's one session, so a slot aggregates
+once. Starting early buys proving time, not an earlier publication: an aggregate finished
+before the interval-2 boundary is emitted at the boundary (`emit_at_blocking`), fenced with
+the job, so a cancelled session's held aggregate is never delivered.
 
 Block import runs a second, smaller aggregation path. `reaggregate.rs` splits an imported
 block's merged proof back into per-attestation aggregates and folds them into the local pool,
@@ -278,8 +282,13 @@ spawn is fail-fast, so a misconfigured node stops at boot instead of hours later
    swarm, spawn `P2PServer`, and wire the two together with `InitP2P` and `InitBlockChain`.
 6. Spawn the API and metrics servers.
 
-Shutdown runs in reverse: the first ctrl+c or SIGTERM stops both actors and cancels the servers'
-shutdown token, and three more, of either kind, force the process to exit if a graceful stop hangs.
+Shutdown runs in reverse: one `ActorSystem` owns the chain actor, the P2P actor and the HTTP
+server, and the first ctrl+c or SIGTERM has it stop them in reverse admission order (the HTTP
+server, given `HTTP_SHUTDOWN_TIMEOUT` of it, then P2P, then the chain actor), cancelling each
+actor's jobs with it, all within `SHUTDOWN_DEADLINE` (8 s, under Docker's 10 s stop grace). A
+shutdown that misses the deadline logs which actors are still running (`log_incomplete_shutdown`)
+and exits non-zero. Three more signals, of either kind, force the process to exit if a graceful
+stop hangs.
 
 > Note: booting with `HIVE_LEAN_TEST_DRIVER=1` short-circuits everything from step 2 on and
 > exposes only the Hive test-driver endpoints, so a driver run never touches the node key,

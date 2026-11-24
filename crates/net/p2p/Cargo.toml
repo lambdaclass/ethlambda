@@ -77,6 +77,11 @@ rand = "0.8"
 # discovery server and peer table this crate starts are Spawned actors, so a tag
 # would run a second, older actor runtime beside ours. Move back to a tag once
 # ethrex releases on Spawned 0.8.
+#
+# Until then the commit is reachable only from that PR's branch. A squash merge
+# and branch deletion there would leave it unreachable, and a build without a
+# cached copy could no longer fetch it: re-pin to the merge commit on ethrex
+# `main` (or a tag) as soon as that PR merges.
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "bc13c9d28e3904fd7186fa91650f81be270373b5" }

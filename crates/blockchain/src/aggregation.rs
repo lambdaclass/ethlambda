@@ -795,8 +795,9 @@ fn resolve_child_pubkeys(
 
 /// Run the expensive `aggregate_mixed` call for a single prepared job.
 ///
-/// Pure function — no store access, safe to call from a `tokio::task::spawn_blocking`
-/// worker. Returns `None` on cryptographic failure.
+/// Pure function — no store access, safe to call from the aggregation worker,
+/// which runs as a blocking job owned by the actor (`pipe_blocking`). Returns
+/// `None` on cryptographic failure.
 pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     if job.raw_ids.is_empty() && job.children.len() < 2 {
         return None;

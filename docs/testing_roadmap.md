@@ -224,7 +224,7 @@ acceptance criterion.
 
 ### spawned-test fault injection and lifecycle monitors
 
-- **What:** after the spawned v0.7 upgrade (branch `spawned-v0.7`), use
+- **What:** after the Spawned 0.8.0 upgrade (branch `spawned-v0.7`), use
   `spawned-test` mocks (already replacing hand-written protocol stubs there),
   supervision fault injection, and lifecycle monitors that assert every actor
   stops within the shutdown deadline.
@@ -251,7 +251,7 @@ acceptance criterion.
 | Single-CPU | Nightly 1-CPU devnet finalizes |
 | Soak | Nightly run with RSS/FD/DB budgets |
 
-**Phase 2: with spawned v0.7** (`spawned-v0.7` branch, canary on fede256).
+**Phase 2: with Spawned 0.8.0** (the `spawned-v0.7` branch, PR #783; canary results are on the PR).
 
 | Item | Acceptance |
 |---|---|

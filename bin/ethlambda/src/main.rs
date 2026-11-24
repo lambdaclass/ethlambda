@@ -1253,6 +1253,12 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
+/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
+/// one request's timeout plus a margin, so a reachable server gets them and an
+/// unreachable one does not hold the exit up for long. Capped by what is left
+/// of [`SHUTDOWN_DEADLINE`].
+const TELEMETRY_FLUSH_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// Wait for ctrl-c or SIGTERM, then stop everything within
 /// [`SHUTDOWN_DEADLINE`].
 ///
@@ -1274,12 +1280,6 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
-/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
-/// one request's timeout plus a margin, so a reachable server gets them and an
-/// unreachable one does not hold the exit up for long. Capped by what is left
-/// of [`SHUTDOWN_DEADLINE`].
-const TELEMETRY_FLUSH_TIMEOUT: Duration = Duration::from_secs(12);
-
 async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     let mut signals = ShutdownSignals::listen();
     info!("Node initialized");

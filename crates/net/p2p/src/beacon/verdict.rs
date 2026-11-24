@@ -178,6 +178,28 @@ impl Validated {
         }
     }
 
+    /// A copy of this object to send on if its stateful checks overrun
+    /// [`STATEFUL_CHECK_DEADLINE`], when the object itself is still inside the
+    /// running check. Only a block or a column gets one: [`Self::forward`]
+    /// sends those on without a verdict (a block to the chain actor, whose
+    /// import judges it again; a column through [`column_checks`]), exactly as
+    /// it does on `Ignore(Overloaded)`. Every other kind is dropped on an
+    /// `Ignore`, so a copy would be dropped unused.
+    ///
+    /// Taken for every block and column, since a deadline cannot be known in
+    /// advance. A column is a few tens of kilobytes and a block one per slot,
+    /// which is small next to the KZG or signature checks the copy waits on.
+    fn unjudged_copy(&self) -> Option<Self> {
+        match self {
+            Self::Block { block, block_root } => Some(Self::Block {
+                block: block.clone(),
+                block_root: *block_root,
+            }),
+            Self::Column(sidecar) => Some(Self::Column(sidecar.clone())),
+            _ => None,
+        }
+    }
+
     /// Record this object as the first valid one for its key. `false` when
     /// another verdict recorded one first.
     fn record_seen(&self, server: &mut P2PServer) -> bool {
@@ -601,6 +623,9 @@ pub(crate) enum Dispatch {
 pub(crate) struct GossipVerdict {
     id: GossipId,
     checked: JobOutcome<(Outcome, Validated)>,
+    /// What goes on when the check overran its deadline, the object itself
+    /// being still inside it: [`Validated::unjudged_copy`].
+    unjudged: Option<Validated>,
 }
 
 impl Message for GossipVerdict {
@@ -644,30 +669,49 @@ pub(crate) fn settle_message(
 #[send_handler]
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
-        let GossipVerdict { id, checked } = msg;
-        let (outcome, object) = match checked {
-            Ok((outcome, object)) => (
-                settle_message(self, &id.message_id, outcome, &object),
-                Some(object),
-            ),
+        let GossipVerdict {
+            id,
+            checked,
+            unjudged,
+        } = msg;
+        let received_at = id.received_at;
+        match checked {
+            Ok((outcome, object)) => {
+                let outcome = settle_message(self, &id.message_id, outcome, &object);
+                // Only an Accept or a Queue forwards from here.
+                if report(self, id, outcome) {
+                    object.forward(self, received_at, outcome);
+                }
+            }
+            // The check still runs, holding its permit; its result will be
+            // dropped. Its object goes on as it would on `Overloaded` (see
+            // `report_overloaded`): a block or a column through the copy
+            // taken for this, which `forward` sends on whatever the outcome,
+            // so a slow check of a valid block does not leave the chain actor
+            // to learn of it through a by-root fetch or range sync.
+            Err(JobError::DeadlineExceeded) => {
+                warn!(
+                    kind = id.kind,
+                    deadline_secs = STATEFUL_CHECK_DEADLINE.as_secs(),
+                    forwarded = unjudged.is_some(),
+                    "Beacon gossip validation overran its deadline; reporting Ignore"
+                );
+                let outcome = Outcome::Ignore(IgnoreReason::ValidationTimeout);
+                report(self, id, outcome);
+                if let Some(object) = unjudged {
+                    object.forward(self, received_at, outcome);
+                }
+            }
             // A panic inside validation (a `Store` read's `.expect()` on a DB
             // error, say) must still produce a verdict, or gossipsub would hold
-            // the message until its cache evicts it.
+            // the message until its cache evicts it. Nothing goes on: the
+            // check failed rather than ran out of time.
             Err(JobError::Panicked(panic_message)) => {
                 error!(
                     panic_message,
                     "Beacon gossip validation panicked; reporting Ignore(Internal)"
                 );
-                (Outcome::Ignore(IgnoreReason::Internal), None)
-            }
-            // The check still runs, holding its permit; its result is dropped.
-            Err(JobError::DeadlineExceeded) => {
-                warn!(
-                    kind = id.kind,
-                    deadline_secs = STATEFUL_CHECK_DEADLINE.as_secs(),
-                    "Beacon gossip validation overran its deadline; reporting Ignore"
-                );
-                (Outcome::Ignore(IgnoreReason::ValidationTimeout), None)
+                report(self, id, Outcome::Ignore(IgnoreReason::Internal));
             }
             // `JobError` is `#[non_exhaustive]`: a way of
             // ending spawned adds later still yields the one verdict.
@@ -676,15 +720,8 @@ impl Handler<GossipVerdict> for P2PServer {
                     kind = id.kind,
                     "Beacon gossip validation ended without a result; reporting Ignore(Internal)"
                 );
-                (Outcome::Ignore(IgnoreReason::Internal), None)
+                report(self, id, Outcome::Ignore(IgnoreReason::Internal));
             }
-        };
-        let received_at = id.received_at;
-        // Only an Accept or a Queue forwards, and both come with the object.
-        if report(self, id, outcome)
-            && let Some(object) = object
-        {
-            object.forward(self, received_at, outcome);
         }
     }
 }
@@ -755,7 +792,9 @@ fn pool_of(object: &Validated) -> &'static str {
 /// How long an object's stateful checks may run before it is reported
 /// `Ignore(ValidationTimeout)` anyway. One mainnet slot: a check that has not
 /// finished by then is hung, and gossipsub would otherwise hold its message
-/// until the cache evicts it.
+/// until the cache evicts it. Past it the check's own result is dropped, but
+/// a block or a column still goes on, as on `Ignore(Overloaded)` (see
+/// [`Validated::unjudged_copy`]).
 pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 
 /// Run `object`'s stateful checks off the actor, as a job owned by the p2p
@@ -778,7 +817,9 @@ pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 /// here would leave the actor to learn of it only through a child's by-root
 /// fetch or range sync, both far slower than gossip. An aggregate or a subnet
 /// attestation is not forwarded on this outcome at all: see
-/// [`Validated::forward`]'s own documentation for why.
+/// [`Validated::forward`]'s own documentation for why. A check that overruns
+/// [`STATEFUL_CHECK_DEADLINE`] is treated the same way, with
+/// `Ignore(ValidationTimeout)`.
 ///
 /// The check runs as a blocking job (`pipe_blocking`, on Tokio's blocking
 /// pool). The p2p actor's native-job budget is
@@ -811,7 +852,8 @@ pub(crate) fn spawn_stateful_checks(
     let store = server.store.clone();
     let in_use = metrics::PoolInUse::new(pool);
     let task = metrics::BlockingTask::new(id.kind);
-    pipe_checks(job, id, move || {
+    let unjudged = object.unjudged_copy();
+    pipe_checks(job, id, unjudged, move || {
         let _permit = permit;
         let _in_use = in_use;
         let _run = task.start();
@@ -838,15 +880,27 @@ fn checks_options(deadline: Duration) -> JobOptions {
 
 /// Run `checks` as the reserved blocking `job` (reserved with
 /// [`checks_options`]) and deliver its one [`GossipVerdict`] (also on a
-/// panic, as `JobError::Panicked`).
+/// panic, as `JobError::Panicked`). `unjudged` is what goes on if the job
+/// overruns its deadline ([`Validated::unjudged_copy`]); it is dropped
+/// otherwise.
 fn pipe_checks(
     job: BlockingJobPermit<P2PServer>,
     id: GossipId,
+    unjudged: Option<Validated>,
     checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
 ) {
     job.pipe_blocking(
         move |_job| checks(),
-        move |checked| GossipVerdict { id, checked },
+        move |checked| {
+            // Only a missed deadline leaves no object to send on: drop the
+            // copy here otherwise, rather than carry it through the mailbox.
+            let unjudged = unjudged.filter(|_| matches!(checked, Err(JobError::DeadlineExceeded)));
+            GossipVerdict {
+                id,
+                checked,
+                unjudged,
+            }
+        },
     );
 }
 
@@ -2001,24 +2055,27 @@ mod tests {
         }
     }
 
-    /// Start `checks` on a running p2p actor under `kind`, with `deadline`.
+    /// Start `checks` on a running p2p actor under `kind`, with `deadline`
+    /// and `unjudged` as what goes on if it is missed. The actor's chain
+    /// actor is a recording mock, returned with it.
     async fn run_checks(
         kind: &'static str,
         deadline: Duration,
+        unjudged: Option<Validated>,
         checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
-    ) -> spawned_concurrency::tasks::ActorRef<P2PServer> {
+    ) -> (spawned_concurrency::tasks::ActorRef<P2PServer>, MockRef) {
         use spawned_concurrency::tasks::ActorStart as _;
-        let server = unconnected_beacon_server(Config::mainnet(), 0)
-            .await
-            .start();
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = recording_chain(&mut server);
+        let server = server.start();
         in_actor(&server, move |_, ctx| {
             let job = ctx
                 .reserve_blocking_job(checks_options(deadline))
                 .expect("the p2p actor runs");
-            pipe_checks(job, test_id(kind), checks)
+            pipe_checks(job, test_id(kind), unjudged, checks)
         })
         .await;
-        server
+        (server, chain)
     }
 
     /// Wait (up to 5 s) until `kind` has at least `n` verdicts.
@@ -2033,7 +2090,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_check_still_yields_exactly_one_verdict() {
         const KIND: &str = "test_panicking_check";
-        let server = run_checks(KIND, Duration::from_secs(5), || panic!("a DB read failed")).await;
+        let (server, _chain) = run_checks(KIND, Duration::from_secs(5), None, || {
+            panic!("a DB read failed")
+        })
+        .await;
         verdicts_reach(KIND, 1).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -2046,7 +2106,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hung_check_is_reported_at_its_deadline_and_its_late_result_dropped() {
         const KIND: &str = "test_hung_check";
-        let server = run_checks(KIND, Duration::from_millis(50), || {
+        let (server, chain) = run_checks(KIND, Duration::from_millis(50), None, || {
             std::thread::sleep(Duration::from_millis(500));
             (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
         })
@@ -2059,13 +2119,63 @@ mod tests {
         // The check returns Accept long after: no second verdict.
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
+        assert_nothing_sent(&chain).await;
         server.child_handle().stop();
+    }
+
+    /// A block whose check overruns its deadline still reaches the chain
+    /// actor, unannounced, as an overloaded one does; the check's late
+    /// `Accept` sends nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_block_check_still_forwards_the_block_once() {
+        const KIND: &str = "test_hung_block_check";
+        let block = || Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(1),
+        };
+        let unjudged = block().unjudged_copy();
+        assert!(unjudged.is_some());
+        let (server, chain) = run_checks(KIND, Duration::from_millis(50), unjudged, move || {
+            std::thread::sleep(Duration::from_millis(500));
+            (Outcome::Accept, block())
+        })
+        .await;
+        verdicts_reach(KIND, 1).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "validation_timeout"),
+            (1, 1)
+        );
+        // Past the check's late return: still one verdict and one block.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        chain.settle().await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
+        let sent: Vec<NewBlock> = chain.take_all();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].announcement, BlockAnnouncement::Silent);
+        assert_eq!(chain.received().len(), 1);
+        server.child_handle().stop();
+    }
+
+    /// Only a block or a column has a copy to send on without a verdict.
+    #[test]
+    fn only_blocks_and_columns_have_an_unjudged_copy() {
+        let aggregate = Validated::Aggregate {
+            aggregate: Box::new(phase0_aggregate(5, 1)),
+            attesting_indices: Vec::new(),
+        };
+        assert!(aggregate.unjudged_copy().is_none());
+        let sync_message = sync_message_object(5, 11, 1, vec![(1, 0)]);
+        assert!(sync_message.unjudged_copy().is_none());
+        let column = Validated::Column(Box::new(DataColumnSidecar::Fulu(valid_shaped_sidecar(
+            5, 0,
+        ))));
+        assert!(matches!(column.unjudged_copy(), Some(Validated::Column(_))));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_verdict_reaches_an_actor_that_stopped_during_the_check() {
         const KIND: &str = "test_check_during_stop";
-        let server = run_checks(KIND, Duration::from_secs(5), || {
+        let (server, _chain) = run_checks(KIND, Duration::from_secs(5), None, || {
             std::thread::sleep(Duration::from_millis(300));
             (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
         })

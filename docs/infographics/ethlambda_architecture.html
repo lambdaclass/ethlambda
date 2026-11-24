@@ -285,12 +285,12 @@
 
         <!-- BlockChain Actor -->
         <div class="node consensus" id="an-blockchain" style="left:80px;top:130px;width:230px;height:56px" data-id="blockchain">
-          <div class="node-inner"><div class="node-title">BlockChain (Actor)</div><div class="node-sub">spawned-concurrency 0.5</div></div>
+          <div class="node-inner"><div class="node-title">BlockChain (Actor)</div><div class="node-sub">spawned-concurrency 0.8</div></div>
         </div>
 
         <!-- P2P Actor -->
         <div class="node net" id="an-p2p" style="left:485px;top:130px;width:200px;height:56px" data-id="p2p">
-          <div class="node-inner"><div class="node-title">P2P (Actor)</div><div class="node-sub">spawned-concurrency 0.5</div></div>
+          <div class="node-inner"><div class="node-title">P2P (Actor)</div><div class="node-sub">spawned-concurrency 0.8</div></div>
         </div>
 
         <!-- RPC -->
@@ -667,7 +667,7 @@ const COMPONENTS = {
     desc: 'The application entry point using #[tokio::main]. Spawns both actors independently, then wires them together by exchanging typed Recipient handles via InitP2P and InitBlockChain messages. Neither actor holds a direct reference to the other at construction time.',
     tags: ['tokio::main', 'clap', 'jemalloc', 'actor-wiring'],
     details: [
-      'BlockChain::spawn() - consensus actor via spawned-concurrency 0.5',
+      'BlockChain::spawn() - consensus actor via spawned-concurrency 0.8',
       'P2P::spawn(built, store) - networking actor with SwarmAdapter',
       'build_swarm(SwarmConfig) - create libp2p swarm before actor starts',
       'InitP2P message: gives BlockChain Recipient handles to P2P',
@@ -680,7 +680,7 @@ const COMPONENTS = {
     title: 'BlockChain (Actor)',
     subtitle: 'crates/blockchain/src/lib.rs',
     lang: 'consensus',
-    desc: 'The central consensus actor using spawned-concurrency 0.5 #[actor] macro. Sequences all state updates: block processing, attestation handling, fork choice, and validator duties. Communicates with P2P via typed Recipient handles received through InitP2P.',
+    desc: 'The central consensus actor using spawned-concurrency 0.8 #[actor] macro. Sequences all state updates: block processing, attestation handling, fork choice, and validator duties. Communicates with P2P via typed Recipient handles received through InitP2P.',
     tags: ['#[actor]', 'Handler<M>', 'Recipient', '#[protocol]'],
     details: [
       '#[protocol] BlockChainProtocol: Tick (via send_after)',
@@ -697,7 +697,7 @@ const COMPONENTS = {
     title: 'P2P (Actor)',
     subtitle: 'crates/net/p2p/src/lib.rs',
     lang: 'net',
-    desc: 'The networking actor, also using spawned-concurrency 0.5 #[actor] macro. Processes swarm events (forwarded from SwarmAdapter via spawn_listener), handles gossip/req-resp, and forwards validated messages to BlockChain via Recipient handles.',
+    desc: 'The networking actor, also using spawned-concurrency 0.8 #[actor] macro. Processes swarm events (forwarded from SwarmAdapter via spawn_listener), handles gossip/req-resp, and forwards validated messages to BlockChain via Recipient handles.',
     tags: ['#[actor]', 'Handler<M>', 'SwarmAdapter', 'spawn_listener'],
     details: [
       '#[protocol] P2PProtocol: RetryBlockFetch, RetryPeerRedial',
@@ -909,7 +909,7 @@ const COMPONENTS = {
     title: 'Blockchain (Consensus Layer)',
     subtitle: 'crates/blockchain/',
     lang: 'consensus',
-    desc: 'The consensus layer: BlockChain actor, fork choice, state transition, validator duty orchestration. Uses #[actor] macro from spawned-concurrency 0.5.',
+    desc: 'The consensus layer: BlockChain actor, fork choice, state transition, validator duty orchestration. Uses #[actor] macro from spawned-concurrency 0.8.',
     tags: ['blockchain', 'fork-choice', 'state-transition', 'actor'],
     details: ['BlockChainServer #[actor]: sequences all state updates', 'Handler<M> impls for network-api messages', 'Store + fork choice + state transition'],
   },
