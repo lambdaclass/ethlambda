@@ -48,4 +48,6 @@ tokio = { workspace = true, features = [
     "net",
     "rt-multi-thread",
     "sync",
+    # Paused time, for the in-process transport's timeout ladder.
+    "test-util",
 ] }

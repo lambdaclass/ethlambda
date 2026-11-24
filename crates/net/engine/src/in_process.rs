@@ -26,13 +26,27 @@
 //! malformed ones, and ethrex's verdict on a malformed payload (`INVALID`, or a
 //! `-32602`) is exactly the one it gives over the wire.
 //!
-//! # No retry ladder
+//! # Timeouts, and asking again
 //!
-//! The HTTP transport retries a call that got no answer. There is no transport
-//! to fail here: every `Err` a handler returns is ethrex's answer, which asking
-//! again would only repeat. The per-method timeouts stay, because the chain
-//! actor awaits `newPayload` inline during import, and an unbounded wait would
-//! stall it for as long as a pathological block takes to execute.
+//! Every `Err` a handler returns is ethrex's answer, as an RPC error is over
+//! HTTP, so it is never asked again: asking would only repeat it. A timeout is
+//! not an answer. It is asked again on the HTTP transport's ladder
+//! ([`ENGINE_MAX_ATTEMPTS`] attempts, backing off from
+//! [`ENGINE_INITIAL_BACKOFF`]), with the same exceptions: `getPayload` and
+//! `getBlobsV2` get one attempt. The per-method timeouts are the HTTP ones too.
+//! The chain actor awaits `newPayload` inline during import, so a payload that
+//! keeps timing out holds it for the whole ladder, about 25 s at
+//! [`ENGINE_TIMEOUT`], exactly as an external execution client can.
+//!
+//! Giving up on an attempt does not stop the work it started. `newPayload`
+//! hands its block to ethrex's block executor thread, and ethrex records the
+//! verdict on a task of its own whether or not anyone still waits for it.
+//! Asking again about the same block joins the execution already running
+//! instead of queueing a second one (ethrex's `InFlightPayloads`), or, once it
+//! has finished, is answered from what it left: the stored block, or the
+//! record of an invalid one. That is what an
+//! external client does with a request whose caller hung up, so both transports
+//! leave the same thing behind a timeout.
 
 use std::fmt;
 use std::time::Duration;
@@ -57,11 +71,13 @@ use ethrex_rpc::types::fork_choice::{ForkChoiceState, PayloadAttributesV3, Paylo
 use ethrex_rpc::types::payload::ExecutionPayload;
 use ethrex_rpc::{RpcApiContext, RpcErr, RpcErrorMetadata, RpcHandler};
 use serde::de::DeserializeOwned;
+use tracing::warn;
 
 use crate::building::{self, PayloadId};
 use crate::client::{
-    ENGINE_GET_BLOBS_TIMEOUT, ENGINE_GET_PAYLOAD_TIMEOUT, ENGINE_NEW_PAYLOAD_V5_TIMEOUT,
-    ENGINE_TIMEOUT, new_payload_v4_params, new_payload_v5_params,
+    BACKOFF_MULTIPLIER, ENGINE_GET_BLOBS_TIMEOUT, ENGINE_GET_PAYLOAD_TIMEOUT,
+    ENGINE_INITIAL_BACKOFF, ENGINE_MAX_ATTEMPTS, ENGINE_NEW_PAYLOAD_V5_TIMEOUT, ENGINE_TIMEOUT,
+    new_payload_v4_params, new_payload_v5_params,
 };
 use crate::error::EngineError;
 use crate::types::{
@@ -89,21 +105,21 @@ impl InProcessEngine {
         Self { context }
     }
 
-    /// Runs one handler under `timeout` and decodes its answer as `T`.
+    /// Runs one handler under `timeout`, at most `attempts` times (see
+    /// [`ask`]), and decodes its answer as `T`. `method` names the call in
+    /// the log line a timeout writes, as the HTTP transport's does.
     async fn run<H: RpcHandler, T: DeserializeOwned>(
         &self,
+        method: &str,
         request: H,
         timeout: Duration,
+        attempts: u32,
     ) -> Result<T, EngineError> {
-        let context = self.context.clone();
         // Boxed as ethrex boxes its own dispatch arms: a `newPayload` handler's
         // future carries a block execution, and inlining it would size every
         // caller's future to it.
-        let call = Box::pin(async move { request.handle(context).await });
-        let answer = tokio::time::timeout(timeout, call)
-            .await
-            .map_err(|_| EngineError::Timeout(timeout))?
-            .map_err(rpc_error)?;
+        let call = || Box::pin(request.handle(self.context.clone()));
+        let answer = ask(method, timeout, attempts, call).await?;
         serde_json::from_value(answer).map_err(|err| EngineError::Decode(err.to_string()))
     }
 
@@ -128,7 +144,13 @@ impl InProcessEngine {
                 execution_requests,
             ))?,
         };
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(
+            "engine_newPayloadV4",
+            request,
+            ENGINE_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
 
     pub(crate) async fn new_payload_v5(
@@ -163,7 +185,13 @@ impl InProcessEngine {
                 execution_requests,
             ))?,
         };
-        self.run(request, ENGINE_NEW_PAYLOAD_V5_TIMEOUT).await
+        self.run(
+            "engine_newPayloadV5",
+            request,
+            ENGINE_NEW_PAYLOAD_V5_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
 
     pub(crate) async fn forkchoice_updated(
@@ -175,7 +203,13 @@ impl InProcessEngine {
             fork_choice_state: forkchoice_state(state),
             payload_attributes: attributes.map(payload_attributes_v3),
         };
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(
+            "engine_forkchoiceUpdatedV3",
+            request,
+            ENGINE_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
 
     pub(crate) async fn forkchoice_updated_v4(
@@ -189,7 +223,13 @@ impl InProcessEngine {
             payload_attributes: attributes.map(payload_attributes_v4),
             custody_columns: custody_columns.map(CustodyColumns::to_u128),
         };
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(
+            "engine_forkchoiceUpdatedV4",
+            request,
+            ENGINE_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
 
     /// Under [`ENGINE_GET_PAYLOAD_TIMEOUT`], as over HTTP: the payload is due
@@ -203,7 +243,13 @@ impl InProcessEngine {
         let request = GetPayloadV5Request {
             payload_id: payload_id_u64(payload_id),
         };
-        self.run(request, ENGINE_GET_PAYLOAD_TIMEOUT).await
+        self.run(
+            "engine_getPayloadV5",
+            request,
+            ENGINE_GET_PAYLOAD_TIMEOUT,
+            1,
+        )
+        .await
     }
 
     /// Under [`ENGINE_GET_PAYLOAD_TIMEOUT`], like [`Self::get_payload`].
@@ -214,7 +260,13 @@ impl InProcessEngine {
         let request = GetPayloadV6Request {
             payload_id: payload_id_u64(payload_id),
         };
-        self.run(request, ENGINE_GET_PAYLOAD_TIMEOUT).await
+        self.run(
+            "engine_getPayloadV6",
+            request,
+            ENGINE_GET_PAYLOAD_TIMEOUT,
+            1,
+        )
+        .await
     }
 
     /// Under [`ENGINE_GET_BLOBS_TIMEOUT`], as over HTTP. The answer is the wire
@@ -228,7 +280,8 @@ impl InProcessEngine {
         let param = serde_json::value::to_raw_value(&hashes(versioned_hashes))
             .map_err(|err| EngineError::Decode(err.to_string()))?;
         let request = BlobsV2Request::parse(&Some(vec![param])).map_err(rpc_error)?;
-        self.run(request, ENGINE_GET_BLOBS_TIMEOUT).await
+        self.run("engine_getBlobsV2", request, ENGINE_GET_BLOBS_TIMEOUT, 1)
+            .await
     }
 
     pub(crate) async fn exchange_capabilities(
@@ -237,7 +290,13 @@ impl InProcessEngine {
     ) -> Result<Vec<String>, EngineError> {
         let request: ExchangeCapabilitiesRequest =
             ours.iter().map(|method| method.to_string()).collect();
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(
+            "engine_exchangeCapabilities",
+            request,
+            ENGINE_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
 
     pub(crate) async fn client_version(
@@ -249,8 +308,43 @@ impl InProcessEngine {
         let ours = serde_json::value::to_raw_value(ours)
             .map_err(|err| EngineError::Decode(err.to_string()))?;
         let request = GetClientVersionV1Request::parse(&Some(vec![ours])).map_err(rpc_error)?;
-        self.run(request, ENGINE_TIMEOUT).await
+        self.run(
+            "engine_getClientVersionV1",
+            request,
+            ENGINE_TIMEOUT,
+            ENGINE_MAX_ATTEMPTS,
+        )
+        .await
     }
+}
+
+/// Runs `call` under `timeout`, calling it again after a timeout until
+/// `attempts` calls have been made, with the HTTP transport's backoff between
+/// them. A handler's answer, `Err` included, is returned as it comes: only a
+/// timeout is asked again (see the module docs).
+async fn ask<F, Fut>(
+    method: &str,
+    timeout: Duration,
+    attempts: u32,
+    mut call: F,
+) -> Result<serde_json::Value, EngineError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, RpcErr>>,
+{
+    let mut backoff = ENGINE_INITIAL_BACKOFF;
+    for attempt in 1..=attempts {
+        if let Ok(answer) = tokio::time::timeout(timeout, call()).await {
+            return answer.map_err(rpc_error);
+        }
+        let err = EngineError::Timeout(timeout);
+        warn!(method, attempt, %err, "Engine call failed");
+        if attempt < attempts {
+            tokio::time::sleep(backoff).await;
+            backoff *= BACKOFF_MULTIPLIER;
+        }
+    }
+    Err(EngineError::Timeout(timeout))
 }
 
 /// An ethrex handler error as the wire would carry it: the same code and
@@ -674,6 +768,80 @@ mod tests {
             matches!(too_deep, EngineError::Rpc { code: -38006, .. }),
             "{too_deep:?}"
         );
+    }
+
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_call_is_asked_again() {
+        let calls = std::cell::Cell::new(0);
+        let answer = ask("engine_test", ATTEMPT_TIMEOUT, 3, || {
+            calls.set(calls.get() + 1);
+            let answers_now = calls.get() == 3;
+            async move {
+                if !answers_now {
+                    tokio::time::sleep(2 * ATTEMPT_TIMEOUT).await;
+                }
+                Ok(serde_json::json!("VALID"))
+            }
+        })
+        .await;
+
+        assert_eq!(answer.expect("the third attempt answers"), "VALID");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_keeps_timing_out_spends_the_whole_ladder() {
+        let calls = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let answer = ask("engine_test", ATTEMPT_TIMEOUT, 3, || {
+            calls.set(calls.get() + 1);
+            std::future::pending::<Result<serde_json::Value, RpcErr>>()
+        })
+        .await;
+
+        assert!(
+            matches!(answer, Err(EngineError::Timeout(timeout)) if timeout == ATTEMPT_TIMEOUT),
+            "{answer:?}"
+        );
+        assert_eq!(calls.get(), 3);
+        // Three timeouts and the two backoffs between them, as over HTTP.
+        let ladder = 3 * ATTEMPT_TIMEOUT + ENGINE_INITIAL_BACKOFF * (1 + BACKOFF_MULTIPLIER);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= ladder && elapsed < ladder + Duration::from_millis(10),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_error_is_not_asked_again() {
+        let calls = std::cell::Cell::new(0);
+        let answer = ask("engine_test", ATTEMPT_TIMEOUT, 3, || {
+            calls.set(calls.get() + 1);
+            async { Err(RpcErr::UnsupportedFork("Amsterdam".into())) }
+        })
+        .await;
+
+        assert!(
+            matches!(answer, Err(EngineError::Rpc { code: -38005, .. })),
+            "{answer:?}"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_one_attempt_method_is_not_asked_again() {
+        let calls = std::cell::Cell::new(0);
+        let answer = ask("engine_test", ATTEMPT_TIMEOUT, 1, || {
+            calls.set(calls.get() + 1);
+            std::future::pending::<Result<serde_json::Value, RpcErr>>()
+        })
+        .await;
+
+        assert!(matches!(answer, Err(EngineError::Timeout(_))), "{answer:?}");
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

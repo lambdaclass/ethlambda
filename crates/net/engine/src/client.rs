@@ -77,7 +77,7 @@ pub const ENGINE_MAX_ATTEMPTS: u32 = 3;
 /// and asking again a few milliseconds later only makes it busier.
 pub const ENGINE_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
-const BACKOFF_MULTIPLIER: u32 = 2;
+pub(crate) const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// A connection to one execution client's Engine API.
 #[derive(Debug, Clone)]
