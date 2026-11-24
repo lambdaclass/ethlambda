@@ -71,7 +71,9 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
-and moves its discv5 admission filter. While the window is open a gossip
+and moves its discv5 admission filter, then publishes again the proposer
+preferences whose earlier publish reached no peer (see the builder market
+under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
@@ -111,6 +113,31 @@ block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
+
+Peers join that digest when their own client decides to, Lighthouse only two
+slots before the boundary, so a preference published in the epoch before it
+can reach no peer at all. The market therefore remembers, for each preference
+this node published, whether gossipsub handed it to any peer
+(`BuilderMarket::record_preferences_publish`), and one that reached none is
+published again while its slot is still ahead: when the validator client sends
+it again (once an epoch, at the epoch's second-to-last slot, see
+`docs/cli.md`), and at every fork-digest switch, when every peer following the
+fork has joined (`republish_failed_proposer_preferences`). The new digest's
+first slot has started by then, so its preference is past helping and is left
+out. Only a preference that reached no peer can be retried. A message's
+gossipsub id is its topic and payload alone, and gossipsub keeps the id of
+every message it handed to a peer, or received from one, for `seen_ttl` (two
+epochs) and refuses to publish it again until then (`Duplicate`). So a
+preference that reached even one peer that joined early (another ethlambda
+node, which joins a full epoch ahead) cannot be sent to those that join later.
+One that reached nobody left no such trace and goes out.
+
+A publish of a bid, a preference, an envelope or a payload attestation that no
+peer was handed is logged at `warn` with gossipsub's reason
+(`NoPeersSubscribedToTopic`, say), one gossipsub refuses as a duplicate at
+`debug`, and `Published ... to gossipsub` at `info` only once a peer has it.
+Every other topic's publish failures are logged by the swarm adapter, at
+`debug`.
 
 | Topic | Decoded as |
 | --- | --- |

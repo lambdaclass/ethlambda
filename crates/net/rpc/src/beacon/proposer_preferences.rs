@@ -1,6 +1,7 @@
 //! `POST /eth/v1/validator/proposer_preferences`: signed proposer preferences
 //! from a validator client, validated with the gossip rules, cached in the
-//! shared `BuilderMarket` and gossiped on `proposer_preferences`.
+//! shared `BuilderMarket` and gossiped on `proposer_preferences`. A re-send of
+//! cached preferences whose publish reached no peer is gossiped again.
 //!
 //! Not gated on the sync status: the specification lists no 503, and a node
 //! that lacks the dependent block simply answers `ignore: unknown_block` per
@@ -60,7 +61,8 @@ struct Failure {
 /// relaying. Valid ones are cached for block production and for the bids judged
 /// against them, then gossiped; the others are reported by position and the
 /// rest still go out. An entry already cached, identical, is a success that is
-/// not republished.
+/// not republished, unless this node's own publish of it reached no peer and
+/// its slot is still ahead: then the re-send is published again.
 async fn post_proposer_preferences(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
@@ -135,7 +137,25 @@ fn submit(
         // same message (relayed by another node this client posted it to)
         // while this copy is being validated.
         if holds(market, &signed) {
-            debug!(%slot, validator, "Proposer preferences already cached; not republishing");
+            // This node's own publish of it reached no peer (none had joined
+            // the topic yet, say), and nothing else sends it again before the
+            // next digest switch: the re-send is the chance to. Not recorded
+            // again, and no second event.
+            if market.preferences_publish_failed(&signed) && slot > wall_slot {
+                match p2p.republish_proposer_preferences(signed) {
+                    Ok(()) => debug!(
+                        %slot,
+                        validator,
+                        "Proposer preferences cached but never published; publishing again"
+                    ),
+                    Err(_) => failures.push(Failure {
+                        index,
+                        message: "the network actor is not running".to_string(),
+                    }),
+                }
+            } else {
+                debug!(%slot, validator, "Proposer preferences already cached; not republishing");
+            }
             continue;
         }
         let verdict = validate(market, store, &signed, now_ms);

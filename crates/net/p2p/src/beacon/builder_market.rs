@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::beacon::verdict::{Dispatch, Validated};
 use crate::beacon::{decode as beacon_decode, topics as beacon_topics};
 use crate::gossipsub::compress_message;
+use crate::swarm_adapter::PublishOutcome;
 use crate::{P2PServer, metrics};
 
 /// Decode a gloas execution payload bid and run its cheap gossip checks.
@@ -131,15 +132,18 @@ fn publication(
     Some((topic, compress_message(ssz)))
 }
 
-/// Publish on `publish_digest(bid.slot)` / `execution_payload_bid`.
+/// Publish on `publish_digest(bid.slot)` / `execution_payload_bid`, and log
+/// how it went: `info` once a peer has it, `warn` when none was handed it.
 ///
 /// Precondition: the caller already recorded it in the market, since
 /// gossipsub never delivers a node its own messages.
-pub(crate) fn publish_execution_payload_bid(
+pub(crate) async fn publish_execution_payload_bid(
     server: &mut P2PServer,
     bid: SignedExecutionPayloadBid,
 ) {
     let slot = bid.message.slot;
+    let builder_index = bid.message.builder_index;
+    let value = bid.message.value;
     let Some((topic, data)) = publication(
         server,
         beacon_topics::EXECUTION_PAYLOAD_BID,
@@ -148,18 +152,35 @@ pub(crate) fn publish_execution_payload_bid(
     ) else {
         return;
     };
-    server.swarm_handle.publish(topic, data);
-    info!(
-        slot,
-        builder_index = bid.message.builder_index,
-        value = bid.message.value,
-        "Published execution payload bid to gossipsub"
-    );
+    match server
+        .swarm_handle
+        .publish_reporting(topic, data)
+        .outcome()
+        .await
+    {
+        PublishOutcome::Published => info!(
+            slot,
+            builder_index, value, "Published execution payload bid to gossipsub"
+        ),
+        PublishOutcome::Duplicate => debug!(
+            slot,
+            builder_index,
+            value,
+            "Gossipsub already holds this execution payload bid; not sent again"
+        ),
+        PublishOutcome::Failed(err) => warn!(
+            slot,
+            builder_index,
+            value,
+            %err,
+            "Failed to publish execution payload bid to gossipsub"
+        ),
+    }
 }
 
-/// Publish on `publish_digest(proposal_slot)`: during the epoch before gloas
-/// this is the gloas digest, which is held.
-pub(crate) fn publish_proposer_preferences(
+/// Tell the chain actor of preferences the Beacon API accepted, then gossip
+/// them (see [`gossip_proposer_preferences`]).
+pub(crate) async fn publish_proposer_preferences(
     server: &mut P2PServer,
     preferences: SignedProposerPreferences,
 ) {
@@ -172,20 +193,108 @@ pub(crate) fn publish_proposer_preferences(
             .new_proposer_preferences(proposal_slot)
             .inspect_err(|err| warn!(%err, "Failed to report proposer preferences"));
     }
+    gossip_proposer_preferences(server, preferences).await;
+}
+
+/// Gossip again preferences the market holds whose earlier publish by this
+/// node failed, handed back by the Beacon API when a validator client sends
+/// them again. The chain actor is not told a second time: it was when they
+/// were first published.
+pub(crate) async fn republish_proposer_preferences(
+    server: &mut P2PServer,
+    preferences: SignedProposerPreferences,
+) {
+    debug!(
+        proposal_slot = preferences.message.proposal_slot,
+        validator_index = preferences.message.validator_index,
+        "Republishing resubmitted proposer preferences whose earlier publish failed"
+    );
+    gossip_proposer_preferences(server, preferences).await;
+}
+
+/// Gossip again every preference the market still owes a publish whose slot
+/// has not started, at a fork-digest switch.
+///
+/// Preferences for the first slots past a boundary are published on the next
+/// digest, which this node joins an epoch ahead (`SUBSCRIBE_LEAD_EPOCHS`).
+/// Peers may join it far later (Lighthouse two slots ahead), so a publish in
+/// between can reach no peer at all, and nothing else sends it again: the
+/// validator client re-sends each one only once an epoch. At the switch every
+/// peer that follows the fork has joined. A publish that found no peer
+/// subscribed left no trace in gossipsub's duplicate cache, so this one goes
+/// out. One that did reach a peer is not owed anything and is left alone:
+/// gossipsub would refuse it as a duplicate until its `seen_ttl` (two epochs)
+/// runs out. (One refused because every peer's queue was full did leave its
+/// id there; its retry is answered as a duplicate, which ends the retries.)
+///
+/// The first slot of the new digest has started by the time this runs, so its
+/// preferences are past helping and are not sent.
+pub(crate) async fn republish_failed_proposer_preferences(server: &mut P2PServer) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let wall_slot = wire.wall_slot();
+    let owed = server.builder_market.preferences_to_republish(wall_slot);
+    if owed.is_empty() {
+        return;
+    }
+    info!(
+        wall_slot,
+        count = owed.len(),
+        "Republishing proposer preferences whose earlier publish reached no peer"
+    );
+    for preferences in owed {
+        gossip_proposer_preferences(server, preferences).await;
+    }
+}
+
+/// Publish on `publish_digest(proposal_slot)`: during the epoch before gloas
+/// this is the gloas digest, which is held. Records in the market whether a
+/// peer was handed them, so preferences that reached none are published again
+/// (on a validator client's re-send, and at the next digest switch), and logs
+/// it: `info` once a peer has them, `warn` when none was handed them.
+async fn gossip_proposer_preferences(
+    server: &mut P2PServer,
+    preferences: SignedProposerPreferences,
+) {
+    let proposal_slot = preferences.message.proposal_slot;
+    let validator_index = preferences.message.validator_index;
     let Some((topic, data)) = publication(
         server,
         beacon_topics::PROPOSER_PREFERENCES,
         proposal_slot,
         &preferences.to_ssz(),
     ) else {
+        // Never sent, so owed a publish like one no peer took.
+        server
+            .builder_market
+            .record_preferences_publish(&preferences, true);
         return;
     };
-    server.swarm_handle.publish(topic, data);
-    info!(
-        proposal_slot,
-        validator_index = preferences.message.validator_index,
-        "Published proposer preferences to gossipsub"
-    );
+    let outcome = server
+        .swarm_handle
+        .publish_reporting(topic, data)
+        .outcome()
+        .await;
+    server
+        .builder_market
+        .record_preferences_publish(&preferences, outcome.failed());
+    match outcome {
+        PublishOutcome::Published => info!(
+            proposal_slot,
+            validator_index, "Published proposer preferences to gossipsub"
+        ),
+        PublishOutcome::Duplicate => debug!(
+            proposal_slot,
+            validator_index, "Gossipsub already holds these proposer preferences; not sent again"
+        ),
+        PublishOutcome::Failed(err) => warn!(
+            proposal_slot,
+            validator_index,
+            %err,
+            "Failed to publish proposer preferences to gossipsub; publishing them again on the next re-send or digest switch"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -197,9 +306,13 @@ mod tests {
     use ethlambda_types::beacon::primitives::{Epoch, ExecutionBlockHash};
     use libssz::SszEncode;
 
+    use tokio::sync::mpsc::UnboundedReceiver;
+
     use super::*;
     use crate::beacon::transition::apply;
-    use crate::test_support::unconnected_beacon_server;
+    use crate::gossipsub::decompress_message;
+    use crate::swarm_adapter::{SwarmCommand, SwarmHandle};
+    use crate::test_support::{RecordingChain, unconnected_beacon_server};
 
     const FULU: Epoch = 1_000;
     const GLOAS: Epoch = 5_000;
@@ -412,5 +525,258 @@ mod tests {
         apply(&mut server, GLOAS - 3);
         let kind = beacon_topics::EXECUTION_PAYLOAD_BID;
         assert_eq!(topic_of(&server, kind, GLOAS * slots_per_epoch()), None);
+    }
+
+    // -- Publish outcomes, and republishing what reached no peer --
+
+    /// Holds the digest of the wall clock's epoch, so preferences for slots
+    /// around it have a topic, and returns the wall clock's slot.
+    fn hold_the_wall_clock_digest(server: &mut P2PServer) -> Slot {
+        let wall = server.wire.beacon().expect("a beacon wire").wall_slot();
+        apply(server, wall / slots_per_epoch());
+        wall
+    }
+
+    /// Swaps in a swarm handle whose commands land in the returned receiver.
+    fn capture_commands(server: &mut P2PServer) -> UnboundedReceiver<SwarmCommand> {
+        let (swarm_handle, commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        commands
+    }
+
+    /// Runs `publish` to completion while answering every publish it hands
+    /// the swarm with `outcome`, and returns those publishes' payloads,
+    /// decompressed, in order.
+    async fn answering(
+        commands: &mut UnboundedReceiver<SwarmCommand>,
+        outcome: PublishOutcome,
+        publish: impl Future<Output = ()>,
+    ) -> Vec<Vec<u8>> {
+        answering_with_topics(commands, outcome, publish)
+            .await
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect()
+    }
+
+    /// [`answering`], with each publish's topic name next to its payload.
+    async fn answering_with_topics(
+        commands: &mut UnboundedReceiver<SwarmCommand>,
+        outcome: PublishOutcome,
+        publish: impl Future<Output = ()>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut published = Vec::new();
+        tokio::pin!(publish);
+        loop {
+            tokio::select! {
+                () = &mut publish => break,
+                Some(command) = commands.recv() => {
+                    if let SwarmCommand::Publish { topic, data, outcome_tx } = command {
+                        if let Some(outcome_tx) = outcome_tx {
+                            let _ = outcome_tx.send(outcome.clone());
+                        }
+                        let payload = decompress_message(&data).expect("snappy-compressed");
+                        published.push((topic.to_string(), payload));
+                    }
+                }
+            }
+        }
+        published
+    }
+
+    /// The real adapter, with no peer on the topic, answers
+    /// `NoPeersSubscribedToTopic`: the market remembers that.
+    #[tokio::test]
+    async fn preferences_no_peer_took_are_remembered_as_owed() {
+        let mut server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
+        let wall = hold_the_wall_clock_digest(&mut server);
+        let preferences = preferences_at(wall + 40);
+        assert!(
+            server
+                .builder_market
+                .record_preferences(preferences.clone(), wall)
+        );
+
+        publish_proposer_preferences(&mut server, preferences.clone()).await;
+
+        assert!(
+            server
+                .builder_market
+                .preferences_publish_failed(&preferences)
+        );
+        assert_eq!(
+            server.builder_market.preferences_to_republish(wall),
+            vec![preferences]
+        );
+    }
+
+    /// Whatever went out, or gossipsub refused as a duplicate (it left this
+    /// node earlier, or arrived from a peer), is owed nothing more; a failure
+    /// is owed a publish again.
+    #[tokio::test]
+    async fn each_publish_outcome_is_recorded_in_the_market() {
+        let mut server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
+        let wall = hold_the_wall_clock_digest(&mut server);
+        let mut commands = capture_commands(&mut server);
+        let preferences = preferences_at(wall + 40);
+        assert!(
+            server
+                .builder_market
+                .record_preferences(preferences.clone(), wall)
+        );
+
+        let no_peer = PublishOutcome::Failed("NoPeersSubscribedToTopic".to_string());
+        for (outcome, owed) in [
+            (no_peer.clone(), true),
+            (PublishOutcome::Published, false),
+            (no_peer, true),
+            (PublishOutcome::Duplicate, false),
+        ] {
+            let published = answering(
+                &mut commands,
+                outcome.clone(),
+                publish_proposer_preferences(&mut server, preferences.clone()),
+            )
+            .await;
+            assert_eq!(published, vec![preferences.to_ssz()]);
+            assert_eq!(
+                server
+                    .builder_market
+                    .preferences_publish_failed(&preferences),
+                owed,
+                "after {outcome:?}"
+            );
+        }
+    }
+
+    /// At a digest switch, only what is owed and still ahead goes out: not
+    /// preferences whose slot has started, nor ones that already went out.
+    /// What goes out is the held message itself, and once it does, nothing is
+    /// owed for it.
+    #[tokio::test]
+    async fn a_digest_switch_republishes_only_owed_preferences_still_ahead() {
+        let mut server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
+        let wall = hold_the_wall_clock_digest(&mut server);
+        let mut commands = capture_commands(&mut server);
+        let started = preferences_at(wall - 1);
+        let owed = preferences_at(wall + 40);
+        let delivered = preferences_at(wall + 41);
+        let market = &server.builder_market;
+        for preferences in [&started, &owed, &delivered] {
+            assert!(market.record_preferences(preferences.clone(), wall - 1));
+        }
+        market.record_preferences_publish(&started, true);
+        market.record_preferences_publish(&owed, true);
+        market.record_preferences_publish(&delivered, false);
+
+        let published = answering(
+            &mut commands,
+            PublishOutcome::Published,
+            republish_failed_proposer_preferences(&mut server),
+        )
+        .await;
+
+        assert_eq!(published, vec![owed.to_ssz()]);
+        assert!(!server.builder_market.preferences_publish_failed(&owed));
+        // The stale one is not sent, and stays as it was.
+        assert!(server.builder_market.preferences_publish_failed(&started));
+        assert!(commands.try_recv().is_err(), "nothing else was sent");
+    }
+
+    /// Across a real boundary, on the clock the switch runs at (just into the
+    /// first gloas slot): the last fulu slot's preferences and the first gloas
+    /// slot's, which has started, stay owed and unsent, and a later gloas
+    /// slot's go out on the gloas digest's topic.
+    #[tokio::test]
+    async fn at_the_gloas_switch_later_gloas_slots_go_out_on_the_gloas_digest() {
+        let first_gloas_slot = GLOAS * slots_per_epoch();
+        let mut config = rollover_config();
+        // One second into the first gloas slot, leaving the rest of it for the
+        // test.
+        let slot_seconds = config.slot_duration_ms / 1000;
+        config.genesis_time = unix_now_ms() / 1000 - first_gloas_slot * slot_seconds - 1;
+        let mut server = unconnected_beacon_server(config, 0).await;
+        apply(&mut server, GLOAS);
+        let wire = server.wire.beacon().expect("a beacon wire");
+        assert_eq!(wire.wall_slot(), first_gloas_slot);
+        let gloas_topic = beacon_topics::topic_name(
+            wire.schedule.digest_at(GLOAS),
+            beacon_topics::PROPOSER_PREFERENCES,
+        );
+        let mut commands = capture_commands(&mut server);
+        let last_fulu = preferences_at(first_gloas_slot - 1);
+        let first_gloas = preferences_at(first_gloas_slot);
+        let later = preferences_at(first_gloas_slot + 5);
+        for preferences in [&last_fulu, &first_gloas, &later] {
+            let market = &server.builder_market;
+            assert!(market.record_preferences(preferences.clone(), first_gloas_slot - 1));
+            market.record_preferences_publish(preferences, true);
+        }
+
+        let published = answering_with_topics(
+            &mut commands,
+            PublishOutcome::Published,
+            republish_failed_proposer_preferences(&mut server),
+        )
+        .await;
+
+        assert_eq!(published, vec![(gloas_topic, later.to_ssz())]);
+        assert!(server.builder_market.preferences_publish_failed(&last_fulu));
+        assert!(
+            server
+                .builder_market
+                .preferences_publish_failed(&first_gloas)
+        );
+        assert!(!server.builder_market.preferences_publish_failed(&later));
+    }
+
+    /// A first publish tells the chain actor; a re-send's republish does not
+    /// tell it again, and a failure leaves the preferences owed.
+    #[tokio::test]
+    async fn a_resubmission_republishes_without_reporting_to_the_chain_again() {
+        let mut server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
+        let chain = std::sync::Arc::new(RecordingChain::default());
+        server.blockchain = Some(chain.clone());
+        let wall = hold_the_wall_clock_digest(&mut server);
+        let mut commands = capture_commands(&mut server);
+        let preferences = preferences_at(wall + 40);
+        assert!(
+            server
+                .builder_market
+                .record_preferences(preferences.clone(), wall)
+        );
+        let no_peer = PublishOutcome::Failed("NoPeersSubscribedToTopic".to_string());
+
+        answering(
+            &mut commands,
+            no_peer.clone(),
+            publish_proposer_preferences(&mut server, preferences.clone()),
+        )
+        .await;
+        assert_eq!(*chain.preference_slots.lock().unwrap(), vec![wall + 40]);
+        assert!(
+            server
+                .builder_market
+                .preferences_publish_failed(&preferences)
+        );
+
+        let published = answering(
+            &mut commands,
+            no_peer,
+            republish_proposer_preferences(&mut server, preferences.clone()),
+        )
+        .await;
+
+        assert_eq!(published, vec![preferences.to_ssz()]);
+        assert!(
+            server
+                .builder_market
+                .preferences_publish_failed(&preferences)
+        );
+        assert_eq!(
+            chain.preference_slots.lock().unwrap().len(),
+            1,
+            "the chain actor is told once"
+        );
     }
 }

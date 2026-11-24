@@ -372,7 +372,14 @@ actual_slot = finalized_slot + 1 + relative_index
     Bids and preferences are validated in p2p against one shared `BuilderMarket`
     (`state_transition::beacon::builder_market`) and never reach the chain actor, except that an
     accepted preference (gossip or API) is reported to it by proposal slot alone
-    (`new_proposer_preferences`), for `payload_attributes`. Gloas has its own rules for `beacon_block`,
+    (`new_proposer_preferences`), for `payload_attributes`. The four gloas topics' own publishes
+    read gossipsub's answer back (`SwarmHandle::publish_reporting`): `info` only once a peer has
+    the message, `warn` when none was handed it. The market remembers a preference whose publish
+    reached no peer (peers join the next digest late, Lighthouse two slots ahead) and publishes it
+    again on the validator client's re-send (`republish_proposer_preferences`) and at the next
+    digest switch, while its slot is ahead. One that reached any peer cannot be sent again:
+    gossipsub's id is topic plus payload, and its duplicate cache refuses it for `seen_ttl` (two
+    epochs). Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate

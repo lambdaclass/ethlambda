@@ -86,7 +86,19 @@ impl BidPool {
 }
 
 /// Preferences by `(proposal_slot, dependent_root)`: the first valid one wins.
-type PreferencesCache = BTreeMap<(Slot, Root), gloas::SignedProposerPreferences>;
+type PreferencesCache = BTreeMap<(Slot, Root), HeldPreferences>;
+
+/// Preferences held in the market, and whether this node's own gossip publish
+/// of them failed.
+#[derive(Debug)]
+struct HeldPreferences {
+    signed: gloas::SignedProposerPreferences,
+    /// Set while this node's last publish of them reached no peer (none had
+    /// joined the topic yet, say), so they are still owed one; cleared once a
+    /// publish goes out. Never set for preferences gossip delivered, which
+    /// peers already relay. Kept with the entry so it is pruned with it.
+    publish_failed: bool,
+}
 
 #[derive(Debug)]
 pub struct BuilderMarket {
@@ -207,7 +219,7 @@ impl BuilderMarket {
     ) -> Option<gloas::SignedProposerPreferences> {
         lock(&self.preferences)
             .get(&(proposal_slot, dependent_root))
-            .cloned()
+            .map(|held| held.signed.clone())
     }
 
     /// The first valid preferences per key win. `false` if one is held. Prunes
@@ -223,11 +235,54 @@ impl BuilderMarket {
             return false;
         }
         *cache = cache.split_off(&(current_slot, Root::ZERO));
-        cache.insert(key, signed);
+        let held = HeldPreferences {
+            signed,
+            publish_failed: false,
+        };
+        cache.insert(key, held);
         while cache.len() > MAX_PREFERENCES {
             cache.pop_first();
         }
         cache.contains_key(&key)
+    }
+
+    /// Records how this node's own gossip publish of `signed` went: `failed`
+    /// when no peer was handed them. Applies only to the very message held
+    /// under its key; one pruned, or other preferences held first, are left
+    /// alone.
+    pub fn record_preferences_publish(
+        &self,
+        signed: &gloas::SignedProposerPreferences,
+        failed: bool,
+    ) {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        if let Some(held) = lock(&self.preferences)
+            .get_mut(&key)
+            .filter(|held| held.signed == *signed)
+        {
+            held.publish_failed = failed;
+        }
+    }
+
+    /// Whether `signed` itself is held and this node's last publish of it
+    /// reached no peer.
+    pub fn preferences_publish_failed(&self, signed: &gloas::SignedProposerPreferences) -> bool {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        lock(&self.preferences)
+            .get(&key)
+            .is_some_and(|held| held.publish_failed && held.signed == *signed)
+    }
+
+    /// The held preferences still owed a publish (see
+    /// [`Self::record_preferences_publish`]) for a proposal slot after `slot`,
+    /// in slot order. Those for `slot` and earlier are left out: the slot has
+    /// started, so peers ignore them and no bid can use them.
+    pub fn preferences_to_republish(&self, slot: Slot) -> Vec<gloas::SignedProposerPreferences> {
+        lock(&self.preferences)
+            .iter()
+            .filter(|((proposal_slot, _), held)| *proposal_slot > slot && held.publish_failed)
+            .map(|(_, held)| held.signed.clone())
+            .collect()
     }
 
     pub fn prune_preferences_before(&self, slot: Slot) {
@@ -566,6 +621,64 @@ mod tests {
         assert!(market.preferences(101, Root::repeat_byte(1)).is_some());
         // A message below everything held is itself the one dropped.
         assert!(!market.record_preferences(prefs(50, 1, 3), 0));
+    }
+
+    #[test]
+    fn a_failed_publish_is_remembered_until_one_goes_out() {
+        let market = BuilderMarket::default();
+        let held = prefs(40, 1, 3);
+        assert!(market.record_preferences(held.clone(), 38));
+        assert!(
+            !market.preferences_publish_failed(&held),
+            "recorded as published"
+        );
+
+        market.record_preferences_publish(&held, true);
+        assert!(market.preferences_publish_failed(&held));
+        // Only the held message itself: other preferences for its key are not.
+        let mut other = held.clone();
+        other.message.fee_recipient = ExecutionAddress::repeat_byte(9);
+        assert!(!market.preferences_publish_failed(&other));
+        market.record_preferences_publish(&other, false);
+        assert!(market.preferences_publish_failed(&held));
+
+        market.record_preferences_publish(&held, false);
+        assert!(!market.preferences_publish_failed(&held));
+
+        // A publish outcome for preferences not held records nothing.
+        let unheld = prefs(41, 1, 3);
+        market.record_preferences_publish(&unheld, true);
+        assert!(!market.preferences_publish_failed(&unheld));
+        assert!(market.preferences(41, Root::repeat_byte(1)).is_none());
+    }
+
+    /// Owed are the preferences whose publish failed and whose slot is still
+    /// ahead: a slot that has started is stale, and one that went out is not
+    /// owed anything.
+    #[test]
+    fn preferences_to_republish_are_the_failed_ones_still_ahead() {
+        let market = BuilderMarket::default();
+        let started = prefs(40, 1, 3);
+        let current = prefs(41, 1, 3);
+        let ahead = prefs(42, 1, 3);
+        let other_root = prefs(42, 2, 3);
+        let delivered = prefs(43, 1, 3);
+        for signed in [&started, &current, &ahead, &other_root, &delivered] {
+            assert!(market.record_preferences(signed.clone(), 40));
+        }
+        for signed in [&started, &current, &ahead, &other_root] {
+            market.record_preferences_publish(signed, true);
+        }
+
+        assert_eq!(
+            market.preferences_to_republish(41),
+            vec![ahead.clone(), other_root.clone()]
+        );
+        assert_eq!(
+            market.preferences_to_republish(39),
+            vec![started, current, ahead, other_root]
+        );
+        assert!(market.preferences_to_republish(43).is_empty());
     }
 
     #[test]

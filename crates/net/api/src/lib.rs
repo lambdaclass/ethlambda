@@ -496,6 +496,15 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         preferences: SignedProposerPreferences,
     ) -> Result<(), ActorError>;
+    /// Gossip again proposer preferences the shared `BuilderMarket` holds
+    /// whose earlier publish by this node reached no peer, handed back when a
+    /// validator client sends them again. Unlike
+    /// [`Self::publish_proposer_preferences`], the chain actor is not told: it
+    /// was when they were first published.
+    fn republish_proposer_preferences(
+        &self,
+        preferences: SignedProposerPreferences,
+    ) -> Result<(), ActorError>;
     /// Gossip a payload timeliness committee member's vote on
     /// `payload_attestation_message` and hand it to the chain actor. Checked by
     /// the caller as above.
