@@ -62,9 +62,14 @@ async fn get_header(Path(block_id): Path<String>, State(store): State<Store>) ->
         .flatten()
         .is_some_and(|canonical| canonical == root);
 
-    // `signature()` panics on a lean block by design (`dispatch_block!`),
-    // which is unreachable here: this router is only ever mounted on a beacon
-    // store.
+    // A PQ block's proposer signs with leanXMSS, and `signature()` (BLS only)
+    // panics on it. It also panics on a lean block by design
+    // (`dispatch_block!`), which is unreachable here: this router is only
+    // ever mounted on a beacon store.
+    let signature = match block.xmss_signature() {
+        Some(xmss) => serde_json::json!(xmss),
+        None => serde_json::json!(block.signature()),
+    };
     crate::json_response(serde_json::json!({
         "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, block.slot()),
@@ -73,7 +78,7 @@ async fn get_header(Path(block_id): Path<String>, State(store): State<Store>) ->
             "canonical": canonical,
             "header": {
                 "message": message,
-                "signature": block.signature(),
+                "signature": signature,
             }
         }
     }))

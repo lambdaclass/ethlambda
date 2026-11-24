@@ -37,7 +37,7 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::Preset;
 use ethlambda_types::beacon::primitives::{
     BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, CommitteeIndex, Epoch, Root,
-    Slot, ValidatorIndex, Version,
+    Slot, ValidatorIndex, Version, XMSS_PUBKEY_SIZE, XmssPubkey,
 };
 use libssz::SszDecode as _;
 use serde::{Deserialize, Serialize};
@@ -213,6 +213,11 @@ pub struct AttesterDutyDto {
     pub validator_committee_index: u64,
     #[serde(with = "quoted_u64")]
     pub slot: Slot,
+    /// At a PQ slot, whether the node counts the validator on its committee's
+    /// aggregation committee, which is what makes a PQ aggregator; absent
+    /// before PQ, where aggregators select themselves with a BLS proof.
+    #[serde(default)]
+    pub is_aggregator: Option<bool>,
 }
 
 /// One proposer duty, from `GET /eth/v1/validator/duties/proposer/{epoch}`.
@@ -468,16 +473,31 @@ pub fn parse_signature(text: &str) -> Result<BlsSignature> {
     Ok(BlsSignature(array))
 }
 
+/// A pubkey from the beacon node (see [`parse_registry_key`]). A PQ key of
+/// this client's own is answered as the BLS key that owns it (`crate::pq`),
+/// so every duty still matches a local key by BLS key.
 pub fn parse_pubkey(text: &str) -> Result<BlsPubkey> {
-    let bytes = hex::decode(text.strip_prefix("0x").unwrap_or(text))
-        .map_err(|err| Error::Decode(format!("bad pubkey hex: {err}")))?;
-    let array: [u8; BLS_PUBKEY_SIZE] = bytes.try_into().map_err(|got: Vec<u8>| {
-        Error::Decode(format!(
-            "pubkey is {} bytes, expected {BLS_PUBKEY_SIZE}",
-            got.len()
-        ))
-    })?;
-    Ok(BlsPubkey(array))
+    let array = parse_registry_key(text)?;
+    Ok(crate::pq::bls_for_request_key(&array).unwrap_or(BlsPubkey(array)))
+}
+
+/// A registry key from the beacon node, in the 48-byte form this client keeps
+/// every key in: a BLS key as it is, or on the PQ fork the 32-byte XMSS key
+/// (the specification's `XMSSPubkey`, what Lighthouse and Lodestar answer
+/// with) in request form, 16 zero bytes then the key. A node from before the
+/// API's switch to 32 bytes answers with that request form itself, which
+/// reads the same.
+pub fn parse_registry_key(text: &str) -> Result<[u8; BLS_PUBKEY_SIZE]> {
+    let bytes = parse_hex(text, "pubkey")?;
+    match <[u8; XMSS_PUBKEY_SIZE]>::try_from(bytes.as_slice()) {
+        Ok(xmss) => Ok(XmssPubkey(xmss).to_request_key().0),
+        Err(_) => bytes.try_into().map_err(|got: Vec<u8>| {
+            Error::Decode(format!(
+                "pubkey is {} bytes, expected {BLS_PUBKEY_SIZE} or {XMSS_PUBKEY_SIZE}",
+                got.len()
+            ))
+        }),
+    }
 }
 
 /// `0x`-prefixed hex, through the same adapter the beacon node writes its own
@@ -728,6 +748,26 @@ impl From<&AttestationData> for AttestationDataOutDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 32-byte XMSS key reads into its request form, a 48-byte key (a BLS
+    /// key, or a request form from a node before the switch) as it is, and
+    /// any other width is refused.
+    #[test]
+    fn a_registry_key_reads_from_either_width() {
+        let mut request = [0u8; BLS_PUBKEY_SIZE];
+        request[16..].copy_from_slice(&[0x5a; XMSS_PUBKEY_SIZE]);
+        let xmss = format!("0x{}", "5a".repeat(XMSS_PUBKEY_SIZE));
+        assert_eq!(parse_registry_key(&xmss).unwrap(), request);
+        assert_eq!(parse_registry_key(&encode_hex(&request)).unwrap(), request);
+        let bls = [0xb1; BLS_PUBKEY_SIZE];
+        assert_eq!(parse_registry_key(&encode_hex(&bls)).unwrap(), bls);
+        // A key no local key owns comes back as read.
+        assert_eq!(parse_pubkey(&xmss).unwrap(), BlsPubkey(request));
+
+        let err = parse_registry_key(&format!("0x{}", "5a".repeat(33))).unwrap_err();
+        assert!(err.to_string().contains("33 bytes"), "got {err}");
+        assert!(parse_registry_key("0xzz").is_err());
+    }
 
     /// A real `GET /eth/v1/validator/attestation_data` body.
     const ATTESTATION_DATA: &str = r#"{

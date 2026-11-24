@@ -331,8 +331,35 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
+| `POST` | `/eth/v1/validator/pq_blocks/{slot}` | SSZ | An unsigned PQ block and the envelope of its self-built payload, `pq::BlockContents`, given the proposer's VRF proof (ethlambda's own; see [PQ](#pq)) |
 | `POST` | `/eth/v1/validator/register_validator` | *(status only)* | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
+
+### PQ
+
+At a PQ slot (`docs/beacon_pq.md`) the endpoints a validator client needs
+take PQ's containers under `Eth-Consensus-Version: pq`: attestations, payload
+attestations and aggregates in the pool endpoints, blocks and envelopes in
+the publish endpoints. The Beacon API has no PQ block production yet, so
+ethlambda's validator client asks `POST /eth/v1/validator/pq_blocks/{slot}`
+with `{"randao_reveal": [<VRF leaf and branch, hex roots>], "graffiti"?}`;
+the block's graffiti gets both clients' codes appended, as `produceBlockV3`'s
+does (see its **Graffiti** note below). Attester duties at a PQ epoch add `is_aggregator`, the validator's seat in
+its committee's aggregation committee, and `GET aggregate_attestation` at a
+PQ slot answers `{"aggregate", "proof"}`, the aggregate this node proved for
+its aggregators' committee (Lighthouse's PQ branch's `PqAggregate`), or 404.
+
+A PQ validator's public key is its 32-byte XMSS key (`XMSSPubkey`), and the
+API names it that way, as Lighthouse and Lodestar do: `states/{state_id}/validators`
+answers a PQ state's entries as the PQ `Validator` container (the 32-byte
+`pubkey`, then `vrf_root`), and the proposer, attester and PTC duties carry
+the 32-byte key. The 48-byte form the state keeps it in, 16 zero bytes then
+the key, is the deposit and request form only. A `validator_id` may be either:
+a 32-byte key, or a 48-byte one as a client from before that switch sends.
+`POST beacon/execution_payload_envelopes` under `pq` takes the bare signed
+envelope and builds the columns from the blobs it kept at `pq_blocks`, so it
+reads no `Eth-Blob-Data-Included`; ethlambda's validator client still sends
+`false`, which a node reading the header as gloas defines it requires.
 
 ### Validator endpoints
 

@@ -37,6 +37,7 @@ pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod pq;
 pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
@@ -86,11 +87,14 @@ pub(crate) fn require_unread_preset() -> Result<()> {
         .map_err(|err| Error::Preset(err.to_string()))
 }
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, Bytes32, ExecutionAddress, Slot, ValidatorIndex,
+};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -157,10 +161,19 @@ pub struct ValidatorConfig {
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
     pub init_slashing_protection: bool,
+    /// Where precomputed VRF tree states are read from on a network that
+    /// schedules PQ (an HTTP(S) URL or a file path), so a key's tree need
+    /// not be hashed in full. See [`pq::fetch_vrf_state`].
+    pub vrf_state_url: Option<String>,
     /// Withhold every key's attestations and blocks until the beacon network
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// Where precomputed leanXMSS keys are read from on a network that
+    /// schedules PQ (an HTTP(S) URL or a file path, ethereum-package's
+    /// `xmss_cache_url`), so a key loads instead of being built. See
+    /// [`load_xmss_cache`].
+    pub xmss_cache_url: Option<String>,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -346,6 +359,120 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         context = context.with_doppelganger(doppelganger.clone());
     }
     let context = Arc::new(context);
+
+    // A network scheduling the PQ fork: derive every validator's leanXMSS key
+    // before any duty runs, since index lookup already needs the keys. Loaded
+    // from `xmss_cache_url` when it has the key, else built (about 2.4 s a
+    // key), the keys in parallel. Their VRF trees, which only proposals read
+    // and which take minutes each to hash, follow in the background.
+    let pq_epoch = context
+        .config
+        .fork_epoch(ethlambda_types::beacon::fork::ForkName::Pq);
+    if pq_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+        let secrets: Vec<(BlsPubkey, [u8; 32])> = {
+            let store = store.read().await;
+            store
+                .pubkeys()
+                .into_iter()
+                .filter_map(|pubkey| match store.signer(&pubkey)? {
+                    keys::store::SigningMethod::LocalKeystore { secret_key } => {
+                        Some((pubkey, secret_key.to_bytes()))
+                    }
+                    // The PQ keys derive from the BLS secret, which a remote
+                    // signer never hands over: such a validator has no PQ key.
+                    keys::store::SigningMethod::Web3Signer { .. } => None,
+                })
+                .collect()
+        };
+        let count = secrets.len();
+        let pubkeys: Vec<BlsPubkey> = secrets.iter().map(|(pubkey, _)| *pubkey).collect();
+        let current_slot = clock.now().unwrap_or(0);
+        let started = std::time::Instant::now();
+        let cache = match &config.xmss_cache_url {
+            Some(source) if !secrets.is_empty() => {
+                load_xmss_cache(beacon_node.as_ref(), &secrets, source.clone()).await
+            }
+            _ => HashMap::new(),
+        };
+        info!(
+            count,
+            pq_epoch,
+            cache_records = cache.len(),
+            "Deriving the validators' PQ keys"
+        );
+        // leanVM derives a key on one thread, so the keys go across rayon's
+        // pool: one per core, not one OS thread per validator.
+        let derived = tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            secrets
+                .par_iter()
+                .map(|(pubkey, secret)| {
+                    let derived =
+                        pq::derive_and_register(*pubkey, secret, current_slot, cache.get(pubkey));
+                    if derived.source == pq::KeySource::CacheRefused {
+                        warn!(
+                            pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
+                            "The leanXMSS cache record is not this key's; built it instead"
+                        );
+                    }
+                    derived
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|err| Error::Io {
+            path: "PQ key derivation".into(),
+            source: std::io::Error::other(err.to_string()),
+        })?;
+        let tally = |wanted| {
+            derived
+                .iter()
+                .filter(|derived| derived.source == wanted)
+                .count()
+        };
+        let slowest = |time: fn(&pq::Derived) -> std::time::Duration| {
+            derived
+                .iter()
+                .map(time)
+                .max()
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
+        info!(
+            count,
+            cached = tally(pq::KeySource::Cached),
+            built = tally(pq::KeySource::Built) + tally(pq::KeySource::CacheRefused),
+            refused = tally(pq::KeySource::CacheRefused),
+            trees_built = derived
+                .iter()
+                .map(|derived| derived.trees_built)
+                .sum::<usize>(),
+            slowest_key_ms = slowest(|derived| derived.key_time),
+            slowest_trees_ms = slowest(|derived| derived.tree_time),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Derived the validators' PQ keys"
+        );
+        // Before any duty signs: the leaves a previous run signed stay spent.
+        let kept =
+            pq::open_leaf_record(&config.validators_dir, current_slot).map_err(|source| {
+                Error::Io {
+                    path: config
+                        .validators_dir
+                        .join(pq::LEAF_RECORD_FILE)
+                        .display()
+                        .to_string(),
+                    source,
+                }
+            })?;
+        info!(leaves = kept, "Opened the PQ leaf record");
+        prepare_bottom_trees(clock.clone(), current_slot);
+        prepare_vrf_trees(
+            pubkeys,
+            config.validators_dir.clone(),
+            config.vrf_state_url.clone(),
+            beacon_node.clone(),
+        );
+    }
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
@@ -560,6 +687,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // should not compete with it producing this slot's block. Off the slot
             // loop, since it is single-flight and a slow node must not delay this
             // slot's duties.
+            // At PQ the service signs with leanXMSS, once per slot.
             tokio::spawn(preferences.clone().poll(slot, store.clone()));
 
             // The subscriptions the refresh above left owing, sent from a task
@@ -578,6 +706,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // next, so the duties that are near were subscribed an epoch ago,
             // and the proofs are remembered for the aggregation whenever they
             // land.
+            //
+            // At a PQ slot a duty's aggregator role is the node's
+            // `is_aggregator` rather than a BLS selection proof; `subscribe`
+            // reads either.
             if resubscribe {
                 let (beacon_node, store, context) =
                     (beacon_node.clone(), store.clone(), context.clone());
@@ -1063,8 +1195,14 @@ async fn aggregate<B: BeaconNodeApi>(
     store: &RwLock<ValidatorStore>,
 ) {
     let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store));
-    match attempt.await {
+    // PQ aggregators are the aggregation committee and publish what the node
+    // proved; see `AggregationService::aggregate_pq`.
+    let outcome = if data.target.epoch >= aggregation.pq_fork_epoch() {
+        tokio::time::timeout(budget, aggregation.aggregate_pq(slot, data, duties)).await
+    } else {
+        tokio::time::timeout(budget, aggregation.aggregate(slot, data, duties, store)).await
+    };
+    match outcome {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
             error!(%slot, %err, "Failed to publish this slot's aggregates");
@@ -1417,6 +1555,340 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
     }
 }
 
+/// Give every key its VRF tree, one key after another, on a thread of its
+/// own: the tree it stored at an earlier start, else its record from
+/// `vrf_state_url` when one is configured, else the tree hashed in full.
+///
+/// Off the duty path because hashing a tree takes minutes of every core
+/// (`ethlambda_crypto::vrf`), and only a proposal reads one: the keys attest
+/// meanwhile, and a proposal that falls before its key's tree is ready is
+/// missed and logged as such. One key at a time since each already uses every
+/// core. A plain thread, not the runtime's blocking pool, so a shutdown does
+/// not wait minutes for a tree nobody will use; each finished tree is already
+/// on disk for the next start.
+///
+/// A state record is looked up by validator index, which the beacon node
+/// resolves, and checked against the key's own seed: a genesis whose
+/// validators are not in the file's order only costs those keys the hashing.
+fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
+    pubkeys: Vec<BlsPubkey>,
+    validators_dir: PathBuf,
+    vrf_state_url: Option<String>,
+    beacon_node: Arc<B>,
+) {
+    let runtime = tokio::runtime::Handle::current();
+    let spawned = std::thread::Builder::new()
+        .name("pq-vrf-trees".into())
+        .spawn(move || {
+            let count = pubkeys.len();
+            let started = std::time::Instant::now();
+            let mut pending: Vec<BlsPubkey> = pubkeys
+                .into_iter()
+                .filter(|pubkey| pq::restore_vrf_tree(pubkey, &validators_dir).is_none())
+                .collect();
+            let stored = count - pending.len();
+            let mut loaded = 0usize;
+            if let Some(source) = vrf_state_url.filter(|_| !pending.is_empty()) {
+                let indices = runtime.block_on(resolve_indices(beacon_node.as_ref(), &pending));
+                let states =
+                    pq::RecordFile::new(reqwest::Client::new(), source, ethlambda_crypto::vrf::STATE_RECORD_SIZE);
+                pending.retain(|pubkey| {
+                    let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
+                    let Some(&index) = indices.get(pubkey) else {
+                        warn!(pubkey = %encoded, "No validator index for this key; hashing its VRF tree");
+                        return true;
+                    };
+                    let fetched = runtime.block_on(states.fetch(index));
+                    let record = match fetched {
+                        Ok(Some(record)) => record,
+                        Ok(None) => {
+                            warn!(pubkey = %encoded, index, "The VRF state file has no record for this validator; hashing its tree");
+                            return true;
+                        }
+                        Err(err) => {
+                            warn!(pubkey = %encoded, index, %err, "Could not fetch this validator's VRF state; hashing its tree");
+                            return true;
+                        }
+                    };
+                    match pq::adopt_vrf_state(pubkey, &record, &validators_dir) {
+                        Ok(()) => {
+                            loaded += 1;
+                            false
+                        }
+                        Err(err) => {
+                            warn!(pubkey = %encoded, index, %err, "Refused this validator's VRF state; hashing its tree");
+                            true
+                        }
+                    }
+                });
+            }
+            if !pending.is_empty() {
+                info!(
+                    count = pending.len(),
+                    "Hashing the VRF trees no state was found for; each takes minutes"
+                );
+            }
+            let to_hash = pending.len();
+            let hash_all = || {
+                for (done, pubkey) in pending.iter().enumerate() {
+                    let key_started = std::time::Instant::now();
+                    if pq::prepare_vrf_tree(pubkey, &validators_dir)
+                        == Some(pq::VrfTreeSource::Hashed)
+                    {
+                        info!(
+                            pubkey = %crate::beacon_node::dto::encode_hex(&pubkey.0),
+                            hashed = done + 1,
+                            count = to_hash,
+                            elapsed_ms = key_started.elapsed().as_millis() as u64,
+                            "Hashed a validator's VRF tree"
+                        );
+                    }
+                }
+            };
+            if to_hash > 0 {
+                // In a pool of its own, never rayon's global one. leanXMSS
+                // signing parallelizes on the global pool, and rayon runs a
+                // job injected from outside a pool only once a worker's own
+                // queue is empty: a tree hashed there keeps every queue full
+                // for minutes, and every attestation, aggregate and PTC vote
+                // signature waits behind it. One core is left to the rest.
+                let threads = std::thread::available_parallelism()
+                    .map_or(1, |cores| cores.get().saturating_sub(1).max(1));
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|index| format!("pq-vrf-hash-{index}"))
+                    .build();
+                match pool {
+                    Ok(pool) => pool.install(hash_all),
+                    Err(err) => {
+                        warn!(%err, "Could not start the VRF hashing pool; hashing on the shared one, which delays every PQ signature until it is done");
+                        hash_all();
+                    }
+                }
+            }
+            info!(
+                count,
+                stored,
+                loaded,
+                hashed = to_hash,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Every validator's VRF tree is ready; PQ proposals can be made"
+            );
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "Could not start preparing the VRF trees; PQ proposals will be missed");
+    }
+}
+
+/// How far ahead [`prepare_bottom_trees`] looks: long enough to build a tree
+/// for a thousand keys on a few cores, about an hour and three quarters at
+/// 12-second slots.
+const BOTTOM_TREE_LOOKAHEAD_SLOTS: Slot = 512;
+
+/// How often [`prepare_bottom_trees`] looks.
+const BOTTOM_TREE_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The leaves `lookahead` slots past `slot` whose bottom trees are not in
+/// `prepared`, which they are added to: what [`prepare_bottom_trees`] builds
+/// next.
+fn bottom_trees_due(prepared: &mut std::collections::HashSet<u64>, slot: Slot) -> Vec<u64> {
+    pq::duty_leaves(slot + BOTTOM_TREE_LOOKAHEAD_SLOTS)
+        .into_iter()
+        .filter(|&leaf| prepared.insert(pq::bottom_tree_of(leaf)))
+        .collect()
+}
+
+/// Builds every key's next bottom trees ahead of the duties that sign in
+/// them, on a thread of its own: once a minute it looks
+/// [`BOTTOM_TREE_LOOKAHEAD_SLOTS`] ahead and builds any tree a duty leaf
+/// there falls in that it has not built yet. The trees of `current_slot`,
+/// which key derivation built, count as built.
+///
+/// Without this, the first signature in a new tree builds it at its duty's
+/// deadline, about 2.5 s a key: the per-slot leaves move to a new tree at
+/// slot 4096 (about 13.6 h in at 12-second slots) and every 8192 slots after.
+/// leanVM keeps four bottom trees a key, enough for the attestation tree and
+/// the current and next per-slot ones.
+///
+/// In a pool of half the cores, so the duties signing meanwhile keep the
+/// rest. A plain thread, so a shutdown does not wait for it.
+fn prepare_bottom_trees(clock: SlotClock, current_slot: Slot) {
+    let mut prepared: std::collections::HashSet<u64> = pq::duty_leaves(current_slot)
+        .into_iter()
+        .map(pq::bottom_tree_of)
+        .collect();
+    let spawned = std::thread::Builder::new()
+        .name("pq-bottom-trees".into())
+        .spawn(move || {
+            let threads =
+                std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("pq-bottom-tree-{index}"))
+                .build()
+                .inspect_err(|err| {
+                    warn!(%err, "Could not start the bottom-tree pool; building on the shared one")
+                })
+                .ok();
+            loop {
+                if let Some(slot) = clock.now() {
+                    for leaf in bottom_trees_due(&mut prepared, slot) {
+                        let started = std::time::Instant::now();
+                        let tree = pq::bottom_tree_of(leaf);
+                        info!(%slot, tree, leaf, "Building every key's next leanXMSS bottom tree");
+                        let build = || pq::prepare_bottom_tree(leaf);
+                        let builds = match &pool {
+                            Some(pool) => pool.install(build),
+                            None => build(),
+                        };
+                        info!(
+                            tree,
+                            keys = builds.keys,
+                            built = builds.built,
+                            slowest_key_ms = builds.slowest.as_millis() as u64,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Built every key's next leanXMSS bottom tree"
+                        );
+                    }
+                }
+                std::thread::sleep(BOTTOM_TREE_CHECK);
+            }
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "Could not start preparing bottom trees; each is built at its first duty");
+    }
+}
+
+/// How long [`load_xmss_cache`] waits for the beacon node's registry before
+/// building every key instead: [`REGISTRY_ATTEMPTS`] tries this far apart.
+const REGISTRY_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+const REGISTRY_ATTEMPTS: u32 = 12;
+
+/// How many cache records are fetched at once.
+const XMSS_CACHE_FETCHES: usize = 16;
+
+/// Each of `keys`' leanXMSS cache record from `source` (ethereum-package's
+/// `xmss_cache_url`: [`pq::XMSS_CACHE_RECORD_SIZE`]-byte records indexed by
+/// validator index), with the public key the registry holds for it.
+///
+/// A key's index is found before the key exists: the registry is scanned for
+/// the entry whose public parameter is the one the key's seed gives
+/// ([`pq::indices_by_public_param`]). Best effort throughout: a registry the
+/// node does not give within about two minutes, a record the file lacks, or a
+/// source that fails leaves those keys out, and [`pq::derive_and_register`]
+/// builds them. A record is only offered here; it is checked against the
+/// seed and the registered key when loaded.
+async fn load_xmss_cache<B: BeaconNodeApi>(
+    beacon_node: &B,
+    keys: &[(BlsPubkey, [u8; 32])],
+    source: String,
+) -> HashMap<BlsPubkey, pq::XmssCacheRecord> {
+    use futures_util::StreamExt as _;
+
+    let mut registry = None;
+    for attempt in 1..=REGISTRY_ATTEMPTS {
+        match beacon_node.registry().await {
+            Ok(entries) => {
+                registry = Some(entries);
+                break;
+            }
+            Err(err) if attempt < REGISTRY_ATTEMPTS => {
+                warn!(attempt, %err, "Could not read the registry for the leanXMSS cache; retrying");
+                tokio::time::sleep(REGISTRY_RETRY).await;
+            }
+            Err(err) => {
+                warn!(%err, "Could not read the registry for the leanXMSS cache; building every key");
+            }
+        }
+    }
+    let Some(registry) = registry else {
+        return HashMap::new();
+    };
+    let indices = pq::indices_by_public_param(keys, &registry);
+    if indices.len() < keys.len() {
+        warn!(
+            unregistered = keys.len() - indices.len(),
+            "Keys with no registry entry are built, not loaded from the leanXMSS cache"
+        );
+    }
+    let file = pq::RecordFile::new(reqwest::Client::new(), source, pq::XMSS_CACHE_RECORD_SIZE);
+    let fetch = |(pubkey, (index, registered)): (BlsPubkey, (u64, [u8; 32]))| {
+        let file = &file;
+        async move { (pubkey, index, registered, file.fetch(index).await) }
+    };
+    let mut wanted = indices.into_iter();
+    // One record first, alone: a server that ignores the range sends the
+    // whole file, which is then kept, rather than sent once per key.
+    let Some(first) = wanted.next() else {
+        return HashMap::new();
+    };
+    let first = fetch(first).await;
+    if let (_, index, _, Err(err)) = &first {
+        warn!(source = file.source(), index, %err, "Could not read the leanXMSS cache; building every key");
+        return HashMap::new();
+    }
+    let fetched: Vec<_> = futures_util::stream::iter(wanted)
+        .map(fetch)
+        .buffer_unordered(XMSS_CACHE_FETCHES)
+        .collect()
+        .await;
+    let (mut missing, mut failed) = (0usize, 0usize);
+    let records = std::iter::once(first)
+        .chain(fetched)
+        .filter_map(|(pubkey, index, registered, fetched)| match fetched {
+            Ok(Some(bytes)) => Some((pubkey, pq::XmssCacheRecord { registered, bytes })),
+            Ok(None) => {
+                missing += 1;
+                None
+            }
+            Err(err) => {
+                failed += 1;
+                warn!(index, %err, "Could not read a leanXMSS cache record; building that key");
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    if missing > 0 {
+        warn!(
+            missing,
+            source = file.source(),
+            "The leanXMSS cache file does not reach these validators' indices; building them"
+        );
+    }
+    info!(
+        records = records.len(),
+        missing,
+        failed,
+        source = file.source(),
+        "Read the leanXMSS cache"
+    );
+    records
+}
+
+/// Each of `pubkeys`' validator index, from the beacon node, retried for a
+/// few minutes while the node is not answering (a validator client may start
+/// before its node). Keys the node does not know are left out.
+async fn resolve_indices<B: BeaconNodeApi>(
+    beacon_node: &B,
+    pubkeys: &[BlsPubkey],
+) -> std::collections::HashMap<BlsPubkey, u64> {
+    for attempt in 1..=20u32 {
+        match beacon_node.validator_indices(pubkeys).await {
+            Ok(entries) => {
+                return entries
+                    .into_iter()
+                    .map(|entry| (entry.pubkey, entry.index))
+                    .collect();
+            }
+            Err(err) => {
+                warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        }
+    }
+    std::collections::HashMap::new()
+}
+
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
 /// registration: one that is pending or active, not one that exited or was
 /// withdrawn.
@@ -1524,7 +1996,9 @@ async fn refresh_sync<B: BeaconNodeApi>(
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
-    if context.config.fork_at_epoch(epoch) < ForkName::Altair {
+    // Sync committees start at altair, and PQ removes them.
+    let fork = context.config.fork_at_epoch(epoch);
+    if fork < ForkName::Altair || fork == ForkName::Pq {
         return;
     }
     let period = crate::duties::sync_committee_period(epoch);
@@ -1562,6 +2036,90 @@ mod tests {
     use crate::beacon_node::ValidatorEntry;
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::primitives::{H160, Root};
+
+    /// A registry entry for the key `secret` grows, under an arbitrary root:
+    /// the cache lookup reads only its public parameter.
+    fn pq_entry(index: u64, secret: &[u8; 32]) -> (u64, [u8; 48]) {
+        let mut request = [0u8; 48];
+        request[16..32].copy_from_slice(&[index as u8; 16]);
+        request[32..].copy_from_slice(&ethlambda_crypto::pq_keys::xmss_public_param(secret));
+        (index, request)
+    }
+
+    #[tokio::test]
+    async fn each_registered_key_gets_its_own_cache_record() {
+        let (ours, past_the_file, unregistered) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let keys = [
+            (pubkey(1), ours),
+            (pubkey(2), past_the_file),
+            (pubkey(3), unregistered),
+        ];
+        let node = MockBeaconNode {
+            registry: vec![
+                pq_entry(0, &[9; 32]),
+                pq_entry(2, &ours),
+                pq_entry(5, &past_the_file),
+            ],
+            ..MockBeaconNode::default()
+        };
+        // Three records, each filled with its index: index 5 is past the end.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys.xmss");
+        let file: Vec<u8> = (0..3u8)
+            .flat_map(|index| [index; pq::XMSS_CACHE_RECORD_SIZE])
+            .collect();
+        std::fs::write(&path, file).unwrap();
+
+        let source = path.to_str().unwrap().to_string();
+        let records = load_xmss_cache(&node, &keys, source).await;
+        assert_eq!(records.len(), 1);
+        let record = &records[&pubkey(1)];
+        assert_eq!(record.bytes, vec![2; pq::XMSS_CACHE_RECORD_SIZE]);
+        assert_eq!(record.registered[..], pq_entry(2, &ours).1[16..]);
+
+        // A source that cannot be read leaves every key to be built.
+        let gone = directory
+            .path()
+            .join("missing")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(load_xmss_cache(&node, &keys, gone).await.is_empty());
+    }
+
+    /// Nothing is due while the lookahead stays in the trees key derivation
+    /// built; the per-slot tree after slot 4095 comes due once, as soon as
+    /// the lookahead reaches it.
+    #[test]
+    fn the_next_bottom_tree_comes_due_once_ahead_of_its_first_slot() {
+        let mut prepared: std::collections::HashSet<u64> = pq::duty_leaves(0)
+            .into_iter()
+            .map(pq::bottom_tree_of)
+            .collect();
+        let edge = 4096 - BOTTOM_TREE_LOOKAHEAD_SLOTS;
+        assert!(bottom_trees_due(&mut prepared, 0).is_empty());
+        assert!(bottom_trees_due(&mut prepared, edge - 1).is_empty());
+        let due = bottom_trees_due(&mut prepared, edge);
+        assert_eq!(due, vec![pq::slot_leaf(4096, 0)]);
+        assert_ne!(
+            pq::bottom_tree_of(due[0]),
+            pq::bottom_tree_of(pq::slot_leaf(4095, 7))
+        );
+        assert!(bottom_trees_due(&mut prepared, edge + 1).is_empty());
+        assert!(bottom_trees_due(&mut prepared, 4096).is_empty());
+    }
+
+    /// A node that never gives its registry costs the cache, not the start:
+    /// after a bounded wait, every key is built.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_registry_gives_up_after_a_bounded_wait() {
+        let node = MockBeaconNode::default().failing_call("registry", "down");
+        let keys = [(pubkey(1), [1u8; 32])];
+        let started = tokio::time::Instant::now();
+        let records = load_xmss_cache(&node, &keys, "/nonexistent".to_string()).await;
+        assert!(records.is_empty());
+        assert_eq!(started.elapsed(), REGISTRY_RETRY * (REGISTRY_ATTEMPTS - 1));
+    }
 
     fn pubkey(byte: u8) -> BlsPubkey {
         BlsPubkey([byte; 48])
@@ -2470,6 +3028,7 @@ mod tests {
             committees_at_slot: 64,
             validator_committee_index: 0,
             slot: 3200,
+            is_aggregator: None,
         }
     }
 

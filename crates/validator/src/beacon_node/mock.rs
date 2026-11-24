@@ -64,6 +64,8 @@ pub struct MockBeaconNode {
     /// still refuse is exactly "synced, but optimistic".
     pub optimistic: bool,
     pub validators: Vec<ValidatorEntry>,
+    /// What `registry` answers: every entry, pubkeys as a state holds them.
+    pub registry: Vec<(ValidatorIndex, [u8; 48])>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
     /// What `proposer_duties_v2` answers with, by epoch, like `proposers`.
@@ -76,6 +78,10 @@ pub struct MockBeaconNode {
     /// Every proposer preferences batch `submit_proposer_preferences`
     /// received, with the fork it was sent under, in call order.
     pub submitted_preferences: Mutex<Vec<(ForkName, Vec<gloas::SignedProposerPreferences>)>>,
+    /// Every PQ proposer preference `submit_pq_proposer_preferences`
+    /// received, in call order.
+    pub submitted_pq_preferences:
+        Mutex<Vec<ethlambda_types::beacon::containers::pq::SignedProposerPreferences>>,
     /// Proposal slots whose preference the mock refuses, as a node does one it
     /// holds with other content: a call carrying any of them is an `Err` and
     /// records nothing, like the node's 400 for the whole call.
@@ -844,6 +850,11 @@ impl BeaconNodeApi for MockBeaconNode {
         Ok(self.validators.clone())
     }
 
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        self.guard("registry")?;
+        Ok(self.registry.clone())
+    }
+
     async fn attester_duties(
         &self,
         epoch: Epoch,
@@ -1155,6 +1166,63 @@ impl BeaconNodeApi for MockBeaconNode {
             )));
         }
         Ok(Some(data))
+    }
+
+    async fn pq_aggregate(
+        &self,
+        _slot: Slot,
+        _attestation_data_root: Root,
+        _committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        self.guard("pq_aggregate")?;
+        // What a node with nothing to publish for the committee answers.
+        Err(Error::BeaconNodeStatus {
+            status: 404,
+            body: "the mock proves no PQ aggregates".into(),
+        })
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        _aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        self.guard("publish_pq_aggregates")
+    }
+
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        self.guard("submit_pq_proposer_preferences")?;
+        self.submitted_pq_preferences
+            .lock()
+            .expect("lock")
+            .extend(preferences.iter().cloned());
+        Ok(Delivery::Everywhere)
+    }
+
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.guard("submit_pq_payload_attestations")?;
+        Ok(messages.len())
+    }
+
+    async fn produce_pq_block(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &[Root],
+        _graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        self.guard("produce_pq_block")?;
+        Err(Error::InconsistentResponse(
+            "the mock produces no PQ blocks".into(),
+        ))
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, _body: &[u8]) -> Result<()> {
+        self.guard("publish_pq_execution_payload_envelope")
     }
 
     async fn submit_payload_attestations(

@@ -28,7 +28,7 @@
 //!   const-generic bound. The build asserts each one equal in both presets.
 //! - A value they disagree on is a function returning it under
 //!   [`Preset::active`]: `preset::slots_per_epoch()` is `SLOTS_PER_EPOCH`.
-//!   There are 29 of these, every one listed in `per_preset!` below.
+//!   There are 35 of these, every one listed in `per_preset!` below.
 //! - A container bounded by such a value cannot carry the bound as a const
 //!   generic, since it is not known when the crate is compiled. It takes a
 //!   [`Length`] marker instead (`preset::SyncCommitteeSize`), through the
@@ -579,6 +579,99 @@ pub mod mainnet {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // EIP-8483 (consensus-specs `_features/eip8483`)
+    // ================================================================
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.validator_pq_registrations` per payload.
+    pub const MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 1_024;
+
+    /// Bounds `ExecutionRequests.builder_pq_registrations` per payload.
+    pub const MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // ================================================================
+    // PQ (consensus-specs `_features/pq`)
+    // ================================================================
+
+    // --- Misc ---
+
+    /// The PQ fork's cap on a slot's committees, which replaces
+    /// [`MAX_COMMITTEES_PER_SLOT`] in `get_committee_count_per_slot` and
+    /// bounds `Attestation.committee_bits` (`Bitvector<MAX_COMMITTEES_PER_SLOT_PQ>`).
+    /// A quarter of `MAX_COMMITTEES_PER_SLOT`.
+    pub const MAX_COMMITTEES_PER_SLOT_PQ: usize = 16;
+
+    // --- Time parameters ---
+
+    /// Replaces [`MIN_ATTESTATION_INCLUSION_DELAY`] from PQ: a block includes
+    /// attestations from at least two slots before it, which gives the
+    /// proposer a slot to receive aggregates and merge their proofs. The
+    /// timely-head flag needs exactly this delay.
+    pub const MIN_ATTESTATION_INCLUSION_DELAY_PQ: u64 = 2;
+
+    // --- XMSS ---
+
+    /// Bounds `AttestationProof` (`ByteList<MAX_STARK_PROOF_SIZE>`). A
+    /// placeholder for a STARK's size: the reference concatenation fits
+    /// `MAX_STARK_PROOF_SIZE / XMSS_SIGNATURE_SIZE` signatures.
+    pub const MAX_STARK_PROOF_SIZE: usize = 1_048_576;
+
+    // --- Max operations per block ---
+
+    /// Replaces [`MAX_ATTESTATIONS_ELECTRA`] as the PQ block's attestation cap.
+    pub const MAX_ATTESTATIONS_PQ: u64 = 16;
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.validator_preregistrations` per payload.
+    pub const MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 64;
+
+    /// Bounds `ExecutionRequests.builder_preregistrations` per payload.
+    pub const MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 4;
+
+    /// Bounds `ExecutionRequests.voluntary_exits` per payload.
+    pub const MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // --- Type-specific SSZ bounds ---
+
+    /// The largest SSZ encoding of a PQ `SignedAggregateAndProof`: a
+    /// `MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT_PQ`-bit
+    /// aggregate and a `MAX_STARK_PROOF_SIZE` proof. follows
+    /// `MAX_COMMITTEES_PER_SLOT_PQ`.
+    pub const MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ: usize = 1_055_231;
+
+    /// The largest SSZ encoding of a PQ `AttesterSlashing`: two indexed
+    /// attestations, each naming `MAX_VALIDATORS_PER_COMMITTEE *
+    /// MAX_COMMITTEES_PER_SLOT_PQ` attesters with a `MAX_STARK_PROOF_SIZE`
+    /// proof. follows `MAX_COMMITTEES_PER_SLOT_PQ`.
+    pub const MAX_ATTESTER_SLASHING_SIZE_PQ: usize = 2_621_720;
+
+    /// The largest SSZ encoding of a PQ `SignedExecutionPayloadBid`:
+    /// `MAX_BLOB_COMMITMENTS_PER_BLOCK` commitments and an XMSS signature.
+    pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ: usize = 199_240;
+
+    /// How many active preregistrations of one kind the state admits.
+    /// From `presets/mainnet/eip8205.yaml`: the PQ preset file does not list
+    /// it, and the specification's build loads every preset file of the
+    /// directory.
+    pub const PREREGISTRATIONS_LIMIT: u64 = 524_288;
+
+    /// How long a preregistration binds its key, in slots from the slot it was
+    /// stored at. From `presets/mainnet/eip8205.yaml`: the PQ preset file does not list
+    /// it, and the specification's build loads every preset file of the
+    /// directory.
+    pub const PREREGISTRATION_EXPIRY_SLOTS: u64 = 262_144;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the length of
+    /// `BeaconState.aggregation_committee_window`: the aggregation committees
+    /// of the previous, current, and lookahead epochs.
+    pub const AGGREGATION_COMMITTEE_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1087,6 +1180,99 @@ pub mod minimal {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // EIP-8483 (consensus-specs `_features/eip8483`)
+    // ================================================================
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.validator_pq_registrations` per payload.
+    pub const MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 1_024;
+
+    /// Bounds `ExecutionRequests.builder_pq_registrations` per payload.
+    pub const MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // ================================================================
+    // PQ (consensus-specs `_features/pq`)
+    // ================================================================
+
+    // --- Misc ---
+
+    /// The PQ fork's cap on a slot's committees, which replaces
+    /// [`MAX_COMMITTEES_PER_SLOT`] in `get_committee_count_per_slot` and
+    /// bounds `Attestation.committee_bits` (`Bitvector<MAX_COMMITTEES_PER_SLOT_PQ>`).
+    /// `[customized]`: minimal's `MAX_COMMITTEES_PER_SLOT` is 4 too.
+    pub const MAX_COMMITTEES_PER_SLOT_PQ: usize = 4;
+
+    // --- Time parameters ---
+
+    /// Replaces [`MIN_ATTESTATION_INCLUSION_DELAY`] from PQ: a block includes
+    /// attestations from at least two slots before it, which gives the
+    /// proposer a slot to receive aggregates and merge their proofs. The
+    /// timely-head flag needs exactly this delay.
+    pub const MIN_ATTESTATION_INCLUSION_DELAY_PQ: u64 = 2;
+
+    // --- XMSS ---
+
+    /// Bounds `AttestationProof` (`ByteList<MAX_STARK_PROOF_SIZE>`). A
+    /// placeholder for a STARK's size: the reference concatenation fits
+    /// `MAX_STARK_PROOF_SIZE / XMSS_SIGNATURE_SIZE` signatures.
+    pub const MAX_STARK_PROOF_SIZE: usize = 1_048_576;
+
+    // --- Max operations per block ---
+
+    /// Replaces [`MAX_ATTESTATIONS_ELECTRA`] as the PQ block's attestation cap.
+    pub const MAX_ATTESTATIONS_PQ: u64 = 16;
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.validator_preregistrations` per payload.
+    pub const MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 64;
+
+    /// Bounds `ExecutionRequests.builder_preregistrations` per payload.
+    pub const MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64 = 4;
+
+    /// Bounds `ExecutionRequests.voluntary_exits` per payload.
+    pub const MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // --- Type-specific SSZ bounds ---
+
+    /// The largest SSZ encoding of a PQ `SignedAggregateAndProof`: a
+    /// `MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT_PQ`-bit
+    /// aggregate and a `MAX_STARK_PROOF_SIZE` proof. `[customized]`: follows
+    /// `MAX_COMMITTEES_PER_SLOT_PQ`.
+    pub const MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ: usize = 1_052_158;
+
+    /// The largest SSZ encoding of a PQ `AttesterSlashing`: two indexed
+    /// attestations, each naming `MAX_VALIDATORS_PER_COMMITTEE *
+    /// MAX_COMMITTEES_PER_SLOT_PQ` attesters with a `MAX_STARK_PROOF_SIZE`
+    /// proof. `[customized]`: follows `MAX_COMMITTEES_PER_SLOT_PQ`.
+    pub const MAX_ATTESTER_SLASHING_SIZE_PQ: usize = 2_228_504;
+
+    /// The largest SSZ encoding of a PQ `SignedExecutionPayloadBid`:
+    /// `MAX_BLOB_COMMITMENTS_PER_BLOCK` commitments and an XMSS signature.
+    pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ: usize = 199_240;
+
+    /// How many active preregistrations of one kind the state admits.
+    /// `[customized]`, from `presets/minimal/eip8205.yaml`: the PQ preset file
+    /// does not list it, and the specification's build loads every preset
+    /// file of the directory.
+    pub const PREREGISTRATIONS_LIMIT: u64 = 64;
+
+    /// How long a preregistration binds its key, in slots from the slot it was
+    /// stored at. `[customized]`, from `presets/minimal/eip8205.yaml`: the PQ preset file
+    /// does not list it, and the specification's build loads every preset
+    /// file of the directory.
+    pub const PREREGISTRATION_EXPIRY_SLOTS: u64 = 64;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the length of
+    /// `BeaconState.aggregation_committee_window`: the aggregation committees
+    /// of the previous, current, and lookahead epochs.
+    pub const AGGREGATION_COMMITTEE_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
 }
 
 // ================================================================
@@ -1375,6 +1561,15 @@ shared! {
     MAX_PAYLOAD_ATTESTATIONS: u64,
     MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64,
     MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MIN_ATTESTATION_INCLUSION_DELAY_PQ: u64,
+    MAX_STARK_PROOF_SIZE: usize,
+    MAX_ATTESTATIONS_PQ: u64,
+    MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: u64,
+    MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ: usize,
 }
 
 // ================================================================
@@ -1438,6 +1633,12 @@ per_preset! {
     max_builders_per_withdrawals_sweep => MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64,
     ptc_window_length => PTC_WINDOW_LENGTH: usize,
     builder_pending_payments_length => BUILDER_PENDING_PAYMENTS_LENGTH: usize,
+    max_committees_per_slot_pq => MAX_COMMITTEES_PER_SLOT_PQ: usize,
+    max_signed_aggregate_and_proof_size_pq => MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ: usize,
+    max_attester_slashing_size_pq => MAX_ATTESTER_SLASHING_SIZE_PQ: usize,
+    preregistrations_limit => PREREGISTRATIONS_LIMIT: u64,
+    preregistration_expiry_slots => PREREGISTRATION_EXPIRY_SLOTS: u64,
+    aggregation_committee_window_length => AGGREGATION_COMMITTEE_WINDOW_LENGTH: usize,
 }
 
 // ================================================================
@@ -1483,6 +1684,8 @@ length_markers! {
     PtcSize => ptc_size,
     PtcWindowLength => ptc_window_length,
     BuilderPendingPaymentsLength => builder_pending_payments_length,
+    MaxCommitteesPerSlotPq => max_committees_per_slot_pq,
+    AggregationCommitteeWindowLength => aggregation_committee_window_length,
 }
 
 /// Preset values that a later fork retunes without changing any container's
@@ -1547,7 +1750,9 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("proportional_slashing_multiplier"),
         }
     }
@@ -1569,9 +1774,11 @@ pub mod retuned {
             ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
-                super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
             ForkName::Lean => lean_fork_unreachable("min_slashing_penalty_quotient"),
         }
     }
@@ -1585,9 +1792,11 @@ pub mod retuned {
     /// small one.
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
-            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
-                super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
-            }
+            ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq => super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -1613,7 +1822,9 @@ pub mod retuned {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
             ForkName::Lean => lean_fork_unreachable("inactivity_penalty_quotient"),
         }
     }
@@ -2031,5 +2242,49 @@ mod tests {
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
             PAYLOAD_TIMELY_THRESHOLD, DATA_AVAILABILITY_TIMELY_THRESHOLD,
         );
+
+        in_both!(u64:
+            MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+            MAX_BUILDER_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+        );
+        in_both!(usize:
+            MAX_COMMITTEES_PER_SLOT_PQ, MAX_STARK_PROOF_SIZE, AGGREGATION_COMMITTEE_WINDOW_LENGTH,
+            MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ, MAX_ATTESTER_SLASHING_SIZE_PQ,
+            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ,
+        );
+        in_both!(u64:
+            MAX_ATTESTATIONS_PQ, MIN_ATTESTATION_INCLUSION_DELAY_PQ,
+            MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+            MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD, MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD,
+            PREREGISTRATIONS_LIMIT, PREREGISTRATION_EXPIRY_SLOTS,
+        );
+    }
+
+    /// The PQ preset's values, pinned from `presets/{mainnet,minimal}/pq.yaml`,
+    /// `eip8483.yaml` and `eip8205.yaml` at consensus-specs' `pq` pin
+    /// `2f43bc0f989f47af81df390a90bc1f78e2436323`.
+    #[test]
+    fn pq_pinned_values() {
+        assert_eq!(mainnet::MAX_COMMITTEES_PER_SLOT_PQ, 16);
+        assert_eq!(minimal::MAX_COMMITTEES_PER_SLOT_PQ, 4);
+        assert_eq!(mainnet::MIN_ATTESTATION_INCLUSION_DELAY_PQ, 2);
+        assert_eq!(minimal::MIN_ATTESTATION_INCLUSION_DELAY_PQ, 2);
+        assert_eq!(mainnet::PREREGISTRATIONS_LIMIT, 1 << 19);
+        assert_eq!(minimal::PREREGISTRATIONS_LIMIT, 64);
+        assert_eq!(mainnet::PREREGISTRATION_EXPIRY_SLOTS, 1 << 18);
+        assert_eq!(minimal::PREREGISTRATION_EXPIRY_SLOTS, 64);
+        assert_eq!(mainnet::MAX_STARK_PROOF_SIZE, 1 << 20);
+        assert_eq!(
+            mainnet::MAX_VALIDATOR_PQ_REGISTRATION_REQUESTS_PER_PAYLOAD,
+            1 << 10
+        );
+        assert_eq!(mainnet::AGGREGATION_COMMITTEE_WINDOW_LENGTH, 96);
+        assert_eq!(minimal::AGGREGATION_COMMITTEE_WINDOW_LENGTH, 24);
+        assert_eq!(mainnet::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ, 1_055_231);
+        assert_eq!(minimal::MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ, 1_052_158);
+        assert_eq!(mainnet::MAX_ATTESTER_SLASHING_SIZE_PQ, 2_621_720);
+        assert_eq!(minimal::MAX_ATTESTER_SLASHING_SIZE_PQ, 2_228_504);
+        assert_eq!(mainnet::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ, 199_240);
+        assert_eq!(minimal::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ, 199_240);
     }
 }

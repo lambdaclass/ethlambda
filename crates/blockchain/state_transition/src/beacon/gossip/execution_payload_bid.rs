@@ -31,19 +31,70 @@ use super::{
     IgnoreReason, Outcome, RejectReason, is_current_slot, is_gloas_slot,
     proposer_preferences::dependent_root_at,
 };
-use crate::beacon::builder_market::{BuilderMarket, KnownPayload};
+use crate::beacon::builder_market::{BuilderMarket, KnownPayload, SignedBid, SignedPreferences};
 use crate::beacon::config::Config;
 use crate::beacon::constants::PAYLOAD_BUILDER_VERSION;
-use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas, pq};
 use crate::beacon::fork_choice::{self, ForkChoiceNode, PayloadStatus, Store};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
 use crate::beacon::helpers::gloas::{can_builder_cover_bid, is_active_builder};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::lean_boundary::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot};
+use crate::beacon::primitives::{BlsPubkey, Epoch, ExecutionBlockHash, Root, Slot};
 use crate::beacon::stf;
-use crate::beacon::stf::gloas::verify_execution_payload_bid_signature;
+
+/// What a bid's rules need from its fork beyond the shared message: which
+/// state shape judges it, how an exit request names a builder, and the
+/// signature. Gloas's bid is BLS-signed, PQ's XMSS-signed
+/// (`specs/_features/pq/p2p-interface.md`'s modified `execution_payload_bid`).
+pub trait BidRules: SignedBid {
+    /// Whether `state` holds the registry this bid is judged against.
+    fn judged_by(state: &BeaconState) -> bool;
+    /// Whether an exit request for `request_pubkey` exits the builder whose
+    /// registry key is `builder_pubkey`.
+    fn exit_names(request_pubkey: &BlsPubkey, builder_pubkey: &BlsPubkey) -> bool;
+    /// The builder's signature over the bid, against `state`'s registry.
+    fn signature_valid(&self, state: &BeaconState) -> bool;
+}
+
+impl BidRules for gloas::SignedExecutionPayloadBid {
+    fn judged_by(state: &BeaconState) -> bool {
+        matches!(state, BeaconState::Gloas(_))
+    }
+
+    fn exit_names(request_pubkey: &BlsPubkey, builder_pubkey: &BlsPubkey) -> bool {
+        request_pubkey == builder_pubkey
+    }
+
+    fn signature_valid(&self, state: &BeaconState) -> bool {
+        matches!(
+            stf::gloas::verify_execution_payload_bid_signature(state, self),
+            Ok(true)
+        )
+    }
+}
+
+impl BidRules for pq::SignedExecutionPayloadBid {
+    fn judged_by(state: &BeaconState) -> bool {
+        matches!(state, BeaconState::Pq(_))
+    }
+
+    /// `[Modified in PQ]` `XMSSPubkey(request.pubkey[16:]) == builder.pubkey`.
+    /// The state holds a PQ builder's key in the 48-byte request form, so its
+    /// last 32 bytes are the key; the request's first 16 are not compared.
+    fn exit_names(request_pubkey: &BlsPubkey, builder_pubkey: &BlsPubkey) -> bool {
+        request_pubkey.0[16..] == builder_pubkey.0[16..]
+    }
+
+    /// `[Modified in PQ]` an XMSS signature at a bid leaf.
+    fn signature_valid(&self, state: &BeaconState) -> bool {
+        matches!(
+            stf::pq::verify_execution_payload_bid_signature(state, self),
+            Ok(true)
+        )
+    }
+}
 
 /// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`.
 pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
@@ -78,13 +129,13 @@ pub(crate) fn is_current_or_next_slot(config: &Config, slot: Slot, now_ms: u64) 
 
 /// The rules that read only the message, the market's seen state and the
 /// clock.
-pub fn cheap_checks(
-    market: &BuilderMarket,
+pub fn cheap_checks<B: SignedBid, P: SignedPreferences>(
+    market: &BuilderMarket<B, P>,
     store: &Store,
-    signed: &gloas::SignedExecutionPayloadBid,
+    signed: &B,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    let bid = &signed.message;
+    let bid = signed.message();
     let config = store.config();
     // [IGNORE] The first bid for this slot, parent and builder, and [IGNORE]
     // the highest value seen for the slot and parent.
@@ -138,7 +189,11 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
             let header = &s.latest_execution_payload_header;
             Some((header.block_hash, header.gas_limit))
         }
-        BeaconState::Phase0(_) | BeaconState::Altair(_) | BeaconState::Gloas(_) => None,
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Gloas(_)
+        | BeaconState::Eip8483(_)
+        | BeaconState::Pq(_) => None,
         BeaconState::Lean(_) => lean_state_unreachable("execution_payload_bid::pre_gloas_payload"),
     }
 }
@@ -171,43 +226,59 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
         _ => fork_choice::get_head_node(store, &config).map_err(|_| internal())?,
     };
     if let Some(state) = store.cached_state(CacheKey::BlockState(node.root)) {
-        return match &*state {
-            BeaconState::Gloas(inner) => Ok(HeadView::Gloas {
+        // A head of gloas or a fork built on it carries the bid its payload
+        // facts are read from, so a PQ bid is judged against a PQ head.
+        if let Some(inner) = state.gloas_family() {
+            return Ok(HeadView::Gloas {
                 node,
                 parent_root: inner.latest_block_header.parent_root,
                 bid_parent_hash: inner.latest_execution_payload_bid.parent_block_hash,
                 bid_block_hash: inner.latest_execution_payload_bid.block_hash,
+            });
+        }
+        return match pre_gloas_payload(&state) {
+            Some((block_hash, _)) => Ok(HeadView::PreGloas {
+                root: node.root,
+                block_hash,
             }),
-            other => match pre_gloas_payload(other) {
-                Some((block_hash, _)) => Ok(HeadView::PreGloas {
-                    root: node.root,
-                    block_hash,
-                }),
-                None => Err(Outcome::Ignore(IgnoreReason::NotOnHeadBranch)),
-            },
+            None => Err(Outcome::Ignore(IgnoreReason::NotOnHeadBranch)),
         };
     }
     let block = store
         .get_signed_block(&node.root)
         .map_err(|_| internal())?
         .ok_or(Outcome::Ignore(IgnoreReason::StateUnavailable))?;
-    match block {
-        SignedBeaconBlock::Gloas(block) => {
-            let bid = &block.message.body.signed_execution_payload_bid.message;
-            Ok(HeadView::Gloas {
-                node,
-                parent_root: block.message.parent_root,
-                bid_parent_hash: bid.parent_block_hash,
-                bid_block_hash: bid.block_hash,
-            })
-        }
-        other => match other.execution_block_hash() {
-            Some(block_hash) => Ok(HeadView::PreGloas {
-                root: node.root,
-                block_hash,
-            }),
-            None => Err(Outcome::Ignore(IgnoreReason::NotOnHeadBranch)),
-        },
+    // Every gloas-family block's bid message is gloas's, whatever its
+    // signature.
+    let bid = match &block {
+        SignedBeaconBlock::Gloas(block) => Some((
+            block.message.parent_root,
+            &block.message.body.signed_execution_payload_bid.message,
+        )),
+        SignedBeaconBlock::Eip8483(block) => Some((
+            block.message.parent_root,
+            &block.message.body.signed_execution_payload_bid.message,
+        )),
+        SignedBeaconBlock::Pq(block) => Some((
+            block.message.parent_root,
+            &block.message.body.signed_execution_payload_bid.message,
+        )),
+        _ => None,
+    };
+    if let Some((parent_root, bid)) = bid {
+        return Ok(HeadView::Gloas {
+            node,
+            parent_root,
+            bid_parent_hash: bid.parent_block_hash,
+            bid_block_hash: bid.block_hash,
+        });
+    }
+    match block.execution_block_hash() {
+        Some(block_hash) => Ok(HeadView::PreGloas {
+            root: node.root,
+            block_hash,
+        }),
+        None => Err(Outcome::Ignore(IgnoreReason::NotOnHeadBranch)),
     }
 }
 
@@ -283,9 +354,9 @@ pub(crate) fn cached_checkpoint_state(
 /// The exits a parent payload carried, for rule 21: the market's known payload
 /// when it is the parent block's own, else the verified envelope in the store.
 /// `None` when neither is available.
-fn parent_payload_exits(
+fn parent_payload_exits<B: SignedBid, P: SignedPreferences>(
     store: &Store,
-    market: &BuilderMarket,
+    market: &BuilderMarket<B, P>,
     bid: &gloas::ExecutionPayloadBid,
 ) -> Option<
     Vec<(
@@ -302,9 +373,12 @@ fn parent_payload_exits(
     {
         return Some(builder_exits);
     }
+    // A gloas bid's parent payload is a gloas envelope: the later forks'
+    // bids are judged against their own markets.
     let envelope = store
         .get_execution_payload_envelope(&bid.parent_block_root)
         .ok()??;
+    let envelope = envelope.as_gloas()?;
     Some(
         envelope
             .message
@@ -317,10 +391,10 @@ fn parent_payload_exits(
 }
 
 /// The rules that need states, then the signature. Runs on a blocking thread.
-pub fn stateful_checks(
+pub fn stateful_checks<B: BidRules, P: SignedPreferences>(
     store: &Store,
-    market: &BuilderMarket,
-    signed: &gloas::SignedExecutionPayloadBid,
+    market: &BuilderMarket<B, P>,
+    signed: &B,
 ) -> Outcome {
     match stateful_rules(store, market, signed) {
         Ok(()) => Outcome::Accept,
@@ -328,12 +402,12 @@ pub fn stateful_checks(
     }
 }
 
-fn stateful_rules(
+fn stateful_rules<B: BidRules, P: SignedPreferences>(
     store: &Store,
-    market: &BuilderMarket,
-    signed: &gloas::SignedExecutionPayloadBid,
+    market: &BuilderMarket<B, P>,
+    signed: &B,
 ) -> Result<(), Outcome> {
-    let bid = &signed.message;
+    let bid = signed.message();
     let ignore = |reason| Outcome::Ignore(reason);
     let reject = |reason| Outcome::Reject(reason);
     let proposal_epoch = compute_epoch_at_slot(bid.slot);
@@ -364,7 +438,8 @@ fn stateful_rules(
     let preferences = market
         .preferences(bid.slot, dependent_root)
         .ok_or(ignore(IgnoreReason::PreferencesUnseen))?
-        .message;
+        .message()
+        .clone();
     // [IGNORE] The fee recipient matches the proposer's preference.
     if bid.fee_recipient != preferences.fee_recipient {
         return Err(ignore(IgnoreReason::FeeRecipientMismatch));
@@ -403,11 +478,16 @@ fn stateful_rules(
         cached_checkpoint_state(store, proposal_epoch, bid.parent_block_root)
             .ok_or(ignore(IgnoreReason::StateUnavailable))?
     };
-    let BeaconState::Gloas(inner) = &*state else {
-        // A bid in a gloas epoch is advanced into gloas by the epoch
-        // transition; anything else is a state this cannot judge.
+    // A bid in a gloas epoch is advanced into gloas by the epoch transition,
+    // and a PQ bid's into PQ; anything else is a state this cannot judge.
+    // EIP-8483's states are left out: its parent envelopes are not gloas's
+    // shape, which the builder-exit rule below reads.
+    if !B::judged_by(&state) {
         return Err(ignore(IgnoreReason::StateUnavailable));
-    };
+    }
+    let inner = state
+        .gloas_family()
+        .expect("a state a bid is judged by is gloas or PQ");
 
     // [REJECT] The builder index is valid, [REJECT] it is a payload builder
     // and [REJECT] active.
@@ -418,31 +498,31 @@ fn stateful_rules(
     if builder.version != PAYLOAD_BUILDER_VERSION {
         return Err(reject(RejectReason::NotPayloadBuilder));
     }
-    if !is_active_builder(inner, bid.builder_index).unwrap_or(false) {
+    if !is_active_builder(&inner, bid.builder_index).unwrap_or(false) {
         return Err(reject(RejectReason::InactiveBuilder));
     }
     // [IGNORE] The builder can cover the bid.
-    if !can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false) {
+    if !can_builder_cover_bid(&inner, bid.builder_index, bid.value).unwrap_or(false) {
         return Err(ignore(IgnoreReason::BuilderCannotCover));
     }
     // [IGNORE] The parent's payload does not try to exit the builder. Only a
-    // gloas parent has an envelope to carry the request.
-    let parent_is_gloas = matches!(&*parent_state, BeaconState::Gloas(_));
-    if parent_is_gloas && bid.parent_block_hash == inner.latest_execution_payload_bid.block_hash {
+    // parent of the bid's own fork has an envelope to carry the request. A
+    // PQ parent's envelope is never recorded (the node does not follow PQ),
+    // so a PQ bid on one ends here as unverified.
+    let parent_has_envelope = B::judged_by(&parent_state);
+    if parent_has_envelope && bid.parent_block_hash == inner.latest_execution_payload_bid.block_hash
+    {
         let exits = parent_payload_exits(store, market, bid)
             .ok_or(ignore(IgnoreReason::ParentPayloadUnverified))?;
         if exits.iter().any(|(pubkey, source)| {
-            *pubkey == builder.pubkey && *source == builder.execution_address
+            B::exit_names(pubkey, &builder.pubkey) && *source == builder.execution_address
         }) {
             return Err(ignore(IgnoreReason::BuilderMayExit));
         }
     }
     // [REJECT] The signature is valid. An error (an index the state lacks)
     // is a signature that cannot be.
-    if !matches!(
-        verify_execution_payload_bid_signature(&state, signed),
-        Ok(true)
-    ) {
+    if !signed.signature_valid(&state) {
         return Err(reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -450,10 +530,10 @@ fn stateful_rules(
 
 /// Both halves. The caller records the bid on `Accept`: the specification's
 /// `validate_execution_payload_bid_gossip`.
-pub fn validate(
-    market: &BuilderMarket,
+pub fn validate<B: BidRules, P: SignedPreferences>(
+    market: &BuilderMarket<B, P>,
     store: &Store,
-    signed: &gloas::SignedExecutionPayloadBid,
+    signed: &B,
     now_ms: u64,
 ) -> Outcome {
     if let Err(outcome) = cheap_checks(market, store, signed, now_ms) {
@@ -736,7 +816,7 @@ mod tests {
     #[test]
     fn a_bid_without_preferences_is_ignored() {
         let scene = scene();
-        let empty = BuilderMarket::default();
+        let empty: BuilderMarket = BuilderMarket::default();
         assert_eq!(
             stateful_checks(&scene.store, &empty, &scene.bid),
             ignore(IgnoreReason::PreferencesUnseen)
@@ -1047,7 +1127,7 @@ mod tests {
         store.set_head_payload_status(parent, PayloadStatus::Empty);
 
         let slot = 2 * slots_per_epoch();
-        let market = BuilderMarket::default();
+        let market: BuilderMarket = BuilderMarket::default();
         let proposer = fixed_proposer(&state, slot).expect("in the window");
         let dependent_root = dependent_root_at(&state, parent, slot).expect("in the window");
         let preferences = sign_preferences(

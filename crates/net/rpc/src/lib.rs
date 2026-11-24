@@ -7,7 +7,8 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::{SharedBuilderMarket, SharedPqBuilderMarket},
+    payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
@@ -279,6 +280,9 @@ pub struct BeaconApiHandles {
     /// Bids, proposer preferences and known payloads: filled by the bid and
     /// preferences endpoints and by gossip, read by block production.
     pub builder_market: SharedBuilderMarket,
+    /// The PQ fork's bids and proposer preferences, shared with gossip
+    /// validation: filled by the preferences endpoint and by gossip.
+    pub pq_builder_market: SharedPqBuilderMarket,
     /// Filled by gossip and the sync committee endpoints, read by block
     /// production and the contribution endpoint.
     pub sync_committee_pool: SharedSyncCommitteePool,
@@ -334,11 +338,13 @@ pub async fn start_beacon_rpc_server(
             sync_status.clone(),
         ))
     });
+    beacon::pq_aggregation::spawn(store.clone(), shutdown.clone());
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.payload_attestation_pool))
         .layer(Extension(handles.builder_market))
+        .layer(Extension(handles.pq_builder_market))
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(handles.fee_recipients))
@@ -560,6 +566,7 @@ pub(crate) mod test_utils {
         pub(crate) operations:
             std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
+        pub(crate) pq_subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
         pub(crate) sidecars:
@@ -596,6 +603,13 @@ pub(crate) mod test_utils {
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
+        fn publish_pq_gossip(
+            &self,
+            _object: ethlambda_network_api::PqGossipObject,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
         fn publish_beacon_attestation(
             &self,
             subnet_id: u64,
@@ -642,6 +656,14 @@ pub(crate) mod test_utils {
             Ok(())
         }
 
+        fn subscribe_pq_attestation_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.pq_subscriptions.lock().unwrap().extend(subnets);
+            Ok(())
+        }
+
         fn publish_beacon_block(
             &self,
             block: ethlambda_types::beacon::containers::SignedBeaconBlock,
@@ -654,12 +676,14 @@ pub(crate) mod test_utils {
 
         fn publish_execution_payload_envelope(
             &self,
-            envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
+            envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
             sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            let envelope = envelope
+                .as_gloas()
+                .expect("the rpc tests publish gloas envelopes")
+                .clone();
+            self.envelopes.lock().unwrap().push((envelope, sidecars));
             Ok(())
         }
 

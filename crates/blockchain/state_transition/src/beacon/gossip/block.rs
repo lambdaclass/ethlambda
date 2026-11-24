@@ -28,6 +28,13 @@ pub fn cheap_checks(
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
+    if !block.fork_name().is_followed() {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
+    // PQ's rules: gloas's with its own operation and request limits.
+    if let SignedBeaconBlock::Pq(pq_block) = block {
+        return super::pq::block_cheap_checks(seen, store, pq_block, now_ms);
+    }
     if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
         return cheap_checks_gloas(seen, store, gloas_block, now_ms);
     }
@@ -71,6 +78,10 @@ fn as_gloas<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_) => None,
+        // Not followed (`ForkName::is_followed`): `cheap_checks` ignores
+        // their blocks before any rule reads them. PQ's rules are
+        // `super::pq::block_cheap_checks`.
+        SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => None,
         SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
     }
 }
@@ -140,7 +151,9 @@ fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
 /// rebuild the state from diffs, which is far too slow for a verdict that
 /// gossipsub waits on. A miss queues the block instead.
 pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Root) -> Outcome {
-    let gloas_block = as_gloas(block, "block::stateful_checks");
+    // Gloas and the feature forks built on it (EIP-8483, PQ) share the
+    // payload-envelope rules: they read only the bid and the parent.
+    let bid = payload_bid(block);
     let config = store.config();
     let parent_root = block.parent_root();
     let parent_known = store.has_block(&parent_root);
@@ -168,7 +181,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     }
     // The parent's fullness is read once: it decodes the parent block, which
     // the bounded validation pool should not do twice.
-    let parent_full = if gloas_block.is_some() {
+    let parent_full = if bid.is_some() {
         match fork_choice::is_parent_node_full(store, block) {
             Ok(full) => full,
             Err(err) => {
@@ -194,12 +207,7 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     if let Err(outcome @ Outcome::Reject(_)) = ancestry {
         return outcome;
     }
-    if let Some(gloas_block) = gloas_block {
-        let bid = &gloas_block
-            .message
-            .body
-            .signed_execution_payload_bid
-            .message;
+    if let Some(bid) = bid {
         // [REJECT] The bid's parent equals the block's parent.
         if bid.parent_block_root != parent_root {
             return Outcome::Reject(RejectReason::BidParentMismatch);
@@ -256,11 +264,37 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     Outcome::Accept
 }
 
+/// The execution payload bid of a block of gloas or a feature fork built on
+/// it, or `None` for an earlier fork.
+fn payload_bid(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPayloadBid> {
+    match block {
+        SignedBeaconBlock::Gloas(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Eip8483(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Pq(inner) => {
+            Some(&inner.message.body.signed_execution_payload_bid.message)
+        }
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => None,
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("block::payload_bid"),
+    }
+}
+
 /// `state.latest_block_hash`, for a gloas state. `None` for an earlier fork,
 /// which has none: its parent counts as full, so no caller asks.
 fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
     match state {
-        BeaconState::Gloas(state) => Some(state.latest_block_hash),
+        BeaconState::Gloas(_) | BeaconState::Eip8483(_) | BeaconState::Pq(_) => {
+            state.gloas_family().map(|inner| *inner.latest_block_hash)
+        }
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)

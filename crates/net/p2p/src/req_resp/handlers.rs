@@ -1772,7 +1772,7 @@ fn range_needs_columns(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra => false,
-        ForkName::Fulu | ForkName::Gloas => true,
+        ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => true,
         ForkName::Lean => {
             unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
         }
@@ -3745,12 +3745,14 @@ pub(crate) mod tests {
             )),
             payload_attestation_pool: Default::default(),
             builder_market: Default::default(),
+            pq_builder_market: Default::default(),
             builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            aggregator_subnets_pq: HashMap::new(),
             peer_scoring: None,
         }
     }

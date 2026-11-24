@@ -50,9 +50,9 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishPayloadAttestationMessage, PublishPqGossip, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
-        SubscribeSyncCommitteeSubnets,
+        SubscribePqAttestationSubnets, SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::max_aggregates_per_slot;
@@ -66,7 +66,8 @@ use ethlambda_state_transition::beacon::gossip::{
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
 use ethlambda_state_transition::beacon::{
-    builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
+    builder_market::{SharedBuilderMarket, SharedPqBuilderMarket},
+    payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
@@ -1461,7 +1462,11 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 beacon.fork,
                 beacon.fork_digest,
                 &column_subnets,
-                &beacon.attestation_subnets,
+                beacon::topics::backbone_subnets(
+                    beacon.fork,
+                    &beacon.attestation_subnets,
+                    &beacon.attestation_subnets_pq,
+                ),
             );
             for topic in &topics.topics {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
@@ -1498,6 +1503,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
+                attestation_subnets_pq: beacon.attestation_subnets_pq,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
                 metadata: MetaDataController::default(),
             };
@@ -1553,6 +1559,7 @@ impl P2P {
         discovery: Option<DiscoverySpawnConfig>,
         payload_attestation_pool: SharedPayloadAttestationPool,
         builder_market: SharedBuilderMarket,
+        pq_builder_market: SharedPqBuilderMarket,
         sync_committee_pool: SharedSyncCommitteePool,
         gossip_events: Option<Arc<dyn GossipEventSink>>,
     ) -> Result<P2P, DiscoveryError> {
@@ -1583,10 +1590,9 @@ impl P2P {
             .wire
             .beacon()
             .map_or(0, |beacon| beacon.attestation_subnets.len());
-        let peer_scoring = built
-            .wire
-            .beacon()
-            .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest));
+        let peer_scoring = built.wire.beacon().map(|beacon| {
+            beacon::scoring::PeerScoring::new(&beacon.config, beacon.fork_digest, beacon.fork)
+        });
         let local_metadata = built.wire.beacon().map(|beacon| beacon.metadata.clone());
         let first_status_refresh = status_refresh_tick(&store);
         let peer_table = PeerTableController::default();
@@ -1644,12 +1650,14 @@ impl P2P {
             )),
             payload_attestation_pool,
             builder_market,
+            pq_builder_market,
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool,
             gossip_events,
             aggregator_subnets: HashMap::new(),
+            aggregator_subnets_pq: HashMap::new(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
@@ -1868,6 +1876,10 @@ pub struct P2PServer {
     /// Gossip's stateful checks read it from blocking threads, so it cannot
     /// live in the chain actor; lean never touches it.
     pub(crate) builder_market: SharedBuilderMarket,
+    /// The PQ fork's bids and preferences, kept apart from
+    /// [`Self::builder_market`]: they carry XMSS signatures, and block
+    /// production must never read one. Only gossip touches it.
+    pub(crate) pq_builder_market: SharedPqBuilderMarket,
     /// Permits for `execution_payload_bid` and `proposer_preferences` stateful
     /// checks, see [`BUILDER_VALIDATION_PERMITS`].
     pub(crate) builder_validation_permits: Arc<tokio::sync::Semaphore>,
@@ -1886,6 +1898,11 @@ pub struct P2PServer {
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// [`Self::aggregator_subnets`] for PQ slots: among PQ's 16 subnets, and
+    /// joined under PQ digests only, where the other map is joined under
+    /// every other digest.
+    pub(crate) aggregator_subnets_pq: HashMap<u64, u64>,
 
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
@@ -2276,6 +2293,12 @@ impl Handler<PublishBeaconOperation> for P2PServer {
     }
 }
 
+impl Handler<PublishPqGossip> for P2PServer {
+    async fn handle(&mut self, msg: PublishPqGossip, _ctx: &Context<Self>) {
+        beacon::pq::publish_pq_gossip(self, msg.object);
+    }
+}
+
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
         publish_beacon_block(self, msg.block, msg.sidecars).await;
@@ -2309,6 +2332,12 @@ impl Handler<PublishPayloadAttestationMessage> for P2PServer {
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<SubscribePqAttestationSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribePqAttestationSubnets, _ctx: &Context<Self>) {
+        gossipsub::join_pq_aggregator_subnets(self, msg.subnets);
     }
 }
 
@@ -3918,9 +3947,22 @@ pub(crate) mod test_support {
         }
         fn new_execution_payload_envelope(
             &self,
-            _envelope: Box<
-                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
-            >,
+            _envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
+            _arrival: ethlambda_network_api::BlockArrival,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_pq_aggregate(
+            &self,
+            _data: ethlambda_types::beacon::containers::AttestationData,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: ethlambda_network_api::AggregateArrival,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_pq_payload_attestation_message(
+            &self,
+            _message: Box<ethlambda_types::beacon::containers::pq::PayloadAttestationMessage>,
             _arrival: ethlambda_network_api::BlockArrival,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             Ok(())
@@ -4011,6 +4053,7 @@ pub(crate) mod test_support {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                attestation_subnets_pq: Vec::new(),
             })),
         })
         .expect("swarm builds");
@@ -4137,12 +4180,14 @@ pub(crate) mod test_support {
             )),
             payload_attestation_pool: Default::default(),
             builder_market: Default::default(),
+            pq_builder_market: Default::default(),
             builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::BUILDER_VALIDATION_PERMITS,
             )),
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            aggregator_subnets_pq: HashMap::new(),
             peer_scoring: None,
         }
     }
@@ -4576,6 +4621,7 @@ mod tests {
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
                     attestation_subnets: Vec::new(),
+                    attestation_subnets_pq: Vec::new(),
                 })),
             })
             .expect("swarm builds")
@@ -5700,6 +5746,7 @@ mod tests {
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
                 attestation_subnets: Vec::new(),
+                attestation_subnets_pq: Vec::new(),
             })),
         })
         .expect("swarm builds");

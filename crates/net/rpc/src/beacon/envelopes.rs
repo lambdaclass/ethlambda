@@ -14,7 +14,6 @@ use axum::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::fork::ForkName;
-use libssz::SszEncode;
 
 use crate::{
     beacon::{ApiError, Envelope as ResponseEnvelope, blocks::is_finalized},
@@ -55,20 +54,21 @@ async fn get_envelope(
         Err(_) => return ApiError::Internal("store read failed").into_response(),
     };
     // Verified against its block's bid, so the payload's slot is the block's.
-    let slot = envelope.message.payload.slot_number;
+    let slot = envelope.payload().slot_number;
+    let fork: ForkName = envelope.fork();
 
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(envelope.to_ssz()),
         Encoding::Json => crate::json_response(ResponseEnvelope {
-            version: ForkName::Gloas.as_str(),
+            version: fork.as_str(),
             execution_optimistic: envelope_is_optimistic(&store, root),
             finalized: is_finalized(&store, slot),
             data: envelope,
         }),
     };
 
-    with_consensus_version(response, ForkName::Gloas)
+    with_consensus_version(response, fork)
 }
 
 #[cfg(test)]
@@ -150,7 +150,10 @@ mod tests {
             "gloas"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body.as_ref(), envelope.to_ssz().as_slice());
+        assert_eq!(
+            body.as_ref(),
+            libssz::SszEncode::to_ssz(&envelope).as_slice()
+        );
     }
 
     #[tokio::test]

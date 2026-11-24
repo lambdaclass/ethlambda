@@ -223,6 +223,14 @@ fn block_has_slashings(block: &SignedBeaconBlock) -> bool {
             !b.message.body.proposer_slashings.is_empty()
                 || !b.message.body.attester_slashings.is_empty()
         }
+        SignedBeaconBlock::Eip8483(b) => {
+            !b.message.body.proposer_slashings.is_empty()
+                || !b.message.body.attester_slashings.is_empty()
+        }
+        SignedBeaconBlock::Pq(b) => {
+            !b.message.body.proposer_slashings.is_empty()
+                || !b.message.body.attester_slashings.is_empty()
+        }
         SignedBeaconBlock::Lean(_) => {
             lean_block_unreachable("target_balances::block_has_slashings")
         }

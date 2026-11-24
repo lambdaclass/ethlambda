@@ -44,7 +44,7 @@ use crate::beacon_node::dto::{
     LivenessDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
     SyncingDto, ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse,
-    config_from_spec_response, encode_hex, parse_pubkey, parse_root,
+    config_from_spec_response, encode_hex, parse_pubkey, parse_registry_key, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
@@ -676,27 +676,21 @@ impl BeaconNodeApi for HttpBeaconNode {
         if pubkeys.is_empty() {
             return Ok(Vec::new());
         }
+        let keys: Vec<(BlsPubkey, Option<[u8; 48]>)> = pubkeys
+            .iter()
+            .map(|key| (*key, crate::pq::request_key(key)))
+            .collect();
+        self.validators_by_ids(validator_id_lists(&keys)).await
+    }
 
-        #[derive(Serialize)]
-        struct Body {
-            ids: Vec<String>,
-        }
-        let body = Body {
-            ids: pubkeys.iter().map(|key| encode_hex(&key.0)).collect(),
-        };
-        let response: DataResponse<Vec<ValidatorEntryDto>> = self
-            .post("/eth/v1/beacon/states/head/validators", &body, None)
-            .await?;
+    async fn registry(&self) -> Result<Vec<(ValidatorIndex, [u8; 48])>> {
+        // No ids: the endpoint answers for every validator.
+        let response: DataResponse<Vec<ValidatorEntryDto>> =
+            self.get("/eth/v1/beacon/states/head/validators").await?;
         response
             .data
             .into_iter()
-            .map(|entry| {
-                Ok(ValidatorEntry {
-                    index: entry.index,
-                    pubkey: parse_pubkey(&entry.validator.pubkey)?,
-                    status: entry.status,
-                })
-            })
+            .map(|entry| Ok((entry.index, parse_registry_key(&entry.validator.pubkey)?)))
             .collect()
     }
 
@@ -943,6 +937,22 @@ impl BeaconNodeApi for HttpBeaconNode {
         .map(|()| Delivery::Everywhere)
     }
 
+    async fn submit_pq_proposer_preferences(
+        &self,
+        preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],
+    ) -> Result<Delivery> {
+        if preferences.is_empty() {
+            return Ok(Delivery::Everywhere);
+        }
+        self.post_no_content(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+        .map(|()| Delivery::Everywhere)
+    }
+
     async fn execution_payload_envelope(
         &self,
         slot: Slot,
@@ -1071,6 +1081,126 @@ impl BeaconNodeApi for HttpBeaconNode {
         Self::handle_pool_submission(status, body, messages.len())
     }
 
+    async fn submit_pq_payload_attestations(
+        &self,
+        messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/pool/payload_attestations", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Pq.as_str())
+            .json(messages)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(messages.len());
+        }
+        let body = read_error_body(response).await;
+        Self::handle_pool_submission(status, body, messages.len())
+    }
+
+    async fn produce_pq_block(
+        &self,
+        slot: Slot,
+        randao_reveal: &[Root],
+        graffiti: Option<Root>,
+    ) -> Result<ethlambda_types::beacon::containers::pq::BlockContents> {
+        #[derive(Serialize)]
+        struct Body {
+            randao_reveal: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            graffiti: Option<String>,
+        }
+        let body = Body {
+            randao_reveal: randao_reveal
+                .iter()
+                .map(|node| encode_hex(&node.0))
+                .collect(),
+            graffiti: graffiti.map(|graffiti| encode_hex(&graffiti.0)),
+        };
+        let url = format!("{}/eth/v1/validator/pq_blocks/{slot}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = error_body(response).await;
+            return Err(Error::BeaconNodeStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let bytes = response.bytes().await.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let contents =
+            <ethlambda_types::beacon::containers::pq::BlockContents as libssz::SszDecode>::from_ssz_bytes(&bytes)
+                .map_err(|err| Error::Decode(format!("pq block contents: {err:?}")))?;
+        let block_root =
+            ethlambda_types::beacon::primitives::HashTreeRoot::hash_tree_root(&contents.block);
+        if contents.block.slot != slot
+            || contents.execution_payload_envelope.beacon_block_root != block_root
+        {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ block at slot {slot}, node answered one at slot {} or an envelope for another block",
+                contents.block.slot
+            )));
+        }
+        Ok(contents)
+    }
+
+    async fn publish_pq_execution_payload_envelope(&self, body: &[u8]) -> Result<()> {
+        let url = format!(
+            "{}/eth/v1/beacon/execution_payload_envelopes",
+            self.base_url
+        );
+        // `false`: the body is the bare signed envelope, and the node builds
+        // the data columns from the blobs it kept when it built the payload.
+        // A node that reads the header as gloas defines it (Silver) refuses
+        // the request without it.
+        let sent = self
+            .client
+            .post(&url)
+            .header("Eth-Consensus-Version", ForkName::Pq.as_str())
+            .header("Eth-Blob-Data-Included", "false")
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.to_vec())
+            .send()
+            .await;
+        let response = sent.map_err(|err| Error::BeaconNode {
+            url: url.clone(),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = error_body(response).await;
+        Err(Error::BeaconNodeStatus {
+            status: status.as_u16(),
+            body,
+        })
+    }
+
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -1156,6 +1286,13 @@ impl BeaconNodeApi for HttpBeaconNode {
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)
             }
+            // Not supported by this client: see `ProducedBlock::from_ssz`.
+            ForkName::Eip8483 | ForkName::Pq => {
+                return Err(Error::InconsistentResponse(format!(
+                    "node produced a {} aggregate, which this client does not publish",
+                    fork.as_str()
+                )));
+            }
         };
         // The same contract the other two fetches carry, enforced here so a
         // node answering about the wrong slot is failed over from rather than
@@ -1174,6 +1311,46 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// JSON, because Lighthouse answers an SSZ body here with 415. See the
     /// contract on [`BeaconNodeApi::publish_aggregates`].
+    async fn pq_aggregate(
+        &self,
+        slot: Slot,
+        attestation_data_root: Root,
+        committee_index: u64,
+    ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        let path = Self::aggregate_path(slot, attestation_data_root, committee_index);
+        let response: VersionedResponse<ethlambda_types::beacon::containers::pq::ProvenAggregate> =
+            self.get(&path).await?;
+        if !response.version.eq_ignore_ascii_case(ForkName::Pq.as_str()) {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for a PQ aggregate, node answered a {} one",
+                response.version
+            )));
+        }
+        let aggregate = response.data;
+        if aggregate.aggregate.data.slot != slot
+            || ethlambda_types::primitives::HashTreeRoot::hash_tree_root(&aggregate.aggregate.data)
+                != attestation_data_root
+        {
+            return Err(Error::InconsistentResponse(
+                "the PQ aggregate is for another vote".into(),
+            ));
+        }
+        Ok(aggregate)
+    }
+
+    async fn publish_pq_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
+    ) -> Result<()> {
+        // The PQ container serialises as the endpoint's JSON itself.
+        self.post_no_content(
+            "/eth/v2/validator/aggregate_and_proofs",
+            &aggregates,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+    }
+
     async fn publish_aggregates(
         &self,
         fork: ForkName,
@@ -1373,6 +1550,84 @@ impl BeaconNodeApi for HttpBeaconNode {
         });
         futures_util::future::try_join_all(queries).await
     }
+}
+
+impl HttpBeaconNode {
+    /// The registry entries `lists` name (see [`validator_id_lists`]), one
+    /// request per list, merged. A list the node refuses with a 4xx is
+    /// skipped, since a node that reads one width of key refuses a list of
+    /// the other outright (Lighthouse with a `400`; another client's status
+    /// is not known); it is an error only when every list was refused.
+    async fn validators_by_ids(&self, lists: Vec<Vec<String>>) -> Result<Vec<ValidatorEntry>> {
+        #[derive(Serialize)]
+        struct Body {
+            ids: Vec<String>,
+        }
+        // By index, so a validator two lists both find is answered once, and
+        // in registry order, as one answer would have it.
+        let mut entries = std::collections::BTreeMap::new();
+        let mut answered = false;
+        let mut refusal = None;
+        for ids in lists {
+            let answer: Result<DataResponse<Vec<ValidatorEntryDto>>> = self
+                .post("/eth/v1/beacon/states/head/validators", &Body { ids }, None)
+                .await;
+            match answer {
+                Ok(response) => {
+                    for entry in response.data {
+                        let resolved = ValidatorEntry {
+                            index: entry.index,
+                            pubkey: parse_pubkey(&entry.validator.pubkey)?,
+                            status: entry.status,
+                        };
+                        entries.insert(resolved.index, resolved);
+                    }
+                    answered = true;
+                }
+                Err(
+                    err @ Error::BeaconNodeStatus {
+                        status: 400..=499, ..
+                    },
+                ) => {
+                    debug!(url = %self.base_url, %err, "Beacon node refused a list of validator ids");
+                    refusal.get_or_insert(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        match refusal {
+            Some(err) if !answered => Err(err),
+            _ => Ok(entries.into_values().collect()),
+        }
+    }
+}
+
+/// The id lists [`HttpBeaconNode::validator_indices`] asks by, one request
+/// each, for `keys` paired with their PQ request forms (`crate::pq`).
+///
+/// First every 48-byte form: each BLS key, which a registry before PQ names
+/// its validator by, and each PQ key's request form (16 zero bytes, then the
+/// XMSS key), which a node from before the Beacon API's switch to 32-byte PQ
+/// keys still reads. Then, for a client with PQ keys, each one's 32-byte XMSS
+/// key, the specification's form. Two requests because no node need read
+/// both widths: Lighthouse's PQ node refuses a whole request holding any
+/// 48-byte id, and a node from before the switch any 32-byte one.
+fn validator_id_lists(keys: &[(BlsPubkey, Option<[u8; 48]>)]) -> Vec<Vec<String>> {
+    let wide = keys
+        .iter()
+        .flat_map(|(key, request)| {
+            std::iter::once(encode_hex(&key.0)).chain(request.map(|request| encode_hex(&request)))
+        })
+        .collect();
+    let narrow: Vec<String> = keys
+        .iter()
+        .filter_map(|(_, request)| request.map(|request| encode_hex(&request[16..])))
+        .collect();
+    let mut lists = vec![wide];
+    if !narrow.is_empty() {
+        lists.push(narrow);
+    }
+    lists
 }
 
 #[cfg(test)]
@@ -2077,5 +2332,131 @@ mod tests {
         let answers = node.liveness(&[12], &[]).await.expect("empty");
         assert_eq!(answers, vec![Vec::new()]);
         assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// The 48-byte ids (BLS keys, PQ request forms) and the 32-byte XMSS keys
+    /// go in separate lists, and a client with no PQ key sends one list.
+    #[test]
+    fn validator_ids_of_each_width_go_in_a_list_of_their_own() {
+        let bls = BlsPubkey([0xb1; 48]);
+        assert_eq!(
+            validator_id_lists(&[(bls, None)]),
+            vec![vec![encode_hex(&bls.0)]]
+        );
+
+        let pq = BlsPubkey([0xb2; 48]);
+        let mut request = [0u8; 48];
+        request[16..].copy_from_slice(&[0x5a; 32]);
+        let lists = validator_id_lists(&[(bls, None), (pq, Some(request))]);
+        assert_eq!(
+            lists,
+            vec![
+                vec![encode_hex(&bls.0), encode_hex(&pq.0), encode_hex(&request)],
+                vec![format!("0x{}", "5a".repeat(32))],
+            ]
+        );
+    }
+
+    /// A node that reads one width of id only (Lighthouse's PQ node refuses
+    /// any 48-byte one, a node from before the switch any 32-byte one) still
+    /// resolves the keys in the list it reads, and its 32-byte answer is read
+    /// back into the request form. Refused by every list, the lookup fails.
+    #[tokio::test]
+    async fn a_list_of_the_width_a_node_refuses_does_not_fail_the_lookup() {
+        let xmss = format!("0x{}", "5a".repeat(32));
+        let mut request = [0u8; 48];
+        request[16..].copy_from_slice(&[0x5a; 32]);
+        let wide = vec![encode_hex(&[0xb1; 48]), encode_hex(&request)];
+        let narrow = vec![xmss.clone()];
+
+        let answer = xmss.clone();
+        let handler = move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let answer = answer.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let ids = body["ids"].as_array().cloned().unwrap_or_default();
+                if ids
+                    .iter()
+                    .any(|id| id.as_str().is_some_and(|id| id.len() != 66))
+                {
+                    let refusal = serde_json::json!({
+                        "code": 400,
+                        "message": "The validator registry uses XMSS public keys",
+                    });
+                    return (axum::http::StatusCode::BAD_REQUEST, axum::Json(refusal))
+                        .into_response();
+                }
+                axum::Json(serde_json::json!({ "data": [{
+                    "index": "5",
+                    "balance": "32000000000",
+                    "status": "active_ongoing",
+                    "validator": { "pubkey": answer, "vrf_root": format!("0x{}", "00".repeat(32)) },
+                }] }))
+                .into_response()
+            }
+        };
+        let app = axum::Router::new().fallback(handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let node = HttpBeaconNode::new(format!("http://{address}")).expect("builds");
+
+        let entries = node
+            .validators_by_ids(vec![wide.clone(), narrow])
+            .await
+            .expect("the 32-byte list answers");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 5);
+        assert_eq!(entries[0].pubkey, BlsPubkey(request));
+
+        let err = node
+            .validators_by_ids(vec![wide])
+            .await
+            .expect_err("every list refused");
+        assert!(
+            matches!(err, Error::BeaconNodeStatus { status: 400, .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// The whole registry reads both widths into the request form, which
+    /// the leanXMSS cache is looked up by.
+    #[tokio::test]
+    async fn the_registry_reads_32_and_48_byte_keys() {
+        let mut request = [0u8; 48];
+        request[16..].copy_from_slice(&[0x5a; 32]);
+        let reply = serde_json::json!({ "data": [
+            { "index": "0", "status": "active_ongoing",
+              "validator": { "pubkey": format!("0x{}", "5a".repeat(32)) } },
+            { "index": "1", "status": "active_ongoing",
+              "validator": { "pubkey": encode_hex(&request) } },
+            { "index": "2", "status": "active_ongoing",
+              "validator": { "pubkey": encode_hex(&[0xb1; 48]) } },
+        ] });
+        let served = serve(200, vec![], reply.to_string().into_bytes()).await;
+        let registry = served.node.registry().await.expect("reads");
+        assert_eq!(registry, vec![(0, request), (1, request), (2, [0xb1; 48])]);
+    }
+
+    /// The PQ envelope goes out bare, so it says its blobs are not included:
+    /// a node that reads the header as gloas defines it refuses it otherwise.
+    #[tokio::test]
+    async fn a_pq_envelope_says_its_blobs_are_not_included() {
+        let served = serve(200, vec![], vec![]).await;
+        served
+            .node
+            .publish_pq_execution_payload_envelope(&[1, 2, 3])
+            .await
+            .expect("published");
+        let seen = served.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        let (uri, body, headers) = &seen[0];
+        assert_eq!(uri, "/eth/v1/beacon/execution_payload_envelopes");
+        assert_eq!(body, &[1, 2, 3]);
+        assert_eq!(headers["eth-blob-data-included"], "false");
+        assert_eq!(headers["eth-consensus-version"], "pq");
+        assert_eq!(headers["content-type"], "application/octet-stream");
     }
 }

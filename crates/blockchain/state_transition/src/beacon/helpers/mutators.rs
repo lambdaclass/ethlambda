@@ -163,7 +163,7 @@ fn initiate_validator_exit_for_fork(
         // `initiate_validator_exit` does on a gloas state: the churn it
         // draws through `compute_exit_epoch_and_update_churn` is already
         // gloas's own by the time it gets here.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Eip8483 | ForkName::Pq => {
             crate::beacon::helpers::electra::initiate_validator_exit(
                 state,
                 index,
@@ -248,6 +248,20 @@ pub fn slash_validator(
         whistleblower_index,
         whistleblower_reward - proposer_reward,
     )?;
+
+    // From EIP-8483 on (the `pq` branch's newer gloas, see
+    // `stf::eip8483`'s module doc): remove the pending builder payments for
+    // blocks the slashed validator proposed, whatever the slashing.
+    if fork >= ForkName::Eip8483
+        && fork != ForkName::Lean
+        && let Some(inner) = state.gloas_family_mut()
+    {
+        for payment in inner.builder_pending_payments.iter_mut() {
+            if payment.proposer_index == slashed_index {
+                *payment = crate::beacon::containers::gloas::BuilderPendingPayment::default();
+            }
+        }
+    }
     Ok(())
 }
 

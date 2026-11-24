@@ -359,6 +359,14 @@ impl ProducedBlock {
                 "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
                     .to_string(),
             )),
+            // The consensus-specs feature forks after gloas. A PQ proposal goes
+            // through `BeaconNodeApi::produce_pq_block`, never this decoder,
+            // and the client does not follow EIP-8483.
+            ForkName::Eip8483 | ForkName::Pq => Err(Error::InconsistentResponse(format!(
+                "beacon node produced a {} block through the BLS production path; PQ blocks \
+                 come from produce_pq_block",
+                fork.as_str()
+            ))),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -398,6 +406,8 @@ impl ProducedBlock {
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Gloas
+            | ForkName::Eip8483
+            | ForkName::Pq
             | ForkName::Lean => Err(Error::InconsistentResponse(format!(
                 "beacon node produced a blinded block for fork {}; blinded blocks exist for \
                  electra and fulu only",

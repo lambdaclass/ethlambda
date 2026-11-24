@@ -96,6 +96,13 @@ async fn post_pool_attestations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let is_pq = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(ForkName::Pq.as_str());
+    if is_pq {
+        return post_pq_attestations(&store, &p2p, &headers, &body);
+    }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
@@ -172,6 +179,83 @@ async fn post_pool_attestations(
     )
 }
 
+/// The PQ half of `submitPoolAttestationsV2`: PQ's `SingleAttestation`,
+/// signed with leanXMSS, judged by PQ's gossip rules (its signature at the
+/// target epoch's leaf, its committee, its subnet among PQ's 16) and
+/// gossiped on that subnet.
+fn post_pq_attestations(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::{SeenAttestations, pq as pq_gossip};
+    let attestations = match decode_list::<ethlambda_types::beacon::containers::pq::SingleAttestation>(
+        headers, body,
+    ) {
+        Ok(attestations) => attestations,
+        Err(err) => return err.into_response(),
+    };
+    let (_head_root, state) = match head(store) {
+        Ok(found) => found,
+        Err(err) => return err.into_response(),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let config = store.config();
+    // A fresh cache: the node gossips its own validator client's votes once.
+    let seen = SeenAttestations::new(std::num::NonZeroUsize::MIN);
+    let mut failures = Vec::new();
+    for (index, attestation) in attestations.into_iter().enumerate() {
+        let slot = attestation.data.slot;
+        let validator = attestation.attester_index;
+        let committees_per_slot = store
+            .committee_cache()
+            .committees(&state, attestation.data.target.epoch)
+            .committees_per_slot();
+        let subnet_id = pq_gossip::compute_subnet_for_attestation(
+            committees_per_slot,
+            slot,
+            attestation.committee_index,
+            &config,
+        );
+        let verdict = pq_gossip::attestation_cheap_checks(&seen, store, &attestation, now_ms)
+            .err()
+            .unwrap_or_else(|| {
+                pq_gossip::attestation_stateful_checks(store, &attestation, subnet_id)
+            });
+        let published = match verdict {
+            Outcome::Accept => {
+                // This node's own aggregator may be collecting the committee.
+                let now = wall_slot(&config, now_ms);
+                store.pq_signature_pool().insert(now, &attestation);
+                p2p.publish_pq_gossip(ethlambda_network_api::PqGossipObject::Attestation {
+                    subnet_id,
+                    attestation: Box::new(attestation),
+                })
+                .map_err(|_| "the network actor is not running".to_string())
+            }
+            other => Err(format!("{other:?}")),
+        };
+        match published {
+            Ok(()) => debug!(%slot, validator, subnet_id, "Accepted a PQ attestation for gossip"),
+            Err(message) => {
+                warn!(%slot, validator, reason = %message, "Refused a submitted PQ attestation");
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
+            }
+        }
+    }
+    batch_response(
+        failures,
+        "some attestations failed validation and were not published",
+    )
+}
+
 /// Where `attestation` belongs, if it passes every gossip condition
 /// this node can check, or the first one it fails.
 ///
@@ -207,9 +291,11 @@ fn validate(
         return Err("attestation is older than the previous epoch");
     }
 
-    // [REJECT] data.index == 0 (electra), or at a gloas slot 0 or 1, the
-    // payload-present flag; the target epoch is the slot's.
-    let at_gloas = config.fork_at_epoch(attestation_epoch) == ForkName::Gloas;
+    // [REJECT] data.index == 0 (electra), or from gloas on 0 or 1, the
+    // payload-present flag; the target epoch is the slot's. The forks after
+    // gloas build on it, so they keep the flag; `fork_at_epoch` never names
+    // lean, which sorts after them.
+    let at_gloas = config.fork_at_epoch(attestation_epoch) >= ForkName::Gloas;
     if at_gloas {
         if data.index > 1 {
             return Err("data.index must be 0 or 1 from gloas on");
@@ -322,6 +408,9 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
+            // Not followed: their attestations are not gloas's to submit.
+            | ForkName::Eip8483
+            | ForkName::Pq
             | ForkName::Lean,
         )
         | None => Err(ApiError::BadRequest(
@@ -330,13 +419,21 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
     }
 }
 
-/// Whether `header` is a version the fork at `slot` accepts: gloas's slots need
-/// the gloas header, and electra's and fulu's, whose containers are the same,
-/// accept either of theirs.
+/// Whether `header` is a version the fork at `slot` accepts: a slot from gloas
+/// on needs its own fork's header, and electra's and fulu's, whose containers
+/// are the same, accept either of theirs.
+///
+/// A slot of a fork after gloas is a gloas slot too, never an electra one, so
+/// an older header is refused there rather than judged by electra's rules.
+/// [`submission_fork`] refuses the EIP-8483 and PQ headers, which leaves no
+/// version that submits at their slots: the node does not follow them.
 fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
-    let slot_is_gloas =
-        store.config().fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Gloas;
-    slot_is_gloas == (header == ForkName::Gloas)
+    let slot_fork = store.config().fork_at_epoch(compute_epoch_at_slot(slot));
+    if slot_fork >= ForkName::Gloas {
+        header == slot_fork
+    } else {
+        header < ForkName::Gloas
+    }
 }
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
@@ -367,6 +464,13 @@ async fn post_aggregate_and_proofs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let is_pq = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(ForkName::Pq.as_str());
+    if is_pq {
+        return post_pq_aggregate_and_proofs(&store, &p2p, &headers, &body);
+    }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
@@ -452,6 +556,66 @@ async fn post_aggregate_and_proofs(
     )
 }
 
+/// [`post_aggregate_and_proofs`] at a PQ slot: aggregates proved with
+/// STARKs and signed with leanXMSS, judged by PQ's `beacon_aggregate_and_proof`
+/// rules (the aggregator's signature at the slot's aggregate leaf, its seat
+/// in the aggregation committee, the proof) and gossiped. The network actor
+/// hands each to the chain actor and to block production's pool.
+fn post_pq_aggregate_and_proofs(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::pq as pq_gossip;
+    use ethlambda_types::beacon::containers::pq;
+    let aggregates = match decode_list::<pq::SignedAggregateAndProof>(headers, body) {
+        Ok(aggregates) => aggregates,
+        Err(err) => return err.into_response(),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let capacity = std::num::NonZeroUsize::MIN;
+    let mut failures = Vec::new();
+    for (index, signed) in aggregates.into_iter().enumerate() {
+        let slot = signed.message.aggregate.data.slot;
+        let aggregator = signed.message.aggregator_index;
+        // A fresh seen-cache, as for the other forks' aggregates.
+        let seen = aggregate::SeenAggregates::new(capacity, capacity);
+        let checked = pq_gossip::aggregate_cheap_checks(&seen, store, &signed, now_ms)
+            .and_then(|()| pq_gossip::aggregate_stateful_checks(store, &signed))
+            .map_err(|outcome| format!("{outcome:?}"));
+        let published = checked.and_then(|attesting_indices| {
+            p2p.publish_pq_gossip(ethlambda_network_api::PqGossipObject::Aggregate {
+                aggregate: Box::new(signed),
+                attesting_indices,
+            })
+            .map_err(|_| "the network actor is not running".to_string())
+        });
+        match published {
+            Ok(()) => debug!(%slot, aggregator, "Accepted a PQ aggregate for gossip"),
+            Err(message) => {
+                warn!(%slot, aggregator, reason = %message, "Refused a submitted PQ aggregate");
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
+            }
+        }
+    }
+    batch_response(
+        failures,
+        "some aggregates failed validation and were not published",
+    )
+}
+
+/// The wall clock's slot at `now_ms` (`0` before genesis).
+fn wall_slot(config: &ethlambda_types::beacon::config::Config, now_ms: u64) -> Slot {
+    now_ms.saturating_sub(config.genesis_time.saturating_mul(1000)) / config.slot_duration_ms.max(1)
+}
+
 #[derive(Debug, Deserialize)]
 struct AggregateQuery {
     attestation_data_root: Root,
@@ -473,6 +637,7 @@ async fn get_aggregate_attestation(
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
     Query(query): Query<AggregateQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
@@ -480,6 +645,9 @@ async fn get_aggregate_attestation(
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot));
+    if fork == ForkName::Pq {
+        return get_pq_aggregate(&store, &query, &headers).await;
+    }
     let aggregate = store.attestation_pool().aggregate(
         query.attestation_data_root,
         query.slot,
@@ -491,9 +659,13 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_validated(&store, aggregate.data.beacon_block_root) {
         return err.into_response();
     }
-    // The pool holds electra-shaped votes; a gloas slot is served the same
-    // vote in gloas's container, whose JSON is the same shape.
-    let data = if fork == ForkName::Gloas {
+    // The pool holds electra-shaped votes; a slot from gloas on is served the
+    // same vote in gloas's container, whose JSON is the same shape. EIP-8483
+    // keeps that container. PQ replaces it, but its votes never reach this
+    // pool: the pq header submits them to `pq_signature_pool`
+    // (`post_pq_attestations`), and a PQ slot is answered by
+    // `get_pq_aggregate` above.
+    let data = if fork >= ForkName::Gloas {
         serde_json::json!(gloas::Attestation::from(&aggregate))
     } else {
         serde_json::json!(aggregate)
@@ -503,6 +675,56 @@ async fn get_aggregate_attestation(
         "data": data,
     }));
     crate::shared::content::with_consensus_version(response, fork)
+}
+
+/// [`get_aggregate_attestation`] at a PQ slot: the committee's aggregate
+/// this node proved from the votes it collected for its aggregators (see
+/// [`crate::beacon::pq_aggregation`]), with its proof. A request racing the
+/// proof waits for it until the slot's signatures are sealed and proved, for
+/// at most a few seconds; a 404 when there is none.
+async fn get_pq_aggregate(store: &Store, query: &AggregateQuery, headers: &HeaderMap) -> Response {
+    use ethlambda_types::beacon::containers::pq;
+    use libssz::SszEncode as _;
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let aggregate = loop {
+        let proven = store.pq_signature_pool().proven(
+            query.slot,
+            query.attestation_data_root,
+            query.committee_index,
+        );
+        if let Some(aggregate) = proven {
+            break aggregate;
+        }
+        let collecting = store
+            .pq_signature_pool()
+            .is_subscribed(query.slot, query.committee_index);
+        if !collecting || started.elapsed() >= WAIT {
+            return ApiError::NotFound("no PQ aggregate proved for this committee").into_response();
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    if let Err(err) = require_validated(store, aggregate.attestation.data.beacon_block_root) {
+        return err.into_response();
+    }
+    let answer = pq::ProvenAggregate {
+        aggregate: aggregate.attestation.clone(),
+        proof: aggregate.proof.clone(),
+    };
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    let response = match crate::shared::content::Encoding::from_accept(accept) {
+        crate::shared::content::Encoding::Ssz => {
+            crate::shared::content::ssz_response(answer.to_ssz())
+        }
+        crate::shared::content::Encoding::Json => crate::json_response(serde_json::json!({
+            "version": ForkName::Pq.as_str(),
+            "data": answer,
+        })),
+    };
+    crate::shared::content::with_consensus_version(response, ForkName::Pq)
 }
 
 /// The root of the latest block at or before `epoch`'s first slot on the chain
@@ -589,10 +811,18 @@ mod tests {
     /// slot, as [`fixture`]'s does, so it is its own checkpoint. Its votes are
     /// gloas's, so it submits under that version.
     fn fork_boundary_fixture() -> Fixture {
+        fork_boundary_fixture_at(&[ForkName::Gloas])
+    }
+
+    /// [`fork_boundary_fixture`], with each of `forks` scheduled at the wall
+    /// clock's epoch.
+    fn fork_boundary_fixture_at(forks: &[ForkName]) -> Fixture {
         let mut state = with_signing_validators_at(ForkName::Fulu, 64);
         let (probe, _) = crate::test_utils::beacon_store_at(state.clone());
         let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
-        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, wall_epoch);
+        let config = forks.iter().fold(Config::mainnet(), |config, &fork| {
+            config.with_fork_epoch(fork, wall_epoch)
+        });
         *state.slot_mut() = compute_start_slot_at_epoch(wall_epoch - 1);
         *state.fork_mut() = Fork {
             previous_version: config.fork_version(ForkName::Electra),
@@ -1141,6 +1371,40 @@ mod tests {
         let (status, _) = submit_as(&fulu, std::slice::from_ref(&vote), "gloas").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(fulu.network.published.lock().unwrap().is_empty());
+    }
+
+    /// The forks after gloas build on it, so their slots are gloas slots, not
+    /// electra ones: a vote there under fulu's header is refused rather than
+    /// judged by electra's rules. Gloas's header names a different fork too:
+    /// a PQ vote is PQ's own container, which only the pq header submits
+    /// (`post_pq_attestations`).
+    #[tokio::test]
+    async fn no_header_submits_at_a_slot_after_gloas() {
+        let schedules: [&[ForkName]; 2] = [
+            &[ForkName::Gloas, ForkName::Eip8483],
+            &[ForkName::Gloas, ForkName::Eip8483, ForkName::Pq],
+        ];
+        for forks in schedules {
+            let fixture = fork_boundary_fixture_at(forks);
+            let slot = first_slot_of_the_fork(&fixture);
+            let roots = (fixture.head_root, fixture.head_root);
+            let vote = attestation_for(&fixture, slot, roots, 0, 0, 0);
+            for version in ["fulu", "gloas"] {
+                let (status, json) =
+                    submit_as(&fixture, std::slice::from_ref(&vote), version).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{forks:?} {version}: {json}"
+                );
+                assert_eq!(
+                    json["failures"][0]["message"],
+                    "Eth-Consensus-Version does not match the attestation slot's fork",
+                    "{forks:?} {version}"
+                );
+            }
+            assert!(fixture.network.published.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

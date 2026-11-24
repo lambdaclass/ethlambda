@@ -44,7 +44,7 @@ use ethlambda_types::{
             gloas::{PayloadAttestation, PayloadAttestationData, PayloadAttestationMessage},
         },
         fork::ForkName,
-        primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex},
+        primitives::{Epoch, Slot, ValidatorIndex},
         signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     },
     primitives::H256,
@@ -57,6 +57,7 @@ use crate::{
     CustodyColumns,
     beacon::{
         ApiError, copy_if_listened, decode_list, emit_accepted,
+        states::ApiPubkey,
         validator::{head, require_execution_client, require_validated},
     },
     shared::content::{Encoding, ssz_response, with_consensus_version},
@@ -84,7 +85,7 @@ pub(crate) fn routes() -> Router<Store> {
 
 #[derive(Debug, Serialize)]
 struct PtcDuty {
-    pubkey: BlsPubkey,
+    pubkey: ApiPubkey,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -230,7 +231,8 @@ fn ptc_duties(
         ));
     }
 
-    let readable_from_head = matches!(*head_state, BeaconState::Gloas(_))
+    // A head of a fork after gloas holds the PTC window too.
+    let readable_from_head = head_state.fork_name().has_payload_envelopes()
         && epoch <= state_epoch + preset::MIN_SEED_LOOKAHEAD;
     let state: Arc<BeaconState> = if readable_from_head {
         head_state
@@ -248,7 +250,7 @@ fn ptc_duties(
         .filter_map(|(validator_index, slot)| {
             let pubkey = state.validator(validator_index).ok()?.pubkey;
             Some(PtcDuty {
-                pubkey,
+                pubkey: ApiPubkey::of(&state, pubkey),
                 validator_index,
                 slot,
             })
@@ -324,6 +326,16 @@ async fn get_payload_attestation_data(
 fn bid_commitment_count(block: &SignedBeaconBlock) -> Option<usize> {
     match block {
         SignedBeaconBlock::Gloas(inner) => Some(
+            inner
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
+        ),
+        // PQ keeps gloas's bid.
+        SignedBeaconBlock::Pq(inner) => Some(
             inner
                 .message
                 .body
@@ -431,6 +443,13 @@ async fn post_pool_payload_attestations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(ForkName::Pq.as_str())
+    {
+        return post_pq_payload_attestations(&store, &p2p, &headers, &body);
+    }
     if let Err(err) = require_gloas_or_absent(&headers) {
         return err.into_response();
     }
@@ -489,6 +508,68 @@ async fn post_pool_payload_attestations(
         }
     }
 
+    if failures.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let body = serde_json::json!({
+        "code": 400,
+        "message": "some payload attestations failed validation and were not published",
+        "failures": failures,
+    });
+    let mut response = crate::json_response(body);
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
+}
+
+/// The PQ half: PQ's message, signed with leanXMSS at the slot's PTC leaf,
+/// judged by PQ's gossip rules, gossiped and handed to the chain actor by the
+/// publish path. Not pooled: a PQ block carries no payload attestations.
+fn post_pq_payload_attestations(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::pq as pq_gossip;
+    let messages = match decode_list::<
+        ethlambda_types::beacon::containers::pq::PayloadAttestationMessage,
+    >(headers, body)
+    {
+        Ok(messages) => messages,
+        Err(err) => return err.into_response(),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let seen = SeenPayloadAttestations::new(std::num::NonZeroUsize::MIN);
+    let mut failures = Vec::new();
+    for (index, message) in messages.into_iter().enumerate() {
+        let slot = message.data.slot;
+        let validator = message.validator_index;
+        let verdict =
+            match pq_gossip::payload_attestation_cheap_checks(&seen, store, &message, now_ms) {
+                Ok(()) => pq_gossip::payload_attestation_stateful_checks(store, &message),
+                Err(outcome) => outcome,
+            };
+        if verdict != Outcome::Accept {
+            let (outcome, reason) = verdict.labels();
+            warn!(%slot, validator, outcome, reason, "Refused a submitted PQ payload attestation");
+            failures.push(Failure {
+                index,
+                message: format!("{outcome}: {reason}"),
+            });
+            continue;
+        }
+        let object = ethlambda_network_api::PqGossipObject::PayloadAttestation(Box::new(message));
+        match p2p.publish_pq_gossip(object) {
+            Ok(()) => debug!(%slot, validator, "Accepted a PQ payload attestation for gossip"),
+            Err(_) => failures.push(Failure {
+                index,
+                message: "the network actor is not running".to_string(),
+            }),
+        }
+    }
     if failures.is_empty() {
         return StatusCode::OK.into_response();
     }

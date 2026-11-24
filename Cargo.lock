@@ -538,7 +538,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -1090,6 +1090,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "claims"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
+dependencies = [
+ "lean_sphincs",
+ "lean_xmss",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,7 +1155,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1575,7 +1584,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2012,7 +2021,7 @@ dependencies = [
  "sha2",
  "snap",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",
@@ -2043,7 +2052,7 @@ dependencies = [
  "serde_json",
  "snap",
  "spawned-concurrency",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2054,14 +2063,21 @@ name = "ethlambda-crypto"
 version = "1.0.0"
 dependencies = [
  "blst",
+ "claims",
  "ethlambda-metrics",
  "ethlambda-types",
  "hex",
+ "keccak 0.1.6",
+ "lean_xmss",
  "leanvm",
+ "pbkdf2",
  "postcard",
  "rand 0.10.1",
  "rayon",
- "thiserror 2.0.18",
+ "sha2",
+ "sha3 0.10.9",
+ "sidecar",
+ "thiserror 2.0.21",
  "tracing",
  "zk_alloc",
 ]
@@ -2078,7 +2094,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2095,7 +2111,7 @@ name = "ethlambda-metrics"
 version = "1.0.0"
 dependencies = [
  "prometheus",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2134,7 +2150,7 @@ dependencies = [
  "sha2",
  "snap",
  "spawned-concurrency",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2167,7 +2183,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spawned-concurrency",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tower",
@@ -2214,7 +2230,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "snap",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2234,7 +2250,7 @@ dependencies = [
  "proptest",
  "rocksdb",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "xdelta3",
 ]
@@ -2284,7 +2300,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2296,6 +2312,7 @@ dependencies = [
  "axum",
  "blst",
  "ctr",
+ "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-types",
  "futures-util",
@@ -2307,15 +2324,17 @@ dependencies = [
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "pbkdf2",
+ "rayon",
  "reqwest",
  "scrypt",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "sha3 0.10.9",
  "subtle",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tower",
@@ -2344,7 +2363,7 @@ dependencies = [
  "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rayon",
  "rustc-hash",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2380,7 +2399,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2402,7 +2421,7 @@ dependencies = [
  "ripemd",
  "secp256k1 0.30.0",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tiny-keccak",
 ]
 
@@ -2426,7 +2445,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_with",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2443,7 +2462,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_with",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2462,7 +2481,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "strum",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2473,7 +2492,7 @@ dependencies = [
  "ethrex-common",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing-subscriber",
 ]
 
@@ -2512,7 +2531,7 @@ dependencies = [
  "snap",
  "spawned-concurrency",
  "spawned-rt",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2526,7 +2545,7 @@ source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc577049
 dependencies = [
  "bytes",
  "ethereum-types",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2546,7 +2565,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2568,7 +2587,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "spin",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2585,7 +2604,7 @@ dependencies = [
  "ethrex-rlp",
  "rustc-hash",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3156,7 +3175,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "socket2 0.5.10",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tinyvec",
  "tokio",
  "tracing",
@@ -3179,7 +3198,7 @@ dependencies = [
  "rand 0.9.4",
  "resolv-conf",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -3811,6 +3830,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak256"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3882,6 +3906,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lean_sphincs"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
+dependencies = [
+ "keccak256",
+]
+
+[[package]]
 name = "lean_vm"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
@@ -3893,6 +3925,14 @@ dependencies = [
  "primitives",
  "tracing",
  "zk_alloc",
+]
+
+[[package]]
+name = "lean_xmss"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
+dependencies = [
+ "keccak256",
 ]
 
 [[package]]
@@ -3980,7 +4020,7 @@ dependencies = [
  "multiaddr",
  "pin-project",
  "rw-stream-sink",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4021,7 +4061,7 @@ dependencies = [
  "quick-protobuf",
  "rand 0.8.6",
  "rw-stream-sink",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "unsigned-varint",
  "web-time",
@@ -4086,7 +4126,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -4105,7 +4145,7 @@ dependencies = [
  "quick-protobuf",
  "rand 0.8.6",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "zeroize",
 ]
@@ -4178,7 +4218,7 @@ dependencies = [
  "rand 0.8.6",
  "snow",
  "static_assertions",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "x25519-dalek",
  "zeroize",
@@ -4200,7 +4240,7 @@ dependencies = [
  "ring",
  "rustls",
  "socket2 0.6.3",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -4279,7 +4319,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-webpki",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "x509-parser",
  "yasna",
 ]
@@ -4306,7 +4346,7 @@ dependencies = [
  "either",
  "futures",
  "libp2p-core",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "yamux 0.12.1",
  "yamux 0.13.10",
@@ -4733,7 +4773,7 @@ dependencies = [
  "log",
  "netlink-packet-core",
  "netlink-sys",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5356,7 +5396,7 @@ dependencies = [
  "parking_lot",
  "procfs",
  "protobuf",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5487,7 +5527,7 @@ dependencies = [
  "asynchronous-codec",
  "bytes",
  "quick-protobuf",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "unsigned-varint",
 ]
 
@@ -5515,7 +5555,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2 0.5.10",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -5537,7 +5577,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -6482,6 +6522,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "sidecar"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
+dependencies = [
+ "claims",
+ "lean_sphincs",
+ "lean_xmss",
+ "verifier",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6584,7 +6635,7 @@ dependencies = [
  "pin-project-lite",
  "spawned-macros",
  "spawned-rt",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -6804,11 +6855,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -6824,13 +6875,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -7130,7 +7181,7 @@ checksum = "f09cb459317a3811f76644334473239d696cd8efc606963ae7d1c308cead3b74"
 dependencies = [
  "ansi_term",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
 ]
@@ -7356,6 +7407,11 @@ dependencies = [
  "derive_builder",
  "rustversion",
 ]
+
+[[package]]
+name = "verifier"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764#c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764"
 
 [[package]]
 name = "version_check"
@@ -8049,7 +8105,7 @@ dependencies = [
  "nom",
  "oid-registry",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "time",
 ]
 

@@ -294,6 +294,24 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
+- Two schemes share the name. Lean consensus signs with leanVM's XMSS
+  (BLAKE2s, below). The Beacon Chain's PQ fork signs with leanXMSS over
+  Keccak-256 (`ethlambda_crypto::lean_xmss`, 32-byte keys, 2404-byte
+  signatures, a port of leanVM `4af2cddd`'s Rust implementation pinned by
+  consensus-specs' and leanVM's known answers), and proves many signatures at
+  once through `ethlambda_crypto::stark`: the specification's reference (the
+  signatures concatenated) by default, or real leanVM proofs from a
+  `leanvm-sidecar` process (leanVM `c5ee9d239`, bindings v0.15.0, the
+  release pq-devnet-0 runs for its signer, prover, verifier and sidecar),
+  which is what the PQ devnet runs. The node only connects to a sidecar
+  (`--pq-prover-socket`); as for Lighthouse, something else starts it: the
+  image's `ethlambda-pq` supervisor (`bin/ethlambda/pq/`), run as
+  `ethlambda-pq beacon <flags>`. The image builds `leanvm-sidecar` from the
+  revision in the root `leanvm-revision` file (or `--build-arg LEANVM_REV`),
+  so which prover a devnet runs is chosen outside the node; the node's client
+  only refuses a sidecar with another protocol version or verifier tag.
+  The two encodings do not verify each other's proofs. Never pass one
+  scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
   (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
   constants in `common/crypto/src/signature.rs`
@@ -654,7 +672,7 @@ existing once per chain.
   silent wrong answer.
 - **`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
   what `parse`, `previous` and `next` search, so its absence keeps
-  `parse("lean")` at `None` and `Gloas.next()` at `None`, meaning a fork upgrade
+  `parse("lean")` at `None` and `Pq.next()` at `None`, meaning a fork upgrade
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
@@ -859,6 +877,54 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   Fork choice is fixture-verified too, including bellatrix's terminal-PoW
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
+- **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
+  `2f43bc0f`, the pq-devnet-0 spec; branch `pq-devnet-0-b5d422b2` follows
+  `b5d422b2`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
+  8 and 9, implemented in the state transition and fork choice
+  (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
+  and PQ's gossip rules (`gossip/pq.rs`, `p2p/src/beacon/pq.rs`: a PQ digest's
+  reshaped topics decode by the digest and are judged with XMSS signatures
+  and STARK proofs). **The node follows PQ** (`ForkName::is_followed`): PQ
+  blocks and envelopes import from gossip and req/resp, accepted PQ
+  aggregates and payload attestations reach fork choice, and envelopes of
+  every fork travel as the fork-tagged `containers::SignedExecutionPayloadEnvelope`
+  (storage decodes one by its slot's fork, req/resp by the chunk's context
+  bytes, the engine gets each fork's typed requests list). It runs next to
+  other clients' PQ branches on PQ-at-genesis devnets (ethpandaops/ethereum-package's
+  `pq` branch, see `docs/beacon_pq.md`, "Running a devnet"),
+  with its own validators: the validator client derives each
+  validator's leanXMSS key and VRF seed from its BLS key
+  (`ethlambda_crypto::pq_keys`) and attests, aggregates, casts PTC votes and
+  proposes, each signature
+  at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
+  `2^31` leaves, each `keccak256(vrf_seed || le64(slot))`) takes minutes of
+  every core per key, so a background thread hashes it after startup (in a
+  rayon pool of its own: on the global one it starves every leanXMSS
+  signature until done) and stores its upper nodes in
+  `<validators-dir>/pq_vrf_trees/`; a proposal before its key's tree is
+  ready is missed. `--vrf-state-url` loads precomputed tree states instead
+  (ethereum-package's `vrf_state_url` file, which the package publishes and
+  `ethlambda pq-keys` writes along with the genesis key file), and every leaf
+  signed is recorded durably in `<validators-dir>/pq_signed_leaves.bin`
+  before its signature exists. With Lighthouse, ethlambda's blocks, envelopes,
+  data columns, aggregates and PTC votes are accepted, and the validator
+  client survives a restart. The beacon node builds PQ blocks through `POST
+  /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
+  `pq_block_production.rs`), packing attestations from the validated
+  aggregates in `Store::pq_aggregate_pool` with their proofs merged on the
+  sidecar under a deadline (one unmerged attestation when it misses), and
+  proves its aggregators' committees ahead (`rpc/src/beacon/pq_aggregation.rs`,
+  `Store::pq_signature_pool`). Blobs travel as in gloas: the node keeps the
+  blobs of the payload it built and the envelope endpoint publishes their
+  data columns. EIP-8483 is not followed yet. The
+  gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
+  (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
+  and the PQ registry holds each XMSS key in its 48-byte request form so the
+  registry accessors keep handing out the shared `Validator` (in memory only:
+  the Beacon API names a PQ key by its 32 bytes, `states::ApiPubkey` in
+  `rpc/src/beacon/states.rs`, and the validator client reads either width). No release ships
+  their fixtures; see [`docs/beacon_pq.md`](docs/beacon_pq.md) for the design,
+  how to generate them, and what remains.
 - **Gloas** lives in `stf/gloas.rs`, `stf/epoch/gloas.rs`, `helpers/gloas.rs`,
   the gloas section of `fork_choice.rs`, and `containers/gloas.rs` in
   `ethlambda-types`. **The live follower follows gloas.** The chain actor's
@@ -1148,10 +1214,16 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: `States` and `StateDiffs` moved from root keys to
-  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
-  so `Store::prune_finalized_states` can range-delete finalized states; a
-  directory written by an earlier version holds rows no lookup finds. (6 was
+- `DB_VERSION` is 9: `Config` lost PQ's aggregation timing keys
+  (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`, `AGGREGATOR_DELAY_BPS`,
+  consensus-specs `4595f0fc`) with the move back to `2f43bc0f`, so a version
+  8 directory's stored config decodes into the wrong fields. (8 added the
+  EIP-8483 and PQ fork versions and epochs,
+  `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY` and
+  `ATTESTATION_SUBNET_COUNT_PQ`; 7 moved `States`
+  and `StateDiffs` from root keys to slot||root keys, the block's slot looked
+  up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can
+  range-delete finalized states; 6 was
   the gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded
   under `KEY_CONFIG`; 5 was the unrealized-justifications table, since a
   directory written before it has no row there for any block it already

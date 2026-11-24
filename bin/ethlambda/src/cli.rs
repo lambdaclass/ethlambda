@@ -191,7 +191,7 @@ pub(crate) enum Network {
     /// its payloads are validated against. Everything else it needs is a
     /// common flag.
     Mainnet {
-        mainnet: MainnetOptions,
+        mainnet: Box<MainnetOptions>,
         execution: Option<ExecutionOptions>,
     },
 }
@@ -279,7 +279,7 @@ impl From<BeaconOptions> for Options {
         Options {
             common: options.common,
             network: Network::Mainnet {
-                mainnet: options.mainnet,
+                mainnet: Box::new(options.mainnet),
                 execution,
             },
         }
@@ -419,6 +419,20 @@ pub(crate) struct MainnetOptions {
         allow_hyphen_values = true
     )]
     pub(crate) bootnodes: Vec<String>,
+
+    /// The Unix socket of a running `leanvm-sidecar`, which makes and checks
+    /// the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ
+    /// devnet's clients use. Something else starts the sidecar, as for
+    /// Lighthouse: the image's `ethlambda-pq` supervisor does, and picks which
+    /// build. The node refuses one speaking another protocol version or
+    /// proving for another verifier than its client (leanVM
+    /// `c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764`, bindings v0.15.0).
+    ///
+    /// Without it, the node uses the specification's reference encoding (a
+    /// proof is the signatures concatenated), which only another node on the
+    /// reference accepts.
+    #[arg(long)]
+    pub(crate) pq_prover_socket: Option<PathBuf>,
 
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block

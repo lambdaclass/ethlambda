@@ -178,6 +178,31 @@ pub(crate) struct ValidatorOptions {
     /// `/eth/v1/validator/liveness`.
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
+
+    /// Where to read the validators' precomputed VRF tree states from, on a
+    /// network that schedules the PQ fork: an HTTP(S) URL or a file path, of
+    /// 1028-byte records indexed by validator index (ethereum-package's
+    /// `vrf_state_url`).
+    ///
+    /// Each record is checked against the validator's own VRF seed, and a key
+    /// whose record is missing or does not match hashes its tree in full
+    /// instead, which takes minutes per key. A tree read either way is kept
+    /// under the validators directory, so this is read once per key.
+    #[arg(long)]
+    pub(crate) vrf_state_url: Option<String>,
+
+    /// Where to read the validators' precomputed leanXMSS keys from, on a
+    /// network that schedules the PQ fork: an HTTP(S) URL or a file path, of
+    /// 14696-byte records indexed by validator index (ethereum-package's
+    /// `xmss_cache_url`, leanVM's `cache_to_bytes`).
+    ///
+    /// A key's index is found in the beacon node's registry by its public
+    /// parameter, and its record is checked against the key's own seed and
+    /// registered public key. A key whose record is missing or does not match,
+    /// or every key when the registry or the file cannot be read, is built
+    /// instead, about 2.4 s per key across the cores.
+    #[arg(long)]
+    pub(crate) xmss_cache_url: Option<String>,
 }
 
 impl ValidatorOptions {
@@ -283,6 +308,8 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        vrf_state_url: options.vrf_state_url,
+        xmss_cache_url: options.xmss_cache_url,
     })
     .await
     .map_err(Into::into)
@@ -311,6 +338,8 @@ mod tests {
             builder_min_bid: 0,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            vrf_state_url: None,
+            xmss_cache_url: None,
         }
     }
 

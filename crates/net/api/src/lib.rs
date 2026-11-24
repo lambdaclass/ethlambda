@@ -5,12 +5,16 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
-        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        AttestationData, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        SignedExecutionPayloadEnvelope,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
-        gloas::{
-            PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-            SignedProposerPreferences,
+        gloas::{PayloadAttestationMessage, SignedExecutionPayloadBid, SignedProposerPreferences},
+        pq::{
+            PayloadAttestationMessage as PqPayloadAttestationMessage,
+            SignedAggregateAndProof as PqSignedAggregateAndProof,
+            SignedProposerPreferences as PqSignedProposerPreferences,
+            SingleAttestation as PqSingleAttestation,
         },
     },
     beacon::operation::BeaconOperation,
@@ -362,6 +366,24 @@ pub trait P2PToBlockChain: Send + Sync {
     /// whose `payload_attributes` event carries the fee recipient and gas
     /// target they name, that the next slot's attributes may have changed.
     fn new_proposer_preferences(&self, proposal_slot: u64) -> Result<(), ActorError>;
+    /// A PQ aggregate that passed gossip validation (its aggregator's XMSS
+    /// signature and its STARK proof included), as the vote it carries and
+    /// the attesting indices validation resolved: what fork choice applies.
+    /// Not the aggregate itself, whose proof and leanXMSS signature nothing
+    /// past gossip reads.
+    fn new_pq_aggregate(
+        &self,
+        data: AttestationData,
+        attesting_indices: Vec<ValidatorIndex>,
+        arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+    /// A PQ payload attestation message that passed gossip validation, for
+    /// fork choice. Not queued, like gloas's.
+    fn new_pq_payload_attestation_message(
+        &self,
+        message: Box<PqPayloadAttestationMessage>,
+        arrival: BlockArrival,
+    ) -> Result<(), ActorError>;
 }
 
 /// When an aggregate reached this node, for the one metric that cannot be
@@ -411,6 +433,27 @@ impl AggregateArrival {
 /// these requests come from a validator client through the HTTP server, not
 /// from the chain actor, and a beacon node's chain actor has nothing to publish
 /// on its own behalf.
+/// A validator client's PQ message for [`RpcToP2P::publish_pq_gossip`].
+#[derive(Debug, Clone)]
+pub enum PqGossipObject {
+    /// For `beacon_attestation_{subnet_id}`, one of PQ's 16 subnets.
+    Attestation {
+        subnet_id: u64,
+        attestation: Box<PqSingleAttestation>,
+    },
+    /// For `beacon_aggregate_and_proof`, with the attesting indices
+    /// validation resolved, which fork choice applies.
+    Aggregate {
+        aggregate: Box<PqSignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
+    },
+    /// For `payload_attestation_message`.
+    PayloadAttestation(Box<PqPayloadAttestationMessage>),
+    /// For `proposer_preferences`, already recorded in the node's PQ builder
+    /// market.
+    ProposerPreferences(Box<PqSignedProposerPreferences>),
+}
+
 #[protocol]
 pub trait RpcToP2P: Send + Sync {
     /// Gossip one unaggregated attestation on `beacon_attestation_{subnet_id}`.
@@ -438,10 +481,19 @@ pub trait RpcToP2P: Send + Sync {
     ) -> Result<(), ActorError>;
     /// Gossip one operation on its topic, already validated by the caller.
     fn publish_beacon_operation(&self, operation: BeaconOperation) -> Result<(), ActorError>;
+    /// Gossip one of a validator client's PQ messages, already validated by
+    /// the caller with PQ's gossip rules, on its PQ-digest topic, and hand
+    /// what fork choice reads to the chain actor, since gossip never delivers
+    /// a node its own messages.
+    fn publish_pq_gossip(&self, object: PqGossipObject) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
     fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
+    /// [`Self::subscribe_attestation_subnets`] for a PQ slot's committees:
+    /// `(subnet_id, slot)` pairs among PQ's 16 subnets, joined under PQ
+    /// digests only.
+    fn subscribe_pq_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
     /// Gossip one sync committee message on `sync_committee_{id}` for every id
     /// in `subnet_ids` (every subnet its validator has a seat in, computed by
     /// the caller from the head state), and mark it seen. Checked by the caller.

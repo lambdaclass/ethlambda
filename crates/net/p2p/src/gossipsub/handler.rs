@@ -247,7 +247,14 @@ fn handle_beacon_gossip(
     let topic_fork = beacon_topics::topic_digest(topic)
         .and_then(|digest| wire.schedule.fork_for_digest(digest))
         .unwrap_or(wire.fork);
-    let dispatch = if kind == beacon_topics::BEACON_BLOCK {
+    // A PQ digest's reshaped topics decode as PQ's containers; its block and
+    // column topics take the shared path below.
+    let pq_dispatch = (topic_fork == ForkName::Pq)
+        .then(|| crate::beacon::pq::triage(server, kind, payload, id.received_at))
+        .flatten();
+    let dispatch = if let Some(dispatch) = pq_dispatch {
+        dispatch
+    } else if kind == beacon_topics::BEACON_BLOCK {
         triage_block(server, wire, payload)
     } else if let Some(subnet_id) = beacon_topics::data_column_subnet(kind) {
         triage_data_column(server, topic_fork, payload, subnet_id)
@@ -1029,16 +1036,23 @@ pub async fn publish_beacon_block(
 /// peers.
 pub async fn publish_execution_payload_envelope(
     server: &mut P2PServer,
-    envelope: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+    envelope: ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope,
     sidecars: Vec<DataColumnSidecar>,
 ) {
-    let slot = envelope.message.payload.slot_number;
-    let block_root = envelope.message.beacon_block_root;
+    use ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope as Envelope;
+    let slot = envelope.payload().slot_number;
+    let block_root = envelope.beacon_block_root();
     // Gossip never echoes a node's own message, so its own envelope is a
     // known payload for bid validation only because it is recorded here.
-    server
-        .builder_market
-        .record_execution_payload(&envelope.message);
+    match &envelope {
+        Envelope::Gloas(inner) => server
+            .builder_market
+            .record_execution_payload(&inner.message),
+        Envelope::Pq(inner) => server
+            .pq_builder_market
+            .record_pq_execution_payload(&inner.message),
+        Envelope::Eip8483(_) => {}
+    }
     let Some(beacon) = server.wire.beacon() else {
         error!(
             slot,
@@ -1062,7 +1076,7 @@ pub async fn publish_execution_payload_envelope(
         .publish(topic, compress_message(&envelope.to_ssz()));
     info!(
         slot,
-        builder_index = envelope.message.builder_index,
+        builder_index = envelope.builder_index(),
         block_root = %ShortRoot(&block_root.0),
         "Published execution payload envelope to gossipsub"
     );
@@ -1190,15 +1204,50 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
         *until = (*until).max(slot);
     }
     // Under every digest the node holds: while a boundary's window is open,
-    // attestations are published on either side of it.
+    // attestations are published on either side of it. Not a PQ digest's: the
+    // subnet comes from a BLS duty over `ATTESTATION_SUBNET_COUNT` subnets.
     for &subnet_id in &joined {
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
             let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
             server.swarm_handle.subscribe(IdentTopic::new(topic));
         }
     }
     if !joined.is_empty() {
         info!(?joined, "Joined attestation subnets for aggregation");
+    }
+}
+
+/// [`join_aggregator_subnets`] for a PQ slot's committees: `(subnet_id,
+/// slot)` pairs among PQ's 16 subnets, joined under every held PQ digest. A
+/// subnet of PQ's backbone is joined there already.
+pub fn join_pq_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let mut joined = Vec::new();
+    for (subnet_id, slot) in subnets {
+        if subnet_id >= wire.config.attestation_subnet_count_pq
+            || wire.attestation_subnets_pq.contains(&subnet_id)
+        {
+            continue;
+        }
+        let until = server
+            .aggregator_subnets_pq
+            .entry(subnet_id)
+            .or_insert_with(|| {
+                joined.push(subnet_id);
+                slot
+            });
+        *until = (*until).max(slot);
+    }
+    for &subnet_id in &joined {
+        for held in wire.held_topics().filter(|held| held.pq) {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
+            server.swarm_handle.subscribe(IdentTopic::new(topic));
+        }
+    }
+    if !joined.is_empty() {
+        info!(?joined, "Joined PQ attestation subnets for aggregation");
     }
 }
 
@@ -1277,7 +1326,20 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
         .collect();
     for subnet_id in &expired {
         server.aggregator_subnets.remove(subnet_id);
-        for held in wire.held_topics() {
+        for held in wire.held_topics().filter(|held| !held.pq) {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
+            server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        }
+    }
+    let expired_pq: Vec<u64> = server
+        .aggregator_subnets_pq
+        .iter()
+        .filter(|&(_, &until)| until < now)
+        .map(|(&subnet_id, _)| subnet_id)
+        .collect();
+    for subnet_id in &expired_pq {
+        server.aggregator_subnets_pq.remove(subnet_id);
+        for held in wire.held_topics().filter(|held| held.pq) {
             let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
             server.swarm_handle.unsubscribe(IdentTopic::new(topic));
         }

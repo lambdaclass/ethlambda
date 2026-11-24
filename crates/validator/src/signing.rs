@@ -815,9 +815,8 @@ impl SigningContext {
         pubkey: &BlsPubkey,
         preferences: &ProposerPreferences,
     ) -> Result<BlsSignature> {
+        let root = self.proposer_preferences_signing_root(preferences);
         let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
-        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
-        let root = compute_signing_root(preferences.hash_tree_root(), domain);
         self.sign(
             store,
             pubkey,
@@ -831,6 +830,15 @@ impl SigningContext {
             },
         )
         .await
+    }
+
+    /// The root proposer preferences are signed over: under the proposal
+    /// epoch's own fork version (see [`Self::sign_proposer_preferences`]).
+    /// The PQ fork signs the same root with leanXMSS.
+    pub fn proposer_preferences_signing_root(&self, preferences: &ProposerPreferences) -> Root {
+        let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
+        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
+        compute_signing_root(preferences.hash_tree_root(), domain)
     }
 
     /// Sign a payload timeliness committee vote on behalf of `pubkey`.

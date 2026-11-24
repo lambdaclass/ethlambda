@@ -932,7 +932,9 @@ fn data_availability_for(
         // block's own import (see `beacon_envelope`). So a gloas block has
         // nothing to wait for here, and `on_block` reads no availability
         // evidence for it.
-        SignedBeaconBlock::Gloas(_) => Some(fork_choice::DataAvailability::NotRequired),
+        SignedBeaconBlock::Gloas(_) | SignedBeaconBlock::Eip8483(_) | SignedBeaconBlock::Pq(_) => {
+            Some(fork_choice::DataAvailability::NotRequired)
+        }
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
         // one; named on its own rather than folded into the group above so
@@ -2730,6 +2732,35 @@ impl BlockChainServer {
         self.apply_beacon_aggregate(&aggregate, &attesting_indices, &index, Some(arrival));
     }
 
+    /// Apply one PQ aggregate gossip already verified (its STARK proof
+    /// included) to fork choice.
+    fn apply_pq_aggregate(
+        &mut self,
+        data: ethlambda_types::beacon::containers::AttestationData,
+        attesting_indices: &[ValidatorIndex],
+        index: &HashMap<H256, (u64, H256)>,
+    ) {
+        let config = self.store.config();
+        let outcome = fork_choice::apply_verified_aggregate(
+            &mut self.store,
+            data,
+            attesting_indices,
+            &config,
+            index,
+        );
+        match outcome {
+            Ok(()) => metrics::inc_beacon_aggregate_outcome("applied"),
+            Err(err) => {
+                trace!(
+                    slot = data.slot,
+                    %err,
+                    "PQ aggregate not applied to fork choice"
+                );
+                metrics::inc_beacon_aggregate_outcome("invalid");
+            }
+        }
+    }
+
     /// Apply one already-verified aggregate to fork choice and record what
     /// became of it.
     ///
@@ -2831,6 +2862,14 @@ impl BlockChainServer {
                     &index,
                     None,
                 );
+            }
+        }
+
+        let ready_pq = self.beacon_aggregates.take_ready_pq(current_slot);
+        if !ready_pq.is_empty() {
+            let index = self.store.block_index();
+            for (data, attesting_indices) in ready_pq {
+                self.apply_pq_aggregate(data, &attesting_indices, &index);
             }
         }
 
@@ -4348,7 +4387,7 @@ impl BlockChainServer {
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
     NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
-    NewProposerPreferences,
+    NewPqAggregate, NewPqPayloadAttestationMessage, NewProposerPreferences,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -4521,6 +4560,55 @@ impl Handler<NewProposerPreferences> for BlockChainServer {
         if msg.proposal_slot == self.wall_clock_slot() + 1 {
             self.maybe_prepare_payload_attributes(ctx);
         }
+    }
+}
+
+impl Handler<NewPqAggregate> for BlockChainServer {
+    async fn handle(&mut self, msg: NewPqAggregate, _ctx: &Context<Self>) {
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        metrics::observe_beacon_aggregate_mailbox_wait(msg.arrival.handed_off.elapsed());
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        // `validate_on_attestation`'s `current_slot >= data.slot + 1`, as for
+        // every other fork's aggregates: held until its slot has passed.
+        if current_slot < msg.data.slot.saturating_add(1) {
+            self.beacon_aggregates
+                .defer_pq(msg.data, msg.attesting_indices);
+            return;
+        }
+        let index = self.store.block_index();
+        self.apply_pq_aggregate(msg.data, &msg.attesting_indices, &index);
+    }
+}
+
+impl Handler<NewPqPayloadAttestationMessage> for BlockChainServer {
+    async fn handle(&mut self, msg: NewPqPayloadAttestationMessage, ctx: &Context<Self>) {
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        let slot = msg.message.data.slot;
+        let config = self.store.config();
+        if self.ms_until_slot_start(slot) == 0
+            && fork_choice::get_current_slot(&self.store, &config) < slot
+        {
+            self.on_tick(unix_now_ms(), ctx).await;
+        }
+        self.advance_beacon_clock_to(msg.arrival.wire_ms(Instant::now(), unix_now_ms()));
+        let validator = msg.message.validator_index;
+        let block_root = msg.message.data.beacon_block_root;
+        let _ =
+            fork_choice::on_pq_payload_attestation_message(&mut self.store, &msg.message, &config)
+                .inspect_err(|err| {
+                    debug!(
+                        slot,
+                        validator,
+                        block_root = %ShortRoot(&block_root.0),
+                        %err,
+                        "Dropping a PQ payload attestation message"
+                    )
+                });
     }
 }
 

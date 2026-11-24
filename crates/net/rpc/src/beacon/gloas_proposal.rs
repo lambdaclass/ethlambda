@@ -107,6 +107,7 @@ use crate::beacon::{
     builder_config::{BuilderConfig, decode_builder_config},
     emit_accepted,
     graffiti::{self, OwnVersion},
+    pq_proposal::{PqBlobs, PqPayloadBlobs},
     proposal::{
         Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
     },
@@ -126,6 +127,19 @@ use crate::CustodyColumns as NodeCustodyColumns;
 /// first.
 const BLOCK_WAIT: Duration = Duration::from_secs(4);
 const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long [`build_payload`] lets the execution client build between
+/// `forkchoiceUpdated` (which starts the build) and `getPayload` (which ends
+/// it).
+///
+/// The node asks for a payload only when its block is requested, with no
+/// payload prepared ahead of the slot. Geth answers a `getPayload` that
+/// follows the update at once with the empty payload it starts from, before
+/// its first build with transactions finishes, so without a window every
+/// self-built block carried no transactions and no blobs, whatever the
+/// mempool held. Half a second covers a devnet mempool many times over; it
+/// overlaps the attestation packing that runs beside the build.
+const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
 
 /// What `produceBlockV4` built for one block, kept for the envelope endpoints.
 #[derive(Debug, Clone)]
@@ -721,7 +735,8 @@ async fn build_local(
     prepared: &Prepared,
     slot: Slot,
 ) -> Result<LocalBuild, ApiError> {
-    let built = build_payload(store, engine, fee_recipients, custody, prepared).await?;
+    let fee_recipient = fee_recipient_for(fee_recipients, prepared);
+    let built = build_payload(store, engine, fee_recipient, custody, &prepared.inputs).await?;
     let bundle = &built.blobs_bundle;
     if bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len()
@@ -776,16 +791,15 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
 /// execution client starts with a valid payload and improves it, so an early
 /// `getPayload` always answers, and the validator client asks at the start of
 /// the slot, when the block is due.
-async fn build_payload(
+pub(crate) async fn build_payload(
     store: &Store,
     engine: &EngineClient,
-    fee_recipients: &FeeRecipients,
+    fee_recipient: ExecutionAddress,
     custody: &NodeCustodyColumns,
-    prepared: &Prepared,
+    inputs: &GloasPayloadInputs,
 ) -> Result<BuiltGloasPayload, ApiError> {
-    let fee_recipient = fee_recipient_for(fee_recipients, prepared);
-    let forkchoice = building_forkchoice_state(store, prepared.inputs.head_block_hash);
-    let attributes = payload_attributes_v4(&prepared.inputs, fee_recipient);
+    let forkchoice = building_forkchoice_state(store, inputs.head_block_hash);
+    let attributes = payload_attributes_v4(inputs, fee_recipient);
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
     let (status, payload_id) = engine
         .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
@@ -800,6 +814,7 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW).await;
     engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
@@ -992,6 +1007,7 @@ async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(cache): Extension<PayloadCache>,
+    pq_blobs: Option<Extension<PqBlobs>>,
     events: Option<Extension<EventBus>>,
     headers: HeaderMap,
     body: Bytes,
@@ -1000,6 +1016,7 @@ async fn post_envelope(
         &store,
         &p2p,
         &cache,
+        pq_blobs.as_deref(),
         events.as_deref(),
         &headers,
         &body,
@@ -1018,20 +1035,25 @@ async fn post_envelope_waiting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
-    post_envelope_emitting(store, p2p, cache, None, headers, body, block_wait).await
+    post_envelope_emitting(store, p2p, cache, None, None, headers, body, block_wait).await
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn post_envelope_emitting(
     store: &Store,
     p2p: &RpcToP2PRef,
     cache: &PayloadCache,
+    pq_blobs: Option<&PqBlobs>,
     events: Option<&EventBus>,
     headers: &HeaderMap,
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
+    if consensus_version(headers) == Some(ForkName::Pq) {
+        return post_pq_envelope(store, p2p, pq_blobs, events, headers, body, block_wait).await;
+    }
     if consensus_version(headers) != Some(ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or pq").into_response();
     }
     let encoding = match BodyEncoding::from_headers(headers) {
         Ok(encoding) => encoding,
@@ -1161,7 +1183,122 @@ async fn post_envelope_emitting(
         block_root,
     };
     if p2p
-        .publish_execution_payload_envelope(Box::new(signed), sidecars)
+        .publish_execution_payload_envelope(Box::new(signed.into()), sidecars)
+        .is_err()
+    {
+        return ApiError::Internal("the network actor is not running").into_response();
+    }
+    emit_accepted(events, || accepted);
+    StatusCode::OK.into_response()
+}
+
+/// The PQ half of `publishExecutionPayloadEnvelope`: PQ's container, signed
+/// with leanXMSS at the slot's envelope leaf. The body carries no blobs: when
+/// the bid commits to some, they are the ones this node kept when it built
+/// the payload (`pq_proposal::PqBlobs`), and the data columns built from
+/// them are checked against the bid and gossiped with the envelope, as
+/// gloas's `Eth-Blob-Data-Included: false` path does.
+async fn post_pq_envelope(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    pq_blobs: Option<&PqBlobs>,
+    events: Option<&EventBus>,
+    headers: &HeaderMap,
+    body: &[u8],
+    block_wait: Duration,
+) -> Response {
+    let encoding = match BodyEncoding::from_headers(headers) {
+        Ok(encoding) => encoding,
+        Err(err) => return err.into_response(),
+    };
+    let Some(signed) = encoding.decode::<containers::pq::SignedExecutionPayloadEnvelope>(body)
+    else {
+        return ApiError::BadRequest("the body is not a pq SignedExecutionPayloadEnvelope")
+            .into_response();
+    };
+    let block_root = signed.message.beacon_block_root;
+    let Some((block, post_state)) = wait_for_block(store, block_root, block_wait).await else {
+        return ApiError::BadRequest("unknown block: the envelope's block is not held")
+            .into_response();
+    };
+    let containers::SignedBeaconBlock::Pq(block) = block else {
+        return ApiError::BadRequest("the envelope's block is not a pq block").into_response();
+    };
+    let block_slot = block.message.slot;
+    let bid = &block.message.body.signed_execution_payload_bid.message;
+    if signed.message.builder_index != bid.builder_index
+        || signed.message.payload.block_hash != bid.block_hash
+    {
+        return ApiError::BadRequest("the envelope does not fulfill the block's bid")
+            .into_response();
+    }
+    // The blobs this node kept when it built the payload: PQ production hands
+    // the validator client no blobs, so it sends none back.
+    let commitments: Vec<_> = bid.blob_kzg_commitments.iter().copied().collect();
+    let blobs = if commitments.is_empty() {
+        PqPayloadBlobs::default()
+    } else {
+        match pq_blobs.and_then(|cache| cache.get(block_slot, block_root)) {
+            Some(blobs) => blobs,
+            None => {
+                return ApiError::BadRequest(
+                    "no blobs kept for the block: it was not built by this node",
+                )
+                .into_response();
+            }
+        }
+    };
+    if blobs.blobs.len() != commitments.len() {
+        return ApiError::BadRequest("the blobs do not match the bid's commitments")
+            .into_response();
+    }
+    // Signature and the columns' proofs are CPU-bound; off the runtime.
+    let envelope_for_check = signed.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let signed_well =
+            ethlambda_state_transition::beacon::stf::pq::verify_execution_payload_envelope_signature(
+                &post_state,
+                &envelope_for_check,
+            )
+            .map_err(|_| ApiError::BadRequest("the envelope's signer is unknown"))?;
+        if !signed_well {
+            return Err(ApiError::BadRequest("invalid envelope signature"));
+        }
+        if blobs.blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // PQ keeps gloas's data column sidecar.
+        let sidecars =
+            gloas_data_column_sidecars(block_root, block_slot, &blobs.blobs, &blobs.cell_proofs)
+                .map_err(|_| ApiError::Internal("the kept blobs do not form valid columns"))?;
+        let verified = sidecars.iter().all(|sidecar| {
+            gloas_verify_data_column_sidecar(sidecar, &commitments)
+                && gloas_verify_data_column_sidecar_kzg_proofs(sidecar, &commitments)
+                    .unwrap_or(false)
+        });
+        if !verified {
+            return Err(ApiError::Internal(
+                "the data columns do not verify against the bid's commitments",
+            ));
+        }
+        Ok(sidecars)
+    })
+    .await;
+    let sidecars = match checked {
+        Ok(Ok(sidecars)) => sidecars,
+        Ok(Err(err)) => return err.into_response(),
+        Err(_) => return ApiError::Internal("verifying the envelope failed").into_response(),
+    };
+    let sidecars: Vec<DataColumnSidecar> =
+        sidecars.into_iter().map(DataColumnSidecar::Gloas).collect();
+    let accepted = GossipEvent::ExecutionPayloadGossip {
+        slot: block_slot,
+        builder_index: signed.message.builder_index,
+        block_hash: signed.message.payload.block_hash,
+        block_root,
+    };
+    if p2p
+        .publish_execution_payload_envelope(Box::new(signed.into()), sidecars)
         .is_err()
     {
         return ApiError::Internal("the network actor is not running").into_response();

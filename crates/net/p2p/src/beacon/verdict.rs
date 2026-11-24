@@ -43,6 +43,7 @@ use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
 use crate::beacon::column_checks;
+use crate::beacon::pq::PqValidated;
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -112,6 +113,10 @@ pub(crate) enum Validated {
     },
     /// A `sync_committee_contribution_and_proof`.
     SyncContribution(Box<SignedContributionAndProof>),
+    /// A message off a PQ digest's topic, in the PQ fork's container. Never
+    /// forwarded, pooled or announced: the node does not follow PQ. See
+    /// [`crate::beacon::pq`].
+    Pq(Box<PqValidated>),
 }
 
 impl Validated {
@@ -151,7 +156,7 @@ impl Validated {
                 gossip::execution_payload_bid::stateful_checks(store, market, bid)
             }
             Self::ProposerPreferences(preferences) => {
-                gossip::proposer_preferences::stateful_checks(store, preferences)
+                gossip::proposer_preferences::stateful_checks(store, &**preferences)
             }
             Self::PayloadAttestation(message) => {
                 gossip::payload_attestation::stateful_checks(store, message)
@@ -173,6 +178,7 @@ impl Validated {
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
             }
+            Self::Pq(object) => object.stateful_checks(store),
         }
     }
 
@@ -231,6 +237,7 @@ impl Validated {
                     .record(message.slot, message.validator_index, *subnet_id)
             }
             Self::SyncContribution(signed) => server.seen_sync_contributions.record(signed),
+            Self::Pq(object) => object.record_seen(server),
         }
     }
 
@@ -273,6 +280,12 @@ impl Validated {
     /// validators it names as live for its target epoch; see
     /// [`record_liveness`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
+        // Relayed on `Accept` by gossipsub itself; the chain actor takes what
+        // fork choice reads (see `PqValidated::forward`).
+        if let Self::Pq(object) = self {
+            object.forward(server, received_at, outcome);
+            return;
+        }
         if outcome == Outcome::Accept {
             record_liveness(server, &self);
             publish_gossip_event(server, &self);
@@ -396,6 +409,11 @@ impl Validated {
                     handed_off: Instant::now(),
                     deferred_from: None,
                 };
+                let envelope = Box::new(
+                    ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope::Gloas(
+                        *envelope,
+                    ),
+                );
                 let _ = blockchain
                     .new_execution_payload_envelope(envelope, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip envelope"));
@@ -427,7 +445,8 @@ impl Validated {
             | Self::PayloadAttestation(_)
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
-            | Self::SyncContribution(_) => {}
+            | Self::SyncContribution(_)
+            | Self::Pq(_) => {}
         }
     }
 }
@@ -504,7 +523,8 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::ProposerPreferences(_)
         | Validated::Operation(_)
         | Validated::SyncCommitteeMessage { .. }
-        | Validated::SyncContribution(_) => {}
+        | Validated::SyncContribution(_)
+        | Validated::Pq(_) => {}
     }
 }
 
@@ -712,6 +732,7 @@ fn pool_of(object: &Validated) -> &'static str {
         | Validated::Operation(_) => "attestation",
         Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => "builder",
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => "sync",
+        Validated::Pq(object) => object.pool(),
     }
 }
 
@@ -1322,10 +1343,25 @@ mod tests {
         }
         fn new_execution_payload_envelope(
             &self,
-            _envelope: Box<SignedExecutionPayloadEnvelope>,
+            _envelope: Box<ethlambda_types::beacon::containers::SignedExecutionPayloadEnvelope>,
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Sent::Envelope);
+            Ok(())
+        }
+        fn new_pq_aggregate(
+            &self,
+            _data: ethlambda_types::beacon::containers::AttestationData,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_pq_payload_attestation_message(
+            &self,
+            _message: Box<ethlambda_types::beacon::containers::pq::PayloadAttestationMessage>,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
             Ok(())
         }
         fn new_payload_attestation_message(
@@ -1714,7 +1750,12 @@ mod tests {
         let hash = signed.message.payload.block_hash;
         assert!(server.builder_market.known_payload(hash).is_none());
 
-        crate::gossipsub::publish_execution_payload_envelope(&mut server, signed, Vec::new()).await;
+        crate::gossipsub::publish_execution_payload_envelope(
+            &mut server,
+            signed.into(),
+            Vec::new(),
+        )
+        .await;
 
         assert!(server.builder_market.known_payload(hash).is_some());
     }

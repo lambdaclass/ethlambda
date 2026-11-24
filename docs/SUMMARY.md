@@ -17,6 +17,7 @@
 - [Beacon Chain State Transition](./beacon_stf.md)
 - [The mainnet wire](./beacon_wire.md)
 - [The execution layer pairing](./beacon_engine.md)
+- [The PQ fork](./beacon_pq.md)
 
 # Operations
 

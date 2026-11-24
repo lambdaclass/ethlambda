@@ -25,7 +25,7 @@ use lru::LruCache;
 use super::{IgnoreReason, Outcome, RejectReason, is_current_slot};
 use crate::beacon::bls;
 use crate::beacon::constants::DOMAIN_PTC_ATTESTER;
-use crate::beacon::containers::gloas;
+use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::accessors::get_domain;
 use crate::beacon::helpers::gloas::get_ptc;
@@ -67,14 +67,31 @@ pub fn cheap_checks(
     message: &gloas::PayloadAttestationMessage,
     now_ms: u64,
 ) -> Result<(), Outcome> {
+    cheap_checks_parts(
+        seen,
+        store,
+        message.data.slot,
+        message.validator_index,
+        now_ms,
+    )
+}
+
+/// [`cheap_checks`] over the two fields it reads, for a message of a shape
+/// this module's own type does not carry (the PQ fork's, in `super::pq`).
+pub(crate) fn cheap_checks_parts(
+    seen: &SeenPayloadAttestations,
+    store: &Store,
+    slot: Slot,
+    validator_index: ValidatorIndex,
+    now_ms: u64,
+) -> Result<(), Outcome> {
     let config = store.config();
-    let slot = message.data.slot;
     // [REJECT] The payload attestation's slot is at or after the gloas fork.
     if compute_epoch_at_slot(slot) < config.gloas_fork_epoch {
         return Err(Outcome::Reject(RejectReason::PreGloasSlot));
     }
     // [IGNORE] This is the first valid payload attestation from this validator.
-    if seen.contains(slot, message.validator_index) {
+    if seen.contains(slot, validator_index) {
         return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
     }
     // [IGNORE] The payload attestation's slot is the current slot.
@@ -87,8 +104,42 @@ pub fn cheap_checks(
 /// The rules that need the voted block and the head state. Runs on a blocking
 /// thread.
 pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage) -> Outcome {
-    let data = &message.data;
-    let validator_index = message.validator_index;
+    stateful_checks_with(
+        store,
+        message.validator_index,
+        &message.data,
+        |state| !matches!(state, BeaconState::Pq(_)),
+        |state, validator_index| {
+            let Ok(validator) = state.validator(validator_index) else {
+                return false;
+            };
+            let domain = get_domain(
+                state,
+                DOMAIN_PTC_ATTESTER,
+                Some(compute_epoch_at_slot(message.data.slot)),
+            );
+            let signing_root = compute_signing_root(message.data.hash_tree_root(), domain);
+            let validator = bls::IndexedPubkey {
+                index: validator_index,
+                pubkey: validator.pubkey,
+            };
+            bls::verify(&validator, signing_root, &message.signature)
+        },
+    )
+}
+
+/// [`stateful_checks`]' rules for any fork's message: the PQ fork changes only
+/// the signature (`specs/_features/pq/p2p-interface.md`), so `verify` is the
+/// fork's own signature check and `judged_by` says which registry shape
+/// holds the key it reads. A head state of another shape cannot judge the
+/// message, which is not the sender's fault.
+pub(crate) fn stateful_checks_with(
+    store: &Store,
+    validator_index: ValidatorIndex,
+    data: &gloas::PayloadAttestationData,
+    judged_by: impl FnOnce(&BeaconState) -> bool,
+    verify: impl FnOnce(&BeaconState, ValidatorIndex) -> bool,
+) -> Outcome {
     // [IGNORE] The voted block has been seen.
     let Some((block_slot, _)) = store.block_slot_and_state_root(&data.beacon_block_root) else {
         return Outcome::Ignore(IgnoreReason::UnknownBlock);
@@ -113,10 +164,13 @@ pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage
     let Some(state) = store.cached_state(CacheKey::BlockState(head_root)) else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
+    if !judged_by(&state) {
+        return Outcome::Ignore(IgnoreReason::StateUnavailable);
+    }
     // [REJECT] The validator index is valid.
-    let Ok(validator) = state.validator(validator_index) else {
+    if state.validator(validator_index).is_err() {
         return Outcome::Reject(RejectReason::UnknownValidator);
-    };
+    }
     // [REJECT] The validator is a member of the payload timeliness committee.
     // A slot the head's committee window cannot answer is not the sender's fault.
     let Ok(ptc) = get_ptc(&state, data.slot, &store.config()) else {
@@ -126,17 +180,7 @@ pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage
         return Outcome::Reject(RejectReason::NotInPtc);
     }
     // [REJECT] The signature is valid.
-    let domain = get_domain(
-        &state,
-        DOMAIN_PTC_ATTESTER,
-        Some(compute_epoch_at_slot(data.slot)),
-    );
-    let signing_root = compute_signing_root(data.hash_tree_root(), domain);
-    let validator = bls::IndexedPubkey {
-        index: validator_index,
-        pubkey: validator.pubkey,
-    };
-    if !bls::verify(&validator, signing_root, &message.signature) {
+    if !verify(&state, validator_index) {
         return Outcome::Reject(RejectReason::BadSignature);
     }
     Outcome::Accept

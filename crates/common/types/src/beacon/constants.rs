@@ -427,6 +427,79 @@ pub const PTC_TIMELINESS_INDEX: usize = 1;
 /// length every entry has, one slot per index above.
 pub const NUM_BLOCK_TIMELINESS_DEADLINES: usize = 2;
 
+// ---------------------------------------------------------------------------
+// EIP-8483 (consensus-specs `_features/eip8483`)
+// ---------------------------------------------------------------------------
+
+/// The first byte identifying an execution layer request as a validator's PQ
+/// registration (EIP-8483).
+pub const VALIDATOR_PQ_REGISTRATION_REQUEST_TYPE: u8 = 0x05;
+/// The first byte identifying an execution layer request as a builder's PQ
+/// registration (EIP-8483).
+pub const BUILDER_PQ_REGISTRATION_REQUEST_TYPE: u8 = 0x06;
+
+// ---------------------------------------------------------------------------
+// PQ (consensus-specs `_features/pq`)
+// ---------------------------------------------------------------------------
+
+/// How many validators a beacon committee's aggregation committee samples.
+pub const AGGREGATORS_PER_COMMITTEE: u64 = 4;
+
+/// The encoded length of a leanXMSS public key: the top tree's root, then the
+/// public parameter.
+pub const XMSS_PUBKEY_SIZE: usize = 32;
+/// The encoded length of a leanXMSS signature: the leaf index, then one
+/// signature per layer.
+pub const XMSS_SIGNATURE_SIZE: usize = 2404;
+
+/// The first leaves of every key, which a message without a leaf of its own (a
+/// voluntary exit, a preregistration) may be signed at.
+pub const XMSS_RESERVED_LEAVES: u64 = 1 << 15;
+/// The leaves after the reserved ones: one attestation per target epoch.
+pub const XMSS_ATTESTATION_LEAVES: u64 = 1 << 29;
+/// The leaves after the attestation ones, which a builder signs its bids at,
+/// any of them, each once.
+pub const XMSS_BUILDER_BID_LEAVES: u64 = 1 << 30;
+/// The leaves each slot owns past the bid leaves, one per `LEAF_OFFSET_*`.
+pub const XMSS_LEAVES_PER_SLOT: u64 = 1 << 3;
+
+/// The depth of the tree under a validator's VRF root: a leaf per slot.
+pub const VRF_TREE_DEPTH: usize = 31;
+
+/// The slot leaf a beacon block (and so a proposer slashing's headers) is
+/// signed at.
+pub const LEAF_OFFSET_BEACON_PROPOSER: u64 = 0;
+/// The slot leaf a `SignedAggregateAndProof` is signed at.
+pub const LEAF_OFFSET_AGGREGATE_AND_PROOF: u64 = 1;
+/// The slot leaf a payload timeliness committee vote is signed at.
+pub const LEAF_OFFSET_PTC_ATTESTER: u64 = 2;
+/// The slot leaf `SignedProposerPreferences` is signed at.
+pub const LEAF_OFFSET_PROPOSER_PREFERENCES: u64 = 3;
+/// The slot leaf a `SignedExecutionPayloadEnvelope` is signed at.
+pub const LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE: u64 = 4;
+
+/// The 16 zero bytes that precede an XMSS public key in a request's or pending
+/// deposit's 48-byte key field. A BLS key never starts with them: its first
+/// byte has the compression flag set.
+pub const XMSS_DEPOSIT_PREFIX: [u8; 16] = [0; 16];
+
+/// Appended to a BLS key to derive the XMSS key a validator or builder that
+/// did not register takes at the fork.
+pub const LEGACY_XMSS_PUBKEY_DOMAIN: u8 = 0x00;
+/// Appended to a BLS key to derive the VRF root a validator that did not
+/// register takes at the fork.
+pub const LEGACY_VRF_ROOT_DOMAIN: u8 = 0x01;
+
+/// The first byte identifying an execution layer request as a validator
+/// preregistration (EIP-8205, adopted by PQ).
+pub const VALIDATOR_PREREGISTRATION_REQUEST_TYPE: u8 = 0x07;
+/// The first byte identifying an execution layer request as a builder
+/// preregistration.
+pub const BUILDER_PREREGISTRATION_REQUEST_TYPE: u8 = 0x08;
+/// The first byte identifying an execution layer request as a voluntary exit,
+/// which PQ moves to the execution layer.
+pub const VOLUNTARY_EXIT_REQUEST_TYPE: u8 = 0x09;
+
 #[cfg(test)]
 mod tests {
     use super::*;

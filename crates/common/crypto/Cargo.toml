@@ -15,8 +15,15 @@ ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+keccak.workspace = true
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 leanvm.workspace = true
+leanvm_claims.workspace = true
+leanvm_lean_xmss.workspace = true
+leanvm_sidecar.workspace = true
 postcard.workspace = true
 
 thiserror.workspace = true

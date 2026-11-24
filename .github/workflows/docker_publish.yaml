@@ -13,6 +13,10 @@ on:
       tags:
         description: "Docker image tags, comma-separated (e.g., devnet5,devnet5-fix)"
         required: true
+      leanvm_rev:
+        description: "leanVM commit, tag or branch to build the PQ prover sidecar from (blank: the one in leanvm-revision)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -108,9 +112,11 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          # An empty LEANVM_REV builds the sidecar from leanvm-revision.
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
+            LEANVM_REV=${{ inputs.leanvm_rev }}
             ${{ matrix.variant.build_args }}
           push: true
           tags: ${{ steps.prep.outputs.tags }}

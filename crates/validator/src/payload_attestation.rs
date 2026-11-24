@@ -117,6 +117,15 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             )));
         }
 
+        // From PQ a leanXMSS signature at the slot's PTC leaf, which
+        // `crate::pq` guards against a second message.
+        let is_pq = self.context.config.fork_at_epoch(
+            ethlambda_types::beacon::signing::compute_epoch_at_slot(slot),
+        ) == ethlambda_types::beacon::fork::ForkName::Pq;
+        if is_pq {
+            return self.attest_pq(slot, &pending, data).await;
+        }
+
         // Recorded one by one before anything is signed, so a signature that
         // exists is one the record already knows about; then signed all at
         // once, each within the signing budget.
@@ -181,6 +190,68 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             payload_present = data.payload_present,
             blob_data_available = data.blob_data_available,
             "Published payload attestations"
+        );
+        crate::metrics::inc_payload_attestations_published(published as u64);
+        Ok(published)
+    }
+
+    /// [`Self::attest`] at a PQ slot.
+    async fn attest_pq(
+        &self,
+        slot: Slot,
+        pending: &[&PtcDutyDto],
+        data: ethlambda_types::beacon::containers::gloas::PayloadAttestationData,
+    ) -> Result<usize> {
+        let root = self.context.payload_attestation_signing_root(&data);
+        let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_PTC_ATTESTER);
+        let mut owed = Vec::with_capacity(pending.len());
+        for duty in pending {
+            let pubkey = match parse_pubkey(&duty.pubkey) {
+                Ok(pubkey) => pubkey,
+                Err(err) => {
+                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                    continue;
+                }
+            };
+            if !self.record(duty.validator_index, slot) {
+                continue;
+            }
+            owed.push((
+                duty.validator_index,
+                crate::pq::SignRequest { pubkey, leaf, root },
+            ));
+        }
+        // Signed together, in parallel off this task.
+        let requests = owed.iter().map(|(_, request)| *request).collect();
+        let signatures = crate::pq::sign_all(requests).await;
+        let mut messages = Vec::with_capacity(owed.len());
+        for ((validator_index, _), signature) in owed.into_iter().zip(signatures) {
+            match signature {
+                Ok(signature) => messages.push(
+                    ethlambda_types::beacon::containers::pq::PayloadAttestationMessage {
+                        validator_index,
+                        data,
+                        signature,
+                    },
+                ),
+                Err(err) => {
+                    error!(%slot, validator = validator_index, %err, "Failed to sign a PQ payload attestation");
+                    crate::metrics::inc_signing_failures();
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let published = self
+            .beacon_node
+            .submit_pq_payload_attestations(&messages)
+            .await?;
+        info!(
+            %slot,
+            count = published,
+            payload_present = data.payload_present,
+            "Published PQ payload attestations"
         );
         crate::metrics::inc_payload_attestations_published(published as u64);
         Ok(published)
