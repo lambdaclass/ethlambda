@@ -51,13 +51,14 @@ docker build -t ethlambda:pq-local .
 
 # 2. The package: lambdaclass/ethereum-package's `add-ethlambda` (the
 #    ethlambda launcher) merged with ethpandaops/ethereum-package's `pq` (the
-#    PQ genesis and Lighthouse wiring), plus the launcher patch here.
-git clone https://github.com/lambdaclass/ethereum-package.git ethereum-package
+#    PQ genesis and Lighthouse wiring), plus the launcher patch here. The
+#    fork's branch is gone since it merged upstream (ethpandaops'
+#    pull request 1515), whose pull request ref still holds its history.
+git clone https://github.com/ethpandaops/ethereum-package.git ethereum-package
 cd ethereum-package
+git fetch origin pull/1515/head
 git checkout 8159202d71cca5a1de086d8152d512c5b95465ca      # add-ethlambda
-git fetch https://github.com/ethpandaops/ethereum-package.git \
-  87788250ac957609e4826705421d59ea924ba69f                  # pq
-git merge --no-edit FETCH_HEAD
+git merge --no-edit 87788250ac957609e4826705421d59ea924ba69f  # pq
 git apply <ethlambda>/tooling/pq-devnet/ethlambda-launcher.patch
 # This pin's launcher writes the bootnodes to a file, which `beacon
 # --bootnodes` no longer takes: in src/cl/ethlambda/ethlambda_launcher.star,
