@@ -876,7 +876,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
         format!("0x{:x}", 30_000_000u64)
     );
 
-    // Neither: the zero address.
+    // Neither, and no `--fallback-fee-recipient`: the zero address.
     let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
