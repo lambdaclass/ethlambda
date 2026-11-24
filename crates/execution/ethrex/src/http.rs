@@ -10,8 +10,11 @@
 //! `map_http_requests` itself, which also refuses every `engine_*` method on
 //! this port.
 //!
-//! Left out, compared with ethrex's server: WebSocket subscriptions and the
-//! heap-profiling routes.
+//! Left out, compared with ethrex's server: WebSocket subscriptions, the
+//! heap-profiling routes, and its permissive CORS layer, so a page in a
+//! browser (a dapp, a web wallet) cannot call this server. Allowing every
+//! origin on a node's RPC port is a choice for the operator to make, not one to
+//! inherit silently.
 //!
 //! Added: once shutdown begins, no request reaches the node. One arriving after
 //! it (a body that finishes uploading late, say) is refused without dispatch,

@@ -129,5 +129,13 @@ beacon node shuts down the same way and exits with an error.
   namespaces (`eth`, `net`, `web3`); `ETHREX_HTTP_API=eth,net,web3,debug` widens
   them, as it does for the standalone binary.
 - ethrex's RocksDB metrics collector, which is crate-private.
+- ethrex's Engine API metrics (per-method latency and outcome counts): the
+  in-process transport calls each handler directly, past the wrapper that
+  records them, so those series stay empty on `--ethrex.metrics-port`.
+- Separate discovery metrics. The beacon node's discv5 runs on ethrex's
+  discovery server too, and both update ethrex's process-wide p2p metrics, so
+  the discovered and discarded node counts include consensus-layer records.
+- The permissive CORS layer ethrex's JSON-RPC server has, so a page in a
+  browser cannot call the execution JSON-RPC server.
 - The authenticated Engine API port: nothing outside the process can drive the
   embedded node's fork choice.
