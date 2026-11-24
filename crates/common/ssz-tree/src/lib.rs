@@ -10,9 +10,10 @@
 //! # Leaves hold a run of elements
 //!
 //! A leaf is not one SSZ chunk but a whole subtree's worth of elements, about
-//! `LEAF_BYTES` of them, stored contiguously. The Merkle shape is still the
-//! SSZ one: a leaf hashes its elements up to its own height, so the root is
-//! unchanged, but there are far fewer nodes to walk and allocate. A lookup
+//! `LEAF_BYTES` of them (a page; 1 KiB for `u64`s, see
+//! `WIDE_PACKED_LEAF_BYTES`), stored contiguously. The Merkle shape is still
+//! the SSZ one: a leaf hashes its elements up to its own height, so the root
+//! is unchanged, but there are far fewer nodes to walk and allocate. A lookup
 //! descends to the leaf and indexes into it, and iteration walks each leaf as
 //! a slice. The cost is on writes: a rebuilt leaf copies its run and rehashes
 //! its own subtree, so a composite leaf keeps each element's root to rehash
@@ -20,8 +21,9 @@
 //!
 //! Inner nodes are wide in the same way: each holds about `NODE_BYTES` of
 //! child pointers and spans that many binary levels at once, so a lookup
-//! crosses a handful of nodes. A rebuilt inner node rehashes its binary levels
-//! from its children's cached roots.
+//! crosses a handful of nodes. A hashed inner node keeps every one of those
+//! binary levels, so a node rebuilt from it rehashes only the paths of the
+//! children it replaced, not all of its levels.
 //!
 //! The result is shaped much like a B+-tree over indices: page-sized nodes
 //! with a high fan-out, and every element in the leaves. Unlike one, it has no
@@ -193,14 +195,43 @@ pub(crate) fn tree_depth<T: Value>(limit: usize) -> usize {
 /// in one contiguous run and iteration walks few nodes.
 pub(crate) const LEAF_BYTES: usize = 4096;
 
+/// The leaf size for packed elements of eight or sixteen bytes (the `u64`
+/// balances, inactivity scores and slashings), smaller than [`LEAF_BYTES`].
+///
+/// A packed leaf keeps only its root, so writing one element rehashes the
+/// whole leaf: 127 hashes for a 4 KiB leaf, 31 for a 1 KiB one. A mainnet
+/// block writes about 530 balances at scattered positions, which at 4 KiB was
+/// 53k hashes a block and at 1 KiB is 16k (with inner nodes rehashing only
+/// changed paths, see `tree::Base`). Smaller still saves fewer hashes than it
+/// costs: an epoch rewrites most balances, and every leaf adds its own node,
+/// so 512 and 256 bytes were slower per epoch than they were faster per block,
+/// and held more memory. Participation flags keep [`LEAF_BYTES`]: a block's
+/// ~27k writes dirty nearly every leaf at any size.
+pub(crate) const WIDE_PACKED_LEAF_BYTES: usize = 1024;
+
 /// The height of `T`'s leaves in a tree tall enough to hold them: the largest
-/// power-of-two run of elements whose in-memory size fits in [`LEAF_BYTES`],
-/// counted in chunks. At least one chunk, so a leaf is never below height 0.
+/// power-of-two run of elements whose in-memory size fits in a leaf (see
+/// [`leaf_bytes`]), counted in chunks. At least one chunk, so a leaf is never
+/// below height 0.
 pub(crate) fn max_leaf_height<T: Value>() -> usize {
-    let fits = (LEAF_BYTES / size_of::<T>().max(1)).max(1);
+    let fits = (leaf_bytes::<T>() / size_of::<T>().max(1)).max(1);
     let elements = 1usize << fits.ilog2();
     let chunks = (elements / packing_factor::<T>()).max(1);
     chunks.ilog2() as usize
+}
+
+/// How many bytes of elements a leaf of `T` holds: [`WIDE_PACKED_LEAF_BYTES`]
+/// for a packed type of eight or sixteen bytes, [`LEAF_BYTES`] otherwise.
+///
+/// Not every packed type: a 32-byte root is packed one to a chunk too, and
+/// the root vectors (block roots, state roots, randao mixes) were not
+/// measured at the smaller size.
+fn leaf_bytes<T: Value>() -> usize {
+    if is_packed::<T>() && (8..32).contains(&size_of::<T>()) {
+        WIDE_PACKED_LEAF_BYTES
+    } else {
+        LEAF_BYTES
+    }
 }
 
 /// The height of the leaves in a tree of height `depth`: [`max_leaf_height`],
@@ -256,8 +287,8 @@ mod tests {
 
     #[test]
     fn a_leaf_holds_about_a_page_of_elements() {
-        // 512 u64s = 128 chunks.
-        assert_eq!(max_leaf_height::<u64>(), 7);
+        // A wide packed type gets the smaller leaf: 128 u64s = 32 chunks.
+        assert_eq!(max_leaf_height::<u64>(), 5);
         // 4096 u8s = 128 chunks.
         assert_eq!(max_leaf_height::<u8>(), 7);
         // 128 roots, one chunk each.
@@ -271,18 +302,18 @@ mod tests {
     #[test]
     fn an_inner_node_holds_about_a_page_of_children() {
         assert_eq!(NODE_LEVELS, 9);
-        // u64 leaves sit at height 7: nodes at 16, 25, 34, and the root at 38.
-        assert_eq!(child_height::<u64>(8), 7);
-        assert_eq!(child_height::<u64>(16), 7);
-        assert_eq!(child_height::<u64>(17), 16);
-        assert_eq!(child_height::<u64>(25), 16);
-        assert_eq!(child_height::<u64>(38), 34);
+        // u64 leaves sit at height 5: nodes at 14, 23, 32, and the root at 38.
+        assert_eq!(child_height::<u64>(6), 5);
+        assert_eq!(child_height::<u64>(14), 5);
+        assert_eq!(child_height::<u64>(15), 14);
+        assert_eq!(child_height::<u64>(23), 14);
+        assert_eq!(child_height::<u64>(38), 32);
     }
 
     #[test]
     fn a_tree_shorter_than_a_leaf_is_one_leaf() {
         assert_eq!(leaf_height::<u64>(3), 3);
-        assert_eq!(leaf_height::<u64>(38), 7);
+        assert_eq!(leaf_height::<u64>(38), 5);
     }
 
     #[test]

@@ -165,10 +165,22 @@ mod tests {
 
     #[test]
     fn tree_iter_crosses_leaf_boundaries_from_any_start() {
-        // 512 u64s to a leaf: three leaves, the last partial.
-        let values: Vec<u64> = (0..1300).collect();
+        // Three leaves, the last partial.
+        let leaf = crate::packing_factor::<u64>() << crate::max_leaf_height::<u64>();
+        let len = 2 * leaf + 20;
+        let values: Vec<u64> = (0..len as u64).collect();
         let (tree, _) = Tree::from_values(values.clone(), 9);
-        for start in [0usize, 1, 511, 512, 513, 1023, 1024, 1299, 1300] {
+        for start in [
+            0,
+            1,
+            leaf - 1,
+            leaf,
+            leaf + 1,
+            2 * leaf - 1,
+            2 * leaf,
+            len - 1,
+            len,
+        ] {
             let got: Vec<u64> = TreeIter::new(&tree, 9, start).copied().collect();
             assert_eq!(got, values[start..], "start {start}");
         }

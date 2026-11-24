@@ -187,7 +187,7 @@ proptest! {
         run_list::<u64, { 1 << 40 }, VecMap<u64>>(initial, ops)?;
     }
 
-    /// A leaf holds 512 u64s: this spans several, with the last partial.
+    /// A leaf holds 128 u64s: this spans many, with the last partial.
     #[test]
     fn u64_list_spanning_leaves(
         initial in vec(any::<u64>(), 0..1600),
@@ -1395,7 +1395,7 @@ proptest! {
         run_list::<u8, 16_384, VecMap<u8>>(initial, ops)?;
     }
 
-    /// A leaf holds 512 u64s: 8192 slashings span 16.
+    /// A leaf holds 128 u64s: 8192 slashings span 64.
     #[test]
     fn u64_vector_spanning_leaves(
         initial in vec(any::<u64>(), 8192),
