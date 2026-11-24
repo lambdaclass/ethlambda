@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e48672b8.js";
+            window.path_to_searchindex_js = "searchindex-6045e438.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -4836,10 +4836,18 @@ and it would buy nothing: the attestations this client submits are electra’s
 <code>SingleAttestation</code>, which has no earlier form, so a pre-electra chain is one it
 cannot serve whatever it does with blocks. A block from any earlier fork is
 refused by name rather than failing to decode.</p>
-<p>Blocks are fetched and published as SSZ rather than JSON. Signing a block means
-computing its <code>hash_tree_root</code>, which only the typed container can give; a
-hand-written JSON mapping of an execution payload would be a large surface on
-which a single wrong field silently produces a signature over the wrong block.</p>
+<p>Blocks are fetched as SSZ by preference and published as SSZ. Signing a block
+means computing its <code>hash_tree_root</code>, which only the typed container can give;
+a hand-written JSON mapping of an execution payload would be a large surface on
+which a single wrong field silently produces a signature over the wrong block.
+<code>produceBlockV3</code> (electra and fulu) is still asked for
+<code>application/octet-stream;q=1.0,application/json;q=0.9</code>, and a JSON answer is
+decoded into the same containers through their serde support in
+<code>ethlambda-types</code>, the one an ethlambda beacon node writes that answer with.
+That is for ethereum-package’s blobber, which sits between the client and its
+node, rewrites <code>Accept</code> to <code>application/json</code> on block production, and relays
+the node’s answer unchanged. Gloas’s <code>produceBlockV4</code>, which blobber does not
+intercept, stays SSZ-only.</p>
 <p>From gloas on a proposal is two messages. The client asks for the block with
 <code>include_payload=true</code> (<code>produceBlockV4</code>), publishes the block bare, then signs
 the envelope with the proposer’s own key under the builder domain and publishes
