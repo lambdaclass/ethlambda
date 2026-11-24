@@ -163,8 +163,14 @@ proofs through one of two backends, chosen once per process:
   Until then the node proves nothing, gossip aggregates it cannot verify are
   IGNOREd (`prover_unreachable`) rather than held against their senders, and
   a block whose proof it could not check fails import and is fetched again
-  later (there is no bad-block cache). After `LEANVM_MAX_RESTARTS` (10) such
-  quick exits in a row it stops the node too. `LEANVM_THREADS` sets the
+  later (there is no bad-block cache). The gap is the sidecar's warm-up, not
+  the pause: on the local devnet, a sidecar on 2 threads killed mid-run
+  served again 50 s later (12 s at the container's start, on an idle
+  machine). Its node's head stood still meanwhile, so the two blocks it
+  proposed were built on a stale head and orphaned, and it imported the
+  block it had missed 8 s after the sidecar came back. After
+  `LEANVM_MAX_RESTARTS` (10) quick exits in a row the supervisor stops the
+  node too. `LEANVM_THREADS` sets the
   sidecar's proving threads, `LEANVM_SIDECAR` another executable. The image
   builds `leanvm-sidecar` from the commit in the root `leanvm-revision` file,
   or from
@@ -409,6 +415,7 @@ ethlambda's validator client (Silver has no client of its own):
 ```yaml
 participants:
   - el_type: geth
+    el_image: ethpandaops/geth:glamsterdam-devnet-8
     cl_type: ethlambda
     cl_image: ethlambda:pq-local
     cl_extra_env_vars:
@@ -418,17 +425,20 @@ participants:
     validator_count: 16
     supernode: true
   - el_type: geth
+    el_image: ethpandaops/geth:glamsterdam-devnet-8
     cl_type: teku
     cl_image: ethpandaops/teku:pq-devnet-0
     vc_image: ethpandaops/teku:pq-devnet-0
     validator_count: 16
     supernode: true
   - el_type: geth
+    el_image: ethpandaops/geth:glamsterdam-devnet-8
     cl_type: lodestar
     cl_image: ethpandaops/lodestar:pq-devnet-0
     vc_image: ethpandaops/lodestar:pq-devnet-0
     validator_count: 16
   - el_type: geth
+    el_image: ethpandaops/geth:glamsterdam-devnet-8
     cl_type: silver
     cl_image: ethpandaops/silver:pq-devnet-0
     vc_type: ethlambda
@@ -440,6 +450,9 @@ network_params:
   pq_fork_epoch: 0
   genesis_delay: 240
 ```
+
+`el_image` is the execution client the pq-devnet-0 notes name; without it the
+package runs `ethereum/client-go:latest`.
 
 What the package does for ethlambda on a PQ network:
 
