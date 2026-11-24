@@ -204,7 +204,7 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
     ) -> Result<usize> {
         let root = self.context.payload_attestation_signing_root(&data);
         let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_PTC_ATTESTER);
-        let mut messages = Vec::with_capacity(pending.len());
+        let mut owed = Vec::with_capacity(pending.len());
         for duty in pending {
             let pubkey = match parse_pubkey(&duty.pubkey) {
                 Ok(pubkey) => pubkey,
@@ -216,16 +216,26 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             if !self.record(duty.validator_index, slot) {
                 continue;
             }
-            match crate::pq::sign(&pubkey, leaf, root) {
+            owed.push((
+                duty.validator_index,
+                crate::pq::SignRequest { pubkey, leaf, root },
+            ));
+        }
+        // Signed together, in parallel off this task.
+        let requests = owed.iter().map(|(_, request)| *request).collect();
+        let signatures = crate::pq::sign_all(requests).await;
+        let mut messages = Vec::with_capacity(owed.len());
+        for ((validator_index, _), signature) in owed.into_iter().zip(signatures) {
+            match signature {
                 Ok(signature) => messages.push(
                     ethlambda_types::beacon::containers::pq::PayloadAttestationMessage {
-                        validator_index: duty.validator_index,
+                        validator_index,
                         data,
                         signature,
                     },
                 ),
                 Err(err) => {
-                    error!(%slot, validator = duty.validator_index, %err, "Failed to sign a PQ payload attestation");
+                    error!(%slot, validator = validator_index, %err, "Failed to sign a PQ payload attestation");
                     crate::metrics::inc_signing_failures();
                 }
             }

@@ -36,6 +36,11 @@
 //! in [`LEAF_RECORD_FILE`] under the validators directory and flushed to disk
 //! before the signature exists, so a restart, however quick, cannot sign a
 //! second message at a leaf (see [`open_leaf_record`]).
+//!
+//! **Signing.** A duty signs its keys as one batch ([`sign_all`]): every
+//! leaf the batch spends is recorded with one flush, then the keys sign in
+//! parallel on rayon's global pool, on tokio's blocking pool rather than the
+//! duty's task.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -60,7 +65,7 @@ pub use ethlambda_types::beacon::constants::{
 /// client signed at and the root it signed there: [`LEAF_RECORD_SIZE`]-byte
 /// records (the 48-byte BLS key, the leaf as a little-endian `u64`, the
 /// signing root), appended and flushed before each first signature at a
-/// leaf.
+/// leaf, a batch's records with one flush.
 pub const LEAF_RECORD_FILE: &str = "pq_signed_leaves.bin";
 
 const LEAF_RECORD_SIZE: usize = 48 + 8 + 32;
@@ -143,25 +148,69 @@ impl LeafRecord {
         ))
     }
 
-    /// Claims `leaf` of `pubkey` for `root`: refused when the leaf already
-    /// signed another root, and recorded durably the first time.
+    /// Claims `leaf` of `pubkey` for `root`: [`Self::claim_all`] of one.
     fn claim(&mut self, pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<(), PqSignError> {
-        match self.roots.get(&(*pubkey, leaf)) {
-            Some(previous) if *previous != root => return Err(PqSignError::LeafUsed(leaf)),
-            Some(_) => return Ok(()),
-            None => {}
+        let request = SignRequest {
+            pubkey: *pubkey,
+            leaf,
+            root,
+        };
+        self.claim_all(&[request])
+            .pop()
+            .expect("one outcome per claim")
+    }
+
+    /// Claims each request's leaf for its root, in order, answering in the
+    /// same order: refused when the leaf already signed another root, before
+    /// this call or earlier in `requests`, so a batch cannot spend one leaf
+    /// on two roots either. The leaves claimed for the first time are
+    /// recorded together, one write and one flush; when that fails, every
+    /// one of them fails with it and none is kept.
+    fn claim_all(&mut self, requests: &[SignRequest]) -> Vec<Result<(), PqSignError>> {
+        let mut fresh: HashMap<(BlsPubkey, u64), Root> = HashMap::new();
+        let mut record = Vec::new();
+        // `None` for a request whose leaf the write below claims.
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let at = (request.pubkey, request.leaf);
+            let held = match self.roots.get(&at) {
+                Some(root) => Some((*root, true)),
+                None => fresh.get(&at).map(|root| (*root, false)),
+            };
+            outcomes.push(match held {
+                Some((root, _)) if root != request.root => {
+                    Some(Err(PqSignError::LeafUsed(request.leaf)))
+                }
+                Some((_, durable)) => durable.then_some(Ok(())),
+                None => {
+                    fresh.insert(at, request.root);
+                    record.extend_from_slice(&request.pubkey.0);
+                    record.extend_from_slice(&request.leaf.to_le_bytes());
+                    record.extend_from_slice(&request.root.0);
+                    None
+                }
+            });
         }
-        if let Some(file) = &mut self.file {
-            let mut record = Vec::with_capacity(LEAF_RECORD_SIZE);
-            record.extend_from_slice(&pubkey.0);
-            record.extend_from_slice(&leaf.to_le_bytes());
-            record.extend_from_slice(&root.0);
-            file.write_all(&record)
-                .and_then(|()| file.sync_data())
-                .map_err(PqSignError::Record)?;
+        let written = match &mut self.file {
+            Some(file) if !record.is_empty() => {
+                file.write_all(&record).and_then(|()| file.sync_data())
+            }
+            _ => Ok(()),
+        };
+        if written.is_ok() {
+            self.roots.extend(fresh);
         }
-        self.roots.insert((*pubkey, leaf), root);
-        Ok(())
+        outcomes
+            .into_iter()
+            .map(|outcome| match (outcome, &written) {
+                (Some(outcome), _) => outcome,
+                (None, Ok(())) => Ok(()),
+                (None, Err(err)) => Err(PqSignError::Record(std::io::Error::new(
+                    err.kind(),
+                    err.to_string(),
+                ))),
+            })
+            .collect()
     }
 }
 
@@ -494,6 +543,8 @@ pub enum PqSignError {
     SlotPastVrfTree(Slot),
     #[error("could not record the leaf before signing: {0}")]
     Record(std::io::Error),
+    #[error("the signing task failed: {0}")]
+    Task(String),
 }
 
 /// Where [`prepare_vrf_tree`] got a key's VRF tree.
@@ -698,32 +749,110 @@ pub fn prepare_vrf_tree(pubkey: &BlsPubkey, validators_dir: &Path) -> Option<Vrf
     Some(VrfTreeSource::Hashed)
 }
 
-/// Signs `root` at `leaf` with `pubkey`'s leanXMSS key. Refuses a leaf this
-/// process already signed a different root at; the same root again is
+/// One leanXMSS signature to make: `root` at `leaf` with `pubkey`'s key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignRequest {
+    pub pubkey: BlsPubkey,
+    pub leaf: u64,
+    pub root: Root,
+}
+
+/// Signs each request, answering in the same order. A leaf this process
+/// already signed a different root at is refused; the same root again is
 /// re-signed, which yields the same bytes (signing is deterministic).
-/// Blocking: building a bottom tree takes about 2.5 s, single-threaded.
-pub fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, PqSignError> {
-    let key = key(pubkey).ok_or(PqSignError::UnknownValidator)?;
+///
+/// Every leaf the batch spends is recorded with one write and one flush
+/// before any of its signatures exists, then the keys sign in parallel on
+/// rayon's global pool (leanVM signs on one thread, and different keys share
+/// nothing). One signature recomputes a `2^8`-leaf subtree of its bottom
+/// tree, a 256th of building the tree: roughly 10 ms on a core.
+///
+/// Blocking, for the batch's slowest signature: [`sign_all`] runs it off
+/// the async runtime.
+pub fn sign_batch(requests: &[SignRequest]) -> Vec<Result<XmssSignature, PqSignError>> {
+    use rayon::prelude::*;
+    let mut checked: Vec<Result<(Arc<PqKey>, u32), PqSignError>> = requests
+        .iter()
+        .map(|request| {
+            let key = key(&request.pubkey).ok_or(PqSignError::UnknownValidator)?;
+            let leaf_index = u32::try_from(request.leaf)
+                .map_err(|_| PqSignError::LeafOutOfRange(request.leaf))?;
+            Ok((key, leaf_index))
+        })
+        .collect();
     // Checked before the claim, so an unsignable leaf is not recorded as spent.
-    let leaf_index = u32::try_from(leaf).map_err(|_| PqSignError::LeafOutOfRange(leaf))?;
-    signed_leaves()
+    let claimable: Vec<SignRequest> = requests
+        .iter()
+        .zip(&checked)
+        .filter(|(_, checked)| checked.is_ok())
+        .map(|(request, _)| *request)
+        .collect();
+    let claims = signed_leaves()
         .lock()
         .expect("PQ leaf record poisoned")
-        .claim(pubkey, leaf, root)?;
+        .claim_all(&claimable);
+    let signable = checked.iter_mut().filter(|checked| checked.is_ok());
+    for (checked, claim) in signable.zip(claims) {
+        if let Err(err) = claim {
+            *checked = Err(err);
+        }
+    }
+    requests
+        .par_iter()
+        .zip(checked)
+        .map(|(request, checked)| {
+            let (key, leaf_index) = checked?;
+            Ok(sign_claimed(request, &key, leaf_index))
+        })
+        .collect()
+}
+
+/// [`sign_batch`] on tokio's blocking pool, so neither the flush nor the
+/// hashing holds the task that awaits it.
+pub async fn sign_all(requests: Vec<SignRequest>) -> Vec<Result<XmssSignature, PqSignError>> {
+    if requests.is_empty() {
+        return Vec::new();
+    }
+    let count = requests.len();
+    tokio::task::spawn_blocking(move || sign_batch(&requests))
+        .await
+        .unwrap_or_else(|err| {
+            let reason = err.to_string();
+            (0..count)
+                .map(|_| Err(PqSignError::Task(reason.clone())))
+                .collect()
+        })
+}
+
+/// One [`sign_all`] signature.
+pub async fn sign(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, PqSignError> {
+    let request = SignRequest {
+        pubkey: *pubkey,
+        leaf,
+        root,
+    };
+    sign_all(vec![request])
+        .await
+        .pop()
+        .expect("one answer per request")
+}
+
+/// The signature at a leaf already claimed for `request.root`.
+fn sign_claimed(request: &SignRequest, key: &PqKey, leaf_index: u32) -> XmssSignature {
     // Signing builds the leaf's bottom tree if the key lacks it, seconds on
     // the duty's own deadline; `prepare_bottom_tree` exists so that it never
     // does. Prepared first, timed, so a build that still lands here is seen.
     if let Some(elapsed) = prepare_tree(&key.xmss, leaf_index) {
         warn!(
-            pubkey = %encode_pubkey(pubkey),
-            tree = bottom_tree_of(leaf),
-            leaf,
+            pubkey = %encode_pubkey(&request.pubkey),
+            tree = bottom_tree_of(request.leaf),
+            leaf = request.leaf,
             elapsed_ms = elapsed.as_millis() as u64,
             "Built a leanXMSS bottom tree at signing time"
         );
     }
-    let signature = leanvm_lean_xmss::sign(&key.xmss, &root.0, leaf_index);
-    Ok(XmssSignature(signature.to_bytes()))
+    let signature = leanvm_lean_xmss::sign(&key.xmss, &request.root.0, leaf_index);
+    XmssSignature(signature.to_bytes())
 }
 
 const _: () =
@@ -742,6 +871,24 @@ pub fn vrf_proof(pubkey: &BlsPubkey, slot: Slot) -> Result<Vec<Root>, PqSignErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One signature, on this thread.
+    fn sign_now(pubkey: &BlsPubkey, leaf: u64, root: Root) -> Result<XmssSignature, PqSignError> {
+        let request = SignRequest {
+            pubkey: *pubkey,
+            leaf,
+            root,
+        };
+        sign_batch(&[request]).pop().unwrap()
+    }
+
+    fn request(pubkey: BlsPubkey, leaf: u64, root: u8) -> SignRequest {
+        SignRequest {
+            pubkey,
+            leaf,
+            root: Root::from([root; 32]),
+        }
+    }
 
     #[test]
     fn leaves_follow_the_specification() {
@@ -768,10 +915,10 @@ mod tests {
         assert_eq!(bls_for_request_key(&pubkey.0), None);
 
         let leaf = slot_leaf(5, LEAF_OFFSET_PTC_ATTESTER);
-        let first = sign(&pubkey, leaf, Root::from([1; 32])).unwrap();
-        assert_eq!(sign(&pubkey, leaf, Root::from([1; 32])).unwrap(), first);
+        let first = sign_now(&pubkey, leaf, Root::from([1; 32])).unwrap();
+        assert_eq!(sign_now(&pubkey, leaf, Root::from([1; 32])).unwrap(), first);
         assert!(matches!(
-            sign(&pubkey, leaf, Root::from([2; 32])),
+            sign_now(&pubkey, leaf, Root::from([2; 32])),
             Err(PqSignError::LeafUsed(_))
         ));
         let public = request[16..].try_into().unwrap();
@@ -779,9 +926,127 @@ mod tests {
             &public, leaf, &[1; 32], &first.0
         ));
         assert!(matches!(
-            sign(&pubkey, 1 << 32, Root::from([1; 32])),
+            sign_now(&pubkey, 1 << 32, Root::from([1; 32])),
             Err(PqSignError::LeafOutOfRange(_))
         ));
+    }
+
+    /// A batch answers each request in its place: a refused one costs only
+    /// itself, and a leaf is claimed only for a request that can sign.
+    #[test]
+    fn a_batch_signs_each_request_in_its_place() {
+        let pubkey = BlsPubkey([23; 48]);
+        let unknown = BlsPubkey([24; 48]);
+        derive_and_register(pubkey, &[23; 32], 0, None);
+        // Slot 0's bottom tree, which registering built.
+        let spent = slot_leaf(1, LEAF_OFFSET_PTC_ATTESTER);
+        let free = slot_leaf(2, LEAF_OFFSET_PTC_ATTESTER);
+        let other = slot_leaf(3, LEAF_OFFSET_AGGREGATE_AND_PROOF);
+        sign_now(&pubkey, spent, Root::from([1; 32])).unwrap();
+
+        let requests = [
+            request(pubkey, free, 1),
+            request(pubkey, spent, 2),
+            request(unknown, free, 1),
+            request(pubkey, other, 3),
+            request(pubkey, 1 << 32, 1),
+        ];
+        let signed = sign_batch(&requests);
+        assert_eq!(signed.len(), requests.len());
+        assert!(matches!(signed[1], Err(PqSignError::LeafUsed(_))));
+        assert!(matches!(signed[2], Err(PqSignError::UnknownValidator)));
+        assert!(matches!(signed[4], Err(PqSignError::LeafOutOfRange(_))));
+        let public = request_key(&pubkey).unwrap()[16..].try_into().unwrap();
+        for at in [0, 3] {
+            let signature = signed[at].as_ref().unwrap();
+            let SignRequest { leaf, root, .. } = requests[at];
+            assert!(ethlambda_crypto::lean_xmss::verify(
+                &public,
+                leaf,
+                &root.0,
+                &signature.0
+            ));
+        }
+        let record = signed_leaves().lock().unwrap();
+        assert!(!record.roots.contains_key(&(unknown, free)));
+        assert!(!record.roots.contains_key(&(pubkey, 1 << 32)));
+        assert_eq!(
+            record.roots.get(&(pubkey, spent)),
+            Some(&Root::from([1; 32]))
+        );
+    }
+
+    /// A batch cannot spend one leaf on two roots, and what it claims is
+    /// written once and found again after a restart.
+    #[test]
+    fn a_batch_claims_each_leaf_once_and_records_it_in_one_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(LEAF_RECORD_FILE);
+        let (pubkey, other) = (BlsPubkey([15; 48]), BlsPubkey([16; 48]));
+        let (held, fresh) = (
+            slot_leaf(100, LEAF_OFFSET_PTC_ATTESTER),
+            slot_leaf(101, LEAF_OFFSET_PTC_ATTESTER),
+        );
+        {
+            let (mut record, _) = LeafRecord::open(&path, 0).unwrap();
+            record.claim(&pubkey, held, Root::from([1; 32])).unwrap();
+            let claims = record.claim_all(&[
+                request(pubkey, fresh, 1),
+                request(pubkey, fresh, 2),
+                request(pubkey, held, 2),
+                request(pubkey, held, 1),
+                request(other, fresh, 2),
+                request(pubkey, fresh, 1),
+            ]);
+            let refused: Vec<bool> = claims
+                .iter()
+                .map(|claim| matches!(claim, Err(PqSignError::LeafUsed(_))))
+                .collect();
+            assert_eq!(refused, [false, true, true, false, false, false]);
+            assert!(
+                claims
+                    .iter()
+                    .all(|claim| matches!(claim, Ok(()) | Err(PqSignError::LeafUsed(_))))
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * LEAF_RECORD_SIZE as u64,
+            "the held leaf, then the batch's two new ones"
+        );
+        let (mut record, count) = LeafRecord::open(&path, 0).unwrap();
+        assert_eq!(count, 3);
+        let claims = record.claim_all(&[request(pubkey, fresh, 2), request(other, fresh, 1)]);
+        assert!(
+            claims
+                .iter()
+                .all(|claim| matches!(claim, Err(PqSignError::LeafUsed(_))))
+        );
+    }
+
+    /// When the batch's write fails, every leaf it claimed for the first
+    /// time fails with it and none is kept, so none is signed.
+    #[test]
+    fn a_failed_write_fails_every_new_leaf_of_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(LEAF_RECORD_FILE);
+        std::fs::write(&path, []).unwrap();
+        let pubkey = BlsPubkey([17; 48]);
+        let held = slot_leaf(100, LEAF_OFFSET_PTC_ATTESTER);
+        let mut record = LeafRecord::default();
+        record.claim(&pubkey, held, Root::from([1; 32])).unwrap();
+        // Read-only: the write is refused.
+        record.file = Some(std::fs::File::open(&path).unwrap());
+
+        let claims = record.claim_all(&[
+            request(pubkey, slot_leaf(101, LEAF_OFFSET_PTC_ATTESTER), 1),
+            request(pubkey, held, 1),
+            request(pubkey, slot_leaf(102, LEAF_OFFSET_PTC_ATTESTER), 1),
+        ]);
+        assert!(matches!(claims[0], Err(PqSignError::Record(_))));
+        assert!(matches!(claims[1], Ok(())), "already recorded");
+        assert!(matches!(claims[2], Err(PqSignError::Record(_))));
+        assert_eq!(record.roots.len(), 1);
     }
 
     /// What ethereum-package's leanXMSS cache file holds for the key `secret`
@@ -824,7 +1089,7 @@ mod tests {
         );
         assert_eq!(request_key(&pubkey), Some(request));
         let leaf = slot_leaf(3, LEAF_OFFSET_PTC_ATTESTER);
-        let signature = sign(&pubkey, leaf, Root::from([4; 32])).unwrap();
+        let signature = sign_now(&pubkey, leaf, Root::from([4; 32])).unwrap();
         assert!(ethlambda_crypto::lean_xmss::verify(
             &public,
             leaf,
@@ -924,7 +1189,7 @@ mod tests {
         let pubkey = BlsPubkey([10; 48]);
         derive_and_register(pubkey, &secret, 0, None);
         // Registered and signing, with no tree yet: a proposal is refused.
-        assert!(sign(&pubkey, attestation_leaf(0), Root::from([1; 32])).is_ok());
+        assert!(sign_now(&pubkey, attestation_leaf(0), Root::from([1; 32])).is_ok());
         assert!(matches!(
             vrf_proof(&pubkey, 5),
             Err(PqSignError::VrfTreeNotReady)

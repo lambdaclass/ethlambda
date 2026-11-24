@@ -260,16 +260,26 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // From PQ a leanXMSS signature at the target epoch's leaf, over the
         // same signing root: the slashing protection record above already
         // guards that leaf (one per target epoch). Those keys are derived from
-        // local keystores at startup, so they sign here, with no round trip.
+        // local keystores at startup, so they sign here, with no round trip,
+        // in parallel off this task (`pq::sign_all`).
         let signatures: Vec<std::result::Result<String, String>> = {
             let _timing = crate::metrics::time_signing();
             if is_pq {
                 let root = self.context.attestation_signing_root(&data);
                 let leaf = crate::pq::attestation_leaf(data.target.epoch);
-                to_sign
+                let requests = to_sign
                     .iter()
-                    .map(|(_, pubkey)| {
-                        crate::pq::sign(pubkey, leaf, root)
+                    .map(|(_, pubkey)| crate::pq::SignRequest {
+                        pubkey: *pubkey,
+                        leaf,
+                        root,
+                    })
+                    .collect();
+                crate::pq::sign_all(requests)
+                    .await
+                    .into_iter()
+                    .map(|signature| {
+                        signature
                             .map(|signature| encode_hex(&signature.0))
                             .map_err(|err| err.to_string())
                     })

@@ -589,7 +589,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                     };
                     let root = self.context.proposer_preferences_signing_root(&message);
                     let leaf = crate::pq::slot_leaf(duty.slot, LEAF_OFFSET_PROPOSER_PREFERENCES);
-                    match crate::pq::sign(&pubkey, leaf, root) {
+                    match crate::pq::sign(&pubkey, leaf, root).await {
                         Ok(signature) => {
                             (pq::SignedProposerPreferences { message, signature }, true)
                         }

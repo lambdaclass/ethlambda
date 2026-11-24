@@ -143,7 +143,7 @@ impl<B: BeaconNodeApi> AggregationService<B> {
             }
         }
 
-        let mut signed = Vec::new();
+        let mut owed = Vec::new();
         for duty in &selected {
             let Some(proven) = aggregates.get(&duty.committee_index) else {
                 continue;
@@ -164,10 +164,19 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                 .context
                 .aggregate_and_proof_signing_root(message.hash_tree_root(), slot);
             let leaf = crate::pq::slot_leaf(slot, LEAF_OFFSET_AGGREGATE_AND_PROOF);
-            match crate::pq::sign(&pubkey, leaf, root) {
+            let request = crate::pq::SignRequest { pubkey, leaf, root };
+            owed.push((message, request));
+        }
+        // Signed together, in parallel off this task.
+        let requests = owed.iter().map(|(_, request)| *request).collect();
+        let signatures = crate::pq::sign_all(requests).await;
+        let mut signed = Vec::with_capacity(owed.len());
+        for ((message, _), signature) in owed.into_iter().zip(signatures) {
+            match signature {
                 Ok(signature) => signed.push(pq::SignedAggregateAndProof { message, signature }),
                 Err(err) => {
-                    warn!(%slot, validator = duty.validator_index, %err, "Failed to sign a PQ aggregate");
+                    let validator = message.aggregator_index;
+                    warn!(%slot, validator, %err, "Failed to sign a PQ aggregate");
                 }
             }
         }

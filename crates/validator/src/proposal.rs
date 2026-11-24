@@ -485,7 +485,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
 
         let signing_root = self.context.block_signing_root(block_root, slot);
         let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_BEACON_PROPOSER);
-        let signature = crate::pq::sign(&pubkey, leaf, signing_root).map_err(pq_error)?;
+        let signature = crate::pq::sign(&pubkey, leaf, signing_root)
+            .await
+            .map_err(pq_error)?;
         let signed = pq::SignedBeaconBlock {
             message: contents.block,
             signature,
@@ -515,7 +517,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE);
         // Logged and counted rather than propagated, as for gloas: the block
         // is out and the proposal did happen.
-        match crate::pq::sign(&pubkey, leaf, envelope_root) {
+        match crate::pq::sign(&pubkey, leaf, envelope_root).await {
             Ok(signature) => {
                 let signed = pq::SignedExecutionPayloadEnvelope {
                     message: envelope,

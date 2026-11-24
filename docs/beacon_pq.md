@@ -336,6 +336,10 @@ attestation at its target epoch's, the others at the slot's own offset. The
 client refuses to sign two different roots at one leaf, and keeps the record
 in `<validators-dir>/pq_signed_leaves.bin`, each leaf written and synced
 before its signature exists, so a restart cannot sign a leaf twice either.
+A duty's keys sign as one batch: its leaves are written with one sync, then
+the keys sign in parallel on rayon's global pool (leanVM signs on one
+thread; a signature recomputes a 256th of its bottom tree, roughly 10 ms on
+a core), on tokio's blocking pool rather than the duty's task.
 A start drops the leaves of slots more than two epochs back, which nothing
 asks for again.
 
