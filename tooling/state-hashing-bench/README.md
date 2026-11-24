@@ -30,15 +30,10 @@ How each library is driven:
 |---|---|---|
 | API | the state's own list types (`Validators`, `Balances`, ...) with their update buffers (`VecMap` for balances and participation, `BTreeMap` for validators and inactivity scores) | `SharedList` (the `multi-owner` storage its own benchmark uses); every list is committed once after `new`, so its flat tree is parked in the pool as after any commit |
 | Pages | 4 KiB leaves, wide inner nodes | Silver's client's page sizes: balances 16 nodes, participation and inactivity 256, validator roots 1024 |
-| Writes | buffered (`get_mut`/`push`, highest index first, as the node's unsorted writes reach the end of the list early and grow a `VecMap` buffer once), then `apply_updates`; through the write cursor (`iter_cow`) when they cover at least 1/8 of the list, which is the epoch's balance rewrite, as `try_update_balances` does | `set`/`push`, then `commit` |
+| Writes | buffered (`get_mut`/`push`, highest index first, as the node's unsorted writes reach the end of the list early and grow a `VecMap` buffer once), then `apply_updates`; through the write cursor (`iter_cow`) when they cover at least 1/8 of the list, which is the epoch's balance rewrite (fulu's epoch pass buffers those too; at that density both cost the same, 49.8 vs 50.0 ms per epoch on an M3 Pro) | `set`/`push`, then `commit` |
 | Participation rotation | `mem::take` + `List::repeat(0, n)`, as `process_participation_flag_updates` does | previous = clone of current, current = `SharedList::new(zeros)` (this API has no in-place zero fill) |
 | Validators | the list holds `Validator`s and hashes the changed ones itself | the list holds roots; each changed validator's root is computed in the timed region with the same `hash_tree_root` |
 | Threads | 1, and every core (it hashes large subtrees on rayon) | 1 |
-
-The node also walks every validator through the cursor at an epoch, since it
-computes each one's effective balance on the way. That walk is the state
-transition's work rather than hashing, and Silver is not charged for one, so
-the few epoch writes to validators are buffered here.
 
 Both run under jemalloc (the node's allocator) and the node's release
 profile (`lto = "fat"`, one codegen unit). `--keep` versions stay alive
