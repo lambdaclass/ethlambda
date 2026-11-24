@@ -349,6 +349,18 @@ its committee's aggregation committee, and `GET aggregate_attestation` at a
 PQ slot answers `{"aggregate", "proof"}`, the aggregate this node proved for
 its aggregators' committee (Lighthouse's PQ branch's `PqAggregate`), or 404.
 
+A PQ validator's public key is its 32-byte XMSS key (`XMSSPubkey`), and the
+API names it that way, as Lighthouse and Lodestar do: `states/{state_id}/validators`
+answers a PQ state's entries as the PQ `Validator` container (the 32-byte
+`pubkey`, then `vrf_root`), and the proposer, attester and PTC duties carry
+the 32-byte key. The 48-byte form the state keeps it in, 16 zero bytes then
+the key, is the deposit and request form only. A `validator_id` may be either:
+a 32-byte key, or a 48-byte one as a client from before that switch sends.
+`POST beacon/execution_payload_envelopes` under `pq` takes the bare signed
+envelope and builds the columns from the blobs it kept at `pq_blocks`, so it
+reads no `Eth-Blob-Data-Included`; ethlambda's validator client still sends
+`false`, which a node reading the header as gloas defines it requires.
+
 ### Validator endpoints
 
 These are what `ethlambda validator` needs to attest through this node. Every

@@ -18,8 +18,10 @@ use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
         constants::FAR_FUTURE_EPOCH,
-        containers::{BeaconState, shared::Validator},
-        primitives::{BlsPubkey, Epoch, Gwei, ValidatorIndex},
+        containers::{BeaconState, pq, shared::Validator},
+        primitives::{
+            BLS_PUBKEY_SIZE, BlsPubkey, Epoch, Gwei, ValidatorIndex, XMSS_PUBKEY_SIZE, XmssPubkey,
+        },
         signing::compute_epoch_at_slot,
     },
     primitives::H256,
@@ -224,20 +226,95 @@ impl ValidatorStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidatorId {
     Index(ValidatorIndex),
+    /// In the registry's in-memory form, which is what it is compared with.
     Pubkey(BlsPubkey),
 }
 
 impl ValidatorId {
+    /// An index, a 48-byte key, or a 32-byte XMSS key. The last is the form a
+    /// PQ registry names a validator by (the specification's `XMSSPubkey`), and
+    /// the one Lighthouse's PQ validator client asks by; it is read into the
+    /// request form the registry keeps it in, so it matches nothing before PQ.
+    /// A 48-byte key is still read as it is: a client from before the API's
+    /// switch to 32 bytes asks for a PQ key in that request form.
     fn parse(text: &str) -> Result<Self, ApiError> {
         if let Some(hex_digits) = text.strip_prefix("0x") {
-            let mut bytes = [0u8; 48];
-            return hex::decode_to_slice(hex_digits, &mut bytes)
-                .map(|()| Self::Pubkey(BlsPubkey(bytes)))
-                .map_err(|_| ApiError::BadRequest("invalid validator id"));
+            let invalid = |_| ApiError::BadRequest("invalid validator id");
+            if hex_digits.len() == 2 * XMSS_PUBKEY_SIZE {
+                let mut bytes = [0u8; XMSS_PUBKEY_SIZE];
+                hex::decode_to_slice(hex_digits, &mut bytes).map_err(invalid)?;
+                return Ok(Self::Pubkey(XmssPubkey(bytes).to_request_key()));
+            }
+            let mut bytes = [0u8; BLS_PUBKEY_SIZE];
+            hex::decode_to_slice(hex_digits, &mut bytes).map_err(invalid)?;
+            return Ok(Self::Pubkey(BlsPubkey(bytes)));
         }
         text.parse()
             .map(Self::Index)
             .map_err(|_| ApiError::BadRequest("invalid validator id"))
+    }
+}
+
+/// A validator's public key as the Beacon API names it: the BLS key, or in a
+/// PQ state the 32-byte XMSS key (`Validator.pubkey: XMSSPubkey`).
+///
+/// A PQ registry keeps each XMSS key in memory in the 48-byte form an
+/// execution-layer request names it by (16 zero bytes, then the key; see
+/// `containers::pq`). That form is for deposits and requests only: the API
+/// answers with the key itself, as Lighthouse and Lodestar do, and a client
+/// expecting 32 bytes cannot read the padded form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ApiPubkey {
+    Bls(BlsPubkey),
+    Xmss(XmssPubkey),
+}
+
+impl ApiPubkey {
+    /// `pubkey`, read from `state`'s registry, as the API names it.
+    pub(crate) fn of(state: &BeaconState, pubkey: BlsPubkey) -> Self {
+        match state {
+            BeaconState::Pq(_) => Self::Xmss(XmssPubkey::from_request_key(&pubkey)),
+            _ => Self::Bls(pubkey),
+        }
+    }
+}
+
+/// A registry entry as the API renders it: the state's own `Validator`
+/// container. A PQ state's is [`pq::Validator`], whose JSON is the
+/// specification's (the 32-byte key, then `vrf_root`), not the shared record
+/// it keeps in memory.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(untagged)]
+enum RegistryEntry<'a> {
+    Shared(&'a Validator),
+    Pq(&'a pq::Validator),
+}
+
+impl<'a> RegistryEntry<'a> {
+    /// The fields every fork shares, which status and id matching read.
+    fn record(self) -> &'a Validator {
+        match self {
+            Self::Shared(validator) => validator,
+            Self::Pq(validator) => &validator.record,
+        }
+    }
+
+    /// Every entry of `state`'s registry, in index order.
+    fn iter(state: &'a BeaconState) -> Box<dyn Iterator<Item = Self> + 'a> {
+        match state {
+            BeaconState::Pq(pq_state) => Box::new(pq_state.validators.iter().map(Self::Pq)),
+            _ => Box::new(state.iter_validators().map(Self::Shared)),
+        }
+    }
+
+    /// The entry at `index` in `state`'s registry.
+    fn at(state: &'a BeaconState, index: ValidatorIndex) -> Result<Self, ApiError> {
+        let found = match state {
+            BeaconState::Pq(_) => state.pq_validator(index).map(Self::Pq),
+            _ => state.validator(index).map(Self::Shared),
+        };
+        found.map_err(|_| ApiError::NotFound("validator not found"))
     }
 }
 
@@ -270,7 +347,7 @@ struct ValidatorEntry<'a> {
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     balance: Gwei,
     status: &'static str,
-    validator: &'a Validator,
+    validator: RegistryEntry<'a>,
 }
 
 /// `GET .../validators?id=…&status=…`. Each parameter may repeat, and each
@@ -336,13 +413,12 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
                 ValidatorId::Pubkey(wanted) => *wanted == validator.pubkey,
             })
     };
-    let entries: Vec<ValidatorEntry> = state
-        .iter_validators()
+    let entries: Vec<ValidatorEntry> = RegistryEntry::iter(&state)
         .zip(state.iter_balances())
         .enumerate()
-        .filter(|(index, (validator, _))| selected(*index as ValidatorIndex, validator))
+        .filter(|(index, (validator, _))| selected(*index as ValidatorIndex, validator.record()))
         .map(|(index, (validator, balance))| {
-            let status = ValidatorStatus::of(validator, balance, epoch);
+            let status = ValidatorStatus::of(validator.record(), balance, epoch);
             (index as ValidatorIndex, balance, status, validator)
         })
         .filter(|(_, _, status, _)| {
@@ -396,13 +472,12 @@ fn validator_response(
             .ok_or(ApiError::NotFound("validator not found"))?
             as ValidatorIndex,
     };
-    let validator = state
-        .validator(index)
-        .map_err(|_| ApiError::NotFound("validator not found"))?;
+    let validator = RegistryEntry::at(&state, index)?;
     let balance = state
         .balance(index)
         .map_err(|_| ApiError::Internal("the registry and balances disagree in length"))?;
-    let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
+    let epoch = compute_epoch_at_slot(state.slot());
+    let status = ValidatorStatus::of(validator.record(), balance, epoch);
     Ok(serde_json::json!({
         "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
@@ -744,6 +819,107 @@ mod tests {
                     expected
                 );
             }
+        }
+    }
+
+    /// A PQ registry, as the Beacon API names it: the 32-byte XMSS key, not
+    /// the 48-byte request form the state keeps it in.
+    mod pq_registry {
+        use super::*;
+        use crate::test_utils::beacon_store_at;
+        use ethlambda_state_transition::beacon::helpers::test_state::with_validators_at;
+        use ethlambda_types::beacon::fork::ForkName;
+
+        const COUNT: u64 = 8;
+
+        /// Validator `index`'s XMSS key in [`pq_state`].
+        fn key(index: u64) -> XmssPubkey {
+            XmssPubkey([index as u8 + 1; XMSS_PUBKEY_SIZE])
+        }
+
+        /// A PQ head whose validators each hold their own [`key`], and whose
+        /// validator 5 has a VRF root of its own.
+        fn pq_state() -> BeaconState {
+            let mut state = with_validators_at(ForkName::Pq, COUNT as usize);
+            for index in 0..COUNT {
+                state.validator_mut(index).unwrap().pubkey = key(index).to_request_key();
+            }
+            let BeaconState::Pq(pq_state) = &mut state else {
+                unreachable!("built at PQ")
+            };
+            pq_state.validators.get_mut(5).unwrap().vrf_root = H256::repeat_byte(0x77);
+            state.apply_pending_mutations();
+            state
+        }
+
+        async fn get_json(uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+            let (store, _root) = beacon_store_at(pq_state());
+            let request = Request::get(uri).body(Body::empty()).unwrap();
+            let response = routes().with_state(store).oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+
+        fn hex32(index: u64) -> String {
+            format!("0x{}", hex::encode(key(index).0))
+        }
+
+        #[tokio::test]
+        async fn the_list_names_each_key_in_32_bytes_with_its_vrf_root() {
+            let (status, json) = get_json("/eth/v1/beacon/states/head/validators").await;
+            assert_eq!(status, StatusCode::OK);
+            let data = json["data"].as_array().unwrap();
+            assert_eq!(data.len(), COUNT as usize);
+            for (index, entry) in data.iter().enumerate() {
+                assert_eq!(entry["validator"]["pubkey"], hex32(index as u64));
+            }
+            assert_eq!(
+                data[5]["validator"]["vrf_root"],
+                format!("0x{}", "77".repeat(32))
+            );
+            assert_eq!(data[5]["status"], "active_ongoing");
+        }
+
+        /// A 32-byte id is what a PQ client asks by; the 48-byte request form
+        /// is what one from before the API's switch sends. Both find the key.
+        #[tokio::test]
+        async fn a_key_is_found_by_either_width() {
+            let request = format!("0x{}", hex::encode(key(5).to_request_key().0));
+            for id in [hex32(5), request] {
+                let (status, json) =
+                    get_json(&format!("/eth/v1/beacon/states/head/validators/{id}")).await;
+                assert_eq!(status, StatusCode::OK, "{id}");
+                assert_eq!(json["data"]["index"], "5");
+                assert_eq!(json["data"]["validator"]["pubkey"], hex32(5));
+
+                let (status, json) =
+                    get_json(&format!("/eth/v1/beacon/states/head/validators?id={id}")).await;
+                assert_eq!(status, StatusCode::OK, "{id}");
+                assert_eq!(json["data"].as_array().unwrap().len(), 1);
+                assert_eq!(json["data"][0]["index"], "5");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_id_of_another_width_is_a_400() {
+            for width in [31, 33] {
+                let id = format!("0x{}", "01".repeat(width));
+                let (status, _) =
+                    get_json(&format!("/eth/v1/beacon/states/head/validators/{id}")).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{width} bytes");
+            }
+        }
+
+        /// Before PQ a key is the BLS key it always was, and the registry
+        /// entry has no `vrf_root`.
+        #[test]
+        fn a_key_before_pq_stays_48_bytes() {
+            let state = with_validators_at(ForkName::Gloas, 2);
+            let pubkey = state.validator(1).unwrap().pubkey;
+            assert_eq!(ApiPubkey::of(&state, pubkey), ApiPubkey::Bls(pubkey));
+            let entry = serde_json::to_value(RegistryEntry::at(&state, 1).unwrap()).unwrap();
+            assert_eq!(entry["pubkey"].as_str().unwrap().len(), 2 + 2 * 48);
+            assert!(entry.get("vrf_root").is_none());
         }
     }
 

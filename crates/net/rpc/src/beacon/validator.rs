@@ -45,7 +45,7 @@ use ethlambda_state_transition::beacon::{
     helpers::pq::get_aggregation_committee,
 };
 
-use crate::beacon::ApiError;
+use crate::beacon::{ApiError, states::ApiPubkey};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -508,7 +508,7 @@ fn block_root_at_or_before(
 
 #[derive(Debug, Serialize)]
 struct ProposerDuty {
-    pubkey: BlsPubkey,
+    pubkey: ApiPubkey,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -636,7 +636,7 @@ fn proposer_duties(
                 .validator(validator_index)
                 .map_err(|_| ApiError::Internal("lookahead names an unknown validator"))?;
             Ok(ProposerDuty {
-                pubkey: validator.pubkey,
+                pubkey: ApiPubkey::of(&state, validator.pubkey),
                 validator_index,
                 slot,
             })
@@ -653,7 +653,7 @@ fn proposer_duties(
 
 #[derive(Debug, Serialize)]
 struct AttesterDuty {
-    pubkey: BlsPubkey,
+    pubkey: ApiPubkey,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -759,7 +759,7 @@ fn attester_duties(
                         .is_ok_and(|members| members.contains(&validator_index))
                 });
                 duties.push(AttesterDuty {
-                    pubkey: validator.pubkey,
+                    pubkey: ApiPubkey::of(&state, validator.pubkey),
                     validator_index,
                     committee_index,
                     committee_length: committee.len() as u64,
@@ -1014,6 +1014,59 @@ mod tests {
         let before = compute_start_slot_at_epoch(state_epoch) - 1;
         let expected = get_block_root_at_slot(&state, before).unwrap();
         assert_eq!(json["dependent_root"], format!("{expected}"));
+    }
+
+    /// A PQ head whose validator `i` holds the XMSS key `[i + 1; 32]`, in the
+    /// 48-byte request form the state keeps it in.
+    fn pq_state() -> BeaconState {
+        use ethlambda_state_transition::beacon::helpers::test_state::with_validators_at;
+        let mut state = with_validators_at(ForkName::Pq, COUNT);
+        for index in 0..COUNT as u64 {
+            state.validator_mut(index).unwrap().pubkey = pq_key(index).to_request_key();
+        }
+        state.apply_pending_mutations();
+        state
+    }
+
+    fn pq_key(index: u64) -> ethlambda_types::beacon::primitives::XmssPubkey {
+        ethlambda_types::beacon::primitives::XmssPubkey([index as u8 + 1; 32])
+    }
+
+    /// At PQ a duty names its validator by the 32-byte XMSS key, as
+    /// Lighthouse's PQ validator client reads it, not by the request form.
+    #[tokio::test]
+    async fn pq_duties_name_each_validator_by_its_32_byte_key() {
+        let state = pq_state();
+        let epoch = compute_epoch_at_slot(state.slot());
+        let expected = |duty: &serde_json::Value| {
+            let index: u64 = duty["validator_index"].as_str().unwrap().parse().unwrap();
+            format!("0x{}", hex::encode(pq_key(index).0))
+        };
+
+        let (status, json) = get(
+            state.clone(),
+            &format!("/eth/v1/validator/duties/proposer/{epoch}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let duties = json["data"].as_array().unwrap();
+        assert_eq!(duties.len(), preset::slots_per_epoch() as usize);
+        for duty in duties {
+            assert_eq!(duty["pubkey"], expected(duty));
+        }
+
+        let (status, json) = post(
+            state,
+            &format!("/eth/v1/validator/duties/attester/{epoch}"),
+            serde_json::json!(["3", "17"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let duties = json["data"].as_array().unwrap();
+        assert_eq!(duties.len(), 2);
+        for duty in duties {
+            assert_eq!(duty["pubkey"], expected(duty));
+        }
     }
 
     async fn get_v2(

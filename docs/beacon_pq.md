@@ -291,10 +291,15 @@ generator and Lighthouse's PQ branch do: the leanXMSS key grows from
 `sha256("leanxmss-seed" || sk)` and the VRF tree from the VRF seed
 `sha256("vrf-seed" || sk)` (`ethlambda_crypto::pq_keys`). The specification
 asks only that both seeds be secret; deriving them from the signing key is
-the devnet's convention. The registry names a validator by its key's 48-byte
-request form, which the client looks its validators up by and maps back to
-the BLS key it holds, so a validator whose derived key is not the registered
-one resolves to no index and gets no duties. Key generation builds two bottom
+the devnet's convention. The registry names a validator by its XMSS key,
+which the Beacon API carries as its 32 bytes (a node from before that switch
+sends the 48-byte request form instead; the client reads either). The client
+looks its validators up by that key and maps it back to the BLS key it holds,
+so a validator whose derived key is not the registered one resolves to no
+index and gets no duties. It asks in two requests, the 48-byte ids (BLS keys
+and request forms) and the 32-byte ones, since a node may refuse a whole
+request holding the width it does not read: Lighthouse's PQ node refuses any
+48-byte id. Key generation builds two bottom
 trees per key, which takes under a minute for 16 validators.
 
 The VRF tree takes minutes per key (see [The VRF tree](#the-vrf-tree)) and

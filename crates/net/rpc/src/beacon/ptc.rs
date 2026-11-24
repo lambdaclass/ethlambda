@@ -44,7 +44,7 @@ use ethlambda_types::{
             gloas::{PayloadAttestation, PayloadAttestationData, PayloadAttestationMessage},
         },
         fork::ForkName,
-        primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex},
+        primitives::{Epoch, Slot, ValidatorIndex},
         signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     },
     primitives::H256,
@@ -57,6 +57,7 @@ use crate::{
     CustodyColumns,
     beacon::{
         ApiError, copy_if_listened, decode_list, emit_accepted,
+        states::ApiPubkey,
         validator::{head, require_execution_client, require_validated},
     },
     shared::content::{Encoding, ssz_response, with_consensus_version},
@@ -84,7 +85,7 @@ pub(crate) fn routes() -> Router<Store> {
 
 #[derive(Debug, Serialize)]
 struct PtcDuty {
-    pubkey: BlsPubkey,
+    pubkey: ApiPubkey,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -249,7 +250,7 @@ fn ptc_duties(
         .filter_map(|(validator_index, slot)| {
             let pubkey = state.validator(validator_index).ok()?.pubkey;
             Some(PtcDuty {
-                pubkey,
+                pubkey: ApiPubkey::of(&state, pubkey),
                 validator_index,
                 slot,
             })

@@ -18,9 +18,12 @@
 //! once per key, not once per start.
 //!
 //! **The registry's form.** A PQ state names each validator by its 32-byte
-//! XMSS key in the 48-byte form an execution-layer request names one: 16 zero
-//! bytes, then the key. Duty responses carry that form, and no BLS key starts
-//! with 16 zero bytes (its first byte carries the compression flag), so
+//! XMSS key, which duty and validator responses carry as it is (a node from
+//! before the Beacon API's switch to 32 bytes sends the 48-byte form an
+//! execution-layer request names one by: 16 zero bytes, then the key). The
+//! client reads either into that 48-byte form
+//! (`beacon_node::dto::parse_registry_key`), and no BLS key starts with 16
+//! zero bytes (its first byte carries the compression flag), so
 //! [`bls_for_request_key`] maps one back to the local key that owns it, and
 //! the client keeps working with BLS keys everywhere else.
 //!
