@@ -61,19 +61,6 @@ const NO_USABLE_NODE: &str = "no configured beacon node is on this client's chai
 /// covers a node that misses a round or restarts.
 const SERVED_FOR_EPOCHS: u64 = 1;
 
-/// Which nodes a [`FallbackBeaconNode::check_nodes`] round asks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckScope {
-    /// Every node: the round at an epoch's first slot, which also follows the
-    /// schedule.
-    All,
-    /// Only the nodes not usable now, to let them back in as soon as they are
-    /// compatible again, and the ones that did not answer their last check,
-    /// so a schedule missed in one round is read at the next slot rather than
-    /// the next epoch.
-    OnlyUnusable,
-}
-
 /// What asking one node about its chain came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeAnswer {
@@ -123,9 +110,9 @@ pub struct FallbackBeaconNode<B> {
     /// so a node that stays unusable warns once per epoch rather than once per
     /// slot. `u64::MAX` is never.
     warned_at: Vec<AtomicU64>,
-    /// Whether each node, by position, failed to answer its last check. Such
-    /// a node is asked again every slot, whatever its usable flag says.
-    unanswered: Vec<AtomicBool>,
+    /// How many times a node has been let back in (its usable flag raised
+    /// from down): see [`BeaconNodeApi::readmissions`].
+    readmissions: AtomicU64,
     /// The configuration each node last served while on this client's chain,
     /// by position, with the epoch it served it in: what the schedule is
     /// followed from. Kept through a check the node does not answer, so one
@@ -144,19 +131,18 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
         let usable = nodes.iter().map(|_| AtomicBool::new(true)).collect();
         let warned_at = nodes.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
-        let unanswered = nodes.iter().map(|_| AtomicBool::new(false)).collect();
         let served = nodes.iter().map(|_| Mutex::new(None)).collect();
         Self {
             nodes,
             usable,
             warned_at,
-            unanswered,
+            readmissions: AtomicU64::new(0),
             served,
         }
     }
 
     fn is_usable(&self, position: usize) -> bool {
-        self.usable[position].load(Ordering::Relaxed)
+        self.usable[position].load(Ordering::SeqCst)
     }
 
     fn set_served(&self, position: usize, config: Option<(Config, u64)>) {
@@ -224,12 +210,13 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// out, then again at most once per epoch for as long as it stays out.
     fn record(&self, position: usize, answer: &NodeAnswer, epoch: u64) {
         let node = self.nodes[position].describe();
-        let unanswered = matches!(answer, NodeAnswer::Unreachable(_));
-        self.unanswered[position].store(unanswered, Ordering::Relaxed);
         match answer {
             NodeAnswer::Compatible(config) => {
                 self.set_served(position, Some(((**config).clone(), epoch)));
-                if !self.usable[position].swap(true, Ordering::Relaxed) {
+                if !self.usable[position].swap(true, Ordering::SeqCst) {
+                    // After the flag: a caller that reads the new count then
+                    // selects the usable nodes finds this one among them.
+                    self.readmissions.fetch_add(1, Ordering::SeqCst);
                     info!(position, %node, "Beacon node is on this client's chain; using it");
                 }
             }
@@ -332,49 +319,45 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         // a fork another node already schedules, and if that fork's epoch came
         // before the next check, the upgraded node would be the one refused.
         let mut chain = reference;
-        if let Some(config) = follow_schedule(&chain.config, &self.served_configs(epoch), epoch) {
+        let served = self.served_configs(epoch);
+        if let Some(config) = follow_schedule(&chain.config, &served, epoch, true) {
             chain.config = config;
         }
         Ok(chain)
     }
 
-    /// Ask the nodes `scope` selects about their chain, all at once and
-    /// directly (not through the failover helpers, which would skip exactly
-    /// the nodes being asked), and set each one's flag from the answer.
+    /// Ask every node about its chain, all at once and directly (not through
+    /// the failover helpers, which would skip exactly the nodes being asked),
+    /// and set each one's flag from the answer.
     ///
     /// A node whose chain matches `ours` is usable; one that differs, or is on
     /// another preset, is not. A node that did not answer keeps its flag: an
     /// outage says nothing about the chain. A node going out is warned about
     /// with the first field that differs, then again at most once per epoch.
     ///
-    /// Returns one answer per node asked, with its position. The schedule is
-    /// followed from [`Self::served_configs`], which this keeps current.
+    /// The answers are judged at `epoch_now()` as read once they are all in,
+    /// not when the requests went out, so a fork whose epoch passed while a
+    /// node took its time answering counts as arrived (see
+    /// [`crate::chain_check::check_once`]).
+    ///
+    /// Returns one answer per node, with its position, and the epoch they were
+    /// judged at. The schedule is followed from [`Self::served_configs`], which
+    /// this keeps current.
     pub async fn check_nodes(
         &self,
         ours: &ChainId,
-        current_epoch: u64,
-        scope: CheckScope,
-    ) -> Vec<(usize, NodeAnswer)> {
-        let selected: Vec<(usize, &B)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| {
-                scope == CheckScope::All
-                    || !self.is_usable(*position)
-                    || self.unanswered[*position].load(Ordering::Relaxed)
-            })
-            .collect();
-        let asked =
-            futures_util::future::join_all(selected.iter().map(|(_, node)| ask(*node))).await;
+        epoch_now: impl Fn() -> u64,
+    ) -> (Vec<(usize, NodeAnswer)>, u64) {
+        let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
+        let current_epoch = epoch_now();
 
-        let mut answers = Vec::with_capacity(selected.len());
-        for ((position, _), asked) in selected.iter().zip(asked) {
+        let mut answers = Vec::with_capacity(self.nodes.len());
+        for (position, asked) in asked.into_iter().enumerate() {
             let answer = classify(ours, asked, current_epoch);
-            self.record(*position, &answer, current_epoch);
-            answers.push((*position, answer));
+            self.record(position, &answer, current_epoch);
+            answers.push((position, answer));
         }
-        answers
+        (answers, current_epoch)
     }
 
     /// The nodes, in order, for a test outside this module that drives a
@@ -466,9 +449,11 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     }
 
     /// Send to **every** node on this client's chain, succeeding if any
-    /// accepted. A node whose usable flag is down is not sent to, and counts
-    /// as one that missed it: the answer is [`Delivery::Everywhere`] only when
-    /// every configured node accepted.
+    /// accepted. A node whose usable flag is down is not sent to: the answer
+    /// is [`Delivery::Everywhere`] when every node sent to accepted. A caller
+    /// that stops sending once every node has it reads
+    /// [`BeaconNodeApi::readmissions`] to send again when a skipped node is
+    /// let back in.
     ///
     /// The counterpart to [`Self::try_each`], for the calls where first-success
     /// is the wrong rule. A query has one right answer and any node can give
@@ -570,15 +555,16 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 }
             }
         }
-        // Nested, so no node at all is never "every node": the constructor
-        // refuses an empty list, but this does not lean on it.
+        // Nested, so no node at all is never "every node".
         //
-        // Against every configured node, not the ones sent to: a node skipped
-        // for now does not hold what was sent, and is called first again as
-        // soon as a check lets it back in. A caller that stops sending once
-        // every node has it must keep sending for that node.
+        // Against the nodes sent to, not every configured one: a node on
+        // another chain can stay skipped for as long as it is configured, and
+        // counting it would have a caller resend, and count a failure, every
+        // slot for a send every usable node took. A skipped node that is let
+        // back in does not hold what was sent; the caller learns of it through
+        // `readmissions`.
         if accepted > 0 {
-            return if accepted == self.nodes.len() {
+            return if accepted == selected.len() {
                 Ok(Delivery::Everywhere)
             } else {
                 Ok(Delivery::Partly)
@@ -594,6 +580,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
 
 #[async_trait]
 impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
+    fn readmissions(&self) -> u64 {
+        self.readmissions.load(Ordering::SeqCst)
+    }
+
     async fn genesis(&self) -> Result<Genesis> {
         self.try_each("genesis", |node| node.genesis()).await
     }
@@ -852,8 +842,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// To every node, since each one gossips what it accepts: a preference
     /// only the first node heard reaches the mesh through that node alone, and
     /// builders subscribed elsewhere would ignore the slot. [`Delivery::Partly`]
-    /// when some node refused, so the service sends it again until every node
-    /// holds it.
+    /// when some usable node refused, so the service sends it again until every
+    /// node holds it.
     async fn submit_proposer_preferences(
         &self,
         fork: ForkName,

@@ -948,14 +948,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
   the first node that answers at startup, and a node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
-  until a later check finds it compatible again. A background task re-asks the
-  unusable nodes, and the ones that missed their last check, every slot and
-  every node each epoch. The startup check, the epoch check and any round that
-  finds a node compatible follow a fork the compatible nodes newly schedule,
-  merged from what each usable node last served
-  (`FallbackBeaconNode::served_configs`; only a fork still in the future may change),
-  into the `SharedConfig` the slot clock and signing domains read, logging the
-  change at `warn`. The spec parser requires the slot duration and every altair
+  until a later check finds it compatible again. A background task re-asks
+  every node every slot, judging the answers at the epoch read once they are in.
+  The startup check and every round follow a fork the compatible nodes newly
+  schedule, merged from what each usable node last served
+  (`FallbackBeaconNode::served_configs`; only a fork still in the future may
+  change, a scheduled one moves only when every node scheduling it agrees, and
+  is never unscheduled), into the `SharedConfig` the slot clock and signing
+  domains read, logging the change at `warn`. `Delivery::Everywhere` means every
+  usable node; `BeaconNodeApi::readmissions` tells the preferences service to
+  resend when a skipped node is let back in. The spec parser requires the slot duration and every altair
   to fulu epoch and version rather than defaulting them to mainnet.
   `--enable-doppelganger-protection` (`crate::doppelganger`,
   Lighthouse's rule) withholds a key's attestations, blocks, RANDAO reveals and

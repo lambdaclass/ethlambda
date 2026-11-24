@@ -28,7 +28,7 @@ use ethlambda_types::beacon::primitives::{Epoch, Version};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::beacon_node::fallback::{CheckScope, FallbackBeaconNode, NodeAnswer};
+use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, Genesis};
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
@@ -217,13 +217,29 @@ const OFFSETS: [Offset; 10] = [
 /// reports another epoch or version for such a fork is not compatible, and
 /// [`first_chain_difference`] has already left it out of `nodes`.
 ///
-/// For each such fork the node reporting the lowest epoch wins, with its
-/// version, and list order breaks a tie: a node that has the fork scheduled
-/// beats one that reports it as unscheduled, because the network moves toward
-/// the fork, and a node that has not been upgraded yet is the one behind. Nodes
-/// that disagree about a fork are listed in
-/// [`ScheduleMerge::disagreements`], since the one without the fork becomes
-/// incompatible when its epoch arrives.
+/// For each such fork, a node that has the fork scheduled beats one that
+/// reports it as unscheduled, because the network moves toward the fork, and a
+/// node that has not been upgraded yet is the one behind. Among the nodes that
+/// schedule it:
+///
+/// - When they all report the same epoch and version, that is taken.
+/// - When they differ and the client has the fork unscheduled, the lowest
+///   epoch wins, with its version, and list order breaks a tie, so that at
+///   least the nodes reporting it stay usable when it arrives.
+/// - When they differ and the client already has the fork scheduled, the
+///   client's schedule stays. A scheduled fork moves only once every node that
+///   schedules it agrees on where to, so one node (misconfigured, or lying)
+///   cannot pull a fork the others agree on to another epoch or version.
+///
+/// A fork the client has scheduled is never unscheduled: no node reporting it
+/// does not mean the network dropped it. The node that had it may be
+/// restarting for the upgrade, out of the merge for a few epochs, and
+/// unscheduling the fork would refuse that node for good once the fork's
+/// epoch arrives. A fork the network does cancel needs a restart.
+///
+/// Nodes that disagree about a fork are listed in
+/// [`ScheduleMerge::disagreements`], since the ones the client's schedule does
+/// not match become incompatible when its epoch arrives.
 ///
 /// The duty offsets are taken from the first node, because an upgraded node
 /// may start serving the gloas offsets and they identify no chain. The caller
@@ -249,15 +265,34 @@ pub fn merge_schedule(
             .filter(|(_, node)| node.fork_epoch(fork) > current_epoch)
             .map(|(position, node)| (*position, node.fork_epoch(fork), node.fork_version(fork)))
             .collect();
+        let old_epoch = current.fork_epoch(fork);
+        let old_version = current.fork_version(fork);
         // The first of the lowest epochs, so list order breaks a tie.
-        let Some(&(_, epoch, version)) = reports.iter().min_by_key(|(_, epoch, _)| *epoch) else {
+        let Some(&(_, lowest, lowest_version)) = reports.iter().min_by_key(|(_, epoch, _)| *epoch)
+        else {
             continue;
         };
 
         // The version of an unscheduled fork says nothing, so two nodes that
         // both leave a fork unscheduled agree whatever it holds.
+        let same = |(epoch_a, version_a): (Epoch, Version),
+                    (epoch_b, version_b): (Epoch, Version)| {
+            epoch_a == epoch_b && (epoch_a == FAR_FUTURE_EPOCH || version_a == version_b)
+        };
+        let scheduled_agree = reports
+            .iter()
+            .filter(|(_, epoch, _)| *epoch != FAR_FUTURE_EPOCH)
+            .all(|(_, epoch, version)| same((*epoch, *version), (lowest, lowest_version)));
+        // Where the fork goes: see the doc above for each case.
+        let (epoch, version) =
+            if old_epoch != FAR_FUTURE_EPOCH && (lowest == FAR_FUTURE_EPOCH || !scheduled_agree) {
+                (old_epoch, old_version)
+            } else {
+                (lowest, lowest_version)
+            };
+
         let differs = |(_, other_epoch, other_version): &(usize, Epoch, Version)| {
-            *other_epoch != epoch || (epoch != FAR_FUTURE_EPOCH && *other_version != version)
+            !same((*other_epoch, *other_version), (epoch, version))
         };
         if reports.iter().any(differs) {
             // The version too, for a scheduled fork: two nodes can agree on the
@@ -279,7 +314,6 @@ pub fn merge_schedule(
             ));
         }
 
-        let old_epoch = current.fork_epoch(fork);
         if epoch == FAR_FUTURE_EPOCH && old_epoch == FAR_FUTURE_EPOCH {
             continue;
         }
@@ -294,11 +328,11 @@ pub fn merge_schedule(
         }
         // An unscheduled fork keeps the version it had: the node's is a
         // default, not a decision.
-        if epoch != FAR_FUTURE_EPOCH && version != current.fork_version(fork) {
+        if epoch != FAR_FUTURE_EPOCH && version != old_version {
             changes.push(format!(
                 "{} {} -> {}",
                 fork_key(fork, "VERSION"),
-                version_text(current.fork_version(fork)),
+                version_text(old_version),
                 version_text(version)
             ));
             config = config.with_fork_version(fork, version);
@@ -321,42 +355,42 @@ pub fn merge_schedule(
     }
 }
 
-/// One round of the check: ask the nodes `scope` selects, then follow the
-/// schedule the compatible ones serve.
+/// One round of the check: ask every node, then follow the schedule the
+/// compatible ones serve.
+///
+/// `epoch_now` is read once the answers are in, not before the requests go
+/// out: a request can take most of its timeout, which on a short-slot network
+/// crosses an epoch boundary, and a fork first learned at or after its epoch
+/// must be judged at the epoch it is learned in (see [`first_chain_difference`]),
+/// not adopted as if it were still ahead. Everything after that read is
+/// synchronous, so the classification and the swap see the same epoch.
 ///
 /// The schedule is merged from what every usable node last served
 /// (`FallbackBeaconNode::served_configs`), not from this round's answers
-/// alone: a node that misses one round keeps its say, so the merge neither
-/// waits an epoch for it nor flips the duty offsets to the next node's while
-/// it is away. One that stays away longer loses it, so it cannot hold a fork
-/// at an epoch the network has since moved. After startup the client's schedule is only ever replaced
+/// alone: a node that misses one round keeps its say, so the merge does not
+/// flip the duty offsets to the next node's while it is away. One that stays
+/// away longer loses it, so it cannot hold a fork at an epoch the network has
+/// since moved. After startup the client's schedule is only ever replaced
 /// here.
+///
+/// Disagreements between nodes are warned about only when
+/// `warn_disagreements`: the caller asks once per epoch, since a round runs
+/// every slot.
 pub async fn check_once<B: BeaconNodeApi>(
     nodes: &FallbackBeaconNode<B>,
     genesis: Genesis,
     context: &SigningContext,
-    epoch: Epoch,
-    scope: CheckScope,
+    epoch_now: impl Fn() -> Epoch,
+    warn_disagreements: bool,
 ) {
     let ours = ChainId {
         genesis,
         config: (*context.config()).clone(),
     };
-    let answers = nodes.check_nodes(&ours, epoch, scope).await;
-    // Every epoch, and whenever a node asked in between turned out to be on
-    // this chain: one that was let back in, or one that missed its last check.
-    // Its schedule may hold a fork the client has not seen, which must not
-    // wait for the next epoch, where the fork could already be active and the
-    // node refused for it.
-    let answered_compatible = answers
-        .iter()
-        .any(|(_, answer)| matches!(answer, NodeAnswer::Compatible(_)));
-    if scope != CheckScope::All && !answered_compatible {
-        return;
-    }
+    let (_, epoch) = nodes.check_nodes(&ours, epoch_now).await;
 
     let compatible = nodes.served_configs(epoch);
-    if let Some(config) = follow_schedule(&ours.config, &compatible, epoch) {
+    if let Some(config) = follow_schedule(&ours.config, &compatible, epoch, warn_disagreements) {
         context.replace_config(config);
     }
 }
@@ -372,9 +406,15 @@ pub fn follow_schedule(
     current: &Config,
     nodes: &[(usize, Config)],
     epoch: Epoch,
+    warn_disagreements: bool,
 ) -> Option<Config> {
     let merge = merge_schedule(current, nodes, epoch);
-    for disagreement in &merge.disagreements {
+    let disagreements = if warn_disagreements {
+        merge.disagreements.as_slice()
+    } else {
+        &[]
+    };
+    for disagreement in disagreements {
         warn!(
             %epoch,
             %disagreement,
@@ -394,13 +434,16 @@ pub fn follow_schedule(
     Some(merge.config)
 }
 
-/// Run the check until `shutdown`: the nodes that are not usable, or did not
-/// answer their last check, every slot, and every node at the first slot of
-/// each epoch.
+/// Run the check until `shutdown`: every node, at the start of every slot.
 ///
-/// The startup check already covered every node and followed the schedule
-/// they served (see `FallbackBeaconNode::establish`), so the first full one is
-/// at the next epoch's first slot.
+/// Every node, not only the ones out of use: a node that was fine at the
+/// epoch's first slot can be upgraded later in the epoch for a fork at the
+/// next one, and the client has to read that schedule while the fork is still
+/// ahead. Read only at the next epoch, the fork would be active already, and
+/// the upgraded node refused for it. Two small requests per node per slot is
+/// the price of that.
+///
+/// Disagreements are warned about once per epoch, at the epoch's first round.
 pub async fn run<B: BeaconNodeApi>(
     nodes: Arc<FallbackBeaconNode<B>>,
     genesis: Genesis,
@@ -408,7 +451,8 @@ pub async fn run<B: BeaconNodeApi>(
     context: Arc<SigningContext>,
     shutdown: CancellationToken,
 ) {
-    let mut full_checked = clock.now().map(|slot| clock.epoch_of(slot));
+    let mut warned_epoch = None;
+    let epoch_now = || clock.now().map_or(0, |slot| clock.epoch_of(slot));
     loop {
         let now = SystemTime::now();
         let next = clock.slot_at(now).map_or(0, |slot| slot + 1);
@@ -421,17 +465,12 @@ pub async fn run<B: BeaconNodeApi>(
             () = tokio::time::sleep(delay) => {}
         }
 
-        let slot = clock.slot_at(SystemTime::now()).unwrap_or(next);
-        let epoch = clock.epoch_of(slot);
-        let scope = if full_checked == Some(epoch) {
-            CheckScope::OnlyUnusable
-        } else {
-            full_checked = Some(epoch);
-            CheckScope::All
-        };
+        let epoch = epoch_now();
+        let warn_disagreements = warned_epoch != Some(epoch);
+        warned_epoch = Some(epoch);
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = check_once(&nodes, genesis, &context, epoch, scope) => {}
+            () = check_once(&nodes, genesis, &context, epoch_now, warn_disagreements) => {}
         }
     }
 }
@@ -663,8 +702,53 @@ mod tests {
         assert_eq!(merge.changes.len(), 1, "got {:?}", merge.changes);
     }
 
+    /// The only node that scheduled the fork is out of the merge (restarting
+    /// for the upgrade, say) and the one left reports it unscheduled: the
+    /// client keeps the fork, so the upgraded node is still usable when it
+    /// comes back after the fork's epoch.
+    #[test]
+    fn an_adopted_fork_is_never_unscheduled() {
+        let current = with_gloas(NOW + 10, [8, 0, 0, 0]);
+        let merge = merge_schedule(&current, &[(1, Config::mainnet())], NOW);
+        assert_eq!(merge.config, current);
+        assert!(merge.changes.is_empty(), "got {:?}", merge.changes);
+        assert_eq!(merge.disagreements.len(), 1, "the node without it");
+    }
+
+    /// One node reporting an earlier epoch, or another version, for a fork the
+    /// client already schedules does not move it while another node keeps it.
+    #[test]
+    fn one_node_cannot_move_an_adopted_fork_the_others_keep() {
+        let current = with_gloas(NOW + 10, [8, 0, 0, 0]);
+        for other in [
+            with_gloas(NOW + 2, [8, 0, 0, 0]),
+            with_gloas(NOW + 10, [9, 9, 9, 9]),
+        ] {
+            let nodes = [(0, other), (1, current.clone())];
+            let merge = merge_schedule(&current, &nodes, NOW);
+            assert_eq!(merge.config, current);
+            assert_eq!(merge.disagreements.len(), 1);
+        }
+    }
+
+    /// A postponement every node that schedules the fork agrees on is
+    /// followed, even while a node not yet upgraded leaves it unscheduled.
+    #[test]
+    fn an_adopted_fork_moves_once_every_node_scheduling_it_agrees() {
+        let current = with_gloas(NOW + 10, [8, 0, 0, 0]);
+        let nodes = [
+            (0, with_gloas(NOW + 100, [8, 0, 0, 0])),
+            (1, Config::mainnet()),
+            (2, with_gloas(NOW + 100, [8, 0, 0, 0])),
+        ];
+        let merge = merge_schedule(&current, &nodes, NOW);
+        assert_eq!(merge.config.fork_epoch(ForkName::Gloas), NOW + 100);
+        assert_eq!(merge.changes.len(), 1, "got {:?}", merge.changes);
+    }
+
     // The checks through the fallback, against scripted mock nodes.
 
+    use crate::beacon_node::fallback::NodeAnswer;
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::error::Error;
     use crate::shared_config::SharedConfig;
@@ -732,7 +816,7 @@ mod tests {
         for node in fallback.nodes() {
             node.set_spec(Config::mainnet().with_fork_version(ForkName::Phase0, [5, 5, 5, 5]));
         }
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         let err = fallback
             .attester_duties(3, &[])
@@ -797,14 +881,7 @@ mod tests {
 
         // It comes up and the next unusable-nodes round lets it in.
         fallback.nodes()[1].failures.lock().expect("lock").clear();
-        check_once(
-            &fallback,
-            genesis(),
-            &context,
-            NOW,
-            CheckScope::OnlyUnusable,
-        )
-        .await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
         let duties = fallback.attester_duties(3, &[]).await.expect("node 1 now");
         assert_eq!(duties.dependent_root, Root::repeat_byte(7));
     }
@@ -820,7 +897,7 @@ mod tests {
         assert!(!clock.is_gloas(gloas_slot));
 
         fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_slot), "the clock shares the handle");
         assert_eq!(
@@ -849,9 +926,7 @@ mod tests {
 
         // At the fork's epoch the upgraded node agrees with the client, and
         // the one that never scheduled the fork is the one left out.
-        let answers = fallback
-            .check_nodes(&chain, gloas_epoch, CheckScope::All)
-            .await;
+        let (answers, _) = fallback.check_nodes(&chain, || gloas_epoch).await;
         assert!(matches!(answers[0].1, NodeAnswer::Incompatible(_)));
         assert!(matches!(answers[1].1, NodeAnswer::Compatible(_)));
     }
@@ -871,14 +946,7 @@ mod tests {
 
         fallback.nodes()[1].failures.lock().expect("lock").clear();
         fallback.nodes()[1].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
-        check_once(
-            &fallback,
-            genesis(),
-            &context,
-            NOW,
-            CheckScope::OnlyUnusable,
-        )
-        .await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -896,18 +964,11 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("spec", "down".to_string());
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
         assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
 
         fallback.nodes()[0].failures.lock().expect("lock").clear();
-        check_once(
-            &fallback,
-            genesis(),
-            &context,
-            NOW,
-            CheckScope::OnlyUnusable,
-        )
-        .await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -926,7 +987,7 @@ mod tests {
             .expect("lock")
             .insert("spec", "down".to_string());
 
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         assert_eq!(*context.config(), Config::mainnet());
     }
@@ -953,33 +1014,45 @@ mod tests {
         fallback.nodes()[0].set_spec(with_gloas(NOW + 100, [8, 0, 0, 0]));
 
         // Within an epoch of its last answer the silent node still counts.
-        check_once(&fallback, genesis(), &context, NOW + 1, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW + 1, true).await;
         assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 10);
 
-        check_once(&fallback, genesis(), &context, NOW + 2, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW + 2, true).await;
         assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 100);
     }
 
-    /// A node skipped for being on another chain did not take what was sent,
-    /// so the delivery is partial however many usable nodes accepted.
+    /// A node skipped for being on another chain is not counted against a
+    /// send every usable node took, so a caller does not resend and count a
+    /// failure every slot for as long as it stays configured. Letting a node
+    /// back in moves `readmissions`, which is how such a caller learns to
+    /// send it again.
     #[tokio::test]
-    async fn a_send_that_skipped_a_node_is_not_delivered_everywhere() {
+    async fn a_send_every_usable_node_took_is_delivered_everywhere() {
         use crate::beacon_node::Delivery;
         use ethlambda_types::beacon::containers::gloas::SignedProposerPreferences;
 
-        let fallback = established(vec![
-            node(),
-            node().with_genesis_root(Root::repeat_byte(0xbb)),
-        ])
-        .await;
+        let late = node();
+        late.failures
+            .lock()
+            .expect("lock")
+            .insert("genesis", "booting".to_string());
+        let fallback = established(vec![node(), late]).await;
         let preference = SignedProposerPreferences::default();
 
         let delivery = fallback
             .submit_proposer_preferences(ForkName::Gloas, std::slice::from_ref(&preference))
             .await
             .expect("the usable node accepted");
+        assert_eq!(delivery, Delivery::Everywhere);
+        assert_eq!(fallback.readmissions(), 0);
 
-        assert_eq!(delivery, Delivery::Partly);
+        fallback.nodes()[1].failures.lock().expect("lock").clear();
+        check_once(&fallback, genesis(), &context_and_clock().0, || NOW, true).await;
+        assert_eq!(fallback.readmissions(), 1, "node 1 was let back in");
+
+        // A node that was usable all along answering again is no readmission.
+        check_once(&fallback, genesis(), &context_and_clock().0, || NOW, true).await;
+        assert_eq!(fallback.readmissions(), 1);
     }
 
     /// A node that moves a fork already active is on another chain: it is
@@ -992,7 +1065,7 @@ mod tests {
         fallback.nodes()[0]
             .set_spec(Config::mainnet().with_fork_epoch(ForkName::Electra, electra + 1));
 
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
 
         assert_eq!(*context.config(), Config::mainnet());
         let err = fallback
@@ -1013,12 +1086,62 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("spec", "down".to_string());
-        check_once(&fallback, genesis(), &context, NOW, CheckScope::All).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
         fallback.nodes()[0].failures.lock().expect("lock").clear();
 
         fallback
             .attester_duties(3, &[])
             .await
             .expect("still usable");
+    }
+
+    /// Every round asks every node: one that answered the epoch's first round
+    /// and is upgraded later in the epoch, for a fork at the next one, is read
+    /// while the fork is still ahead, not at the next epoch's first round,
+    /// where it would already be active and the node refused for it.
+    #[tokio::test]
+    async fn a_node_upgraded_mid_epoch_is_read_at_the_next_round() {
+        let (context, clock) = context_and_clock();
+        let fallback = established(vec![node()]).await;
+        check_once(&fallback, genesis(), &context, || NOW, true).await;
+
+        let gloas_epoch = NOW + 1;
+        fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
+        check_once(&fallback, genesis(), &context, || NOW, false).await;
+
+        assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
+    }
+
+    /// The epoch the answers are judged at is read once they are in. A node
+    /// whose answer arrives after the boundary of the epoch it schedules a
+    /// fork for has reported the fork at its epoch: it is refused, and the
+    /// fork is not adopted late.
+    #[tokio::test]
+    async fn the_epoch_is_read_once_the_nodes_have_answered() {
+        use std::sync::atomic::Ordering;
+
+        let (context, clock) = context_and_clock();
+        let fallback = established(vec![node()]).await;
+        let asked_at_startup = fallback.nodes()[0].spec_calls.load(Ordering::SeqCst);
+        let gloas_epoch = NOW + 1;
+        fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
+
+        // The boundary passed while the node was answering.
+        let epoch_now = || {
+            let asked = fallback.nodes()[0].spec_calls.load(Ordering::SeqCst);
+            assert!(asked > asked_at_startup, "read before the node answered");
+            gloas_epoch
+        };
+        check_once(&fallback, genesis(), &context, epoch_now, true).await;
+
+        assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
+        let err = fallback
+            .attester_duties(3, &[])
+            .await
+            .expect_err("the node is out");
+        assert!(
+            err.to_string().contains("no configured beacon node is on"),
+            "got {err}"
+        );
     }
 }

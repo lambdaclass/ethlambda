@@ -167,10 +167,14 @@ enum Sent {
     Partly(SignedProposerPreferences),
     /// Every node accepted this message, last in the re-send round `round`
     /// (see [`round_of`]). Sent again, as signed, in each later round, for a
-    /// node that restarted since and lost it.
+    /// node that restarted since and lost it, and as soon as a node skipped
+    /// by that send is let back in: when the node's
+    /// [`BeaconNodeApi::readmissions`] is no longer `readmissions`, the count
+    /// read before the send.
     Everywhere {
         signed: SignedProposerPreferences,
         round: Epoch,
+        readmissions: u64,
     },
 }
 
@@ -225,8 +229,8 @@ enum Before {
     Unconfirmed,
     /// Some node accepted it, and not every node is known to hold it.
     Partly,
-    /// Every node accepted it in an earlier round: this is this round's
-    /// re-send (see [`round_of`]).
+    /// Every node accepted it in an earlier round, or before a skipped node
+    /// was let back in: this is the re-send (see [`round_of`]).
     Everywhere,
 }
 
@@ -458,6 +462,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         };
         let dependent_root = duties.dependent_root;
         let round = round_of(current_slot);
+        let readmissions = self.beacon_node.readmissions();
         // Before anything kept is read: what was signed under a domain the
         // schedule has since moved is not sent again.
         let domain = self.domain(target);
@@ -500,8 +505,9 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                 Some(Sent::Everywhere {
                     signed,
                     round: held,
+                    readmissions: held_readmissions,
                 }) => {
-                    if held < round {
+                    if held < round || held_readmissions != readmissions {
                         resend.push((signed, Before::Everywhere));
                     }
                     continue;
@@ -629,6 +635,9 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
         // One request per preference: see the module doc.
         let key = (entry.message.proposal_slot, entry.message.dependent_root);
         let validator = entry.message.validator_index;
+        // Before the send, so a node let back in while it is in flight (and
+        // perhaps not sent to) has the next poll send it again.
+        let readmissions = self.beacon_node.readmissions();
         let answer = self
             .beacon_node
             .submit_proposer_preferences(fork, std::slice::from_ref(&entry))
@@ -644,6 +653,7 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                 let held = Sent::Everywhere {
                     signed: entry,
                     round: round_of(current_slot),
+                    readmissions,
                 };
                 lock(&self.sent).insert(key, held);
                 Tally {
@@ -1554,6 +1564,83 @@ mod tests {
             .publish_epoch(current + 3, GLOAS_EPOCH, &snapshot, &store)
             .await;
         assert_eq!(held(0).len(), 3);
+        assert_eq!(held(1).len(), 1);
+    }
+
+    /// A node skipped for not being on this client's chain is not a refusal:
+    /// a preference every usable node took is held as delivered everywhere,
+    /// not resent each slot nor counted as a failure. Once the chain check
+    /// lets the skipped node back in, the next poll sends it the preference
+    /// as first signed.
+    #[tokio::test]
+    async fn a_node_let_back_in_gets_the_preferences_it_was_skipped_for() {
+        use crate::beacon_node::Genesis;
+        use crate::beacon_node::fallback::FallbackBeaconNode;
+
+        let (store, pubkeys) = store_with_keys(1);
+        let snapshot: HashSet<BlsPubkey> = pubkeys.iter().copied().collect();
+        let store = Arc::new(RwLock::new(store));
+        let slot = slot_in(GLOAS_EPOCH, 10);
+        let root = Root::repeat_byte(0x11);
+        let node = || {
+            let mut node = MockBeaconNode::new().with_proposers_v2(
+                GLOAS_EPOCH,
+                root,
+                vec![duty(&pubkeys[0], 3, slot)],
+            );
+            node.genesis = Some(Genesis {
+                genesis_time: 0,
+                genesis_validators_root: Root::repeat_byte(0x42),
+            });
+            node
+        };
+        let late = node();
+        late.failures
+            .lock()
+            .expect("lock")
+            .insert("genesis", "booting".to_string());
+        let fallback = Arc::new(FallbackBeaconNode::new(vec![node(), late]));
+        let chain = fallback.establish(|_| Ok(0)).await.expect("node 0 answers");
+        let service =
+            PreferencesService::new(fallback.clone(), context(), settings(Some(FEE_RECIPIENT)));
+        let held = |position: usize| {
+            fallback.nodes()[position]
+                .submitted_preferences
+                .lock()
+                .expect("lock")
+                .clone()
+        };
+        let current = slot_in(GLOAS_EPOCH, 1);
+
+        let counted = service
+            .publish_epoch(current, GLOAS_EPOCH, &snapshot, &store)
+            .await;
+        assert_eq!(counted, 1);
+        let everywhere = HashMap::from([((slot, root), "everywhere")]);
+        assert_eq!(stages(&service), everywhere, "every usable node took it");
+
+        // Nothing more is sent while node 1 stays out.
+        service
+            .publish_epoch(current + 1, GLOAS_EPOCH, &snapshot, &store)
+            .await;
+        assert_eq!(held(0).len(), 1);
+        assert!(held(1).is_empty());
+
+        fallback.nodes()[1].failures.lock().expect("lock").clear();
+        fallback.check_nodes(&chain, || 0).await;
+        let counted = service
+            .publish_epoch(current + 2, GLOAS_EPOCH, &snapshot, &store)
+            .await;
+        assert_eq!(counted, 0, "a re-send is not counted again");
+        let first = held(0)[0].clone();
+        assert_eq!(held(1), vec![first], "the message as first signed");
+        assert_eq!(stages(&service), everywhere);
+
+        // Both hold it now: nothing more is sent.
+        service
+            .publish_epoch(current + 3, GLOAS_EPOCH, &snapshot, &store)
+            .await;
+        assert_eq!(held(0).len(), 2);
         assert_eq!(held(1).len(), 1);
     }
 

@@ -241,7 +241,7 @@ pub enum Published {
     HandedToBuilder,
 }
 
-/// How many of the configured nodes took something sent to every node.
+/// How many of the nodes sent to took something sent to every node.
 ///
 /// The caller needs it when what it sends lives on each node separately and
 /// a node that missed it never hears it any other way. Proposer preferences
@@ -250,7 +250,10 @@ pub enum Published {
 /// node accepted" must not be mistaken for "every node did".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    /// Every configured node accepted. The only answer a single node gives.
+    /// Every node it was sent to accepted. The only answer a single node
+    /// gives. A fallback sends only to the nodes on this client's chain, so a
+    /// node skipped for not being on it does not hold it: see
+    /// [`BeaconNodeApi::readmissions`].
     Everywhere,
     /// At least one node accepted and at least one refused or did not answer.
     Partly,
@@ -379,6 +382,16 @@ pub trait BeaconNodeApi: Send + Sync {
     /// node, empty for an implementation with nothing to say.
     fn describe(&self) -> String {
         String::new()
+    }
+
+    /// A count that grows each time a node calls may go to is added back: a
+    /// fallback's node let back in by the chain check. A caller that stops
+    /// sending something once every node took it ([`Delivery::Everywhere`])
+    /// sends it again when this moves, since the node let back in was skipped
+    /// by the sends before. Constant for one node, which is every node there
+    /// is.
+    fn readmissions(&self) -> u64 {
+        0
     }
 
     /// The chain's genesis time and validators root, needed to compute slots

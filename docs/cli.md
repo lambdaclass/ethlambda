@@ -390,20 +390,32 @@ has verified it. The warning names the node and the field, when the state
 changes and then at most once per epoch. If no node is usable, every request
 fails with an error that says no configured node is on the client's chain.
 
-A background task, separate from the duty loop, repeats the check: every slot for
-the nodes not in use and the ones that did not answer their last check, and for
-every node at the first slot of each epoch. After the startup check, each epoch
-check, and any check in between that finds a node on the client's chain, a fork
+A background task, separate from the duty loop, repeats the check for every node
+at the start of every slot, so a node upgraded partway through an epoch for a fork
+at the next one is read while that fork is still ahead. The epoch the answers are
+judged at is read once they are in, so a fork whose epoch passed while a node was
+answering counts as arrived rather than as still ahead. After every check, a fork
 the compatible nodes schedule and the client does not have yet is adopted by the
 slot clock and every signing domain together, and the client logs at `warn`
-which fields moved. A fork scheduled by one node and not another takes the
-lowest epoch, with a warning naming the nodes; the node without it stops being
-used when the fork's epoch arrives. A node that stops answering keeps its say in
-that for one more epoch and then loses it, so an unreachable node cannot hold a
-fork at an epoch the network has postponed. A fork that is already active is never moved:
-a node that reports another epoch or version for it is on another chain. The
-client does not need a restart for a fork the network schedules after it
-started.
+which fields moved. A fork scheduled by one node and not another is taken from
+the node that has it; when the nodes that schedule it disagree, and the client
+does not have it yet, the lowest epoch wins. Either way a warning names the nodes,
+once per epoch, and a node without the client's epoch stops being used when the
+fork's epoch arrives. Once the client has a fork scheduled, it moves only when
+every node that schedules it agrees on the new epoch and version, so one node
+cannot pull it elsewhere, and it is never unscheduled: a node reporting it
+unscheduled may only be the one not upgraded yet, while the upgraded one is
+restarting. A fork the network cancels therefore needs a restart. A node that
+stops answering keeps its say in the merge for one more epoch and then loses it,
+so an unreachable node cannot hold a fork at an epoch the network has postponed.
+A fork that is already active is never moved: a node that reports another epoch
+or version for it is on another chain. The client does not need a restart for a
+fork the network schedules after it started.
+
+A send that has to reach every node (proposer preferences) counts as delivered
+everywhere once every node in use took it: a node skipped for being on another
+chain is not a refusal. When a check lets a skipped node back in, the client
+sends it what it missed at the next poll.
 
 | Flag | Default | Meaning |
 |---|---|---|
