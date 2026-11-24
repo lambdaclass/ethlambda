@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c869ee23.js";
+            window.path_to_searchindex_js = "searchindex-ba9c13cc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -645,9 +645,12 @@ once a slot.</p>
 </li>
 <li>
 <p><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
-memory, so a restart forgets it and the node builds its own payloads for the
-zero address until the next call. ethlambda’s validator client repeats the
-call every slot, as Lighthouse’s does.</p>
+memory, so a restart forgets it and the node builds its own payloads for
+<code>beacon --fallback-fee-recipient</code> (the zero address without it) until the
+next call. ethlambda’s validator client repeats the call every slot, as
+Lighthouse’s does. The fallback pays any proposer no validator client named
+a recipient for, but does not register it: the <code>payload_attributes</code> event
+still follows <code>prepare_beacon_proposer</code>.</p>
 </li>
 <li>
 <p><strong><code>register_validator</code></strong> takes a JSON array or an SSZ list of signed
@@ -1318,10 +1321,11 @@ into its fork choice.</p>
 <li><strong>What it carries</strong> is what <code>produceBlockV3</code>/<code>produceBlockV4</code> would send the
 execution client for a block at <code>proposal_slot</code> on the current head, from
 the same code: the head state advanced to the slot, the fee recipient
-(gloas: the proposer’s signed preferences, else <code>prepare_beacon_proposer</code>‘s,
-else the zero address), and on gloas the parent payload fork choice selects
-(the head’s payload status, and for a head at the previous slot the PTC’s
-votes on its payload) and the preferences’ gas target. <code>payload_attributes</code>
+(on gloas the proposer’s signed preferences first, then on every fork
+<code>prepare_beacon_proposer</code>‘s, else <code>--fallback-fee-recipient</code>, else the zero
+address), and on gloas the parent payload fork choice selects (the head’s
+payload status, and for a head at the previous slot the PTC’s votes on its
+payload) and the preferences’ gas target. <code>payload_attributes</code>
 is the execution API’s <code>PayloadAttributesV3</code> (<code>V4</code> from gloas) in
 <code>snake_case</code> with quoted integers.</li>
 <li><strong>When</strong>: at two thirds of each slot (Lighthouse’s default
