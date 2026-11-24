@@ -150,8 +150,10 @@ pub struct ValidatorConfig {
     /// The gas limit every validator targets unless the keymanager API gives
     /// it its own: its builder registrations' before gloas, and its proposer
     /// preferences' from gloas, which is what the node's own payload is built
-    /// toward.
-    pub gas_limit: u64,
+    /// toward. `None` when `--gas-limit` was not given: the network's
+    /// `GAS_LIMIT_SCHEDULE` then names it per epoch, and
+    /// [`proposer_settings::DEFAULT_GAS_LIMIT`] where it names none.
+    pub gas_limit: Option<u64>,
     /// Builder proposals, or `None` when `--builder-proposals` is off.
     pub builder: Option<BuilderProposals>,
     /// The smallest p2p bid, in gwei, a gloas block may be built on
@@ -304,6 +306,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             Ok(chain_check::current_epoch_of(reference))
         })
         .await?;
+    settings.set_gas_limit_schedule(spec.gas_limit_schedule.clone());
     info!(
         preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
@@ -311,7 +314,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         attestation_due_bps = spec.attestation_due_bps,
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
-        gas_limit = config.gas_limit,
+        gas_limit = ?config.gas_limit,
+        gas_limit_schedule = ?spec.gas_limit_schedule.entries(),
         "Validator client starting"
     );
 

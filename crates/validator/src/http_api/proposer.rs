@@ -382,7 +382,11 @@ pub async fn get_gas_limit(
 ) -> Result<Json<Data<GasLimitEntry>>, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
     require_held(&*context.store.read().await, &pubkey)?;
-    let gas_limit = context.settings.gas_limit(&pubkey);
+    // The one in force now, which without an override or `--gas-limit` is
+    // the schedule's for the current epoch (Lighthouse's answer too). Epoch 0
+    // before genesis.
+    let epoch = context.clock.current_epoch().unwrap_or(0);
+    let gas_limit = context.settings.gas_limit(&pubkey, epoch);
     Ok(Json(Data {
         data: GasLimitEntry {
             pubkey: encode_hex(&pubkey.0),
@@ -698,6 +702,41 @@ mod tests {
         assert_eq!(body["data"]["gas_limit"], DEFAULT_GAS_LIMIT.to_string());
     }
 
+    /// Without an override, `GET` reports the gas limit in force now, which
+    /// the network's schedule names for the current epoch (the harness clock
+    /// started at the Unix epoch, so it is past epoch 1 and short of the last
+    /// one); an override still wins over it.
+    #[tokio::test]
+    async fn the_default_served_is_the_one_scheduled_for_the_current_epoch() {
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let harness = harness(None);
+        harness.settings.set_gas_limit_schedule(
+            vec![
+                GasLimitScheduleEntry {
+                    epoch: 1,
+                    gas_limit: 200_000_000,
+                },
+                GasLimitScheduleEntry {
+                    epoch: u64::MAX,
+                    gas_limit: 300_000_000,
+                },
+            ]
+            .into(),
+        );
+        let path = uri(&harness.pubkey, "gas_limit");
+
+        let (status, body) = send(&harness.app, request("GET", &path, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["gas_limit"], "200000000");
+
+        let set = serde_json::json!({ "gas_limit": "30000000" });
+        let (status, _) = send(&harness.app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, body) = send(&harness.app, request("GET", &path, None)).await;
+        assert_eq!(body["data"]["gas_limit"], "30000000");
+    }
+
     /// The specification's `Uint64` is a decimal string with no sign and no
     /// leading zero; a JSON number is not one.
     #[tokio::test]
@@ -717,7 +756,7 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{gas_limit}");
         }
         assert_eq!(
-            harness.settings.gas_limit(&harness.pubkey),
+            harness.settings.gas_limit(&harness.pubkey, 0),
             DEFAULT_GAS_LIMIT
         );
     }
@@ -735,7 +774,7 @@ mod tests {
         let zero = serde_json::json!({ "gas_limit": "0" });
         let (status, _) = send(&harness.app, request("POST", &path, Some(zero))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(harness.settings.gas_limit(&harness.pubkey), 30_000_000);
+        assert_eq!(harness.settings.gas_limit(&harness.pubkey, 0), 30_000_000);
     }
 
     #[tokio::test]
@@ -850,7 +889,7 @@ mod tests {
             restarted.graffiti(&harness.pubkey),
             graffiti_from_text("persisted").expect("fits")
         );
-        assert_eq!(restarted.gas_limit(&harness.pubkey), DEFAULT_GAS_LIMIT);
+        assert_eq!(restarted.gas_limit(&harness.pubkey, 0), DEFAULT_GAS_LIMIT);
     }
 
     /// The file was replaced and only its directory's flush failed: the

@@ -953,7 +953,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   client do), unconditionally, re-sending each kept one once an epoch (a node
   holds them in memory only), and `produceBlockV4` carries the boost factor and
   `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
-  carry, which the node's own gloas payload is built toward.
+  carry, which the node's own gloas payload is built toward; without it, the
+  one the beacon node's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch,
+  else 60M.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;

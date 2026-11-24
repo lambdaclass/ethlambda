@@ -684,7 +684,9 @@ fn check_preset(value: &serde_json::Value, preset: Preset) -> Result<()> {
 ///
 /// The `*_DUE_BPS` offsets and `SHARD_COMMITTEE_PERIOD` keep their defaults
 /// when absent: a node that predates the basis-point form is right with
-/// them, and they do not identify the chain. Every other `Config` field is
+/// them, and they do not identify the chain. So does `GAS_LIMIT_SCHEDULE`
+/// (an empty schedule), which a node that does not serve it leaves to
+/// `DEFAULT_GAS_LIMIT`. Every other `Config` field is
 /// its preset's default whatever the node reports, so code in this crate that starts
 /// reading one has to read its key here first.
 ///
@@ -786,6 +788,13 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     // there if this stayed at the default.
     if let Some(epochs) = spec_u64(value, "SHARD_COMMITTEE_PERIOD")? {
         config.shard_committee_period = epochs;
+    }
+    // The default gas limit, per epoch, when `--gas-limit` names none. Absent
+    // (a node that does not serve it) leaves the schedule empty, which is what
+    // falls back to `DEFAULT_GAS_LIMIT`.
+    if let Some(field) = value.get("GAS_LIMIT_SCHEDULE") {
+        config.gas_limit_schedule = serde_json::from_value(field.clone())
+            .map_err(|err| Error::Decode(format!("config/spec: GAS_LIMIT_SCHEDULE: {err}")))?;
     }
 
     let genesis_version = required(
@@ -1504,6 +1513,35 @@ mod tests {
         assert_eq!(config.shard_committee_period, 256);
 
         let response = complete_spec(&[("SHARD_COMMITTEE_PERIOD", "soon")]);
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// The schedule in the shape a beacon node serves it (this one's and
+    /// lighthouse's), looked up at the proposal's epoch; a node that does not
+    /// serve the key, or serves it empty, schedules nothing.
+    #[test]
+    fn the_gas_limit_schedule_is_read_and_defaults_to_empty() {
+        let response = serde_json::json!({
+            "GAS_LIMIT_SCHEDULE": [
+                {"EPOCH": "353024", "GAS_LIMIT": "200000000"},
+                {"EPOCH": "400000", "GAS_LIMIT": "300000000"},
+            ],
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        let schedule = &config.gas_limit_schedule;
+        assert_eq!(schedule.entries().len(), 2);
+        assert_eq!(schedule.gas_limit_at(353_023), None);
+        assert_eq!(schedule.gas_limit_at(353_024), Some(200_000_000));
+        assert_eq!(schedule.gas_limit_at(400_000), Some(300_000_000));
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": [] });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+
+        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": "200000000" });
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }

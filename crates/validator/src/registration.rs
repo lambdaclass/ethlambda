@@ -107,7 +107,9 @@
 //!
 //! # The per-slot check is one atomic read
 //!
-//! Only a keymanager write changes what a registration says, so
+//! Only a keymanager write changes what a registration says between two
+//! epochs' full sends (the gas limit schedule moves a default only at an
+//! epoch, and each full send compares every value it signs), so
 //! [`RegistrationService::register_changed`] compares
 //! [`ProposerSettings::generation`] with the one it last signed against and
 //! returns before touching the store when it has not moved. While something
@@ -288,12 +290,16 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
     /// per lookup, inside the signer), and the cache is written last, so a key
     /// is cached only once its chunk is signed in full.
     ///
-    /// `now_secs` is a parameter so a test can fix the timestamp.
+    /// `now_secs` is a parameter so a test can fix the timestamp. `epoch` is
+    /// the one the send is for, which picks the gas limit schedule's entry for
+    /// a validator with no gas limit of its own (see
+    /// [`ProposerSettings::fee_recipient_and_gas_limit`]).
     async fn current(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkeys: &[BlsPubkey],
         now_secs: u64,
+        epoch: Epoch,
     ) -> Current {
         /// Where a validator's registration comes from, in `pubkeys`' order.
         enum Source {
@@ -318,7 +324,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
                 }
 
                 let Some((fee_recipient, gas_limit)) =
-                    self.settings.fee_recipient_and_gas_limit(pubkey)
+                    self.settings.fee_recipient_and_gas_limit(pubkey, epoch)
                 else {
                     no_fee_recipient += 1;
                     if signed.contains_key(pubkey) {
@@ -443,6 +449,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         self: &Arc<Self>,
         store: &Arc<RwLock<ValidatorStore>>,
         pubkeys: &[BlsPubkey],
+        epoch: Epoch,
     ) -> Current {
         let now_secs = Self::now_secs();
         let mut current = Current {
@@ -457,7 +464,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             // thread is outside it, so it enters it to wait on them.
             let runtime = tokio::runtime::Handle::current();
             let part = tokio::task::spawn_blocking(move || {
-                runtime.block_on(service.current(&store, &chunk, now_secs))
+                runtime.block_on(service.current(&store, &chunk, now_secs, epoch))
             })
             .await;
             match part {
@@ -563,7 +570,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = pubkeys.clone();
 
-        let current = self.current_blocking(&store, &pubkeys).await;
+        let current = self.current_blocking(&store, &pubkeys, epoch).await;
         if current.no_fee_recipient > 0 {
             warn!(
                 skipped = current.no_fee_recipient,
@@ -622,7 +629,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if known.is_empty() {
             return;
         }
-        let current = self.current_blocking(&store, &known).await;
+        let current = self.current_blocking(&store, &known, epoch).await;
         // What changed, and what an earlier slot could not get any node to
         // take. Both are read off `all`, the newest registration per key, so a
         // key that changed again since its failed send goes out once, as now.
@@ -727,11 +734,11 @@ mod tests {
         let store = RwLock::new(store);
         let (service, _) = service(Config::mainnet(), settings(Some(H160([0xab; 20]))));
 
-        let first = service.current(&store, &pubkeys, 1_000).await;
+        let first = service.current(&store, &pubkeys, 1_000, 0).await;
         assert_eq!(first.all.len(), 2);
         assert_eq!(first.changed.len(), 2);
 
-        let second = service.current(&store, &pubkeys, 2_000).await;
+        let second = service.current(&store, &pubkeys, 2_000, 0).await;
         assert_eq!(second.all, first.all, "same timestamp and signature");
         assert!(second.changed.is_empty());
         assert_eq!(second.all[0].message.timestamp, 1_000);
@@ -743,11 +750,11 @@ mod tests {
         let store = RwLock::new(store);
         let settings = settings(Some(H160([0xab; 20])));
         let (service, _) = service(Config::mainnet(), settings.clone());
-        let first = service.current(&store, &pubkeys, 1_000).await;
+        let first = service.current(&store, &pubkeys, 1_000, 0).await;
 
         settings.set_fee_recipient(&pubkeys[0], H160([0xcd; 20]));
         settings.set_gas_limit(&pubkeys[1], 30_000_000);
-        let second = service.current(&store, &pubkeys, 2_000).await;
+        let second = service.current(&store, &pubkeys, 2_000, 0).await;
 
         let changed: Vec<_> = second.changed.iter().map(|r| r.message.pubkey).collect();
         assert_eq!(changed, vec![pubkeys[0], pubkeys[1]]);
@@ -759,6 +766,34 @@ mod tests {
         assert_eq!(second.all[2], first.all[2], "the third is untouched");
     }
 
+    /// A validator with no gas limit of its own registers the one the schedule
+    /// names for the send's epoch, and is re-signed when that moves, which
+    /// no keymanager write signals: the epoch's full send compares the values.
+    #[tokio::test]
+    async fn the_gas_limit_follows_the_schedule_at_the_sends_epoch() {
+        use crate::proposer_settings::DEFAULT_GAS_LIMIT;
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let (store, pubkeys) = store_with_keys(1);
+        let store = RwLock::new(store);
+        let settings = settings(Some(H160([0xab; 20])));
+        settings.set_gas_limit_schedule(
+            vec![GasLimitScheduleEntry {
+                epoch: 5,
+                gas_limit: 200_000_000,
+            }]
+            .into(),
+        );
+        let (service, _) = service(Config::mainnet(), settings);
+
+        let before = service.current(&store, &pubkeys, 1_000, 4).await;
+        assert_eq!(before.all[0].message.gas_limit, DEFAULT_GAS_LIMIT);
+
+        let from = service.current(&store, &pubkeys, 2_000, 5).await;
+        assert_eq!(from.changed.len(), 1, "re-signed for the new gas limit");
+        assert_eq!(from.all[0].message.gas_limit, 200_000_000);
+    }
+
     /// A relay drops a registration that is not newer than the one it holds,
     /// so a change signed within the same second, or after the clock stepped
     /// back, still gets a later timestamp than the registration it replaces.
@@ -768,20 +803,20 @@ mod tests {
         let store = RwLock::new(store);
         let settings = settings(Some(H160([0xab; 20])));
         let (service, _) = service(Config::mainnet(), settings.clone());
-        let first = service.current(&store, &pubkeys, 2_000).await;
+        let first = service.current(&store, &pubkeys, 2_000, 0).await;
         assert_eq!(first.all[0].message.timestamp, 2_000);
 
         settings.set_gas_limit(&pubkeys[0], 30_000_000);
-        let same_second = service.current(&store, &pubkeys, 2_000).await;
+        let same_second = service.current(&store, &pubkeys, 2_000, 0).await;
         assert_eq!(same_second.changed[0].message.timestamp, 2_001);
 
         settings.set_gas_limit(&pubkeys[0], 31_000_000);
-        let stepped_back = service.current(&store, &pubkeys, 1_000).await;
+        let stepped_back = service.current(&store, &pubkeys, 1_000, 0).await;
         assert_eq!(stepped_back.changed[0].message.timestamp, 2_002);
 
         // Once the clock is ahead again, its reading is used.
         settings.set_gas_limit(&pubkeys[0], 32_000_000);
-        let caught_up = service.current(&store, &pubkeys, 5_000).await;
+        let caught_up = service.current(&store, &pubkeys, 5_000, 0).await;
         assert_eq!(caught_up.changed[0].message.timestamp, 5_000);
     }
 
@@ -793,7 +828,7 @@ mod tests {
         settings.set_fee_recipient(&pubkeys[1], H160([0xcd; 20]));
         let (service, _) = service(Config::mainnet(), settings);
 
-        let current = service.current(&store, &pubkeys, 1_000).await;
+        let current = service.current(&store, &pubkeys, 1_000, 0).await;
 
         assert_eq!(current.no_fee_recipient, 1);
         assert_eq!(current.all.len(), 1);
@@ -807,7 +842,7 @@ mod tests {
         store.remove(&pubkeys[0]);
         let store = RwLock::new(store);
 
-        let current = service.current(&store, &pubkeys, 1_000).await;
+        let current = service.current(&store, &pubkeys, 1_000, 0).await;
 
         assert_eq!(current.all.len(), 1);
         assert_eq!(current.all[0].message.pubkey, pubkeys[1]);
