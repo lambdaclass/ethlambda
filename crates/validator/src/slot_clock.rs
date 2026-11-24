@@ -3,7 +3,9 @@
 //! Seeded once from the beacon node's genesis, then independent of it. It is
 //! deliberately not driven by the node's event stream: that stream is
 //! best-effort by contract, dropping events for a slow subscriber, and a
-//! dropped event must not mean a missed duty.
+//! dropped event must not mean a missed duty. The stream can only start a duty
+//! earlier than the offset this clock gives (see `crate::head_monitor`); the
+//! offset stays its deadline.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
