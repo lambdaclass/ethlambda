@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ba9c13cc.js";
+            window.path_to_searchindex_js = "searchindex-e48672b8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -9539,9 +9539,11 @@ long-lived validator key performs every 65,536 slots is never exercised.</li>
 three seal phases only appear in real runs.</li>
 </ul>
 <h3 id="in-ci"><a class="header" href="#in-ci">In CI</a></h3>
-<p>The Test job runs a short mock benchmark and asserts the JSON report’s shape
-(<code>schema_version</code>, one sample per iteration). It costs seconds, and it means a
-change to the report contract cannot land unnoticed.</p>
+<p>The <code>Test (node)</code> job runs a short mock benchmark through the built binary
+(<code>bin/ethlambda/tests/benchmark_smoke.rs</code>, part of <code>make test-node</code>) and
+asserts the JSON report’s shape (<code>schema_version</code>, one sample per iteration).
+It costs seconds, and it means a change to the report contract cannot land
+unnoticed.</p>
 <h2 id="import-workload"><a class="header" href="#import-workload">Import workload</a></h2>
 <p><code>ethlambda benchmark import</code> measures block import: the state transition,
 attestation processing, persistence and fork-choice work a node does for every
