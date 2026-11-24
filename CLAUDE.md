@@ -531,7 +531,11 @@ the next fork the node cannot follow: the first refuses such an anchor with
 `UnsupportedFork`, the second warns once per scheduled fork for which
 `ForkName::is_followed` answers no (the one place that says which forks the
 node follows). The ignored-keys warning only ever names heze's keys and
-`GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
+`INCLUSION_LIST_DUE_BPS`. `GAS_LIMIT_SCHEDULE` (EIP-8261) is a `Config` field
+served on `/eth/v1/config/spec` but left out of the stored encoding: its SSZ
+impls are zero bytes, so `Metadata["config"]` and `DB_VERSION` are unchanged,
+and a resume puts the file's back through `replace_config`. `ConfigFile::parse`
+refuses one with an entry before `GLOAS_FORK_EPOCH` or two at one epoch.
 Platåberget (the Glamsterdam testnet) is already past its `GLOAS_FORK_EPOCH`,
 so its checkpoint anchor is a gloas state: it is accepted, starts with no
 payload known (head EMPTY), and its first FULL child is held until the anchor's

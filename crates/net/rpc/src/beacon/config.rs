@@ -18,7 +18,13 @@
 //!
 //! The configuration keys include gloas's (`GLOAS_*` and the other gloas
 //! timing and churn keys), since `Config` holds them and this serializes the
-//! whole of it. The preset and constant keys are the ones lighthouse reports
+//! whole of it. That includes `GAS_LIMIT_SCHEDULE` (EIP-8261), a list of
+//! `{"EPOCH", "GAS_LIMIT"}` entries with quoted values, ascending by epoch, as
+//! `BLOB_SCHEDULE` is reported and as lighthouse reports it. It is reported
+//! empty when the network schedules nothing, where lighthouse leaves the key
+//! out while gloas is unscheduled: the specification's own `config.yaml`s
+//! carry it empty, and this endpoint echoes every key a `config.yaml` carries.
+//! A validator client takes its default gas limit from it. The preset and constant keys are the ones lighthouse reports
 //! plus gloas's own, from `presets/*/gloas.yaml` and `beacon-chain.md`'s
 //! constants (`PTC_SIZE`, `DOMAIN_BEACON_BUILDER`, ...), less keys the
 //! specification does not define at all (`GAS_LIMIT_ADJUSTMENT_FACTOR`,
@@ -494,6 +500,43 @@ mod tests {
         );
         // A `Config` field, so it comes from the config half of the object.
         assert!(data["MIN_BUILDER_WITHDRAWABILITY_DELAY"].is_string());
+    }
+
+    /// The fixture's `Config::mainnet()` schedules no gas limit, which is
+    /// reported as an empty list rather than left out.
+    #[tokio::test]
+    async fn the_spec_reports_an_empty_gas_limit_schedule() {
+        let json = get_spec_json().await;
+        assert_eq!(json["data"]["GAS_LIMIT_SCHEDULE"], serde_json::json!([]));
+    }
+
+    /// The shape lighthouse reports and validator clients read: quoted
+    /// values, ascending by epoch.
+    #[test]
+    fn the_spec_reports_the_gas_limit_schedule_as_quoted_entries() {
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let mut config = Config::mainnet();
+        config.gas_limit_schedule = vec![
+            GasLimitScheduleEntry {
+                epoch: 400_000,
+                gas_limit: 300_000_000,
+            },
+            GasLimitScheduleEntry {
+                epoch: 353_024,
+                gas_limit: 200_000_000,
+            },
+        ]
+        .into();
+
+        let data = spec(&config);
+        assert_eq!(
+            data["GAS_LIMIT_SCHEDULE"],
+            serde_json::json!([
+                {"EPOCH": "353024", "GAS_LIMIT": "200000000"},
+                {"EPOCH": "400000", "GAS_LIMIT": "300000000"},
+            ])
+        );
     }
 
     #[tokio::test]
