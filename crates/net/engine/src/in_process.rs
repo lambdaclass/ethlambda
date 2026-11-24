@@ -38,6 +38,14 @@
 //! keeps timing out holds it for the whole ladder, about 25 s at
 //! [`ENGINE_TIMEOUT`], exactly as an external execution client can.
 //!
+//! That bound holds because each attempt runs on a thread of tokio's blocking
+//! pool, not on the caller's task. A handler can block the thread it runs on:
+//! ethrex replays a deep reorg's side chain on a thread of its own and joins it
+//! synchronously inside `forkchoiceUpdated`. Inline, that would hold the chain
+//! actor's thread for as long as the replay took, and no timeout could fire. A
+//! timed-out attempt is cancelled, which drops the handler at its next await; a
+//! synchronous section runs to its end first, on its own thread.
+//!
 //! Giving up on an attempt does not stop the work it started. `newPayload`
 //! hands its block to ethrex's block executor thread, and ethrex records the
 //! verdict on a task of its own whether or not anyone still waits for it.
@@ -47,8 +55,18 @@
 //! record of an invalid one. That is what an
 //! external client does with a request whose caller hung up, so both transports
 //! leave the same thing behind a timeout.
+//!
+//! # Shutdown
+//!
+//! Once the embedded node's shutdown begins, a call is refused before it
+//! reaches a handler, with a transport error (as a stopped external client
+//! refuses the connection), and a call still running is cancelled. The chain
+//! actor has joined by then, but a Beacon API request still in its server's
+//! drain, or a blob fetch the chain actor spawned, can still be calling, and
+//! without this would reach a store that is flushing or already shut.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -71,6 +89,7 @@ use ethrex_rpc::types::fork_choice::{ForkChoiceState, PayloadAttributesV3, Paylo
 use ethrex_rpc::types::payload::ExecutionPayload;
 use ethrex_rpc::{RpcApiContext, RpcErr, RpcErrorMetadata, RpcHandler};
 use serde::de::DeserializeOwned;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::building::{self, PayloadId};
@@ -86,10 +105,14 @@ use crate::types::{
 };
 
 /// A handle on an embedded ethrex's Engine API: its RPC context, which every
-/// handler takes by value.
+/// handler takes by value, and the token the node's shutdown cancels.
 #[derive(Clone)]
 pub(crate) struct InProcessEngine {
     context: RpcApiContext,
+    /// Cancelled once the embedded node starts shutting down. From then on a
+    /// call is refused before it reaches a handler, and one still running is
+    /// cancelled (see the module docs).
+    shutdown: CancellationToken,
 }
 
 impl fmt::Debug for InProcessEngine {
@@ -101,26 +124,84 @@ impl fmt::Debug for InProcessEngine {
 }
 
 impl InProcessEngine {
-    pub(crate) fn new(context: RpcApiContext) -> Self {
-        Self { context }
+    pub(crate) fn new(context: RpcApiContext, shutdown: CancellationToken) -> Self {
+        Self { context, shutdown }
     }
 
     /// Runs one handler under `timeout`, at most `attempts` times (see
     /// [`ask`]), and decodes its answer as `T`. `method` names the call in
     /// the log line a timeout writes, as the HTTP transport's does.
-    async fn run<H: RpcHandler, T: DeserializeOwned>(
+    ///
+    /// Refused once the node's shutdown has begun, as an external client that
+    /// has stopped refuses a connection; the ladder is cancelled if it begins
+    /// mid-call.
+    async fn run<H, T>(
         &self,
         method: &str,
         request: H,
         timeout: Duration,
         attempts: u32,
-    ) -> Result<T, EngineError> {
-        // Boxed as ethrex boxes its own dispatch arms: a `newPayload` handler's
-        // future carries a block execution, and inlining it would size every
-        // caller's future to it.
-        let call = || Box::pin(request.handle(self.context.clone()));
-        let answer = ask(method, timeout, attempts, call).await?;
-        serde_json::from_value(answer).map_err(|err| EngineError::Decode(err.to_string()))
+    ) -> Result<T, EngineError>
+    where
+        H: RpcHandler + Send + Sync + 'static,
+        T: DeserializeOwned,
+    {
+        if self.shutdown.is_cancelled() {
+            return Err(shutting_down());
+        }
+        let request = Arc::new(request);
+        let call = || self.attempt(Arc::clone(&request));
+        let ladder = self
+            .shutdown
+            .run_until_cancelled(ask(method, timeout, attempts, call))
+            .await;
+        match ladder {
+            Some(Ok(answer)) => {
+                serde_json::from_value(answer).map_err(|err| EngineError::Decode(err.to_string()))
+            }
+            Some(Err(err)) if !self.shutdown.is_cancelled() => Err(err),
+            // Shutdown began mid-call. The ladder can still finish first, on the
+            // error its cancelled attempt left, so the token says which this is.
+            _ => Err(shutting_down()),
+        }
+    }
+
+    /// One attempt at `request`, run on a thread of tokio's blocking pool.
+    ///
+    /// Not on the caller's task, because a handler can block its thread:
+    /// ethrex replays a deep reorg's side chain on a thread of its own and
+    /// joins it synchronously inside `forkchoiceUpdated`. Inline, that would
+    /// hold the chain actor's thread for the whole replay, and no timeout
+    /// could fire. Dropping the returned future (a timeout, shutdown, a caller
+    /// that gave up) cancels the attempt, which drops the handler at its next
+    /// await, as when it ran inline.
+    fn attempt<H>(&self, request: Arc<H>) -> impl Future<Output = Result<serde_json::Value, RpcErr>>
+    where
+        H: RpcHandler + Send + Sync + 'static,
+    {
+        let context = self.context.clone();
+        let cancel = self.shutdown.child_token();
+        let cancel_on_drop = cancel.clone().drop_guard();
+        let runtime = tokio::runtime::Handle::current();
+        let task = tokio::task::spawn_blocking(move || {
+            // Boxed as ethrex boxes its own dispatch arms: a `newPayload`
+            // handler's future carries a block execution, too large for the
+            // stack it would otherwise be pinned on.
+            let handler = Box::pin(request.handle(context));
+            runtime.block_on(cancel.run_until_cancelled(handler))
+        });
+        async move {
+            let _cancel_on_drop = cancel_on_drop;
+            match task.await {
+                Ok(Some(answer)) => answer,
+                // Cancelled while this future still waits: shutdown began,
+                // which `run` reports as the refusal it is.
+                Ok(None) => Err(RpcErr::Internal(SHUTTING_DOWN.to_string())),
+                // A panicking handler panics its caller, as it did inline.
+                Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+                Err(err) => Err(RpcErr::Internal(err.to_string())),
+            }
+        }
     }
 
     pub(crate) async fn new_payload(
@@ -345,6 +426,15 @@ where
         }
     }
     Err(EngineError::Timeout(timeout))
+}
+
+const SHUTTING_DOWN: &str = "the embedded execution client is shutting down";
+
+/// A call refused because the node's shutdown has begun. A failure to get an
+/// answer, as a refused connection is over HTTP, so no caller reads it as a
+/// verdict on a payload.
+fn shutting_down() -> EngineError {
+    EngineError::Transport(SHUTTING_DOWN.to_string())
 }
 
 /// An ethrex handler error as the wire would carry it: the same code and

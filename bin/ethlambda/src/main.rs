@@ -769,7 +769,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     let started = ethlambda_ethrex::start(config)
                         .await
                         .map_err(|err| eyre::eyre!("starting the embedded ethrex: {err}"))?;
-                    let client = EngineClient::in_process(started.rpc_context());
+                    let client =
+                        EngineClient::in_process(started.rpc_context(), started.shutdown_token());
                     info!("Embedded ethrex configured as the execution client");
                     embedded_ethrex = Some(started);
                     Some(client)

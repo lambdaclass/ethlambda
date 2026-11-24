@@ -330,6 +330,13 @@ impl EmbeddedEthrex {
         self.context.clone()
     }
 
+    /// A token cancelled when the node's shutdown begins, or when the node
+    /// stops itself, for `EngineClient::in_process`. A child of the node's
+    /// own, so whoever holds it cannot stop the node.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.cancel_token.child_token()
+    }
+
     /// Where the execution JSON-RPC server listens, if it runs: the bound
     /// address, so a requested port `0` reads as the one the OS picked.
     pub fn http_addr(&self) -> Option<SocketAddr> {

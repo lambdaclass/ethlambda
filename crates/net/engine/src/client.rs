@@ -122,11 +122,17 @@ impl EngineClient {
 
     /// A client for an ethrex running in this process, driven through the
     /// node's own RPC context instead of its authenticated RPC port.
+    ///
+    /// `shutdown` is the token the node's shutdown cancels: from then on every
+    /// call is refused, and one still running is cancelled.
     #[cfg(feature = "include-ethrex")]
-    pub fn in_process(context: ethrex_rpc::RpcApiContext) -> Self {
+    pub fn in_process(
+        context: ethrex_rpc::RpcApiContext,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Self {
         Self {
             transport: Transport::InProcess(std::sync::Arc::new(
-                crate::in_process::InProcessEngine::new(context),
+                crate::in_process::InProcessEngine::new(context, shutdown),
             )),
         }
     }

@@ -86,6 +86,13 @@ EngineClient::new_payload(&deneb::ExecutionPayload, ..)
   Giving up on an attempt does not stop ethrex's execution of the block: it
   records the verdict on its own, and asking again joins the execution already
   running.
+- **Off the caller's thread.** Each attempt runs on a thread of tokio's blocking
+  pool. ethrex replays a deep reorg's side chain inside `forkchoiceUpdated` and
+  waits for it synchronously; on the chain actor's own thread that would hold
+  the actor for the whole replay, with no timeout able to fire.
+- **Refused once shutdown begins**, with a transport error (as a stopped
+  external client refuses the connection), and a call still running is
+  cancelled. See [Lifecycle](#lifecycle).
 
 ## Lifecycle
 

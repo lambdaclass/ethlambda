@@ -92,7 +92,7 @@ fn attributes(timestamp: u64, parent_beacon_block_root: H256) -> PayloadAttribut
 #[tokio::test(flavor = "multi_thread")]
 async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
     let node = embedded("genesis-osaka.json", &[]).await;
-    let engine = EngineClient::in_process(node.rpc_context());
+    let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
     let (genesis_hash, genesis_time) = genesis("genesis-osaka.json");
 
     let capabilities = engine
@@ -182,7 +182,7 @@ async fn an_osaka_payload_round_trips_through_the_in_process_engine() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payload_with_an_undecodable_transaction_gets_ethrexs_own_verdict() {
     let node = embedded("genesis-osaka.json", &[]).await;
-    let engine = EngineClient::in_process(node.rpc_context());
+    let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
     let (genesis_hash, genesis_time) = genesis("genesis-osaka.json");
 
     let parent_beacon_block_root = H256([7; 32]);
@@ -220,7 +220,7 @@ async fn a_payload_with_an_undecodable_transaction_gets_ethrexs_own_verdict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_amsterdam_payload_round_trips_through_the_v4_v5_v6_methods() {
     let node = embedded("genesis-amsterdam.json", &[]).await;
-    let engine = EngineClient::in_process(node.rpc_context());
+    let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
     let (genesis_hash, genesis_time) = genesis("genesis-amsterdam.json");
 
     let status = engine
@@ -272,7 +272,7 @@ async fn an_amsterdam_payload_round_trips_through_the_v4_v5_v6_methods() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
     let node = embedded("genesis-amsterdam.json", &[]).await;
-    let engine = EngineClient::in_process(node.rpc_context());
+    let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
     let (genesis_hash, genesis_time) = genesis("genesis-amsterdam.json");
 
     let attributes = PayloadAttributesV4 {
@@ -322,6 +322,22 @@ async fn a_v4_payload_past_amsterdam_is_refused_with_the_wire_code() {
     );
 
     node.shutdown().await;
+}
+
+/// Once shutdown begins, an in-process call is refused before it reaches a
+/// handler, as a failure to get an answer rather than a verdict: the store is
+/// flushing by then, or flushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_call_after_shutdown_begins_is_refused() {
+    let node = embedded("genesis-osaka.json", &[]).await;
+    let engine = EngineClient::in_process(node.rpc_context(), node.shutdown_token());
+    node.shutdown().await;
+
+    let err = engine
+        .exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES)
+        .await
+        .expect_err("refused once shutdown has begun");
+    assert!(matches!(err, EngineError::Transport(_)), "{err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
