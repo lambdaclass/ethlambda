@@ -372,6 +372,20 @@ Metrics are served on `--metrics-port` (default `5064`). See
 [`docs/cli.md`](./docs/cli.md#validator-flags) for the remaining flags and what
 the client does each slot.
 
+Stop the client with `Ctrl+C` or SIGTERM. Once its duties have started, either
+one stops it cleanly: it starts no other slot, gives the slot in progress and a
+blinded block's publish up to 8 s, gives a keymanager request in flight up to a
+minute more, and exits 0. Under systemd that needs no setting: SIGTERM is the
+default `KillSignal`, and the default `TimeoutStopSec` (90 s) covers both
+waits. `docker stop` sends SIGTERM to the client, which is the image's PID 1,
+and its default 10 s covers the slot; with `--enable-keymanager`, pass
+`--stop-timeout 70` so an import in flight is not cut short. A signal during
+startup, while the keystores are decrypted, ends the process at once, or in a
+container is ignored until Docker kills it. v1.0.0 handles neither signal at
+any point: outside a container either one ends it at once, and inside one
+`docker stop` waits out its timeout and kills it. See
+[`docs/cli.md`](./docs/cli.md#stopping) for what a stop waits for.
+
 ### Running in a devnet
 
 To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):

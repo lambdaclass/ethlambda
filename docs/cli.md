@@ -824,6 +824,37 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
+### Stopping
+
+SIGINT or SIGTERM stops the client cleanly once its duties have started. It
+logs `Shutdown signal received`, starts no other slot, and lets the work in
+flight finish:
+
+- The slot in progress, with its proposal, gloas envelope and attestations,
+  and a signed blinded block's publish, get up to 8 s after the signal, which
+  is what Prysm's validator client waits. On a 12 s slot that covers the
+  proposal and the attestations; the aggregates, sync committee contributions
+  and payload timeliness vote due later in the slot may be cut. Cutting any of
+  it is safe: a block or attestation is recorded in slashing protection before
+  it is signed, and the rest is not slashable.
+- The keymanager API takes no new request, and one in flight gets up to 60 s
+  more, so an import is not cut between saving its keys and registering them.
+- The sends that are repeated anyway (proposer preferences, subnet
+  subscriptions, builder registrations, the fee recipient re-send) are not
+  waited for.
+
+It then logs `Shutdown complete` and exits 0. Three more signals end it at
+once, with exit code 1. A signal during startup, while the keystores are
+decrypted and the beacon node is first asked for the chain, keeps its default
+action, as the node's do until it has started: it ends the process at once, or,
+in a container, where the client is PID 1, it is ignored until Docker kills
+the container.
+
+systemd's defaults need no change: `KillSignal` is SIGTERM, and `TimeoutStopSec`
+(90 s) covers both waits. `docker stop` sends SIGTERM and waits 10 s, enough for
+the slot; with `--enable-keymanager`, pass `--stop-timeout 70` so an import in
+flight is not cut short.
+
 ### Metrics
 
 Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the

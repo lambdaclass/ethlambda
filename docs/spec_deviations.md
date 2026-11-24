@@ -951,9 +951,9 @@ signature, whichever way the node answered. Three departures:
   up to 5 s on the relay and the client up to 8 s on the node, against well
   under a second for a full block. The publish runs on its own task so the
   proposal budget cannot cut it off: past the budget the proposal returns
-  "still publishing" and the task reports the outcome itself. The process
-  handles no signals, though: a SIGINT in that window ends the task with the
-  request.
+  "still publishing" and the task reports the outcome itself. A SIGINT or
+  SIGTERM in that window waits for the task, up to 8 s after the signal; a
+  publish still going then, or a SIGKILL, ends it with the request.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the

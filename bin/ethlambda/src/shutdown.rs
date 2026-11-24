@@ -12,6 +12,10 @@
 //! a signal sent during startup, but it would also hold a ctrl-c sent during a
 //! long checkpoint sync until startup finished, since nothing in startup gives
 //! up on a signal.
+//!
+//! The validator client follows the same rule: it listens from when its duties
+//! start (`validator::run`), not while it decrypts its keystores and first
+//! reaches its beacon node.
 
 #[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
