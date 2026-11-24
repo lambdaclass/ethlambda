@@ -123,7 +123,7 @@ from a normal build.
 | `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | How many custody groups this node custodies, advertised as the ENR's `cgc` |
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
-| `--ethrex.*` | see [Embedded ethrex](./ethrex.md#flags) | Only in a build with the `include-ethrex` feature: configure the ethrex that build runs in-process when `--execution-endpoint` is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers) |
+| `--ethrex.*` | see [Embedded ethrex](./ethrex.md#flags) | Only in a build with the `include-ethrex` feature: configure the ethrex that build runs in-process when `--execution-endpoint` is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers), and are refused together with it |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). Lighthouse's flag of the same name |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |

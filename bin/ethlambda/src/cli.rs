@@ -343,6 +343,11 @@ pub(crate) struct BeaconOptions {
     /// execution client about their payloads, which is what it did before this
     /// flag existed.
     #[arg(long, requires = "execution_jwt_secret")]
+    // The `--ethrex.*` flags configure the embedded client, which an endpoint
+    // replaces, so giving both is a usage error rather than flags silently
+    // ignored. `EthrexArgs` is the group clap derives from that struct, which
+    // counts as present only for a flag given explicitly, not a default.
+    #[cfg_attr(feature = "include-ethrex", arg(conflicts_with = "EthrexArgs"))]
     pub(crate) execution_endpoint: Option<String>,
 
     /// File holding the 32-byte hex JWT secret shared with the execution
@@ -1429,6 +1434,29 @@ mod tests {
         let beacon = parse_beacon(args);
         assert!(beacon.execution_endpoint.is_some());
         assert!(beacon.execution_jwt_secret.is_some());
+    }
+
+    /// An endpoint replaces the embedded client, so a flag that configures the
+    /// embedded one alongside it is refused rather than ignored. The pair
+    /// alone still parses (above), defaulted `--ethrex.http-addr` and all.
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn ethrex_flags_conflict_with_an_execution_endpoint() {
+        let mut args = beacon_args();
+        args.extend_from_slice(&[
+            "--execution-endpoint",
+            "http://127.0.0.1:8551",
+            "--execution-jwt-secret",
+            "jwt.hex",
+            "--ethrex.http-port",
+            "8545",
+        ]);
+        let err = try_parse_from(args).expect_err("--ethrex.* with an endpoint must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "an embedded-client flag beside an endpoint is a usage error: {err}"
+        );
     }
 
     #[test]

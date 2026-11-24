@@ -762,6 +762,21 @@ async fn run_node(
             let attestation_subnets: HashSet<u64> =
                 params.wire.attestation_subnets.iter().copied().collect();
 
+            // Resolved and checked ahead of the anchor fetch, so a bad
+            // `--ethrex.*` value or a port clash fails startup before a
+            // checkpoint download rather than after it.
+            #[cfg(feature = "include-ethrex")]
+            let mut embedded_config = match &execution {
+                Execution::Embedded(args) => {
+                    let config = args
+                        .resolve(&data_dir, &mainnet.network)
+                        .map_err(|err| eyre::eyre!("configuring the embedded ethrex: {err}"))?;
+                    common.validate_embedded_ports(true, p2p_socket.ip(), &config)?;
+                    Some(config)
+                }
+                Execution::External(_) => None,
+            };
+
             // The anchored beacon store. `P2PServer` holds it for the lean
             // handlers, and the two beacon block handlers read it too: it is
             // what `beacon_blocks_by_{range,root}/2` are answered from.
@@ -788,11 +803,10 @@ async fn run_node(
                     Some(client)
                 }
                 #[cfg(feature = "include-ethrex")]
-                Execution::Embedded(args) => {
-                    let config = args
-                        .resolve(&data_dir, &mainnet.network)
-                        .map_err(|err| eyre::eyre!("configuring the embedded ethrex: {err}"))?;
-                    common.validate_embedded_ports(true, p2p_socket.ip(), &config)?;
+                Execution::Embedded(_) => {
+                    let config = embedded_config
+                        .take()
+                        .expect("resolved above for an embedded execution client");
                     let started = ethlambda_ethrex::start(config)
                         .await
                         .map_err(|err| eyre::eyre!("starting the embedded ethrex: {err}"))?;

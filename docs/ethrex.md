@@ -32,7 +32,9 @@ The `--ethrex.*` flags are a deliberate subset of ethrex's own. Everything they
 leave out keeps the value the `ethrex` binary would start with, read the way that
 binary reads it: its clap defaults, overridden by any `ETHREX_*` environment
 variable (`ETHREX_P2P_NAT_EXTIP`, `ETHREX_MEMPOOL_MAXSIZE`, ...). A flag given
-here wins over both.
+here wins over both. An `--ethrex.*` flag together with `--execution-endpoint`
+is a usage error: the endpoint replaces the embedded client the flag would
+configure.
 
 | Flag | Default | Notes |
 |---|---|---|
