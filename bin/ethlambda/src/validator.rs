@@ -12,6 +12,8 @@ use ethlambda_validator::proposer_settings::{
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 use eyre::WrapErr as _;
 
+use crate::shutdown::ShutdownSignals;
+
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
 
@@ -279,6 +281,10 @@ impl ValidatorOptions {
 /// `main` stays synchronous, the same way it does for the `node` sub-command:
 /// each sub-command picks its own concurrency model rather than being forced
 /// onto one runtime shared with the others.
+///
+/// SIGINT or SIGTERM, once the duties have started, stops the client cleanly
+/// (see `ethlambda_validator::run`). Three more signals then end it at once,
+/// as they end the node ([`ShutdownSignals::force_exit_on_repeats`]).
 #[tokio::main]
 pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     options.validate_ports()?;
@@ -292,7 +298,16 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
-    ethlambda_validator::run(ValidatorConfig {
+    // Lazy: nothing listens until `run` first polls this, once its duties
+    // start. Until then both signals keep their default action, as they do
+    // for the node until it has started (see the `shutdown` module).
+    let stop = async {
+        let mut signals = ShutdownSignals::listen();
+        let signal = signals.recv().await;
+        signals.force_exit_on_repeats();
+        signal
+    };
+    let config = ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
         suggested_fee_recipient,
@@ -310,9 +325,10 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         doppelganger_protection: options.enable_doppelganger_protection,
         vrf_state_url: options.vrf_state_url,
         xmss_cache_url: options.xmss_cache_url,
-    })
-    .await
-    .map_err(Into::into)
+    };
+    ethlambda_validator::run(config, stop)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
