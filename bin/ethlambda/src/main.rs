@@ -492,6 +492,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             })
             .transpose()?,
     };
+    let fallback_fee_recipient = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet.fallback_fee_recipient,
+    };
     let builder_fallback = match &network {
         Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
         Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
@@ -847,7 +851,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
     // Filled by `prepare_beacon_proposer` and builder registrations, read by
     // block production and by the chain actor's `payload_attributes` event.
-    let fee_recipients = ethlambda_blockchain::FeeRecipients::default();
+    let fee_recipients = ethlambda_blockchain::FeeRecipients::with_fallback(fallback_fee_recipient);
     // Before the P2P actor starts, so its first column rows are not lost.
     if let Some(url) = telemetry_url {
         let url = url.into_inner();
