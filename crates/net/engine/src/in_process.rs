@@ -221,7 +221,7 @@ impl InProcessEngine {
         let request = ForkChoiceUpdatedV4 {
             fork_choice_state: forkchoice_state(state),
             payload_attributes: attributes.map(payload_attributes_v4),
-            custody_columns: custody_columns.map(CustodyColumns::to_u128),
+            custody_columns: custody_columns.map(u128::from),
         };
         self.run(
             "engine_forkchoiceUpdatedV4",
