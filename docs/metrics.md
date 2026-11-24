@@ -909,6 +909,7 @@ and absent is not the same as zero.
 |---|---|---|
 | `ethlambda_validator_validators_loaded` | Gauge | Validator keys loaded from the keystores |
 | `ethlambda_validator_validators_resolved` | Gauge | Loaded keys that have an index on chain, out of `validators_loaded`. A persistent gap means validators are deposited but not yet activated |
+| `ethlambda_validator_validators_slashed` | Gauge | Loaded keys the chain reports slashed (their `validator.slashed`), as of the last epoch refresh. Should read zero forever: a slashed key gets no more proposer, attester or aggregation duties, and its setup is likely to put the other keys at risk. See [Slashed validators](./cli.md#slashed-validators) |
 | `ethlambda_validator_duties_held` | Gauge | Attester duties currently scheduled |
 | `ethlambda_validator_attestations_published_total` | Counter | Attestations a beacon node accepted |
 | `ethlambda_validator_attestation_failures_total` | Counter | Slots whose attestation duty failed and returned |

@@ -461,6 +461,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Taken with or without `--builder-proposals`: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 | `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
+| `--shut-down-when-slashed` | off | Stop when the chain reports a loaded validator slashed, exiting with code `3`, rather than only dropping that key's proposer, attester and aggregation duties. See [Slashed validators](#slashed-validators) |
 
 ### What it does today
 
@@ -666,6 +667,53 @@ both see silence and both start signing, and a doppelganger that is down for
 the epochs checked goes unseen until it comes back, when nothing is checking any
 more. `ethlambda_validator_doppelganger_detecting` counts the keys still
 withheld.
+
+### Slashed validators
+
+Each epoch's refresh resolves every loaded key through
+`POST /eth/v1/beacon/states/head/validators`, and reads each one's
+`validator.slashed` (not its `status`, which stops saying so once the validator
+reaches `withdrawal_possible`). A slashing shows in the head state once a block
+includes it, so it is seen within an epoch of that block. The client does not
+subscribe to the beacon node's `proposer_slashing` or `attester_slashing`
+events yet, which would cut that to seconds.
+
+A key reported slashed:
+
+- is logged at error, with its index, pubkey and status, by the first refresh
+  that finds it, and counted in `ethlambda_validator_validators_slashed` while
+  it stays loaded;
+- gets no more proposals (the chain refuses a block from a slashed proposer),
+  attestations or aggregations (its attestations earn nothing);
+- keeps its sync committee and payload timeliness committee duties, which the
+  chain still counts: a slashed sync committee member is rewarded for taking
+  part and penalised for missing, as any other, and nothing in gloas refuses
+  or ignores a slashed member's payload attestation;
+- is left out of builder registrations, fee recipient preparations and
+  proposer preferences.
+
+The other keys go on. They are the ones at risk: a slashing means the setup is
+broken (a key running in a second place, slashing protection bypassed, a
+leaked key), and whatever caused it usually applies to every key that shares
+the validators directory or the copied setup. Each refresh's answer replaces
+the last, so a key leaves the set only when it is no longer loaded or when a
+node's earlier answer was wrong.
+
+With `--shut-down-when-slashed` the first refresh that finds a slashed key
+stops the client instead, before it sends anything else for the epoch, with an
+error saying not to restart it until the cause is found. The process exits
+with code **3**, distinct from the `1` of any other failure, clap's `2` for a
+bad command line and the `101` of a panic. Every start finds the same key
+again, so tell the supervisor not to restart on it: systemd's
+`RestartPreventExitStatus=3` next to `Restart=on-failure`. Kubernetes has no
+per-code equivalent, and restarts the pod into the same stop until the key is
+removed. The flag is off by default, as Teku's
+`--shut-down-when-validator-slashed-enabled` is.
+
+The answer is one beacon node's: with several `--beacon-nodes` the lookup
+takes the first that answers, and nothing confirms it against another. A node
+that wrongly reports a key slashed stops the client with the flag on, and
+costs that key an epoch of duties without it.
 
 ### Duty offsets come from the network
 

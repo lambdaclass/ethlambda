@@ -401,8 +401,16 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             return;
         }
         // Snapshotted with the guard dropped at once: nothing below awaits a
-        // node while holding the store.
-        let pubkeys: HashSet<BlsPubkey> = store.read().await.pubkeys().into_iter().collect();
+        // node while holding the store. A key the chain reports slashed is
+        // left out: its block would be refused, so there is no proposal for a
+        // preference to describe (see `crate::slashed`).
+        let pubkeys: HashSet<BlsPubkey> = store
+            .read()
+            .await
+            .pubkeys()
+            .into_iter()
+            .filter(|pubkey| !self.context.slashed().contains(pubkey))
+            .collect();
         if pubkeys.is_empty() {
             return;
         }
@@ -1083,6 +1091,45 @@ mod tests {
         assert_eq!(sent[0].1.len(), 1);
         assert_eq!(sent[0].1[0].message.proposal_slot, slot_in(GLOAS_EPOCH, 12));
         assert_eq!(sent[0].1[0].message.validator_index, 3);
+    }
+
+    /// A key the chain reports slashed signs no preference, since its block
+    /// would be refused; the other keys' go out as usual.
+    #[tokio::test]
+    async fn a_slashed_validator_signs_no_preference() {
+        let (store, pubkeys) = store_with_keys(2);
+        let store = Arc::new(RwLock::new(store));
+        let node = Arc::new(MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![
+                duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10)),
+                duty(&pubkeys[1], 4, slot_in(GLOAS_EPOCH, 11)),
+            ],
+        ));
+        let context = context();
+        let slashed = crate::beacon_node::ValidatorEntry {
+            index: 3,
+            pubkey: pubkeys[0],
+            status: "active_slashed".to_string(),
+            slashed: true,
+        };
+        context
+            .slashed()
+            .observe(std::slice::from_ref(&slashed))
+            .expect("without the flag a slashed key stops nothing");
+        let service = Arc::new(PreferencesService::new(
+            node.clone(),
+            context,
+            settings(Some(FEE_RECIPIENT)),
+        ));
+
+        service.poll(slot_in(GLOAS_EPOCH, 1), store).await;
+
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.len(), 1);
+        assert_eq!(sent[0].1[0].message.validator_index, 4);
     }
 
     #[tokio::test]

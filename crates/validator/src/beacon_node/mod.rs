@@ -351,6 +351,9 @@ pub struct ValidatorEntry {
     pub index: ValidatorIndex,
     pub pubkey: BlsPubkey,
     pub status: String,
+    /// Whether the chain reports the validator slashed, which `status` stops
+    /// saying once it reaches `withdrawal_possible`. See [`crate::slashed`].
+    pub slashed: bool,
 }
 
 /// Whether the node saw one validator act in the epoch asked about. See
