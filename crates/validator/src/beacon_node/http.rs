@@ -1554,9 +1554,10 @@ impl BeaconNodeApi for HttpBeaconNode {
 
 impl HttpBeaconNode {
     /// The registry entries `lists` name (see [`validator_id_lists`]), one
-    /// request per list, merged. A list the node refuses with a `400` is
+    /// request per list, merged. A list the node refuses with a 4xx is
     /// skipped, since a node that reads one width of key refuses a list of
-    /// the other outright; it is an error only when every list was refused.
+    /// the other outright (Lighthouse with a `400`; another client's status
+    /// is not known); it is an error only when every list was refused.
     async fn validators_by_ids(&self, lists: Vec<Vec<String>>) -> Result<Vec<ValidatorEntry>> {
         #[derive(Serialize)]
         struct Body {
@@ -1583,7 +1584,11 @@ impl HttpBeaconNode {
                     }
                     answered = true;
                 }
-                Err(err @ Error::BeaconNodeStatus { status: 400, .. }) => {
+                Err(
+                    err @ Error::BeaconNodeStatus {
+                        status: 400..=499, ..
+                    },
+                ) => {
                     debug!(url = %self.base_url, %err, "Beacon node refused a list of validator ids");
                     refusal.get_or_insert(err);
                 }

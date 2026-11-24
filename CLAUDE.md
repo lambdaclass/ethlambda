@@ -919,7 +919,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   gloas rules run on all three gloas-family states through `GloasFamily(Mut)`
   (`containers/gloas_family.rs`, returned by `helpers::gloas::gloas_state(_ref)`),
   and the PQ registry holds each XMSS key in its 48-byte request form so the
-  registry accessors keep handing out the shared `Validator`. No release ships
+  registry accessors keep handing out the shared `Validator` (in memory only:
+  the Beacon API names a PQ key by its 32 bytes, `states::ApiPubkey` in
+  `rpc/src/beacon/states.rs`, and the validator client reads either width). No release ships
   their fixtures; see [`docs/beacon_pq.md`](docs/beacon_pq.md) for the design,
   how to generate them, and what remains.
 - **Gloas** lives in `stf/gloas.rs`, `stf/epoch/gloas.rs`, `helpers/gloas.rs`,
