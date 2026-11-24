@@ -152,37 +152,71 @@ impl EthrexArgs {
     }
 }
 
+/// One socket the embedded node binds, for the beacon node's clash check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listener {
+    /// The flag that sets its port.
+    pub flag: &'static str,
+    /// The address it binds. `None` when that is not known before ethrex
+    /// starts: devp2p without `ETHREX_P2P_ADDR` binds a local address ethrex
+    /// detects, and an address option that is not an IP is resolved by ethrex
+    /// itself. Either way it could be any address.
+    pub ip: Option<IpAddr>,
+    pub port: u16,
+}
+
 impl EthrexConfig {
-    /// The ports the embedded node binds, with the flag that sets each, so the
-    /// beacon node can refuse a clash before anything binds. A port option
-    /// that does not parse is left out: ethrex itself refuses it at startup.
-    pub fn tcp_ports(&self) -> Vec<(&'static str, u16)> {
-        let mut ports = Vec::new();
+    /// The TCP sockets the embedded node binds, so the beacon node can refuse a
+    /// clash before anything binds. A port option that does not parse is left
+    /// out: ethrex itself refuses it at startup.
+    pub fn tcp_listeners(&self) -> Vec<Listener> {
+        let mut listeners = Vec::new();
         if !self.options.p2p_disabled
             && let Ok(port) = self.options.p2p_port.parse()
         {
-            ports.push(("--ethrex.p2p-port", port));
+            listeners.push(Listener {
+                flag: "--ethrex.p2p-port",
+                ip: self.p2p_ip(),
+                port,
+            });
         }
         if let Some(http) = self.http {
-            ports.push(("--ethrex.http-port", http.port()));
+            listeners.push(Listener {
+                flag: "--ethrex.http-port",
+                ip: Some(http.ip()),
+                port: http.port(),
+            });
         }
         if self.options.metrics_enabled
             && let Ok(port) = self.options.metrics_port.parse()
         {
-            ports.push(("--ethrex.metrics-port", port));
+            listeners.push(Listener {
+                flag: "--ethrex.metrics-port",
+                ip: self.options.metrics_addr.parse().ok(),
+                port,
+            });
         }
-        ports
+        listeners
     }
 
-    /// The UDP ports the embedded node binds; see [`Self::tcp_ports`].
-    pub fn udp_ports(&self) -> Vec<(&'static str, u16)> {
-        let mut ports = Vec::new();
+    /// The UDP sockets the embedded node binds; see [`Self::tcp_listeners`].
+    pub fn udp_listeners(&self) -> Vec<Listener> {
+        let mut listeners = Vec::new();
         if !self.options.p2p_disabled
             && let Ok(port) = self.options.discovery_port.parse()
         {
-            ports.push(("--ethrex.discovery-port", port));
+            listeners.push(Listener {
+                flag: "--ethrex.discovery-port",
+                ip: self.p2p_ip(),
+                port,
+            });
         }
-        ports
+        listeners
+    }
+
+    /// The address devp2p binds, both RLPx (TCP) and discovery (UDP).
+    fn p2p_ip(&self) -> Option<IpAddr> {
+        self.options.p2p_addr.as_deref()?.parse().ok()
     }
 }
 
@@ -329,15 +363,36 @@ mod tests {
         assert!(config.options.metrics_enabled);
         assert_eq!(config.options.metrics_port, "9091");
         assert_eq!(config.http, Some("127.0.0.1:8545".parse().unwrap()));
+        let localhost = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let any = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(
-            config.tcp_ports(),
+            config.tcp_listeners(),
             vec![
-                ("--ethrex.p2p-port", 30304),
-                ("--ethrex.http-port", 8545),
-                ("--ethrex.metrics-port", 9091),
+                Listener {
+                    flag: "--ethrex.p2p-port",
+                    ip: None,
+                    port: 30304,
+                },
+                Listener {
+                    flag: "--ethrex.http-port",
+                    ip: localhost,
+                    port: 8545,
+                },
+                Listener {
+                    flag: "--ethrex.metrics-port",
+                    ip: any,
+                    port: 9091,
+                },
             ]
         );
-        assert_eq!(config.udp_ports(), vec![("--ethrex.discovery-port", 30305)]);
+        assert_eq!(
+            config.udp_listeners(),
+            vec![Listener {
+                flag: "--ethrex.discovery-port",
+                ip: None,
+                port: 30305,
+            }]
+        );
     }
 
     #[test]

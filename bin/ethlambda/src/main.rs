@@ -765,7 +765,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     let config = args
                         .resolve(&data_dir, &mainnet.network)
                         .map_err(|err| eyre::eyre!("configuring the embedded ethrex: {err}"))?;
-                    common.validate_embedded_ports(true, &config)?;
+                    common.validate_embedded_ports(true, p2p_socket.ip(), &config)?;
                     let started = ethlambda_ethrex::start(config)
                         .await
                         .map_err(|err| eyre::eyre!("starting the embedded ethrex: {err}"))?;

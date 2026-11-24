@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-pub use config::{ConfigError, EthrexArgs, EthrexConfig};
+pub use config::{ConfigError, EthrexArgs, EthrexConfig, Listener};
 
 /// How long shutdown waits for ethrex's tasks to wind down before flushing the
 /// store regardless. The flush is what must not be skipped; a task still
