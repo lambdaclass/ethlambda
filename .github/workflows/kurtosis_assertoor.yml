@@ -30,9 +30,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to main (or to the PR) makes this run's result stale.
+# A newer push to main (or to the PR) makes this run's result stale. The event
+# is part of the group so a dispatch on main (the Commit-Boost check) and a
+# push to main do not cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
