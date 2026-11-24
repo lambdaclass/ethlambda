@@ -25,7 +25,7 @@
 //! here yet.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ethlambda_engine::ForkchoiceStateV1;
@@ -97,22 +97,36 @@ impl FeeRecipients {
         }
     }
 
-    /// The map of recipients validator clients named, keyed by validator
-    /// index. The fallback is not in it: an entry here means a validator client
-    /// registered the validator, which is what decides whether the node
-    /// prepares payload attributes for it.
-    pub fn lock(
-        &self,
-    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashMap<ValidatorIndex, ExecutionAddress>>>
-    {
-        self.prepared.lock()
+    /// Records the fee recipient a validator client named for `validator`
+    /// (`prepare_beacon_proposer` or a builder registration), replacing any
+    /// earlier one.
+    pub fn insert(&self, validator: ValidatorIndex, recipient: ExecutionAddress) {
+        self.map().insert(validator, recipient);
+    }
+
+    /// The fee recipient a validator client named for `proposer`, never the
+    /// fallback: a `Some` means a validator client registered the proposer,
+    /// which is what decides whether the node prepares payload attributes for
+    /// it. [`Self::for_proposer`] is the address a payload pays.
+    pub fn prepared(&self, proposer: ValidatorIndex) -> Option<ExecutionAddress> {
+        self.map().get(&proposer).copied()
+    }
+
+    /// Whether a validator client named a fee recipient for any validator.
+    /// The fallback does not count.
+    pub fn any_prepared(&self) -> bool {
+        !self.map().is_empty()
+    }
+
+    fn map(&self) -> MutexGuard<'_, HashMap<ValidatorIndex, ExecutionAddress>> {
+        self.prepared.lock().expect("fee recipient lock poisoned")
     }
 
     /// The fee recipient a locally built payload for `proposer` pays when no
     /// signed preferences name one: `prepare_beacon_proposer`'s, else
     /// `--fallback-fee-recipient`, else the zero address.
     pub fn for_proposer(&self, proposer: ValidatorIndex) -> (ExecutionAddress, FeeRecipientSource) {
-        if let Some(recipient) = prepared_fee_recipient(self, proposer) {
+        if let Some(recipient) = self.prepared(proposer) {
             return (recipient, FeeRecipientSource::Prepared);
         }
         match self.fallback {
@@ -120,20 +134,6 @@ impl FeeRecipients {
             None => (ExecutionAddress::ZERO, FeeRecipientSource::Unknown),
         }
     }
-}
-
-/// The fee recipient `prepare_beacon_proposer` recorded for `proposer`. Never
-/// the fallback: see [`FeeRecipients::for_proposer`] for the address a payload
-/// pays.
-pub fn prepared_fee_recipient(
-    fee_recipients: &FeeRecipients,
-    proposer: ValidatorIndex,
-) -> Option<ExecutionAddress> {
-    fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&proposer)
-        .copied()
 }
 
 /// What the chain actor reads to publish `payload_attributes`: the same fee
@@ -443,8 +443,7 @@ pub(crate) fn payload_attributes_event(
     let config = store.config();
     let fork = config.fork_at_epoch(compute_epoch_at_slot(proposal_slot));
     let prepares_for = |proposer| {
-        preparation.always_prepare
-            || prepared_fee_recipient(&preparation.fee_recipients, proposer).is_some()
+        preparation.always_prepare || preparation.fee_recipients.prepared(proposer).is_some()
     };
     let data = match fork {
         ForkName::Fulu => {
@@ -570,8 +569,7 @@ pub(crate) fn attributes_key(
     proposal_slot: Slot,
 ) -> AttributesKey {
     let proposer = lookahead_proposer(head_state, proposal_slot);
-    let fee_recipient =
-        proposer.and_then(|proposer| prepared_fee_recipient(&preparation.fee_recipients, proposer));
+    let fee_recipient = proposer.and_then(|proposer| preparation.fee_recipients.prepared(proposer));
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(proposal_slot));
@@ -762,11 +760,7 @@ impl BlockChainServer {
         let wanted = preparation.always_prepare
             || match key.proposer {
                 Some(_) => key.fee_recipient.is_some(),
-                None => !preparation
-                    .fee_recipients
-                    .lock()
-                    .expect("fee recipient lock poisoned")
-                    .is_empty(),
+                None => preparation.fee_recipients.any_prepared(),
             };
         if !wanted {
             self.payload_attributes.published = Some(key);
@@ -897,11 +891,7 @@ mod tests {
         let inputs = payload_inputs(&advanced, &config).unwrap();
         let fee_recipient = ExecutionAddress::repeat_byte(0xab);
         let preparation = preparation(false);
-        preparation
-            .fee_recipients
-            .lock()
-            .unwrap()
-            .insert(proposer, fee_recipient);
+        preparation.fee_recipients.insert(proposer, fee_recipient);
 
         let event = payload_attributes_event(
             &store,
@@ -1021,10 +1011,11 @@ mod tests {
             (fallback, FeeRecipientSource::Fallback)
         );
         // The fallback is not an entry: nothing registered the validator.
-        assert_eq!(prepared_fee_recipient(&recipients, 3), None);
+        assert_eq!(recipients.prepared(3), None);
+        assert!(!recipients.any_prepared());
 
         // A clone shares the map, so a later registration is seen by both.
-        recipients.clone().lock().unwrap().insert(3, prepared);
+        recipients.clone().insert(3, prepared);
         assert_eq!(
             recipients.for_proposer(3),
             (prepared, FeeRecipientSource::Prepared)
@@ -1190,11 +1181,7 @@ mod tests {
         );
 
         let fee_recipient = ExecutionAddress::repeat_byte(0xab);
-        preparation
-            .fee_recipients
-            .lock()
-            .unwrap()
-            .insert(proposer, fee_recipient);
+        preparation.fee_recipients.insert(proposer, fee_recipient);
         let after = attributes_key(&store, &preparation, head_root, &head_state, proposal_slot);
         assert_eq!(after.fee_recipient, Some(fee_recipient));
         assert_ne!(after, before);
