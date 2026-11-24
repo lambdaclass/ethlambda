@@ -182,6 +182,15 @@ fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
 }
 
+/// A block request's `&graffiti=` parameter, or nothing when the request
+/// carries no graffiti, so the beacon node applies its own default.
+fn graffiti_param(request: &BlockRequest) -> String {
+    request
+        .graffiti
+        .map(|graffiti| format!("&graffiti={}", encode_hex(&graffiti.0)))
+        .unwrap_or_default()
+}
+
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
 pub struct HttpBeaconNode {
     base_url: String,
@@ -702,10 +711,10 @@ impl HttpBeaconNode {
     /// container the bytes are.
     async fn produce_gloas_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         let path = format!(
-            "/eth/v4/validator/blocks/{}?randao_reveal={}&graffiti={}&include_payload=true",
+            "/eth/v4/validator/blocks/{}?randao_reveal={}{}&include_payload=true",
             request.slot,
             encode_hex(&request.randao_reveal.0),
-            encode_hex(&request.graffiti.0),
+            graffiti_param(request),
         );
         let response = self
             .post_json_for_ssz(
@@ -1001,10 +1010,10 @@ impl BeaconNodeApi for HttpBeaconNode {
             return self.produce_gloas_block(request).await;
         }
         let path = format!(
-            "/eth/v3/validator/blocks/{}?randao_reveal={}&graffiti={}&builder_boost_factor={}",
+            "/eth/v3/validator/blocks/{}?randao_reveal={}{}&builder_boost_factor={}",
             request.slot,
             encode_hex(&request.randao_reveal.0),
-            encode_hex(&request.graffiti.0),
+            graffiti_param(request),
             request.builder_boost_factor.unwrap_or(0),
         );
         // SSZ or JSON, the fork and blindedness settled either way; see
@@ -1872,6 +1881,42 @@ mod tests {
                 "{} lacks {expected}",
                 seen[0].0
             );
+        }
+    }
+
+    /// `graffiti` is in the query only when the request carries one, at every
+    /// fork, so a node can tell "not set" from "set to empty" and apply its own
+    /// default to the first.
+    #[tokio::test]
+    async fn the_graffiti_is_sent_only_when_one_is_set() {
+        use ethlambda_types::beacon::primitives::Bytes32;
+
+        let chosen = Bytes32::repeat_byte(0xab);
+        let expected = format!("&graffiti={}", encode_hex(&chosen.0));
+        for fork in [ForkName::Fulu, ForkName::Gloas] {
+            for (graffiti, sent) in [
+                (None, None),
+                (
+                    Some(Bytes32::ZERO),
+                    Some(format!("&graffiti=0x{}", "00".repeat(32))),
+                ),
+                (Some(chosen), Some(expected.clone())),
+            ] {
+                let served = serve(500, vec![], vec![]).await;
+                let request = BlockRequest {
+                    fork,
+                    graffiti,
+                    ..block_request(None)
+                };
+                let _ = served.node.produce_block(&request).await;
+                let seen = served.seen.lock().expect("lock");
+                assert_eq!(seen.len(), 1);
+                let uri = &seen[0].0;
+                match &sent {
+                    Some(param) => assert!(uri.contains(param), "{uri} lacks {param}"),
+                    None => assert!(!uri.contains("graffiti"), "{uri} at {fork:?}"),
+                }
+            }
         }
     }
 

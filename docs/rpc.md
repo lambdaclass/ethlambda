@@ -574,7 +574,8 @@ the chain actor writes, so no request waits on the actor.
   `1a2b…` under ethlambda at `3c4d…`. The execution client's half comes from
   `engine_getClientVersionV1`, asked alongside the payload build and given up
   on after `EL_VERSION_TIMEOUT`, and is left out when it cannot be had
-  (`hello LA3c4d`). The
+  (`hello LA3c4d`). A request without `graffiti` is read as an empty one, so
+  its block carries the suffix alone (`RH1a2bLA3c4d`). The
   suffix shrinks rather than cutting the validator's text short, in
   Lighthouse's tiers, and is appended to every block with no opt-out; the
   `graffiti_policy` parameter Lighthouse's validator client sends is not read.

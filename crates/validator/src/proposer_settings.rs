@@ -4,6 +4,10 @@
 //! The keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
 //! override them per key, and `DELETE` puts a key back on the defaults.
 //!
+//! Graffiti has one source more, `--graffiti-file`, read before every
+//! proposal and ahead of the other two. [`ProposerSettings::next_graffiti`]
+//! gives the order; [`crate::graffiti_file`] the format.
+//!
 //! # The definitions file is the record; this is the cache
 //!
 //! Each override is persisted on its validator's entry in
@@ -45,6 +49,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H160, H256};
+use tracing::warn;
+
+use crate::graffiti_file::GraffitiFile;
 
 /// A block's graffiti field is exactly this wide.
 pub const GRAFFITI_BYTES: usize = 32;
@@ -156,7 +163,7 @@ pub enum SettingChange {
 #[derive(Debug)]
 struct Inner {
     default_fee_recipient: Option<ExecutionAddress>,
-    default_graffiti: Bytes32,
+    default_graffiti: Option<Bytes32>,
     default_gas_limit: u64,
     overrides: HashMap<BlsPubkey, Overrides>,
 }
@@ -178,21 +185,37 @@ pub struct ProposerSettings {
     /// builder registrations) can tell that nothing changed without reading
     /// every key. A graffiti write leaves it alone: nothing cached reads it.
     generation: AtomicU64,
+    /// `--graffiti-file`, read ahead of every other graffiti source. Outside
+    /// the lock: it is only a path, and each read parses the file afresh.
+    graffiti_file: Option<GraffitiFile>,
 }
 
 impl ProposerSettings {
     /// Settings with no overrides, where every validator gets `graffiti` and
-    /// `fee_recipient`.
-    pub fn new(graffiti: Bytes32, fee_recipient: Option<ExecutionAddress>) -> Self {
+    /// `fee_recipient`. A `graffiti` of `None` sends none, so the beacon node
+    /// applies its own default.
+    pub fn new(
+        graffiti: impl Into<Option<Bytes32>>,
+        fee_recipient: Option<ExecutionAddress>,
+    ) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 default_fee_recipient: fee_recipient,
-                default_graffiti: graffiti,
+                default_graffiti: graffiti.into(),
                 default_gas_limit: DEFAULT_GAS_LIMIT,
                 overrides: HashMap::new(),
             }),
             generation: AtomicU64::new(0),
+            graffiti_file: None,
         }
+    }
+
+    /// These settings with `file` read before every proposal, ahead of every
+    /// other graffiti source (see [`Self::next_graffiti`]). `None` leaves them
+    /// without one.
+    pub fn with_graffiti_file(mut self, file: Option<GraffitiFile>) -> Self {
+        self.graffiti_file = file;
+        self
     }
 
     /// These settings with `gas_limit` as the gas limit of every validator
@@ -267,12 +290,50 @@ impl ProposerSettings {
         })
     }
 
-    /// The graffiti `pubkey` proposes with.
-    pub fn graffiti(&self, pubkey: &BlsPubkey) -> Bytes32 {
+    /// The graffiti `pubkey` proposes with when the graffiti file gives it
+    /// none: its own, from the keymanager API or the definitions file, else
+    /// `--graffiti`, else `None`. What a proposal sends is
+    /// [`Self::next_graffiti`], which reads the file first.
+    pub fn graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
         self.read(|inner| {
             let overridden = inner.overrides.get(pubkey).and_then(|o| o.graffiti);
-            overridden.unwrap_or(inner.default_graffiti)
+            overridden.or(inner.default_graffiti)
         })
+    }
+
+    /// The graffiti `pubkey`'s next block request carries, and what the
+    /// keymanager API's `GET graffiti` answers, so the two cannot disagree.
+    /// The first of:
+    ///
+    /// - the graffiti file's line for `pubkey`;
+    /// - the graffiti file's `default` line;
+    /// - the validator's own graffiti, from the keymanager API or the
+    ///   definitions file;
+    /// - `--graffiti`.
+    ///
+    /// Lighthouse's order, so a `default` line in the file shadows a
+    /// validator's own graffiti too. `None` when none is set: the request then
+    /// carries no graffiti, and the beacon node applies its own default.
+    ///
+    /// The file is read afresh on every call, on the blocking pool. One that
+    /// cannot be read or no longer parses is skipped with a warning, and the
+    /// next source applies.
+    pub async fn next_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
+        let from_file = match &self.graffiti_file {
+            Some(file) => file
+                .read()
+                .await
+                .inspect_err(|err| {
+                    warn!(
+                        %err,
+                        "Graffiti file skipped; using the validator's own graffiti or --graffiti"
+                    )
+                })
+                .ok()
+                .and_then(|table| table.graffiti(pubkey)),
+            None => None,
+        };
+        from_file.or_else(|| self.graffiti(pubkey))
     }
 
     /// The gas limit `pubkey` reports.
@@ -363,7 +424,7 @@ mod tests {
     fn a_key_without_overrides_gets_the_defaults() {
         let settings = settings();
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x11));
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
         assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
     }
 
@@ -375,11 +436,11 @@ mod tests {
         settings.set_gas_limit(&key(1), 30_000_000);
 
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x22));
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x22)));
         assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
 
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
+        assert_eq!(settings.graffiti(&key(2)), Some(Bytes32::repeat_byte(0x11)));
         assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
     }
 
@@ -433,7 +494,7 @@ mod tests {
 
         settings.clear_fee_recipient(&key(1));
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x22));
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x22)));
     }
 
     /// A per-key address counts even with no process-wide default: it is how
@@ -455,7 +516,7 @@ mod tests {
 
         settings.forget(&key(1));
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x11));
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
         assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
     }
 
@@ -552,5 +613,99 @@ mod tests {
         settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x22));
         assert!(!moved(&settings, &|s| s.forget(&key(2))));
         assert!(!moved(&settings, &|s| s.forget(&key(3))));
+    }
+
+    fn text(graffiti: &str) -> Option<Bytes32> {
+        Some(graffiti_from_text(graffiti).expect("fits"))
+    }
+
+    /// A graffiti file at a fresh path holding `contents`, with the directory
+    /// that keeps it alive.
+    fn graffiti_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf, GraffitiFile) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, contents).expect("writes");
+        let file = GraffitiFile::open(&path).expect("opens");
+        (dir, path, file)
+    }
+
+    fn line(byte: u8, graffiti: &str) -> String {
+        format!("0x{}: {graffiti}\n", hex::encode(key(byte).0))
+    }
+
+    /// The file's line for the key, then its `default` line, then the
+    /// validator's own graffiti, then `--graffiti`: Lighthouse's order, a
+    /// `default` line shadowing a validator's own graffiti included.
+    #[tokio::test]
+    async fn the_file_comes_first_then_the_validators_own_then_the_flag() {
+        let contents = format!("default: wall\n{}", line(1, "from the file"));
+        let (_dir, path, file) = graffiti_file(&contents);
+        let settings = ProposerSettings::new(text("flag"), None).with_graffiti_file(Some(file));
+        settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
+        settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x33));
+
+        assert_eq!(settings.next_graffiti(&key(1)).await, text("from the file"));
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("wall"));
+        assert_eq!(settings.next_graffiti(&key(3)).await, text("wall"));
+
+        // Without a `default` line, a key the file does not name falls
+        // through to its own graffiti, then to the flag.
+        std::fs::write(&path, line(1, "from the file")).expect("rewrites");
+        assert_eq!(settings.next_graffiti(&key(1)).await, text("from the file"));
+        assert_eq!(
+            settings.next_graffiti(&key(2)).await,
+            Some(Bytes32::repeat_byte(0x33))
+        );
+        assert_eq!(settings.next_graffiti(&key(3)).await, text("flag"));
+
+        // A line deleted from the file stops applying at the next read.
+        std::fs::write(&path, "").expect("empties");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+    }
+
+    /// A file that stopped parsing, or is gone, is skipped: the next source
+    /// applies as if there were no file.
+    #[tokio::test]
+    async fn an_unreadable_file_falls_back_to_the_validators_own_then_the_flag() {
+        let (_dir, path, file) = graffiti_file(&format!("default: wall\n{}", line(1, "mine")));
+        let settings = ProposerSettings::new(text("flag"), None).with_graffiti_file(Some(file));
+        settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
+
+        std::fs::write(&path, "default: wall\nnot a line\n").expect("breaks");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("flag"));
+
+        std::fs::remove_file(&path).expect("removes");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("flag"));
+    }
+
+    /// With no graffiti anywhere there is none to send, rather than 32 zero
+    /// bytes the beacon node cannot tell from a chosen empty graffiti.
+    #[tokio::test]
+    async fn with_nothing_set_there_is_no_graffiti() {
+        let settings = ProposerSettings::new(None, None);
+        assert_eq!(settings.graffiti(&key(1)), None);
+        assert_eq!(settings.next_graffiti(&key(1)).await, None);
+
+        let (_dir, _path, file) = graffiti_file(&line(2, "only two"));
+        let settings = ProposerSettings::new(None, None).with_graffiti_file(Some(file));
+        assert_eq!(settings.next_graffiti(&key(1)).await, None);
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("only two"));
+
+        let chosen_empty = ProposerSettings::new(text(""), None);
+        assert_eq!(
+            chosen_empty.next_graffiti(&key(1)).await,
+            Some(Bytes32::ZERO)
+        );
     }
 }

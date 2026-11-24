@@ -449,7 +449,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
 
         // Both read once, before the block is asked for, so the check below
         // compares against the address in force when the request went out.
-        let graffiti = self.settings.graffiti(&pubkey);
+        // The graffiti reads `--graffiti-file` afresh, so an edit to the file
+        // reaches this proposal.
+        let graffiti = self.settings.next_graffiti(&pubkey).await;
         let fee_recipient = self.settings.fee_recipient(&pubkey);
         let request = BlockRequest {
             slot,
@@ -1106,7 +1108,7 @@ mod tests {
         // request the node received.
         let seen = node.block_requests();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].graffiti, Bytes32::repeat_byte(0xab));
+        assert_eq!(seen[0].graffiti, Some(Bytes32::repeat_byte(0xab)));
     }
 
     /// A per-validator graffiti replaces the default for that validator's
@@ -1133,8 +1135,121 @@ mod tests {
 
         assert_eq!(
             node.block_requests()[0].graffiti,
-            Bytes32::repeat_byte(0xcd)
+            Some(Bytes32::repeat_byte(0xcd))
         );
+    }
+
+    /// A service on `settings` whose node produces at `slot`, for tests that
+    /// propose more than once on the same settings: the mock answers one slot
+    /// only, and slashing protection refuses a second block at it.
+    fn service_at(
+        settings: &Arc<ProposerSettings>,
+        slot: Slot,
+    ) -> (Arc<MockBeaconNode>, ProposalService<MockBeaconNode>) {
+        let node = Arc::new(MockBeaconNode::new().with_block(slot, 7));
+        let service = ProposalService::new(
+            node.clone(),
+            context(),
+            settings.clone(),
+            SlashingProtection::in_memory(),
+            None,
+        );
+        (node, service)
+    }
+
+    /// The graffiti of the one block request a proposal at `slot` made.
+    async fn proposed_graffiti(
+        settings: &Arc<ProposerSettings>,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+    ) -> Option<Bytes32> {
+        let (node, service) = service_at(settings, slot);
+        service
+            .propose(slot, &duty(pubkey, 7, slot), store)
+            .await
+            .expect("proposes");
+        node.block_requests().remove(0).graffiti
+    }
+
+    /// A graffiti file at a fresh path holding `contents`, and the directory
+    /// that keeps it alive.
+    fn graffiti_file(
+        contents: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::graffiti_file::GraffitiFile,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, contents).expect("writes");
+        let file = crate::graffiti_file::GraffitiFile::open(&path).expect("opens");
+        (dir, path, file)
+    }
+
+    /// `--graffiti-file` is read again for every proposal: an edit between
+    /// two proposals reaches the second, and a line deleted from the file no
+    /// longer applies to the one after.
+    #[tokio::test]
+    async fn an_edit_to_the_graffiti_file_reaches_the_next_proposal() {
+        use crate::proposer_settings::graffiti_from_text;
+
+        let (store, pubkey) = store();
+        let line = |text: &str| {
+            let key = crate::beacon_node::dto::encode_hex(&pubkey.0);
+            format!("{key}: {text}\n")
+        };
+        let (_dir, path, file) = graffiti_file(&line("first"));
+        let settings =
+            ProposerSettings::new(Bytes32::repeat_byte(0xab), None).with_graffiti_file(Some(file));
+        let settings = Arc::new(settings);
+
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot()).await;
+        assert_eq!(graffiti, graffiti_from_text("first"));
+
+        std::fs::write(&path, line("second")).expect("rewrites");
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot() + 1).await;
+        assert_eq!(graffiti, graffiti_from_text("second"));
+
+        std::fs::write(&path, "").expect("empties");
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot() + 2).await;
+        assert_eq!(
+            graffiti,
+            Some(Bytes32::repeat_byte(0xab)),
+            "the deleted line no longer applies, so --graffiti does"
+        );
+    }
+
+    /// A graffiti file that stopped parsing costs the proposal the file and
+    /// nothing else: the request carries the validator's own graffiti, else
+    /// `--graffiti`.
+    #[tokio::test]
+    async fn an_unreadable_graffiti_file_falls_back_to_the_next_source() {
+        let (store, pubkey) = store();
+        let (_dir, path, file) = graffiti_file("default: wall\n");
+        let settings =
+            ProposerSettings::new(Bytes32::repeat_byte(0xab), None).with_graffiti_file(Some(file));
+        let settings = Arc::new(settings);
+        settings.set_graffiti(&pubkey, Bytes32::repeat_byte(0xcd));
+        std::fs::write(&path, "default wall\n").expect("breaks");
+
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot()).await;
+        assert_eq!(graffiti, Some(Bytes32::repeat_byte(0xcd)));
+
+        settings.clear_graffiti(&pubkey);
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot() + 1).await;
+        assert_eq!(graffiti, Some(Bytes32::repeat_byte(0xab)));
+    }
+
+    /// With no graffiti anywhere the request carries none, so the beacon node
+    /// applies its own default rather than being handed 32 zero bytes.
+    #[tokio::test]
+    async fn with_no_graffiti_set_the_request_carries_none() {
+        let (store, pubkey) = store();
+        let settings = Arc::new(ProposerSettings::new(None, None));
+        let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot()).await;
+        assert_eq!(graffiti, None);
     }
 
     /// The reveal is over the slot's epoch, and it is what the node is given
@@ -2020,7 +2135,7 @@ mod gloas_tests {
 
         let request = node.block_requests().remove(0);
         assert_eq!(request.fork, ForkName::Gloas);
-        assert_eq!(request.graffiti, Bytes32::repeat_byte(0xcd));
+        assert_eq!(request.graffiti, Some(Bytes32::repeat_byte(0xcd)));
     }
 
     /// A deadline that passes while the envelope is being published fails the

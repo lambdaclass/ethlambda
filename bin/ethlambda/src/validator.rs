@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::graffiti_file::GraffitiFile;
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
@@ -49,17 +50,30 @@ pub(crate) struct ValidatorOptions {
     pub(crate) metrics_port: u16,
 
     /// Text to put in the graffiti field of every block this client proposes,
-    /// unless the keymanager API gives a validator its own.
+    /// unless `--graffiti-file` or the keymanager API gives a validator its
+    /// own.
     ///
     /// At most 32 bytes once encoded as UTF-8, right-padded with zeros.
     /// Consensus never reads it.
     ///
-    /// Empty by default. An ethlambda beacon node appends its own and its
-    /// execution client's codes and commits to whatever this is, so an empty
-    /// graffiti still names both clients; other beacon nodes apply their own
-    /// policy.
-    #[arg(long, default_value = "")]
-    pub(crate) graffiti: String,
+    /// Unset by default, and then a block request carries no graffiti and the
+    /// beacon node applies its own default. An ethlambda beacon node appends
+    /// its own and its execution client's codes and commits to whatever the
+    /// graffiti is, and an absent one is empty there, so the block still names
+    /// both clients; other beacon nodes apply their own policy.
+    #[arg(long)]
+    pub(crate) graffiti: Option<String>,
+
+    /// A file of per-validator graffiti, read again before every proposal:
+    /// `default: <text>` and `<0xpubkey>: <text>` lines, Lighthouse's format.
+    ///
+    /// Read ahead of the keymanager API's per-validator graffiti and
+    /// `--graffiti`: the file's line for a validator wins, then its `default`
+    /// line, then those two in that order. A file that does not parse refuses
+    /// startup; once running, a bad read logs a warning and the next source
+    /// applies.
+    #[arg(long)]
+    pub(crate) graffiti_file: Option<PathBuf>,
 
     /// Execution address to receive block rewards from blocks this client
     /// proposes, as `0x`-prefixed hex, for every validator the keymanager API
@@ -181,8 +195,8 @@ pub(crate) struct ValidatorOptions {
 }
 
 impl ValidatorOptions {
-    /// The graffiti bytes, or an error naming the limit if the text is too
-    /// long.
+    /// The graffiti bytes, `None` when the flag is absent, or an error naming
+    /// the limit if the text is too long.
     ///
     /// Truncating instead would be worse than refusing: the operator asked for
     /// a string, and a silently clipped one appears in every block they
@@ -191,13 +205,17 @@ impl ValidatorOptions {
     /// Measured in bytes rather than characters, because that is what the field
     /// holds. A 32-character string of anything outside ASCII does not fit, and
     /// saying so in bytes is the only way the message helps.
-    pub(crate) fn graffiti(&self) -> eyre::Result<Bytes32> {
-        graffiti_from_text(&self.graffiti).ok_or_else(|| {
+    pub(crate) fn graffiti(&self) -> eyre::Result<Option<Bytes32>> {
+        let Some(text) = &self.graffiti else {
+            return Ok(None);
+        };
+        let graffiti = graffiti_from_text(text).ok_or_else(|| {
             eyre::eyre!(
                 "--graffiti is {} bytes encoded as UTF-8; the field holds {GRAFFITI_BYTES}",
-                self.graffiti.len()
+                text.len()
             )
-        })
+        })?;
+        Ok(Some(graffiti))
     }
 
     /// The configured fee recipient, or `None` if the operator named none.
@@ -265,11 +283,18 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     // signature those requests were for fails with it.
     crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
     let graffiti = options.graffiti()?;
+    // Read once here, so a file every proposal would skip refuses startup.
+    let graffiti_file = options
+        .graffiti_file
+        .as_deref()
+        .map(GraffitiFile::open)
+        .transpose()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
     ethlambda_validator::run(ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
+        graffiti_file,
         suggested_fee_recipient,
         validators_dir: options.validators_dir,
         secrets_dir: options.secrets_dir,
@@ -300,7 +325,8 @@ mod tests {
             http_address: "127.0.0.1".parse().expect("valid address"),
             keymanager_port: 5062,
             metrics_port: 5064,
-            graffiti: graffiti.to_string(),
+            graffiti: Some(graffiti.to_string()),
+            graffiti_file: None,
             suggested_fee_recipient: None,
             gas_limit: DEFAULT_GAS_LIMIT,
             enable_keymanager: false,
@@ -446,15 +472,29 @@ mod tests {
         .expect_err("the two say different things");
     }
 
+    /// No flag is no graffiti, so the beacon node's own default applies; an
+    /// empty one is a graffiti chosen to be empty.
     #[test]
-    fn the_default_graffiti_is_empty() {
+    fn the_graffiti_is_unset_by_default_and_an_empty_one_is_zeros() {
+        assert_eq!(parse(&[]).expect("parses").graffiti().expect("valid"), None);
         let bytes = options("").graffiti().expect("valid");
-        assert_eq!(bytes, Bytes32::ZERO);
+        assert_eq!(bytes, Some(Bytes32::ZERO));
+    }
+
+    /// The file comes first and `--graffiti` is where its misses fall
+    /// through to, so the two go together, unlike Lighthouse's flags.
+    #[test]
+    fn a_graffiti_file_is_taken_beside_the_graffiti_flag() {
+        let options =
+            parse(&["--graffiti", "fallback", "--graffiti-file", "/tmp/g.txt"]).expect("parses");
+        assert_eq!(options.graffiti_file, Some(PathBuf::from("/tmp/g.txt")));
+        assert!(options.graffiti().expect("valid").is_some());
+        assert_eq!(parse(&[]).expect("parses").graffiti_file, None);
     }
 
     #[test]
     fn graffiti_text_is_right_padded_with_zeros() {
-        let bytes = options("hello").graffiti().expect("valid");
+        let bytes = options("hello").graffiti().expect("valid").expect("set");
         assert_eq!(&bytes.0[..5], b"hello");
         assert!(
             bytes.0[5..].iter().all(|byte| *byte == 0),
@@ -466,7 +506,7 @@ mod tests {
     fn graffiti_of_exactly_the_field_width_is_accepted() {
         let text = "a".repeat(GRAFFITI_BYTES);
         let bytes = options(&text).graffiti().expect("32 bytes fits exactly");
-        assert_eq!(bytes.0, text.as_bytes());
+        assert_eq!(bytes.expect("set").0, text.as_bytes());
     }
 
     #[test]

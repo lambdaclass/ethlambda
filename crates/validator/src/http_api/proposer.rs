@@ -11,6 +11,13 @@
 //! value, so it is back on the default; it answers 204 whether or not there was
 //! one to drop.
 //!
+//! Graffiti also has `--graffiti-file`, read ahead of the validator's own
+//! value, and `GET graffiti` answers what the next proposal would carry, the
+//! file included (see `ProposerSettings::next_graffiti`). A `POST` or `DELETE`
+//! is written and applied as usual while the file is set, and shows in
+//! proposals and in `GET` whenever the file names neither the key nor a
+//! `default`.
+//!
 //! Every route answers 404 for a key this client does not hold. The check and
 //! the change happen under one hold of `definitions_lock`, which a keystore
 //! delete also holds from before it removes the key until after it has
@@ -336,11 +343,15 @@ pub async fn get_graffiti(
 ) -> Result<Json<Data<GraffitiEntry>>, ApiError> {
     let pubkey = parse_path_key(&pubkey)?;
     require_held(&*context.store.read().await, &pubkey)?;
-    let graffiti = context.settings.graffiti(&pubkey);
+    // What the next proposal would carry, the graffiti file included. With
+    // no graffiti anywhere a proposal sends none and the beacon node applies
+    // its own; the specification has no way to say so, and an empty string
+    // is the nearest answer.
+    let graffiti = context.settings.next_graffiti(&pubkey).await;
     Ok(Json(Data {
         data: GraffitiEntry {
             pubkey: encode_hex(&pubkey.0),
-            graffiti: graffiti_to_text(&graffiti),
+            graffiti: graffiti.as_ref().map(graffiti_to_text).unwrap_or_default(),
         },
     }))
 }
@@ -474,8 +485,8 @@ mod tests {
             .expect("32 bytes")
     }
 
-    fn default_graffiti() -> Bytes32 {
-        graffiti_from_text("default").expect("fits")
+    fn default_graffiti() -> Option<Bytes32> {
+        Some(graffiti_from_text("default").expect("fits"))
     }
 
     /// A router over a store holding one key, with a default graffiti of
@@ -677,6 +688,72 @@ mod tests {
         );
     }
 
+    /// `GET graffiti` answers what the next proposal would carry, the graffiti
+    /// file included: the file's line while it names the key, the validator's
+    /// own value once it does not, and `--graffiti` after a `DELETE`. A `POST`
+    /// made while the file names the key is kept, and shows once the line goes.
+    #[tokio::test]
+    async fn get_graffiti_answers_what_the_next_proposal_carries_the_file_included() {
+        let harness = harness(None);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("graffiti.txt");
+        let line = format!("{}: from the file\n", encode_hex(&harness.pubkey.0));
+        std::fs::write(&file_path, &line).expect("writes");
+        let file = crate::graffiti_file::GraffitiFile::open(&file_path).expect("opens");
+        let settings =
+            ProposerSettings::new(default_graffiti(), None).with_graffiti_file(Some(file));
+        let context = KeymanagerContext {
+            settings: Arc::new(settings),
+            ..harness.context.clone()
+        };
+        let app = router(context, TOKEN.to_string());
+        let path = uri(&harness.pubkey, "graffiti");
+
+        let (status, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["graffiti"], "from the file");
+
+        let set = serde_json::json!({ "graffiti": "hello" });
+        let (status, _) = send(&app, request("POST", &path, Some(set))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(harness.entry().graffiti.as_deref(), Some("hello"));
+        let (_, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(
+            body["data"]["graffiti"], "from the file",
+            "the file still names the key"
+        );
+
+        std::fs::write(&file_path, "").expect("empties");
+        let (_, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(body["data"]["graffiti"], "hello");
+
+        let (status, _) = send(&app, request("DELETE", &path, None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(body["data"]["graffiti"], "default");
+
+        // A file that no longer parses is skipped, here as in a proposal.
+        std::fs::write(&file_path, format!("{line}not a line\n")).expect("breaks");
+        let (_, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(body["data"]["graffiti"], "default");
+    }
+
+    /// With no graffiti anywhere a proposal sends none, and `GET` answers an
+    /// empty string, the nearest the specification's shape allows.
+    #[tokio::test]
+    async fn with_no_graffiti_anywhere_get_answers_an_empty_string() {
+        let harness = harness(None);
+        let context = KeymanagerContext {
+            settings: Arc::new(ProposerSettings::new(None, None)),
+            ..harness.context.clone()
+        };
+        let app = router(context, TOKEN.to_string());
+        let path = uri(&harness.pubkey, "graffiti");
+        let (status, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["graffiti"], "");
+    }
+
     #[tokio::test]
     async fn a_gas_limit_is_set_read_back_and_reset_to_the_default() {
         let harness = harness(None);
@@ -848,7 +925,7 @@ mod tests {
         );
         assert_eq!(
             restarted.graffiti(&harness.pubkey),
-            graffiti_from_text("persisted").expect("fits")
+            graffiti_from_text("persisted")
         );
         assert_eq!(restarted.gas_limit(&harness.pubkey), DEFAULT_GAS_LIMIT);
     }
@@ -876,7 +953,7 @@ mod tests {
         assert!(message.contains("power loss"), "{message}");
         assert_eq!(
             harness.settings.graffiti(&harness.pubkey),
-            graffiti_from_text("hello").expect("fits"),
+            graffiti_from_text("hello"),
             "the file holds the change, so memory must"
         );
     }
@@ -930,7 +1007,7 @@ mod tests {
         written.seed_overrides(&restarted).expect("seeds");
         assert_eq!(
             restarted.graffiti(&harness.pubkey),
-            graffiti_from_text("hello").expect("fits"),
+            graffiti_from_text("hello"),
             "the restart runs with what the request set"
         );
     }
