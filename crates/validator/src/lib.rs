@@ -431,6 +431,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         }));
     }
 
+    // Every beacon node's sync status, probed a sixth of a slot ahead of each
+    // boundary on its own clock: the duty loop reads it at the boundary and
+    // never waits for it. Aborted once the client stops. See
+    // `beacon_node::health`.
+    let probes = tokio::spawn(crate::beacon_node::health::run(
+        beacon_node.clone(),
+        clock.clone(),
+    ));
+
     // The check runs on its own clock, three quarters into each slot, so a
     // slow duty never delays it and a slow liveness query never delays a
     // duty. Its handle is kept: the duties race it below, and it is aborted
@@ -476,6 +485,16 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
             let epoch = clock.epoch_of(slot);
 
+            // The slot's sync check, from the probe taken ahead of this
+            // boundary. A slot it withholds signs nothing and skips the epoch
+            // refresh, which the next slot that passes tries again. Only the
+            // fee recipient re-send goes on, since it signs nothing and a node
+            // restarted mid-sync must be prepared before its first proposal.
+            if !crate::beacon_node::health::slot_signs(beacon_node.health(), slot) {
+                preparations.after_slot(slot, &resolved, &store);
+                continue;
+            }
+
             // What the refresh below leaves owing once the slot's block is
             // out: the subnet subscriptions when it moved the attester
             // schedule, and the builder registrations of the validators it
@@ -484,8 +503,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             let mut to_register = None;
             if last_epoch != Some(epoch) {
                 // Snapshot the pubkeys and let the guard drop right here, before
-                // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
-                // validator lookup). Passing the guard itself in used to extend
+                // `refresh_epoch`'s awaits (two duties fetches, a validator
+                // lookup). Passing the guard itself in used to extend
                 // it across that whole call, because `&*store.read().await` as a
                 // match scrutinee has its temporary lifetime extended to the
                 // entire match. Holding a read lock that long lets the
@@ -704,11 +723,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     };
 
     let stopped = run_until_stopped(duties, &protection, shutdown, keymanager).await;
-    // Whatever stopped the client, the check stops with it rather than
-    // polling the beacon node for a runtime that outlives `run`.
+    // Whatever stopped the client, the check and the probe stop with it rather
+    // than polling the beacon node for a runtime that outlives `run`.
     if let Some(check) = check {
         check.abort();
     }
+    probes.abort();
     Err(stopped)
 }
 
@@ -1176,6 +1196,9 @@ struct Refreshed {
 /// Sends no subnet subscription and no builder registration itself: both
 /// need signatures, so the duty loop sends them from tasks of their own, off
 /// the path to the slot's block. See [`Refreshed`].
+///
+/// Asks no node whether it is syncing: the duty loop runs this only in a slot
+/// its per-slot sync check passed (see [`beacon_node::health`]).
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -1189,10 +1212,6 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
         return Ok(Refreshed::default());
-    }
-
-    if beacon_node.is_optimistic_or_syncing().await? {
-        return Err(Error::BeaconNodeSyncing);
     }
 
     // Re-resolved every epoch, not once at startup: a validator can be

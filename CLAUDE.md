@@ -940,6 +940,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   holds them in memory only), and `produceBlockV4` carries the boost factor and
   `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
   carry, which the node's own gloas payload is built toward.
+  Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
+  slot before the boundary, on its own task (`beacon_node::health`, records
+  in `NodeHealth`, shared by the fallback): a slot in which every node that
+  answered is syncing or optimistic signs nothing and skips the epoch refresh,
+  only the fee recipient re-send going on (a node that did not answer does not
+  count, so the duty endpoints' 503 stays the backstop); requests try the
+  nodes that passed first, then the rest, each
+  in `--beacon-nodes` order; and the head root and PTC data are never asked of
+  a node whose last probe said syncing or optimistic. No rule reads the head's
+  age off the client's clock.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
