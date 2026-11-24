@@ -4,8 +4,9 @@
 # no assertoor: the check is scripts/check-builder-blocks.sh, which reads the
 # builder metrics of every ethlambda service. See README.md ("Commit-Boost
 # check") for the steps. The package comes from a clone of
-# lambdaclass/ethereum-package at the commit pinned in
-# .github/workflows/kurtosis_assertoor.yml (COMMIT_BOOST_PACKAGE_REF).
+# ethpandaops/ethereum-package at the commit pinned in
+# .github/workflows/kurtosis_assertoor.yml (ETHEREUM_PACKAGE_REF, the base
+# battery's pin).
 #
 # Participants, in the order ethereum-package launches them (the order fixes the
 # service names check-builder-blocks.sh reads):
@@ -20,9 +21,10 @@
 # `mev_type: commit-boost` adds a flashbots mev-boost-relay, a reth-rbuilder
 # builder (with its own lighthouse beacon node) and one Commit-Boost PBS module
 # per participant. The package passes each ethlambda beacon node `--builder` and
-# each ethlambda validator client `--builder-proposals`, which only an image
-# built with the builder support understands. The workflow rewrites the
-# `cl_image` and `vc_image` of the ethlambda entries (selected by type, not
+# each ethlambda validator client `--builder-proposals`, plus
+# `--init-slashing-protection`; that flag cannot be repeated, so adding it to
+# `vc_extra_params` stops the validator client at startup. The workflow rewrites
+# the `cl_image` and `vc_image` of the ethlambda entries (selected by type, not
 # position) to the image under test; the values below are what a local run uses.
 # If the battery ever changes `network_id`, the preset or the fork epochs, the
 # explicit Commit-Boost chain under `mev_params` must change with it.
@@ -33,19 +35,15 @@ participants:
     cl_type: lighthouse
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:unstable
-    # Genesis keys in a fresh directory: nothing has ever signed with them, so
-    # registering them without history is safe. Without it the validator
-    # client refuses to start (no slashing-protection record), as in
-    # network_params.yaml.
-    vc_extra_params: ["--init-slashing-protection"]
   - el_type: geth
     cl_type: ethlambda
     cl_image: ghcr.io/lambdaclass/ethlambda:unstable
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:unstable
-    vc_extra_params: ["--init-slashing-protection"]
 network_params:
-  # ethlambda only supports the mainnet preset: 32-slot epochs of 12 s.
+  # The mainnet preset: 32-slot epochs of 12 s. ethlambda runs `minimal` too,
+  # but the relay and the builder have not been tried on it, and the explicit
+  # Commit-Boost chain below is written for 12 s slots.
   preset: mainnet
   # Fulu is the last fork ethlambda processes; gloas stays unscheduled.
   electra_fork_epoch: 0

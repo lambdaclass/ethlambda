@@ -105,17 +105,17 @@ The relay, builder, PBS and spamoor images are pinned by digest in
 
 ### Run it locally
 
-The image needs the builder support, so build one from a checkout of the
-builder PR stack (#694 to #705). From that checkout's root, `make docker-build
-DOCKER_TAG=<tag>` tags it `ghcr.io/lambdaclass/ethlambda:<tag>`; set that as the
-`cl_image` and `vc_image` of the ethlambda entries in `commit_boost_params.yaml`.
-Kurtosis uses an image that exists in the local Docker daemon and only pulls a
-missing one (`kurtosis run --image-download`, default `missing`), so no setting
-is needed; do not pass `--image-download always`. From the repository root:
+The default image (`:unstable`) has the builder support. To test a local build,
+`make docker-build DOCKER_TAG=<tag>` tags it `ghcr.io/lambdaclass/ethlambda:<tag>`;
+set that as the `cl_image` and `vc_image` of the ethlambda entries in
+`commit_boost_params.yaml`. Kurtosis uses an image that exists in the local
+Docker daemon and only pulls a missing one (`kurtosis run --image-download`,
+default `missing`), so no setting is needed; do not pass `--image-download
+always`. From the repository root:
 
 ```bash
-git clone https://github.com/lambdaclass/ethereum-package.git /tmp/ethereum-package
-git -C /tmp/ethereum-package checkout 7fa7d1225fe5d975300ecc5584bf28ca6d42d451
+git clone https://github.com/ethpandaops/ethereum-package.git /tmp/ethereum-package
+git -C /tmp/ethereum-package checkout 90d0f4e795cd4c3298753b428bb588ed7999d4da
 
 kurtosis run /tmp/ethereum-package --enclave ethlambda-commit-boost \
   --args-file tooling/kurtosis-assertoor/commit_boost_params.yaml
@@ -129,39 +129,23 @@ kurtosis enclave rm -f ethlambda-commit-boost
 ### In CI
 
 The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on
-manual dispatch only. Pick `battery: commit-boost` (or `both`) and give `image`
-the tag of an image built from the builder PR stack; the default `assertoor`
-runs only the base battery, as before. Its pin is `COMMIT_BOOST_PACKAGE_REF`,
-separate from `ETHEREUM_PACKAGE_REF`, and it uploads `commit-boost-enclave-dump-<run id>`.
+manual dispatch only. Pick `battery: commit-boost` (or `both`); `image` defaults
+to `:unstable`, like the base battery's. The default `assertoor` runs only the
+base battery, as before. It runs the package at the base battery's pin
+(`ETHEREUM_PACKAGE_REF`), which has ethlambda's builder flags
+(ethpandaops/ethereum-package#1515), and it uploads
+`commit-boost-enclave-dump-<run id>`.
 
-It is dispatch-only because the image that pushes and pull requests test
-(`sha-<7>` of `main`, or `unstable`) does not have `--builder` or
-`--builder-proposals` until the builder PR stack is on `main`, so the check
-would fail there. Once it lands, drop the event condition on the job to run it
-on push and on pull requests.
+It stays dispatch-only until it has passed in CI. Then drop the event condition
+on the job to run it on push and on pull requests.
 
-### The fork pin
+### Upstream workaround
 
-lambdaclass/ethereum-package#22 added ethlambda to `apply_external_builder_flags`
-(`--builder=<url>` for the beacon node, `--builder-proposals` for the validator
-client) and is merged (`a15e7df`). `COMMIT_BOOST_PACKAGE_REF` is
-`7fa7d1225fe5d975300ecc5584bf28ca6d42d451`, from
-lambdaclass/ethereum-package#23, which adds the builder's enode bootnode fix on
-top of it. Re-pin to #23's merge commit once it lands: a squash-merge leaves the
-current commit unreachable from the fork's default branch, so it may be garbage
-collected.
-
-### Upstream workarounds
-
-A local run found two breakages in images and packages we do not control:
-
-| Breakage | Worked around in |
-|---|---|
-| `ethpandaops/reth-rbuilder:develop` (newest image, 2026-07-17) parses only enode URLs as bootnodes, and the package has passed ENRs since its 08-05 refactor, so the builder's execution client refused them | fork PR #23, through the `COMMIT_BOOST_PACKAGE_REF` pin |
-| Commit-Boost's PBS requires `SECONDS_PER_SLOT` in the chain config, and the genesis generator now writes only `SLOT_DURATION_MS` | `mev_params.commit_boost_config` in `commit_boost_params.yaml`, which gives the chain explicitly (`chain_id` has to be a hex string) |
-
-Drop each once the upstream is fixed. The explicit chain must change with the
-network parameters.
+Commit-Boost's PBS requires `SECONDS_PER_SLOT` in the chain config, and the
+genesis generator now writes only `SLOT_DURATION_MS`. `mev_params.commit_boost_config`
+in `commit_boost_params.yaml` therefore gives the chain explicitly (`chain_id`
+has to be a hex string). Drop it once either upstream is fixed; until then the
+explicit chain must change with the network parameters.
 
 ### Startup noise
 

@@ -44,12 +44,6 @@ env:
   ETHEREUM_PACKAGE_REPO: https://github.com/ethpandaops/ethereum-package.git
   ETHEREUM_PACKAGE_REF: 90d0f4e795cd4c3298753b428bb588ed7999d4da
   ENCLAVE: ethlambda-assertoor
-  # The Commit-Boost check needs the fork's `--builder` / `--builder-proposals`
-  # wiring for ethlambda, which the commit above lacks. It has its own pin so
-  # the base battery stays where it is. Fork PR #22 (that wiring) is merged as
-  # a15e7df; this commit adds PR #23's fix for the builder's enode bootnodes on
-  # top. Re-pin to #23's merge commit once it lands; see the README.
-  COMMIT_BOOST_PACKAGE_REF: 7fa7d1225fe5d975300ecc5584bf28ca6d42d451
   COMMIT_BOOST_ENCLAVE: ethlambda-commit-boost
 
 jobs:
@@ -187,12 +181,11 @@ jobs:
         if: always()
         run: kurtosis enclave rm -f "$ENCLAVE" || true
 
-  # Dispatch-only for now: main's image does not have the builder flags until
-  # the builder PR stack (#694 to #705) lands. Once it is on main, drop the
-  # event condition so the check also runs on push and on pull requests, and at
-  # the same time add `commit-boost` to `notify`'s `needs` and its failed.txt to
-  # the Slack text: `notify` reports pushes only, so until then it can never
-  # see this job.
+  # Dispatch-only until it has passed in CI. Main's image has the builder flags
+  # (the builder stack, #694 to #705, landed on 2026-11-17). To run it on push
+  # and on pull requests, drop the event condition, and at the same time add
+  # `commit-boost` to `notify`'s `needs` and its failed.txt to the Slack text:
+  # `notify` reports pushes only, so until then it can never see this job.
   commit-boost:
     name: Commit-Boost
     needs: image
@@ -214,14 +207,16 @@ jobs:
           kurtosis analytics disable
           kurtosis version
 
-      # A clone for the same reason as in the assertoor job.
+      # The base battery's pin: it has ethlambda's builder flags
+      # (ethpandaops/ethereum-package#1515) and the builder's enode bootnodes
+      # (#1525).
       - name: Fetch ethereum-package at the pinned commit
         run: |
           git init "$RUNNER_TEMP/ethereum-package"
           cd "$RUNNER_TEMP/ethereum-package"
-          git fetch --depth 1 "$ETHEREUM_PACKAGE_REPO" "$COMMIT_BOOST_PACKAGE_REF"
+          git fetch --depth 1 "$ETHEREUM_PACKAGE_REPO" "$ETHEREUM_PACKAGE_REF"
           git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$COMMIT_BOOST_PACKAGE_REF"
+          test "$(git rev-parse HEAD)" = "$ETHEREUM_PACKAGE_REF"
 
       - name: Point the args at the image under test
         env:
