@@ -784,7 +784,7 @@ pub enum ParticipationSortedReader<'a> {
         ethlambda_ssz_tree::SortedReader<
             'a,
             ParticipationFlags,
-            ethlambda_ssz_tree::VecMap<ParticipationFlags>,
+            ethlambda_ssz_tree::SparseMap<ParticipationFlags>,
         >,
     ),
     /// Gloas.
@@ -792,7 +792,7 @@ pub enum ParticipationSortedReader<'a> {
         ethlambda_ssz_tree::ProgressiveSortedReader<
             'a,
             ParticipationFlags,
-            ethlambda_ssz_tree::VecMap<ParticipationFlags>,
+            ethlambda_ssz_tree::SparseMap<ParticipationFlags>,
         >,
     ),
 }

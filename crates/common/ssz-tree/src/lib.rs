@@ -89,7 +89,7 @@ pub use list::{List, ListOf};
 pub use progressive_list::{
     ProgressiveIter, ProgressiveIterCow, ProgressiveList, ProgressiveSortedReader,
 };
-pub use update_map::{UpdateMap, VecMap};
+pub use update_map::{SparseMap, UpdateMap, VecMap};
 pub use vector::{Vector, VectorOf};
 
 use libssz::{SszDecode, SszEncode};

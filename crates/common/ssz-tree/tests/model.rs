@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-use ethlambda_ssz_tree::{List, ProgressiveList, UpdateMap, Value, VecMap, Vector};
+use ethlambda_ssz_tree::{List, ProgressiveList, SparseMap, UpdateMap, Value, VecMap, Vector};
 use libssz::{DecodeError, SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher};
@@ -158,6 +158,16 @@ proptest! {
     }
 
     #[test]
+    fn u64_list_sparse(initial in vec(any::<u64>(), 0..40), ops in ops(any::<u64>())) {
+        run_list::<u64, 64, SparseMap<u64>>(initial, ops)?;
+    }
+
+    #[test]
+    fn u8_list_sparse(initial in vec(any::<u8>(), 0..100), ops in ops(any::<u8>())) {
+        run_list::<u8, 130, SparseMap<u8>>(initial, ops)?;
+    }
+
+    #[test]
     fn root_list(initial in vec(any::<[u8; 32]>(), 0..15), ops in ops(any::<[u8; 32]>())) {
         run_list::<[u8; 32], 20, BTreeMap<usize, [u8; 32]>>(initial, ops)?;
     }
@@ -184,6 +194,15 @@ proptest! {
         ops in ops(any::<u64>()),
     ) {
         run_list::<u64, 4096, VecMap<u64>>(initial, ops)?;
+    }
+
+    /// As above, with the buffer the balances use.
+    #[test]
+    fn u64_list_spanning_leaves_sparse(
+        initial in vec(any::<u64>(), 0..1600),
+        ops in ops(any::<u64>()),
+    ) {
+        run_list::<u64, 4096, SparseMap<u64>>(initial, ops)?;
     }
 
     /// A leaf holds 64 items: 40 bytes each, a page fits 102, rounded down to a
@@ -590,6 +609,11 @@ proptest! {
     #[test]
     fn progressive_u64(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
         run_progressive::<u64, VecMap<u64>>(initial, ops, Write::IndexMut);
+    }
+    // As above, with the buffer gloas's balances use.
+    #[test]
+    fn progressive_u64_sparse(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
+        run_progressive::<u64, SparseMap<u64>>(initial, ops, Write::GetMut);
     }
     // Composite: one per chunk, subtrees start at 0, 1, 5, 21, 85.
     #[test]

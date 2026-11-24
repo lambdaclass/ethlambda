@@ -56,17 +56,14 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
         if index >= self.len {
             return None;
         }
-        if self.updates.get(index).is_none() {
+        let (tree, depth) = (&self.tree, self.depth);
+        Some(self.updates.get_or_insert_with(index, || {
             // Pending pushes are always in `updates`, so this is a committed
             // element.
-            let value = self
-                .tree
-                .get(index, self.depth)
+            tree.get(index, depth)
                 .expect("an index below the committed length is in the tree")
-                .clone();
-            self.updates.insert(index, value);
-        }
-        self.updates.get_mut(index)
+                .clone()
+        }))
     }
 
     /// Buffers `value` as the new value of the element at `index`, without

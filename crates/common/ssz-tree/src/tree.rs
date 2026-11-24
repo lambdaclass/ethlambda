@@ -107,10 +107,11 @@ impl<T: Value> Leaf<T> {
     fn root(&self, height: usize) -> Hash256 {
         let chunks = 1 << height;
         if is_packed::<T>() {
+            // In bulk: a memcpy for the integer types on a little-endian host,
+            // where appending element by element was a call per byte of a
+            // participation leaf.
             let mut bytes = Vec::with_capacity(self.values.len() * <T as SszEncode>::fixed_size());
-            for value in &self.values {
-                value.ssz_append(&mut bytes);
-            }
+            T::ssz_append_fixed_slice(&self.values, &mut bytes);
             return merkleize(&pack(&bytes), chunks);
         }
         merkleize(self.element_roots(), chunks)
