@@ -786,6 +786,18 @@ pub trait BeaconNodeApi: Send + Sync {
     /// to the signer.
     async fn head_block_root(&self) -> Result<Root>;
 
+    /// The root of the block at `slot` on the node's canonical chain, or
+    /// `None` when that chain has no block there (the endpoint's 404).
+    /// `GET /eth/v1/beacon/headers/{slot}`, which the proposal check in
+    /// [`crate::performance`] reads a few slots after a block is published.
+    ///
+    /// # Contract: the answer is about `slot`, or it is an `Err`
+    ///
+    /// The header names its own slot, and one at another slot is
+    /// [`crate::error::Error::InconsistentResponse`] rather than a root to
+    /// compare: a block at another slot says nothing about this one's.
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>>;
+
     /// Submit signed sync committee messages to the node's pool. Returns how
     /// many it accepted, with the same partial-success reading as
     /// [`Self::submit_attestations`].

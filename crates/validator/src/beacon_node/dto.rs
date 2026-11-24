@@ -285,6 +285,30 @@ pub struct BlockRootDto {
     pub root: String,
 }
 
+/// `GET /eth/v1/beacon/headers/{block_id}`: the block's root, and the slot its
+/// header names, which is what the proposal check reads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderResponse {
+    pub data: BlockHeaderDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderDto {
+    pub root: String,
+    pub header: SignedBlockHeaderDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignedBlockHeaderDto {
+    pub message: BlockHeaderMessageDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderMessageDto {
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+}
+
 /// One entry of `POST /eth/v1/validator/duties/sync/{epoch}`: the validator and
 /// every seat it holds in the period's sync committee. Seats are positions in
 /// the whole committee, and a validator can hold several.

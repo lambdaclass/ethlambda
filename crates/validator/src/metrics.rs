@@ -491,6 +491,8 @@ pub fn init() {
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
+    // The per-validator series, which live with what records them.
+    crate::performance::init();
 }
 
 pub fn set_validators_loaded(count: u64) {

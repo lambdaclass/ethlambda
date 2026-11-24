@@ -46,6 +46,7 @@ use crate::beacon_node::dto::{SyncDutyDto, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, validate_sync_contribution};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::performance::{Batch, Duty, Performance};
 use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept.
@@ -88,6 +89,9 @@ pub struct SyncCommitteeService<B> {
     context: Arc<SigningContext>,
     /// Which (validator, slot) pairs already produced a message signature.
     done: std::sync::Mutex<HashSet<(ValidatorIndex, Slot)>>,
+    /// Where each validator's message outcome is counted. `None` counts
+    /// nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi> SyncCommitteeService<B> {
@@ -96,7 +100,14 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             beacon_node,
             context,
             done: std::sync::Mutex::new(HashSet::new()),
+            performance: None,
         }
+    }
+
+    /// Count each message duty's outcome per validator in `performance`.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
     }
 
     /// Sign and submit this client's sync committee messages for `slot`.
@@ -121,9 +132,19 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             return Ok(None);
         }
 
+        // Each pending duty counts once, published or failed, however this
+        // call ends: an early `?` or the duty loop's deadline counts it failed.
+        let mut outcomes = Batch::new(
+            self.performance.as_ref(),
+            Duty::SyncCommitteeMessage,
+            slot,
+            pending.iter().map(|duty| duty.validator_index),
+        );
         let root = match self.beacon_node.head_block_root().await {
             Ok(root) => root,
             Err(Error::BeaconNodeSyncing) => {
+                // Not a failure: nothing may be signed over this head.
+                outcomes.skip_all();
                 warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
                 return Ok(None);
             }
@@ -181,6 +202,8 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             .beacon_node
             .submit_sync_committee_messages(&messages)
             .await?;
+        let sent: Vec<_> = messages.iter().map(|m| m.validator_index).collect();
+        outcomes.submitted(&sent, published);
         if published < submitted {
             warn!(%slot, published, submitted, "Some sync committee messages in this slot's batch were rejected");
         }

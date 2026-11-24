@@ -693,6 +693,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
+        self.try_each("canonical_block_root", |node| {
+            node.canonical_block_root(slot)
+        })
+        .await
+    }
+
     async fn submit_sync_committee_messages(
         &self,
         messages: &[altair::SyncCommitteeMessage],

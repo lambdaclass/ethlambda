@@ -37,6 +37,7 @@ pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod performance;
 pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
@@ -347,12 +348,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     }
     let context = Arc::new(context);
 
+    // Each validator's duty outcomes, counted by the services that serve them.
+    let performance = Arc::new(performance::Performance::new(
+        performance::LABELLED_VALIDATORS,
+    ));
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
-        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone())
+            .with_performance(performance.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
-    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
-    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
+    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
+    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
 
     // Unconditional, as Lighthouse does: from gloas the preferences carry the
     // fee recipient of every proposal, builders or not. See the module doc.
@@ -370,7 +378,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     )
     .with_clock(clock.clone())
     .with_builder_min_bid(config.builder_min_bid)
-    .with_preferences(preferences.clone());
+    .with_preferences(preferences.clone())
+    .with_performance(performance);
     // The proposer preparations' per-slot re-send. The epoch's own send is
     // `refresh_epoch`'s.
     let preparations = Arc::new(Preparations::new(beacon_node.clone(), settings.clone()));

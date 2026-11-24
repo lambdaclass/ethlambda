@@ -574,6 +574,19 @@ async fn an_optimistic_head_is_one_the_client_will_not_attest_through() {
     assert!(!client.is_optimistic_or_syncing().await.unwrap());
 }
 
+/// The proposal check reads this node's `/eth/v1/beacon/headers/{slot}`: the
+/// root of the block it holds at a slot, and nothing at a slot without one.
+#[tokio::test]
+async fn the_client_reads_the_canonical_block_at_a_slot_off_this_node() {
+    let (client, _, _, store) = serve_with_store(None).await;
+    let (slot, root) = store.beacon_head().expect("the anchor is the head");
+
+    let answer = client.canonical_block_root(slot).await.unwrap();
+    assert_eq!(answer, Some(root));
+    let answer = client.canonical_block_root(slot + 1).await.unwrap();
+    assert_eq!(answer, None, "no block after the anchor");
+}
+
 /// Without an execution client to build a payload with, block production
 /// answers 503, which the client reads as a node it can fail over from rather
 /// than a malformed answer.

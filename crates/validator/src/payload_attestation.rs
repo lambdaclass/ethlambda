@@ -43,6 +43,7 @@ use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{PtcDutyDto, parse_pubkey};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
+use crate::performance::{Batch, Duty, Performance};
 use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept. Far more than the one slot a duty
@@ -57,6 +58,8 @@ pub struct PayloadAttestationService<B> {
     /// A `std::sync::Mutex` for the reason the attestation service's guard is:
     /// the critical section is a lookup and an insert with no await inside it.
     done: std::sync::Mutex<HashSet<(ValidatorIndex, Slot)>>,
+    /// Where each member's vote outcome is counted. `None` counts nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi> PayloadAttestationService<B> {
@@ -65,7 +68,14 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             beacon_node,
             context,
             done: std::sync::Mutex::new(HashSet::new()),
+            performance: None,
         }
+    }
+
+    /// Count each vote's outcome per validator in `performance`.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
     }
 
     /// Sign and submit this client's committee votes for `slot`.
@@ -101,7 +111,17 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             return Ok(0);
         }
 
+        // Each pending vote counts once, published or failed, however this
+        // call ends: an early `?` or the duty loop's deadline counts it failed.
+        let mut outcomes = Batch::new(
+            self.performance.as_ref(),
+            Duty::PayloadAttestation,
+            slot,
+            pending.iter().map(|duty| duty.validator_index),
+        );
         let Some(data) = self.beacon_node.payload_attestation_data(slot).await? else {
+            // Not a failure: there is nothing to vote on.
+            outcomes.skip_all();
             info!(%slot, "No block known for this slot; not voting on its payload");
             return Ok(0);
         };
@@ -167,6 +187,8 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             .beacon_node
             .submit_payload_attestations(&messages)
             .await?;
+        let sent: Vec<_> = messages.iter().map(|m| m.validator_index).collect();
+        outcomes.submitted(&sent, published);
         if published < submitted {
             warn!(
                 %slot,

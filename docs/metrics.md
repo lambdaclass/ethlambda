@@ -928,6 +928,11 @@ and absent is not the same as zero.
 | `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |
 | `ethlambda_validator_sync_contribution_failures_total` | Counter | Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted |
 | `ethlambda_validator_sync_duties_held` | Gauge | Sync committee duties held for the current period |
+| `ethlambda_validator_attestation_outcomes_total` | Counter | Attestation duties by `validator` and `outcome` (`published`, `failed`). See [Per-validator outcomes](#per-validator-outcomes) |
+| `ethlambda_validator_proposal_outcomes_total` | Counter | Proposal duties by `validator` and `outcome` (`published`, `failed`) |
+| `ethlambda_validator_sync_committee_message_outcomes_total` | Counter | Sync committee message duties by `validator` and `outcome` (`published`, `failed`) |
+| `ethlambda_validator_payload_attestation_outcomes_total` | Counter | Payload timeliness committee votes by `validator` and `outcome` (`published`, `failed`) (gloas) |
+| `ethlambda_validator_proposal_checks_total` | Counter | Blocks this client handed to a beacon node, by `validator` and by which block the canonical chain held at their slot four slots later: `result` is `canonical`, `replaced`, `orphaned` or `unknown` |
 | `ethlambda_validator_doppelganger_detecting` | Gauge | Keys doppelganger protection still withholds attestations and blocks for (`--enable-doppelganger-protection`). Non-zero for two to three epochs after a start or an import, then zero; a key that stays here has no validator index yet, or its beacon nodes keep failing the liveness query. Always zero with the protection off |
 | `ethlambda_validator_doppelganger_check_failures_total` | Counter | Doppelganger checks (one a slot while any key is withheld) that got no liveness answer, because a query failed or every beacon node was syncing. Only a failure at an epoch's last slot costs anything: it pushes the withheld keys' first signature back an epoch, and is logged at error. A count that climbs every slot is a beacon node that does not serve `/eth/v1/validator/liveness`, or one that is down |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
@@ -983,6 +988,54 @@ ones worth alerting on at any non-zero value rather than on a rate:
 guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
 means blocks are being proposed that pay someone else. `envelope_failures_total`
 belongs with them on a gloas network.
+
+### Per-validator outcomes
+
+Five series carry a `validator` label: the four `*_outcomes_total` and
+`proposal_checks_total` (`crates/validator/src/performance.rs`). Each duty a
+service takes up counts once, as `published` when a beacon node accepted the
+message, and as `failed` otherwise: the node refused it or did not answer, the
+signature failed, slashing protection refused it, or the duty ran past its
+deadline. What the unlabelled series count as neither is neither here too: a
+duty doppelganger protection withholds, an attestation for a key deleted since
+the schedule was fetched, a sync committee message over an optimistic head, a
+payload vote for a slot the node knows no block for, and a blinded block the
+node did not confirm.
+
+The label is the validator's index for the first 64 validators an outcome is
+recorded for, which keep it for the life of the process, and `other` for every
+validator after them. A client with thousands of keys therefore has at most 65
+series per outcome, and `sum without (validator) (...)` is always the client's
+total. The `other` series exist from startup; a validator's own appear with its
+first outcome. Past 64 keys, which validators get their own label depends on
+which had a duty first, so it can change from one run to the next.
+
+A batch a node accepted only in part is counted under `other`: its accepted part
+as `published`, the rest as `failed`. The node's answer names the positions it
+refused, which the client logs, but `submit_attestations` and its sync committee
+and payload vote counterparts return a count, so no validator is credited with
+an outcome that may be another's.
+
+`proposal_checks_total` counts one check of each block this client handed to a
+node, an unconfirmed blinded block included, made when the fourth slot after
+the block's starts, through `GET /eth/v1/beacon/headers/{slot}`. It runs on a
+task of its own, so it never delays a duty. `canonical` means the canonical
+chain holds this block at the slot, `replaced` another block, `orphaned` none,
+and `unknown` that no node answered. The first node to answer is believed, so a node four
+slots behind the chain that does not report itself syncing reads as `orphaned`.
+Each check is also logged, at info when canonical and at warn otherwise.
+
+These series count what the client attempted, not what the chain did with it:
+an accepted attestation that was never included, or was included with the wrong
+head, reads `published`. That answer needs the standard rewards endpoints
+(`/eth/v1/beacon/rewards/attestations/{epoch}`), which ethlambda's beacon node
+does not serve yet.
+
+The same cap governs the log. When the first outcome of an epoch is recorded,
+every earlier epoch is summarized at info: one `Validator epoch summary` line
+per labelled validator with an outcome in it, each duty as `published/attempted`,
+and one more line for `other` when it has any. So a client writes at most 65 of
+these lines an epoch however many keys it holds.
 
 ## Troubleshooting
 
