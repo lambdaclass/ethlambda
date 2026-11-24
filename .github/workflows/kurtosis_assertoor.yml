@@ -2,7 +2,9 @@ name: Kurtosis Assertoor
 
 # Starts a devnet with ethlambda beacon and validator clients next to
 # lighthouse, then runs assertoor's stability, block-proposal and sync checks
-# against every client pair. See tooling/kurtosis-assertoor/README.md.
+# against every client pair. Next to it, on its own runner, the Commit-Boost
+# check starts the same participants with a builder and waits for ethlambda to
+# build blocks through it. See tooling/kurtosis-assertoor/README.md.
 
 on:
   push:
@@ -25,7 +27,7 @@ on:
           - assertoor
           - commit-boost
           - both
-        default: assertoor
+        default: both
 
 permissions:
   contents: read
@@ -183,17 +185,16 @@ jobs:
         if: always()
         run: kurtosis enclave rm -f "$ENCLAVE" || true
 
-  # Dispatch-only until it has passed in CI. Main's image has the builder flags
-  # (the builder stack, #694 to #705, landed on 2026-11-17). To run it on push
-  # and on pull requests, drop the event condition, and at the same time add
-  # `commit-boost` to `notify`'s `needs` and its failed.txt to the Slack text:
-  # `notify` reports pushes only, so until then it can never see this job.
+  # Every push and pull request, and every dispatch except one that asked for
+  # the assertoor battery alone: `commit-boost` and `both` both run this job.
   commit-boost:
     name: Commit-Boost
     needs: image
-    if: github.event_name == 'workflow_dispatch' && inputs.battery != 'assertoor'
+    if: github.event_name != 'workflow_dispatch' || inputs.battery != 'assertoor'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      failed: ${{ steps.collect.outputs.failed }}
     steps:
       - uses: actions/checkout@v6.1.0
 
@@ -245,6 +246,18 @@ jobs:
           tooling/kurtosis-assertoor/scripts/check-builder-blocks.sh \
             "$COMMIT_BOOST_ENCLAVE" 40 "$RUNNER_TEMP/builder-results"
 
+      # Runs after a failure too: the notify job names the unmet conditions.
+      - name: Collect unmet conditions
+        id: collect
+        if: always()
+        run: |
+          failed="$RUNNER_TEMP/builder-results/failed.txt"
+          {
+            echo "failed<<EOF"
+            if [ -s "$failed" ]; then tr -s ' ' < "$failed"; else echo "the check did not produce a result (the devnet did not start?)"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Dump the enclave
         if: always()
         run: |
@@ -269,7 +282,7 @@ jobs:
 
   notify:
     name: Post failure to Slack
-    needs: [image, assertoor]
+    needs: [image, assertoor, commit-boost]
     if: failure() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
@@ -278,20 +291,33 @@ jobs:
       - name: Build Slack payload
         # Values go through the environment and the JSON is built with jq, as in
         # daily_ci.yml, so a failed-test name cannot break the payload.
+        # Each battery is reported by its own job result: a job that passed
+        # still has a `failed` output, which then says it produced no result.
         env:
           SHA: ${{ github.sha }}
-          FAILED: ${{ needs.assertoor.outputs.failed }}
           IMAGE_RESULT: ${{ needs.image.result }}
+          ASSERTOOR_RESULT: ${{ needs.assertoor.result }}
+          ASSERTOOR_FAILED: ${{ needs.assertoor.outputs.failed }}
+          COMMIT_BOOST_RESULT: ${{ needs.commit-boost.result }}
+          COMMIT_BOOST_FAILED: ${{ needs.commit-boost.outputs.failed }}
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          join() { paste -sd, - | sed 's/,/, /g'; }
+          lines=()
           if [ "$IMAGE_RESULT" != "success" ]; then
-            FAILED="no image: the sha-${SHA::7} tag never appeared"
+            lines+=("no image: the sha-${SHA::7} tag never appeared")
+          fi
+          if [ "$ASSERTOOR_RESULT" = "failure" ]; then
+            lines+=("Assertoor: $(join <<<"$ASSERTOOR_FAILED")")
+          fi
+          if [ "$COMMIT_BOOST_RESULT" = "failure" ]; then
+            lines+=("Commit-Boost: $(join <<<"$COMMIT_BOOST_FAILED")")
           fi
           # The backticks are literal Slack mrkdwn, not command substitution.
           # shellcheck disable=SC2016
-          text=$(printf '❌ *Kurtosis Assertoor* failed on <%s|`%s`>\nFailed: %s\n<%s|View run>' \
-            "$COMMIT_URL" "${SHA::7}" "$(echo "$FAILED" | paste -sd, - | sed 's/,/, /g')" "$RUN_URL")
+          text=$(printf '❌ *Kurtosis Assertoor* failed on <%s|`%s`>\n%s\n<%s|View run>' \
+            "$COMMIT_URL" "${SHA::7}" "$(printf '%s\n' "${lines[@]}")" "$RUN_URL")
           jq -n --arg text "$text" \
             '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
             > assertoor_slack.json

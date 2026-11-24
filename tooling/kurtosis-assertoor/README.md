@@ -51,12 +51,13 @@ Expect about an hour: the stability check waits for finality at 12 s slots.
 |---|---|
 | push to `main` | `ghcr.io/lambdaclass/ethlambda:sha-<7>`, waited for up to 75 min until `docker_publish.yaml` pushes it |
 | pull request touching this directory or the workflow | `ghcr.io/lambdaclass/ethlambda:unstable` |
-| manual dispatch | the `image` input, else `unstable` |
+| manual dispatch | the `image` input, else `unstable`; `battery` picks `assertoor`, `commit-boost` or `both` (default) |
 
 The workflow rewrites the ethlambda images with `yq`, runs the battery, and always
 uploads the enclave dump and assertoor results (`enclave-dump-<run id>`) before
-removing the enclave. A failure on `main` posts the commit, the failed tests and
-the run URL to Slack.
+removing the enclave. The Commit-Boost check below runs next to it on every
+trigger, on its own runner. A failure on `main` posts the commit, each failed
+battery with its failed tests or unmet conditions, and the run URL to Slack.
 
 ## Commit-Boost check
 
@@ -119,16 +120,13 @@ kurtosis enclave rm -f ethlambda-commit-boost
 
 ### In CI
 
-The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on
-manual dispatch only. Pick `battery: commit-boost` (or `both`); `image` defaults
-to `:unstable`, like the base battery's. The default `assertoor` runs only the
-base battery, as before. It runs the package at the base battery's pin
+The `commit-boost` job of `.github/workflows/kurtosis_assertoor.yml` runs on the
+base battery's triggers and image (see "In CI" above), in parallel with it, so
+it adds a runner but no wall-clock time. A dispatch runs it unless `battery` is
+`assertoor`. It runs the package at the base battery's pin
 (`ETHEREUM_PACKAGE_REF`), which has ethlambda's builder flags
 (ethpandaops/ethereum-package#1515), and it uploads
 `commit-boost-enclave-dump-<run id>`.
-
-It stays dispatch-only until it has passed in CI. Then drop the event condition
-on the job to run it on push and on pull requests.
 
 ### Upstream workaround
 
