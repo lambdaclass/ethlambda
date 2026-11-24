@@ -149,10 +149,16 @@ pub struct ValidatorConfig {
     /// The smallest p2p bid, in gwei, a gloas block may be built on
     /// (`produceBlockV4`'s `min_bid`). `0` takes any bid that wins on value.
     ///
-    /// Not part of [`BuilderProposals`]: without them a node whose local build
-    /// fails may still build on a pooled bid, and this floor applies to that
-    /// bid too.
+    /// Not part of [`BuilderProposals`]: gloas requests carry it with or
+    /// without them.
     pub builder_min_bid: u64,
+    /// The `builder_boost_factor` every gloas block request carries, with or
+    /// without builder proposals: `--builder-boost-factor` (default 100), or
+    /// `u64::MAX` with `--prefer-builder-proposals`.
+    pub gloas_boost_factor: u64,
+    /// `--self-build-only`: from gloas, ask for no bid and sign no block built
+    /// on one. See [`ProposalService::with_self_build_only`].
+    pub self_build_only: bool,
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
@@ -167,10 +173,10 @@ pub struct ValidatorConfig {
 /// and accept a blinded block when the builder's bid wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuilderProposals {
-    /// The `builder_boost_factor` sent with every block request (in the query
-    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
-    /// bid and the local payload as they are; `u64::MAX` takes the builder
-    /// whenever there is a bid.
+    /// The `builder_boost_factor` sent in every block request's query before
+    /// gloas: 100 compares the bid and the local payload as they are;
+    /// `u64::MAX` takes the builder whenever there is a bid. From gloas
+    /// [`ValidatorConfig::gloas_boost_factor`] is sent, with or without these.
     pub boost_factor: u64,
 }
 
@@ -370,6 +376,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     )
     .with_clock(clock.clone())
     .with_builder_min_bid(config.builder_min_bid)
+    .with_gloas_boost_factor(config.gloas_boost_factor)
+    .with_self_build_only(config.self_build_only)
     .with_preferences(preferences.clone());
     // The proposer preparations' per-slot re-send. The epoch's own send is
     // `refresh_epoch`'s.
@@ -386,12 +394,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             settings.clone(),
         ))
     });
-    // Logged above when builder proposals are on.
-    if config.builder.is_none() && config.builder_min_bid > 0 {
+    // From gloas, with or without builder proposals.
+    if config.self_build_only {
+        info!("Self-build only: from gloas, no block built on a builder's bid is signed");
+    } else {
         info!(
+            boost_factor = config.gloas_boost_factor,
             min_bid_gwei = config.builder_min_bid,
-            "Builder proposals off; --builder-min-bid still applies to a p2p bid taken when the local \
-             payload cannot be built"
+            "From gloas, builders' p2p bids compete with the local payload"
         );
     }
 
