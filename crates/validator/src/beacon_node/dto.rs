@@ -96,11 +96,38 @@ pub struct VersionedResponse<T> {
     pub data: T,
 }
 
+/// `produceBlockV3`'s JSON answer, as far as this client reads it.
+///
+/// `version` and `execution_payload_blinded` are required by the
+/// specification but optional here: each has a header saying the same thing
+/// (`Eth-Consensus-Version`, `Eth-Execution-Payload-Blinded`), which stands in
+/// when the body leaves it out. `execution_payload_value` and
+/// `consensus_block_value` are not read, as their headers are not on an SSZ
+/// answer: the node, not this client, weighs one payload against another.
+/// `data` stays untyped until the fork and blindedness say which container it
+/// is (see `ProducedBlock::from_json`).
+#[derive(Debug, Deserialize)]
+pub struct ProduceBlockV3Response {
+    pub version: Option<String>,
+    pub execution_payload_blinded: Option<bool>,
+    pub data: serde_json::Value,
+}
+
 /// A duties response additionally pins the block its schedule depends on.
 #[derive(Debug, Deserialize)]
 pub struct DutiesResponse<T> {
     pub dependent_root: String,
     pub data: T,
+}
+
+/// The beacon-APIs `ErrorMessage` schema, the body of a failed request.
+///
+/// Read only where a success status may carry it: behind a proxy that drops
+/// the node's status (see `HttpBeaconNode::relayed_error`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ErrorMessageDto {
+    pub code: u16,
+    pub message: String,
 }
 
 /// The beacon-APIs `IndexedErrorMessage` schema: a batch endpoint answers 400
@@ -177,19 +204,21 @@ pub struct AttestationDataDto {
 /// An electra-shaped `Attestation`, as `/eth/v2/validator/aggregate_attestation`
 /// returns it in JSON.
 ///
-/// # Why an aggregate goes through JSON when a block does not
+/// # Why an aggregate goes through JSON
 ///
 /// Because the node sends JSON whatever this client asks for. Lighthouse v8.2.2
 /// answers this endpoint with `200 application/json` to a request whose
 /// `Accept` names only SSZ, where the specification says it should answer SSZ
 /// or `406`. It is the most widely run consensus client, so a client that only
-/// takes SSZ here aggregates for nobody against it.
+/// takes SSZ here aggregates for nobody against it. (A produced block is taken
+/// as JSON too, but only when SSZ was not given; see
+/// [`super::block_contents`].)
 ///
-/// It is also cheap to get right here, unlike for a block. An `Attestation` is
-/// four fields, and the two bitfields arrive as hex of their exact SSZ
-/// encoding, so they decode through SSZ rather than through anything
-/// hand-written. The root this client later signs over is therefore computed
-/// from the same bytes the node would have sent as SSZ.
+/// It is also cheap to get right here. An `Attestation` is four fields, and
+/// the two bitfields arrive as hex of their exact SSZ encoding, so they decode
+/// through SSZ rather than through anything hand-written. The root this client
+/// later signs over is therefore computed from the same bytes the node would
+/// have sent as SSZ.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationDto {
     pub aggregation_bits: String,
