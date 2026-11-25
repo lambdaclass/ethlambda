@@ -23,7 +23,9 @@
 //! Some duties end as neither, as the unlabelled series in [`crate::metrics`]
 //! count them: a duty doppelganger protection withholds (dropped before any
 //! service sees it), an attestation for a key the keymanager deleted since the
-//! schedule was fetched, a sync committee message or payload vote already
+//! schedule was fetched (once the slot's attestation data was fetched: the
+//! held keys are read after it, so a failed fetch counts every duty of the
+//! slot as failed), a sync committee message or payload vote already
 //! served this slot, a sync committee message not signed over an optimistic
 //! head, a payload vote for a slot the node knows no block for, and a blinded
 //! block the node did not confirm. The proposal check below says whether that
@@ -52,7 +54,14 @@
 //! `sum without (validator)` is always the whole client's count. Lighthouse
 //! caps its validator monitor's per-validator series at the same 64. Which
 //! validators get a label depends on which had a duty first, so it can differ
-//! from one run to the next once more than the cap are loaded.
+//! from one run to the next once more than the cap are loaded. A label is
+//! never given back: a key the keymanager deletes keeps its own, and once the
+//! cap is taken, a key imported later is counted under `other` until the
+//! client restarts.
+//!
+//! A validator's children of every series are created at zero when it takes
+//! its label, so each outcome after the one that granted it is an increase
+//! `rate()` and `increase()` see, its first `orphaned` included.
 //!
 //! # The epoch summary
 //!
@@ -149,16 +158,25 @@ static PROPOSAL_CHECKS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// Register every series, with its `other` children at zero, so the client's
-/// totals exist from startup. A labelled validator's series appear with its
-/// first outcome. Called from [`crate::metrics::init`].
+/// totals exist from startup. A labelled validator's children are created at
+/// zero when it takes its label (see [`Performance::label`]). Called from
+/// [`crate::metrics::init`].
 pub(crate) fn init() {
+    create_children(OTHER);
+}
+
+/// Create `validator`'s child of every series at zero, so that its first
+/// `failed` or `orphaned` is an increase `rate()` and `increase()` see rather
+/// than the starting value of a new series, which they read as a baseline.
+fn create_children(validator: &str) {
     for duty in Duty::ALL {
         for outcome in Outcome::ALL {
-            duty.series().with_label_values(&[OTHER, outcome.as_str()]);
+            duty.series()
+                .with_label_values(&[validator, outcome.as_str()]);
         }
     }
     for check in ProposalCheck::ALL {
-        PROPOSAL_CHECKS_TOTAL.with_label_values(&[OTHER, check.as_str()]);
+        PROPOSAL_CHECKS_TOTAL.with_label_values(&[validator, check.as_str()]);
     }
 }
 
@@ -350,12 +368,22 @@ impl Performance {
     /// `validator`'s own label, or `None` when it is counted under `other`.
     ///
     /// A validator holding one keeps it; one that does not takes the next
-    /// free one, while any is left.
+    /// free one, while any is left, and its children of every series are
+    /// created at zero then. The outcome that granted the label is counted
+    /// right after, so that first one still appears as the series' starting
+    /// value; every later one is an increase.
     fn label(&self, validator: ValidatorIndex) -> Option<String> {
         let mut labelled = lock(&self.labelled);
-        let holds = labelled.contains(&validator)
-            || (labelled.len() < self.cap && labelled.insert(validator));
-        holds.then(|| validator.to_string())
+        if labelled.contains(&validator) {
+            return Some(validator.to_string());
+        }
+        if labelled.len() >= self.cap {
+            return None;
+        }
+        labelled.insert(validator);
+        let label = validator.to_string();
+        create_children(&label);
+        Some(label)
     }
 
     /// Count `count` outcomes, `validator`'s or, for `None`, those of
@@ -614,11 +642,13 @@ pub(crate) async fn check_proposal_at<B: BeaconNodeApi>(
 mod tests {
     use super::*;
     use crate::attestation::AttestationService;
-    use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, encode_hex};
+    use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, SyncDutyDto, encode_hex};
+    use crate::beacon_node::fallback::FallbackBeaconNode;
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::proposal::ProposalService;
     use crate::signing::SigningContext;
     use crate::slashing_protection::SlashingProtection;
+    use crate::sync_committee::SyncCommitteeService;
     use crate::test_support::{settings, store_with_keys};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::preset::slots_per_epoch;
@@ -673,6 +703,47 @@ mod tests {
         }
         assert_eq!(performance.label(9).as_deref(), Some("9"));
         assert_eq!(performance.label(150), None);
+    }
+
+    /// The value of `validator`'s child of the series `family` whose other
+    /// label is `value`, or `None` when no such child exists.
+    fn child(family: &str, validator: &str, value: &str) -> Option<u64> {
+        ethlambda_metrics::gather()
+            .iter()
+            .filter(|found| found.name() == family)
+            .flat_map(|found| found.get_metric())
+            .find(|metric| {
+                let labels = metric.get_label();
+                let holds = |name: &str, wanted: &str| {
+                    labels
+                        .iter()
+                        .any(|label| label.name() == name && label.value() == wanted)
+                };
+                holds("validator", validator) && (holds("outcome", value) || holds("result", value))
+            })
+            .map(|metric| metric.get_counter().value() as u64)
+    }
+
+    /// A validator's children of every series exist at zero from the moment
+    /// it takes its label, so its first `failed` or `orphaned` after that is
+    /// an increase rather than a new series' starting value. One past the cap
+    /// gets none.
+    #[test]
+    fn a_labelled_validators_series_start_at_zero() {
+        // Indices no other test records: the series are process-wide.
+        let (labelled, unlabelled) = (987_654, 987_655);
+        let performance = Performance::new(1);
+        performance.record(Duty::Attestation, 96, labelled, Outcome::Published);
+        performance.record(Duty::Attestation, 96, unlabelled, Outcome::Published);
+
+        let (labelled, unlabelled) = (labelled.to_string(), unlabelled.to_string());
+        let attestations = "ethlambda_validator_attestation_outcomes_total";
+        assert_eq!(child(attestations, &labelled, "published"), Some(1));
+        assert_eq!(child(attestations, &labelled, "failed"), Some(0));
+        let checks = "ethlambda_validator_proposal_checks_total";
+        assert_eq!(child(checks, &labelled, "orphaned"), Some(0));
+        assert_eq!(child(attestations, &unlabelled, "published"), None);
+        assert_eq!(child(checks, &unlabelled, "orphaned"), None);
     }
 
     /// A batch counts each validator once: what the service resolved as it
@@ -798,6 +869,45 @@ mod tests {
         assert_eq!(attestations(12), Some(counts(0, 1)));
         assert_eq!(attestations(13), Some(counts(0, 1)));
         assert_eq!(attestations(14), None, "not held, so not attempted");
+    }
+
+    /// Through the sync committee service and the fallback the client always
+    /// talks through: a head every node reports optimistic signs nothing and
+    /// counts as neither, while every node down counts the member failed.
+    #[tokio::test]
+    async fn an_optimistic_head_through_the_fallback_is_no_failed_sync_committee_message() {
+        let (store, pubkeys) = store_with_keys(1);
+        let store = RwLock::new(store);
+        let performance = Arc::new(Performance::new(LABELLED_VALIDATORS));
+        let slot = 3200;
+        let epoch = compute_epoch_at_slot(slot);
+        let duties = [SyncDutyDto {
+            pubkey: encode_hex(&pubkeys[0].0),
+            validator_index: 21,
+            validator_sync_committee_indices: vec![3],
+        }];
+        let service = |node: MockBeaconNode| {
+            let fallback = FallbackBeaconNode::new(vec![node]);
+            SyncCommitteeService::new(Arc::new(fallback), context())
+                .with_performance(performance.clone())
+        };
+
+        let mut optimistic = MockBeaconNode::new().with_head_root(Root::repeat_byte(7));
+        optimistic.head_optimistic = true;
+        let signed_over = service(optimistic)
+            .publish_messages(slot, &duties, &store)
+            .await
+            .expect("not an error");
+        assert_eq!(signed_over, None);
+        assert_eq!(performance.tally(epoch, Some(21)), None, "neither");
+
+        let down = MockBeaconNode::new().failing_call("head_block_root", "node down");
+        service(down)
+            .publish_messages(slot, &duties, &store)
+            .await
+            .expect_err("every node failed");
+        let tally = performance.tally(epoch, Some(21)).expect("counted");
+        assert_eq!(tally.sync_committee_messages, counts(0, 1));
     }
 
     /// Through the proposal service and a mock node: a block the node took is

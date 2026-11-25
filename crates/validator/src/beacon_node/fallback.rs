@@ -688,9 +688,47 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
 
     /// An optimistic head is an error from each implementation, so a node
     /// tracking an unvalidated head is walked past rather than signed over.
+    ///
+    /// Not a plain `try_each`, which would turn every node answering
+    /// `BeaconNodeSyncing` into `AllBeaconNodesFailed`, and the sync
+    /// committee service would then count a head nothing may be signed over
+    /// as a missed duty. The rule is [`Self::is_optimistic_or_syncing`]'s:
+    /// the first root wins, and when no node gives one but at least one said
+    /// it is optimistic or syncing, the answer is `BeaconNodeSyncing`, even
+    /// if the others failed outright.
     async fn head_block_root(&self) -> Result<Root> {
-        self.try_each("head_block_root", |node| node.head_block_root())
-            .await
+        let mut last = None;
+        let mut syncing = false;
+        for (position, node) in self.nodes.iter().enumerate() {
+            match node.head_block_root().await {
+                Ok(root) => return Ok(root),
+                Err(Error::BeaconNodeSyncing) => {
+                    syncing = true;
+                    debug!(
+                        position,
+                        "Beacon node head is optimistic or the node is syncing; trying the next"
+                    );
+                }
+                Err(err) => {
+                    debug!(what = "head_block_root", position, %err, "Beacon node request failed; trying the next");
+                    last = Some(err);
+                }
+            }
+        }
+
+        // The caller says so itself, without calling it a missed duty.
+        if syncing {
+            return Err(Error::BeaconNodeSyncing);
+        }
+
+        let detail = last
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "no nodes configured".to_string());
+        warn!(
+            what = "head_block_root",
+            %detail, "All configured beacon nodes failed; duty likely missed"
+        );
+        Err(Error::AllBeaconNodesFailed(detail))
     }
 
     // Quiet: the proposal check is no duty, and it logs and counts a failure
@@ -1362,6 +1400,32 @@ mod tests {
             fallback.head_block_root().await.expect("second answers"),
             Root::repeat_byte(2)
         );
+    }
+
+    /// No root anywhere, and a node said why: that is the answer, whatever
+    /// the rest did, so the caller can tell it from every node being down.
+    #[tokio::test]
+    async fn an_optimistic_head_with_no_root_elsewhere_is_syncing_not_a_failure() {
+        let optimistic = || {
+            let mut node = MockBeaconNode::new().with_head_root(Root::repeat_byte(1));
+            node.head_optimistic = true;
+            node
+        };
+        let down = || MockBeaconNode::new().failing_call("head_block_root", "node down");
+
+        for nodes in [vec![optimistic(), optimistic()], vec![down(), optimistic()]] {
+            let err = FallbackBeaconNode::new(nodes)
+                .head_block_root()
+                .await
+                .expect_err("no root");
+            assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        }
+
+        let err = FallbackBeaconNode::new(vec![down(), down()])
+            .head_block_root()
+            .await
+            .expect_err("no root");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
     }
 
     #[tokio::test]

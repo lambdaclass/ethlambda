@@ -998,17 +998,23 @@ message, and as `failed` otherwise: the node refused it or did not answer, the
 signature failed, slashing protection refused it, or the duty ran past its
 deadline. What the unlabelled series count as neither is neither here too: a
 duty doppelganger protection withholds, an attestation for a key deleted since
-the schedule was fetched, a sync committee message over an optimistic head, a
-payload vote for a slot the node knows no block for, and a blinded block the
-node did not confirm.
+the schedule was fetched (once the slot's attestation data was fetched; a
+failed fetch counts every duty of the slot `failed`), a sync committee message
+when no beacon node has a head that is not optimistic, a payload vote for a
+slot the node knows no block for, and a blinded block the node did not confirm.
 
 The label is the validator's index for the first 64 validators an outcome is
 recorded for, which keep it for the life of the process, and `other` for every
 validator after them. A client with thousands of keys therefore has at most 65
 series per outcome, and `sum without (validator) (...)` is always the client's
-total. The `other` series exist from startup; a validator's own appear with its
-first outcome. Past 64 keys, which validators get their own label depends on
-which had a duty first, so it can change from one run to the next.
+total. The `other` series exist from startup. A validator's own are all created
+at zero when it takes its label, with its first outcome, so every outcome after
+that one is an increase `rate()` and `increase()` see; the first is the series'
+starting value. Past 64 keys, which validators get their own label depends on
+which had a duty first, so it can change from one run to the next. A label is
+never given back: a key the keymanager deletes keeps its own, and once 64
+validators have had one, a key imported later is counted under `other` until
+the client restarts.
 
 A batch a node accepted only in part is counted under `other`: its accepted part
 as `published`, the rest as `failed`. The node's answer names the positions it
