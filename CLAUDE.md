@@ -1004,7 +1004,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   with the lookahead, so `ahead_of_block` asks for nothing then, and only the
   first slot served (no schedule held) refreshes in front of a block, uncut,
   so a hung first node cannot keep it from failing over. A refresh that finds
-  the node syncing or optimistic stops proposals until one gets through. Builder
+  the node syncing or optimistic stops proposals until one gets through.
+  Between refreshes, every slot from fulu re-asks v2 proposer duties for this
+  epoch and the next (`follow_dependent_roots`), whose root is the attester
+  and PTC schedules' too, and refetches those (and resubscribes) only when a
+  reorg moved it; no `head` event stream is read. Builder
   registrations and proposer preferences sign through the same path
   (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
   `Web3Signer::normalize_url`'s rendering of its URL, which is what requests

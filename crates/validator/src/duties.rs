@@ -3,7 +3,9 @@
 //! Holds one epoch's attester duties at a time, plus a lookahead epoch, and
 //! discards them when the beacon node reports a different `dependent_root`: a
 //! reorg deeper than `MIN_SEED_LOOKAHEAD` changes the committee shuffling, and
-//! acting on the old schedule would attest from the wrong committee.
+//! acting on the old schedule would attest from the wrong committee. From
+//! fulu those roots are checked every slot, not only at each epoch's refresh
+//! (see [`DutiesService::follow_dependent_root`]).
 //!
 //! Proposer duties are held alongside them, in a separate map and on
 //! deliberately different terms:
@@ -96,6 +98,19 @@ struct EpochDuties<T> {
     duties: Vec<T>,
 }
 
+/// The v2 root an epoch's attester and payload committee schedules were last
+/// checked against (see [`DutiesService::follow_dependent_root`]).
+#[derive(Debug, Clone, Copy)]
+struct Followed {
+    root: Root,
+    /// Whether the checks are done with this root: the schedules hold it, or
+    /// a second refetch for it answered off it too, as a node whose roots
+    /// disagree for good does. Until then each check refetches, so a refetch
+    /// answered from before the reorg (a fallback node that had not caught up,
+    /// say) is made again rather than taken as the node's last word.
+    settled: bool,
+}
+
 pub struct DutiesService<B> {
     beacon_node: Arc<B>,
     /// Validator indices this client signs for, resolved from public keys.
@@ -124,6 +139,11 @@ pub struct DutiesService<B> {
     /// lose it, since the next attempt fetches the same root and reports no
     /// change. Kept here, the move waits for whoever sends the subscriptions.
     attesters_moved: bool,
+    /// The v2 proposer duties root each epoch's attester and payload
+    /// committee schedules were last checked against by
+    /// [`Self::follow_dependent_root`], recorded only once the refetches that
+    /// check called for answered.
+    followed: HashMap<Epoch, Followed>,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -142,6 +162,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             sync: HashMap::new(),
             indices_grown: 0,
             attesters_moved: false,
+            followed: HashMap::new(),
             warned_no_indices: false,
         }
     }
@@ -247,17 +268,32 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             // per epoch would make the log read as two separate faults.
             return Ok(());
         }
+        self.fetch_proposers(epoch, version).await.map(|_| ())
+    }
 
+    /// [`Self::refresh_proposers`] with indices resolved, returning the
+    /// `dependent_root` the node answered with.
+    async fn fetch_proposers(
+        &mut self,
+        epoch: Epoch,
+        version: ProposerDutiesVersion,
+    ) -> Result<Root> {
         let fetched = match version {
             ProposerDutiesVersion::V1 => self.beacon_node.proposer_duties(epoch).await?,
             ProposerDutiesVersion::V2 => self.beacon_node.proposer_duties_v2(epoch).await?,
         };
+        let root = fetched.dependent_root;
 
-        let unchanged = self.proposers.get(&epoch).is_some_and(|held| {
-            held.dependent_root == fetched.dependent_root && held.indices_seen == self.indices_grown
-        });
-        if unchanged {
-            return Ok(());
+        match self.proposers.get(&epoch) {
+            Some(held) if held.dependent_root != root => warn!(
+                %epoch,
+                held = %hex::encode(&held.dependent_root.0[..4]),
+                fetched = %hex::encode(&root.0[..4]),
+                "Proposer duties invalidated by a reorg; replacing the schedule"
+            ),
+            // The same root: kept, unless a validator was added since.
+            Some(held) if held.indices_seen == self.indices_grown => return Ok(root),
+            _ => {}
         }
 
         // The genesis slot is dropped along with other validators' entries.
@@ -293,12 +329,84 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         self.proposers.insert(
             epoch,
             EpochDuties {
-                dependent_root: fetched.dependent_root,
+                dependent_root: root,
                 indices_seen: self.indices_grown,
                 duties: mine,
             },
         );
-        Ok(())
+        Ok(root)
+    }
+
+    /// Check `epoch`'s held schedules against the node's v2 proposer duties,
+    /// refetching the attester schedule, and the payload committee one when
+    /// `ptc` is set, if a reorg moved the block they depend on. Returns
+    /// whether the attester schedule moved, which owes the node this client's
+    /// subnet subscriptions again.
+    ///
+    /// Only for an epoch whose proposers are fixed a whole epoch ahead (see
+    /// [`ProposerDutiesVersion`]), and `ptc` only for a gloas epoch other than
+    /// the fork's own, whose committee has a dependent root of its own.
+    ///
+    /// # One cheap request standing in for three
+    ///
+    /// v2's `dependent_root` for an epoch is the last block before the epoch
+    /// before it, which is the attester and payload committee schedules'
+    /// root too (beacon-APIs `attester.yaml`, `ptc.yaml`, `proposer.v2.yaml`).
+    /// A node answers it from the state's `proposer_lookahead`, where the
+    /// other two walk the epoch's committees. So the duty loop asks for this
+    /// one every slot and fetches the others only when it says they moved,
+    /// as Lighthouse asks for a few validators' attester duties first.
+    ///
+    /// # When a root counts as moved
+    ///
+    /// When it differs from the one the schedule is held with *and* from the
+    /// v2 root the checks of this epoch settled on (`followed`). The second
+    /// condition is what stops a node whose roots disagree for any other
+    /// reason from costing a refetch, a full shuffle on some nodes, every
+    /// slot: that node's v2 root does not move, so it is refetched twice at
+    /// most. A real reorg is still caught: it moves the v2 root away from the
+    /// one settled on.
+    ///
+    /// A root is settled on only once the refetches it called for answered,
+    /// so one that failed or was cut off at the slot's end is made again at
+    /// the next check, not dropped because the proposer schedule (replaced
+    /// first) already holds the new root. And only once the schedules hold
+    /// it, or a second refetch for it also answered off it: a refetch
+    /// answered from before the reorg, by a fallback node that had not caught
+    /// up, is made again at the next check.
+    ///
+    /// A schedule not held at all is fetched, so a lookahead fetch that failed
+    /// at the epoch refresh is made good within a slot rather than an epoch.
+    pub async fn follow_dependent_root(&mut self, epoch: Epoch, ptc: bool) -> Result<bool> {
+        if self.indices.is_empty() {
+            return Ok(false);
+        }
+        let followed = self.followed.get(&epoch).copied();
+        let settled = followed.filter(|followed| followed.settled);
+        let previous = settled.map(|followed| followed.root);
+        let root = self
+            .fetch_proposers(epoch, ProposerDutiesVersion::V2)
+            .await?;
+        let stale = |held: Option<Root>| match held {
+            None => true,
+            Some(held) => held != root && previous != Some(root),
+        };
+
+        let mut moved = false;
+        if stale(self.by_epoch.get(&epoch).map(|held| held.dependent_root)) {
+            moved = self.refresh(epoch).await?;
+        }
+        if ptc && stale(self.ptc.get(&epoch).map(|held| held.dependent_root)) {
+            self.refresh_ptc(epoch).await?;
+        }
+
+        let holds = |held: Option<Root>| held == Some(root);
+        let agrees = holds(self.by_epoch.get(&epoch).map(|held| held.dependent_root))
+            && (!ptc || holds(self.ptc.get(&epoch).map(|held| held.dependent_root)));
+        let second = followed.is_some_and(|followed| followed.root == root);
+        let settled = agrees || second;
+        self.followed.insert(epoch, Followed { root, settled });
+        Ok(moved)
     }
 
     /// Fetch `epoch`'s payload timeliness committee duties for this client's
@@ -510,6 +618,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
         self.by_epoch.retain(|epoch, _| *epoch >= current_epoch);
         self.proposers.retain(|epoch, _| *epoch >= current_epoch);
+        self.followed.retain(|epoch, _| *epoch >= current_epoch);
         Ok(changed)
     }
 
@@ -912,6 +1021,215 @@ mod tests {
 
         assert!(service.holds_attesters(4));
         assert!(!service.holds_proposers(4));
+    }
+
+    // ---- following dependent roots between refreshes (#827) -------------
+
+    /// A service holding epoch 3 and its lookahead, refreshed on a fulu chain
+    /// where every schedule of an epoch shares one root: `root(3)` for epoch 3
+    /// and `root(4)` for epoch 4.
+    async fn following(node: &Arc<MockBeaconNode>) -> DutiesService<MockBeaconNode> {
+        for (epoch, slot) in [(3, 96), (4, 130)] {
+            let epoch_root = root(epoch as u8);
+            node.set_duties(epoch, epoch_root, vec![duty(1337, slot, 2)]);
+            node.set_proposers_v2(epoch, epoch_root, vec![proposer(1337, slot + 1)]);
+            node.set_ptc_duties(epoch, epoch_root, vec![ptc_duty(1337, slot + 2)]);
+        }
+        let mut service = DutiesService::new(node.clone(), vec![1337]);
+        service
+            .refresh_around(3, &fulu_config())
+            .await
+            .expect("refreshes");
+        service.refresh_ptc(3).await.expect("ptc 3");
+        service.refresh_ptc(4).await.expect("ptc 4");
+        service
+    }
+
+    /// Roots that have not moved cost the one v2 request and nothing else.
+    #[tokio::test]
+    async fn unmoved_roots_cost_the_proposer_request_alone() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+        let (attesters, ptc, v2) = (
+            node.duties_call_count(),
+            node.ptc_call_count(),
+            node.proposer_duties_v2_call_count(),
+        );
+
+        for epoch in [3, 4] {
+            let moved = service
+                .follow_dependent_root(epoch, true)
+                .await
+                .expect("checks");
+            assert!(!moved);
+        }
+
+        assert_eq!(node.duties_call_count(), attesters);
+        assert_eq!(node.ptc_call_count(), ptc);
+        assert_eq!(node.proposer_duties_v2_call_count(), v2 + 2);
+    }
+
+    /// The lookahead's root moving between two slots of an epoch, as a
+    /// one-slot reorg at the boundary moves it: the next check replaces the
+    /// attester, payload committee and proposer schedules, and reports the
+    /// attester move so the subscriptions are sent again.
+    #[tokio::test]
+    async fn a_moved_root_replaces_the_schedules_within_the_epoch() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+
+        node.set_duties(4, root(9), vec![duty(1337, 140, 5)]);
+        node.set_proposers_v2(4, root(9), vec![proposer(1337, 141)]);
+        node.set_ptc_duties(4, root(9), vec![ptc_duty(1337, 142)]);
+        let moved = service
+            .follow_dependent_root(4, true)
+            .await
+            .expect("checks");
+
+        assert!(moved, "the attester schedule moved");
+        assert!(service.at_slot(130, 4).is_empty(), "the old duty is gone");
+        assert_eq!(service.at_slot(140, 4)[0].committee_index, 5);
+        assert!(service.proposer_at_slot(131, 4).is_none());
+        assert!(service.proposer_at_slot(141, 4).is_some());
+        assert!(service.ptc_at_slot(132, 4).is_empty());
+        assert_eq!(service.ptc_at_slot(142, 4).len(), 1);
+    }
+
+    /// The same for this epoch's schedules, which a reorg deeper than an epoch
+    /// moves: the slot after the check attests from the new schedule.
+    #[tokio::test]
+    async fn a_deep_reorg_replaces_this_epochs_attester_schedule() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+
+        node.set_duties(3, root(8), vec![duty(1337, 100, 7)]);
+        node.set_proposers_v2(3, root(8), Vec::new());
+        assert!(
+            service
+                .follow_dependent_root(3, false)
+                .await
+                .expect("checks")
+        );
+
+        assert!(service.at_slot(96, 3).is_empty());
+        assert_eq!(service.at_slot(100, 3)[0].committee_index, 7);
+        assert!(
+            service.proposer_at_slot(97, 3).is_none(),
+            "this epoch's proposers follow the same root"
+        );
+    }
+
+    /// A refetch a moved root called for that failed is made again by the
+    /// next check. The proposer schedule already holds the new root by then,
+    /// so only the root recorded after a check got through can tell the two
+    /// apart.
+    #[tokio::test]
+    async fn a_refetch_that_failed_is_made_again_by_the_next_check() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+        node.set_duties(4, root(9), vec![duty(1337, 140, 5)]);
+        node.set_proposers_v2(4, root(9), vec![proposer(1337, 141)]);
+
+        node.start_failing("attester_duties", "down");
+        assert!(service.follow_dependent_root(4, false).await.is_err());
+        assert_eq!(service.at_slot(130, 4).len(), 1, "still the old schedule");
+
+        node.stop_failing("attester_duties");
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+        assert!(moved);
+        assert_eq!(service.at_slot(140, 4)[0].committee_index, 5);
+    }
+
+    /// A node whose attester root never matches its v2 root, for whatever
+    /// reason, costs two attester refetches at most, not one every slot: on
+    /// an ethlambda node each is a full shuffle.
+    #[tokio::test]
+    async fn roots_that_disagree_without_moving_are_not_refetched_every_slot() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+        node.set_proposers_v2(4, root(7), vec![proposer(1337, 131)]);
+        let before = node.duties_call_count();
+
+        for _ in 0..2 {
+            service
+                .follow_dependent_root(4, false)
+                .await
+                .expect("checks");
+        }
+        let after_second = node.duties_call_count();
+        assert_eq!(after_second, before + 2, "the second settles it");
+        for _ in 0..3 {
+            service
+                .follow_dependent_root(4, false)
+                .await
+                .expect("checks");
+        }
+
+        assert_eq!(node.duties_call_count(), after_second);
+        assert_eq!(service.at_slot(130, 4).len(), 1, "the schedule is kept");
+    }
+
+    /// A refetch answered from before the reorg, as a fallback node that has
+    /// not caught up answers it, is made again at the next check rather than
+    /// taken as the node's last word.
+    #[tokio::test]
+    async fn a_refetch_answered_from_before_the_reorg_is_made_again() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+        node.set_proposers_v2(4, root(9), vec![proposer(1337, 141)]);
+
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+        assert!(!moved, "the attester answer is still the old one");
+
+        node.set_duties(4, root(9), vec![duty(1337, 140, 5)]);
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+        assert!(moved);
+        assert_eq!(service.at_slot(140, 4)[0].committee_index, 5);
+    }
+
+    /// A lookahead the epoch refresh failed to fetch is fetched by the next
+    /// check, rather than by the next epoch's first slot ahead of its block.
+    #[tokio::test]
+    async fn a_lookahead_the_refresh_missed_is_fetched_by_the_next_check() {
+        // No epoch 4 duties yet: the mock refuses the lookahead.
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(3), vec![duty(1337, 96, 2)])
+                .with_proposers_v2(3, root(3), Vec::new())
+                .with_proposers_v2(4, root(4), Vec::new()),
+        );
+        let mut service = DutiesService::new(node.clone(), vec![1337]);
+        service
+            .refresh_around(3, &fulu_config())
+            .await
+            .expect("this epoch");
+        assert!(!service.holds_attesters(4), "the lookahead failed");
+
+        node.set_duties(4, root(4), vec![duty(1337, 130, 2)]);
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+
+        assert!(moved, "a first schedule is a move for the subscriptions");
+        assert_eq!(service.at_slot(130, 4).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_no_validators_no_root_is_checked() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = DutiesService::new(node.clone(), Vec::new());
+        assert!(!service.follow_dependent_root(4, true).await.expect("idles"));
+        assert_eq!(node.proposer_duties_v2_call_count(), 0);
     }
 
     #[tokio::test]
