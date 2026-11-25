@@ -153,11 +153,8 @@ async fn register(
     // Recorded before the builder is even looked for, as Lighthouse records
     // them: they hold with no builder configured and whatever the builder
     // answers.
-    {
-        let mut recipients = fee_recipients.lock().expect("fee recipient lock poisoned");
-        for (index, registration) in &kept {
-            recipients.insert(*index, registration.message.fee_recipient);
-        }
+    for (index, registration) in &kept {
+        fee_recipients.insert(*index, registration.message.fee_recipient);
     }
     // The builder check comes before the empty one on purpose, so a request
     // whose every validator was dropped is a 500 without a builder and a 200
@@ -400,14 +397,13 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), registrations);
-        let recipients = fee_recipients.lock().unwrap();
         assert_eq!(
-            recipients.get(&0),
-            Some(&ExecutionAddress::repeat_byte(0x11))
+            fee_recipients.prepared(0),
+            Some(ExecutionAddress::repeat_byte(0x11))
         );
         assert_eq!(
-            recipients.get(&1),
-            Some(&ExecutionAddress::repeat_byte(0x11))
+            fee_recipients.prepared(1),
+            Some(ExecutionAddress::repeat_byte(0x11))
         );
     }
 
@@ -430,7 +426,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), [kept]);
-        assert_eq!(fee_recipients.lock().unwrap().len(), 1);
+        assert!(fee_recipients.prepared(0).is_some());
+        assert_eq!(fee_recipients.prepared(2), None);
+        assert_eq!(fee_recipients.prepared((VALIDATORS + 10) as u64), None);
     }
 
     #[tokio::test]
@@ -569,8 +567,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&0),
-            Some(&ExecutionAddress::repeat_byte(0x11))
+            fee_recipients.prepared(0),
+            Some(ExecutionAddress::repeat_byte(0x11))
         );
     }
 
@@ -591,8 +589,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&0),
-            Some(&ExecutionAddress::repeat_byte(0x11))
+            fee_recipients.prepared(0),
+            Some(ExecutionAddress::repeat_byte(0x11))
         );
         // The builder never took it, so block production never asks for it.
         assert_eq!(
@@ -678,8 +676,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&0),
-            Some(&ExecutionAddress::repeat_byte(0x11))
+            fee_recipients.prepared(0),
+            Some(ExecutionAddress::repeat_byte(0x11))
         );
     }
 
@@ -769,8 +767,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(relay.registrations(), [newest, other]);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&0),
-            Some(&ExecutionAddress::repeat_byte(0x33))
+            fee_recipients.prepared(0),
+            Some(ExecutionAddress::repeat_byte(0x33))
         );
     }
 
@@ -897,7 +895,7 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let recipient = || fee_recipients.lock().unwrap().get(&0).copied();
+        let recipient = || fee_recipients.prepared(0);
         let prepared = ExecutionAddress::repeat_byte(0xab);
         let registered = ExecutionAddress::repeat_byte(0x11);
 
