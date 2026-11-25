@@ -17,8 +17,9 @@
 //!
 //! The primitive takes the layer as a slice and writes digests to an output
 //! slice, so a backend that hashes several independent messages per instruction
-//! (AVX2 or AVX-512 lanes, or SHA-NI interleaved) replaces the loop body of
-//! [`hash_pairs_into`] without changing a caller.
+//! replaces the loop body of [`hash_pairs_into`] without changing a caller.
+//! The `hashtree` feature is one: Prysm's kernels, which hash 16 messages per
+//! AVX-512 call or two interleaved per SHA-NI call (see `hashtree_backend`).
 
 use libssz_merkle::ZERO_HASHES;
 use sha2::compress256;
@@ -64,6 +65,10 @@ pub(crate) fn hash_pairs_into(input: &[Hash256], output: &mut [Hash256]) {
         }
         return;
     }
+    #[cfg(feature = "hashtree")]
+    if hashtree_backend::hash_pairs(input, output) {
+        return;
+    }
     let padding = GenericArray::<u8, U64>::clone_from_slice(&PADDING_BLOCK);
     for (pair, out) in input.chunks_exact(2).zip(output.iter_mut()) {
         let mut blocks = [padding, padding];
@@ -73,6 +78,125 @@ pub(crate) fn hash_pairs_into(input: &[Hash256], output: &mut [Hash256]) {
         compress256(&mut state, &blocks);
         for (word, bytes) in state.iter().zip(out.chunks_exact_mut(4)) {
             bytes.copy_from_slice(&word.to_be_bytes());
+        }
+    }
+}
+
+/// Prysm's `hashtree` kernels, which hash many independent 64-byte messages per
+/// call: 16 per AVX-512 call, two interleaved per SHA-NI call, with the
+/// padding block's message schedule precomputed.
+///
+/// On x86 the kernels are called directly, chosen here by CPU, as
+/// `silver_state_hashing` does: whole groups of 16 to AVX-512 and the rest to
+/// SHA-NI. `hashtree_rs::hash` instead goes through one process-wide function
+/// pointer that any other user of the library may install.
+#[cfg(feature = "hashtree")]
+mod hashtree_backend {
+    use crate::Hash256;
+
+    /// Hashes the pairs with a `hashtree` kernel, or answers `false` when no
+    /// kernel suits this CPU, leaving the work to the caller.
+    pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+        if output.is_empty() {
+            return true;
+        }
+        imp::hash_pairs(input, output)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod imp {
+        use std::arch::x86_64::_mm256_zeroupper;
+        use std::sync::LazyLock;
+
+        use crate::Hash256;
+
+        // Linked from the static library `hashtree-rs` builds.
+        use hashtree_rs as _;
+
+        unsafe extern "C" {
+            fn hashtree_sha256_avx512_x16(output: *mut u8, input: *const u8, count: u64);
+            fn hashtree_sha256_shani_x2(output: *mut u8, input: *const u8, count: u64);
+        }
+
+        #[derive(Clone, Copy)]
+        enum Kernel {
+            Avx512ThenShani,
+            Shani,
+            Unsupported,
+        }
+
+        static KERNEL: LazyLock<Kernel> = LazyLock::new(|| {
+            let sha = is_x86_feature_detected!("sha");
+            let avx512 = is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512bw");
+            match (sha, avx512) {
+                (true, true) => Kernel::Avx512ThenShani,
+                (true, false) => Kernel::Shani,
+                (false, _) => Kernel::Unsupported,
+            }
+        });
+
+        /// The AVX-512 kernel takes whole groups of this many messages.
+        const GROUP: usize = 16;
+
+        pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+            let count = output.len();
+            let (out, inp) = (
+                output.as_mut_ptr().cast::<u8>(),
+                input.as_ptr().cast::<u8>(),
+            );
+            match *KERNEL {
+                // SAFETY: `KERNEL` checked the CPU for every kernel each arm
+                // calls; `input` holds `2 * count` nodes, that is `count`
+                // 64-byte messages, and `output` `count` 32-byte digests.
+                Kernel::Avx512ThenShani => unsafe { avx512_then_shani(out, inp, count) },
+                Kernel::Shani => unsafe { hashtree_sha256_shani_x2(out, inp, count as u64) },
+                Kernel::Unsupported => return false,
+            }
+            true
+        }
+
+        #[target_feature(enable = "avx")]
+        unsafe fn avx512_then_shani(output: *mut u8, input: *const u8, count: usize) {
+            let grouped = count / GROUP * GROUP;
+            if grouped > 0 {
+                unsafe { hashtree_sha256_avx512_x16(output, input, grouped as u64) };
+                // The assembly leaves the upper vector state dirty, which
+                // slows every SSE instruction after it until cleared.
+                _mm256_zeroupper();
+            }
+            let rest = (count - grouped) as u64;
+            if rest > 0 {
+                unsafe {
+                    hashtree_sha256_shani_x2(
+                        output.add(32 * grouped),
+                        input.add(64 * grouped),
+                        rest,
+                    )
+                };
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    mod imp {
+        use std::sync::LazyLock;
+
+        use crate::Hash256;
+
+        /// `hashtree` picks its kernel (on aarch64, the SHA2 instructions)
+        /// into a global pointer on first use; this sets it once, before any
+        /// thread hashes.
+        static READY: LazyLock<()> = LazyLock::new(|| {
+            hashtree_rs::init();
+        });
+
+        pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+            LazyLock::force(&READY);
+            let count = output.len();
+            hashtree_rs::hash(output.as_flattened_mut(), input.as_flattened(), count);
+            true
         }
     }
 }
@@ -171,7 +295,9 @@ mod tests {
 
     #[test]
     fn batched_pairs_match_hash_nodes() {
-        for pairs in [0usize, 1, 2, 3, 7, 255, 256, 257, 1000, 5000] {
+        // Every size up to three AVX-512 groups and a SHA-NI remainder, then
+        // the scratch-buffer edges of `hash_layer`.
+        for pairs in (0usize..=49).chain([255, 256, 257, 1000, 5000]) {
             let input = nodes(pairs as u64 + 1, 2 * pairs);
             let mut out = vec![[0u8; 32]; pairs];
             hash_pairs_into(&input, &mut out);
