@@ -317,10 +317,25 @@ static SLOTS_SKIPPED_SYNCING_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Set on every scrape from the same report `/health` answers with. See
+/// `crate::client_health`.
 static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_beacon_node_available",
-        "1 when a beacon node answered the last duty refresh or attestation"
+        "1 when at least one beacon node answered its latest sync probe neither syncing nor \
+         optimistic"
+    )
+    .unwrap()
+});
+
+/// What `/health` answers, as a series: 1 for its `200`, 0 for its `503`.
+/// Set on every scrape from the same report, so an alert on it and a probe of
+/// the endpoint cannot disagree. See `crate::client_health`.
+static HEALTHY: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_healthy",
+        "1 when /health answers 200: the client has started, a beacon node is usable and the \
+         last slashing-protection write went through"
     )
     .unwrap()
 });
@@ -499,6 +514,7 @@ pub fn init() {
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
     LazyLock::force(&SLOTS_SKIPPED_SYNCING_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
+    LazyLock::force(&HEALTHY);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
@@ -647,6 +663,10 @@ pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
 }
 
+pub fn set_healthy(healthy: bool) {
+    HEALTHY.set(i64::from(healthy));
+}
+
 pub fn set_doppelganger_detecting(count: u64) {
     DOPPELGANGER_DETECTING.set(count as i64);
 }
@@ -683,16 +703,25 @@ pub fn observe_publication_delay(seconds: f64) {
     PUBLICATION_DELAY_SECONDS.observe(seconds);
 }
 
-/// A Prometheus endpoint for this process.
+/// A Prometheus endpoint for this process, and `/health`, both answered from
+/// `health`.
 ///
 /// Deliberately not `ethlambda-rpc`'s router: reaching that would put the
 /// blockchain and storage crates, and RocksDB with them, on a process that
 /// only signs attestations.
-pub fn router() -> axum::Router {
+pub fn router(health: std::sync::Arc<crate::client_health::ClientHealth>) -> axum::Router {
+    use std::sync::Arc;
+
+    use axum::extract::State;
     use axum::response::IntoResponse;
     use axum::routing::get;
 
-    async fn serve() -> impl IntoResponse {
+    use crate::client_health::ClientHealth;
+
+    async fn serve(State(health): State<Arc<ClientHealth>>) -> impl IntoResponse {
+        // The gauges that mirror `/health`, from the report it would answer
+        // now, before the series are read.
+        crate::client_health::publish(&health.report());
         match ethlambda_metrics::gather_default_metrics() {
             Ok(body) => (
                 [(
@@ -709,14 +738,16 @@ pub fn router() -> axum::Router {
         }
     }
 
-    async fn health() -> impl IntoResponse {
-        (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            r#"{"status":"healthy","service":"ethlambda-validator"}"#,
-        )
+    /// `200` when the client can do its duties, `503` when it cannot or has
+    /// not started yet, with the checks behind the answer. See
+    /// `crate::client_health`.
+    async fn report(State(health): State<Arc<ClientHealth>>) -> impl IntoResponse {
+        let report = health.report();
+        (report.status_code(), axum::Json(report))
     }
 
     axum::Router::new()
         .route("/metrics", get(serve))
-        .route("/health", get(health))
+        .route("/health", get(report))
+        .with_state(health)
 }
