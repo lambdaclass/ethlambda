@@ -666,6 +666,8 @@ on one host share a clock, so between the two only a split setup is caught.
   second it names, less the midpoint of the round trip; answers slower than a
   second are not used. A node is warned about once the median of its last three
   samples is 2 s or more off, which is as fine as a one-second header can tell.
+  A sample is read for six slots, so a node that stops sending a usable `Date`
+  loses its estimate rather than keeping an old one.
 - **Slots.** A `head_slot` more than one slot past this client's wall slot
   means this client's clock is behind, as Lighthouse checks. A node that
   reports a nonzero `sync_distance` and is not syncing also gives its own wall
@@ -675,9 +677,10 @@ on one host share a clock, so between the two only a split setup is caught.
   is read.) A node that sends no `Date` gets this check alone.
 - **Steps.** Each pass of the duty loop compares how far the wall clock moved
   with how far the monotonic clock did. A step of half a second or more is
-  logged and counted on `ethlambda_validator_clock_steps_total`: back, the loop
-  waits for the wall clock to reach the next slot again; forward, the slots
-  stepped over are lost. A loop back more than a slot late with no step (a duty
+  logged and counted on `ethlambda_validator_clock_steps_total`: back before
+  the slot served, the loop waits for the wall clock to reach the next slot
+  again; forward past the next slot, the slots stepped over are lost; within
+  those, only the next boundary moves. A loop back more than a slot late with no step (a duty
   overran, or the process was paused) is logged too.
 
 The warnings name the node by its position in `--beacon-nodes`, from 0, and

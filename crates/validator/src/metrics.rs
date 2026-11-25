@@ -737,6 +737,13 @@ pub fn set_beacon_node_clock_offset(position: usize, seconds: f64) {
         .set(seconds);
 }
 
+/// Drop the node at `position`'s clock offset series: it did not answer the
+/// probe the check read.
+pub fn clear_beacon_node_clock_offset(position: usize) {
+    // An error only says there was no series yet.
+    let _ = BEACON_NODE_CLOCK_OFFSET_SECONDS.remove_label_values(&[position.to_string().as_str()]);
+}
+
 pub fn inc_clock_steps() {
     CLOCK_STEPS_TOTAL.inc();
 }

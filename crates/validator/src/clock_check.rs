@@ -64,6 +64,12 @@ const SKEW_THRESHOLD_SECS: f64 = 2.0;
 /// and still report within three slots.
 const SAMPLES: usize = 3;
 
+/// How many slots a `Date` sample is read for: twice the span [`SAMPLES`]
+/// take. A slow round trip or two leaves the estimate standing, and a node
+/// that stops sending a usable `Date` loses it within this many slots, rather
+/// than keeping an old skew warned about and on its gauge for good.
+const SAMPLE_SLOTS: Slot = 2 * SAMPLES as Slot;
+
 /// The longest round trip a `Date` sample is kept from. The node wrote the
 /// header somewhere inside the round trip, so half of it bounds that error;
 /// with the header's own half second, a kept sample is within a second of the
@@ -286,7 +292,7 @@ pub struct Reading {
     /// zero.
     pub offset: f64,
     /// The median of the node's last [`SAMPLES`] `Date` samples, once that
-    /// many are kept.
+    /// many are kept from the last [`SAMPLE_SLOTS`] slots.
     pub date_offset: Option<f64>,
     /// The slot comparison, when it shows the clocks apart.
     pub slots: Option<SlotSkew>,
@@ -316,8 +322,9 @@ enum Report {
 /// One node's clock across probes.
 #[derive(Debug, Default)]
 struct NodeClock {
-    /// The last [`SAMPLES`] `Date` samples kept, oldest first.
-    samples: VecDeque<f64>,
+    /// The last [`SAMPLES`] `Date` samples kept, oldest first, each with the
+    /// slot of the probe it came from.
+    samples: VecDeque<(Slot, f64)>,
     /// The slot of the last warning about this node.
     warned_at: Option<Slot>,
     /// A warning was logged and no agreement since.
@@ -325,18 +332,24 @@ struct NodeClock {
 }
 
 impl NodeClock {
-    fn keep(&mut self, sample: f64) {
+    fn keep(&mut self, slot: Slot, sample: f64) {
         if self.samples.len() == SAMPLES {
             self.samples.pop_front();
         }
-        self.samples.push_back(sample);
+        self.samples.push_back((slot, sample));
+    }
+
+    /// Drop the samples more than [`SAMPLE_SLOTS`] older than `slot`.
+    fn forget_before(&mut self, slot: Slot) {
+        let oldest = slot.saturating_sub(SAMPLE_SLOTS);
+        self.samples.retain(|&(taken, _)| taken >= oldest);
     }
 
     fn estimate(&self) -> Option<f64> {
         if self.samples.len() < SAMPLES {
             return None;
         }
-        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        let mut sorted: Vec<f64> = self.samples.iter().map(|&(_, sample)| sample).collect();
         sorted.sort_by(f64::total_cmp);
         sorted.get(SAMPLES / 2).copied()
     }
@@ -381,12 +394,15 @@ impl ClockWatch {
 
     /// Read the probes taken for `slot`, every node's in command-line order (a
     /// [`crate::beacon_node::health::NodeHealth::snapshot`]): set each
-    /// answering node's gauge, and warn about each node whose clock disagrees
-    /// with this client's, at most once an epoch.
+    /// answering node's gauge and drop the others', and warn about each node
+    /// whose clock disagrees with this client's, at most once an epoch.
     pub fn observe(&mut self, slot: Slot, probes: &[Option<Probe>]) {
         self.nodes.resize_with(probes.len(), NodeClock::default);
         for (position, probe) in probes.iter().enumerate() {
+            // A node that did not answer has no offset to report: its series
+            // goes, rather than keeping a value nothing current supports.
             let Some(reading) = self.read(position, slot, probe.as_ref()) else {
+                crate::metrics::clear_beacon_node_clock_offset(position);
                 continue;
             };
             crate::metrics::set_beacon_node_clock_offset(position, reading.offset);
@@ -418,8 +434,9 @@ impl ClockWatch {
             .date
             .and_then(|date| date_offset(probe.at, reply.received, date));
         if let Some(sample) = sample {
-            node.keep(sample);
+            node.keep(slot, sample);
         }
+        node.forget_before(slot);
         let date_offset = node.estimate();
         let slots = compare_slots(&self.clock, status, probe.at, reply.received);
         // The estimate, held to what the slots prove when they disagree with
@@ -521,7 +538,13 @@ impl StepWatch {
             }) => {
                 crate::metrics::inc_clock_steps();
                 let step_seconds = format!("{seconds:+.1}");
-                if seconds > 0.0 {
+                // What the step does to the slots: forward past the next one,
+                // the ones between are lost; back before the one served, the
+                // loop waits for it again. Inside those bounds it only moves
+                // the next boundary by its size.
+                let skipped = wall_slot.is_some_and(|wall| wall > served.saturating_add(1));
+                let went_back = wall_slot.is_none_or(|wall| wall < served);
+                if seconds > 0.0 && skipped {
                     warn!(
                         %served,
                         ?wall_slot,
@@ -529,13 +552,21 @@ impl StepWatch {
                         "Wall clock stepped forward: duties go to the slot it now reads, and the \
                          slots it jumped over are lost"
                     );
-                } else {
+                } else if seconds < 0.0 && went_back {
                     warn!(
                         %served,
                         ?wall_slot,
                         %step_seconds,
                         "Wall clock stepped back: duties wait until it reaches the slot after the \
                          one served"
+                    );
+                } else {
+                    warn!(
+                        %served,
+                        ?wall_slot,
+                        %step_seconds,
+                        "Wall clock stepped, within the slot served or into the next: no slot is \
+                         lost, and the next boundary moves by the step"
                     );
                 }
             }
@@ -726,10 +757,40 @@ mod tests {
     #[test]
     fn one_bad_sample_does_not_flag_a_node() {
         let mut node = NodeClock::default();
-        for sample in [0.1, 30.0, -0.2] {
-            node.keep(sample);
+        for (slot, sample) in [(1, 0.1), (2, 30.0), (3, -0.2)] {
+            node.keep(slot, sample);
         }
         assert_eq!(node.estimate(), Some(0.1));
+    }
+
+    /// A node that stops sending a `Date` loses its estimate once its samples
+    /// are more than [`SAMPLE_SLOTS`] old, so an old skew is not warned about
+    /// for good; until then the estimate stands.
+    #[test]
+    fn an_estimate_from_old_samples_is_dropped() {
+        let mut watch = ClockWatch::new(clock());
+        watch.nodes.resize_with(1, NodeClock::default);
+        for slot in 10..13 {
+            let reading = watch.read(0, slot, Some(&probe(slot, 3_000, 0)));
+            assert_eq!(reading.expect("answered").is_skewed(), slot == 12);
+        }
+        let dateless = |slot| {
+            let mut probe = probe(slot, 3_000, 0);
+            probe.reply = probe.reply.map(|reply| Reply {
+                date: None,
+                ..reply
+            });
+            probe
+        };
+        let last_read = 10 + SAMPLE_SLOTS;
+        let held = watch.read(0, last_read, Some(&dateless(last_read)));
+        assert!(held.expect("answered").date_offset.is_some());
+        let next = last_read + 1;
+        let dropped = watch
+            .read(0, next, Some(&dateless(next)))
+            .expect("answered");
+        assert_eq!(dropped.date_offset, None);
+        assert!(!dropped.is_skewed());
     }
 
     /// A node whose answers carry no `Date` is read by the slot comparison
