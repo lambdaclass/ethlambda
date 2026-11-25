@@ -111,6 +111,17 @@ needless `seq` bump would send every peer back for an identical record.
 The writer holds the node key the record is signed with, so it stays inside the
 p2p crate; the RPC server gets only the read side.
 
+The record starts each boot at `seq` = the current time in milliseconds, not at
+a constant. A peer identifies a record by (node id, seq) and takes a replacement
+only at a strictly higher `seq`, so a restart that began again from a constant
+would serve a record behind the one peers cached from the previous run (which
+IP voting and every boundary bumped), and they would keep the cached copy, stale
+`eth2`, address and all. The same goes for an upgrade that changes which entries
+the record carries. Nothing is persisted, so the clock is the floor: the
+previous run would have had to edit its record more than once per millisecond of
+uptime to pass it. A clock stepped back past the previous run's last edit is the
+one case it does not cover.
+
 ## Which peers get dialed
 
 A discovered peer is admitted only if:
@@ -289,24 +300,6 @@ another network's infrastructure is a configuration mistake, and the unbounded
 redial is what keeps a devnet's own bootnode reachable across its restarts.
 Splitting the flag into initial peers, dialed once, and bootnodes, seeded into
 discv5, is the real fix and is left to a follow-up.
-
-### An upgrade's new ENR entries are invisible to peers that stayed up
-
-The record is signed at ethrex's `INITIAL_ENR_SEQ`, a constant. A peer
-identifies a record by (node id, seq) and accepts a replacement only at a
-strictly higher seq, and ethrex's WHOAREYOU responder does not even send the
-record when the requester's `enr_seq` already matches. So when an ethlambda
-release changes which entries it publishes, as adding `tcp` did, a peer holding
-the previous record under the same seq keeps it: the new entries reach only
-peers that meet this node for the first time.
-
-A fixed local floor above `INITIAL_ENR_SEQ` does not close this. ethrex re-signs
-the record at `seq + 1` whenever discv5's IP voting moves the advertised
-address, so a node behind NAT may already be serving a seq above any constant
-the code could pick, which is exactly the case the floor was meant to cover.
-Closing it needs a seq that grows without bound across restarts: a persisted
-counter bumped on every content change, or one derived from the wall clock at
-startup, which is what several beacon clients do.
 
 ### One lean devnet is not separated from another
 
