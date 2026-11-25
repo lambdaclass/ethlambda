@@ -40,9 +40,10 @@ fn backend() -> &'static Backend {
 }
 
 /// Makes every proof of this process a leanVM proof, made and checked in
-/// process, after starting leanVM's prover pool (seconds). Call once, at
-/// startup, before anything proves or verifies: whichever backend is first
-/// used stays for the life of the process.
+/// process, after starting leanVM's prover pool and passing its self-check
+/// (about a second). Call once, at startup, before anything proves or
+/// verifies: whichever backend is first used stays for the life of the
+/// process.
 pub fn install_leanvm(config: leanvm::LeanVmConfig) -> Result<(), leanvm::Error> {
     if BACKEND.get().is_some() {
         return Err(leanvm::Error::AlreadyInstalled);
