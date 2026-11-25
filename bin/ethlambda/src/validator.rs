@@ -46,11 +46,12 @@ pub(crate) struct ValidatorOptions {
 
     /// File holding the keymanager API's bearer token, read in place of
     /// `api-token.txt` in `--validators-dir`. Only read with
-    /// `--enable-keymanager`.
+    /// `--enable-keymanager`; set without it, startup warns.
     ///
     /// Never written or created: a missing file, or one holding fewer than 16
-    /// characters once trimmed, stops the client at startup rather than being
-    /// replaced with a generated token.
+    /// characters once trimmed or anything but visible ASCII (no spaces
+    /// inside), stops the client at startup rather than being replaced with a
+    /// generated token.
     #[arg(long)]
     pub(crate) keymanager_token_file: Option<PathBuf>,
 

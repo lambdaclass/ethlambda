@@ -434,6 +434,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 error!(%err, "Keymanager API stopped");
             }
         }));
+    } else if let Some(path) = &config.keymanager_token_file {
+        // Accepted, like `--keymanager-port`, but worth saying: tooling holding
+        // that token would otherwise find nothing listening and no reason why.
+        warn!(
+            path = %path.display(),
+            "--keymanager-token-file is set without --enable-keymanager; the keymanager API is off and the file is not read"
+        );
     }
 
     // The check runs on its own clock, three quarters into each slot, so a

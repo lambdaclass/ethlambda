@@ -129,15 +129,32 @@ fn load_token_file(path: &Path) -> crate::Result<String> {
         path: path.display().to_string(),
         source,
     })?;
-    let token = checked_token(path, &contents, "write a longer token to it")?;
+    let remedy =
+        format!("write a token of at least {MIN_TOKEN_LEN} visible ASCII characters to it");
+    let token = checked_token(path, &contents, &remedy)?;
     info!(path = %path.display(), "Read the keymanager API token");
     Ok(token)
 }
 
-/// `contents` trimmed, or an error if that is shorter than [`MIN_TOKEN_LEN`].
-/// `remedy` ends the error, telling the operator what to do about it.
+/// `contents` trimmed, or an error if that is not a token a request can
+/// carry, or is shorter than [`MIN_TOKEN_LEN`]. `remedy` ends the error,
+/// telling the operator what to do about it.
 fn checked_token(path: &Path, contents: &str, remedy: &str) -> crate::Result<String> {
     let token = contents.trim();
+    // A request carries the token in its `Authorization` header, which
+    // `require_bearer` reads only as visible ASCII, and a bearer token has no
+    // spaces in it (RFC 6750). A token with anything else would start the
+    // client with a keymanager API no request can authenticate to. Checked
+    // first, so the length below counts characters as well as bytes.
+    if let Some(unusable) = token.chars().find(|c| !c.is_ascii_graphic()) {
+        return Err(Error::Keystore {
+            path: path.display().to_string(),
+            reason: format!(
+                "the API token file holds {unusable:?}, which a bearer token cannot carry \
+                 (only visible ASCII characters, and no spaces inside); {remedy}"
+            ),
+        });
+    }
     if token.len() < MIN_TOKEN_LEN {
         return Err(Error::Keystore {
             path: path.display().to_string(),
@@ -442,6 +459,29 @@ mod token_tests {
             };
             assert!(reason.contains("below the"), "should say why: {reason}");
             assert!(!reason.contains("delete"), "wrong remedy: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_supplied_token_no_request_could_carry_is_refused() {
+        // Long enough, but `require_bearer` reads the header only as visible
+        // ASCII and a bearer token has no spaces, so each would start a
+        // keymanager API no request can authenticate to.
+        for contents in [
+            "token-for-all-clients-\u{fc}",
+            "a-token-an-operator\npicked",
+            "a-token-an operator-picked",
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("keymanager.txt");
+            std::fs::write(&path, contents).expect("writes it");
+
+            let err = load_token_file(&path).expect_err("an unusable token must be refused");
+
+            let Error::Keystore { reason, .. } = err else {
+                panic!("expected the character refusal, got {err}");
+            };
+            assert!(reason.contains("cannot carry"), "should say why: {reason}");
         }
     }
 
