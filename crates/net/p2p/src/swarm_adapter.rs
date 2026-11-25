@@ -147,6 +147,8 @@ pub enum PublishOutcome {
     /// epochs on the beacon wire), refusing to publish it again until then. So
     /// this very message went out from this node earlier, or a peer sent it
     /// here: it cannot be sent again, and that is not this publish failing.
+    /// (An earlier publish that found every peer's queue full left its id
+    /// there too, so its retry also lands here although no peer got it.)
     Duplicate,
     /// Not handed to any peer, with the reason for the log: no peer is
     /// subscribed to the topic (`NoPeersSubscribedToTopic`, in which case

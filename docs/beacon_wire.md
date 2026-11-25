@@ -144,9 +144,10 @@ an epoch, at the epoch's second-to-last slot, see `docs/cli.md`; a held one
 stays held), at the release, and at every fork-digest switch, when every peer
 following the fork has joined (`publish_owed_proposer_preferences`). The new
 digest's first slot has started by the switch, so its preference is past
-helping there and is left out. Only a preference that reached no peer can be
-retried: one that reached nobody left no trace in the duplicate cache, and
-goes out.
+helping there and is left out. Only a publish that found no peer subscribed
+can be retried: it left no trace in the duplicate cache, so its retry goes
+out. One refused because every peer's queue was full did leave its id there,
+so its retry is answered as a duplicate, which ends the retries.
 
 A publish of a bid, a preference, an envelope or a payload attestation that no
 peer was handed is logged at `warn` with gossipsub's reason

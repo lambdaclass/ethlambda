@@ -766,8 +766,10 @@ message accepted from either side is seen by both.
   wall clock's fork. Each entry runs the gossip rules in order; an entry already
   cached, identical, succeeds without a republish, including one gossip cached
   while this copy was being validated. The exception is an entry this node
-  published itself whose publish reached no peer: while its slot is ahead, the
-  re-send is gossiped again (see `docs/beacon_wire.md`, Gossip). Accepted
+  still owes a publish (one whose publish reached no peer, or one held back for
+  the next fork digest): while its slot is ahead, the re-send is handed to p2p
+  again, which gossips it unless it is still held back (see
+  `docs/beacon_wire.md`, Gossip). Accepted
   entries are cached
   (the first per `(proposal slot, dependent root)` wins) and gossiped, except
   that an entry for a slot past the next fork-digest boundary (from gloas on) is
