@@ -453,7 +453,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let fee_recipient = self.settings.fee_recipient(&pubkey);
         let request = BlockRequest {
             slot,
-            fork: self.context.config.fork_at_epoch(epoch),
+            fork: self.context.config().fork_at_epoch(epoch),
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti,
@@ -494,12 +494,13 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         //
         // The two are separate facts. The block was decoded, and will be
         // published, under the fork the node named in its response header. The
-        // signing domain comes from this client's own fork schedule, fetched
-        // from `/config/spec` at startup. They normally agree because they came
-        // from the same place; when they do not, one of them is wrong about
+        // signing domain comes from this client's own fork schedule, taken
+        // from `/config/spec` at startup and kept current by the chain check
+        // (see `chain_check`). They normally agree because they came from the
+        // same place; when they do not, one of them is wrong about
         // where a fork boundary sits, and signing anyway produces a block that
         // is rejected for a reason nothing in the logs would explain.
-        let expected = self.context.config.fork_at_epoch(epoch);
+        let expected = self.context.config().fork_at_epoch(epoch);
         if produced.fork != expected {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a {} block for slot {slot}, but this client's fork schedule puts \

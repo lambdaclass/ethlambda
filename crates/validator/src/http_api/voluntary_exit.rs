@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(signed.message.epoch, 0);
         let capella = compute_domain(
             DOMAIN_VOLUNTARY_EXIT,
-            harness.signing.config.capella_fork_version,
+            harness.signing.config().capella_fork_version,
             harness.signing.genesis_validators_root,
         );
         assert!(verify(

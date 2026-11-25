@@ -261,7 +261,7 @@ async fn eligible_for_exit<B: BeaconNodeApi + ?Sized>(
     }
     let eligible_epoch = details
         .activation_epoch
-        .checked_add(signing.config.shard_committee_period)
+        .checked_add(signing.config().shard_committee_period)
         .ok_or_else(|| {
             Error::InconsistentResponse(format!(
                 "validator {} has an activation epoch too high to add SHARD_COMMITTEE_PERIOD to",
@@ -274,7 +274,7 @@ async fn eligible_for_exit<B: BeaconNodeApi + ?Sized>(
              (activated at epoch {}, and SHARD_COMMITTEE_PERIOD is {} epochs)",
             encode_hex(&pubkey.0),
             details.activation_epoch,
-            signing.config.shard_committee_period
+            signing.config().shard_committee_period
         )));
     }
     Ok(details)

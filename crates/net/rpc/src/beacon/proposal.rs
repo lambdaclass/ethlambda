@@ -30,8 +30,7 @@ use ethlambda_blockchain::{
     SyncStatusController,
     metrics::SyncStatus,
     payload_attributes::{
-        advance_for_proposal, building_forkchoice_state, payload_attributes_v3,
-        prepared_fee_recipient,
+        FeeRecipientSource, advance_for_proposal, building_forkchoice_state, payload_attributes_v3,
     },
 };
 use ethlambda_engine::{
@@ -70,8 +69,8 @@ use ethlambda_types::{
         fork::ForkName,
         preset,
         primitives::{
-            BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash,
-            HashTreeRoot as _, KzgProof, Slot, Uint256, ValidatorIndex,
+            BlsPubkey, BlsSignature, Bytes32, ExecutionBlockHash, HashTreeRoot as _, KzgProof,
+            Slot, Uint256, ValidatorIndex,
         },
         signing::compute_epoch_at_slot,
     },
@@ -1238,13 +1237,18 @@ async fn build_payload(
     let config = store.config();
     let inputs = payload_inputs(state, &config)
         .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
-    let fee_recipient = prepared_fee_recipient(fee_recipients, proposer).unwrap_or_else(|| {
-        warn!(
+    let (fee_recipient, source) = fee_recipients.for_proposer(proposer);
+    match source {
+        FeeRecipientSource::Prepared | FeeRecipientSource::Preferences => {}
+        FeeRecipientSource::Fallback => debug!(
             proposer,
-            "No fee recipient prepared for the proposer; using the zero address"
-        );
-        ExecutionAddress::ZERO
-    });
+            "No fee recipient prepared for the proposer; using --fallback-fee-recipient"
+        ),
+        FeeRecipientSource::Unknown => warn!(
+            proposer,
+            "No fee recipient prepared for the proposer and no --fallback-fee-recipient; using the zero address"
+        ),
+    }
     let forkchoice = building_forkchoice_state(store, inputs.parent_hash);
     let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
     let (status, payload_id) = engine
@@ -1282,6 +1286,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
     use http_body_util::BodyExt as _;
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -2552,6 +2557,7 @@ pub(crate) mod test_support {
     use ethlambda_types::beacon::containers::capella;
     use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
     use ethlambda_types::beacon::containers::electra;
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
     use std::time::Duration;
 
     /// A fulu head with its proposer lookahead and sync committee filled in,

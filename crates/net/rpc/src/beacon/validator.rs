@@ -346,9 +346,8 @@ async fn post_prepare_beacon_proposer(
     Extension(fee_recipients): Extension<FeeRecipients>,
     Json(preparations): Json<Vec<ProposerPreparation>>,
 ) -> Response {
-    let mut map = fee_recipients.lock().expect("fee recipient lock poisoned");
     for preparation in preparations {
-        map.insert(preparation.validator_index, preparation.fee_recipient);
+        fee_recipients.insert(preparation.validator_index, preparation.fee_recipient);
     }
     axum::http::StatusCode::OK.into_response()
 }
@@ -1471,8 +1470,8 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
         assert_eq!(
-            fee_recipients.lock().unwrap().get(&7),
-            Some(&ExecutionAddress::from_slice(&[0xab; 20]))
+            fee_recipients.prepared(7),
+            Some(ExecutionAddress::from_slice(&[0xab; 20]))
         );
     }
 
