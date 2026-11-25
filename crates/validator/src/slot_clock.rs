@@ -255,8 +255,9 @@ impl SlotClock {
     /// How long from `now` until the payload timeliness committee's duty for
     /// `slot`, or zero once that instant has passed.
     ///
-    /// The PTC counterpart to [`Self::until_aggregation`]: the loop sleeps on
-    /// it between aggregation and the committee vote.
+    /// The PTC counterpart to [`Self::until_aggregation`]: the committee
+    /// vote's deadline, which it waits for unless a beacon node reports the
+    /// slot's payload available first (see `crate::head_monitor`).
     pub fn until_payload_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
         self.payload_attestation_time(slot)
             .duration_since(now)

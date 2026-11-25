@@ -13,8 +13,9 @@
 //!
 //! # Which slot, and which root
 //!
-//! The message carries the wall slot and the head root at the deadline, which
-//! may be an older block when slots were skipped. A member assigned to wall
+//! The message carries the wall slot and the head root when it is signed (on
+//! the slot's block, or at the deadline), which may be an older block when
+//! slots were skipped. A member assigned to wall
 //! slot `S` signs for `S - 1`; the caller picks the duties accordingly (see
 //! [`crate::duties::DutiesService::sync_at_slot`]).
 //!

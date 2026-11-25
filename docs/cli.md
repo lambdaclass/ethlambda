@@ -631,8 +631,9 @@ on a network that schedules gloas `execution_payload_available` as well.
   data that also says `payload_present` and `blob_data_available`. Otherwise
   nothing is recorded or signed, and the duty asks again on the next report
   about the slot it has not tried (another node's, or another block's), or
-  runs at its offset if none comes, as it would have with no event. Each duty
-  is signed at most once a slot either way.
+  runs at its offset if none comes, as it would have with no event. An answer
+  still outstanding at the offset is dropped there, so an event never makes a
+  duty later. Each duty is signed at most once a slot either way.
 - An event from any node starts a duty. The check above is what makes that safe
   when the node answering has not imported the block yet: that attempt
   declines, and the answering node's own report of the block starts the next.

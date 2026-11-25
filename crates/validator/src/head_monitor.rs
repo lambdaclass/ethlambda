@@ -48,14 +48,17 @@
 //!   always one that saw both.
 //!
 //! Anything else (another root, a failed request, a 204, a payload not called
-//! present) is a `mismatch`: nothing was recorded and nothing signed. The
-//! duty then waits for the next report about the slot that it has not tried
+//! present, or an answer still outstanding at the deadline, which is dropped
+//! there) is a `mismatch`: nothing was recorded and nothing signed. The duty
+//! then waits for the next report about the slot that it has not tried
 //! (another node's, or another block's), and asks again on it; with none
 //! before the deadline it runs at the deadline, exactly as it would have with
 //! no event. That is what keeps one signature per duty per slot: another
 //! attempt follows only ones that stopped before recording anything, and an
 //! attempt that got as far as recording is final for the slot whatever became
 //! of it, as [`AttestationService::attest`]'s rule against retrying requires.
+//! And no early request outlives the deadline, so an event can make a duty
+//! earlier but never later.
 //!
 //! # Every node's stream
 //!
@@ -423,16 +426,25 @@ impl DutyTriggers {
         Self::default()
     }
 
-    /// Wait at most `wait` for a node to report a head at `slot`, and answer
-    /// its block, or `None` once `wait` has passed.
+    /// Wait at most `wait` for a node to report a head at `slot`, or its
+    /// payload available, and answer the reported block, or `None` once
+    /// `wait` has passed.
     ///
     /// What the duty loop sleeps on between a slot's proposal and the rest of
-    /// its duties, so an early head is not held back by that sleep.
-    pub async fn head_within(&self, slot: Slot, wait: Duration) -> Option<Root> {
+    /// its duties, so no early trigger is held back by that sleep. A payload
+    /// report ends it too: with a node's head stream down and its payload
+    /// stream up, the committee vote then starts on the payload rather than
+    /// at the first duty's offset.
+    pub async fn report_within(&self, slot: Slot, wait: Duration) -> Option<Root> {
         let deadline = Instant::now() + wait;
-        SlotReports::new(self.heads.clone(), slot, deadline)
-            .next()
-            .await
+        let mut heads = SlotReports::new(self.heads.clone(), slot, deadline);
+        let mut payloads = SlotReports::new(self.payloads.clone(), slot, deadline);
+        // Each answers `None` only at the deadline, so the first to finish is
+        // either a report or the deadline itself.
+        tokio::select! {
+            block = heads.next() => block,
+            block = payloads.next() => block,
+        }
     }
 
     /// Attest for `slot` when a node reports the slot's block as its head, or
@@ -464,7 +476,15 @@ impl DutyTriggers {
         let mut reports = SlotReports::new(self.heads.clone(), slot, deadline);
         let mut fired = Fired::Deadline;
         while let Some(block) = reports.next().await {
-            match service.attestation_data(slot).await {
+            // Bounded by the deadline, so an early request still out then
+            // never delays the deadline attempt (see the module doc).
+            let early = service.attestation_data(slot);
+            let Ok(fetched) = tokio::time::timeout_at(deadline, early).await else {
+                debug!(%slot, "Attestation data still outstanding at the deadline; attesting at the deadline instead");
+                fired = Fired::Mismatch;
+                continue;
+            };
+            match fetched {
                 Ok(data) if data.beacon_block_root == block => {
                     debug!(%slot, block = %ShortRoot(&block.0), "Slot's block is the head; attesting now");
                     metrics::inc_duty_trigger(Duty::Attestation, Fired::Event);
@@ -518,7 +538,13 @@ impl DutyTriggers {
         let mut reports = SlotReports::new(self.heads.clone(), slot, deadline);
         let mut fired = Fired::Deadline;
         while let Some(block) = reports.next().await {
-            match service.head_block_root().await {
+            let early = service.head_block_root();
+            let Ok(fetched) = tokio::time::timeout_at(deadline, early).await else {
+                debug!(%slot, "Head root still outstanding at the deadline; signing at the deadline instead");
+                fired = Fired::Mismatch;
+                continue;
+            };
+            match fetched {
                 Ok(root) if root == block => {
                     debug!(%slot, block = %ShortRoot(&block.0), "Slot's block is the head; signing sync committee messages now");
                     metrics::inc_duty_trigger(Duty::SyncCommitteeMessage, Fired::Event);
@@ -577,7 +603,13 @@ impl DutyTriggers {
         let mut reports = SlotReports::new(self.payloads.clone(), slot, deadline);
         let mut fired = Fired::Deadline;
         while let Some(block) = reports.next().await {
-            match service.data(slot).await {
+            let early = service.data(slot);
+            let Ok(fetched) = tokio::time::timeout_at(deadline, early).await else {
+                debug!(%slot, "Payload attestation data still outstanding at the deadline; voting at the deadline instead");
+                fired = Fired::Mismatch;
+                continue;
+            };
+            match fetched {
                 Ok(Some(data))
                     if data.beacon_block_root == block
                         && data.payload_present
@@ -1054,9 +1086,26 @@ mod tests {
         let (_monitor, triggers) = read_streams(std::slice::from_ref(&node), false);
 
         let started = Instant::now();
-        assert_eq!(triggers.head_within(SLOT, WAIT).await, Some(block()));
+        assert_eq!(triggers.report_within(SLOT, WAIT).await, Some(block()));
         assert!(started.elapsed() < WAIT);
-        assert_eq!(triggers.head_within(SLOT + 1, WAIT).await, None);
+        assert_eq!(triggers.report_within(SLOT + 1, WAIT).await, None);
+    }
+
+    /// A payload report ends that wait as well, so a node whose head stream
+    /// is down but whose payload stream is up does not hold the committee
+    /// vote to the first duty's offset.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_before_the_slots_duties_ends_on_its_payload() {
+        let node = Arc::new(MockBeaconNode::new().with_topic_stream(
+            Topic::ExecutionPayloadAvailable,
+            vec![after(1_000), payload(SLOT, block())],
+            StreamEnd::Hang,
+        ));
+        let (_monitor, triggers) = read_streams(std::slice::from_ref(&node), true);
+
+        let started = Instant::now();
+        assert_eq!(triggers.report_within(SLOT, WAIT).await, Some(block()));
+        assert!(started.elapsed() < WAIT);
     }
 
     // Sync committee messages.
