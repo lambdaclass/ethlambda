@@ -689,46 +689,40 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// An optimistic head is an error from each implementation, so a node
     /// tracking an unvalidated head is walked past rather than signed over.
     ///
-    /// Not a plain `try_each`, which would turn every node answering
-    /// `BeaconNodeSyncing` into `AllBeaconNodesFailed`, and the sync
-    /// committee service would then count a head nothing may be signed over
-    /// as a missed duty. The rule is [`Self::is_optimistic_or_syncing`]'s:
-    /// the first root wins, and when no node gives one but at least one said
-    /// it is optimistic or syncing, the answer is `BeaconNodeSyncing`, even
-    /// if the others failed outright.
+    /// Not a plain `try_each`, whose `AllBeaconNodesFailed` would hide every
+    /// node answering `BeaconNodeSyncing`, and the sync committee service
+    /// would then count a head nothing may be signed over as a missed duty.
+    /// The rule is [`Self::is_optimistic_or_syncing`]'s: the first root wins,
+    /// and when no node gives one but at least one said it is optimistic or
+    /// syncing, the answer is `BeaconNodeSyncing`, even if the others failed
+    /// outright. Still the same walk as `try_each`, so it asks the nodes
+    /// every other call asks.
     async fn head_block_root(&self) -> Result<Root> {
-        let mut last = None;
-        let mut syncing = false;
-        for (position, node) in self.nodes.iter().enumerate() {
-            match node.head_block_root().await {
-                Ok(root) => return Ok(root),
-                Err(Error::BeaconNodeSyncing) => {
-                    syncing = true;
-                    debug!(
-                        position,
-                        "Beacon node head is optimistic or the node is syncing; trying the next"
-                    );
-                }
-                Err(err) => {
-                    debug!(what = "head_block_root", position, %err, "Beacon node request failed; trying the next");
-                    last = Some(err);
-                }
+        let syncing = std::sync::atomic::AtomicBool::new(false);
+        let answer = self
+            .try_each_quiet("head_block_root", |node| {
+                let syncing = &syncing;
+                Box::pin(async move {
+                    node.head_block_root().await.inspect_err(|err| {
+                        if matches!(err, Error::BeaconNodeSyncing) {
+                            syncing.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    })
+                })
+            })
+            .await;
+        match answer {
+            // The caller says so itself, without calling it a missed duty.
+            Err(_) if syncing.into_inner() => Err(Error::BeaconNodeSyncing),
+            Err(Error::AllBeaconNodesFailed(detail)) => {
+                warn!(
+                    what = "head_block_root",
+                    %detail, "All configured beacon nodes failed; duty likely missed"
+                );
+                Err(Error::AllBeaconNodesFailed(detail))
             }
+            other => other,
         }
-
-        // The caller says so itself, without calling it a missed duty.
-        if syncing {
-            return Err(Error::BeaconNodeSyncing);
-        }
-
-        let detail = last
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "no nodes configured".to_string());
-        warn!(
-            what = "head_block_root",
-            %detail, "All configured beacon nodes failed; duty likely missed"
-        );
-        Err(Error::AllBeaconNodesFailed(detail))
     }
 
     // Quiet: the proposal check is no duty, and it logs and counts a failure
