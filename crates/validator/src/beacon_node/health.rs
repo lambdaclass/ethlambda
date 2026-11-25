@@ -31,8 +31,10 @@
 //! - **Two calls the Beacon API leaves ungated.** No 503 covers a syncing
 //!   node's head root, or an optimistic node's payload attestation data, so the
 //!   fallback does not ask a node whose last probe reported syncing or
-//!   optimistic for either. Without that, a passed node failing either call
-//!   would hand it to the next node in the walk, which may be that one.
+//!   optimistic, or got no answer, for either. Without that, a passed node
+//!   failing either call would hand it to the next node in the walk, which may
+//!   be that one. Unlike the gate, a node that did not answer is not given the
+//!   benefit of the doubt here: no 503 stands behind it.
 //!
 //! # No clock-based rule
 //!
@@ -144,6 +146,14 @@ impl Standing {
     /// The node said it is one a validator must not sign against.
     pub fn is_unsynced(self) -> bool {
         matches!(self, Self::Syncing | Self::Optimistic)
+    }
+
+    /// Whether a call the Beacon API gives no 503 for in an unsynced state may
+    /// go to the node: its probe answered synced, or there is no probe to
+    /// read, as in a fallback no probe task runs for. A probe that failed
+    /// vouches for nothing, and nothing else would stop the answer.
+    pub fn may_serve_ungated(self) -> bool {
+        matches!(self, Self::Synced | Self::Unknown)
     }
 }
 

@@ -948,7 +948,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   count, so the duty endpoints' 503 stays the backstop); requests try the
   nodes that passed first, then the rest, each
   in `--beacon-nodes` order; and the head root and PTC data are never asked of
-  a node whose last probe said syncing or optimistic. No rule reads the head's
+  a node whose last probe said syncing or optimistic, or got no answer. No rule reads the head's
   age off the client's clock.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),

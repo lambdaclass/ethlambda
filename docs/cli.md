@@ -565,10 +565,13 @@ the next slot's probe to answer.
   in `--beacon-nodes` order. A blinded block still goes back to the node that
   produced it.
 - **The head root and the payload attestation data are never asked of a node
-  whose last probe said syncing or optimistic**, even after the nodes that
-  passed have failed the request. Neither endpoint has a `503` for that state:
-  a syncing node answers its stale head, and an optimistic one hands out
-  payload data for a block its execution client has not validated.
+  whose last probe said syncing or optimistic, or got no answer**, even after
+  the nodes that passed have failed the request. Neither endpoint has a `503`
+  for that state: a syncing node answers its stale head, and an optimistic one
+  hands out payload data for a block its execution client has not validated.
+  So here, unlike for the slot's check, a node that did not answer is not
+  given the benefit of the doubt. With no node left to ask, the sync committee
+  message and the payload vote are not signed.
 - **`el_offline` is logged, not acted on**: a node whose execution client has
   just gone offline still has the head it validated before, and reports itself
   optimistic once that stops being true. A node's change of state (synced,

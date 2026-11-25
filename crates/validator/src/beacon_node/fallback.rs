@@ -48,8 +48,9 @@ enum Reach {
     /// Every node.
     Every,
     /// Every node but those whose last sync probe reported syncing or
-    /// optimistic, for the calls the Beacon API gives no 503 for in that state.
-    /// A node that did not answer its probe is still asked.
+    /// optimistic, or got no answer, for the calls the Beacon API gives no 503
+    /// for in that state. A node with no probe to read is still asked (see
+    /// [`Standing::may_serve_ungated`]).
     SkipUnsynced,
 }
 
@@ -149,11 +150,11 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     }
 
     /// [`Self::try_each`] without the nodes whose last sync probe reported
-    /// syncing or optimistic, for a call whose endpoint answers such a node
-    /// with no 503 and data this client must not sign. A node that did not
-    /// answer its probe is still asked. When no node is left to ask, this is
-    /// `Err(BeaconNodeSyncing)`, which the callers read as "do not sign" rather
-    /// than as a failure.
+    /// syncing or optimistic, or got no answer, for a call whose endpoint
+    /// answers such a node with no 503 and data this client must not sign. A
+    /// node with no probe to read is still asked. When no node is left to ask,
+    /// this is `Err(BeaconNodeSyncing)`, which the callers read as "do not
+    /// sign" rather than as a failure.
     async fn try_each_synced<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<T>
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
@@ -195,8 +196,8 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             let Some(node) = self.nodes.get(position) else {
                 continue;
             };
-            if reach == Reach::SkipUnsynced && standing.is_unsynced() {
-                debug!(%what, position, ?standing, "Not asking a beacon node whose last sync probe said it is unsynced");
+            if reach == Reach::SkipUnsynced && !standing.may_serve_ungated() {
+                debug!(%what, position, ?standing, "Not asking a beacon node whose last sync probe did not answer synced");
                 continue;
             }
             asked = true;
@@ -212,8 +213,8 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 }
             }
         }
-        // Every node said, at its last probe, that it is one this client must
-        // not sign against: an answer, not a failure.
+        // No node vouched, at its last probe, for being one this client may
+        // sign against: an answer, not a failure.
         if reach == Reach::SkipUnsynced && !asked {
             return Err(Error::BeaconNodeSyncing);
         }
@@ -1752,15 +1753,27 @@ mod tests {
         assert_eq!(fallback.nodes[0].payload_attestation_data_call_count(), 0);
     }
 
-    /// A node whose probe failed is not known to be unsynced, and is asked.
+    /// A node whose probe failed vouches for nothing, and nothing stops a
+    /// syncing node's stale head root, so it is not asked either. A node with
+    /// no probe at all, in a fallback no probe task runs for, still is.
     #[tokio::test]
-    async fn a_node_that_did_not_answer_its_probe_is_still_asked_for_a_head_root() {
-        let unprobed = answering(3).failing_call("is_syncing", "down");
-        let fallback = FallbackBeaconNode::new(vec![unprobed]);
+    async fn a_node_that_did_not_answer_its_probe_is_not_asked_for_a_head_root() {
+        let unanswered = answering(3).failing_call("is_syncing", "down");
+        let fallback = FallbackBeaconNode::new(vec![unanswered]);
         fallback.probe(96, std::time::Duration::from_secs(1)).await;
 
+        let err = fallback.head_block_root().await.expect_err("no root");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        let err = fallback
+            .payload_attestation_data(96)
+            .await
+            .expect_err("no data");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        assert_eq!(fallback.nodes[0].payload_attestation_data_call_count(), 0);
+
+        let never_probed = FallbackBeaconNode::new(vec![answering(3)]);
         assert_eq!(
-            fallback.head_block_root().await.expect("a root"),
+            never_probed.head_block_root().await.expect("a root"),
             Root::repeat_byte(3)
         );
     }
