@@ -1378,7 +1378,11 @@ fn resubscribe<B: BeaconNodeApi + 'static>(
 /// Check this epoch's and the next one's held schedules against the node's
 /// dependent roots, within `budget`, and refetch those a reorg moved. Returns
 /// whether the attester schedule moved, which owes the node this client's
-/// subnet subscriptions again.
+/// subnet subscriptions again. Read off the service
+/// ([`DutiesService::take_attesters_moved`]) rather than from each check's
+/// answer: a check that replaced the attester schedule and then failed or ran
+/// out of budget on the payload committee fetch would lose the move, and the
+/// next slot's check finds the roots matching.
 ///
 /// # Why every slot
 ///
@@ -1413,7 +1417,6 @@ async fn follow_dependent_roots<B: BeaconNodeApi>(
 ) -> bool {
     use ethlambda_types::beacon::fork::ForkName;
 
-    let mut moved = false;
     let probe = async {
         for target in [epoch, epoch + 1] {
             if !ProposerDutiesVersion::fixed_ahead(config, target) {
@@ -1421,18 +1424,16 @@ async fn follow_dependent_roots<B: BeaconNodeApi>(
             }
             let ptc = config.fork_at_epoch(target) >= ForkName::Gloas
                 && target != config.gloas_fork_epoch;
-            match duties.follow_dependent_root(target, ptc).await {
-                Ok(target_moved) => moved |= target_moved,
-                Err(err) => {
-                    debug!(epoch = target, %err, "Dependent root check failed; trying again next slot");
-                }
-            }
+            let checked = duties.follow_dependent_root(target, ptc).await;
+            let _ = checked.inspect_err(|err| {
+                debug!(epoch = target, %err, "Dependent root check failed; trying again next slot");
+            });
         }
     };
     if tokio::time::timeout(budget, probe).await.is_err() {
         debug!(%epoch, "Dependent root check ran out of slot; trying again next slot");
     }
-    moved
+    duties.take_attesters_moved()
 }
 
 /// Resolve any newly activated validators and refresh the duty schedule.
@@ -2592,6 +2593,32 @@ mod tests {
         follow_dependent_roots(&mut duties, 5, budget, &config).await;
 
         assert_eq!(node.ptc_requested_epochs(), vec![6]);
+    }
+
+    /// A check that replaced the attester schedule still reports the move
+    /// when the payload committee fetch after it fails: the next slot's check
+    /// finds the roots matching, so nothing else would send the
+    /// subscriptions.
+    #[tokio::test]
+    async fn a_move_is_reported_although_the_committee_fetch_after_it_failed() {
+        // No payload committee duties: the mock refuses them.
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_proposers_v2(5, Root::repeat_byte(5), Vec::new())
+                .with_duties(5, Root::repeat_byte(5), Vec::new()),
+        );
+        let config = fulu_context()
+            .config
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
+        let mut duties = DutiesService::new(node.clone(), vec![11]);
+        let budget = std::time::Duration::from_secs(1);
+
+        assert!(follow_dependent_roots(&mut duties, 5, budget, &config).await);
+        assert_eq!(node.ptc_requested_epochs(), vec![5], "and it failed");
+        assert!(
+            !follow_dependent_roots(&mut duties, 5, budget, &config).await,
+            "reported once"
+        );
     }
 
     // ---- gloas ----------------------------------------------------------
