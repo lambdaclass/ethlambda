@@ -945,11 +945,16 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   in `NodeHealth`, shared by the fallback): a slot in which every node that
   answered is syncing or optimistic signs nothing and skips the epoch refresh,
   only the fee recipient re-send going on (a node that did not answer does not
-  count, so the duty endpoints' 503 stays the backstop); requests try the
-  nodes that passed first, then the rest, each
-  in `--beacon-nodes` order; and the head root and PTC data are never asked of
-  a node whose last probe said syncing or optimistic, or got no answer. No rule reads the head's
-  age off the client's clock.
+  count, so the duty endpoints' 503 stays the backstop); requests walk the
+  nodes by `health::Tier` (synced; optimistic or `el_offline`; syncing or
+  `sync_distance` > 8; unprobed; failing), `--beacon-nodes` order breaking
+  ties, and a request that timed out or could not connect ranks its node
+  failing until a later probe answers; and the head root and PTC data are
+  never asked of a node whose last probe said syncing or optimistic, or got
+  no answer. No rule that stops a duty reads the head's age. `--broadcast`
+  (`fallback::Broadcast`) sends attestations, blocks (envelopes producer
+  first) or sync committee messages to every node, failing-ranked nodes only
+  if none accepted.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;

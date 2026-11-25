@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::beacon_node::fallback::BroadcastTopic;
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
@@ -20,12 +21,22 @@ pub(crate) struct ValidatorOptions {
     /// Base URL(s) of the beacon node's HTTP API (e.g. http://localhost:5052).
     ///
     /// Several may be supplied, comma-separated or by repeating the flag. Each
-    /// is asked whether it is syncing once a slot; the ones that are not are
-    /// tried first, then the rest, each in the order given, and the first that
-    /// answers is used, so the order is a preference, not a load-balancing
-    /// policy.
+    /// is asked whether it is syncing once a slot and ranked by the answer
+    /// (synced, then optimistic or with its execution client offline, then
+    /// syncing or more than 8 slots behind, then failing), the order given
+    /// breaking ties, and the first that answers is used, so the order is a
+    /// preference, not a load-balancing policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
+
+    /// Signed messages to send to every beacon node at once rather than to
+    /// the first that accepts them, comma-separated: `attestations`
+    /// (attestations, aggregates, payload attestations), `blocks` (blocks
+    /// and envelopes; never a blinded block), `sync-committee` (messages and
+    /// contributions), `subscriptions` (always sent to every node, accepted
+    /// for Lighthouse compatibility). None by default.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) broadcast: Vec<BroadcastTopic>,
 
     /// Directory holding the EIP-2335 keystores and `validator_definitions.yml`.
     /// Without that file, keystores in the Lighthouse layout
@@ -285,6 +296,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        broadcast: options.broadcast.into_iter().collect(),
     })
     .await
     .map_err(Into::into)
@@ -297,6 +309,7 @@ mod tests {
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
             beacon_nodes: vec!["http://localhost:5052".to_string()],
+            broadcast: Vec::new(),
             validators_dir: PathBuf::from("/tmp/validators"),
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
@@ -365,6 +378,35 @@ mod tests {
         assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
         let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
         assert!(options.enable_doppelganger_protection);
+    }
+
+    /// Nothing is broadcast unless asked for, as in Lighthouse; topics are
+    /// comma-separated or repeated, and an unknown one is refused at startup.
+    #[test]
+    fn broadcast_topics_are_off_unless_named() {
+        use ethlambda_validator::beacon_node::fallback::Broadcast;
+
+        let topics =
+            |options: ValidatorOptions| -> Broadcast { options.broadcast.into_iter().collect() };
+        assert_eq!(topics(parse(&[]).expect("parses")), Broadcast::default());
+        let options = parse(&[
+            "--broadcast",
+            "attestations,blocks",
+            "--broadcast",
+            "sync-committee",
+        ])
+        .expect("parses");
+        assert_eq!(
+            topics(options),
+            Broadcast {
+                attestations: true,
+                blocks: true,
+                sync_committee: true,
+            }
+        );
+        let options = parse(&["--broadcast", "subscriptions"]).expect("parses");
+        assert_eq!(topics(options), Broadcast::default());
+        parse(&["--broadcast", "everything"]).expect_err("not a topic");
     }
 
     #[test]

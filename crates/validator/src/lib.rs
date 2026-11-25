@@ -161,6 +161,9 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// `--broadcast`: the signed messages sent to every beacon node rather
+    /// than the first that accepts them. See [`beacon_node::fallback`].
+    pub broadcast: beacon_node::fallback::Broadcast,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
@@ -276,7 +279,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         .iter()
         .map(HttpBeaconNode::new)
         .collect::<Result<Vec<_>>>()?;
-    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
+    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes).with_broadcast(config.broadcast));
 
     let genesis = beacon_node.genesis().await?;
     let spec = beacon_node.spec().await?;

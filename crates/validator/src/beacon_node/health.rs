@@ -24,10 +24,18 @@
 //!   holding it shut. A node whose answer is still on its way at the boundary,
 //!   and that answered synced the slot before, holds the gate open too, so a
 //!   slow synced node does not lose the slot to a fast syncing one.
-//! - **Routing** ([`NodeHealth::ranked`]). The fallback asks the nodes whose
-//!   last probe passed (neither syncing nor optimistic) first, in command-line
-//!   order, then the rest, in the same order. Positions stay command-line
-//!   positions, so a blinded block still goes back to the node that produced it.
+//! - **Routing** ([`NodeHealth::ranked`]). The fallback asks the nodes in
+//!   [`Tier`] order, best first: synced and validated; synced but optimistic
+//!   or with its execution client offline; syncing, or more than
+//!   [`SYNC_TOLERANCE`] slots behind by its own `sync_distance`; not probed
+//!   yet; failing. Command-line order breaks ties, so a single healthy node,
+//!   or several equally healthy ones, are asked exactly as listed. Positions
+//!   stay command-line positions, so a blinded block still goes back to the
+//!   node that produced it.
+//! - **The last real request** ([`NodeHealth::record_request_failure`]). A
+//!   request to a node that timed out or could not connect ranks it failing
+//!   until a probe recorded after it answers, so a node that hangs costs at
+//!   most one request timeout per probe, not one per request.
 //! - **Two calls the Beacon API leaves ungated.** No 503 covers a syncing
 //!   node's head root, or an optimistic node's payload attestation data, so the
 //!   fallback does not ask a node whose last probe reported syncing or
@@ -36,16 +44,17 @@
 //!   be that one. Unlike the gate, a node that did not answer is not given the
 //!   benefit of the doubt here: no 503 stands behind it.
 //!
-//! # No clock-based rule
+//! # No clock-based rule for signing
 //!
-//! Nothing here judges a node by how old its head looks against this client's
+//! Nothing here stops a duty because a head looks old against this client's
 //! clock. During a network-wide stall every head is old, and clients that stop
-//! signing then keep the chain stalled. The signal is the node's own
-//! `is_syncing` and `is_optimistic`. `head_slot` and `sync_distance` are kept in
-//! the record, not acted on. A record older than two slots is no longer read for
-//! routing, which only ever moves a node back to plain command-line order.
+//! signing then keep the chain stalled. The gate reads the node's own
+//! `is_syncing` and `is_optimistic`, nothing else. `sync_distance`, which is the
+//! node's own clock against its head, only orders the walk: in a stall every
+//! node is behind by about as much, so they share a tier and keep command-line
+//! order. A record older than two slots is no longer read for routing, which
+//! only ever moves a node back to plain command-line order.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -54,7 +63,15 @@ use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::fallback::FallbackBeaconNode;
+use crate::error::{BeaconNodeFailure, Error};
 use crate::slot_clock::SlotClock;
+
+/// How many slots behind its own clock a node may report (`sync_distance`) and
+/// still rank as synced: Lighthouse's tolerance. A node answers `is_syncing:
+/// false` by its own threshold, which the Beacon API leaves to each client, so
+/// one a few slots behind can still say it is synced while it hands out an old
+/// head. Past this it ranks with the syncing nodes.
+pub const SYNC_TOLERANCE: u64 = 8;
 
 /// How far ahead of a slot's boundary its probe is taken, as a fraction of the
 /// slot: a sixth, which is Lighthouse's 2 s on mainnet's 12 s slots. Past the
@@ -81,9 +98,9 @@ pub struct SyncStatus {
     /// The node's head has an execution payload its execution client has not
     /// validated. `false` when the node left the field out.
     pub is_optimistic: bool,
-    /// The node cannot reach its execution client. Logged, never acted on: the
-    /// node reports `is_optimistic` once that starts to matter. `false` when
-    /// the node left the field out.
+    /// The node cannot reach its execution client. Ranks the node below the
+    /// fully synced ones, never stops a duty: the node reports `is_optimistic`
+    /// once that starts to matter. `false` when the node left the field out.
     pub el_offline: bool,
 }
 
@@ -91,6 +108,15 @@ impl SyncStatus {
     /// Neither syncing nor optimistic: a node a validator may sign against.
     pub fn is_synced(&self) -> bool {
         !self.is_syncing && !self.is_optimistic
+    }
+
+    /// Syncing, or further behind its own clock than [`SYNC_TOLERANCE`]. A
+    /// node that sent no `sync_distance` is judged by `is_syncing` alone.
+    pub fn is_behind(&self) -> bool {
+        self.is_syncing
+            || self
+                .sync_distance
+                .is_some_and(|distance| distance > SYNC_TOLERANCE)
     }
 }
 
@@ -157,6 +183,75 @@ impl Standing {
     }
 }
 
+/// Where a node ranks in the order requests walk the nodes in, best first.
+///
+/// For ordering only. Whether a slot signs, and which nodes the head root and
+/// the payload attestation data may come from, is [`Standing`]'s, so a node
+/// that is merely behind or has lost its execution client ranks lower without
+/// being refused anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tier {
+    /// Answered neither syncing nor optimistic, within [`SYNC_TOLERANCE`] of
+    /// its clock, with its execution client online.
+    Synced,
+    /// Answered within the tolerance and not syncing, but optimistic or with
+    /// its execution client offline.
+    Degraded,
+    /// Answered syncing, or more than [`SYNC_TOLERANCE`] slots behind.
+    Behind,
+    /// Not probed yet, or its last probe is too old to read.
+    Unknown,
+    /// Did not answer its last probe, or since then did not answer a request
+    /// (it timed out or could not connect).
+    Failing,
+}
+
+impl Tier {
+    /// The tier a probe puts a node in, before any request since.
+    pub fn of(probe: &Probe) -> Self {
+        match &probe.outcome {
+            Err(_) => Self::Failing,
+            Ok(status) if status.is_behind() => Self::Behind,
+            Ok(status) if status.is_optimistic || status.el_offline => Self::Degraded,
+            Ok(_) => Self::Synced,
+        }
+    }
+}
+
+/// A request to a node that got no answer, which ranks the node
+/// [`Tier::Failing`] until a probe recorded after it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestFailure {
+    at: SystemTime,
+}
+
+/// Whether a request failing with `err` says the node is not answering, and so
+/// ranks it [`Tier::Failing`]: it timed out, or the connection could not be
+/// made. Both cost a duty seconds (the request timeout, the connect timeout)
+/// each time the node is asked first. A status, even a 5xx, is an answer, and a
+/// 404 from a node with nothing to aggregate is routine.
+pub fn ranks_failing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::BeaconNode {
+            failure: BeaconNodeFailure::Timeout | BeaconNodeFailure::Connect,
+            ..
+        }
+    )
+}
+
+/// One node's record: its last probe, and the last request it did not answer
+/// since that probe, if any.
+#[derive(Debug, Clone, Default)]
+struct Record {
+    probe: Option<Probe>,
+    failure: Option<RequestFailure>,
+    /// Whether the last probe that answered reported the execution client
+    /// offline. A probe with no answer leaves it as it was, so the change logs
+    /// compare one answer with the last.
+    el_offline: bool,
+}
+
 /// How the nodes that answered one round of probes split.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncVerdict {
@@ -194,28 +289,24 @@ impl SyncVerdict {
     }
 }
 
-/// The last probe of each configured beacon node, in command-line order.
+/// The last probe of each configured beacon node, in command-line order, and
+/// the last request each did not answer since.
 ///
 /// Shared, so the fallback that routes requests by it and anything that reports
-/// on the nodes read the same records. [`Self::snapshot`] is the cheap read for
-/// the latter.
+/// on the nodes read the same records. [`Self::snapshot`] and [`Self::tiers`]
+/// are the cheap reads for the latter.
 pub struct NodeHealth {
-    probes: RwLock<Vec<Option<Probe>>>,
-    /// Whether each node's last probe that answered reported its execution
-    /// client offline. A probe with no answer leaves it as it was, so the
-    /// change logs compare one answer with the last.
-    el_offline: Vec<AtomicBool>,
-    /// How long a probe is read for routing. Unset until [`run`] starts, so a
-    /// fallback that is never probed on a schedule (a test, the voluntary-exit
-    /// command) reads whatever it holds.
+    records: RwLock<Vec<Record>>,
+    /// How long a probe, or a request failure, is read for routing. Unset
+    /// until [`run`] starts, so a fallback that is never probed on a schedule
+    /// (a test, the voluntary-exit command) reads whatever it holds.
     read_for: OnceLock<Duration>,
 }
 
 impl NodeHealth {
     pub fn new(nodes: usize) -> Self {
         Self {
-            probes: RwLock::new(vec![None; nodes]),
-            el_offline: (0..nodes).map(|_| AtomicBool::new(false)).collect(),
+            records: RwLock::new(vec![Record::default(); nodes]),
             read_for: OnceLock::new(),
         }
     }
@@ -223,40 +314,98 @@ impl NodeHealth {
     /// Every node's last probe, in command-line order: `None` for a node not
     /// probed yet. A copy, so a caller holds no lock.
     pub fn snapshot(&self) -> Vec<Option<Probe>> {
-        self.read().clone()
+        self.read()
+            .iter()
+            .map(|record| record.probe.clone())
+            .collect()
     }
 
-    /// Stop reading a probe for routing once it is older than `age`.
+    /// Keep that a request to the node at `position` failed with `err`, when
+    /// that failure says the node is not answering ([`ranks_failing`]): the
+    /// node then ranks [`Tier::Failing`] until a probe recorded after this
+    /// answers. Logged once, when the node starts being passed over.
+    pub fn record_request_failure(&self, position: usize, what: &'static str, err: &Error) {
+        if !ranks_failing(err) {
+            return;
+        }
+        let already = {
+            let mut records = self.write();
+            let Some(record) = records.get_mut(position) else {
+                return;
+            };
+            record
+                .failure
+                .replace(RequestFailure {
+                    at: SystemTime::now(),
+                })
+                .is_some()
+        };
+        if !already {
+            warn!(
+                %what,
+                position,
+                %err,
+                "Beacon node did not answer a request; it is asked last until it answers a sync \
+                 probe"
+            );
+        }
+    }
+
+    /// Stop reading a probe, or a request failure, for routing once it is older
+    /// than `age`.
     pub fn expire_after(&self, age: Duration) {
         let _ = self.read_for.set(age);
     }
 
     /// Keep `probe` as the node at `position`'s last, and log what changed: a
-    /// node that stopped or started answering synced, and `el_offline` going on
-    /// or off. Only changes, since a probe runs every slot.
+    /// node that stopped or started answering synced, falling behind or
+    /// catching up by [`SYNC_TOLERANCE`], and `el_offline` going on or off.
+    /// Only changes, since a probe runs every slot.
+    ///
+    /// A probe that answered also ends a request failure recorded before it
+    /// ([`Self::record_request_failure`]): the node answers again, so it is
+    /// ranked by what it said.
     pub fn record(&self, position: usize, probe: Probe) {
         let standing = probe.standing();
         let el_offline = is_el_offline(&probe);
+        let lagging = is_lagging(&probe);
         let (head_slot, sync_distance) = match &probe.outcome {
             Ok(status) => (status.head_slot, status.sync_distance),
             Err(_) => (None, None),
         };
         let error = probe.outcome.as_ref().err().cloned();
-        let previous = {
-            let mut probes = self.probes.write().unwrap_or_else(PoisonError::into_inner);
-            let Some(held) = probes.get_mut(position) else {
+        let answered = probe.outcome.is_ok();
+        let (previous, cleared, was_el_offline) = {
+            let mut records = self.write();
+            let Some(record) = records.get_mut(position) else {
                 return;
             };
-            held.replace(probe)
+            let cleared = if answered {
+                record.failure.take().is_some()
+            } else {
+                false
+            };
+            let was_el_offline = record.el_offline;
+            if answered {
+                record.el_offline = el_offline;
+            }
+            (record.probe.replace(probe), cleared, was_el_offline)
         };
 
+        if cleared {
+            info!(
+                position,
+                "Beacon node answered its sync probe after a request it did not answer; it is \
+                 ranked by its probe again"
+            );
+        }
         let was = previous.as_ref().map(Probe::standing);
         if was != Some(standing) {
             match standing {
                 Standing::Synced if was.is_some() => info!(
                     position,
                     ?head_slot,
-                    "Beacon node reports it is synced; duties go to it first again"
+                    "Beacon node reports it is synced again"
                 ),
                 Standing::Syncing => warn!(
                     position,
@@ -267,7 +416,7 @@ impl NodeHealth {
                 Standing::Optimistic => warn!(
                     position,
                     ?head_slot,
-                    "Beacon node reports an optimistic head; duties go to the other nodes first"
+                    "Beacon node reports an optimistic head; duties go to the synced nodes first"
                 ),
                 Standing::NoAnswer => warn!(
                     position,
@@ -277,58 +426,108 @@ impl NodeHealth {
                 Standing::Synced | Standing::Unknown => {}
             }
         }
+        // A node that says it is syncing is reported as such above; this is
+        // the one that does not, and lags anyway.
+        let was_lagging = previous.as_ref().is_some_and(is_lagging);
+        if lagging && !was_lagging {
+            warn!(
+                position,
+                ?head_slot,
+                ?sync_distance,
+                tolerance = SYNC_TOLERANCE,
+                "Beacon node's head is further behind its clock than the tolerance, though it \
+                 does not report syncing; duties go to the nodes closer to the head first"
+            );
+        } else if was_lagging
+            && !lagging
+            && matches!(standing, Standing::Synced | Standing::Optimistic)
+        {
+            info!(
+                position,
+                ?head_slot,
+                ?sync_distance,
+                "Beacon node is within the sync tolerance again"
+            );
+        }
         // Against the last probe that answered, so a failed probe in between
         // neither hides the execution client coming back nor repeats it going.
-        if standing == Standing::NoAnswer {
+        if !answered {
             return;
         }
-        let was_el_offline = self.el_offline[position].swap(el_offline, Ordering::Relaxed);
         if el_offline && !was_el_offline {
             warn!(
                 position,
-                "Beacon node reports its execution client is offline; it will go optimistic if it \
-                 has not already"
+                "Beacon node reports its execution client is offline; duties go to the nodes with \
+                 one first, and it will go optimistic if it has not already"
             );
         } else if was_el_offline && !el_offline {
             info!(position, "Beacon node reports its execution client is back");
         }
     }
 
-    /// Every position, the nodes whose last probe passed first, then the rest,
-    /// each group in command-line order, with each node's standing.
+    /// Every position in the order requests walk the nodes in, with each
+    /// node's standing: by [`Tier`], best first, command-line order breaking
+    /// ties. With no probe held and no request failed, every node is
+    /// [`Tier::Unknown`], so it is plain command-line order.
     ///
-    /// The order requests walk the nodes in. Nothing more than passed or not:
-    /// with no probe held, it is plain command-line order.
+    /// The standing is the probe's alone, whatever the tier: a node ranked
+    /// failing for a request it did not answer still reads as synced to the
+    /// calls that refuse unsynced nodes.
     pub fn ranked(&self) -> Vec<(usize, Standing)> {
-        self.ranked_at(SystemTime::now())
+        self.ranking_at(SystemTime::now())
+            .into_iter()
+            .map(|(position, standing, _)| (position, standing))
+            .collect()
     }
 
-    fn ranked_at(&self, now: SystemTime) -> Vec<(usize, Standing)> {
+    /// Every position in the walk's order, as [`Self::ranked`], with each
+    /// node's [`Tier`]: what a report on the nodes shows.
+    pub fn tiers(&self) -> Vec<(usize, Tier)> {
+        self.ranking_at(SystemTime::now())
+            .into_iter()
+            .map(|(position, _, tier)| (position, tier))
+            .collect()
+    }
+
+    fn ranking_at(&self, now: SystemTime) -> Vec<(usize, Standing, Tier)> {
         let read_for = self.read_for.get().copied();
-        let probes = self.read();
-        let standings = probes.iter().enumerate().map(|(position, probe)| {
-            let standing = match probe {
-                Some(probe) if !is_stale(probe, read_for, now) => probe.standing(),
-                _ => Standing::Unknown,
-            };
-            (position, standing)
-        });
-        let (mut ranked, rest): (Vec<_>, Vec<_>) =
-            standings.partition(|(_, standing)| *standing == Standing::Synced);
-        ranked.extend(rest);
-        ranked
+        let records = self.read();
+        let mut ranking: Vec<(usize, Standing, Tier)> = records
+            .iter()
+            .enumerate()
+            .map(|(position, record)| {
+                let probe = record
+                    .probe
+                    .as_ref()
+                    .filter(|probe| !is_stale(probe.at, read_for, now));
+                let standing = probe.map_or(Standing::Unknown, Probe::standing);
+                let failed = record
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| !is_stale(failure.at, read_for, now));
+                let tier = if failed {
+                    Tier::Failing
+                } else {
+                    probe.map_or(Tier::Unknown, Tier::of)
+                };
+                (position, standing, tier)
+            })
+            .collect();
+        // Stable, and keyed on the position too, so ties keep command-line
+        // order whatever order the records were written in.
+        ranking.sort_by_key(|&(position, _, tier)| (tier, position));
+        ranking
     }
 
     /// How the probes taken for `slot` split. A node whose last probe was taken
     /// for another slot did not answer this one; one still on the slot before's
     /// synced answer is counted apart, as awaited.
     pub fn verdict(&self, slot: Slot) -> SyncVerdict {
-        let probes = self.read();
-        let for_slot = probes.iter().flatten().filter(|probe| probe.slot == slot);
+        let records = self.read();
+        let probes = || records.iter().filter_map(|record| record.probe.as_ref());
+        let for_slot = probes().filter(|probe| probe.slot == slot);
         let mut verdict = SyncVerdict::tally(for_slot.map(Probe::standing));
-        verdict.awaited_synced = probes
-            .iter()
-            .flatten()
+        verdict.awaited_synced = probes()
             .filter(|probe| probe.slot + 1 == slot && probe.standing() == Standing::Synced)
             .count();
         verdict
@@ -336,8 +535,12 @@ impl NodeHealth {
 
     /// The records are plain values with no invariant between them, so one a
     /// panicking writer left behind is still a record worth reading.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Option<Probe>>> {
-        self.probes.read().unwrap_or_else(PoisonError::into_inner)
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Record>> {
+        self.records.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<Record>> {
+        self.records.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -345,8 +548,13 @@ fn is_el_offline(probe: &Probe) -> bool {
     matches!(&probe.outcome, Ok(status) if status.el_offline)
 }
 
-fn is_stale(probe: &Probe, read_for: Option<Duration>, now: SystemTime) -> bool {
-    read_for.is_some_and(|limit| now.duration_since(probe.at).unwrap_or_default() > limit)
+/// Behind by more than [`SYNC_TOLERANCE`] without saying it is syncing.
+fn is_lagging(probe: &Probe) -> bool {
+    matches!(&probe.outcome, Ok(status) if !status.is_syncing && status.is_behind())
+}
+
+fn is_stale(at: SystemTime, read_for: Option<Duration>, now: SystemTime) -> bool {
+    read_for.is_some_and(|limit| now.duration_since(at).unwrap_or_default() > limit)
 }
 
 /// The duty loop's gate for `slot`, read at its boundary: whether the slot's
@@ -555,8 +763,38 @@ mod tests {
         assert_eq!(Standing::of(&status(false, false)), Standing::Synced);
     }
 
+    fn order(health: &NodeHealth) -> Vec<usize> {
+        health
+            .ranked()
+            .into_iter()
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    fn at_distance(slot: Slot, sync_distance: u64) -> Probe {
+        probe(
+            slot,
+            Ok(SyncStatus {
+                sync_distance: Some(sync_distance),
+                ..status(false, false)
+            }),
+        )
+    }
+
+    fn el_offline(slot: Slot) -> Probe {
+        probe(
+            slot,
+            Ok(SyncStatus {
+                el_offline: true,
+                ..status(false, false)
+            }),
+        )
+    }
+
+    /// The tiers, best first: synced; optimistic; syncing; failing. Nodes in
+    /// one tier keep command-line order.
     #[test]
-    fn nodes_that_passed_come_first_in_command_line_order() {
+    fn nodes_are_ranked_by_tier_and_then_by_command_line_order() {
         let health = health(vec![
             syncing(3),
             synced(3),
@@ -564,12 +802,136 @@ mod tests {
             synced(3),
             optimistic(3),
         ]);
-        let order: Vec<usize> = health
-            .ranked()
-            .into_iter()
-            .map(|(position, _)| position)
-            .collect();
-        assert_eq!(order, vec![1, 3, 0, 2, 4]);
+        assert_eq!(order(&health), vec![1, 3, 4, 0, 2]);
+        assert_eq!(
+            health.tiers(),
+            vec![
+                (1, Tier::Synced),
+                (3, Tier::Synced),
+                (4, Tier::Degraded),
+                (0, Tier::Behind),
+                (2, Tier::Failing)
+            ]
+        );
+    }
+
+    /// Two nodes equally healthy keep the order they were listed in, so a
+    /// client with one healthy node, or several, behaves as it always did.
+    /// Distances inside the tolerance do not reorder them either.
+    #[test]
+    fn two_healthy_nodes_keep_command_line_order() {
+        assert_eq!(order(&health(vec![synced(3), synced(3)])), vec![0, 1]);
+        let within = health(vec![at_distance(3, 2), at_distance(3, 0)]);
+        assert_eq!(order(&within), vec![0, 1]);
+    }
+
+    /// A node that says it is not syncing but whose head is more than the
+    /// tolerance behind its own clock ranks with the syncing nodes, after a
+    /// synced node listed behind it. Within the tolerance it is synced: the
+    /// issue's example of 5 slots is inside Lighthouse's 8, so 9 is the case
+    /// that moves.
+    #[test]
+    fn a_node_beyond_the_sync_tolerance_ranks_after_a_synced_one() {
+        let behind = health(vec![at_distance(3, SYNC_TOLERANCE + 1), synced(3)]);
+        assert_eq!(order(&behind), vec![1, 0]);
+        assert_eq!(behind.tiers()[1], (0, Tier::Behind));
+        assert_eq!(
+            behind.ranked()[1],
+            (0, Standing::Synced),
+            "ranked lower, still synced to the gate"
+        );
+
+        let within = health(vec![at_distance(3, 5), synced(3)]);
+        assert_eq!(order(&within), vec![0, 1]);
+        let at_the_edge = health(vec![at_distance(3, SYNC_TOLERANCE), synced(3)]);
+        assert_eq!(order(&at_the_edge), vec![0, 1]);
+
+        // Behind, it still ranks above a node that did not answer at all.
+        let both = health(vec![down(3), at_distance(3, 40)]);
+        assert_eq!(order(&both), vec![1, 0]);
+    }
+
+    /// An optimistic node, or one whose execution client is offline, ranks
+    /// below a synced one and above a syncing one.
+    #[test]
+    fn optimistic_and_el_offline_nodes_rank_between_synced_and_syncing() {
+        let health = health(vec![syncing(3), el_offline(3), optimistic(3), synced(3)]);
+        assert_eq!(order(&health), vec![3, 1, 2, 0]);
+        assert_eq!(health.tiers()[1], (1, Tier::Degraded));
+    }
+
+    /// A node never probed, or one whose probe has not come back yet, ranks
+    /// below every node that answered and above one that failed.
+    #[test]
+    fn a_node_not_probed_yet_ranks_below_those_that_answered() {
+        let health = NodeHealth::new(3);
+        health.record(1, syncing(3));
+        health.record(2, down(3));
+        assert_eq!(
+            health.tiers(),
+            vec![(1, Tier::Behind), (0, Tier::Unknown), (2, Tier::Failing)]
+        );
+    }
+
+    fn failed(failure: BeaconNodeFailure) -> Error {
+        Error::BeaconNode {
+            url: "mock".to_string(),
+            failure,
+            detail: "no answer".to_string(),
+        }
+    }
+
+    /// A request that timed out ranks its node failing at once, and a probe
+    /// recorded after it that answers ranks it by its probe again. A probe
+    /// that fails changes nothing. An answer with an error status is an
+    /// answer, and a request that broke once sent fails fast, so neither
+    /// ranks a node failing; a refused connection does.
+    #[test]
+    fn a_request_with_no_answer_ranks_the_node_failing_until_a_probe_answers() {
+        let health = health(vec![synced(3), synced(3)]);
+        health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Timeout));
+        assert_eq!(order(&health), vec![1, 0]);
+        assert_eq!(health.tiers()[1], (0, Tier::Failing));
+        assert_eq!(
+            health.ranked()[1],
+            (0, Standing::Synced),
+            "the gate still reads the probe"
+        );
+
+        health.record(0, down(4));
+        assert_eq!(order(&health), vec![1, 0]);
+        health.record(0, synced(5));
+        assert_eq!(order(&health), vec![0, 1]);
+
+        let refused = Error::BeaconNodeStatus {
+            status: 404,
+            body: "no aggregate".to_string(),
+        };
+        health.record_request_failure(0, "aggregate_attestation", &refused);
+        health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Request));
+        assert_eq!(order(&health), vec![0, 1], "neither ranks it failing");
+
+        health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Connect));
+        assert_eq!(order(&health), vec![1, 0]);
+    }
+
+    /// A request failure is read for as long as a probe is: a probe task that
+    /// stopped leaves every node back in command-line order.
+    #[test]
+    fn a_stale_request_failure_is_not_read_for_routing() {
+        let health = NodeHealth::new(2);
+        health.expire_after(Duration::from_secs(24));
+        let failed_at = SystemTime::now();
+        health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Timeout));
+        assert_eq!(health.ranking_at(failed_at)[1].2, Tier::Failing);
+        let later = health.ranking_at(failed_at + Duration::from_secs(60));
+        assert_eq!(
+            later,
+            vec![
+                (0, Standing::Unknown, Tier::Unknown),
+                (1, Standing::Unknown, Tier::Unknown)
+            ]
+        );
     }
 
     /// Before any probe the walk is the command-line order, unchanged, which
@@ -603,28 +965,25 @@ mod tests {
             },
         );
 
-        let fresh = health.ranked_at(taken + Duration::from_secs(1));
-        assert_eq!(fresh[0], (1, Standing::Synced));
+        let fresh = health.ranking_at(taken + Duration::from_secs(1));
+        assert_eq!(fresh[0], (1, Standing::Synced, Tier::Synced));
 
-        let later = health.ranked_at(taken + Duration::from_secs(60));
-        assert_eq!(later, vec![(0, Standing::Unknown), (1, Standing::Unknown)]);
+        let later = health.ranking_at(taken + Duration::from_secs(60));
+        assert_eq!(
+            later,
+            vec![
+                (0, Standing::Unknown, Tier::Unknown),
+                (1, Standing::Unknown, Tier::Unknown)
+            ]
+        );
     }
 
     /// A probe with no answer leaves the execution client's last reported
     /// state as it was, so the next answer is compared with the one before it.
     #[test]
     fn a_failed_probe_leaves_the_execution_clients_state() {
-        let el_offline = |slot| {
-            probe(
-                slot,
-                Ok(SyncStatus {
-                    el_offline: true,
-                    ..status(false, false)
-                }),
-            )
-        };
         let nodes = NodeHealth::new(1);
-        let held = |nodes: &NodeHealth| nodes.el_offline[0].load(Ordering::Relaxed);
+        let held = |nodes: &NodeHealth| nodes.read()[0].el_offline;
         nodes.record(0, el_offline(3));
         nodes.record(0, down(4));
         assert!(held(&nodes), "no answer, nothing changed");

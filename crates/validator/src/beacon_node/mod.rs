@@ -670,6 +670,24 @@ pub trait BeaconNodeApi: Send + Sync {
         blob_data_included: bool,
     ) -> Result<()>;
 
+    /// [`Self::publish_execution_payload_envelope`] for the envelope of a block
+    /// `producer` produced (the [`ProducedBlock::producer`] of the block it
+    /// reveals the payload of).
+    ///
+    /// A single node has no one to choose and ignores `producer`, which is
+    /// the default. The fallback reads it under `--broadcast blocks`, to send
+    /// the envelope to the producing node first.
+    async fn publish_execution_payload_envelope_produced_by(
+        &self,
+        producer: Producer,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        let _ = producer;
+        self.publish_execution_payload_envelope(body, blob_data_included)
+            .await
+    }
+
     /// The payload timeliness committee duties for `indices` in `epoch`.
     ///
     /// An epoch before gloas answers with no duties rather than an error.
