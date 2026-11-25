@@ -28,11 +28,16 @@
 //!   [`SharedProtection::last_write_ok`]). A failed write fails the check
 //!   until a later write succeeds.
 //! - **`started`**: a duty refresh has succeeded since the process started.
+//! - **`schedule_current`**: the last successful duty refresh is at most two
+//!   epochs old, so the schedule it fetched (its own epoch and the next) still
+//!   covers now. A node can answer its probe synced and still fail every
+//!   refresh; once the schedule runs out the client has no duties to do.
+//!   `true` before the first refresh, which `started` reports.
 //!
 //! # Status
 //!
-//! - `healthy`, `200`: started, at least one usable node, and the record's
-//!   last write went through.
+//! - `healthy`, `200`: started, at least one usable node, the record's last
+//!   write went through, and the schedule is current.
 //! - `starting`, `503`: not started yet, and nothing else has failed. A node
 //!   not probed yet does not count against the client before it starts, so a
 //!   normal startup reads `starting` throughout rather than `unhealthy`. Once
@@ -54,7 +59,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -72,6 +77,10 @@ pub const SERVICE: &str = "ethlambda-validator";
 /// bound the fallback reads probes for when it routes.
 const PROBE_READ_SLOTS: u32 = 2;
 
+/// How many epochs a successful duty refresh's schedule covers: its own and
+/// the next.
+const SCHEDULE_EPOCHS: u64 = 2;
+
 /// The state `/health` reads, shared by the metrics server, which reports it,
 /// and the duty loop, which keeps it.
 pub struct ClientHealth {
@@ -84,6 +93,9 @@ pub struct ClientHealth {
     resolved: AtomicU64,
     /// A duty refresh has succeeded.
     started: AtomicBool,
+    /// When the last duty refresh succeeded, in milliseconds since the Unix
+    /// epoch: `0` before the first.
+    refreshed_at: AtomicU64,
     /// Set once the beacon nodes and the record exist, which is after the
     /// metrics server is already answering.
     attached: OnceLock<Attached>,
@@ -93,6 +105,8 @@ struct Attached {
     nodes: Arc<NodeHealth>,
     /// How old a probe may be and still be read.
     read_for: Duration,
+    /// How long a successful refresh's schedule lasts.
+    schedule_lasts: Duration,
     protection: SharedProtection,
 }
 
@@ -107,22 +121,26 @@ impl ClientHealth {
             loaded: AtomicU64::new(loaded),
             resolved: AtomicU64::new(0),
             started: AtomicBool::new(false),
+            refreshed_at: AtomicU64::new(0),
             attached: OnceLock::new(),
         }
     }
 
     /// Read the beacon nodes' probes from `nodes`, judging a probe stale past
     /// two of `slot_duration`, and the record's last write from `protection`.
-    /// Called once; a second call changes nothing.
+    /// Called once, after the preset is adopted, since an epoch's length is
+    /// read from it; a second call changes nothing.
     pub fn attach(
         &self,
         nodes: Arc<NodeHealth>,
         slot_duration: Duration,
         protection: SharedProtection,
     ) {
+        let schedule_slots = SCHEDULE_EPOCHS * ethlambda_types::beacon::preset::slots_per_epoch();
         let _ = self.attached.set(Attached {
             nodes,
             read_for: slot_duration * PROBE_READ_SLOTS,
+            schedule_lasts: slot_duration * u32::try_from(schedule_slots).unwrap_or(u32::MAX),
             protection,
         });
     }
@@ -130,8 +148,27 @@ impl ClientHealth {
     /// A duty refresh succeeded, resolving `resolved` validators to an index.
     /// The first one is what moves the client from `starting`.
     pub fn epoch_refreshed(&self, resolved: usize) {
+        self.epoch_refreshed_at(resolved, SystemTime::now());
+    }
+
+    fn epoch_refreshed_at(&self, resolved: usize, at: SystemTime) {
+        let millis = at
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
         self.resolved.store(resolved as u64, Ordering::Relaxed);
+        self.refreshed_at.store(millis.max(1), Ordering::Relaxed);
         self.started.store(true, Ordering::Relaxed);
+    }
+
+    /// The last successful refresh's schedule still covers `now`, or no
+    /// refresh has succeeded yet.
+    fn schedule_current(&self, attached: &Attached, now: SystemTime) -> bool {
+        let refreshed = self.refreshed_at.load(Ordering::Relaxed);
+        if refreshed == 0 {
+            return true;
+        }
+        let at = UNIX_EPOCH + Duration::from_millis(refreshed);
+        now.duration_since(at).unwrap_or_default() <= attached.schedule_lasts
     }
 
     /// What `/health` answers now.
@@ -150,9 +187,10 @@ impl ClientHealth {
         };
         let last_write_ok = attached.is_none_or(|attached| attached.protection.last_write_ok());
         let started = self.started.load(Ordering::Relaxed);
+        let schedule_current = attached.is_none_or(|attached| self.schedule_current(attached, now));
 
         let nodes_ok = nodes.usable > 0;
-        let status = if started && nodes_ok && last_write_ok {
+        let status = if started && nodes_ok && last_write_ok && schedule_current {
             Status::Healthy
         } else if !started && last_write_ok && (nodes_ok || nodes.unprobed > 0) {
             Status::Starting
@@ -174,6 +212,7 @@ impl ClientHealth {
                 },
                 slashing_protection: SlashingProtectionCheck { last_write_ok },
                 started,
+                schedule_current,
             },
         }
     }
@@ -273,6 +312,7 @@ pub struct Checks {
     pub validators: Validators,
     pub slashing_protection: SlashingProtectionCheck,
     pub started: bool,
+    pub schedule_current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -355,7 +395,7 @@ mod tests {
     }
 
     /// The body is the issue's: `status`, `service` and the four checks, each
-    /// with exactly the fields it names.
+    /// with exactly the fields it names, plus `schedule_current`.
     #[test]
     fn the_body_has_the_issues_shape() {
         let (health, probes) = client(2, 3);
@@ -374,9 +414,39 @@ mod tests {
                     "validators": { "loaded": 3, "resolved": 2 },
                     "slashing_protection": { "last_write_ok": true },
                     "started": true,
+                    "schedule_current": true,
                 }
             })
         );
+    }
+
+    /// A refresh's schedule covers its own epoch and the next. Once the last
+    /// successful refresh is older than that, the client has no duties left
+    /// to do, whatever its nodes' probes say.
+    #[test]
+    fn a_schedule_past_two_epochs_is_unhealthy() {
+        let (health, probes) = client(1, 1);
+        let refreshed = SystemTime::now();
+        health.epoch_refreshed_at(1, refreshed);
+        let two_epochs = SLOT * (2 * ethlambda_types::beacon::preset::slots_per_epoch()) as u32;
+        // The last slot the schedule covers, with a fresh probe.
+        let last = refreshed + two_epochs - SLOT;
+        probes.record(
+            0,
+            Probe {
+                at: last,
+                ..synced()
+            },
+        );
+
+        let covered = health.report_at(last);
+        assert_eq!(covered.status, Status::Healthy);
+        assert!(covered.checks.schedule_current);
+
+        let past = health.report_at(last + SLOT * 2);
+        assert_eq!(past.status, Status::Unhealthy);
+        assert!(!past.checks.schedule_current);
+        assert!(past.beacon_node_available(), "the node still probes usable");
     }
 
     /// Until the first refresh the client is `starting`, a `503`, and the

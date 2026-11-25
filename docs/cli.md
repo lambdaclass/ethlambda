@@ -968,7 +968,8 @@ behind the answer.
     "beacon_nodes": { "usable": 0, "configured": 2 },
     "validators": { "loaded": 64, "resolved": 64 },
     "slashing_protection": { "last_write_ok": true },
-    "started": true
+    "started": true,
+    "schedule_current": true
   }
 }
 ```
@@ -991,11 +992,16 @@ is cheap to poll.
   to finish. A failed write keeps it `false` until a later write succeeds. A
   full disk or a read-only remount under `--validators-dir` shows up here.
 - **`started`**: a duty refresh has succeeded since the process started.
+- **`schedule_current`**: the last successful duty refresh is at most two
+  epochs old, so the schedule it fetched (its own epoch and the next) still
+  covers now. A node can answer its probe synced and still fail every refresh;
+  once the schedule runs out the client has nothing to sign. `true` before the
+  first refresh.
 
 `status` is one of three:
 
-- `healthy` (`200`): started, at least one usable node, and the last write went
-  through.
+- `healthy` (`200`): started, at least one usable node, the last write went
+  through, and the schedule is current.
 - `starting` (`503`): no refresh has succeeded yet and nothing else has failed.
   A node not probed yet does not count against a client that has not started,
   so a normal startup reads `starting` throughout. Once started, a node with no
