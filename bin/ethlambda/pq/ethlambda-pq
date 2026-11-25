@@ -1,120 +1,18 @@
 #!/bin/bash
-# Runs `ethlambda` with a leanVM prover sidecar beside it, for a network that
-# schedules the PQ fork, adapted from Lighthouse's `lighthouse-pq-bn`:
-# `ethlambda-pq beacon <flags>` starts the sidecar on a private socket, waits
-# for it to listen, then starts `ethlambda <flags> --pq-prover-socket <socket>`.
+# Kept so a launcher written for pq-devnet-0's image (`ethlambda-pq beacon
+# <flags>`, as ethereum-package's pq branch runs it) still starts the node.
 #
-# The node exiting stops the sidecar, and the script exits with the node's
-# status. The sidecar exiting does not stop the node: it is started again on
-# the same socket, and the node's client reconnects on its next request.
-# Meanwhile the node proves nothing, and a gossip aggregate it cannot verify
-# is ignored rather than held against its sender. The pause before a restart
-# starts at one second and doubles, up to 32, while the sidecar keeps exiting
-# within a minute of starting. After LEANVM_MAX_RESTARTS (default 10) such
-# exits in a row, the script stops the node too: a sidecar that cannot run
-# (killed for memory at every warm-up, say) is then reported, not retried
-# forever.
+# pq-devnet-0 ran leanVM's prover as a separate `leanvm-sidecar`, which this
+# script started and supervised. leanVM bindings v0.17.0, pq-devnet-1's
+# release, removed the sidecar: the node proves in process on a network that
+# schedules the PQ fork, so this script only runs `ethlambda <flags>`.
 #
-# Which sidecar is this script's choice, not the node's:
-# - LEANVM_SIDECAR: the executable (default: `leanvm-sidecar` on PATH, the one
-#   the image builds from the leanVM revision in `leanvm-revision`, recorded at
-#   /usr/local/share/ethlambda/leanvm-revision).
-# - LEANVM_THREADS: how many threads it proves on (default 0: one per core).
-# The node refuses a sidecar speaking another protocol version or proving for
-# another verifier than its client.
+# LEANVM_THREADS, the sidecar's thread count, is still honored: it becomes
+# `--pq-prover-threads` (0, the default: one per core). LEANVM_SIDECAR and
+# LEANVM_MAX_RESTARTS no longer mean anything and are ignored.
 set -eu
 
-sidecar=${LEANVM_SIDECAR:-leanvm-sidecar}
-threads=${LEANVM_THREADS:-0}
-max_restarts=${LEANVM_MAX_RESTARTS:-10}
-revision_file=/usr/local/share/ethlambda/leanvm-revision
-if [[ -z ${LEANVM_SIDECAR:-} && -r $revision_file ]]; then
-    echo "ethlambda-pq: starting $sidecar (leanVM $(cat "$revision_file")) on $threads threads (0: one per core)" >&2
-else
-    echo "ethlambda-pq: starting $sidecar on $threads threads (0: one per core)" >&2
+if [[ -n ${LEANVM_THREADS:-} ]]; then
+    exec ethlambda "$@" --pq-prover-threads "$LEANVM_THREADS"
 fi
-
-socket_dir=$(mktemp -d "${TMPDIR:-/tmp}/leanvm.XXXXXXXX")
-socket_path="$socket_dir/prover.sock"
-prover_pid=
-prover_started=0
-node_pid=
-
-cleanup() {
-    if [[ -n "$node_pid" ]]; then
-        kill "$node_pid" 2>/dev/null || true
-        wait "$node_pid" 2>/dev/null || true
-    fi
-    if [[ -n "$prover_pid" ]]; then
-        kill "$prover_pid" 2>/dev/null || true
-        wait "$prover_pid" 2>/dev/null || true
-    fi
-    rm -f -- "$socket_path" "$socket_path.lock"
-    rmdir -- "$socket_dir" 2>/dev/null || true
-}
-
-trap cleanup EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
-
-start_sidecar() {
-    # A sidecar killed outright leaves its socket and lock behind.
-    rm -f -- "$socket_path" "$socket_path.lock"
-    "$sidecar" --socket "$socket_path" --threads "$threads" &
-    prover_pid=$!
-    prover_started=$SECONDS
-}
-
-start_sidecar
-ready_deadline=$((SECONDS + 120))
-until [[ -S "$socket_path" ]]; do
-    if ! kill -0 "$prover_pid" 2>/dev/null; then
-        echo "ethlambda-pq: $sidecar exited before creating its socket" >&2
-        exit 1
-    fi
-    if (( SECONDS >= ready_deadline )); then
-        echo "ethlambda-pq: $sidecar did not create its socket within 120 seconds" >&2
-        exit 1
-    fi
-    sleep 0.1
-done
-
-ethlambda "$@" --pq-prover-socket "$socket_path" &
-node_pid=$!
-
-# Short polls rather than one long sleep for the pause, so a TERM is handled
-# within a fraction of a second whatever the script is waiting for.
-delay=1
-failures=0
-restart_at=0
-while kill -0 "$node_pid" 2>/dev/null; do
-    if [[ -n "$prover_pid" ]] && ! kill -0 "$prover_pid" 2>/dev/null; then
-        prover_status=0
-        wait "$prover_pid" || prover_status=$?
-        prover_pid=
-        lived=$((SECONDS - prover_started))
-        if (( lived >= 60 )); then
-            delay=1
-            failures=0
-        else
-            failures=$((failures + 1))
-        fi
-        if (( failures >= max_restarts )); then
-            echo "ethlambda-pq: $sidecar exited within a minute of starting $failures times in a row; stopping ethlambda" >&2
-            exit 1
-        fi
-        echo "ethlambda-pq: $sidecar exited (status $prover_status) after ${lived}s while ethlambda was running; restarting it in ${delay}s" >&2
-        restart_at=$((SECONDS + delay))
-        delay=$((delay * 2 > 32 ? 32 : delay * 2))
-    fi
-    if [[ -z "$prover_pid" ]] && (( SECONDS >= restart_at )); then
-        start_sidecar
-        echo "ethlambda-pq: restarted $sidecar" >&2
-    fi
-    sleep 0.2
-done
-
-status=0
-wait "$node_pid" || status=$?
-node_pid=
-exit "$status"
+exec ethlambda "$@"

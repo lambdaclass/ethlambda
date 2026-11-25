@@ -399,17 +399,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         );
         ethlambda_crypto::init_leanvm(lean.prover_arena);
     }
-    // The PQ fork's attestation proofs: leanVM proofs from a sidecar this node
-    // starts, or one already listening, the specification's reference
-    // encoding otherwise. Before anything can verify a proof, since the first
-    // one used stays installed.
-    if let Network::Mainnet { mainnet, .. } = &network {
-        use ethlambda_crypto::stark::{self, sidecar::SidecarConfig};
-        if let Some(socket) = &mainnet.pq_prover_socket {
-            stark::install_sidecar(SidecarConfig::new(socket.clone()))
-                .wrap_err("cannot use the leanVM prover sidecar")?;
-        }
-    }
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -479,6 +468,26 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
             let source = network::NetworkSource::resolve(&spec)?;
             let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes(), discovery_ip)?;
+            // The PQ fork's attestation proofs: leanVM proofs, made and
+            // checked in this process, on a network that schedules PQ (the
+            // specification's reference encoding otherwise, which nothing
+            // there uses). Here, once the network says whether it does, and
+            // before anything can verify a proof, since the first backend
+            // used stays installed.
+            let pq_epoch = source.config().pq_fork_epoch;
+            if pq_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+                use ethlambda_crypto::stark::{self, leanvm::LeanVmConfig};
+                let config = LeanVmConfig {
+                    threads: mainnet.pq_prover_threads,
+                    ..LeanVmConfig::default()
+                };
+                info!(
+                    pq_epoch,
+                    threads = config.threads,
+                    "Starting leanVM's prover for the PQ fork"
+                );
+                stark::install_leanvm(config).wrap_err("cannot start leanVM's prover")?;
+            }
             (Some(source), bootnodes)
         }
     };
