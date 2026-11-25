@@ -1,6 +1,6 @@
 //! Helpers the PQ fork adds or modifies (consensus-specs
 //! `specs/_features/pq/beacon-chain.md`, on the `pq` branch at
-//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! # Keys
 //!

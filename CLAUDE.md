@@ -300,18 +300,19 @@ actual_slot = finalized_slot + 1 + relative_index
   signatures, a port of leanVM `4af2cddd`'s Rust implementation pinned by
   consensus-specs' and leanVM's known answers), and proves many signatures at
   once through `ethlambda_crypto::stark`: the specification's reference (the
-  signatures concatenated) by default, or real leanVM proofs from a
-  `leanvm-sidecar` process (leanVM `c5ee9d239`, bindings v0.15.0, the
-  release pq-devnet-0 runs for its signer, prover, verifier and sidecar),
-  which is what the PQ devnet runs. The node only connects to a sidecar
-  (`--pq-prover-socket`); as for Lighthouse, something else starts it: the
-  image's `ethlambda-pq` supervisor (`bin/ethlambda/pq/`), run as
-  `ethlambda-pq beacon <flags>`. The image builds `leanvm-sidecar` from the
-  revision in the root `leanvm-revision` file (or `--build-arg LEANVM_REV`),
-  so which prover a devnet runs is chosen outside the node; the node's client
-  only refuses a sidecar with another protocol version or verifier tag.
-  The two encodings do not verify each other's proofs. Never pass one
-  scheme's key to the other
+  signatures concatenated), or real leanVM proofs made in process
+  (`stark::leanvm`, leanVM `1e997c99`, bindings v0.17.0, the one release
+  pq-devnet-1 runs for signer, prover and verifier; `lean_vm` with its
+  experimental prover, `cpu_tiers` off). `run_node` installs leanVM as soon
+  as `--network` resolves to a network that schedules PQ, on
+  `--pq-prover-threads` threads (0: one per core); the reference is then
+  only what the spec tests run. v0.17.0 removed pq-devnet-0's
+  `leanvm-sidecar`, so the image builds none, and `ethlambda-pq`
+  (`bin/ethlambda/pq/`) is now a shim that execs `ethlambda`, kept for
+  launchers that still call it. A proof from another leanVM revision does not
+  verify, and nothing on the wire says why; the root `leanvm-revision` file
+  names the pin. The two encodings do not verify each other's proofs. Never
+  pass one scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
   (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
   constants in `common/crypto/src/signature.rs`
@@ -878,7 +879,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
-  `b5d422b2`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
+  `4c296784`, pq-devnet-1's spec: staggered aggregators of `4595f0fc`, VRF
+  secrets of `b5d422b2`, `X_MAX_COMMITTEE_COUNT_PER_SLOT` of `af898d07`,
+  keccak256 legacy keys of `4c296784`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
   and PQ's gossip rules (`gossip/pq.rs`, `p2p/src/beacon/pq.rs`: a PQ digest's
@@ -914,8 +917,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   client survives a restart. The beacon node builds PQ blocks through `POST
   /eth/v1/validator/pq_blocks/{slot}` (`rpc/src/beacon/pq_proposal.rs`,
   `pq_block_production.rs`), packing attestations from the validated
-  aggregates in `Store::pq_aggregate_pool` with their proofs merged on the
-  sidecar under a deadline (one unmerged attestation when it misses), and
+  aggregates in `Store::pq_aggregate_pool` with their proofs merged by
+  leanVM under a deadline (one unmerged attestation when it misses), and
   proves its aggregators' committees ahead (`rpc/src/beacon/pq_aggregation.rs`,
   `Store::pq_signature_pool`). Blobs travel as in gloas: the node keeps the
   blobs of the payload it built and the envelope endpoint publishes their
@@ -1221,11 +1224,14 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 8: `Config` gained the EIP-8483 and PQ fork versions and
-  epochs, `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, PQ's aggregation
-  timing (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`,
-  `AGGREGATOR_DELAY_BPS`) and `ATTESTATION_SUBNET_COUNT_PQ`, so a version 7
-  directory's stored config decodes into the wrong fields. (7 moved `States`
+- `DB_VERSION` is 10 (pq-devnet-1): `Config` has PQ's aggregation timing
+  (`AGGREGATION_CUTOFF_BPS`, `AGGREGATE_DUE_BPS_PQ`, `AGGREGATOR_DELAY_BPS`)
+  again and `X_MAX_COMMITTEE_COUNT_PER_SLOT`, so a pq-devnet-0 (version 9,
+  without the timing keys) directory's stored config decodes into the wrong
+  fields. (9 dropped the timing keys for pq-devnet-0's `2f43bc0f`; 8 gave
+  `Config` the EIP-8483 and PQ fork versions and epochs,
+  `UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY`, the timing keys and
+  `ATTESTATION_SUBNET_COUNT_PQ`; 7 moved `States`
   and `StateDiffs` from root keys to slot||root keys, the block's slot looked
   up from `BlockHeaders` by readers, so `Store::prune_finalized_states` can
   range-delete finalized states; 6 was

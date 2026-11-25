@@ -1,6 +1,6 @@
 //! Gossip validation for the PQ fork's topics
 //! (`specs/_features/pq/p2p-interface.md`, consensus-specs' `pq` branch at
-//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! Every topic whose message carries a validator's or builder's signature
 //! carries an XMSS one instead, at the leaf the fork assigns that message, and

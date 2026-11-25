@@ -2262,7 +2262,7 @@ mod tests {
 
     /// The PQ preset's values, pinned from `presets/{mainnet,minimal}/pq.yaml`,
     /// `eip8483.yaml` and `eip8205.yaml` at consensus-specs' `pq` pin
-    /// `b5d422b255db80c9bbc48f515370655ecc8bf6e5`.
+    /// `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`.
     #[test]
     fn pq_pinned_values() {
         assert_eq!(mainnet::MAX_COMMITTEES_PER_SLOT_PQ, 16);

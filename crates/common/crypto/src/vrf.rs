@@ -1,6 +1,6 @@
 //! The Beacon Chain PQ fork's VRF tree (consensus-specs
 //! `specs/_features/pq/{beacon-chain,validator}.md`, on the `pq` branch at
-//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! XMSS signatures are not unique, so a proposer could grind a signature-based
 //! RANDAO reveal. A validator instead has a secret for each slot, derived from

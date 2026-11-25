@@ -1005,7 +1005,7 @@ signature, whichever way the node answered. Three departures:
 
 ## EIP-8483 and PQ run on a newer gloas than the gloas fork does
 
-consensus-specs' `pq` branch (`b5d422b255db80c9bbc48f515370655ecc8bf6e5`) is
+consensus-specs' `pq` branch (`4c296784bb6ff54cbdcf72ebdda2a1057cce8893`) is
 based on a `master` newer than this repository's pin (`v1.7.0-beta.2`). Across
 every fork's `beacon-chain.md`, `fork.md` and `fork-choice.md`, the rules that
 changed in between are the three state-transition rules below, the four
@@ -1125,15 +1125,15 @@ Two more:
 The specification's `stark.VerifyAggregates` checks each signature at its
 statement's leaf index, and its reference implementation does (a proof is
 the signatures concatenated). The PQ devnet's clients prove with leanVM
-instead, through a `leanvm-sidecar` (`--pq-prover-socket`,
-`ethlambda_crypto::stark::sidecar`), and a leanVM proof attests only
+instead, in process from bindings v0.17.0 (`ethlambda_crypto::stark::leanvm`,
+installed on any network that schedules PQ), and a leanVM proof attests only
 `(public key, message)` claims (leanEthereum/leanVM#787). So under the
-sidecar backend a proof shows each key signed the message at *some* leaf,
+leanVM backend a proof shows each key signed the message at *some* leaf,
 not at the statement's. Proving still refuses a signature made at another
 leaf, since it sees the signatures, which is Lighthouse's behavior too. The
 two encodings are not interchangeable: a node verifies only the backend it
-runs, so a network picks one, and the reference stays the default for the
-specification's fixtures.
+runs, so a network picks one, and the reference stays what the
+specification's fixtures run.
 
 ## The genesis block's body carries the state's bid from gloas on
 
