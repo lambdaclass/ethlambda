@@ -372,7 +372,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. See [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
-| `--broadcast` | none | Signed messages to send to every beacon node at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` is accepted and changes nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
+| `--broadcast` | none | Signed messages to send to every beacon node at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
@@ -599,11 +599,14 @@ best first, as Lighthouse ranks its nodes:
 5. failing: it did not answer its last probe, or since then did not answer a
    request.
 
-`--beacon-nodes` order breaks ties, so a single healthy node, or several
-equally healthy ones, are asked exactly as listed. Lighthouse's finer tiers
-(16 and 64 slots behind) are not kept: they only reorder nodes that are all
-behind, which in practice means a stalled network, where every node is behind
-by about as much.
+Inside a tier, a node that reports syncing goes last, and an optimistic one
+or one with its execution client offline after the rest. That only reorders
+tier 3, which a stalled network fills with every node, so a synced node is
+still asked ahead of a syncing one there. `--beacon-nodes` order breaks ties,
+so a single healthy node, or several equally healthy ones, are asked exactly
+as listed. Lighthouse's finer tiers (16 and 64 slots behind) are not kept:
+they only reorder nodes that are all behind, which in practice means a stalled
+network, where every node is behind by about as much.
 
 A request that times out, or whose connection cannot be made, ranks its node
 failing at once, until a later probe answers. So a node that takes requests
@@ -622,8 +625,8 @@ mesh: `attestations` (attestations, aggregates, payload attestations),
 contributions), comma-separated. None by default, as in Lighthouse, so the
 client behaves as before unless asked. Subscriptions, fee recipient
 preparations, builder registrations and proposer preferences always go to
-every node; `subscriptions` is accepted for compatibility and changes
-nothing.
+every node; `subscriptions` and `none` are accepted for compatibility and
+change nothing.
 
 - **One accepting node is success.** A message one node took is on the
   network. A node that refused is logged.
@@ -638,7 +641,7 @@ nothing.
   block the envelope reveals; a node that has not imported it yet queues or
   drops the envelope, and waiting for the producer's answer gives each a
   round trip longer to import it. An envelope sent without its blobs goes to
-  the producer alone, since only it cached them.
+  the producer alone, since only it cached them, with or without the flag.
 - **Signed once.** Every message is signed, and recorded by slashing
   protection, before it is sent, however many nodes it is sent to.
 

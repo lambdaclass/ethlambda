@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `AttesterDuty` | pubkey, validator_index, committee_index, committee_length, committees_at_slot, validator_committee_index, slot | all seven, all used |
 //! | Genesis | genesis_time, genesis_validators_root, genesis_fork_version | the first two; the fork version comes from `/config/spec` |
-//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | all five: is_syncing and is_optimistic gate signing; el_offline is logged; head_slot and sync_distance are recorded, and read leniently |
+//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | all five: is_syncing and is_optimistic gate signing; el_offline and sync_distance rank the node, stopping nothing; head_slot is recorded; head_slot and sync_distance are read leniently |
 //! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey; the single-validator form also reads the activation, exit and withdrawable epochs |
 //! | `ProposerDuty` | pubkey, validator_index, slot | all three, all used |
 //! | `ProposerPreparation` | validator_index, fee_recipient | both, sent not read |

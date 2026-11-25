@@ -28,10 +28,11 @@
 //!   [`Tier`] order, best first: synced and validated; synced but optimistic
 //!   or with its execution client offline; syncing, or more than
 //!   [`SYNC_TOLERANCE`] slots behind by its own `sync_distance`; not probed
-//!   yet; failing. Command-line order breaks ties, so a single healthy node,
-//!   or several equally healthy ones, are asked exactly as listed. Positions
-//!   stay command-line positions, so a blinded block still goes back to the
-//!   node that produced it.
+//!   yet; failing. Inside the behind tier, which a stall fills with every
+//!   node, a node that does not report syncing goes first. Command-line order
+//!   breaks ties, so a single healthy node, or several equally healthy ones,
+//!   are asked exactly as listed. Positions stay command-line positions, so a
+//!   blinded block still goes back to the node that produced it.
 //! - **The last real request** ([`NodeHealth::record_request_failure`]). A
 //!   request to a node that timed out or could not connect ranks it failing
 //!   until a probe recorded after it answers, so a node that hangs costs at
@@ -197,7 +198,9 @@ pub enum Tier {
     /// Answered within the tolerance and not syncing, but optimistic or with
     /// its execution client offline.
     Degraded,
-    /// Answered syncing, or more than [`SYNC_TOLERANCE`] slots behind.
+    /// Answered syncing, or more than [`SYNC_TOLERANCE`] slots behind. Inside
+    /// it, a node that does not report syncing goes first (see
+    /// [`NodeHealth::ranked`]).
     Behind,
     /// Not probed yet, or its last probe is too old to read.
     Unknown,
@@ -466,9 +469,11 @@ impl NodeHealth {
     }
 
     /// Every position in the order requests walk the nodes in, with each
-    /// node's standing: by [`Tier`], best first, command-line order breaking
-    /// ties. With no probe held and no request failed, every node is
-    /// [`Tier::Unknown`], so it is plain command-line order.
+    /// node's standing: by [`Tier`], best first, then inside a tier syncing
+    /// last and optimistic or `el_offline` after the rest (which only reorders
+    /// [`Tier::Behind`]), command-line order breaking ties. With no probe held
+    /// and no request failed, every node is [`Tier::Unknown`], so it is plain
+    /// command-line order.
     ///
     /// The standing is the probe's alone, whatever the tier: a node ranked
     /// failing for a request it did not answer still reads as synced to the
@@ -492,7 +497,7 @@ impl NodeHealth {
     fn ranking_at(&self, now: SystemTime) -> Vec<(usize, Standing, Tier)> {
         let read_for = self.read_for.get().copied();
         let records = self.read();
-        let mut ranking: Vec<(usize, Standing, Tier)> = records
+        let mut ranking: Vec<(usize, Standing, Tier, (bool, bool))> = records
             .iter()
             .enumerate()
             .map(|(position, record)| {
@@ -510,13 +515,16 @@ impl NodeHealth {
                 } else {
                     probe.map_or(Tier::Unknown, Tier::of)
                 };
-                (position, standing, tier)
+                (position, standing, tier, within_tier(probe))
             })
             .collect();
         // Stable, and keyed on the position too, so ties keep command-line
         // order whatever order the records were written in.
-        ranking.sort_by_key(|&(position, _, tier)| (tier, position));
+        ranking.sort_by_key(|&(position, _, tier, within)| (tier, within, position));
         ranking
+            .into_iter()
+            .map(|(position, standing, tier, _)| (position, standing, tier))
+            .collect()
     }
 
     /// How the probes taken for `slot` split. A node whose last probe was taken
@@ -551,6 +559,18 @@ fn is_el_offline(probe: &Probe) -> bool {
 /// Behind by more than [`SYNC_TOLERANCE`] without saying it is syncing.
 fn is_lagging(probe: &Probe) -> bool {
     matches!(&probe.outcome, Ok(status) if !status.is_syncing && status.is_behind())
+}
+
+/// What orders the nodes of one [`Tier`], before command-line order: one that
+/// reports syncing last, and one optimistic or with its execution client
+/// offline after the rest, as Lighthouse orders them inside each distance
+/// tier. Only [`Tier::Behind`] mixes them: once a stall puts every node past
+/// the tolerance, a synced node still goes ahead of a syncing one.
+fn within_tier(probe: Option<&Probe>) -> (bool, bool) {
+    match probe.map(|probe| &probe.outcome) {
+        Some(Ok(status)) => (status.is_syncing, status.is_optimistic || status.el_offline),
+        _ => (false, false),
+    }
 }
 
 fn is_stale(at: SystemTime, read_for: Option<Duration>, now: SystemTime) -> bool {
@@ -849,6 +869,30 @@ mod tests {
         // Behind, it still ranks above a node that did not answer at all.
         let both = health(vec![down(3), at_distance(3, 40)]);
         assert_eq!(order(&both), vec![1, 0]);
+    }
+
+    /// In a stall every node is past the tolerance and shares the behind tier.
+    /// Inside it, a node that reports syncing still goes after one that does
+    /// not, and an optimistic one after a validated one, whatever the list
+    /// order.
+    #[test]
+    fn inside_the_behind_tier_a_syncing_node_goes_last() {
+        let stalled = |is_syncing, is_optimistic| {
+            probe(
+                3,
+                Ok(SyncStatus {
+                    sync_distance: Some(SYNC_TOLERANCE + 2),
+                    ..status(is_syncing, is_optimistic)
+                }),
+            )
+        };
+        let health = health(vec![
+            stalled(true, false),
+            stalled(false, true),
+            stalled(false, false),
+        ]);
+        assert_eq!(order(&health), vec![2, 1, 0]);
+        assert!(health.tiers().iter().all(|&(_, tier)| tier == Tier::Behind));
     }
 
     /// An optimistic node, or one whose execution client is offline, ranks

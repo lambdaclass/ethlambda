@@ -676,7 +676,9 @@ pub trait BeaconNodeApi: Send + Sync {
     ///
     /// A single node has no one to choose and ignores `producer`, which is
     /// the default. The fallback reads it under `--broadcast blocks`, to send
-    /// the envelope to the producing node first.
+    /// the envelope to the producing node first, and for a body without its
+    /// blobs, with or without the flag, to send it to the producing node
+    /// alone, the one that cached them.
     async fn publish_execution_payload_envelope_produced_by(
         &self,
         producer: Producer,

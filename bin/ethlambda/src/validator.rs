@@ -34,7 +34,8 @@ pub(crate) struct ValidatorOptions {
     /// (attestations, aggregates, payload attestations), `blocks` (blocks
     /// and envelopes; never a blinded block), `sync-committee` (messages and
     /// contributions), `subscriptions` (always sent to every node, accepted
-    /// for Lighthouse compatibility). None by default.
+    /// for Lighthouse compatibility), `none` (also accepted for Lighthouse
+    /// compatibility, changing nothing). None by default.
     #[arg(long, value_delimiter = ',')]
     pub(crate) broadcast: Vec<BroadcastTopic>,
 
@@ -405,6 +406,8 @@ mod tests {
             }
         );
         let options = parse(&["--broadcast", "subscriptions"]).expect("parses");
+        assert_eq!(topics(options), Broadcast::default());
+        let options = parse(&["--broadcast", "none"]).expect("parses");
         assert_eq!(topics(options), Broadcast::default());
         parse(&["--broadcast", "everything"]).expect_err("not a topic");
     }

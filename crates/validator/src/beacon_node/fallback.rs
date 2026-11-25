@@ -93,15 +93,20 @@ pub enum BroadcastTopic {
     /// node, so naming it changes nothing; accepted as Lighthouse's flag
     /// accepts it.
     Subscriptions,
+    /// `none`, which turns Lighthouse's default subscriptions broadcast off.
+    /// Subscriptions always go to every node here, so it changes nothing;
+    /// accepted so a Lighthouse command line carries over.
+    Nothing,
 }
 
 impl BroadcastTopic {
     /// Every topic, by the name the command line takes.
-    pub const NAMES: [(&'static str, Self); 4] = [
+    pub const NAMES: [(&'static str, Self); 5] = [
         ("attestations", Self::Attestations),
         ("blocks", Self::Blocks),
         ("sync-committee", Self::SyncCommittee),
         ("subscriptions", Self::Subscriptions),
+        ("none", Self::Nothing),
     ];
 }
 
@@ -142,7 +147,7 @@ impl FromIterator<BroadcastTopic> for Broadcast {
                 BroadcastTopic::Attestations => broadcast.attestations = true,
                 BroadcastTopic::Blocks => broadcast.blocks = true,
                 BroadcastTopic::SyncCommittee => broadcast.sync_committee = true,
-                BroadcastTopic::Subscriptions => {}
+                BroadcastTopic::Subscriptions | BroadcastTopic::Nothing => {}
             }
         }
         broadcast
@@ -507,15 +512,14 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     {
         let sends = positions.into_iter().filter_map(|(position, _)| {
             let send = call(self.nodes.get(position)?);
-            Some(async move { (position, send.await) })
+            Some(async move {
+                let answer = send
+                    .await
+                    .inspect_err(|err| self.health.record_request_failure(position, what, err));
+                (position, answer)
+            })
         });
-        let answers = futures_util::future::join_all(sends).await;
-        for (position, answer) in &answers {
-            if let Err(err) = answer {
-                self.health.record_request_failure(*position, what, err);
-            }
-        }
-        answers
+        futures_util::future::join_all(sends).await
     }
 
     /// A broadcast's answers read as one: the best accepted answer by
@@ -954,7 +958,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     /// Without `--broadcast blocks`, [`Self::publish_execution_payload_envelope`]:
-    /// the first node in the walk that accepts it.
+    /// the first node in the walk that accepts it. A body without its blobs is
+    /// the exception, below, with or without the flag.
     ///
     /// With it, the producer first, then every other node. The producer is
     /// the one node certain to hold the block the envelope reveals (it built
@@ -977,7 +982,7 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         blob_data_included: bool,
     ) -> Result<()> {
         let what = "publish_execution_payload_envelope";
-        if !self.broadcast.blocks {
+        if !self.broadcast.blocks && blob_data_included {
             return self
                 .publish_execution_payload_envelope(body, blob_data_included)
                 .await;
@@ -996,10 +1001,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         if !producer_failing || !blob_data_included {
             let answer = node
                 .publish_execution_payload_envelope(body, blob_data_included)
-                .await;
-            if let Err(err) = &answer {
-                self.health.record_request_failure(position, what, err);
-            }
+                .await
+                .inspect_err(|err| self.health.record_request_failure(position, what, err));
             sent = Some((position, answer.is_ok()));
             answers.push((position, answer));
         }
@@ -2771,8 +2774,8 @@ mod tests {
     /// Under `--broadcast blocks` an envelope goes to the node that produced
     /// its block first, and to the rest only once that node has answered. One
     /// without its blobs goes to the producer alone, since only it cached
-    /// them. Without the flag, it is the first node in the walk that takes it,
-    /// as before.
+    /// them, with or without the flag. Without the flag, one with its blobs is
+    /// the first node in the walk that takes it, as before.
     #[tokio::test]
     async fn a_broadcast_envelope_goes_to_its_producer_first_then_to_the_rest() {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2828,6 +2831,17 @@ mod tests {
             .expect("published");
         assert_eq!(one_node.nodes[0].published_envelopes().len(), 1);
         assert!(one_node.nodes[1].published_envelopes().is_empty());
+
+        one_node
+            .publish_execution_payload_envelope_produced_by(Producer::at(1), b"bare", false)
+            .await
+            .expect("published");
+        assert_eq!(one_node.nodes[0].published_envelopes().len(), 1);
+        assert_eq!(
+            one_node.nodes[1].published_envelopes(),
+            vec![(b"bare".to_vec(), false)],
+            "a body without its blobs goes to its producer without the flag too"
+        );
     }
 
     /// Doppelganger protection's liveness query asks every node at once and
