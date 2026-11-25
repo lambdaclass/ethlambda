@@ -10,7 +10,9 @@
 //!   a refused connection, a body that stopped arriving. That is a property of
 //!   the node or the network.
 //! - A response that arrives whole but does not deserialise is
-//!   `Error::Decode`. That is a property of what the node said.
+//!   `Error::Decode`, and so is one refused unread for being longer than any
+//!   answer this client reads (`ANSWER_READ_LIMIT`). That is a property of
+//!   what the node said.
 //! - A response that deserialises but contradicts what was asked for is
 //!   `Error::InconsistentResponse`, raised here. It used to be raised by the
 //!   caller, which was wrong for one specific reason: `FallbackBeaconNode`
@@ -722,6 +724,14 @@ impl HttpBeaconNode {
         })? {
             if chunk.len() > limit - body.len() {
                 return Err(too_large(&url));
+            }
+            // Grown by doubling, as `extend_from_slice` would, but never past
+            // `limit`: left to itself, a body just over a power of two of its
+            // first reservation would reserve nearly twice the limit.
+            let needed = body.len() + chunk.len();
+            if needed > body.capacity() {
+                let grown = body.capacity().saturating_mul(2).clamp(needed, limit);
+                body.reserve_exact(grown - body.len());
             }
             body.extend_from_slice(&chunk);
         }
