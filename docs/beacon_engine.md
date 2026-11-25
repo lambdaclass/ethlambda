@@ -44,7 +44,11 @@ Two method families a full client would have are deliberately absent:
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
-  execution client does not advertise `engine_getPayloadV6`.
+  execution client does not advertise `engine_getPayloadV6`. On gloas and PQ
+  the chain actor sends that `forkchoiceUpdatedV4` with attributes a third of
+  a slot ahead, for a proposer a validator client registered, and block
+  production collects the build with `engine_getPayloadV6` at once; see the
+  `payload_attributes` event in [`rpc.md`](rpc.md).
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto

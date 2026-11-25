@@ -34,21 +34,24 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+use ethlambda_blockchain::{
+    PreparedPayloads, SyncStatusController,
+    metrics::SyncStatus,
+    payload_attributes::{PqProposal, ProposalError, prepare_pq_proposal, prepared_fee_recipient},
+};
 use ethlambda_engine::{EngineClient, types::ClientVersionV1};
 use ethlambda_state_transition::beacon::{
-    block_production::advance_to_slot,
-    fork_choice::{ForkChoiceNode, get_attestation_due_ms, get_head_node, should_build_on_full},
-    helpers::{accessors::get_beacon_proposer_index, pq::is_valid_vrf_proof},
+    fork_choice::get_attestation_due_ms,
+    helpers::pq::is_valid_vrf_proof,
     pq_block_production::{
-        PqBlockInputs, PqPacked, assemble_pq_block, parse_pq_execution_requests, pq_payload_inputs,
+        PqBlockInputs, PqPacked, assemble_pq_block, parse_pq_execution_requests,
         select_pq_attestations,
     },
 };
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
     config::Config,
-    containers::{BeaconState, SignedBeaconBlock, SignedExecutionPayloadEnvelope, pq},
+    containers::{BeaconState, pq},
     fork::ForkName,
     preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ,
     primitives::{Bytes32, ExecutionAddress, HashTreeRoot as _, KzgProof, Root, Slot},
@@ -131,6 +134,7 @@ async fn post_produce_pq_block(
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
     blob_cache: Option<Extension<PqBlobs>>,
+    ahead: Option<Extension<PreparedPayloads>>,
     Json(request): Json<ProducePqBlock>,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -160,6 +164,7 @@ async fn post_produce_pq_block(
         &engine,
         &fee_recipients,
         &custody,
+        ahead.as_ref().map(|Extension(ahead)| ahead),
         &own_version,
         slot,
         randao_reveal,
@@ -189,6 +194,7 @@ async fn produce(
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
+    ahead: Option<&PreparedPayloads>,
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: pq::VrfProof,
@@ -196,67 +202,30 @@ async fn produce(
 ) -> Result<(pq::BlockContents, PqPayloadBlobs), ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
-    if slot <= head_state.slot() {
-        return Err(ApiError::BadRequest("slot is not after the head block"));
-    }
-    let payload_status = match store.head_payload_status() {
-        Some(status) => status,
-        None => {
-            get_head_node(store, &config)
-                .map_err(|_| ApiError::Internal("fork choice could not name the head"))?
-                .payload_status
+    // The same preparation the chain actor starts the payload build ahead of
+    // the slot with, so the two ask for the same attributes.
+    let PqProposal {
+        state,
+        inputs,
+        proposer,
+        build_on_full,
+        parent_requests,
+    } = prepare_pq_proposal(store, head_root, &head_state, slot).map_err(|err| match err {
+        ProposalError::NotAfterHead => ApiError::BadRequest("slot is not after the head block"),
+        ProposalError::ParentEnvelopeMissing => {
+            ApiError::ServiceUnavailable("the parent's payload envelope is not held to build on")
         }
-    };
-    let node = ForkChoiceNode {
-        root: head_root,
-        payload_status,
-    };
-    let build_on_full = should_build_on_full(store, node, slot)
-        .map_err(|_| ApiError::Internal("could not decide which parent payload to build on"))?;
-    let head_is_pq = matches!(
-        store.get_signed_block(&head_root),
-        Ok(Some(SignedBeaconBlock::Pq(_)))
-    );
-    let parent_requests = if build_on_full && head_is_pq {
-        match store
-            .get_execution_payload_envelope(&head_root)
-            .map_err(|_| ApiError::Internal("store read failed"))?
-        {
-            Some(SignedExecutionPayloadEnvelope::Pq(envelope)) => {
-                envelope.message.execution_requests.clone()
-            }
-            Some(_) => return Err(ApiError::Internal("a PQ head with a non-PQ envelope")),
-            None => {
-                return Err(ApiError::ServiceUnavailable(
-                    "the parent's payload envelope is not held to build on",
-                ));
-            }
-        }
-    } else {
-        pq::ExecutionRequests::default()
-    };
-
-    let state = advance_to_slot(&head_state, slot, &config).map_err(|err| {
-        warn!(%slot, %err, "Advancing the head state to the PQ proposal slot failed");
-        ApiError::Internal("advancing the head state failed")
+        ProposalError::Internal(message) => ApiError::Internal(message),
     })?;
-    let proposer = get_beacon_proposer_index(&state)
-        .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
     if !is_valid_vrf_proof(&state, proposer, slot, &randao_reveal).unwrap_or(false) {
         return Err(ApiError::BadRequest("invalid randao_reveal"));
     }
-    let inputs = pq_payload_inputs(&state, build_on_full, &parent_requests, &config)
-        .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
-    let fee_recipient = fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&proposer)
-        .copied()
-        .unwrap_or(ExecutionAddress::ZERO);
+    let fee_recipient =
+        prepared_fee_recipient(fee_recipients, proposer).unwrap_or(ExecutionAddress::ZERO);
     // The execution client's version, for the graffiti, is asked alongside
     // the build, as gloas's production does.
     let (built, (attestations, proof), el_version) = tokio::join!(
-        build_payload(store, engine, fee_recipient, custody, &inputs),
+        build_payload(store, engine, fee_recipient, custody, &inputs, ahead),
         pack_attestations(store, &state, &config),
         graffiti::execution_client_version(engine, own_version),
     );
