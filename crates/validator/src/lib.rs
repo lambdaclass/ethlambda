@@ -573,11 +573,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                         // Through the lookahead epoch only when its fetch
                         // went through: `refresh_around` shrugs a failed one
                         // off, and the schedule then ends with this epoch.
-                        let covered_through = if duties.holds_attesters(epoch + 1) {
-                            epoch + 1
-                        } else {
-                            epoch
-                        };
+                        // With no validator resolved there is no schedule
+                        // to run out, and nothing to fetch for the next
+                        // epoch either, so it stands until the next refresh.
+                        let covered_through =
+                            if refreshed_entries.is_empty() || duties.holds_attesters(epoch + 1) {
+                                epoch + 1
+                            } else {
+                                epoch
+                            };
                         health.epoch_refreshed(refreshed_entries.len(), covered_through);
                         resolved = Arc::new(refreshed_entries);
                     }

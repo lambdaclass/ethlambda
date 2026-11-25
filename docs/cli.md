@@ -997,7 +997,9 @@ is cheap to poll.
   the next when its lookahead fetch went through too. A node can answer its
   probe synced and still fail every refresh, or every lookahead; once the
   schedule runs out the client has no attestations to make. `true` before the
-  first refresh and before genesis.
+  first refresh and before genesis. A client with no validator resolved (no
+  keys, or keys waiting for activation) holds no schedule, and a refresh
+  counts through the next epoch, so it is not caught out at each boundary.
 
 `status` is one of three:
 

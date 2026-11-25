@@ -33,7 +33,9 @@
 //!   when the lookahead fetch went through too. A node can answer its probe
 //!   synced and still fail every refresh, or every lookahead; once the
 //!   schedule runs out the client has no attestations to make. `true` before
-//!   the first refresh, which `started` reports, and before genesis.
+//!   the first refresh, which `started` reports, and before genesis. A
+//!   refresh that resolved no validator holds no schedule to run out, and
+//!   counts through the next epoch.
 //!
 //! # Status
 //!
