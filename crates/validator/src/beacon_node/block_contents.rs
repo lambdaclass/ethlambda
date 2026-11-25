@@ -1,27 +1,35 @@
-//! What `produceBlockV3` returns and `publishBlockV2` takes, as SSZ.
+//! What `produceBlockV3` returns and `publishBlockV2` takes.
 //!
-//! The SSZ counterpart to [`super::dto`], and here for the same reason those
-//! types are: these are shapes of one transport, not of the chain. The
-//! difference is that this transport is the one that matters for a block.
+//! The block-shaped counterpart to [`super::dto`], and here for the same
+//! reason those types are: these are shapes of one transport, not of the
+//! chain.
 //!
-//! # Why SSZ rather than the JSON this crate uses everywhere else
+//! # SSZ first, JSON when that is all the node sends
 //!
 //! To sign a block this client must compute its `hash_tree_root`, and a root
-//! can only be computed from the typed container. Going through JSON would
-//! mean hand-writing a field-for-field mapping of an entire `BeaconBlockBody`,
-//! its `ExecutionPayload`, and every operation list inside them, and then
-//! trusting that mapping to be exact: a single wrong field order, a missing
-//! list, one integer read as decimal that was meant as hex, and the client
-//! signs a root that is not the block's. The failure is silent at the point it
-//! happens and shows up as a block the network rejects.
+//! can only be computed from the typed container. Whatever the encoding, the
+//! answer is therefore decoded straight into that container, never into a
+//! mapping of this crate's own: a hand-written field-for-field copy of an
+//! entire `BeaconBlockBody`, its `ExecutionPayload` and every operation list
+//! inside them would be a large surface on which one wrong field order, one
+//! missing list or one integer read as decimal that was meant as hex makes the
+//! client sign a root that is not the block's, silently, and see it only as a
+//! block the network rejects.
 //!
-//! Decoding the specification's own serialization removes that whole class of
-//! bug. The bytes the beacon node sent *are* the block; the root falls out of
-//! it.
+//! SSZ is preferred, because then the bytes the beacon node sent *are* the
+//! block and the root falls out of them. `produceBlockV3` is asked for SSZ at
+//! `q=1.0` and JSON at `q=0.9`, and a JSON answer is decoded too, because a
+//! proxy may make it the only answer there is: ethereum-package's blobber
+//! rewrites the request's `Accept` to `application/json` on that endpoint and
+//! relays the node's answer unchanged (see `HttpBeaconNode::get_block_v3`).
+//! JSON goes through the containers' own serde support in `ethlambda-types`,
+//! the one an ethlambda beacon node serves this endpoint and reads a published
+//! JSON block with, so it is still the typed container the root is taken from.
 //!
-//! The endpoints support it: `Accept: application/octet-stream` on
-//! `produceBlockV3`, `Content-Type: application/octet-stream` on
-//! `publishBlockV2` and `publishBlindedBlockV2`.
+//! Everything else stays SSZ. `publishBlockV2` and `publishBlindedBlockV2` are
+//! sent `Content-Type: application/octet-stream`, which blobber passes through
+//! untouched, and gloas's `produceBlockV4`, which blobber does not intercept,
+//! is asked for SSZ alone.
 //!
 //! # `BlockContents` is not a consensus container
 //!
@@ -131,10 +139,16 @@ pub type CellKzgProofs = SszList<
 pub type Blobs = SszList<Blob, { preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }>;
 
 /// `produceBlockV3`'s body for deneb and electra.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+///
+/// Also its JSON `data`: the proofs as an array of hex strings, the blobs as
+/// an array of hex strings each decoded through the blob's SSZ, so a wrong
+/// length fails as it would on the wire.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Deserialize)]
 pub struct BlockContents {
     pub block: BeaconBlock,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub kzg_proofs: BlobKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub blobs: Blobs,
 }
 
@@ -152,10 +166,16 @@ pub struct SignedBlockContents {
 
 /// `produceBlockV3`'s body for fulu. See the module doc for why this is not
 /// [`BlockContents`].
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+///
+/// Read from JSON as the beacon node's own `FuluBlockContents` writes it
+/// (`ethlambda-rpc`'s `beacon::proposal`): the same field attributes, which
+/// that crate's validator client tests hold the two to.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Deserialize)]
 pub struct FuluBlockContents {
     pub block: BeaconBlock,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub kzg_proofs: CellKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub blobs: Blobs,
 }
 
@@ -302,6 +322,37 @@ pub enum Contents {
     Blinded { block: BlindedBeaconBlock },
 }
 
+/// A `produceBlockV3` body as it arrived: an SSZ answer's bytes, or a JSON
+/// answer's `data`. Both decode into the one container the fork selects, so
+/// which encoding the node chose changes nothing downstream.
+enum Body<'a> {
+    Ssz(&'a [u8]),
+    Json(serde_json::Value),
+}
+
+impl Body<'_> {
+    /// Decode into `T`, the error naming `what` was being decoded for `fork`.
+    fn decode<T>(self, what: &str, fork: ForkName) -> crate::error::Result<T>
+    where
+        T: SszDecode + serde::de::DeserializeOwned,
+    {
+        match self {
+            Self::Ssz(bytes) => T::from_ssz_bytes(bytes).map_err(|err| {
+                Error::Decode(format!(
+                    "produced {what} for fork {} did not decode: {err:?}",
+                    fork.as_str()
+                ))
+            }),
+            Self::Json(data) => serde_json::from_value(data).map_err(|err| {
+                Error::Decode(format!(
+                    "produced {what} for fork {} did not decode from JSON: {err}",
+                    fork.as_str()
+                ))
+            }),
+        }
+    }
+}
+
 impl ProducedBlock {
     /// Decode a `produceBlockV3` body, choosing the container by the fork the
     /// node named in `Eth-Consensus-Version`.
@@ -318,17 +369,25 @@ impl ProducedBlock {
     /// `SingleAttestation` and have no earlier form, so a pre-electra chain is
     /// one it cannot serve whatever it does with blocks.
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> crate::error::Result<Self> {
-        let decode = |what: &str, err: libssz::DecodeError| {
-            Error::Decode(format!(
-                "produced block: {what} for fork {} did not decode: {err:?}",
-                fork.as_str()
-            ))
-        };
+        Self::from_body(fork, Body::Ssz(bytes))
+    }
 
+    /// Decode a JSON `produceBlockV3` answer's `data` into the container
+    /// [`Self::from_ssz`] would decode the same block's SSZ into, refusing
+    /// the forks it refuses.
+    ///
+    /// `fork` is still the caller's to supply, now from the answer's
+    /// `version` (or `Eth-Consensus-Version` when the body leaves it out):
+    /// JSON has no more of a type tag than SSZ, and a fulu `data` is valid
+    /// electra JSON at any ordinary blob count.
+    pub fn from_json(fork: ForkName, data: serde_json::Value) -> crate::error::Result<Self> {
+        Self::from_body(fork, Body::Json(data))
+    }
+
+    fn from_body(fork: ForkName, body: Body<'_>) -> crate::error::Result<Self> {
         match fork {
             ForkName::Electra => {
-                let contents = BlockContents::from_ssz_bytes(bytes)
-                    .map_err(|err| decode("block contents", err))?;
+                let contents: BlockContents = body.decode("block: block contents", fork)?;
                 Ok(Self {
                     fork,
                     contents: Contents::WithBlobProofs {
@@ -340,8 +399,8 @@ impl ProducedBlock {
                 })
             }
             ForkName::Fulu => {
-                let contents = FuluBlockContents::from_ssz_bytes(bytes)
-                    .map_err(|err| decode("fulu block contents", err))?;
+                let contents: FuluBlockContents =
+                    body.decode("block: fulu block contents", fork)?;
                 Ok(Self {
                     fork,
                     contents: Contents::WithCellProofs {
@@ -376,14 +435,23 @@ impl ProducedBlock {
     /// true`). Electra and fulu share one blinded container; every other fork is
     /// refused, as [`Self::from_ssz`] refuses them.
     pub fn from_blinded_ssz(fork: ForkName, bytes: &[u8]) -> crate::error::Result<Self> {
+        Self::from_blinded_body(fork, Body::Ssz(bytes))
+    }
+
+    /// [`Self::from_blinded_ssz`] for a JSON answer's `data`
+    /// (`execution_payload_blinded: true`), as [`Self::from_json`] is
+    /// [`Self::from_ssz`]'s.
+    pub fn from_blinded_json(
+        fork: ForkName,
+        data: serde_json::Value,
+    ) -> crate::error::Result<Self> {
+        Self::from_blinded_body(fork, Body::Json(data))
+    }
+
+    fn from_blinded_body(fork: ForkName, body: Body<'_>) -> crate::error::Result<Self> {
         match fork {
             ForkName::Electra | ForkName::Fulu => {
-                let block = BlindedBeaconBlock::from_ssz_bytes(bytes).map_err(|err| {
-                    Error::Decode(format!(
-                        "produced blinded block for fork {} did not decode: {err:?}",
-                        fork.as_str()
-                    ))
-                })?;
+                let block: BlindedBeaconBlock = body.decode("blinded block", fork)?;
                 Ok(Self {
                     fork,
                     contents: Contents::Blinded { block },

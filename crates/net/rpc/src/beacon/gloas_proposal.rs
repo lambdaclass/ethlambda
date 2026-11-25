@@ -741,7 +741,8 @@ async fn build_local(
 }
 
 /// Where a self-built payload's fee recipient comes from: the proposer's signed
-/// preferences, else `prepare_beacon_proposer`'s, else the zero address.
+/// preferences, else `prepare_beacon_proposer`'s, else
+/// `--fallback-fee-recipient`, else the zero address.
 fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> ExecutionAddress {
     let proposer = prepared.proposer;
     let (recipient, source) =
@@ -759,10 +760,16 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
                 "Using the fee recipient from prepare_beacon_proposer"
             );
         }
+        FeeRecipientSource::Fallback => {
+            debug!(
+                proposer,
+                "No fee recipient for the proposer; using --fallback-fee-recipient"
+            );
+        }
         FeeRecipientSource::Unknown => {
             warn!(
                 proposer,
-                "No fee recipient for the proposer; using the zero address"
+                "No fee recipient for the proposer and no --fallback-fee-recipient; using the zero address"
             );
         }
     }
