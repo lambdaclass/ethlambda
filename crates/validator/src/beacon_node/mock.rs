@@ -196,6 +196,12 @@ pub struct MockBeaconNode {
     /// What `payload_attestation_data` answers with. `None` is the 204.
     pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
     pub payload_attestation_data_calls: Mutex<usize>,
+    /// How long `pq_aggregate` holds a request before answering, as a node
+    /// does while the proof asked for is still being made.
+    pub pq_aggregate_delay: std::time::Duration,
+    /// When each `pq_aggregate` call arrived and for which committee, in
+    /// arrival order.
+    pub pq_aggregate_calls: Mutex<Vec<(tokio::time::Instant, u64)>>,
     pub submitted_payload_attestations: Mutex<Vec<gloas::PayloadAttestationMessage>>,
     /// The fork each `attestation_data` call named, in call order.
     pub attestation_data_forks: Mutex<Vec<ForkName>>,
@@ -468,6 +474,17 @@ impl MockBeaconNode {
             },
         });
         self
+    }
+
+    /// Hold every `pq_aggregate` request for `delay` before answering it.
+    pub fn with_pq_aggregate_delay(mut self, delay: std::time::Duration) -> Self {
+        self.pq_aggregate_delay = delay;
+        self
+    }
+
+    /// When each `pq_aggregate` call arrived and for which committee.
+    pub fn pq_aggregate_calls(&self) -> Vec<(tokio::time::Instant, u64)> {
+        self.pq_aggregate_calls.lock().expect("lock").clone()
     }
 
     /// Answer `attestation_data` naming `root` as the head block. Over
@@ -1286,8 +1303,13 @@ impl BeaconNodeApi for MockBeaconNode {
         &self,
         _slot: Slot,
         _attestation_data_root: Root,
-        _committee_index: u64,
+        committee_index: u64,
     ) -> Result<ethlambda_types::beacon::containers::pq::ProvenAggregate> {
+        self.pq_aggregate_calls
+            .lock()
+            .expect("lock")
+            .push((tokio::time::Instant::now(), committee_index));
+        tokio::time::sleep(self.pq_aggregate_delay).await;
         self.guard("pq_aggregate")?;
         // What a node with nothing to publish for the committee answers.
         Err(Error::BeaconNodeStatus {

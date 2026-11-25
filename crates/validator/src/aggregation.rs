@@ -98,9 +98,12 @@ impl<B: BeaconNodeApi> AggregationService<B> {
     /// ahead, since proving takes seconds.
     ///
     /// The aggregators are staggered by seat: the one at `position` publishes
-    /// at `get_aggregate_due_ms(position)`, so this waits for each seat's time
-    /// in turn. The node answers 404 for an aggregate one already broadcast
-    /// covers (`should_broadcast_aggregate`), which skips it here.
+    /// at `get_aggregate_due_ms(position)`. Each seat waits for its own time
+    /// and then runs on its own, beside the others: the node may hold a
+    /// seat's request for seconds while a proof is still being made, and a
+    /// seat served in turn behind it would publish that much late, into the
+    /// seats after it. The node answers 404 for an aggregate one already
+    /// broadcast covers (`should_broadcast_aggregate`), which skips it here.
     pub async fn aggregate_pq(
         &self,
         clock: &SlotClock,
@@ -118,19 +121,21 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                 .or_default()
                 .push(duty);
         }
-        let mut published = 0;
-        for (position, seated) in by_seat {
+        let seats = by_seat.into_iter().map(|(position, seated)| async move {
             let due = clock.pq_aggregation_time(slot, position);
             let wait = due.duration_since(SystemTime::now()).unwrap_or_default();
             tokio::time::sleep(wait).await;
-            match self.publish_pq_seat(slot, data, &seated).await {
-                Ok(count) => published += count,
-                Err(err) => {
+            self.publish_pq_seat(slot, data, &seated)
+                .await
+                .inspect_err(|err| {
                     warn!(%slot, position, %err, "Failed to publish this seat's PQ aggregates")
-                }
-            }
-        }
-        Ok(published)
+                })
+                .unwrap_or(0)
+        });
+        Ok(futures_util::future::join_all(seats)
+            .await
+            .into_iter()
+            .sum())
     }
 
     /// Fetch, sign and publish the aggregates of the aggregators `selected`,
@@ -489,6 +494,52 @@ mod tests {
                 root: Root::ZERO,
             },
         }
+    }
+
+    /// Each PQ seat asks for its aggregate at its own time. The node holds a
+    /// request while a proof is still being made, here for three seconds:
+    /// the next seat, due 0.6 s after the first, must not wait behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_answer_for_one_pq_seat_does_not_delay_the_next() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let held = Duration::from_secs(3);
+        let node = Arc::new(MockBeaconNode::new().with_pq_aggregate_delay(held));
+        let service = AggregationService::new(node.clone(), context());
+        let config = Config::mainnet().with_fork_epoch(ForkName::Pq, 0);
+        // Slot 64 began within the last second.
+        let slot = 64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let clock = SlotClock::from_config(now.as_secs() - slot * 12, &config);
+        let (_, pubkey) = store();
+        let seat = |position: u64| AttesterDutyDto {
+            is_aggregator: Some(true),
+            aggregator_position: Some(position),
+            // A committee each, so each seat has its own request.
+            ..duty(&pubkey, position, slot, position)
+        };
+
+        let started = tokio::time::Instant::now();
+        let published = service
+            .aggregate_pq(&clock, slot, &data(slot), &[seat(0), seat(1)])
+            .await
+            .expect("a 404 is no error");
+        assert_eq!(published, 0, "the mock proves no aggregate");
+
+        let calls = node.pq_aggregate_calls();
+        assert_eq!(calls.len(), 2);
+        let (first, second) = (calls[0].0 - started, calls[1].0 - started);
+        // 7.2 s and 7.8 s into the slot, less the fraction of a second the
+        // slot is already old.
+        assert!(first > Duration::from_millis(6_200) && first <= Duration::from_millis(7_200));
+        let apart = second - first;
+        assert!(
+            apart > Duration::from_millis(550) && apart < Duration::from_millis(650),
+            "the second seat asked {apart:?} after the first"
+        );
+        // Both answers were held three seconds, side by side.
+        let took = started.elapsed();
+        assert!(took < first + held + Duration::from_secs(1), "{took:?}");
     }
 
     fn duty(
