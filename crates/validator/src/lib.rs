@@ -29,6 +29,7 @@ pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
 pub mod client_health;
+pub mod clock_check;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -503,8 +504,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // Warns when the wall clock stepped since the last pass. See
+        // `clock_check::StepWatch`.
+        let mut steps = crate::clock_check::StepWatch::default();
 
         loop {
+            steps.check(&clock, served);
+
             // One wake per slot, at the slot boundary, rather than one at the
             // attester offset.
             //

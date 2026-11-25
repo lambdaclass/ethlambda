@@ -7,8 +7,8 @@
 use std::sync::LazyLock;
 
 use ethlambda_metrics::{
-    Histogram, IntCounter, IntGauge, TimingGuard, register_histogram, register_int_counter,
-    register_int_gauge,
+    GaugeVec, Histogram, IntCounter, IntGauge, TimingGuard, register_gauge_vec, register_histogram,
+    register_int_counter, register_int_gauge,
 };
 
 static VALIDATORS_LOADED: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -469,6 +469,30 @@ static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .unwrap()
 });
 
+/// Each beacon node's clock minus this client's, labelled by the node's
+/// position in `--beacon-nodes`, from zero. See `clock_check`. Labelled by
+/// position, not URL: a URL can carry credentials.
+static BEACON_NODE_CLOCK_OFFSET_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "ethlambda_validator_beacon_node_clock_offset_seconds",
+        "A beacon node's clock minus this client's, from its Date header, else what its sync \
+         status's slots allow; positive when this client's clock is behind",
+        &["node"]
+    )
+    .unwrap()
+});
+
+/// Steps of this client's wall clock against its monotonic one, found by the
+/// duty loop. See `clock_check::StepWatch`.
+static CLOCK_STEPS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_clock_steps_total",
+        "Steps of half a second or more of this client's wall clock, forward or back, against its \
+         monotonic clock"
+    )
+    .unwrap()
+});
+
 /// Register every series with the Prometheus registry so `/metrics` lists them
 /// at zero from startup, rather than only after whatever first touches them.
 ///
@@ -520,6 +544,9 @@ pub fn init() {
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
+    // A labelled gauge has no series until a node's first answer sets one.
+    LazyLock::force(&BEACON_NODE_CLOCK_OFFSET_SECONDS);
+    LazyLock::force(&CLOCK_STEPS_TOTAL);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -701,6 +728,17 @@ pub fn inc_slashing_protection_write_failures() {
 /// Record how long after a slot's start its attestations were accepted.
 pub fn observe_publication_delay(seconds: f64) {
     PUBLICATION_DELAY_SECONDS.observe(seconds);
+}
+
+/// Record what the clock check last read for the node at `position`.
+pub fn set_beacon_node_clock_offset(position: usize, seconds: f64) {
+    BEACON_NODE_CLOCK_OFFSET_SECONDS
+        .with_label_values(&[position.to_string().as_str()])
+        .set(seconds);
+}
+
+pub fn inc_clock_steps() {
+    CLOCK_STEPS_TOTAL.inc();
 }
 
 /// A Prometheus endpoint for this process, and `/health`, both answered from

@@ -51,7 +51,9 @@ use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
-use crate::beacon_node::health::{NodeHealth, Probe, Standing, SyncStatus, SyncVerdict, Tier};
+use crate::beacon_node::health::{
+    NodeHealth, Probe, Reply, Standing, SyncStatus, SyncVerdict, Tier,
+};
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
@@ -213,11 +215,24 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             .enumerate()
             .map(|(position, node)| async move {
                 let at = SystemTime::now();
-                let outcome = match tokio::time::timeout(budget, node.sync_status()).await {
-                    Ok(answer) => answer.map_err(|err| err.to_string()),
-                    Err(_) => Err(format!("no answer within {} ms", budget.as_millis())),
+                let answer = tokio::time::timeout(budget, node.sync_status_with_date()).await;
+                // Stamped here, as the answer lands, for the clock check.
+                let received = SystemTime::now();
+                let (outcome, reply) = match answer {
+                    Ok(Ok((status, date))) => (Ok(status), Some(Reply { received, date })),
+                    Ok(Err(err)) => (Err(err.to_string()), None),
+                    Err(_) => (
+                        Err(format!("no answer within {} ms", budget.as_millis())),
+                        None,
+                    ),
                 };
-                health.record(position, Probe { slot, at, outcome });
+                let probe = Probe {
+                    slot,
+                    at,
+                    outcome,
+                    reply,
+                };
+                health.record(position, probe);
             });
         futures_util::future::join_all(asks).await;
     }

@@ -20,7 +20,7 @@
 //! Keeping `classify` off the `json` path is what stops `reqwest`'s own
 //! `is_decode` from competing with `Error::Decode` for the same failure.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
@@ -192,6 +192,16 @@ impl HttpBeaconNode {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_dated(path).await.map(|(value, _)| value)
+    }
+
+    /// [`Self::get`], with the answer's `Date` header when it is an
+    /// IMF-fixdate. Read on the sync probe's request alone (see
+    /// [`crate::clock_check`]).
+    async fn get_dated<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, Option<SystemTime>)> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "Beacon API GET");
         let response = self
@@ -204,7 +214,12 @@ impl HttpBeaconNode {
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
-        Self::decode(response).await
+        let date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::clock_check::parse_http_date);
+        Ok((Self::decode(response).await?, date))
     }
 
     async fn post<B: Serialize, T: serde::de::DeserializeOwned>(
@@ -673,6 +688,13 @@ impl BeaconNodeApi for HttpBeaconNode {
     async fn sync_status(&self) -> Result<SyncStatus> {
         let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
         Ok(response.data.into())
+    }
+
+    /// Logs nothing, as [`Self::sync_status`].
+    async fn sync_status_with_date(&self) -> Result<(SyncStatus, Option<SystemTime>)> {
+        let (response, date): (DataResponse<SyncingDto>, _) =
+            self.get_dated("/eth/v1/node/syncing").await?;
+        Ok((response.data.into(), date))
     }
 
     /// Resolves each pubkey to its validator index and current status.
@@ -1841,6 +1863,32 @@ mod tests {
         let status = served.node.sync_status().await.expect("decodes");
         assert!(status.is_synced());
         assert!(!status.el_offline);
+    }
+
+    /// The probe's request reads the answer's `Date`, and one that is not an
+    /// IMF-fixdate is no `Date`.
+    #[tokio::test]
+    async fn the_sync_status_with_date_reads_the_date_header() {
+        let reply = br#"{"data":{"head_slot":"640","sync_distance":"0","is_syncing":false}}"#;
+        let headers = vec![
+            ("content-type", "application/json"),
+            ("date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+        ];
+        let served = serve(200, headers, reply.to_vec()).await;
+        let (status, date) = served.node.sync_status_with_date().await.expect("decodes");
+        assert_eq!(status.head_slot, Some(640));
+        assert_eq!(
+            date,
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
+
+        let headers = vec![
+            ("content-type", "application/json"),
+            ("date", "Sunday, 06-Nov-94 08:49:37 GMT"),
+        ];
+        let served = serve(200, headers, reply.to_vec()).await;
+        let (_, date) = served.node.sync_status_with_date().await.expect("decodes");
+        assert_eq!(date, None);
     }
 
     #[tokio::test]
