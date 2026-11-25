@@ -9,6 +9,7 @@ mod fd_limit;
 mod keygen;
 mod network;
 mod pq_keys;
+mod pq_prover_check;
 mod shutdown;
 mod slashing_protection;
 mod validator;
@@ -137,6 +138,11 @@ fn main() -> eyre::Result<()> {
         Command::PqKeys(options) => {
             init_info_stderr_logging()?;
             pq_keys::run(options)
+        }
+        // Seconds of every core, for a report on stderr: as keygen.
+        Command::PqProverCheck(options) => {
+            init_info_stderr_logging()?;
+            pq_prover_check::run(options)
         }
     }
 }
