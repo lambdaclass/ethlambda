@@ -32,6 +32,7 @@ pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
+pub mod head_events;
 pub mod http_api;
 pub(crate) mod in_flight;
 pub mod keys;
@@ -550,6 +551,14 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
     // and `run` waits for it before returning. On a shutdown signal it is
     // cancelled first, and the duty loop then starts no other slot.
     let shutdown = CancellationToken::new();
+
+    // The first beacon node's head events, so an attester votes once its
+    // slot's block is in rather than always at the deadline. See
+    // `head_events` for why only the first node.
+    let head = match config.beacon_nodes.first() {
+        Some(url) => head_events::HeadWatch::spawn(url, shutdown.clone()),
+        None => head_events::HeadWatch::never(),
+    };
     let mut keymanager = None;
     if let Some(address) = config.keymanager {
         let token = http_api::load_or_create_token(&config.validators_dir)?;
@@ -775,7 +784,13 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
             // puts it earlier. Zero if the refresh or the proposal above already
             // ran past it, in which case the duty is late rather than skipped.
             // Each branch of `serve_slot_duties` waits for its own offset.
-            tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+            //
+            // Cut short when the slot's block is in: an attester votes then
+            // rather than at its deadline (see `head_events`). Waking early is
+            // harmless for the other branches, which still wait for their own
+            // offsets.
+            let first_duty = clock.until_first_slot_duty(slot, SystemTime::now());
+            head_events::until_deadline_or_head(first_duty, &head, slot).await;
 
             // Attesting and aggregating both start from these, so a key
             // doppelganger protection still withholds does neither; its sync
@@ -795,6 +810,7 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
                 &committee,
                 &sync_duties,
                 &store,
+                &head,
             )
             .await;
 
@@ -1069,13 +1085,19 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     committee: &[crate::beacon_node::dto::PtcDutyDto],
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     store: &RwLock<ValidatorStore>,
+    head: &head_events::HeadWatch,
 ) {
     // The sync committee work runs beside the attester and PTC work rather
     // than after it: its deadline is not ordered against theirs (gloas moves
     // it before the attestation) and each is bounded by the slot on its own.
     let attest_then_ptc = async {
         if !slot_duties.is_empty() {
-            tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
+            // At the deadline, or as soon as the slot's block is in, whichever
+            // comes first, as the honest-validator guide has it.
+            let deadline = clock.until_attestation(slot, SystemTime::now());
+            if head_events::until_deadline_or_head(deadline, head, slot).await {
+                debug!(%slot, "The slot's block is in; attesting ahead of the deadline");
+            }
             attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
         }
 
@@ -2899,6 +2921,7 @@ mod tests {
             &committee,
             &[],
             &store,
+            &head_events::HeadWatch::never(),
         )
         .await;
 
@@ -3036,6 +3059,7 @@ mod tests {
             &[],
             &duties,
             &store,
+            &head_events::HeadWatch::never(),
         )
         .await;
 
@@ -3073,6 +3097,7 @@ mod tests {
             &[ptc_duty(3, 5)],
             &[],
             &store,
+            &head_events::HeadWatch::never(),
         )
         .await;
         assert_eq!(node.payload_attestation_data_call_count(), 0);
