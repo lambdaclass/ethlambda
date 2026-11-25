@@ -13,8 +13,9 @@ version.workspace = true
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
 
-# A produced block is decoded and re-published as SSZ, not JSON: signing it
-# needs its `hash_tree_root`, which only the typed container can give. See
+# A produced block is decoded into its typed container (from SSZ, or from JSON
+# when a proxy left nothing else) and re-published as SSZ: signing it needs its
+# `hash_tree_root`, which only the typed container can give. See
 # `beacon_node::block_contents`.
 libssz.workspace = true
 libssz-derive.workspace = true

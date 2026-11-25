@@ -12,12 +12,27 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # The preset names a make target below and decides which job saves the
+    # cache, so anything else fails here with a clear message rather than as
+    # an unknown make target. Read through the environment, never spliced into
+    # the script.
+    - name: Check the preset
+      shell: bash
+      env:
+        PRESET: ${{ inputs.preset }}
+      run: |
+        case "$PRESET" in
+          mainnet|minimal) ;;
+          *) echo "::error::preset must be mainnet or minimal, got '$PRESET'"; exit 1 ;;
+        esac
+
     # One key for both presets: the preset is selected at runtime
     # (`BEACON_SPEC_PRESET`), so the two jobs build the same spec binary, and
-    # the minimal job's build is a subset of the mainnet job's. Only the
-    # mainnet job saves the entry: it also builds the `--lib` tests and
-    # `ethlambda-blockchain`, which an entry saved by the minimal job (the
-    # faster of the two) would leave out for good.
+    # the minimal job's build is a subset of the mainnet job's (the Makefile's
+    # `BEACON_SPEC_TEST` selects the same packages and features for both).
+    # Only the mainnet job saves the entry: it also builds the `--lib` tests,
+    # `ethlambda-blockchain`'s among them, which an entry saved by the minimal
+    # job (the faster of the two) would leave out for good.
     - name: Setup Rust
       uses: $/.github/actions/setup-rust
       with:
@@ -60,7 +75,8 @@ runs:
       shell: bash
       env:
         CONSENSUS_SPEC_TESTS_CONFIGS: ${{ inputs.preset }}
-      run: make test-beacon-${{ inputs.preset }}
+        PRESET: ${{ inputs.preset }}
+      run: make "test-beacon-$PRESET"
 
     # See the same step in the run-fixture-tests action.
     - name: Report disk usage after the build

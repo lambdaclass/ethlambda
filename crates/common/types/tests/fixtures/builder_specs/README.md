@@ -13,6 +13,12 @@ the wire. Each `.ssz` is the same object's SSZ encoding.
 | `bellatrix/signed_validator_registrations` | `registerValidator` request body: a list of registrations |
 | `fulu/signed_builder_bid` | `getHeader` response; the JSON keeps the real `{version, data}` envelope, the SSZ is the bare `SignedBuilderBid` |
 | `fulu/signed_blinded_beacon_block` | `submitBlindedBlockV2` request body |
+| `fulu/execution_payload_and_blobs_bundle` | `submitBlindedBlockV2` response; the JSON keeps the `{version, data}` envelope, the SSZ is the bare `ExecutionPayloadAndBlobsBundle` |
+
+The two fulu block examples are also read by `ethlambda-validator`'s
+`beacon_node::http` tests, as third-party JSON for a `produceBlockV3` answer:
+the blinded block's `message` as a blinded answer, and that block with the
+bundle's payload and blobs as a full one.
 
 The registration example lives under `bellatrix/` upstream because
 `ValidatorRegistrationV1` is not fork-versioned.
