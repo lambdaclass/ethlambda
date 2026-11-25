@@ -25,6 +25,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
     Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
@@ -74,6 +75,12 @@ pub struct MockBeaconNode {
     /// `syncing`, because the pair a real node can report and this client must
     /// still refuse is exactly "synced, but optimistic".
     pub optimistic: bool,
+    /// What the node reports about its sync status once set, in place of
+    /// `syncing` and `optimistic`: a node whose status changes while a test
+    /// runs. See [`MockBeaconNode::set_sync_status`].
+    pub sync_status_override: Mutex<Option<SyncStatus>>,
+    /// How long `sync_status` takes before it answers, as a hung node would.
+    pub sync_status_delay: Option<std::time::Duration>,
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
@@ -498,6 +505,33 @@ impl MockBeaconNode {
         self
     }
 
+    /// Make `sync_status` take `delay` before it answers.
+    pub fn with_sync_status_delay(mut self, delay: std::time::Duration) -> Self {
+        self.sync_status_delay = Some(delay);
+        self
+    }
+
+    /// Report `status` from now on, whatever `syncing` and `optimistic` say:
+    /// the node went optimistic, say, after a test's first probe.
+    pub fn set_sync_status(&self, status: SyncStatus) {
+        *self.sync_status_override.lock().expect("lock") = Some(status);
+    }
+
+    /// What the node reports about its sync status now: the override when one
+    /// is set, else `syncing` and `optimistic`, with no head slot.
+    pub fn current_status(&self) -> SyncStatus {
+        self.sync_status_override
+            .lock()
+            .expect("lock")
+            .unwrap_or(SyncStatus {
+                head_slot: None,
+                sync_distance: None,
+                is_syncing: self.syncing,
+                is_optimistic: self.optimistic,
+                el_offline: false,
+            })
+    }
+
     /// Make `spec` take `delay` before it answers.
     pub fn with_spec_delay(mut self, delay: std::time::Duration) -> Self {
         self.spec_delay = Some(delay);
@@ -896,7 +930,17 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
         self.guard("is_syncing")?;
-        Ok(self.syncing || self.optimistic)
+        Ok(!self.current_status().is_synced())
+    }
+
+    /// Fails with `is_optimistic_or_syncing`, under the same key: both are the
+    /// one `/eth/v1/node/syncing` request on a real node.
+    async fn sync_status(&self) -> Result<SyncStatus> {
+        if let Some(delay) = self.sync_status_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.guard("is_syncing")?;
+        Ok(self.current_status())
     }
 
     async fn validator_indices(&self, pubkeys: &[BlsPubkey]) -> Result<Vec<ValidatorEntry>> {
@@ -1478,7 +1522,7 @@ impl BeaconNodeApi for MockBeaconNode {
             tokio::time::sleep(delay).await;
         }
         self.guard("liveness")?;
-        if self.syncing || self.optimistic {
+        if !self.current_status().is_synced() {
             return Err(Error::BeaconNodeSyncing);
         }
         let live = self.live.lock().expect("lock");

@@ -19,9 +19,11 @@ const ADDRESS_BYTES: usize = 20;
 pub(crate) struct ValidatorOptions {
     /// Base URL(s) of the beacon node's HTTP API (e.g. http://localhost:5052).
     ///
-    /// Several may be supplied, comma-separated or by repeating the flag. They
-    /// are tried in order and the first that answers is used, so the order is
-    /// a preference, not a load-balancing policy.
+    /// Several may be supplied, comma-separated or by repeating the flag. Each
+    /// is asked whether it is syncing once a slot; the ones that are not are
+    /// tried first, then the rest, each in the order given, and the first that
+    /// answers is used, so the order is a preference, not a load-balancing
+    /// policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
 
