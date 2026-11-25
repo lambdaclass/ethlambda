@@ -310,8 +310,25 @@ fn write_back(
     for (index, validator) in validator_changes {
         *state.validator_mut(index as ValidatorIndex)? = validator;
     }
-    for (index, balance) in balance_changes {
-        *state.balance_mut(index as ValidatorIndex)? = balance;
+    // Most balances change at an epoch, so they go through the write cursor,
+    // which buffers nothing, rather than one buffered write each: the
+    // balances' buffer is sized for a block's few hundred writes. The loop
+    // produced the changes in index order, which is the cursor's.
+    let mut balance_changes = balance_changes.into_iter().peekable();
+    state.try_update_balances(|balance| {
+        if let Some(&(index, value)) = balance_changes.peek()
+            && index == balance.index()
+        {
+            balance.set(value);
+            balance_changes.next();
+        }
+        Ok::<(), Error>(())
+    })?;
+    if let Some((index, _)) = balance_changes.next() {
+        return Err(Error::IndexOutOfBounds {
+            index,
+            len: state.validator_count(),
+        });
     }
     let (_, _, scores) = state.altair_validator_lists_mut()?;
     let score_count = scores.len();

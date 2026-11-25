@@ -17,6 +17,12 @@ rayon.workspace = true
 # `compress` exposes `compress256`, the block-level function `batch.rs` hashes
 # whole merkle layers with. A feature of the `sha2` already in the lockfile.
 sha2 = { workspace = true, features = ["compress"] }
+# Multi-message SHA-256 kernels (AVX-512, SHA-NI x2) for `batch.rs`, behind the
+# `hashtree` feature. C and assembly, built by its build script.
+hashtree-rs = { version = "0.2", optional = true }
+
+[features]
+hashtree = ["dep:hashtree-rs"]
 
 [dev-dependencies]
 libssz-derive.workspace = true

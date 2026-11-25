@@ -338,26 +338,38 @@ mod tests {
         HashTreeRoot::hash_tree_root(value, &Sha2Hasher)
     }
 
-    /// A tree of four u64 leaves (512 to a leaf) under one inner node.
-    const DEPTH: usize = 9;
+    /// A tree of four u64 leaves under one inner node.
+    fn four_leaf_depth() -> usize {
+        crate::max_leaf_height::<u64>() + 2
+    }
+
+    /// Elements in one u64 leaf.
+    fn per_leaf() -> usize {
+        crate::packing_factor::<u64>() << crate::max_leaf_height::<u64>()
+    }
 
     #[test]
     fn only_the_changed_leafs_path_is_new() {
-        let values: Vec<u64> = (0..2048).collect();
-        let (mut tree, _) = Tree::from_values(values.clone(), DEPTH);
+        let (depth, per_leaf) = (four_leaf_depth(), per_leaf());
+        let (in_leaf_1, in_leaf_2, in_leaf_3) =
+            (per_leaf + 88, 2 * per_leaf + 76, 3 * per_leaf + 64);
+        let values: Vec<u64> = (0..4 * per_leaf as u64).collect();
+        let (mut tree, _) = Tree::from_values(values.clone(), depth);
         let before = Arc::clone(&tree);
-        before.hash(DEPTH);
+        before.hash(depth);
         {
-            let mut pass = IterCow::new(&mut tree, DEPTH);
+            let mut pass = IterCow::new(&mut tree, depth);
             while let Some(mut element) = pass.next_cow() {
-                match element.index() {
+                let index = element.index();
+                if index == in_leaf_1 {
                     // Changes leaf 1.
-                    600 => element.set(0),
+                    element.set(0);
+                } else if index == in_leaf_2 {
                     // Touches leaf 2 without changing it.
-                    1100 => *element.make_mut() = 1100,
+                    *element.make_mut() = index as u64;
+                } else if index == in_leaf_3 {
                     // Sets the same value in leaf 3.
-                    1600 => element.set(1600),
-                    _ => {}
+                    element.set(index as u64);
                 }
             }
         }
@@ -371,18 +383,20 @@ mod tests {
         assert!(new[1].cached_hash().is_none());
 
         let mut expected = values;
-        expected[600] = 0;
-        assert_eq!(tree.hash(DEPTH), u64_root(&expected, DEPTH));
+        expected[in_leaf_1] = 0;
+        assert_eq!(tree.hash(depth), u64_root(&expected, depth));
         // The original is untouched.
-        assert_eq!(before.get(600, DEPTH), Some(&600));
+        assert_eq!(before.get(in_leaf_1, depth), Some(&(in_leaf_1 as u64)));
     }
 
     #[test]
     fn a_pass_that_changes_nothing_keeps_the_root_node() {
-        let (mut tree, _) = Tree::from_values((0..2048u64).collect::<Vec<_>>(), DEPTH);
+        let depth = four_leaf_depth();
+        let values: Vec<u64> = (0..4 * per_leaf() as u64).collect();
+        let (mut tree, _) = Tree::from_values(values, depth);
         let before = Arc::clone(&tree);
         {
-            let mut pass = IterCow::new(&mut tree, DEPTH);
+            let mut pass = IterCow::new(&mut tree, depth);
             while let Some(mut element) = pass.next_cow() {
                 let same = *element;
                 element.set(same);

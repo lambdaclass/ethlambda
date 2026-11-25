@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
+use ethlambda_state_transition::metrics::BEACON_STF_PHASES;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_types::beacon::preset;
@@ -29,9 +30,24 @@ use tracing::info;
 use super::e2store::EraFile;
 use super::hashing_record::HashingRecorder;
 use super::report::{EraReport, Outcome};
+use crate::benchmark::PhaseTimer;
 
 /// Blocks between progress lines.
 const PROGRESS_EVERY: u64 = 512;
+
+/// The state transition's per-phase timing histogram.
+const STF_PHASE_HISTOGRAM: &str = "lean_beacon_stf_phase_seconds";
+
+/// One line naming every phase's total, largest first.
+fn log_phases(era: u64, phases: &std::collections::BTreeMap<String, f64>) {
+    let mut sorted: Vec<_> = phases.iter().collect();
+    sorted.sort_by(|a, b| b.1.total_cmp(a.1));
+    let summary: Vec<String> = sorted
+        .iter()
+        .map(|(phase, seconds)| format!("{phase}={seconds:.3}s"))
+        .collect();
+    info!(era, phases = %summary.join(" "), "State transition time per phase");
+}
 
 /// Slots per era file.
 pub(super) fn slots_per_era() -> u64 {
@@ -144,6 +160,9 @@ impl<'a> Replay<'a> {
             .transpose()?;
 
         let apply_started = Instant::now();
+        // The replay calls the state transition outside any import, so its
+        // observations land in the `other` context.
+        let stf_timer = PhaseTimer::start_filtered(STF_PHASE_HISTOGRAM, ("context", "other"));
         let mut block_roots: Vec<(u64, H256)> = Vec::new();
         let mut stopped_early = false;
         for slot in first_slot..end_slot {
@@ -222,6 +241,8 @@ impl<'a> Replay<'a> {
             }
         }
         report.apply_secs = apply_started.elapsed().as_secs_f64();
+        report.stf_phase_seconds = stf_timer.finish_summed(BEACON_STF_PHASES.iter().copied());
+        log_phases(era, &report.stf_phase_seconds);
         if let Some(recorder) = recorder {
             recorder.finish()?;
         }

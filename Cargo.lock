@@ -2178,6 +2178,7 @@ dependencies = [
 name = "ethlambda-ssz-tree"
 version = "1.0.0"
 dependencies = [
+ "hashtree-rs",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
@@ -3072,6 +3073,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "hashtree-rs"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "961ec71c1266cb0ee170a5b26c1446073adbf8066734a392a94d6e88ea6eedf2"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

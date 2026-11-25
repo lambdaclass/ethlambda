@@ -78,9 +78,16 @@ impl<T: Value> Tree<T> {
                 if all_orig {
                     return Arc::clone(orig);
                 }
-                // The contents are still orig's, so orig's hash (if any) holds.
+                // The contents are still orig's, so orig's hash and levels (if
+                // any) hold.
                 let hash = orig.cached_hash().map(OnceLock::from).unwrap_or_default();
-                Arc::new(Tree::Node(Node { hash, children }))
+                let levels = orig_node.levels.get().cloned().map(OnceLock::from);
+                Arc::new(Tree::Node(Node {
+                    hash,
+                    levels: levels.unwrap_or_default(),
+                    base: None,
+                    children,
+                }))
             }
             _ => Arc::clone(orig),
         }
@@ -100,17 +107,21 @@ mod tests {
 
     #[test]
     fn only_the_changed_path_stays_unshared() {
-        // 2048 u64s in four leaves of 512, depth 9.
-        let base_values: Vec<u64> = (0..2048).collect();
+        // Four u64 leaves under one inner node; the change is in the second.
+        let per_leaf = crate::packing_factor::<u64>() << crate::max_leaf_height::<u64>();
+        let depth = crate::max_leaf_height::<u64>() + 2;
+        let len = 4 * per_leaf;
+        let changed = per_leaf + 88;
+        let base_values: Vec<u64> = (0..len as u64).collect();
         let mut orig_values = base_values.clone();
-        orig_values[600] = 99;
-        let (base, _) = Tree::from_values(base_values, 9);
-        let (orig, _) = Tree::from_values(orig_values, 9);
-        base.hash(9);
+        orig_values[changed] = 99;
+        let (base, _) = Tree::from_values(base_values, depth);
+        let (orig, _) = Tree::from_values(orig_values, depth);
+        base.hash(depth);
 
-        let rebased = Tree::rebase_on(&orig, &base, 9, 0, 2048);
+        let rebased = Tree::rebase_on(&orig, &base, depth, 0, len);
 
-        // One inner node over the four leaves. Elements 512..1024 hold the
+        // One inner node over the four leaves. The second leaf holds the
         // change, so that leaf is orig's and the root is new...
         let (rebased_leaves, base_leaves) = (children(&rebased), children(&base));
         assert!(!Arc::ptr_eq(&rebased, &base));
@@ -123,8 +134,8 @@ mod tests {
             );
         }
         // And the contents are orig's.
-        assert_eq!(rebased.hash(9), orig.hash(9));
-        assert_eq!(rebased.get(600, 9), Some(&99));
+        assert_eq!(rebased.hash(depth), orig.hash(depth));
+        assert_eq!(rebased.get(changed, depth), Some(&99));
     }
 
     #[test]

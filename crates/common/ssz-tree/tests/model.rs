@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-use ethlambda_ssz_tree::{List, ProgressiveList, UpdateMap, Value, VecMap, Vector};
+use ethlambda_ssz_tree::{List, ProgressiveList, SparseMap, UpdateMap, Value, VecMap, Vector};
 use libssz::{DecodeError, SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher};
@@ -158,6 +158,16 @@ proptest! {
     }
 
     #[test]
+    fn u64_list_sparse(initial in vec(any::<u64>(), 0..40), ops in ops(any::<u64>())) {
+        run_list::<u64, 64, SparseMap<u64>>(initial, ops)?;
+    }
+
+    #[test]
+    fn u8_list_sparse(initial in vec(any::<u8>(), 0..100), ops in ops(any::<u8>())) {
+        run_list::<u8, 130, SparseMap<u8>>(initial, ops)?;
+    }
+
+    #[test]
     fn root_list(initial in vec(any::<[u8; 32]>(), 0..15), ops in ops(any::<[u8; 32]>())) {
         run_list::<[u8; 32], 20, BTreeMap<usize, [u8; 32]>>(initial, ops)?;
     }
@@ -177,13 +187,22 @@ proptest! {
         run_list::<u64, { 1 << 40 }, VecMap<u64>>(initial, ops)?;
     }
 
-    /// A leaf holds 512 u64s: this spans several, with the last partial.
+    /// A leaf holds 128 u64s: this spans many, with the last partial.
     #[test]
     fn u64_list_spanning_leaves(
         initial in vec(any::<u64>(), 0..1600),
         ops in ops(any::<u64>()),
     ) {
         run_list::<u64, 4096, VecMap<u64>>(initial, ops)?;
+    }
+
+    /// As above, with the buffer the balances use.
+    #[test]
+    fn u64_list_spanning_leaves_sparse(
+        initial in vec(any::<u64>(), 0..1600),
+        ops in ops(any::<u64>()),
+    ) {
+        run_list::<u64, 4096, SparseMap<u64>>(initial, ops)?;
     }
 
     /// A leaf holds 64 items: 40 bytes each, a page fits 102, rounded down to a
@@ -591,6 +610,11 @@ proptest! {
     fn progressive_u64(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
         run_progressive::<u64, VecMap<u64>>(initial, ops, Write::IndexMut);
     }
+    // As above, with the buffer gloas's balances use.
+    #[test]
+    fn progressive_u64_sparse(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
+        run_progressive::<u64, SparseMap<u64>>(initial, ops, Write::GetMut);
+    }
     // Composite: one per chunk, subtrees start at 0, 1, 5, 21, 85.
     #[test]
     fn progressive_item(initial in vec(item(), 0..100), ops in ops(item())) {
@@ -711,6 +735,42 @@ fn progressive_writes_and_pushes_across_the_first_spanning_boundary() {
         list.apply_updates();
         check_progressive_matches(&list, &model);
     }
+}
+
+// ── List: iteration with writes pending ──
+
+/// Iteration merges the pending writes in index order rather than looking each
+/// element up: from any start, writes before it are skipped, writes after it
+/// and pending pushes are yielded in place, and everything else comes from the
+/// tree.
+fn iterating_with_writes_pending<U: UpdateMap<u64>>() {
+    let mut model: Vec<u64> = (0..3000).collect();
+    let mut list = List::<u64, 4096, U>::try_from(model.clone()).unwrap();
+    for index in [0, 7, 127, 128, 129, 1000, 1999, 2999] {
+        *list.get_mut(index).unwrap() = 10_000 + index as u64;
+        model[index] = 10_000 + index as u64;
+    }
+    for value in [5, 6] {
+        list.push(value).unwrap();
+        model.push(value);
+    }
+    for start in [0, 1, 7, 8, 128, 1500, 2999, 3000, 3001, 3002] {
+        assert_eq!(
+            list.iter_from(start).copied().collect::<Vec<_>>(),
+            model[start..],
+            "start {start}"
+        );
+    }
+}
+
+#[test]
+fn iterating_with_writes_pending_in_a_sparse_map() {
+    iterating_with_writes_pending::<SparseMap<u64>>();
+}
+
+#[test]
+fn iterating_with_writes_pending_in_a_vec_map() {
+    iterating_with_writes_pending::<VecMap<u64>>();
 }
 
 // ── ProgressiveList: iter_from ──
@@ -1371,7 +1431,7 @@ proptest! {
         run_list::<u8, 16_384, VecMap<u8>>(initial, ops)?;
     }
 
-    /// A leaf holds 512 u64s: 8192 slashings span 16.
+    /// A leaf holds 128 u64s: 8192 slashings span 64.
     #[test]
     fn u64_vector_spanning_leaves(
         initial in vec(any::<u64>(), 8192),

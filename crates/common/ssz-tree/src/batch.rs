@@ -1,4 +1,4 @@
-//! Hashing a whole merkle layer per call.
+//! Hashing many merkle pairs per call.
 //!
 //! Every inner node of an SSZ tree is `SHA-256(left || right)`: a message of
 //! exactly 64 bytes. Going through `Digest` for each pair buffers the input,
@@ -9,18 +9,18 @@
 //! start from the initial state, compress the pair, compress the constant
 //! padding, read the state out.
 //!
-//! This module keeps that as one primitive, [`hash_layer`], that every fold in
-//! this crate goes through. It sits on `sha2::compress256`, so the hardware
-//! backend `sha2` selects at run time (aarch64 SHA2 instructions, x86 SHA-NI)
-//! is the one used, and the output is byte-identical to
-//! `libssz_merkle::hash_nodes(&Sha2Hasher, ..)`.
-//!
-//! The primitive takes the layer as a slice and writes digests to an output
-//! slice, so a backend that hashes several independent messages per instruction
-//! (AVX2 or AVX-512 lanes, or SHA-NI interleaved) replaces the loop body of
-//! [`hash_pairs_into`] without changing a caller.
+//! This module keeps that as one primitive, [`hash_pairs_into`], that every
+//! hash in this crate goes through: a slice of pairs in, a slice of digests
+//! out, so the callers gather a whole level's pairs into one call. By default
+//! it sits on `sha2::compress256`, so the hardware backend `sha2` selects at
+//! run time (aarch64 SHA2 instructions, x86 SHA-NI) is the one used, and the
+//! output is byte-identical to `libssz_merkle::hash_nodes(&Sha2Hasher, ..)`.
+//! With the `hashtree` feature, the pairs go to Prysm's multi-message kernels
+//! instead (see `hashtree_backend`), which hash 16 messages per AVX-512 call or
+//! two interleaved per SHA-NI call. [`hash_pairs`] splits a large call over
+//! rayon.
 
-use libssz_merkle::ZERO_HASHES;
+use rayon::prelude::*;
 use sha2::compress256;
 use sha2::digest::generic_array::{GenericArray, typenum::U64};
 
@@ -64,6 +64,10 @@ pub(crate) fn hash_pairs_into(input: &[Hash256], output: &mut [Hash256]) {
         }
         return;
     }
+    #[cfg(feature = "hashtree")]
+    if hashtree_backend::hash_pairs(input, output) {
+        return;
+    }
     let padding = GenericArray::<u8, U64>::clone_from_slice(&PADDING_BLOCK);
     for (pair, out) in input.chunks_exact(2).zip(output.iter_mut()) {
         let mut blocks = [padding, padding];
@@ -77,64 +81,142 @@ pub(crate) fn hash_pairs_into(input: &[Hash256], output: &mut [Hash256]) {
     }
 }
 
-/// `SHA-256(left || right)`.
-pub(crate) fn hash_pair(left: &Hash256, right: &Hash256) -> Hash256 {
-    let mut out = [[0u8; 32]];
-    hash_pairs_into(&[*left, *right], &mut out);
-    out[0]
+/// Prysm's `hashtree` kernels, which hash many independent 64-byte messages per
+/// call: 16 per AVX-512 call, two interleaved per SHA-NI call, with the
+/// padding block's message schedule precomputed.
+///
+/// On x86 the kernels are called directly, chosen here by CPU, as
+/// `silver_state_hashing` does: whole groups of 16 to AVX-512 and the rest to
+/// SHA-NI. `hashtree_rs::hash` instead goes through one process-wide function
+/// pointer that any other user of the library may install.
+#[cfg(feature = "hashtree")]
+mod hashtree_backend {
+    use crate::Hash256;
+
+    /// Hashes the pairs with a `hashtree` kernel, or answers `false` when no
+    /// kernel suits this CPU, leaving the work to the caller.
+    pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+        if output.is_empty() {
+            return true;
+        }
+        imp::hash_pairs(input, output)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod imp {
+        use std::arch::x86_64::_mm256_zeroupper;
+        use std::sync::LazyLock;
+
+        use crate::Hash256;
+
+        // Linked from the static library `hashtree-rs` builds.
+        use hashtree_rs as _;
+
+        unsafe extern "C" {
+            fn hashtree_sha256_avx512_x16(output: *mut u8, input: *const u8, count: u64);
+            fn hashtree_sha256_shani_x2(output: *mut u8, input: *const u8, count: u64);
+        }
+
+        #[derive(Clone, Copy)]
+        enum Kernel {
+            Avx512ThenShani,
+            Shani,
+            Unsupported,
+        }
+
+        static KERNEL: LazyLock<Kernel> = LazyLock::new(|| {
+            let sha = is_x86_feature_detected!("sha");
+            let avx512 = is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512bw");
+            match (sha, avx512) {
+                (true, true) => Kernel::Avx512ThenShani,
+                (true, false) => Kernel::Shani,
+                (false, _) => Kernel::Unsupported,
+            }
+        });
+
+        /// The AVX-512 kernel takes whole groups of this many messages.
+        const GROUP: usize = 16;
+
+        pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+            let count = output.len();
+            let (out, inp) = (
+                output.as_mut_ptr().cast::<u8>(),
+                input.as_ptr().cast::<u8>(),
+            );
+            match *KERNEL {
+                // SAFETY: `KERNEL` checked the CPU for every kernel each arm
+                // calls; `input` holds `2 * count` nodes, that is `count`
+                // 64-byte messages, and `output` `count` 32-byte digests.
+                Kernel::Avx512ThenShani => unsafe { avx512_then_shani(out, inp, count) },
+                Kernel::Shani => unsafe { hashtree_sha256_shani_x2(out, inp, count as u64) },
+                Kernel::Unsupported => return false,
+            }
+            true
+        }
+
+        #[target_feature(enable = "avx")]
+        unsafe fn avx512_then_shani(output: *mut u8, input: *const u8, count: usize) {
+            let grouped = count / GROUP * GROUP;
+            if grouped > 0 {
+                unsafe { hashtree_sha256_avx512_x16(output, input, grouped as u64) };
+                // The assembly leaves the upper vector state dirty, which
+                // slows every SSE instruction after it until cleared.
+                _mm256_zeroupper();
+            }
+            let rest = (count - grouped) as u64;
+            if rest > 0 {
+                unsafe {
+                    hashtree_sha256_shani_x2(
+                        output.add(32 * grouped),
+                        input.add(64 * grouped),
+                        rest,
+                    )
+                };
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    mod imp {
+        use std::sync::LazyLock;
+
+        use crate::Hash256;
+
+        /// `hashtree` picks its kernel (on aarch64, the SHA2 instructions)
+        /// into a global pointer on first use; this sets it once, before any
+        /// thread hashes.
+        static READY: LazyLock<()> = LazyLock::new(|| {
+            hashtree_rs::init();
+        });
+
+        pub(super) fn hash_pairs(input: &[Hash256], output: &mut [Hash256]) -> bool {
+            LazyLock::force(&READY);
+            let count = output.len();
+            hashtree_rs::hash(output.as_flattened_mut(), input.as_flattened(), count);
+            true
+        }
+    }
 }
 
-/// Folds `layer` one level up in place: node `i` of the result is the hash of
-/// nodes `2i` and `2i + 1`, and a last odd node is paired with `zero`, the root
-/// of an empty subtree of its own height. The layer ends up
-/// `layer.len().div_ceil(2)` long.
-pub(crate) fn hash_layer(layer: &mut Vec<Hash256>, zero: &Hash256) {
-    if layer.len() % 2 == 1 {
-        layer.push(*zero);
-    }
-    let pairs = layer.len() / 2;
-    // Output index `i` is written after input indices `2i` and `2i + 1` were
-    // read, and `i <= 2i`, so folding in place cannot overwrite an unread node.
-    // The borrow checker cannot see that through one slice, so the first
-    // `pairs` outputs go through a scratch copy of the hashes: a small, hot
-    // buffer, and cheaper than allocating a second layer.
-    const CHUNK: usize = 256;
-    let mut scratch = [[0u8; 32]; CHUNK];
-    let mut done = 0;
-    while done < pairs {
-        let n = (pairs - done).min(CHUNK);
-        hash_pairs_into(&layer[2 * done..2 * (done + n)], &mut scratch[..n]);
-        layer[done..done + n].copy_from_slice(&scratch[..n]);
-        done += n;
-    }
-    layer.truncate(pairs);
-}
+/// At or above this many pairs in one call, [`hash_pairs`] splits them over
+/// rayon.
+const PARALLEL_PAIRS: usize = 4096;
 
-/// The merkle root of `chunks` padded with zero chunks to `limit` leaves.
-///
-/// The same function as `libssz_merkle::merkleize(&Sha2Hasher, chunks,
-/// Some(limit))`, with each level hashed as a batch. Padding is virtual: a
-/// subtree wholly beyond `chunks` is read from [`ZERO_HASHES`].
-///
-/// # Panics
-///
-/// If `chunks.len() > limit`, which callers rule out by construction.
-pub(crate) fn merkleize(chunks: &[Hash256], limit: usize) -> Hash256 {
-    assert!(chunks.len() <= limit, "chunk count exceeds the limit");
-    let depth = limit.next_power_of_two().trailing_zeros() as usize;
-    if chunks.is_empty() {
-        return ZERO_HASHES[depth];
+/// Pairs per rayon task when [`hash_pairs`] splits a call.
+const PARALLEL_BLOCK: usize = 1024;
+
+/// [`hash_pairs_into`], split over rayon when there are many pairs.
+pub(crate) fn hash_pairs(pairs: &[Hash256], hashes: &mut [Hash256]) {
+    if hashes.len() >= PARALLEL_PAIRS && rayon::current_num_threads() > 1 {
+        pairs
+            .par_chunks(2 * PARALLEL_BLOCK)
+            .zip(hashes.par_chunks_mut(PARALLEL_BLOCK))
+            .for_each(|(pairs, hashes)| hash_pairs_into(pairs, hashes));
+    } else {
+        hash_pairs_into(pairs, hashes);
     }
-    let real_depth = chunks.len().next_power_of_two().trailing_zeros() as usize;
-    let mut layer = chunks.to_vec();
-    for zero in &ZERO_HASHES[..real_depth] {
-        hash_layer(&mut layer, zero);
-    }
-    let mut root = layer[0];
-    for zero in &ZERO_HASHES[real_depth..depth] {
-        root = hash_pair(&root, zero);
-    }
-    root
 }
 
 #[cfg(test)]
@@ -143,8 +225,7 @@ mod tests {
     use std::time::Instant;
 
     use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-    use libssz_merkle::{Sha2Hasher, hash_nodes, merkleize as libssz_merkleize};
-    use proptest::prelude::*;
+    use libssz_merkle::{Sha2Hasher, hash_nodes};
 
     use crate::List;
 
@@ -171,58 +252,15 @@ mod tests {
 
     #[test]
     fn batched_pairs_match_hash_nodes() {
-        for pairs in [0usize, 1, 2, 3, 7, 255, 256, 257, 1000, 5000] {
+        // Every size up to three AVX-512 groups and a SHA-NI remainder, then
+        // a few larger ones.
+        for pairs in (0usize..=49).chain([255, 256, 257, 1000, 5000]) {
             let input = nodes(pairs as u64 + 1, 2 * pairs);
             let mut out = vec![[0u8; 32]; pairs];
             hash_pairs_into(&input, &mut out);
             for (i, got) in out.iter().enumerate() {
                 let want = hash_nodes(&Sha2Hasher, &input[2 * i], &input[2 * i + 1]);
                 assert_eq!(*got, want, "pairs {pairs}, pair {i}");
-            }
-        }
-    }
-
-    #[test]
-    fn hash_layer_matches_hash_nodes_for_odd_and_even_layers() {
-        let zero = [0xab; 32];
-        for len in [0usize, 1, 2, 3, 4, 5, 511, 512, 513, 4097] {
-            let mut layer = nodes(len as u64 + 9, len);
-            let want: Vec<Hash256> = layer
-                .chunks(2)
-                .map(|p| hash_nodes(&Sha2Hasher, &p[0], p.get(1).unwrap_or(&zero)))
-                .collect();
-            hash_layer(&mut layer, &zero);
-            assert_eq!(layer, want, "len {len}");
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn merkleize_matches_libssz(len in 0usize..300, extra in 0u32..4, seed in any::<u64>()) {
-            let chunks = nodes(seed, len);
-            let limit = (len.max(1)).next_power_of_two() << extra;
-            prop_assert_eq!(
-                merkleize(&chunks, limit),
-                libssz_merkleize(&Sha2Hasher, &chunks, Some(limit))
-            );
-        }
-    }
-
-    /// The edges the proptest above does not reach: a limit that is not a
-    /// power of two (both sides round it up), a limit equal to the chunk
-    /// count, a limit of zero, and the registry's `1 << 40`, whose virtual
-    /// padding is a 40-level tail of zero hashes.
-    #[test]
-    fn merkleize_matches_libssz_at_edge_limits() {
-        for len in [0usize, 1, 2, 3, 4, 5, 255, 256, 257, 511, 512, 513, 1025] {
-            let chunks = nodes(len as u64 + 17, len);
-            let pow2 = len.max(1).next_power_of_two();
-            for limit in [len, len + 1, pow2, pow2 + pow2 / 2 + 1, 1 << 40] {
-                assert_eq!(
-                    merkleize(&chunks, limit),
-                    libssz_merkleize(&Sha2Hasher, &chunks, Some(limit)),
-                    "len {len}, limit {limit}"
-                );
             }
         }
     }
@@ -274,18 +312,6 @@ mod tests {
     #[test]
     #[ignore = "timing benchmark"]
     fn batch_bench() {
-        let layer = nodes(7, 1 << 20);
-        report(
-            "layer fold, 2^20 nodes",
-            || layer.clone(),
-            |mut l| {
-                while l.len() > 1 {
-                    hash_layer(&mut l, &[0; 32]);
-                }
-                l[0]
-            },
-        );
-
         let balances: Vec<u64> = (0..1u64 << 20).collect();
         report(
             "List<u64> 2^20 fresh root",
@@ -310,100 +336,5 @@ mod tests {
             || List::<Validator, { 1 << 40 }>::try_from(validators.clone()).unwrap(),
             |list| libssz_merkle::HashTreeRoot::hash_tree_root(&list, &Sha2Hasher),
         );
-    }
-
-    /// REVIEW-ONLY: the `fold_roots` loop this PR removed, verbatim.
-    fn removed_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
-        for &zero in zeros {
-            let pairs = layer.len().div_ceil(2);
-            for pair in 0..pairs {
-                let left = layer[2 * pair];
-                let right = layer.get(2 * pair + 1).copied().unwrap_or(zero);
-                layer[pair] = hash_nodes(&Sha2Hasher, &left, &right);
-            }
-            layer.truncate(pairs);
-        }
-        layer[0]
-    }
-
-    /// REVIEW-ONLY: the removed loop's shape, on the PR's `compress256` primitive.
-    fn inplace_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
-        for &zero in zeros {
-            let pairs = layer.len().div_ceil(2);
-            for pair in 0..pairs {
-                let left = layer[2 * pair];
-                let right = layer.get(2 * pair + 1).copied().unwrap_or(zero);
-                layer[pair] = hash_pair(&left, &right);
-            }
-            layer.truncate(pairs);
-        }
-        layer[0]
-    }
-
-    /// REVIEW-ONLY: the fold as the PR writes it.
-    fn pr_fold(mut layer: Vec<Hash256>, zeros: &[Hash256]) -> Hash256 {
-        for zero in zeros {
-            hash_layer(&mut layer, zero);
-        }
-        layer[0]
-    }
-
-    /// REVIEW-ONLY: the removed loop against the PR's, on the layer shapes the
-    /// tree actually folds (an inner node's child roots, a leaf's chunks).
-    #[test]
-    #[ignore = "timing benchmark"]
-    fn review_shape_bench() {
-        let shapes = [
-            ("inner node, 1 child, 9 levels", 1usize, 9usize),
-            ("inner node, 8 children, 9 levels", 8, 9),
-            ("inner node, 128 children, 9 levels", 128, 9),
-            ("inner node, 512 children, 9 levels", 512, 9),
-            ("validator leaf, 32 roots, 5 levels", 32, 5),
-            ("validator leaf, 17 roots, 5 levels", 17, 5),
-            ("balance leaf, 128 chunks, 7 levels", 128, 7),
-        ];
-        for (name, len, levels) in shapes {
-            let layer = nodes(len as u64 + 3, len);
-            let zeros = &ZERO_HASHES[..levels];
-            assert_eq!(
-                removed_fold(layer.clone(), zeros),
-                pr_fold(layer.clone(), zeros)
-            );
-            assert_eq!(
-                removed_fold(layer.clone(), zeros),
-                inplace_fold(layer.clone(), zeros)
-            );
-            let iters = 200_000 / len.max(4);
-            let (mut old, mut new, mut inplace) = (Vec::new(), Vec::new(), Vec::new());
-            for _ in 0..15 {
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let input = std::hint::black_box(layer.clone());
-                    std::hint::black_box(removed_fold(input, zeros));
-                }
-                old.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let input = std::hint::black_box(layer.clone());
-                    std::hint::black_box(pr_fold(input, zeros));
-                }
-                new.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
-                let start = Instant::now();
-                for _ in 0..iters {
-                    let input = std::hint::black_box(layer.clone());
-                    std::hint::black_box(inplace_fold(input, zeros));
-                }
-                inplace.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
-            }
-            old.sort_by(f64::total_cmp);
-            new.sort_by(f64::total_cmp);
-            inplace.sort_by(f64::total_cmp);
-            let (old, new, inplace) = (old[7], new[7], inplace[7]);
-            println!(
-                "{name:<38} removed {old:>7.0} ns  pr {new:>7.0} ns  inplace+compress {inplace:>7.0} ns  removed/pr {:.3}  removed/inplace {:.3}",
-                old / new,
-                old / inplace
-            );
-        }
     }
 }

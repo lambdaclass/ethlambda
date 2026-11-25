@@ -730,9 +730,17 @@ existing once per chain.
   (`validator`/`validator_mut`, `balance`/`balance_mut`, `push_validator`,
   `iter_validators`/`iter_balances`, `validator_count`, `validators_root`), so
   no accessor has to return two list types. A leaf holds a page-sized run of
-  elements rather than one chunk, and an inner node a page of child pointers
-  spanning several binary levels, so a lookup crosses a handful of nodes and a
-  rebuilt leaf or node copies one page. Writes are
+  elements rather than one chunk (1 KiB for `u64` lists, whose block writes are
+  scattered), and an inner node a page of child pointers spanning several
+  binary levels, so a lookup crosses a handful of nodes and a rebuilt leaf or
+  node copies one page. A hashed inner node keeps its binary levels, so its
+  rebuilt successor rehashes only the changed children's paths. A bottom inner
+  node and its leaves hash level by level, one SHA-256 call per level across
+  all of them (`Tree::hash`); above them, changed subtrees hash in parallel.
+  Optionally on Prysm's `hashtree` kernels (ssz-tree's `hashtree` feature,
+  off by default; no workspace crate turns it on). Balances and
+  participation buffer writes in a `SparseMap` (hash table, sorted on apply);
+  a pass that rewrites most of a list goes through the cursor instead. Writes are
   buffered until `BeaconState::apply_pending_mutations`, which the state
   transition calls before every state-root computation. A state decoded from
   storage is rebased onto a cached one (`Store::get_state`).

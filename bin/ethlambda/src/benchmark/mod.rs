@@ -323,7 +323,7 @@ const PHASE_HISTOGRAM: &str = "lean_block_proposal_attestation_build_phase_secon
 /// Histogram sums accumulate the raw f64 seconds of every observation, so the
 /// difference between two readings IS the build's phase time — bucket
 /// boundaries play no role, and the hot path needs no extra instrumentation.
-struct PhaseTimer {
+pub(crate) struct PhaseTimer {
     /// The histogram this timer reads; the import workload uses a different
     /// one (`lean_block_import_phase_seconds`) than the synthetic build does.
     histogram: &'static str,
@@ -350,7 +350,10 @@ impl PhaseTimer {
     /// import path's observations from every other caller's: without the filter
     /// a background `process_epoch` that finished mid-import would be charged
     /// to the block that happened to be importing.
-    fn start_filtered(histogram: &'static str, only: (&'static str, &'static str)) -> Self {
+    pub(crate) fn start_filtered(
+        histogram: &'static str,
+        only: (&'static str, &'static str),
+    ) -> Self {
         Self {
             histogram,
             only: Some(only),
@@ -367,7 +370,10 @@ impl PhaseTimer {
     /// the sum of those observations, which is the time the import spent in the
     /// phase. A phase never observed is omitted rather than reported as zero,
     /// for the reason given there.
-    fn finish_summed(self, expected: impl Iterator<Item = &'static str>) -> BTreeMap<String, f64> {
+    pub(crate) fn finish_summed(
+        self,
+        expected: impl Iterator<Item = &'static str>,
+    ) -> BTreeMap<String, f64> {
         let after = read(self.histogram, self.only);
         let mut phases = BTreeMap::new();
         for phase in expected {

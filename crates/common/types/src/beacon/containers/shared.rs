@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_ssz_tree::{List, ListOf, ProgressiveList as TreeProgressiveList, VectorOf};
+use ethlambda_ssz_tree::{
+    List, ListOf, ProgressiveList as TreeProgressiveList, SparseMap, VectorOf,
+};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszVector};
 
@@ -70,9 +72,13 @@ pub type Validators =
 /// changes every epoch while the rest of a validator's record rarely does, and a
 /// separate list means rewards do not redirty the registry's merkle tree.
 ///
-/// Tree-backed like [`Validators`], with writes buffered densely (the default
-/// `VecMap`), since epoch processing writes every balance.
-pub type Balances = List<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+/// Tree-backed like [`Validators`]. Writes are buffered in a [`SparseMap`]:
+/// a block writes a few hundred balances (the sync committee's and the
+/// proposer's rewards, withdrawals) out of millions, which a dense buffer
+/// would answer by allocating, filling and scanning a slot per validator. The
+/// epoch's rewrite of most balances goes through the write cursor instead
+/// (`BeaconState::try_update_balances`), which buffers nothing.
+pub type Balances = List<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }, SparseMap<Gwei>>;
 
 /// Past randao mixes, indexed by epoch modulo the vector length, so the state
 /// retains a bounded history of the beacon chain's randomness.
@@ -109,15 +115,16 @@ pub type DepositProof = SszVector<Bytes32, { constants::DEPOSIT_CONTRACT_TREE_DE
 /// validators are rehashed; a flag is one byte, so 32 share a chunk and a
 /// block's writes dirty far fewer leaves than it has attesters.
 ///
-/// Writes are buffered densely (the default `VecMap`), not in a `BTreeMap`
-/// like the registry's. A block credits a thirty-second of the registry at
-/// scattered positions, and measured at mainnet size the `BTreeMap`'s inserts
-/// cost several times what the hashing it saves does (a few dozen
-/// milliseconds against a few); the dense buffer is an indexed write, and its
-/// slot-per-validator allocation is small next to that. The pass that writes
-/// nearly every entry, the epoch rotation, does not buffer either: it replaces
-/// the list with a freshly built one (see `process_participation_flag_updates`).
-pub type EpochParticipation = List<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+/// Writes are buffered in a [`SparseMap`]. A block credits a thirty-second
+/// of the active validators at scattered positions, a few tens of thousands
+/// of writes into millions of flags: a hash table holds exactly those, where
+/// a dense `VecMap` allocates, fills and scans a slot for every validator, and
+/// a `BTreeMap`'s ordered inserts cost several times what the hashing they
+/// feed does. The pass that writes nearly every entry, the epoch rotation,
+/// does not buffer: it replaces the list with a freshly built one (see
+/// `process_participation_flag_updates`).
+pub type EpochParticipation =
+    List<ParticipationFlags, { preset::VALIDATOR_REGISTRY_LIMIT }, SparseMap<ParticipationFlags>>;
 
 /// Per-validator inactivity scores, positionally parallel to [`Validators`]
 /// (altair and later).
@@ -143,13 +150,14 @@ pub type HistoricalSummaries =
 pub type ProgressiveValidators = TreeProgressiveList<Validator, BTreeMap<usize, Validator>>;
 
 /// The gloas balances, positionally parallel to [`ProgressiveValidators`].
-/// Tree-backed like [`Balances`], with writes buffered densely (the default
-/// `VecMap`), since epoch processing writes every balance.
-pub type ProgressiveBalances = TreeProgressiveList<Gwei>;
+/// Tree-backed and buffered like [`Balances`]; gloas's epoch rewards go
+/// through the write cursor too (`altair::process_rewards_and_penalties`).
+pub type ProgressiveBalances = TreeProgressiveList<Gwei, SparseMap<Gwei>>;
 
 /// The gloas participation flags, positionally parallel to
 /// [`ProgressiveValidators`]. Tree-backed and buffered like [`EpochParticipation`].
-pub type ProgressiveEpochParticipation = TreeProgressiveList<ParticipationFlags>;
+pub type ProgressiveEpochParticipation =
+    TreeProgressiveList<ParticipationFlags, SparseMap<ParticipationFlags>>;
 
 // ---------------------------------------------------------------------------
 // Misc
