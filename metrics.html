@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-42a2a434.js";
+            window.path_to_searchindex_js = "searchindex-ed73c22b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1190,9 +1190,9 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_envelopes_published_total</code></td><td>Counter</td><td>Execution payload envelopes a beacon node accepted for blocks this client proposed (gloas)</td></tr>
 <tr><td><code>ethlambda_validator_envelope_failures_total</code></td><td>Counter</td><td>Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot’s payload is withheld, so this is the failure that costs the payload. Should read zero</td></tr>
 <tr><td><code>ethlambda_validator_payload_attestations_published_total</code></td><td>Counter</td><td>Payload timeliness committee votes a beacon node accepted (gloas)</td></tr>
-<tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes</td></tr>
+<tr><td><code>ethlambda_validator_payload_attestation_failures_total</code></td><td>Counter</td><td>Slots whose payload timeliness committee duty did not result in published votes. A vote withheld because every node’s last sync probe said syncing or optimistic is not counted</td></tr>
 <tr><td><code>ethlambda_validator_sync_committee_messages_published_total</code></td><td>Counter</td><td>Sync committee messages a beacon node accepted</td></tr>
-<tr><td><code>ethlambda_validator_sync_committee_failures_total</code></td><td>Counter</td><td>Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed</td></tr>
+<tr><td><code>ethlambda_validator_sync_committee_failures_total</code></td><td>Counter</td><td>Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic, or every node’s last sync probe saying syncing or optimistic, is not a failure: nothing is signed</td></tr>
 <tr><td><code>ethlambda_validator_sync_contributions_published_total</code></td><td>Counter</td><td>Sync committee contributions this client published as an aggregator. Bursty, like <code>aggregates_published_total</code></td></tr>
 <tr><td><code>ethlambda_validator_sync_contribution_failures_total</code></td><td>Counter</td><td>Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted</td></tr>
 <tr><td><code>ethlambda_validator_sync_duties_held</code></td><td>Gauge</td><td>Sync committee duties held for the current period</td></tr>
@@ -1209,7 +1209,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_blinded_blocks_proposed_total</code></td><td>Counter</td><td>Blinded blocks a beacon node handed to its builder. A subset of <code>blocks_proposed_total</code></td></tr>
 <tr><td><code>ethlambda_validator_blinded_blocks_unconfirmed_total</code></td><td>Counter</td><td>Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation</td></tr>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
-<tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
+<tr><td><code>ethlambda_validator_slots_skipped_syncing_total</code></td><td>Counter</td><td>Slots in which nothing was signed because every beacon node that answered the slot’s sync probe (<code>/eth/v1/node/syncing</code>, a sixth of a slot before the boundary) reported syncing or optimistic. Should read zero once the nodes are synced; a steady climb is a node that stays syncing or on an optimistic head, usually because its execution client is behind. Nodes that did not answer are not counted against the slot, so this stays flat while every node is down. See <a href="./cli.html#the-per-slot-sync-check">The per-slot sync check</a></td></tr>
+<tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation. 0 after a slot the sync check withheld, until the next refresh succeeds</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time a duty waited for its batch of signatures. With local keys that is the signing itself. With keys in a remote signer it is the batch’s slowest answer, round trip and verification included, and at most the 2 s signing budget, so a sample in the top bucket means a signer that did not answer in time</td></tr>
 <tr><td><code>ethlambda_validator_remote_signer_request_duration_seconds</code></td><td>Histogram</td><td>Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer’s 64 request slots. The number to watch for a slow signer; empty when every key is local</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>

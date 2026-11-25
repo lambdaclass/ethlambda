@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-42a2a434.js";
+            window.path_to_searchindex_js = "searchindex-ed73c22b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1072,6 +1072,27 @@ comes first. The validator client signs once, at the deadline
 (<code>SYNC_MESSAGE_DUE_BPS</code>, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (<code>specs/bellatrix/optimistic-sync.md</code>).</p>
+<h2 id="the-validator-client-withholds-payload-timeliness-votes-over-an-optimistic-head"><a class="header" href="#the-validator-client-withholds-payload-timeliness-votes-over-an-optimistic-head">The validator client withholds payload timeliness votes over an optimistic head</a></h2>
+<ul>
+<li><strong>Specification:</strong> <code>specs/bellatrix/optimistic-sync.md</code> says an optimistic
+validator must not produce a block, attest, or take part in sync
+committees. It does not name <code>DOMAIN_PTC_ATTESTER</code>, and the Beacon API asks
+for a <code>503</code> on <code>GET /eth/v1/validator/payload_attestation_data</code> only while a
+node is syncing. Its answer carries no <code>execution_optimistic</code>.</li>
+<li><strong>ethlambda:</strong> the validator client asks every configured beacon node
+<code>/eth/v1/node/syncing</code> once a slot, a sixth of a slot before the boundary
+(<code>crates/validator/src/beacon_node/health.rs</code>). It does not ask a node whose
+last probe reported syncing or optimistic for payload attestation data, and
+casts no vote when no node is left to ask. A slot in which every node that
+answered reported syncing or optimistic signs nothing at all, this vote
+included.</li>
+<li><strong>Why:</strong> the vote is signed over the block’s root and says whether its
+payload arrived, which a node tracking an unvalidated payload is in no
+position to say. ethlambda’s own beacon node already refuses the data for an
+optimistic block (<code>require_validated</code> in <code>crates/net/rpc/src/beacon/ptc.rs</code>),
+so this matters against other implementations. A node that turns optimistic
+between its probe and the vote is not caught by the client.</li>
+</ul>
 <h2 id="the-validator-clients-builder-proposals"><a class="header" href="#the-validator-clients-builder-proposals">The validator client’s builder proposals</a></h2>
 <p>With <code>--builder-proposals</code> the validator client registers its validators with
 the beacon node’s builder and may sign a blinded block (builder-specs and
