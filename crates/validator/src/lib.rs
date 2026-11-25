@@ -1164,8 +1164,10 @@ async fn propose<B: BeaconNodeApi + 'static>(
 /// What one epoch's [`refresh_epoch`] leaves the duty loop to do.
 #[derive(Debug, Default)]
 struct Refreshed {
-    /// Whether the attester schedule moved. When it did, the beacon node is
-    /// owed this client's subnet subscriptions, which the caller sends once
+    /// Whether the attester schedule moved, in this refresh or in an earlier
+    /// attempt abandoned after it moved it (see
+    /// [`DutiesService::take_attesters_moved`]). When it did, the beacon node
+    /// is owed this client's subnet subscriptions, which the caller sends once
     /// the slot's block is out rather than having them sent from the refresh:
     /// each needs a selection proof, a round trip per remote key, and the
     /// refresh can run ahead of the proposal. See [`send_owed`].
@@ -1254,7 +1256,9 @@ async fn ahead_of_block<B: BeaconNodeApi>(
 /// Dropping it mid-way is safe: every fetch in it answers in full before it
 /// changes the schedule it fetched (see [`DutiesService::refresh_around`]), so
 /// an abandoned refresh leaves each schedule either refreshed or as it was,
-/// never half of one. It is retried at the next slot, as a failed one is.
+/// never half of one. It is retried at the next slot, as a failed one is, and
+/// a move it made to the attester schedule waits on the service for that
+/// retry to report, so the subscriptions it owes are not lost with it.
 #[allow(clippy::too_many_arguments)]
 async fn bounded_refresh<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
@@ -1495,14 +1499,17 @@ async fn refresh_epoch<B: BeaconNodeApi>(
         );
     });
 
-    let changed = duties.refresh_around(epoch, &context.config).await?;
+    duties.refresh_around(epoch, &context.config).await?;
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
     metrics::set_beacon_node_available(true);
     let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
     Ok(Refreshed {
-        moved: changed,
+        // Taken here, after the last await, rather than from
+        // `refresh_around`'s answer: a refresh abandoned after that answer
+        // would lose it, and its retry sees the same roots.
+        moved: duties.take_attesters_moved(),
         registrable: registrable.map(|entry| entry.pubkey).collect(),
         resolved: entries,
     })
@@ -2495,6 +2502,28 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert!(owed.moved, "the first schedule is a move");
         assert_eq!(owed.registrable.len(), 2);
+    }
+
+    /// A refresh abandoned after it moved the attester schedule still owes
+    /// the subscriptions. Its retry fetches the same roots, so only the move
+    /// kept on the service can tell it so.
+    #[tokio::test]
+    async fn a_move_an_abandoned_refresh_made_is_reported_by_its_retry() {
+        let node = Arc::new(node());
+        let context = context();
+        let mut duties = DutiesService::new(node.clone(), vec![11, 22]);
+        // What the abandoned refresh got through before its deadline.
+        duties
+            .refresh_around(3, &context.config)
+            .await
+            .expect("refreshes");
+
+        let keys = [pubkey(1), pubkey(2)];
+        let settings = settings(None);
+        let retry = refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context);
+        assert!(retry.await.expect("retries").moved, "the retry owes them");
+        let again = refresh_epoch(&node, &mut duties, &keys, 3, &settings, &context);
+        assert!(!again.await.expect("refreshes").moved, "and only once");
     }
 
     // ---- following dependent roots between refreshes (#827) ---------------

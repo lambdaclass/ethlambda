@@ -32,7 +32,7 @@
 //! this service holds no fork schedule, and so is holding off the gloas fork
 //! epoch's until the fork, before which a node cannot know them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ethlambda_types::beacon::config::Config;
@@ -87,6 +87,14 @@ impl ProposerDutiesVersion {
 #[derive(Debug, Clone)]
 struct EpochDuties<T> {
     dependent_root: Root,
+    /// [`DutiesService::indices_grown`] when the schedule was fetched. A
+    /// schedule narrowed to the indices held then lacks every validator added
+    /// since, whatever its root says, so the proposer and payload committee
+    /// schedules are replaced once this falls behind: from fulu an epoch's
+    /// proposers are fetched an epoch ahead, before that epoch's refresh
+    /// resolves a key imported meanwhile. The attester schedule is stamped
+    /// too but still keyed on its root alone.
+    indices_seen: u64,
     duties: Vec<T>,
 }
 
@@ -105,6 +113,19 @@ pub struct DutiesService<B> {
     /// with no `dependent_root` because the endpoint sends none: the committee
     /// is fixed a period ahead, so each refresh simply replaces what is held.
     sync: HashMap<u64, Vec<SyncDutyDto>>,
+    /// How many times `indices` has gained a validator it did not hold
+    /// before. Stamped on each schedule fetched (see
+    /// [`EpochDuties::indices_seen`]). A set that only shrank does not count:
+    /// a key that failed to resolve for a moment must not cost a good
+    /// schedule, and the duties of one removed for good find no key to sign.
+    indices_grown: u64,
+    /// Whether the attester schedule changed since
+    /// [`Self::take_attesters_moved`] last asked. [`Self::refresh`] reports
+    /// each change to its caller too, but a caller cut off before it acts on
+    /// one (the duty loop abandons a refresh at the end of its slot) would
+    /// lose it, since the next attempt fetches the same root and reports no
+    /// change. Kept here, the move waits for whoever sends the subscriptions.
+    attesters_moved: bool,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -121,6 +142,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             proposers: HashMap::new(),
             ptc: HashMap::new(),
             sync: HashMap::new(),
+            indices_grown: 0,
+            attesters_moved: false,
             warned_no_indices: false,
         }
     }
@@ -131,7 +154,17 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         if !indices.is_empty() {
             self.warned_no_indices = false;
         }
+        let held: HashSet<&ValidatorIndex> = self.indices.iter().collect();
+        if indices.iter().any(|index| !held.contains(index)) {
+            self.indices_grown += 1;
+        }
         self.indices = indices;
+    }
+
+    /// Whether the attester schedule changed since this was last called,
+    /// which owes the node this client's subnet subscriptions again.
+    pub fn take_attesters_moved(&mut self) -> bool {
+        std::mem::take(&mut self.attesters_moved)
     }
 
     pub fn indices(&self) -> &[ValidatorIndex] {
@@ -176,10 +209,12 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
         if changed {
             info!(%epoch, count = fetched.duties.len(), "Attester duties updated");
+            self.attesters_moved = true;
             self.by_epoch.insert(
                 epoch,
                 EpochDuties {
                     dependent_root: fetched.dependent_root,
+                    indices_seen: self.indices_grown,
                     duties: fetched.duties,
                 },
             );
@@ -230,16 +265,16 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         };
         let root = fetched.dependent_root;
 
-        let held = self.proposers.get(&epoch).map(|held| held.dependent_root);
-        match held {
-            Some(held) if held == root => return Ok(root),
-            Some(held) => warn!(
+        match self.proposers.get(&epoch) {
+            Some(held) if held.dependent_root != root => warn!(
                 %epoch,
-                held = %hex::encode(&held.0[..4]),
+                held = %hex::encode(&held.dependent_root.0[..4]),
                 fetched = %hex::encode(&root.0[..4]),
                 "Proposer duties invalidated by a reorg; replacing the schedule"
             ),
-            None => {}
+            // The same root: kept, unless a validator was added since.
+            Some(held) if held.indices_seen == self.indices_grown => return Ok(root),
+            _ => {}
         }
 
         // The genesis slot is dropped along with other validators' entries.
@@ -276,6 +311,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             epoch,
             EpochDuties {
                 dependent_root: root,
+                indices_seen: self.indices_grown,
                 duties: mine,
             },
         );
@@ -352,15 +388,14 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
         let fetched = self.beacon_node.ptc_duties(epoch, &self.indices).await?;
 
-        let held = self.ptc.get(&epoch);
-        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
-            return Ok(());
-        }
-        if held.is_some() {
-            warn!(
+        match self.ptc.get(&epoch) {
+            Some(held) if held.dependent_root != fetched.dependent_root => warn!(
                 %epoch,
                 "Payload timeliness committee duties invalidated by a reorg; replacing the schedule"
-            );
+            ),
+            // The same root: kept, unless a validator was added since.
+            Some(held) if held.indices_seen == self.indices_grown => return Ok(()),
+            _ => {}
         }
 
         // The node was asked about these indices only, but a node that answers
@@ -380,6 +415,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             epoch,
             EpochDuties {
                 dependent_root: fetched.dependent_root,
+                indices_seen: self.indices_grown,
                 duties: mine,
             },
         );
@@ -512,13 +548,14 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         // slot, until the next refresh succeeds.
         let next_epoch = current_epoch + 1;
         let current = ProposerDutiesVersion::for_epoch(config, current_epoch);
-        if let Err(err) = self.refresh_proposers(current_epoch, current).await {
+        let fetched = self.refresh_proposers(current_epoch, current).await;
+        let _ = fetched.inspect_err(|err| {
             warn!(
                 epoch = current_epoch,
                 %err,
                 "Proposer duties fetch failed; trying again before each slot's proposal"
             );
-        }
+        });
         if ProposerDutiesVersion::fixed_ahead(config, next_epoch) {
             let fetched = self
                 .refresh_proposers(next_epoch, ProposerDutiesVersion::V2)
@@ -1170,6 +1207,54 @@ mod tests {
             .await
             .expect("no-op");
         assert_eq!(node.proposer_duties_call_count(), 0);
+    }
+
+    /// From fulu an epoch's proposers are fetched an epoch ahead, so a key
+    /// imported meanwhile is resolved after its epoch's schedule was narrowed
+    /// without it. The same root must not keep that schedule: the validator's
+    /// slots would go unproposed for the whole epoch. Its payload committee
+    /// seats likewise.
+    #[tokio::test]
+    async fn a_schedule_narrowed_before_an_index_was_added_is_replaced() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_proposers_v2(4, root(2), vec![proposer(1337, 128), proposer(42, 129)])
+                .with_ptc_duties(4, root(2), vec![ptc_duty(1337, 130), ptc_duty(42, 131)]),
+        );
+        let mut service = DutiesService::new(node, vec![1337]);
+        let v2 = ProposerDutiesVersion::V2;
+        service.refresh_proposers(4, v2).await.expect("first");
+        service.refresh_ptc(4).await.expect("first");
+        assert!(service.proposer_at_slot(129, 4).is_none());
+
+        service.set_indices(vec![1337, 42]);
+        service.refresh_proposers(4, v2).await.expect("second");
+        service.refresh_ptc(4).await.expect("second");
+
+        assert_eq!(
+            service.proposer_at_slot(129, 4).map(|d| d.validator_index),
+            Some(42)
+        );
+        assert!(service.proposer_at_slot(128, 4).is_some());
+        assert_eq!(service.ptc_at_slot(131, 4).len(), 1);
+    }
+
+    /// A set that only shrank, as one with a key that failed to resolve for a
+    /// moment does, keeps the schedule held for the same root.
+    #[tokio::test]
+    async fn an_index_set_that_only_shrank_keeps_the_held_schedule() {
+        let node =
+            Arc::new(MockBeaconNode::new().with_proposers(3, root(1), vec![proposer(1337, 96)]));
+        let mut service = DutiesService::new(node.clone(), vec![1337, 42]);
+        let v1 = ProposerDutiesVersion::V1;
+        service.refresh_proposers(3, v1).await.expect("first");
+
+        service.set_indices(vec![1337]);
+        node.set_proposers(3, root(1), vec![proposer(1337, 99)]);
+        service.refresh_proposers(3, v1).await.expect("second");
+
+        assert!(service.proposer_at_slot(96, 3).is_some());
+        assert!(service.proposer_at_slot(99, 3).is_none());
     }
 
     fn ptc_duty(validator_index: ValidatorIndex, slot: Slot) -> PtcDutyDto {
