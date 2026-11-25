@@ -798,9 +798,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 );
                 match settled {
                     Ok(Some(owed)) => {
+                        // From the next slot: this one's duties are served.
                         send_owed(
                             owed,
-                            slot,
+                            slot + 1,
                             epoch,
                             &beacon_node,
                             &duties,
@@ -844,8 +845,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 if follow_dependent_roots(&mut duties, epoch, budget, &context.config()).await {
                     metrics::set_duties_held(duties.all().len() as u64);
+                    // From the next slot: this one's duties are served.
                     spawn_subscriptions(
-                        slot,
+                        slot + 1,
                         epoch,
                         &beacon_node,
                         &duties,
@@ -1593,9 +1595,12 @@ fn send_owed<B: BeaconNodeApi + 'static>(
 /// its own: after the attester schedule moved, a node was let back in, or the
 /// schedule was swapped. See [`send_owed`] for why nothing waits on it.
 ///
-/// In distributed mode, the epoch's selection round at `slot` instead: the
-/// middleware's combined proofs are asked for first, and the subscriptions
-/// follow them (see [`distributed::Distributed::spawn_round`]).
+/// In distributed mode, the epoch's selection round for the duties from
+/// `slot` on instead: the middleware's combined proofs are asked for first,
+/// and the subscriptions follow them (see
+/// [`distributed::Distributed::spawn_round`]). `slot` is the first slot
+/// whose duties are still to be served, so a caller that runs after the
+/// slot's duties passes the next one.
 fn spawn_subscriptions<B: BeaconNodeApi + 'static>(
     slot: u64,
     epoch: u64,
