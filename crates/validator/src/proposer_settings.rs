@@ -45,13 +45,13 @@
 //! preference a node accepted.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H160, H256};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
-use crate::graffiti_file::GraffitiFile;
+use crate::graffiti_file::{GraffitiFile, GraffitiFileError, GraffitiTable};
 
 /// A block's graffiti field is exactly this wide.
 pub const GRAFFITI_BYTES: usize = 32;
@@ -188,6 +188,9 @@ pub struct ProposerSettings {
     /// `--graffiti-file`, read ahead of every other graffiti source. Outside
     /// the lock: it is only a path, and each read parses the file afresh.
     graffiti_file: Option<GraffitiFile>,
+    /// Whether the last read of [`Self::graffiti_file`] failed, so a run of
+    /// failures is warned about once. See [`Self::graffiti_file_table`].
+    graffiti_file_failing: AtomicBool,
 }
 
 impl ProposerSettings {
@@ -207,6 +210,7 @@ impl ProposerSettings {
             }),
             generation: AtomicU64::new(0),
             graffiti_file: None,
+            graffiti_file_failing: AtomicBool::new(false),
         }
     }
 
@@ -320,20 +324,42 @@ impl ProposerSettings {
     /// next source applies.
     pub async fn next_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
         let from_file = match &self.graffiti_file {
-            Some(file) => file
-                .read()
-                .await
-                .inspect_err(|err| {
-                    warn!(
-                        %err,
-                        "Graffiti file skipped; using the validator's own graffiti or --graffiti"
-                    )
-                })
-                .ok()
+            Some(file) => self
+                .graffiti_file_table(file.read().await)
                 .and_then(|table| table.graffiti(pubkey)),
             None => None,
         };
         from_file.or_else(|| self.graffiti(pubkey))
+    }
+
+    /// One read of the graffiti file, or `None` when it failed. The first
+    /// failure in a run of them is logged at warn and the rest at debug, so a
+    /// keymanager client polling `GET graffiti` does not repeat it every
+    /// poll; the read that ends the run is logged too.
+    fn graffiti_file_table(
+        &self,
+        read: Result<GraffitiTable, GraffitiFileError>,
+    ) -> Option<GraffitiTable> {
+        match read {
+            Ok(table) => {
+                if self.graffiti_file_failing.swap(false, Ordering::Relaxed) {
+                    info!("Graffiti file read again; its graffiti applies from now on");
+                }
+                Some(table)
+            }
+            Err(err) => {
+                if self.graffiti_file_failing.swap(true, Ordering::Relaxed) {
+                    debug!(%err, "Graffiti file still skipped");
+                } else {
+                    warn!(
+                        %err,
+                        "Graffiti file skipped until it reads again; the validator's own graffiti \
+                         applies, else --graffiti, else none"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// The gas limit `pubkey` reports.

@@ -31,13 +31,17 @@
 //! A file that cannot be read or does not parse, a graffiti over 32 bytes
 //! among them, refuses startup ([`GraffitiFile::open`]), as an over-long
 //! `--graffiti` does. Once running, the same failure costs only the file: the
-//! proposal logs a warning and takes its graffiti from the next source. See
-//! [`ProposerSettings::next_graffiti`] for the order.
+//! proposal logs a warning and takes its graffiti from the next source. So
+//! does a file over [`MAX_FILE_BYTES`], and a read that has not finished
+//! within [`READ_TIMEOUT`], so a stalled mount cannot cost the proposal its
+//! slot. See [`ProposerSettings::next_graffiti`] for the order.
 //!
 //! [`ProposerSettings::next_graffiti`]: crate::proposer_settings::ProposerSettings::next_graffiti
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey, Bytes32};
 use tracing::info;
@@ -47,6 +51,16 @@ use crate::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
 /// The key of the line every validator the file does not name gets.
 const DEFAULT_KEY: &str = "default";
 
+/// The largest file read. A line is under 200 bytes, so this holds tens of
+/// thousands of keys; a file past it is refused rather than read whole into
+/// memory ahead of a proposal.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How long a proposal waits for the file. A local read takes microseconds; a
+/// stalled network mount, or a FIFO swapped in for the file, would otherwise
+/// hold the block request until the slot is lost, for the sake of a graffiti.
+pub const READ_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[derive(Debug, thiserror::Error)]
 pub enum GraffitiFileError {
     #[error("graffiti file {path}: {source}")]
@@ -55,6 +69,10 @@ pub enum GraffitiFileError {
         #[source]
         source: std::io::Error,
     },
+    #[error("graffiti file {path} is over {MAX_FILE_BYTES} bytes")]
+    TooLarge { path: String },
+    #[error("graffiti file {path} was not read within {READ_TIMEOUT:?}")]
+    TimedOut { path: String },
     #[error("graffiti file {path}, line {line}: {reason}")]
     Line {
         path: String,
@@ -82,6 +100,9 @@ impl GraffitiTable {
     /// The file's text as a table, or the first line that does not parse.
     pub fn parse(text: &str) -> Result<Self, BadLine> {
         let mut table = Self::default();
+        // A UTF-8 byte-order mark, which Windows editors write, would
+        // otherwise stick to the first line's key.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -171,14 +192,25 @@ impl GraffitiFile {
         &self.path
     }
 
-    /// Read and parse the file on the calling thread.
+    /// Read and parse the file on the calling thread, refusing one over
+    /// [`MAX_FILE_BYTES`].
     pub fn read_now(&self) -> Result<GraffitiTable, GraffitiFileError> {
         let path = || self.path.display().to_string();
-        let text =
-            std::fs::read_to_string(&self.path).map_err(|source| GraffitiFileError::Read {
-                path: path(),
-                source,
-            })?;
+        let read = |source| GraffitiFileError::Read {
+            path: path(),
+            source,
+        };
+        let file = std::fs::File::open(&self.path).map_err(read)?;
+        let mut bytes = Vec::new();
+        // One byte past the limit, to tell a file at it from one over it.
+        file.take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(read)?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(GraffitiFileError::TooLarge { path: path() });
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|err| read(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
         GraffitiTable::parse(&text).map_err(|BadLine { line, reason }| GraffitiFileError::Line {
             path: path(),
             line,
@@ -187,17 +219,20 @@ impl GraffitiFile {
     }
 
     /// [`Self::read_now`] on the blocking pool, off the runtime's workers
-    /// beside the duties.
+    /// beside the duties, given up after [`READ_TIMEOUT`]. A read given up
+    /// on keeps its blocking thread until the file answers.
     pub async fn read(&self) -> Result<GraffitiTable, GraffitiFileError> {
         let file = self.clone();
-        tokio::task::spawn_blocking(move || file.read_now())
-            .await
-            .unwrap_or_else(|err| {
-                Err(GraffitiFileError::Read {
-                    path: self.path.display().to_string(),
-                    source: std::io::Error::other(err),
-                })
-            })
+        let read = tokio::task::spawn_blocking(move || file.read_now());
+        let path = || self.path.display().to_string();
+        match tokio::time::timeout(READ_TIMEOUT, read).await {
+            Ok(Ok(table)) => table,
+            Ok(Err(err)) => Err(GraffitiFileError::Read {
+                path: path(),
+                source: std::io::Error::other(err),
+            }),
+            Err(_) => Err(GraffitiFileError::TimedOut { path: path() }),
+        }
     }
 }
 
@@ -366,6 +401,32 @@ mod tests {
             "got {err:?}"
         );
         assert!(err.to_string().contains("graffiti.txt"), "got {err}");
+    }
+
+    /// A UTF-8 byte-order mark, as Windows Notepad writes one, is not part
+    /// of the first line's key.
+    #[test]
+    fn a_leading_byte_order_mark_is_not_part_of_the_first_key() {
+        let table = GraffitiTable::parse("\u{feff}default: wall\n").expect("parses");
+        assert_eq!(table.graffiti(&key(PK1)), graffiti("wall"));
+    }
+
+    /// A file at the limit is read; one byte over it is refused before it is
+    /// parsed, rather than read whole.
+    #[test]
+    fn a_file_over_the_size_limit_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        let at_limit = " ".repeat(usize::try_from(MAX_FILE_BYTES).expect("fits"));
+        std::fs::write(&path, &at_limit).expect("writes");
+        let file = GraffitiFile::open(&path).expect("a file at the limit opens");
+
+        std::fs::write(&path, format!("{at_limit} ")).expect("grows");
+        let err = file.read_now().expect_err("over the limit");
+        assert!(
+            matches!(err, GraffitiFileError::TooLarge { .. }),
+            "got {err:?}"
+        );
     }
 
     /// The read the proposal path makes, off the runtime's workers, gives

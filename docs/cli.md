@@ -875,9 +875,13 @@ it to a temporary path and rename it over the old one, so a proposal never
 reads it half-written.
 
 A file that cannot be read or does not parse, a graffiti over 32 bytes among
-them, refuses startup, as an over-long `--graffiti` does. Once the client is
-running, the same failure costs only the file: the proposal logs a warning and
-takes its graffiti from the next source in the list.
+them, refuses startup, as an over-long `--graffiti` does. So does a file over
+16 MiB. Once the client is running, the same failure costs only the file: the
+proposal takes its graffiti from the next source in the list, and the client
+logs a warning at the first failed read and an info line once it reads
+again. A read that takes longer than 250 ms is given up on the same way, so a
+stalled mount cannot cost a proposal its slot. A UTF-8 byte-order mark at the
+start of the file is ignored.
 
 Two things differ from Lighthouse besides the reload. `--graffiti-file` and
 `--graffiti` may be given together, since the flag is where the file's misses
