@@ -455,6 +455,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // Whether the last refresh attempt found the node syncing or
+        // optimistic, until one gets through (see `settle_refresh`).
+        let mut node_syncing = false;
 
         loop {
             // One wake per slot, at the slot boundary, rather than one at the
@@ -514,7 +517,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // What a refresh leaves owing once the slot's block is out.
             let mut owed = None;
             if let Some(outcome) = early {
-                match settle_refresh(epoch, outcome, &mut last_epoch, &mut resolved) {
+                let settled = settle_refresh(
+                    epoch,
+                    outcome,
+                    &mut last_epoch,
+                    &mut resolved,
+                    &mut node_syncing,
+                );
+                match settled {
                     Ok(settled) => owed = settled,
                     Err(err) => return err,
                 }
@@ -525,8 +535,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // Cloned out of `duties` so the borrow ends before the await: the duty
             // is three small fields, and holding a borrow of the schedule across
             // the proposal would stop the next epoch's refresh from replacing it.
+            //
+            // Not while the last refresh attempt found the node syncing or
+            // optimistic: a block must not be built on a head it has not
+            // validated. The schedule can be held regardless, prefetched a
+            // whole epoch ahead from fulu, where a refresh that checked the
+            // node first used to be the only source of an epoch's proposers.
+            // Nothing is asked ahead of the block for this, so an epoch's
+            // first slot proposes on the previous refresh's word.
             if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
-                if doppelganger_cleared(&context, &duty.pubkey) {
+                if node_syncing {
+                    warn!(
+                        %slot,
+                        validator = duty.validator_index,
+                        "Not proposing: the beacon node was syncing or optimistic at the last \
+                         duty refresh"
+                    );
+                } else if doppelganger_cleared(&context, &duty.pubkey) {
                     propose(&proposal, &clock, slot, &duty, &store).await;
                 } else {
                     warn!(
@@ -574,7 +599,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // committee and payload committee duties go on (see
             // `doppelganger`). Read from the schedule held now, which the
             // previous epoch's lookahead filled for an epoch's first slot, so
-            // they need nothing from the refresh below.
+            // they need nothing from the refresh below. That lookahead was
+            // fetched at the previous epoch's first slot, one slot after the
+            // block it depends on, so a one-slot reorg of a late block there
+            // leaves it stale, and this slot acts on it: the refresh below
+            // corrects it from the next slot only.
             let slot_duties = withhold_uncleared(&context, slot, duties.at_slot(slot, epoch));
             let committee = duties.ptc_at_slot(slot, epoch);
             let sync_duties = duties.sync_at_slot(slot);
@@ -625,7 +654,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             };
             let (deferred, ()) = tokio::join!(refresh, slot_work);
             if let Some(outcome) = deferred {
-                match settle_refresh(epoch, outcome, &mut last_epoch, &mut resolved) {
+                let settled = settle_refresh(
+                    epoch,
+                    outcome,
+                    &mut last_epoch,
+                    &mut resolved,
+                    &mut node_syncing,
+                );
+                match settled {
                     Ok(Some(owed)) => {
                         send_owed(
                             owed,
@@ -1179,7 +1215,12 @@ struct Refreshed {
 /// - **The whole refresh**, when it is due and the schedule held cannot say
 ///   who acts this epoch: no validator index resolved yet (the first slot
 ///   served) or no attester schedule for the epoch (its lookahead failed).
-///   Bounded by the end of the slot. Returned, for the caller to settle.
+///   Returned, for the caller to settle. Not cut off at the end of the slot,
+///   unlike the refresh run after a block: with nothing held there is no
+///   duty for the loop to get back to, and a refresh that restarted from its
+///   first request every slot could never get past a hung first node. Each
+///   request is bounded by its own timeout, so the fallback does reach the
+///   next node, as it did when every refresh ran this way.
 /// - **This epoch's proposers alone**, when no proposer schedule is held for
 ///   it: before fulu, where they cannot be fetched an epoch ahead, or after a
 ///   prefetch that failed. Bounded by the proposal's own budget, the
@@ -1202,17 +1243,7 @@ async fn ahead_of_block<B: BeaconNodeApi>(
     let epoch = clock.epoch_of(slot);
     let schedule_held = !duties.indices().is_empty() && duties.holds_attesters(epoch);
     if refresh_due && !schedule_held {
-        let budget = clock.remaining_in(slot, SystemTime::now());
-        let refreshed = bounded_refresh(
-            beacon_node,
-            duties,
-            pubkeys,
-            slot,
-            epoch,
-            settings,
-            context,
-            budget,
-        );
+        let refreshed = refresh_epoch(beacon_node, duties, pubkeys, epoch, settings, context);
         return Some(refreshed.await);
     }
 
@@ -1247,6 +1278,12 @@ async fn ahead_of_block<B: BeaconNodeApi>(
 /// never half of one. It is retried at the next slot, as a failed one is, and
 /// a move it made to the attester schedule waits on the service for that
 /// retry to report, so the subscriptions it owes are not lost with it.
+///
+/// A retry starts again from the first request. Against a first node that
+/// hangs each request to its timeout, a refresh cut off every slot may never
+/// complete. The epoch's own schedule stays in use meanwhile, and an epoch
+/// that starts with no lookahead held refreshes ahead of its block without
+/// this deadline (see [`ahead_of_block`]).
 #[allow(clippy::too_many_arguments)]
 async fn bounded_refresh<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
@@ -1271,17 +1308,34 @@ async fn bounded_refresh<B: BeaconNodeApi>(
 /// whose preparations are re-sent every slot. One that failed leaves both as
 /// they were, so the held schedule stays in use and the next slot tries again.
 /// Only a failure that will not fix itself is returned, to stop the client.
+///
+/// `node_syncing` is set by a refresh that found the node syncing or
+/// optimistic and cleared by one that got through; a failure that says
+/// nothing of the node's sync state leaves it. The duty loop proposes no
+/// block while it is set (see [`run`]).
 fn settle_refresh(
     epoch: u64,
     outcome: Result<Refreshed>,
     last_epoch: &mut Option<u64>,
     resolved: &mut Arc<Vec<ValidatorEntry>>,
+    node_syncing: &mut bool,
 ) -> std::result::Result<Option<Refreshed>, Error> {
     match outcome {
         Ok(mut refreshed) => {
             *last_epoch = Some(epoch);
             *resolved = Arc::new(std::mem::take(&mut refreshed.resolved));
+            *node_syncing = false;
             Ok(Some(refreshed))
+        }
+        Err(Error::BeaconNodeSyncing) => {
+            warn!(
+                %epoch,
+                "Failed to refresh duties: the beacon node is syncing or optimistic; keeping the \
+                 previous schedule and proposing no block until a refresh gets through"
+            );
+            metrics::set_beacon_node_available(false);
+            *node_syncing = true;
+            Ok(None)
         }
         // A beacon node that is down, syncing, slow or answering badly will
         // likely answer later, so keep the schedule already held and try
@@ -1366,7 +1420,13 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // Nothing to resolve, nothing to schedule, nothing to register. Returning
     // here also keeps an empty pubkey list away from `validator_indices`, whose
     // endpoint reads one as "every validator on the chain".
+    //
+    // The indices of keys no longer held are forgotten here too: the duty
+    // loop's own fetches between refreshes (the proposers ahead of a block,
+    // the payload committee retry) ask for nothing without indices, and
+    // would otherwise keep asking for validators whose keys were all deleted.
     if pubkeys.is_empty() {
+        duties.set_indices(Vec::new());
         return Ok(Refreshed::default());
     }
 
@@ -2358,6 +2418,86 @@ mod tests {
         assert!(duties.holds_attesters(3) && duties.holds_proposers(3));
     }
 
+    /// With nothing held the refresh ahead of the block runs to the end, past
+    /// its slot: cut off there, it would start again from its first request
+    /// every slot, and a first node that hangs each request to its timeout
+    /// would keep it from ever reaching a healthy one.
+    #[tokio::test(start_paused = true)]
+    async fn with_nothing_held_the_refresh_is_not_cut_off_at_the_slots_end() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let node = Arc::new(node().with_preparation_gate(gate.clone()));
+        let context = context();
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let clock = clock_at(96, &context);
+        let settings = settings(Some(H160([0xab; 20])));
+        let slot = std::time::Duration::from_millis(context.config.slot_duration_ms);
+
+        let started = tokio::time::Instant::now();
+        let release = async {
+            tokio::time::sleep(slot * 2).await;
+            gate.add_permits(1);
+        };
+        let refresh = ahead_of_block(
+            &node,
+            &mut duties,
+            &keys,
+            &clock,
+            96,
+            true,
+            &settings,
+            &context,
+        );
+        let (early, ()) = tokio::join!(refresh, release);
+
+        assert!(matches!(early, Some(Ok(_))), "got {early:?}");
+        assert!(started.elapsed() >= slot * 2);
+        assert!(duties.holds_attesters(3));
+    }
+
+    /// A refresh that finds the node syncing or optimistic stops the
+    /// proposals until one gets through: the schedule held, prefetched from
+    /// fulu, would otherwise have them built on a head the node has not
+    /// validated.
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_node_syncing_stops_the_proposals() {
+        let mut node = node();
+        node.optimistic = true;
+        let node = Arc::new(node);
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let outcome =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context()).await;
+
+        let mut last_epoch = Some(2);
+        let mut resolved = Arc::default();
+        let mut node_syncing = false;
+        let owed = settle_refresh(
+            3,
+            outcome,
+            &mut last_epoch,
+            &mut resolved,
+            &mut node_syncing,
+        )
+        .expect("a syncing node does not stop the client");
+        assert!(owed.is_none());
+        assert_eq!(last_epoch, Some(2));
+        assert!(node_syncing, "no block until a refresh gets through");
+    }
+
+    /// With every key deleted the indices go too, so nothing between
+    /// refreshes keeps asking for duties of validators no longer held.
+    #[tokio::test]
+    async fn with_every_key_deleted_the_indices_are_forgotten() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), vec![11, 22]);
+        let (settings, context) = (settings(None), context());
+        let refreshed = refresh_epoch(&node, &mut duties, &[], 3, &settings, &context);
+        refreshed.await.expect("refreshes");
+        assert!(duties.indices().is_empty());
+        assert_eq!(node.validator_indices_call_count(), 0);
+    }
+
     /// A refresh a node holds past the end of its slot is abandoned, so the
     /// loop goes on to the next slot's duties on time, and retried there: the
     /// epoch is not marked refreshed.
@@ -2392,10 +2532,18 @@ mod tests {
 
         let mut last_epoch = Some(2);
         let mut resolved = Arc::default();
-        let owed = settle_refresh(3, outcome, &mut last_epoch, &mut resolved)
-            .expect("a deadline does not stop the client");
+        let mut node_syncing = false;
+        let owed = settle_refresh(
+            3,
+            outcome,
+            &mut last_epoch,
+            &mut resolved,
+            &mut node_syncing,
+        )
+        .expect("a deadline does not stop the client");
         assert!(owed.is_none(), "an abandoned refresh owes nothing");
         assert_eq!(last_epoch, Some(2), "the refresh runs again next slot");
+        assert!(!node_syncing, "a deadline says nothing of the node's sync");
     }
 
     /// A refresh that got through marks its epoch done and hands over the
@@ -2410,9 +2558,17 @@ mod tests {
 
         let mut last_epoch = Some(2);
         let mut resolved = Arc::default();
-        let owed = settle_refresh(3, outcome, &mut last_epoch, &mut resolved)
-            .expect("settles")
-            .expect("owes its sends");
+        let mut node_syncing = true;
+        let owed = settle_refresh(
+            3,
+            outcome,
+            &mut last_epoch,
+            &mut resolved,
+            &mut node_syncing,
+        )
+        .expect("settles")
+        .expect("owes its sends");
+        assert!(!node_syncing, "a refresh that got through clears it");
         assert_eq!(last_epoch, Some(3));
         assert_eq!(resolved.len(), 2);
         assert!(owed.moved, "the first schedule is a move");

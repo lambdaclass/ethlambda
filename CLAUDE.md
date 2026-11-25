@@ -971,7 +971,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   itself runs after the epoch's first block, beside that slot's duties and cut
   off at the slot's end: from fulu the next epoch's proposers are fetched (v2)
   with the lookahead, so `ahead_of_block` asks for nothing then, and only the
-  first slot served (no schedule held) refreshes in front of a block. Builder
+  first slot served (no schedule held) refreshes in front of a block, uncut,
+  so a hung first node cannot keep it from failing over. A refresh that finds
+  the node syncing or optimistic stops proposals until one gets through. Builder
   registrations and proposer preferences sign through the same path
   (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
   `Web3Signer::normalize_url`'s rendering of its URL, which is what requests
