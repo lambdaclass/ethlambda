@@ -258,10 +258,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let store = Arc::new(RwLock::new(store));
 
     // Bound before any beacon-node network call, deliberately: a validator
-    // that cannot reach its beacon node still exits (via the `?`s below) if
-    // it never gets one, but until then it must expose `/health` and
-    // `/metrics`, so an operator can tell "still starting, node unreachable"
-    // apart from "crashed with no HTTP surface at all".
+    // that cannot reach its beacon node waits for one at startup, for as long
+    // as it takes (see `FallbackBeaconNode::establish`), and meanwhile it must
+    // expose `/health` and `/metrics`, so an operator can tell "still
+    // starting, node unreachable" apart from "crashed with no HTTP surface at
+    // all".
     let listener = tokio::net::TcpListener::bind(config.metrics)
         .await
         .map_err(|source| Error::Io {
@@ -484,9 +485,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
-        // The beacon node's readmission count as of the last slot, so a node
-        // the chain check let back in since then is sent what it missed.
+        // The beacon node's readmission count, and the schedule's generation,
+        // as of the last slot, so a node the chain check let back in since
+        // then is sent what it missed, and a schedule it swapped gets the
+        // subnet subscriptions sent again.
         let mut readmissions_seen = beacon_node.readmissions();
+        let mut schedule_seen = context.schedule_generation();
 
         loop {
             // One wake per slot, at the slot boundary, rather than one at the
@@ -507,6 +511,16 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             served = Some(slot);
 
             let epoch = clock.epoch_of(slot);
+
+            // Read before the refresh below, so a node let back in, or a
+            // schedule swapped, while it runs is seen at the next slot rather
+            // than taken as covered by sends the refresh made before it.
+            let readmissions = beacon_node.readmissions();
+            let readmitted = readmissions != readmissions_seen;
+            readmissions_seen = readmissions;
+            let schedule = context.schedule_generation();
+            let rescheduled = schedule != schedule_seen;
+            schedule_seen = schedule;
 
             // What the refresh below leaves owing once the slot's block is
             // out: the subnet subscriptions when it moved the attester
@@ -575,22 +589,24 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // over to for needs the votes those subnets carry. All three go to
             // every usable node again, after the block like the refresh's own;
             // a node that has them already takes them again. What a refresh
-            // this slot sent is not sent twice, and before any refresh got
-            // through there is nothing held to send.
+            // this slot sent after the readmission is not sent twice, and
+            // before any refresh got through there is nothing held to send.
+            //
+            // A schedule the chain check swapped resends the subnet
+            // subscriptions too: each one's `is_aggregator` came from a
+            // selection proof under the old schedule's domain, and a fork it
+            // moved can change which validators aggregate.
             let mut resend_sync = None;
-            let readmissions = beacon_node.readmissions();
-            if std::mem::replace(&mut readmissions_seen, readmissions) != readmissions
-                && last_epoch.is_some()
-            {
+            if (readmitted || rescheduled) && last_epoch.is_some() {
                 resubscribe = true;
-                if to_register.is_none() {
-                    let registrable = resolved
-                        .iter()
-                        .filter(|entry| is_registrable(&entry.status))
-                        .map(|entry| entry.pubkey);
-                    to_register = Some(registrable.collect());
-                    resend_sync = Some(sync_subscriptions_owed(&duties, epoch));
-                }
+            }
+            if readmitted && last_epoch.is_some() && to_register.is_none() {
+                let registrable = resolved
+                    .iter()
+                    .filter(|entry| is_registrable(&entry.status))
+                    .map(|entry| entry.pubkey);
+                to_register = Some(registrable.collect());
+                resend_sync = Some(sync_subscriptions_owed(&duties, epoch));
             }
 
             // A block is due now, at the boundary this iteration woke on.
@@ -1640,9 +1656,10 @@ async fn send_sync_subscriptions<B: BeaconNodeApi>(
     owed: &[(Vec<crate::beacon_node::dto::SyncDutyDto>, u64)],
 ) {
     for (seats, until_epoch) in owed {
-        if let Err(err) = subscriptions::subscribe_sync(beacon_node, seats, *until_epoch).await {
+        let subscribed = subscriptions::subscribe_sync(beacon_node, seats, *until_epoch).await;
+        let _ = subscribed.inspect_err(|err| {
             warn!(until_epoch, %err, "Failed to subscribe to sync committee subnets");
-        }
+        });
     }
 }
 

@@ -377,8 +377,9 @@ list order that answers both `/eth/v1/beacon/genesis` and
 `/eth/v1/config/spec`. While none does, the client warns, naming what each node
 said, and asks them all again every 2 seconds, as Lighthouse's validator client
 does, rather than exiting: a client started beside its beacon node otherwise
-exits before the node's API is up. Only when every node answered with a preset
-this client cannot run on does startup fail. A response without the slot
+exits before the node's API is up. Only when every node answered, each with a
+preset this client cannot run on or a spec it cannot read, does startup fail. A
+response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
 absent, meaning unscheduled.

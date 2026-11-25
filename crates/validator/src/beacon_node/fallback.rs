@@ -291,9 +291,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// Lighthouse's validator client does: a client started beside its
     /// beacon node (one container restart, one systemd target) would
     /// otherwise exit before the node's API is up, and read its keystores
-    /// again on every restart. Only when every node answered with a preset
-    /// this client cannot run on does it fail, since waiting cannot change
-    /// that.
+    /// again on every restart. Only when every node answered, each with a
+    /// preset this client cannot run on or a spec it cannot read (a required
+    /// key absent), does it fail, since waiting cannot change that.
     ///
     /// The chain returned is the reference's, schedule included. A fork
     /// another node schedules and the reference lacks is not taken: the
@@ -326,11 +326,15 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
+            // A node that answered with a preset this client cannot run on, or
+            // a spec it cannot read (a required key absent, say), answered:
+            // asking it again gives the same answer. Waiting is for a node
+            // that has not answered yet.
             if asked
                 .iter()
-                .all(|answer| matches!(answer, Err(Error::Preset(_))))
+                .all(|answer| matches!(answer, Err(Error::Preset(_) | Error::Decode(_))))
             {
-                warn!(%detail, "No configured beacon node is on a preset this client can run on");
+                warn!(%detail, "No configured beacon node serves a chain this client can run on");
                 return Err(Error::AllBeaconNodesFailed(detail));
             }
             warn!(

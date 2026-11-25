@@ -261,6 +261,14 @@ impl SigningContext {
         proofs.clear();
     }
 
+    /// How many times [`Self::replace_config`] has swapped the schedule. The
+    /// duty loop sends its attestation subnet subscriptions again when this
+    /// moves: each one's `is_aggregator` came from a selection proof signed
+    /// under the old schedule's domain, which a moved fork can change.
+    pub fn schedule_generation(&self) -> u64 {
+        self.schedule_generation.load(Ordering::Acquire)
+    }
+
     /// Whether `signature` is `pubkey`'s signature over `root`, checked on
     /// the blocking pool rather than on the task that asked.
     ///

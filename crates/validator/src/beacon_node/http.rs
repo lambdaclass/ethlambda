@@ -178,7 +178,7 @@ impl HttpBeaconNode {
             .connect_timeout(connect_timeout)
             .build()
             .map_err(|err| Error::BeaconNode {
-                url: base_url.clone(),
+                url: without_credentials(&base_url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -199,7 +199,7 @@ impl HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -219,7 +219,7 @@ impl HttpBeaconNode {
             request = request.header("Eth-Consensus-Version", version);
         }
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -255,7 +255,7 @@ impl HttpBeaconNode {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -352,7 +352,7 @@ impl HttpBeaconNode {
 
     async fn read_ssz(url: String, request: reqwest::RequestBuilder) -> Result<SszResponse> {
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -450,7 +450,7 @@ impl HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -620,7 +620,9 @@ impl HttpBeaconNode {
     }
 }
 
-/// `url` with its user name and password removed, for a log line. Anything
+/// `url` with its user name and password removed, for a log line or an error
+/// (every `Error::BeaconNode` built here carries its URL through this, since
+/// those errors are logged, and the chain check logs them at `warn`). Anything
 /// that does not parse as a URL is returned as it is: it cannot be a URL that
 /// carries credentials a request would send.
 fn without_credentials(url: &str) -> String {
@@ -842,7 +844,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .post_ssz_body("/eth/v2/beacon/blocks", fork, body)
             .await;
         let response = sent.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -894,7 +896,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         let response = sent.map_err(|err| {
             if err.is_connect() {
                 Error::BeaconNode {
-                    url: url.clone(),
+                    url: without_credentials(&url),
                     failure: BeaconNodeFailure::classify(&err),
                     detail: err.to_string(),
                 }
@@ -1014,7 +1016,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1081,7 +1083,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1110,7 +1112,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1276,7 +1278,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1407,14 +1409,18 @@ mod tests {
         assert_eq!(node.base_url(), "http://x");
     }
 
-    /// The chain check logs a node by `describe`, so a password in its URL
-    /// must not reach the log.
+    /// The chain check logs a node by `describe`, and the errors its requests
+    /// fail with, so a password in its URL must reach neither.
     #[test]
     fn a_node_is_described_without_its_credentials() {
         let node = HttpBeaconNode::new("https://user:secret@node.example:5052").expect("builds");
         assert_eq!(node.describe(), "https://node.example:5052");
         let plain = HttpBeaconNode::new("http://127.0.0.1:5052").expect("builds");
         assert_eq!(plain.describe(), "http://127.0.0.1:5052");
+        assert_eq!(
+            without_credentials("https://user:secret@node.example:5052/eth/v1/beacon/genesis"),
+            "https://node.example:5052/eth/v1/beacon/genesis"
+        );
     }
 
     /// An `IndexedErrorMessage` naming fewer failures than the batch size is
