@@ -64,7 +64,7 @@ changes.
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
 | Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; blobs, their columns gossiped with the envelope. Every block it built on the devnet was canonical on Lighthouse |
 | VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each `keccak256(vrf_seed \|\| le64(slot))`; known answers from ethereum-package's published state. Restorable from a compact state (root and leaf 0's branch), which the package publishes for its genesis validators and `ethlambda pq-keys` writes |
-| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on devnets next to other clients' (see [Running a devnet](#running-a-devnet)) |
+| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; aggregators staggered by seat; run on devnets next to other clients' (see [Running a devnet](#running-a-devnet)) |
 | Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
 | Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
@@ -423,18 +423,23 @@ asks for again.
   two, as `pq/p2p-interface.md` asks.
 - **Aggregating**: a PQ aggregator is a member of its committee's
   aggregation committee, which the attester duties report as
-  `is_aggregator`. Every aggregator broadcasts at gloas's aggregate deadline
-  (`AGGREGATE_DUE_BPS_GLOAS`, 6 s into a 12-second slot); `2f43bc0f` neither
-  staggers them nor has them skip a covered aggregate (consensus-specs'
-  later `4595f0fc` does both; branch `pq-devnet-0-b5d422b2` follows it).
-  Proving takes seconds, so the node proves ahead, as Lighthouse's PQ branch
-  does: the client's committee subscriptions join the committee's subnet and
-  register it, the node keeps the validated votes' signatures for registered
-  committees, and halfway between the attestation and aggregate deadlines
-  seals the slot and proves each committee before the aggregate deadline.
-  `GET aggregate_attestation` then answers the proved aggregate and its
-  proof, or a 404 when the node proved none, and the client signs the
-  `AggregateAndProof` at the slot's aggregate leaf.
+  `is_aggregator`, with its seat in it as `aggregator_position`. The seats
+  are staggered (PQ `validator.md`, "Construct aggregate"): the one at
+  `position` stops collecting at `get_aggregation_cutoff_ms(position)`
+  (`AGGREGATION_CUTOFF_BPS` plus `position` times `AGGREGATOR_DELAY_BPS`) and
+  broadcasts at `get_aggregate_due_ms(position)` (`AGGREGATE_DUE_BPS_PQ` plus
+  the same delay); on a 12-second slot that is 4.8 s and 7.2 s for the first
+  seat, each later one 0.6 s after. Proving takes seconds, so the node proves
+  ahead, as Lighthouse's PQ branch does: the client's committee subscriptions
+  join the committee's subnet and register it with the aggregating validator,
+  the node keeps the validated votes' signatures for registered committees,
+  and at each seat's cutoff proves what it has for the committees one of its
+  validators holds that seat in. The client asks for each aggregate at its
+  seat's broadcast time; `GET aggregate_attestation` answers the proved
+  aggregate and its proof, or a 404 when an aggregate already broadcast for
+  the committee, gossip's or this node's, covers every attester of it
+  (`should_broadcast_aggregate`). The client signs the `AggregateAndProof` at
+  the slot's aggregate leaf.
 
 ## Running a devnet
 
