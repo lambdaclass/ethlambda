@@ -42,10 +42,11 @@ struct Args {
     /// Replay only the first N steps of the trace.
     #[arg(long)]
     max_steps: Option<usize>,
-    /// Threads for ethlambda's parallel run (it hashes large subtrees on
-    /// rayon); every core by default. Silver hashes on one thread.
-    #[arg(long)]
-    threads: Option<usize>,
+    /// Thread counts to run ethlambda at, comma-separated (it hashes large
+    /// subtrees on rayon); one and every core by default. Silver hashes on
+    /// one thread.
+    #[arg(long, value_delimiter = ',')]
+    threads: Vec<usize>,
     /// Also write every summary and per-step time to this JSON file.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -188,9 +189,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         trace.initial.validators.len()
     );
 
-    let threads = match args.threads {
-        Some(threads) => threads,
-        None => std::thread::available_parallelism()?.get(),
+    let mut threads = args.threads.clone();
+    if threads.is_empty() {
+        threads = vec![1, std::thread::available_parallelism()?.get()];
+    }
+    threads.dedup();
+    let label = |n: usize| match n {
+        1 => "1 thread".to_string(),
+        n => format!("{n} threads"),
     };
     let runs = |library| args.only.is_none_or(|only| only == library);
     let mut runners = Vec::new();
@@ -201,14 +207,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?);
     }
     if runs(Library::Ours) {
-        runners.push(Runner::new::<ours::Ours>(
-            "ethlambda-ssz-tree, 1 thread".into(),
-            1,
-        )?);
-        if threads > 1 {
+        for &n in &threads {
             runners.push(Runner::new::<ours::Ours>(
-                format!("ethlambda-ssz-tree, {threads} threads"),
-                threads,
+                format!("ethlambda-ssz-tree, {}", label(n)),
+                n,
             )?);
         }
     }

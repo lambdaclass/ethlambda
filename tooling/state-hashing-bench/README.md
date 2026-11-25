@@ -33,7 +33,7 @@ How each library is driven:
 | Writes | buffered (`get_mut`/`push`, highest index first, as the node's unsorted writes reach the end of the list early and grow a `VecMap` buffer once), then `apply_updates`; through the write cursor (`iter_cow`) when they cover at least 1/8 of the list, which is the epoch's balance rewrite (fulu's epoch pass buffers those too; at that density both cost the same, 49.8 vs 50.0 ms per epoch on an M3 Pro) | `set`/`push`, then `commit` |
 | Participation rotation | `mem::take` + `List::repeat(0, n)`, as `process_participation_flag_updates` does | previous = clone of current, current = `SharedList::new(zeros)` (this API has no in-place zero fill) |
 | Validators | the list holds `Validator`s and hashes the changed ones itself | the list holds roots; each changed validator's root is computed in the timed region with the same `hash_tree_root` |
-| Threads | 1, and every core (it hashes large subtrees on rayon) | 1 |
+| Threads | 1 and every core by default, or the counts `--threads` lists (it hashes large subtrees on rayon) | 1 |
 
 Both run under jemalloc (the node's allocator) and the node's release
 profile (`lto = "fat"`, one codegen unit). `--keep` versions stay alive
@@ -76,7 +76,7 @@ hashes the same way and skips the per-page reference counts.
    |---|---|---|
    | `--rounds` | 3 | whole-trace replays per library; each step reports its median |
    | `--keep` | 32 | versions kept alive behind the head |
-   | `--threads` | every core | threads for ethlambda's parallel run |
+   | `--threads` | 1 and every core | thread counts to run ethlambda at, comma-separated (`1,2,4,8`) |
    | `--max-steps` | all | replay only the first N steps |
    | `--json` | none | also write every summary and per-step time |
    | `--only` | both | `silver` or `ours`, for a quicker loop while working on one |
