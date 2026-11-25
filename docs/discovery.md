@@ -136,7 +136,11 @@ knows an address and a public key and nothing about `quic`, `tcp` or `attnets`;
 the dial loop looks the node id back up in what the filter filed to recover the
 multiaddrs and the subnets. A node discovery offers that we never read an admissible record
 for is skipped, which is what happens to a bootnode still known only as a bare
-endpoint.
+endpoint. What the filter files is capped at 10,000 nodes, the bound of ethrex's own
+connection pool, and like that pool it evicts the oldest entry to make room rather
+than turning new ones away: nodes that leave mainnet are never forgotten otherwise,
+and a full map that refused newcomers would have the dial loop skip every node
+discovery offered it from then on.
 
 A peer's dial list carries every address it advertises, `quic` and `tcp` both,
 in one dial attempt, `quic` first. libp2p walks that list `dial_concurrency_factor`
