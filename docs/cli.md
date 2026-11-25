@@ -700,7 +700,9 @@ the combined proofs and decides on those:
 A duty with no combined proof aggregates for nobody: its subscription goes
 out without the role and no aggregate or contribution is asked for. The
 current epoch's attester duties still missing one are asked for again every
-slot, and subscribed again with the role once they have one. Each partial
+slot, one request per slot so that a duty the middleware cannot combine holds
+back only its own slot's, and subscribed again with the role once a combined
+proof selects them. Each partial
 proof is signed once and sent again as it was, so a retry costs a remote
 signer nothing. Charon answers
 a request only once it has combined every entry in it, so the next-epoch
