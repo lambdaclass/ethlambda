@@ -55,6 +55,12 @@ pub(crate) enum NetworkDirError {
         #[source]
         source: super::ConstantsMismatch,
     },
+    #[error("{}: {source}", path.display())]
+    CommitteeCap {
+        path: PathBuf,
+        #[source]
+        source: ethlambda_types::beacon::config::CommitteeCapTooLarge,
+    },
     // `{fork:?}` rather than `{fork}`: `ForkName` exposes `as_str` and does not
     // implement `Display`.
     #[error("{} did not decode as a {fork:?} BeaconState: {reason}", path.display())]
@@ -77,7 +83,7 @@ impl NetworkDir {
     pub(crate) fn load(base: &Path) -> Result<Self, NetworkDirError> {
         let config_path = base.join(CONFIG_FILE);
         let text = read_required(&config_path)?;
-        let parsed = ConfigFile::parse(&text).map_err(|source| NetworkDirError::Config {
+        let mut parsed = ConfigFile::parse(&text).map_err(|source| NetworkDirError::Config {
             path: config_path.clone(),
             source,
         })?;
@@ -97,7 +103,12 @@ impl NetworkDir {
             path: config_path.clone(),
             source,
         })?;
-        super::select_committee_cap(&parsed.config);
+        super::select_committee_cap(&mut parsed).map_err(|source| {
+            NetworkDirError::CommitteeCap {
+                path: config_path.clone(),
+                source,
+            }
+        })?;
 
         let genesis_path = base.join(GENESIS_STATE_FILE);
         let genesis_bytes = read_required_bytes(&genesis_path)?;

@@ -11,7 +11,11 @@ pub(crate) mod dir;
 
 use std::path::PathBuf;
 
-use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::config::{
+    CommitteeCapTooLarge, Config, select_x_max_committee_count_per_slot,
+};
+
+use self::config_file::ConfigFile;
 use ethlambda_types::beacon::preset::{Preset, PresetAlreadyActive};
 
 pub(crate) use built_in::BuiltInNetwork;
@@ -107,24 +111,27 @@ pub(crate) fn select_preset(declared: &str) -> Result<Preset, PresetSelectError>
     Ok(preset)
 }
 
-/// Makes the network's `X_MAX_COMMITTEE_COUNT_PER_SLOT` the cap every PQ
-/// committee count of this process uses (consensus-specs pq `af898d07`).
-/// After [`select_preset`], whose `MAX_COMMITTEES_PER_SLOT_PQ` bounds it: a
-/// value above that, or zero, is moved into range with a warning rather than
-/// refused, since the key is a testing knob and `CommitteeBits` could not
-/// hold more committees anyway.
-pub(crate) fn select_committee_cap(config: &Config) {
-    let declared = config.x_max_committee_count_per_slot;
-    let cap = ethlambda_types::beacon::config::select_x_max_committee_count_per_slot(config);
-    if cap != declared {
-        tracing::warn!(
-            declared,
-            used = cap,
-            max_committees_per_slot_pq =
-                ethlambda_types::beacon::preset::max_committees_per_slot_pq(),
-            "X_MAX_COMMITTEE_COUNT_PER_SLOT is outside 1..=MAX_COMMITTEES_PER_SLOT_PQ; using the nearest value"
-        );
+/// Settles the network's `X_MAX_COMMITTEE_COUNT_PER_SLOT` and makes it the
+/// cap every PQ committee count of this process uses (consensus-specs pq
+/// `af898d07`). After [`select_preset`], whose `MAX_COMMITTEES_PER_SLOT_PQ`
+/// it is read against:
+///
+/// - A file that omits the key gets the preset's value, not the mainnet 16
+///   every other absent key falls back to. The specification's own configs
+///   set the two equal, and a minimal network whose file predates the key
+///   must not be given more committees than its `CommitteeBits` can name.
+///   The value is written into the config, so the data directory and
+///   `/eth/v1/config/spec` hold what the node runs on.
+/// - A value above the preset's is refused, as the specification forbids it:
+///   a client that ran it would name committees an attestation cannot, and
+///   one that silently lowered it would shuffle another chain than its peers.
+pub(crate) fn select_committee_cap(parsed: &mut ConfigFile) -> Result<(), CommitteeCapTooLarge> {
+    if !parsed.committee_cap_declared {
+        parsed.config.x_max_committee_count_per_slot =
+            ethlambda_types::beacon::preset::max_committees_per_slot_pq() as u64;
     }
+    select_x_max_committee_count_per_slot(&parsed.config)?;
+    Ok(())
 }
 
 /// One `config.yaml` key that the node runs on a compile-time constant for,
@@ -470,6 +477,32 @@ mod tests {
 
     /// The specification's own configs must pass, or every built-in network
     /// and every devnet derived from one would be refused.
+    /// A file that omits `X_MAX_COMMITTEE_COUNT_PER_SLOT` runs on its
+    /// preset's `MAX_COMMITTEES_PER_SLOT_PQ`, not on the mainnet value the key
+    /// parsed as, and its config says so afterwards.
+    #[test]
+    fn an_absent_committee_cap_is_the_presets() {
+        let mut parsed = ConfigFile::parse("CONFIG_NAME: devnet\n").unwrap();
+        assert!(!parsed.committee_cap_declared);
+        // Whatever another preset's default would have left there.
+        parsed.config.x_max_committee_count_per_slot = u64::MAX;
+        select_committee_cap(&mut parsed).unwrap();
+        assert_eq!(
+            parsed.config.x_max_committee_count_per_slot,
+            ethlambda_types::beacon::preset::max_committees_per_slot_pq() as u64
+        );
+    }
+
+    #[test]
+    fn a_committee_cap_above_the_presets_is_refused() {
+        let above = ethlambda_types::beacon::preset::max_committees_per_slot_pq() as u64 + 1;
+        let yaml = format!("X_MAX_COMMITTEE_COUNT_PER_SLOT: {above}\n");
+        let mut parsed = ConfigFile::parse(&yaml).unwrap();
+        assert!(parsed.committee_cap_declared);
+        let err = select_committee_cap(&mut parsed).unwrap_err();
+        assert_eq!((err.declared, err.max), (above, above - 1));
+    }
+
     #[test]
     fn the_shipped_configs_match_the_compiled_constants() {
         check_constants(&Config::mainnet()).unwrap();

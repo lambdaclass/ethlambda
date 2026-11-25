@@ -515,6 +515,11 @@ pub struct Config {
     /// `MAX_COMMITTEES_PER_SLOT_PQ`, the length of `CommitteeBits`; the
     /// state transition reads it through
     /// [`x_max_committee_count_per_slot`], which the node sets from this.
+    ///
+    /// Like every key, absent from a file it parses as mainnet's value. For
+    /// this one that is wrong on a minimal network, so the node replaces an
+    /// absent key with its preset's `MAX_COMMITTEES_PER_SLOT_PQ` once the
+    /// preset is selected (`network::select_committee_cap` in the binary).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub x_max_committee_count_per_slot: u64,
 
@@ -680,39 +685,49 @@ pub struct Config {
     pub min_epochs_for_block_requests: u64,
 }
 
-/// Mainnet's values, which is what an absent key in a `config.yaml` falls back
-/// to.
-///
-/// Deserialization is deliberately permissive: no client surveyed rejects a
-/// configuration for a missing key, and a network that predates a field should
-/// still load. Mainnet is the right fallback because every other network is
-/// described as a deviation from it.
 /// The PQ committee cap this process runs on, `0` until
 /// [`select_x_max_committee_count_per_slot`] sets one.
 static X_MAX_COMMITTEE_COUNT_PER_SLOT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// An `X_MAX_COMMITTEE_COUNT_PER_SLOT` above the preset's
+/// `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification says it must not
+/// exceed: `CommitteeBits` has that many bits, so a slot with more committees
+/// could not name them all in an attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "X_MAX_COMMITTEE_COUNT_PER_SLOT is {declared}, above MAX_COMMITTEES_PER_SLOT_PQ ({max}), \
+     the most committees an attestation's committee bits can name"
+)]
+pub struct CommitteeCapTooLarge {
+    pub declared: u64,
+    pub max: u64,
+}
+
 /// Makes `config`'s `X_MAX_COMMITTEE_COUNT_PER_SLOT` the cap every PQ
 /// committee count of this process uses, and returns it.
 ///
-/// One per process, like the preset (see `beacon::preset`): the state
-/// transition reads it from a state alone, which carries no config. A value
-/// above the preset's `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification
-/// forbids and `CommitteeBits` cannot hold, is lowered to it, and a zero is
-/// raised to one; the caller warns when the returned value differs from the
-/// file's.
-pub fn select_x_max_committee_count_per_slot(config: &Config) -> u64 {
-    let cap = committee_cap_within_preset(
+/// One per process, like the preset (see `beacon::preset`), and selected
+/// after it: the state transition counts committees from a state alone, which
+/// carries no config. Refuses a value above the active preset's
+/// `MAX_COMMITTEES_PER_SLOT_PQ` and stores nothing then.
+pub fn select_x_max_committee_count_per_slot(config: &Config) -> Result<u64, CommitteeCapTooLarge> {
+    let cap = committee_cap(
         config.x_max_committee_count_per_slot,
         preset::max_committees_per_slot_pq() as u64,
-    );
+    )?;
     X_MAX_COMMITTEE_COUNT_PER_SLOT.store(cap, std::sync::atomic::Ordering::Relaxed);
-    cap
+    Ok(cap)
 }
 
-/// `declared` moved into `1..=max_committees_per_slot_pq`.
-fn committee_cap_within_preset(declared: u64, max_committees_per_slot_pq: u64) -> u64 {
-    declared.clamp(1, max_committees_per_slot_pq)
+/// The cap a `declared` `X_MAX_COMMITTEE_COUNT_PER_SLOT` gives under a preset
+/// of `max` committees per slot. A zero is one: `get_committee_count_per_slot`
+/// never goes below one committee, whatever the cap.
+fn committee_cap(declared: u64, max: u64) -> Result<u64, CommitteeCapTooLarge> {
+    if declared > max {
+        return Err(CommitteeCapTooLarge { declared, max });
+    }
+    Ok(declared.max(1))
 }
 
 /// `X_MAX_COMMITTEE_COUNT_PER_SLOT` as selected for this process, or the
@@ -726,6 +741,13 @@ pub fn x_max_committee_count_per_slot() -> u64 {
     }
 }
 
+/// Mainnet's values, which is what an absent key in a `config.yaml` falls back
+/// to.
+///
+/// Deserialization is deliberately permissive: no client surveyed rejects a
+/// configuration for a missing key, and a network that predates a field should
+/// still load. Mainnet is the right fallback because every other network is
+/// described as a deviation from it.
 impl Default for Config {
     fn default() -> Self {
         Self::mainnet()
@@ -1386,17 +1408,27 @@ mod tests {
         let config: Config =
             serde_yaml_ng::from_str("X_MAX_COMMITTEE_COUNT_PER_SLOT: 1\n").unwrap();
         assert_eq!(config.x_max_committee_count_per_slot, 1);
-        // Absent, it is mainnet's, like every other key a file omits.
+        // Absent, it parses as mainnet's, like every other key a file omits;
+        // the node then replaces it with its preset's value.
         let config: Config = serde_yaml_ng::from_str("CONFIG_NAME: x\n").unwrap();
         assert_eq!(config.x_max_committee_count_per_slot, 16);
     }
 
     #[test]
-    fn the_pq_committee_cap_stays_within_committee_bits() {
-        assert_eq!(committee_cap_within_preset(4, 16), 4);
-        assert_eq!(committee_cap_within_preset(16, 16), 16);
-        assert_eq!(committee_cap_within_preset(16, 4), 4);
-        assert_eq!(committee_cap_within_preset(0, 16), 1);
+    fn the_pq_committee_cap_may_not_exceed_committee_bits() {
+        assert_eq!(committee_cap(1, 16), Ok(1));
+        assert_eq!(committee_cap(4, 16), Ok(4));
+        assert_eq!(committee_cap(16, 16), Ok(16));
+        // Mainnet's value on a minimal preset, and anything else above it.
+        let too_large = CommitteeCapTooLarge {
+            declared: 16,
+            max: 4,
+        };
+        assert_eq!(committee_cap(16, 4), Err(too_large));
+        assert!(too_large.to_string().contains("is 16, above"));
+        // `max(1, min(cap, ..))` in the specification: a zero cap is one
+        // committee, not none.
+        assert_eq!(committee_cap(0, 16), Ok(1));
     }
 
     #[test]
