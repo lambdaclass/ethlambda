@@ -25,9 +25,11 @@
 //! service sees it), an attestation for a key the keymanager deleted since the
 //! schedule was fetched (once the slot's attestation data was fetched: the
 //! held keys are read after it, so a failed fetch counts every duty of the
-//! slot as failed), a sync committee message or payload vote already
-//! served this slot, a sync committee message not signed over an optimistic
-//! head, a payload vote for a slot the node knows no block for, and a blinded
+//! slot as failed), every duty of a slot the per-slot sync check withholds
+//! (none reaches a service), a sync committee message or payload vote already
+//! served this slot, a sync committee message or payload vote not signed over
+//! an optimistic head, a payload vote for a slot the node knows no block
+//! for, and a blinded
 //! block the node did not confirm. The proposal check below says whether that
 //! last one went out. The sync committee and payload vote services do not
 //! filter on held keys, so a deleted key's duty there fails to sign and counts

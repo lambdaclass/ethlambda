@@ -305,6 +305,18 @@ static AGGREGATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Slots the duty loop signed nothing in, because every beacon node that
+/// answered the slot's sync probe reported syncing or optimistic. See
+/// `beacon_node::health`.
+static SLOTS_SKIPPED_SYNCING_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_slots_skipped_syncing_total",
+        "Slots with no duty signed because every beacon node that answered the slot's sync probe \
+         was syncing or optimistic"
+    )
+    .unwrap()
+});
+
 static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_beacon_node_available",
@@ -485,6 +497,7 @@ pub fn init() {
     LazyLock::force(&AGGREGATES_PUBLISHED_TOTAL);
     LazyLock::force(&AGGREGATION_FAILURES_TOTAL);
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
+    LazyLock::force(&SLOTS_SKIPPED_SYNCING_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
@@ -626,6 +639,10 @@ pub fn inc_aggregation_failures() {
 
 pub fn inc_fee_recipient_mismatches() {
     FEE_RECIPIENT_MISMATCHES_TOTAL.inc();
+}
+
+pub fn inc_slots_skipped_syncing() {
+    SLOTS_SKIPPED_SYNCING_TOTAL.inc();
 }
 
 pub fn set_beacon_node_available(available: bool) {

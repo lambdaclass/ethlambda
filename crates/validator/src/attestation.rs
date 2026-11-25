@@ -136,7 +136,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // It is signed as received, never reset to zero.
         let slot_fork = self
             .context
-            .config
+            .config()
             .fork_at_epoch(compute_epoch_at_slot(slot));
         let data = self.beacon_node.attestation_data(slot, slot_fork).await?;
 
@@ -160,7 +160,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // attestation actually signs under.
         let fork_name = self
             .context
-            .config
+            .config()
             .fork_at_epoch(data.target.epoch)
             .as_str();
 
