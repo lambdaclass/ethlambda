@@ -166,9 +166,11 @@ Two reports that disagree on any of those are not measuring the same thing.
 
 ### In CI
 
-The Test job runs a short mock benchmark and asserts the JSON report's shape
-(`schema_version`, one sample per iteration). It costs seconds, and it means a
-change to the report contract cannot land unnoticed.
+The `Test (node)` job runs a short mock benchmark through the built binary
+(`bin/ethlambda/tests/benchmark_smoke.rs`, part of `make test-node`) and
+asserts the JSON report's shape (`schema_version`, one sample per iteration).
+It costs seconds, and it means a change to the report contract cannot land
+unnoticed.
 
 ## Import workload
 

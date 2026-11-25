@@ -125,6 +125,7 @@ from a normal build.
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). Lighthouse's flag of the same name |
+| `--fallback-fee-recipient` | none | Execution address (20 bytes of hex, `0x` optional) a locally built payload pays when no validator client named a fee recipient for the proposer through `prepare_beacon_proposer` or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: `payload_attributes` events still need `prepare_beacon_proposer` or `--always-prepare-payload`. Lighthouse's beacon-node `--suggested-fee-recipient` |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
@@ -369,18 +370,90 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > or in the same keymanager API request that imports the key. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
+### Several beacon nodes: the chain check
+
+The client learns its chain, the preset, genesis, slot duration and fork
+schedule, from `--beacon-nodes` at startup: the reference is the first node in
+list order that answers both `/eth/v1/beacon/genesis` and
+`/eth/v1/config/spec`. While none does, the client warns, naming what each node
+said, and asks them all again every 2 seconds, as Lighthouse's validator client
+does, rather than exiting: a client started beside its beacon node otherwise
+exits before the node's API is up. Only when every node answered, each with a
+preset this client cannot run on or a spec it cannot read, does startup fail; a
+body that is not JSON at all (a proxy's page while the node boots) is waited out. A
+response without the slot
+duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
+altair to fulu is refused rather than filled in from mainnet; only gloas may be
+absent, meaning unscheduled.
+
+Every other node is compared with the reference, and one that differs is not
+used: not for a duty, not for failover, not for a subscription. The comparison
+names the first field that differs: `PRESET_BASE`, `genesis_time`,
+`genesis_validators_root`, the slot duration, `GENESIS_FORK_VERSION`, or the
+epoch or version of a fork. A fork may differ only while it is still in the
+future under both schedules, which is how a node upgraded ahead of the others
+stays in use. A node that did not answer at startup is not used until a check
+has verified it. The warning names the node and the field, when the state
+changes and then at most once per epoch. If no node is usable, every request
+fails with an error that says no configured node is on the client's chain.
+
+A background task, separate from the duty loop, repeats the check for every node
+at the start of every slot, so a node upgraded partway through an epoch for a fork
+at the next one is read while that fork is still ahead. Each node's answer is
+judged the moment it arrives, at the epoch read then, so a node that hangs until
+its request timeout holds back only its own answer, and a fork whose epoch passed
+while a node was answering counts as arrived rather than as still ahead.
+
+As each answer arrives, a fork the compatible nodes schedule and the client does
+not have yet is adopted by the slot clock and every signing domain together, and
+the client logs at `warn` which fields moved. Only nodes that answered one of
+their last three checks have a say in this. A fork the client does not have is
+taken only when every one of them schedules it, at the same epoch and with the
+same version:
+one node, misconfigured or not, cannot put a fork on the client's schedule that
+the others do not have. So while a node not yet upgraded still answers, the fork
+waits; it is taken once that node is upgraded, or once it stops answering
+(restarting for the upgrade, say) for three slots and so loses its say. One missed
+check does not cost a node its say, so a single timeout of a correct node does not
+leave a misconfigured one to move the schedule alone. A warning names the nodes
+that disagree, once per epoch, and a node without the client's epoch stops being
+used when the fork's epoch arrives. Once the client has a fork scheduled, it
+moves only when every node with a say that schedules it agrees on the new epoch
+and version, so one node cannot pull it elsewhere, and it is never unscheduled:
+a node reporting it unscheduled may only be the one not upgraded yet, while the
+upgraded one is restarting. A fork the network cancels therefore needs a
+restart. A node that stops answering loses its say after three slots, so it cannot
+hold a fork at an epoch the network has postponed (unless the postponement comes in
+the fork's last three slots); the duty offsets are still read from the first node
+through a round it misses. A merge that would put a fork before the one it follows
+is refused whole and warned about. A fork that is already active is never moved: a
+node that reports another epoch or version for it is on another chain.
+The client does not need a restart for a fork the network schedules after it
+started.
+
+A send that has to reach every node (proposer preferences) counts as delivered
+everywhere once every node in use took it: a node skipped for being on another
+chain is not a refusal. When a check lets a skipped node back in, the client
+sends it what it missed: the proposer preferences at the next poll, and the
+epoch's attestation subnet subscriptions, sync committee subscriptions and
+builder registrations at the next slot.
+
+Offsets into the slot (`*_DUE_BPS`) above 10000 basis points are held to the
+slot's end, so a node serving a wrong one cannot park a duty past its slot.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node is asked `/eth/v1/node/syncing` once a slot; the ones that answered synced and not optimistic are tried first, in list order, then the rest in list order. The first that answers serves the request, so the order is a preference, not load balancing. See [The per-slot sync check](#the-per-slot-sync-check) |
+| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot; the ones that answered synced and not optimistic are tried first, in list order, then the rest in list order. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check) and [The per-slot sync check](#the-per-slot-sync-check) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
-| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
+| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--keymanager-token-file` | `api-token.txt` in `--validators-dir` | File to read the keymanager API's bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an `Authorization` header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with `--enable-keymanager`; set without it, startup warns. See [The keymanager API](#the-keymanager-api) |
 | `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
 | `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in `produceBlockV4`. Without it that factor is `0`, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do |
 | `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is also sent in `produceBlockV4`'s body, so a pooled p2p bid can win on value; without `--builder-proposals` the body carries `0`, which still lets a node whose local build fails build on such a bid. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
@@ -479,10 +552,18 @@ and it would buy nothing: the attestations this client submits are electra's
 cannot serve whatever it does with blocks. A block from any earlier fork is
 refused by name rather than failing to decode.
 
-Blocks are fetched and published as SSZ rather than JSON. Signing a block means
-computing its `hash_tree_root`, which only the typed container can give; a
-hand-written JSON mapping of an execution payload would be a large surface on
+Blocks are fetched as SSZ by preference and published as SSZ. Signing a block
+means computing its `hash_tree_root`, which only the typed container can give;
+a hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.
+`produceBlockV3` (electra and fulu) is still asked for
+`application/octet-stream;q=1.0,application/json;q=0.9`, and a JSON answer is
+decoded into the same containers through their serde support in
+`ethlambda-types`, the one an ethlambda beacon node writes that answer with.
+That is for ethereum-package's blobber, which sits between the client and its
+node, rewrites `Accept` to `application/json` on block production, and relays
+the node's answer unchanged. Gloas's `produceBlockV4`, which blobber does not
+intercept, stays SSZ-only.
 
 From gloas on a proposal is two messages. The client asks for the block with
 `include_payload=true` (`produceBlockV4`), publishes the block bare, then signs
@@ -536,7 +617,8 @@ A validator must not sign against a beacon node that is syncing, whose head is
 not the network's, or one whose head is optimistic (its execution client has
 not validated the payload): the optimistic-sync specification says an
 optimistic validator must not propose, attest or take part in sync
-committees. So every slot the client asks every configured node
+committees. So every slot the client asks every configured node on its chain
+(see [the chain check](#several-beacon-nodes-the-chain-check))
 `GET /eth/v1/node/syncing`, all at once, a sixth of a slot before the slot's
 boundary: 2 s on 12 s slots, as Lighthouse does. That is after the previous
 slot's last duty and leaves a healthy node time to answer, so the duty loop
@@ -780,7 +862,14 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 `DELETE /eth/v1/keystores`, authenticated with a bearer token read from
 `api-token.txt` in the validators directory and generated there on first start
 if absent. The token file is written `0600` and a file too short to be a real
-token is refused rather than accepted.
+token, or holding a character an `Authorization` header cannot carry (anything
+but visible ASCII, spaces and tabs), is refused rather than accepted.
+
+`--keymanager-token-file` names another file to read the token from instead,
+and `api-token.txt` is then neither read nor written. That file is the
+operator's: the client only reads it, trimmed and held to the same checks, and
+a missing or refused one stops it at startup rather than being replaced with a
+generated token.
 
 It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
 Web3Signer holds. The two routes partition the store: `/keystores` lists and

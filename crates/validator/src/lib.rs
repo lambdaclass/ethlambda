@@ -28,6 +28,7 @@ pub mod aggregation;
 pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
+pub mod chain_check;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
 pub mod secure_fs;
+pub mod shared_config;
 pub mod signing;
 pub mod slashing_protection;
 pub mod slot_clock;
@@ -102,6 +104,7 @@ use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
+use crate::chain_check::ChainId;
 use crate::duties::DutiesService;
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
@@ -110,6 +113,7 @@ use crate::preferences::PreferencesService;
 use crate::proposal::{BlindedOutcome, ProposalService, Proposed};
 use crate::proposer_settings::ProposerSettings;
 use crate::registration::RegistrationService;
+use crate::shared_config::SharedConfig;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 use crate::sync_committee::SyncCommitteeService;
@@ -135,6 +139,10 @@ pub struct ValidatorConfig {
     /// Bind address for the keymanager API. `None` when `--enable-keymanager`
     /// was not passed, in which case it is never spawned.
     pub keymanager: Option<std::net::SocketAddr>,
+    /// `--keymanager-token-file`: the file the keymanager API's bearer token
+    /// is read from, never written. `None` reads, or on first start generates,
+    /// [`http_api::API_TOKEN_FILE`] in `validators_dir`.
+    pub keymanager_token_file: Option<PathBuf>,
     /// `--web3signer-url`: the remote signer a key imported through
     /// `POST /eth/v1/remotekeys` without a `url` of its own is assigned to.
     /// Keys the definitions file already names a signer for need no default.
@@ -254,10 +262,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let store = Arc::new(RwLock::new(store));
 
     // Bound before any beacon-node network call, deliberately: a validator
-    // that cannot reach its beacon node still exits (via the `?`s below) if
-    // it never gets one, but until then it must expose `/health` and
-    // `/metrics`, so an operator can tell "still starting, node unreachable"
-    // apart from "crashed with no HTTP surface at all".
+    // that cannot reach its beacon node waits for one at startup, for as long
+    // as it takes (see `FallbackBeaconNode::establish`), and meanwhile it must
+    // expose `/health` and `/metrics`, so an operator can tell "still
+    // starting, node unreachable" apart from "crashed with no HTTP surface at
+    // all".
     let listener = tokio::net::TcpListener::bind(config.metrics)
         .await
         .map_err(|source| Error::Io {
@@ -278,10 +287,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
 
-    let genesis = beacon_node.genesis().await?;
-    let spec = beacon_node.spec().await?;
-    require_unread_preset()?;
-    adopt_preset(&spec)?;
+    // The chain the client runs on is the first node's that answers, waiting
+    // for one while none does; every other node is checked against it, and a
+    // node on another chain is not used. The schedule is the reference's: a
+    // fork another node schedules is taken by the background check once every
+    // node answering schedules it alike. See `chain_check`.
+    let ChainId {
+        genesis,
+        config: spec,
+    } = beacon_node
+        .establish(|reference| {
+            // Right after the reference is chosen and before anything reads a
+            // preset value, which the epoch below does.
+            require_unread_preset()?;
+            adopt_preset(&reference.config)?;
+            Ok(chain_check::current_epoch_of(reference))
+        })
+        .await?;
     info!(
         preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
@@ -293,7 +315,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         "Validator client starting"
     );
 
-    let clock = SlotClock::from_config(genesis.genesis_time, &spec);
+    // One handle for the slot clock and every signing domain, so the chain
+    // check moves them together when the network schedules a fork.
+    let shared_config = SharedConfig::new(spec.clone());
+    let clock = SlotClock::from_shared(genesis.genesis_time, shared_config.clone());
 
     // After the beacon node names the chain, which the record must belong to,
     // and before any service that signs exists. Every loaded key must already
@@ -341,7 +366,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         doppelganger
     });
 
-    let mut context = SigningContext::new(spec, genesis.genesis_validators_root);
+    let mut context = SigningContext::with_shared(shared_config, genesis.genesis_validators_root);
     if let Some(doppelganger) = &doppelganger {
         context = context.with_doppelganger(doppelganger.clone());
     }
@@ -399,9 +424,21 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // keymanager server then stops accepting requests and finishes the ones
     // in flight, and `run` waits for it before returning.
     let shutdown = CancellationToken::new();
+    // The per-node chain check and the schedule follower, on a task of their
+    // own so a node that hangs until its timeout never delays a duty. Its
+    // handle is kept: the duties race it below, as they do the doppelganger
+    // check.
+    let mut chain_check = tokio::spawn(chain_check::run(
+        beacon_node.clone(),
+        genesis,
+        clock.clone(),
+        context.clone(),
+        shutdown.clone(),
+    ));
     let mut keymanager = None;
     if let Some(address) = config.keymanager {
-        let token = http_api::load_or_create_token(&config.validators_dir)?;
+        let token_file = config.keymanager_token_file.as_deref();
+        let token = http_api::load_token(&config.validators_dir, token_file)?;
         let context = http_api::KeymanagerContext {
             store: store.clone(),
             settings: settings.clone(),
@@ -429,6 +466,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 error!(%err, "Keymanager API stopped");
             }
         }));
+    } else if let Some(path) = &config.keymanager_token_file {
+        // Accepted, like `--keymanager-port`, but worth saying: tooling holding
+        // that token would otherwise find nothing listening and no reason why.
+        warn!(
+            path = %path.display(),
+            "--keymanager-token-file is set without --enable-keymanager; the keymanager API is off and the file is not read"
+        );
     }
 
     // Every beacon node's sync status, probed a sixth of a slot ahead of each
@@ -487,6 +531,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // The beacon node's readmission count, and the schedule's generation,
+        // as of the last slot, so a node the chain check let back in since
+        // then is sent what it missed, and a schedule it swapped gets the
+        // subnet subscriptions sent again.
+        let mut readmissions_seen = beacon_node.readmissions();
+        let mut schedule_seen = context.schedule_generation();
 
         loop {
             // One wake per slot, at the slot boundary, rather than one at the
@@ -513,10 +563,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // refresh, which the next slot that passes tries again. Only the
             // fee recipient re-send goes on, since it signs nothing and a node
             // restarted mid-sync must be prepared before its first proposal.
+            // Ahead of the readmission read below, so a node let back in
+            // during a withheld slot is still sent what it missed at the next
+            // slot that passes.
             if !crate::beacon_node::health::slot_signs(beacon_node.health(), slot) {
                 preparations.after_slot(slot, &resolved, &store);
                 continue;
             }
+
+            // Read before the refresh below, so a node let back in, or a
+            // schedule swapped, while it runs is seen at the next slot rather
+            // than taken as covered by sends the refresh made before it.
+            let readmissions = beacon_node.readmissions();
+            let readmitted = readmissions != readmissions_seen;
+            readmissions_seen = readmissions;
+            let schedule = context.schedule_generation();
+            let rescheduled = schedule != schedule_seen;
+            schedule_seen = schedule;
 
             // What the refresh below leaves owing once the slot's block is
             // out: the subnet subscriptions when it moved the attester
@@ -524,6 +587,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // resolved.
             let mut resubscribe = false;
             let mut to_register = None;
+            // Whether `to_register` is a readmitted node's resend rather than
+            // the epoch's own send: see `RegistrationService::register_all_again`.
+            let mut register_again = false;
             if last_epoch != Some(epoch) {
                 // Snapshot the pubkeys and let the guard drop right here, before
                 // `refresh_epoch`'s awaits (two duties fetches, a validator
@@ -576,6 +642,34 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                         return err;
                     }
                 }
+            }
+
+            // A node the chain check let back in since the last slot was
+            // skipped by every send before that: it holds none of the epoch's
+            // subnet subscriptions, sync committee subscriptions or builder
+            // registrations, and an aggregate or a contribution it is failed
+            // over to for needs the votes those subnets carry. All three go to
+            // every usable node again, after the block like the refresh's own;
+            // a node that has them already takes them again. What a refresh
+            // this slot sent after the readmission is not sent twice, and
+            // before any refresh got through there is nothing held to send.
+            //
+            // A schedule the chain check swapped resends the subnet
+            // subscriptions too: each one's `is_aggregator` came from a
+            // selection proof under the old schedule's domain, and a fork it
+            // moved can change which validators aggregate.
+            let mut resend_sync = None;
+            if (readmitted || rescheduled) && last_epoch.is_some() {
+                resubscribe = true;
+            }
+            if readmitted && last_epoch.is_some() && to_register.is_none() {
+                let registrable = resolved
+                    .iter()
+                    .filter(|entry| is_registrable(&entry.status))
+                    .map(|entry| entry.pubkey);
+                to_register = Some(registrable.collect());
+                register_again = true;
+                resend_sync = Some(sync_subscriptions_owed(&duties, epoch));
             }
 
             // A block is due now, at the boundary this iteration woke on.
@@ -633,6 +727,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     });
                 });
             }
+            // The sync committee subscriptions a node let back in missed,
+            // when no refresh this slot sent them (see above).
+            if let Some(owed) = resend_sync {
+                let beacon_node = beacon_node.clone();
+                tokio::spawn(async move { send_sync_subscriptions(&beacon_node, &owed).await });
+            }
 
             // The epoch's full registration send, after the block for the
             // subscriptions' reason: each registration it signs anew is a
@@ -644,7 +744,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // block, never a duty.
             if let (Some(registration), Some(registrable)) = (&registration, to_register) {
                 let registration = registration.clone();
-                tokio::spawn(registration.register_all(epoch, registrable, store.clone()));
+                let store = store.clone();
+                if register_again {
+                    tokio::spawn(registration.register_all_again(epoch, registrable, store));
+                } else {
+                    tokio::spawn(registration.register_all(epoch, registrable, store));
+                }
             }
 
             // The rest of the way to the first of the slot's remaining duties:
@@ -683,13 +788,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             }
 
             // The proposer preparations again, for a beacon node that restarted
-            // since the refresh sent them and so builds for the zero address
-            // until it hears from this client. Once the slot's duties are done,
-            // so they reach the node ahead of the next slot's proposal rather
-            // than racing this one's: a third of the way in on a slot with no
-            // duties, after the aggregation or the payload vote on one with
-            // them. Off the slot loop like the sends above. The refresh's slot
-            // too, although its refresh sent them: see `Preparations`.
+            // since the refresh sent them and so builds for its fallback fee
+            // recipient (the zero address without one) until it hears from
+            // this client. Once the slot's duties are done, so they reach the
+            // node ahead of the next slot's proposal rather than racing this
+            // one's: a third of the way in on a slot with no duties, after the
+            // aggregation or the payload vote on one with them. Off the slot
+            // loop like the sends above. The refresh's slot too, although its
+            // refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
 
             // This epoch's payload committee schedule again, while none is
@@ -716,9 +822,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // client, so it ends only by panicking, which would leave every key it
     // had not cleared withheld for good with nothing to say why; stopping
     // hands the supervisor the restart, as an unusable record does.
-    let duties = async {
+    let doppelganger_watch = async {
         let (Some(doppelganger), Some(check)) = (&doppelganger, &mut check) else {
-            return duty_loop.await;
+            return std::future::pending().await;
         };
         tokio::select! {
             // A sighting is reported as one even when the check's task ends
@@ -741,6 +847,27 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 error!(%err, "Stopping so the validator client can be restarted");
                 err
             }
+        }
+    };
+    // The chain check's task ending stops them for the same reason. It runs
+    // until `shutdown`, which is cancelled only once the duties have stopped,
+    // so it ends before that only by panicking. Left running without it, the
+    // duties would go on with every node it took out still out, none let
+    // back in, and no later fork followed, so the client would stop signing
+    // valid messages at the next fork with nothing to say why.
+    let duties = async {
+        tokio::select! {
+            biased;
+            err = doppelganger_watch => err,
+            ended = &mut chain_check => {
+                let reason = match ended {
+                    Err(err) => err.to_string(),
+                    Ok(()) => "its task returned".to_string(),
+                };
+                let err = Error::ChainCheckStopped { reason };
+                error!(%err, "Stopping so the validator client can be restarted");
+                err
+            }
             err = duty_loop => err,
         }
     };
@@ -752,6 +879,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         check.abort();
     }
     stop_probes.abort();
+    chain_check.abort();
     Err(stopped)
 }
 
@@ -1330,7 +1458,8 @@ fn preparations<'a>(
 ///
 /// As Lighthouse's validator client does. A node keeps a preparation for the
 /// epoch it arrived in and two more, and loses all of them when it restarts;
-/// until the next one arrives it builds its own payloads for the zero address.
+/// until the next one arrives it builds its own payloads for its fallback fee
+/// recipient, which is the zero address unless its operator set one.
 /// Sent only by the epoch refresh, a restart mid-epoch cost the rest of that
 /// epoch's local blocks their execution-layer rewards: six blocks on a devnet,
 /// from a beacon node killed 14 slots into its epoch. Sent every slot, a
@@ -1492,11 +1621,12 @@ async fn refresh_ptc<B: BeaconNodeApi>(
     epoch: u64,
     context: &SigningContext,
 ) {
+    let config = context.config();
     for target in [epoch, epoch + 1] {
-        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+        if config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
             continue;
         }
-        if target == context.config.gloas_fork_epoch && epoch < target {
+        if target == config.gloas_fork_epoch && epoch < target {
             continue;
         }
         if let Err(err) = duties.refresh_ptc(target).await {
@@ -1525,7 +1655,7 @@ async fn retry_missing_ptc<B: BeaconNodeApi>(
     budget: std::time::Duration,
     context: &SigningContext,
 ) {
-    if context.config.fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
+    if context.config().fork_at_epoch(epoch) < ethlambda_types::beacon::fork::ForkName::Gloas
         || duties.holds_ptc(epoch)
     {
         return;
@@ -1564,9 +1694,8 @@ async fn refresh_sync<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
-    if context.config.fork_at_epoch(epoch) < ForkName::Altair {
+    if context.config().fork_at_epoch(epoch) < ForkName::Altair {
         return;
     }
     let period = crate::duties::sync_committee_period(epoch);
@@ -1582,19 +1711,47 @@ async fn refresh_sync<B: BeaconNodeApi>(
     duties.prune_sync_before(period);
     metrics::set_sync_duties_held(duties.sync_for_period(period).len() as u64);
 
-    let current = duties.sync_for_period(period);
-    if let Err(err) =
-        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * period_epochs()).await
-    {
-        warn!(%err, "Failed to subscribe to sync committee subnets");
-    }
+    send_sync_subscriptions(beacon_node, &sync_subscriptions_owed(duties, epoch)).await;
+}
+
+/// The sync committee subscriptions owed at `epoch`, from the duties held:
+/// the current period's seats until the period ends, and the next period's
+/// once its boundary is within [`SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS`], until
+/// that one ends. Each with the epoch it runs until.
+///
+/// What [`refresh_sync`] sends every epoch, and what the duty loop sends again
+/// to a node the chain check let back in.
+fn sync_subscriptions_owed<B: BeaconNodeApi>(
+    duties: &DutiesService<B>,
+    epoch: u64,
+) -> Vec<(Vec<crate::beacon_node::dto::SyncDutyDto>, u64)> {
+    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
+
+    let period = crate::duties::sync_committee_period(epoch);
+    let mut owed = vec![(
+        duties.sync_for_period(period),
+        (period + 1) * period_epochs(),
+    )];
     if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * period_epochs() {
-        let next = duties.sync_for_period(period + 1);
-        if let Err(err) =
-            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * period_epochs()).await
-        {
-            warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
-        }
+        owed.push((
+            duties.sync_for_period(period + 1),
+            (period + 2) * period_epochs(),
+        ));
+    }
+    owed
+}
+
+/// Send each of `owed` (see [`sync_subscriptions_owed`]), warning about any
+/// no node took.
+async fn send_sync_subscriptions<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    owed: &[(Vec<crate::beacon_node::dto::SyncDutyDto>, u64)],
+) {
+    for (seats, until_epoch) in owed {
+        let subscribed = subscriptions::subscribe_sync(beacon_node, seats, *until_epoch).await;
+        let _ = subscribed.inspect_err(|err| {
+            warn!(until_epoch, %err, "Failed to subscribe to sync committee subnets");
+        });
     }
 }
 
@@ -1718,7 +1875,8 @@ mod tests {
     /// included, the refresh's validators again, with the addresses the
     /// settings name by then. That re-send is what a beacon node restarted
     /// mid-epoch hears from first: sent only by the refresh, its local blocks
-    /// paid the zero address for the rest of the epoch.
+    /// paid its fallback fee recipient (the zero address without one) for the
+    /// rest of the epoch.
     ///
     /// On the refresh's own slot it puts the current address back when the
     /// refresh's send was overtaken, here by the previous slot's re-send

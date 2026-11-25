@@ -25,7 +25,7 @@
 //! here yet.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ethlambda_engine::ForkchoiceStateV1;
@@ -73,23 +73,67 @@ use crate::events::{
 
 /// Each validator's execution-layer fee recipient, as its validator client
 /// last named it through `prepare_beacon_proposer` (or a builder
-/// registration). Read by block production, which puts the proposer's into
-/// the payload attributes, and by the chain actor, which publishes
-/// `payload_attributes` for the proposers named here. In memory only: a
-/// validator client repeats the call (ethlambda's and Lighthouse's every
-/// slot), so a restarted node relearns the map from its next one.
-pub type FeeRecipients = Arc<Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>;
+/// registration), plus the operator's `--fallback-fee-recipient` for a
+/// proposer no validator client named one for.
+///
+/// Read by block production, which puts the proposer's into the payload
+/// attributes, and by the chain actor, which publishes `payload_attributes`
+/// for the proposers named here. The map is in memory only: a validator
+/// client repeats the call (ethlambda's and Lighthouse's every slot), so a
+/// restarted node relearns it from its next one. Clones share the map.
+#[derive(Clone, Debug, Default)]
+pub struct FeeRecipients {
+    prepared: Arc<Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>,
+    fallback: Option<ExecutionAddress>,
+}
 
-/// The fee recipient `prepare_beacon_proposer` recorded for `proposer`.
-pub fn prepared_fee_recipient(
-    fee_recipients: &FeeRecipients,
-    proposer: ValidatorIndex,
-) -> Option<ExecutionAddress> {
-    fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&proposer)
-        .copied()
+impl FeeRecipients {
+    /// An empty map that falls back to `fallback` (`--fallback-fee-recipient`)
+    /// for a proposer it does not name.
+    pub fn with_fallback(fallback: Option<ExecutionAddress>) -> Self {
+        Self {
+            prepared: Arc::default(),
+            fallback,
+        }
+    }
+
+    /// Records the fee recipient a validator client named for `validator`
+    /// (`prepare_beacon_proposer` or a builder registration), replacing any
+    /// earlier one.
+    pub fn insert(&self, validator: ValidatorIndex, recipient: ExecutionAddress) {
+        self.map().insert(validator, recipient);
+    }
+
+    /// The fee recipient a validator client named for `proposer`, never the
+    /// fallback: a `Some` means a validator client registered the proposer,
+    /// which is what decides whether the node prepares payload attributes for
+    /// it. [`Self::for_proposer`] is the address a payload pays.
+    pub fn prepared(&self, proposer: ValidatorIndex) -> Option<ExecutionAddress> {
+        self.map().get(&proposer).copied()
+    }
+
+    /// Whether a validator client named a fee recipient for any validator.
+    /// The fallback does not count.
+    pub fn any_prepared(&self) -> bool {
+        !self.map().is_empty()
+    }
+
+    fn map(&self) -> MutexGuard<'_, HashMap<ValidatorIndex, ExecutionAddress>> {
+        self.prepared.lock().expect("fee recipient lock poisoned")
+    }
+
+    /// The fee recipient a locally built payload for `proposer` pays when no
+    /// signed preferences name one: `prepare_beacon_proposer`'s, else
+    /// `--fallback-fee-recipient`, else the zero address.
+    pub fn for_proposer(&self, proposer: ValidatorIndex) -> (ExecutionAddress, FeeRecipientSource) {
+        if let Some(recipient) = self.prepared(proposer) {
+            return (recipient, FeeRecipientSource::Prepared);
+        }
+        match self.fallback {
+            Some(recipient) => (recipient, FeeRecipientSource::Fallback),
+            None => (ExecutionAddress::ZERO, FeeRecipientSource::Unknown),
+        }
+    }
 }
 
 /// What the chain actor reads to publish `payload_attributes`: the same fee
@@ -197,19 +241,24 @@ pub enum ProposalError {
     Internal(&'static str),
 }
 
-/// Where a gloas payload's fee recipient came from.
+/// Where a locally built payload's fee recipient came from. `Preferences` is
+/// gloas-only ([`gloas_fee_recipient`]); [`FeeRecipients::for_proposer`]
+/// answers one of the other three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeeRecipientSource {
     /// The proposer's signed preferences.
     Preferences,
     /// `prepare_beacon_proposer`.
     Prepared,
-    /// Neither: the zero address.
+    /// `--fallback-fee-recipient`.
+    Fallback,
+    /// None of the above: the zero address.
     Unknown,
 }
 
 /// The fee recipient a self-built gloas payload pays: the proposer's signed
-/// `preferences`', else `prepare_beacon_proposer`'s, else the zero address.
+/// `preferences`', else `prepare_beacon_proposer`'s, else
+/// `--fallback-fee-recipient`, else the zero address.
 pub fn gloas_fee_recipient(
     fee_recipients: &FeeRecipients,
     proposer: ValidatorIndex,
@@ -221,10 +270,7 @@ pub fn gloas_fee_recipient(
             FeeRecipientSource::Preferences,
         );
     }
-    match prepared_fee_recipient(fee_recipients, proposer) {
-        Some(recipient) => (recipient, FeeRecipientSource::Prepared),
-        None => (ExecutionAddress::ZERO, FeeRecipientSource::Unknown),
-    }
+    fee_recipients.for_proposer(proposer)
 }
 
 /// `PayloadAttributesV4` for a gloas block with `inputs`, paying
@@ -397,8 +443,7 @@ pub(crate) fn payload_attributes_event(
     let config = store.config();
     let fork = config.fork_at_epoch(compute_epoch_at_slot(proposal_slot));
     let prepares_for = |proposer| {
-        preparation.always_prepare
-            || prepared_fee_recipient(&preparation.fee_recipients, proposer).is_some()
+        preparation.always_prepare || preparation.fee_recipients.prepared(proposer).is_some()
     };
     let data = match fork {
         ForkName::Fulu => {
@@ -411,8 +456,7 @@ pub(crate) fn payload_attributes_event(
             }
             let inputs = payload_inputs(&state, &config)
                 .map_err(|err| format!("computing the payload inputs failed: {err}"))?;
-            let fee_recipient = prepared_fee_recipient(&preparation.fee_recipients, proposer)
-                .unwrap_or(ExecutionAddress::ZERO);
+            let (fee_recipient, _) = preparation.fee_recipients.for_proposer(proposer);
             let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
             PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
                 proposer_index: proposer,
@@ -525,8 +569,7 @@ pub(crate) fn attributes_key(
     proposal_slot: Slot,
 ) -> AttributesKey {
     let proposer = lookahead_proposer(head_state, proposal_slot);
-    let fee_recipient =
-        proposer.and_then(|proposer| prepared_fee_recipient(&preparation.fee_recipients, proposer));
+    let fee_recipient = proposer.and_then(|proposer| preparation.fee_recipients.prepared(proposer));
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(proposal_slot));
@@ -717,11 +760,7 @@ impl BlockChainServer {
         let wanted = preparation.always_prepare
             || match key.proposer {
                 Some(_) => key.fee_recipient.is_some(),
-                None => !preparation
-                    .fee_recipients
-                    .lock()
-                    .expect("fee recipient lock poisoned")
-                    .is_empty(),
+                None => preparation.fee_recipients.any_prepared(),
             };
         if !wanted {
             self.payload_attributes.published = Some(key);
@@ -852,11 +891,7 @@ mod tests {
         let inputs = payload_inputs(&advanced, &config).unwrap();
         let fee_recipient = ExecutionAddress::repeat_byte(0xab);
         let preparation = preparation(false);
-        preparation
-            .fee_recipients
-            .lock()
-            .unwrap()
-            .insert(proposer, fee_recipient);
+        preparation.fee_recipients.insert(proposer, fee_recipient);
 
         let event = payload_attributes_event(
             &store,
@@ -916,6 +951,78 @@ mod tests {
         assert_eq!(
             data.payload_attributes.suggested_fee_recipient,
             ExecutionAddress::ZERO
+        );
+    }
+
+    /// `--fallback-fee-recipient` pays for an unregistered proposer's payload,
+    /// but does not on its own make the node prepare for that proposer.
+    #[test]
+    fn the_fallback_pays_an_unregistered_proposer_without_registering_it() {
+        let (store, head_root, head_state) = fulu_store();
+        let proposal_slot = head_state.slot() + 1;
+        let fallback = ExecutionAddress::repeat_byte(0xfe);
+        let with_fallback = |always_prepare| PayloadPreparation {
+            fee_recipients: FeeRecipients::with_fallback(Some(fallback)),
+            always_prepare,
+            ..PayloadPreparation::default()
+        };
+
+        let event = payload_attributes_event(
+            &store,
+            &with_fallback(false),
+            head_root,
+            &head_state,
+            proposal_slot,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event, None);
+
+        let event = payload_attributes_event(
+            &store,
+            &with_fallback(true),
+            head_root,
+            &head_state,
+            proposal_slot,
+            None,
+        )
+        .unwrap()
+        .expect("every slot is prepared");
+        let PayloadAttributesEventData::V3(data) = event.data else {
+            panic!("a fulu slot carries V3 attributes");
+        };
+        assert_eq!(data.payload_attributes.suggested_fee_recipient, fallback);
+    }
+
+    #[test]
+    fn a_prepared_recipient_wins_over_the_fallback_which_wins_over_zero() {
+        let fallback = ExecutionAddress::repeat_byte(0xfe);
+        let prepared = ExecutionAddress::repeat_byte(0xab);
+
+        let none = FeeRecipients::default();
+        assert_eq!(
+            none.for_proposer(3),
+            (ExecutionAddress::ZERO, FeeRecipientSource::Unknown)
+        );
+
+        let recipients = FeeRecipients::with_fallback(Some(fallback));
+        assert_eq!(
+            recipients.for_proposer(3),
+            (fallback, FeeRecipientSource::Fallback)
+        );
+        // The fallback is not an entry: nothing registered the validator.
+        assert_eq!(recipients.prepared(3), None);
+        assert!(!recipients.any_prepared());
+
+        // A clone shares the map, so a later registration is seen by both.
+        recipients.clone().insert(3, prepared);
+        assert_eq!(
+            recipients.for_proposer(3),
+            (prepared, FeeRecipientSource::Prepared)
+        );
+        assert_eq!(
+            gloas_fee_recipient(&recipients, 4, None),
+            (fallback, FeeRecipientSource::Fallback)
         );
     }
 
@@ -1074,11 +1181,7 @@ mod tests {
         );
 
         let fee_recipient = ExecutionAddress::repeat_byte(0xab);
-        preparation
-            .fee_recipients
-            .lock()
-            .unwrap()
-            .insert(proposer, fee_recipient);
+        preparation.fee_recipients.insert(proposer, fee_recipient);
         let after = attributes_key(&store, &preparation, head_root, &head_state, proposal_slot);
         assert_eq!(after.fee_recipient, Some(fee_recipient));
         assert_ne!(after, before);

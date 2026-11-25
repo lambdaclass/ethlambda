@@ -59,6 +59,17 @@ pub struct MockBeaconNode {
     /// When set, every method fails with this message, regardless of `failures`.
     pub fail_everything: Option<String>,
     pub genesis: Option<Genesis>,
+    /// What `spec` answers with. `None` is mainnet's. A test changes it to
+    /// have a node start reporting a new schedule after startup.
+    pub spec_config: Mutex<Option<Config>>,
+    /// When set, `spec` fails with what this builds, for the errors a real
+    /// node's answer raises (a body that is not JSON, a spec missing a key)
+    /// rather than the request failure `failures` stands for.
+    pub spec_error: Mutex<Option<fn() -> Error>>,
+    /// How many times `genesis` and `spec` were called, for a test that
+    /// checks a node was (or was not) asked.
+    pub genesis_calls: std::sync::atomic::AtomicUsize,
+    pub spec_calls: std::sync::atomic::AtomicUsize,
     pub syncing: bool,
     /// Tracking a head its execution client has not validated. Separate from
     /// `syncing`, because the pair a real node can report and this client must
@@ -240,6 +251,8 @@ pub struct MockBeaconNode {
     pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
     /// How long `liveness` takes before it answers, as a hung node would.
     pub liveness_delay: Option<std::time::Duration>,
+    /// How long `spec` takes before it answers, as a hung node would.
+    pub spec_delay: Option<std::time::Duration>,
 }
 
 impl MockBeaconNode {
@@ -377,6 +390,28 @@ impl MockBeaconNode {
         *self.proposer_duties_v2_calls.lock().expect("lock")
     }
 
+    /// Serve `config` as the spec, in place of mainnet's.
+    pub fn with_spec(self, config: Config) -> Self {
+        self.set_spec(config);
+        self
+    }
+
+    /// Change the spec this node serves, as an upgraded node does.
+    pub fn set_spec(&self, config: Config) {
+        *self.spec_config.lock().expect("lock") = Some(config);
+    }
+
+    /// Serve this validators root as the chain's, in place of the default.
+    pub fn with_genesis_root(mut self, root: Root) -> Self {
+        let mut genesis = self.genesis.unwrap_or(Genesis {
+            genesis_time: 0,
+            genesis_validators_root: Root::ZERO,
+        });
+        genesis.genesis_validators_root = root;
+        self.genesis = Some(genesis);
+        self
+    }
+
     pub fn with_attestation_data(mut self, slot: Slot) -> Self {
         self.attestation_data = Some(AttestationData {
             slot,
@@ -495,6 +530,12 @@ impl MockBeaconNode {
                 is_optimistic: self.optimistic,
                 el_offline: false,
             })
+    }
+
+    /// Make `spec` take `delay` before it answers.
+    pub fn with_spec_delay(mut self, delay: std::time::Duration) -> Self {
+        self.spec_delay = Some(delay);
+        self
     }
 
     /// Make `submit_proposer_preferences` take `delay` before it answers.
@@ -849,6 +890,8 @@ impl MockBeaconNode {
 #[async_trait]
 impl BeaconNodeApi for MockBeaconNode {
     async fn genesis(&self) -> Result<Genesis> {
+        self.genesis_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.guard("genesis")?;
         self.genesis.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -858,8 +901,21 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn spec(&self) -> Result<Config> {
+        self.spec_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(delay) = self.spec_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.guard("spec")?;
-        Ok(Config::mainnet())
+        if let Some(error) = *self.spec_error.lock().expect("lock") {
+            return Err(error());
+        }
+        Ok(self
+            .spec_config
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or_else(Config::mainnet))
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
