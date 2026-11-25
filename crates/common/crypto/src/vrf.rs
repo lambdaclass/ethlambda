@@ -423,6 +423,25 @@ fn reduce(nodes: &mut Vec<Node>, mut index: usize, branch: &mut Vec<Node>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The single-block permutation here and the streaming hasher behind
+    /// [`crate::keccak256`] agree, and both are Keccak-256 (the empty input's
+    /// digest), not SHA3-256.
+    #[test]
+    fn keccak256_is_keccak_and_agrees_with_the_streaming_hasher() {
+        assert_eq!(
+            hex::encode(keccak256(&[])),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
+        for len in [0usize, 1, 49, 64, 135] {
+            let input: Vec<u8> = (0..len as u8).collect();
+            assert_eq!(
+                keccak256(&[&input]),
+                crate::keccak256(&input),
+                "{len} bytes"
+            );
+        }
+    }
     use sha2::Digest as _;
 
     fn hex32(text: &str) -> Node {

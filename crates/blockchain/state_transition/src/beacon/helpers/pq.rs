@@ -121,11 +121,15 @@ pub fn compute_legacy_vrf_root(pubkey: &BlsPubkey) -> Root {
     legacy_digest(pubkey, constants::LEGACY_VRF_ROOT_DOMAIN)
 }
 
+/// `keccak256(pubkey + domain)`. SHA-256 before consensus-specs pq
+/// `4c296784`, which moved both legacy derivations to the hash the VRF tree
+/// already uses; the RANDAO mix and the aggregation committee seeds stay on
+/// SHA-256.
 fn legacy_digest(pubkey: &BlsPubkey, domain: u8) -> Bytes32 {
     let mut input = Vec::with_capacity(pubkey.0.len() + 1);
     input.extend_from_slice(&pubkey.0);
     input.push(domain);
-    hash(&input)
+    ethlambda_types::primitives::H256(ethlambda_crypto::keccak256(&input))
 }
 
 /// `is_legacy_pubkey`: whether a 48-byte request key names a BLS key (made
@@ -597,6 +601,29 @@ mod tests {
             compute_legacy_xmss_pubkey(&bls).0,
             compute_legacy_vrf_root(&bls).0
         );
+    }
+
+    /// consensus-specs pq `4c296784`: `keccak256(pubkey + domain)`, the
+    /// domain one byte, not `sha256`.
+    #[test]
+    fn legacy_keys_are_keccak256_of_the_bls_key_and_domain() {
+        let bls = BlsPubkey([0xa5; 48]);
+        let digest = |domain: u8| {
+            let mut input = bls.0.to_vec();
+            input.push(domain);
+            ethlambda_crypto::keccak256(&input)
+        };
+        assert_eq!(
+            compute_legacy_xmss_pubkey(&bls).0,
+            digest(constants::LEGACY_XMSS_PUBKEY_DOMAIN)
+        );
+        assert_eq!(
+            compute_legacy_vrf_root(&bls).0,
+            digest(constants::LEGACY_VRF_ROOT_DOMAIN)
+        );
+        let mut sha_input = bls.0.to_vec();
+        sha_input.push(constants::LEGACY_XMSS_PUBKEY_DOMAIN);
+        assert_ne!(compute_legacy_xmss_pubkey(&bls).0, hash(&sha_input).0);
     }
 
     /// A PQ state at `slot` whose block root at each earlier slot is

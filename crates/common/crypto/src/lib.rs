@@ -48,7 +48,7 @@ pub mod bls;
 /// The Beacon Chain PQ fork's leanXMSS signatures (the specification's `xmss`
 /// module), over Keccak-256. Not the XMSS of [`signature`].
 pub mod lean_xmss;
-/// leanVM's own leanXMSS (bindings v0.15.0): what a validator signs with and
+/// leanVM's own leanXMSS (bindings v0.17.0): what a validator signs with and
 /// what [`lean_xmss::verify`] runs, re-exported so a signer depends on one pin.
 pub use leanvm_lean_xmss;
 mod metrics;
@@ -57,7 +57,8 @@ mod metrics;
 pub mod pq_keys;
 pub mod signature;
 /// The Beacon Chain PQ fork's proofs of many leanXMSS signatures (the
-/// specification's `stark` module), in its reference concatenation encoding.
+/// specification's `stark` module): its reference concatenation encoding, or
+/// leanVM proofs made in process.
 pub mod stark;
 /// The Beacon Chain PQ fork's VRF tree, whose openings are its RANDAO
 /// reveals: verification for the state transition, derivation for a
@@ -66,6 +67,13 @@ pub mod vrf;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
+
+/// The Beacon Chain PQ fork's `keccak256` (Ethereum's Keccak-256, with
+/// Keccak's original padding, not SHA3-256's), over `data`.
+pub fn keccak256(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest as _, Keccak256};
+    Keccak256::digest(data).into()
+}
 
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
