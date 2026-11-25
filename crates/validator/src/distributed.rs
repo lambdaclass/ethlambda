@@ -50,23 +50,27 @@
 //! beacon node on the subnet at all, and no aggregate or contribution is
 //! asked for. Falling back to the partial proof would only add aggregates
 //! nobody can combine. The current epoch's duties that are still missing a
-//! proof are asked for again at the next slot, as Lighthouse does, and the
-//! subscriptions of those that then get one are sent again, now with the
-//! role. The next epoch's are asked for again at the next epoch, as that
-//! epoch's current ones.
+//! proof are asked for again at the next slot, as Lighthouse does, one
+//! request per slot, so an entry the middleware cannot combine holds back
+//! only its own slot's duties. The subscriptions of those whose combined
+//! proof then selects them are sent again, now with the role. The next
+//! epoch's are asked for again at the next epoch, as that epoch's current
+//! ones.
 //!
 //! Nothing here is slashable, and nothing changes on the beacon node: the
 //! endpoints are the middleware's, and `ethlambda beacon` does not serve them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Slot, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
+use futures_util::future::join_all;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::aggregation_selection::selection_for;
 use crate::beacon_node::dto::{AttesterDutyDto, SyncDutyDto, parse_pubkey};
 use crate::beacon_node::{BeaconCommitteeSelection, BeaconNodeApi, SyncCommitteeSelection};
 use crate::error::{Error, Result};
@@ -80,10 +84,12 @@ use crate::sync_committee::subnets_of;
 pub struct Distributed<B> {
     beacon_node: Arc<B>,
     context: Arc<SigningContext>,
-    /// Held while attester selections are exchanged, so a retry never sends
-    /// what an epoch's round or another retry is still waiting on. An
-    /// epoch's round waits for it, since its subscriptions must go out; a
-    /// retry that finds it held skips the slot.
+    /// Held while the current epoch's attester selections are exchanged, so
+    /// a retry never sends what an epoch's round or another retry is still
+    /// waiting on. An epoch's round waits for it, since its subscriptions
+    /// must go out; a retry that finds it held skips the slot. The round's
+    /// next-epoch exchange runs without it: a retry never sends those
+    /// duties, and that request may wait out its whole timeout unanswered.
     attester: Mutex<()>,
     /// The share's own partial attester selection proofs already signed, by
     /// key and slot, so a retry or the next epoch's round sends them again
@@ -158,30 +164,42 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             });
         }
 
-        if !sync_duties.is_empty() {
-            let (this, store) = (self.clone(), store.clone());
-            // Until the contribution deadline, where the proofs are read: one
-            // that lands after it decides nothing, so it is reported as missed
-            // rather than remembered for no one.
-            let budget = clock.until_contribution(slot, SystemTime::now());
-            tokio::spawn(async move {
-                let exchange = this.exchange_sync(slot, &sync_duties, &store);
-                match tokio::time::timeout(budget, exchange).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => warn!(
-                        %slot,
-                        %err,
-                        "Middleware did not combine the sync committee selection proofs; no \
-                         contribution this slot"
-                    ),
-                    Err(_) => warn!(
-                        %slot,
-                        "Middleware did not combine the sync committee selection proofs before \
-                         the contribution deadline; no contribution this slot"
-                    ),
-                }
-            });
+        if sync_duties.is_empty() {
+            return;
         }
+        // Until the contribution deadline, where the proofs are read: one
+        // that lands after it decides nothing, so it is reported as missed
+        // rather than remembered for no one.
+        let budget = clock.until_contribution(slot, SystemTime::now());
+        // A proposal that ran past the deadline leaves nothing to exchange
+        // for. Not started at all: a timeout of zero still polls the exchange
+        // once, which would sign every seat's partial proof for nothing.
+        if budget.is_zero() {
+            warn!(
+                %slot,
+                "Contribution deadline passed before the sync committee selection exchange; no \
+                 contribution this slot"
+            );
+            return;
+        }
+        let (this, store) = (self.clone(), store.clone());
+        tokio::spawn(async move {
+            let exchange = this.exchange_sync(slot, &sync_duties, &store);
+            match tokio::time::timeout(budget, exchange).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => warn!(
+                    %slot,
+                    %err,
+                    "Middleware did not combine the sync committee selection proofs; no \
+                     contribution this slot"
+                ),
+                Err(_) => warn!(
+                    %slot,
+                    "Middleware did not combine the sync committee selection proofs before the \
+                     contribution deadline; no contribution this slot"
+                ),
+            }
+        });
     }
 
     /// The epoch's round, run when the attester schedule moved: exchange the
@@ -193,56 +211,83 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     /// endpoint is asked at the start of every epoch for all of its duties.
     /// Each epoch's subscriptions go out whether or not its exchange worked,
     /// without the role for the duties it left without a proof.
+    ///
+    /// Only the current epoch's exchange holds the guard the retry tries.
+    /// The next epoch's runs after it is released: a retry never sends
+    /// those duties, and a request the middleware leaves unanswered until
+    /// its timeout would otherwise skip the next slot's retry.
     pub async fn subscribe_epoch(
         &self,
         slot: Slot,
         duties: &[AttesterDutyDto],
         store: &RwLock<ValidatorStore>,
     ) {
-        let _exchanging = self.attester.lock().await;
-        self.forget_partials_before(slot);
         let epoch = compute_epoch_at_slot(slot);
-        for round in [epoch, epoch + 1] {
-            let owed: Vec<AttesterDutyDto> = duties
-                .iter()
-                .filter(|duty| duty.slot >= slot && compute_epoch_at_slot(duty.slot) == round)
-                .cloned()
-                .collect();
-            if owed.is_empty() {
-                continue;
-            }
-            // The next epoch's request is one the middleware may rightly
-            // leave unanswered (see the module doc), so its failure is no
-            // warning: those duties are asked for again as the next epoch's
-            // current ones.
-            let lookahead = round != epoch;
-            let exchanged = self.exchange_attester(&owed, store, lookahead).await;
-            let _ = exchanged.inspect_err(|err| {
-                if lookahead {
-                    debug!(
-                        %slot,
-                        epoch = round,
-                        %err,
-                        "Middleware did not combine the next epoch's attester selection proofs; \
-                         subscribing without the aggregator role until its round"
-                    );
-                } else {
-                    warn!(
-                        %slot,
-                        epoch = round,
-                        %err,
-                        "Middleware did not combine the attester selection proofs; subscribing \
-                         without the aggregator role"
-                    );
-                }
-            });
-            self.subscribe(round, &owed, store).await;
+        {
+            let _exchanging = self.attester.lock().await;
+            self.forget_partials_before(slot);
+            self.round(slot, epoch, duties, store).await;
         }
+        self.round(slot, epoch + 1, duties, store).await;
+    }
+
+    /// One epoch's part of [`Self::subscribe_epoch`] at `slot`: exchange the
+    /// proofs of the duties in `round` that have not passed, then subscribe
+    /// them.
+    async fn round(
+        &self,
+        slot: Slot,
+        round: u64,
+        duties: &[AttesterDutyDto],
+        store: &RwLock<ValidatorStore>,
+    ) {
+        let owed: Vec<AttesterDutyDto> = duties
+            .iter()
+            .filter(|duty| duty.slot >= slot && compute_epoch_at_slot(duty.slot) == round)
+            .cloned()
+            .collect();
+        if owed.is_empty() {
+            return;
+        }
+        // The next epoch's request is one the middleware may rightly leave
+        // unanswered (see the module doc), so its failure is no warning:
+        // those duties are asked for again as the next epoch's current ones.
+        // Either way the duties already holding a combined proof (the
+        // current epoch's, from last epoch's lookahead) keep their role.
+        let lookahead = round != compute_epoch_at_slot(slot);
+        let exchanged = self.exchange_attester(&owed, store, lookahead).await;
+        let _ = exchanged.inspect_err(|err| {
+            if lookahead {
+                debug!(
+                    %slot,
+                    epoch = round,
+                    %err,
+                    "Middleware did not combine the next epoch's attester selection proofs; the \
+                     duties without one are subscribed without the aggregator role until its round"
+                );
+            } else {
+                warn!(
+                    %slot,
+                    epoch = round,
+                    %err,
+                    "Middleware did not combine the attester selection proofs; the duties without \
+                     one are subscribed without the aggregator role"
+                );
+            }
+        });
+        self.subscribe(round, &owed, store).await;
     }
 
     /// The retry at `slot`: exchange the proofs of the current epoch's duties
     /// that have not passed and hold no combined proof yet, and send the
-    /// subscriptions of those that get one again, now with the role.
+    /// subscriptions of those the combined proof then selects again, now
+    /// with the role. The others were already subscribed without it.
+    ///
+    /// One request per slot, all sent at once. The middleware answers a
+    /// request only once it has combined every entry in it (see the module
+    /// doc), so an entry it cannot combine, one the other operators' clients
+    /// never send, would otherwise hold back every other duty of the epoch
+    /// with it, at every retry.
     ///
     /// Skipped while another exchange is in flight. The next epoch's duties
     /// are left to that epoch's round: whether they are answered now depends
@@ -260,43 +305,57 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         };
         self.forget_partials_before(slot);
         let epoch = compute_epoch_at_slot(slot);
-        let missing: Vec<AttesterDutyDto> = duties
-            .iter()
-            .filter(|duty| {
-                duty.slot >= slot
-                    && compute_epoch_at_slot(duty.slot) == epoch
-                    && parse_pubkey(&duty.pubkey).is_ok_and(|pubkey| {
-                        !self
-                            .context
-                            .holds_combined_selection_proof(&pubkey, duty.slot)
-                    })
-            })
-            .cloned()
-            .collect();
+        let mut missing: BTreeMap<Slot, Vec<AttesterDutyDto>> = BTreeMap::new();
+        let still_missing = duties.iter().filter(|duty| {
+            duty.slot >= slot
+                && compute_epoch_at_slot(duty.slot) == epoch
+                && parse_pubkey(&duty.pubkey).is_ok_and(|pubkey| {
+                    !self
+                        .context
+                        .holds_combined_selection_proof(&pubkey, duty.slot)
+                })
+        });
+        for duty in still_missing {
+            missing.entry(duty.slot).or_default().push(duty.clone());
+        }
         if missing.is_empty() {
             return;
         }
-        match self.exchange_attester(&missing, store, false).await {
-            Ok(0) => {}
-            Ok(_) => {
-                let combined: Vec<AttesterDutyDto> = missing
-                    .into_iter()
-                    .filter(|duty| {
-                        parse_pubkey(&duty.pubkey).is_ok_and(|pubkey| {
-                            self.context
-                                .holds_combined_selection_proof(&pubkey, duty.slot)
-                        })
-                    })
-                    .collect();
-                self.subscribe(epoch, &combined, store).await;
+
+        let exchanges = missing
+            .values()
+            .map(|owed| self.exchange_attester(owed, store, false));
+        let mut combined = 0;
+        let (mut failed, mut first_error) = (0, None);
+        for exchanged in join_all(exchanges).await {
+            match exchanged {
+                Ok(answered) => combined += answered,
+                Err(err) => {
+                    failed += 1;
+                    first_error.get_or_insert(err);
+                }
             }
-            Err(err) => warn!(
-                %slot,
-                missing = missing.len(),
-                %err,
-                "Middleware still did not combine the attester selection proofs; retrying next slot"
-            ),
         }
+        if let Some(err) = first_error {
+            warn!(
+                %slot,
+                failed_slots = failed,
+                missing_slots = missing.len(),
+                %err,
+                "Middleware still did not combine some attester selection proofs; retrying next slot"
+            );
+        }
+        if combined == 0 {
+            return;
+        }
+
+        let mut selected = Vec::new();
+        for duty in missing.into_values().flatten() {
+            if let Ok(Some(_)) = selection_for(&self.context, store, &duty).await {
+                selected.push(duty);
+            }
+        }
+        self.subscribe(epoch, &selected, store).await;
     }
 
     /// Sign the partial selection proof of every duty in `duties`, send them
@@ -916,6 +975,52 @@ mod tests {
         // Nothing is missing any more, so the slot after asks for nothing.
         distributed.retry(EPOCH_START + 2, &duties, &store).await;
         assert_eq!(node.selection_requests().len(), 1);
+    }
+
+    /// The retry asks for each slot in a request of its own, so an entry
+    /// the middleware cannot combine holds back only its own slot's, and
+    /// re-sends only the subscriptions a combined proof selects: the round
+    /// already sent the others without the role.
+    #[tokio::test]
+    async fn a_retry_asks_per_slot_and_resubscribes_only_the_selected() {
+        let (store, pubkey) = store();
+        let (chosen, passed_over) = (EPOCH_START + 5, EPOCH_START + 9);
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .failing_call("beacon_committee_selections", "middleware down")
+                .with_combined_selection(1, chosen, attester_proof(true))
+                .with_combined_selection(2, passed_over, attester_proof(false)),
+        );
+        let distributed = Distributed::new(node.clone(), distributed_context());
+        let duties = vec![duty(&pubkey, 1, chosen), duty(&pubkey, 2, passed_over)];
+
+        distributed
+            .subscribe_epoch(EPOCH_START, &duties, &store)
+            .await;
+        let subscribed = node.subscriptions().len();
+        assert_eq!(subscribed, 2, "the round subscribes both, without the role");
+
+        node.failures
+            .lock()
+            .expect("lock")
+            .remove("beacon_committee_selections");
+        distributed.retry(EPOCH_START + 1, &duties, &store).await;
+
+        let mut asked: Vec<Vec<Slot>> = node
+            .selection_requests()
+            .iter()
+            .map(|request| request.iter().map(|entry| entry.slot).collect())
+            .collect();
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![vec![chosen], vec![passed_over]],
+            "one request per slot"
+        );
+        let resent: Vec<_> = node.subscriptions().into_iter().skip(subscribed).collect();
+        assert_eq!(resent.len(), 1, "only the selected duty is re-sent");
+        assert_eq!(resent[0].validator_index, 1);
+        assert!(resent[0].is_aggregator);
     }
 
     /// A partial proof signed for an exchange that failed is sent again as
