@@ -394,11 +394,31 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             settings.clone(),
         ))
     });
-    // From gloas, with or without builder proposals.
-    if config.self_build_only {
-        info!("Self-build only: from gloas, no block built on a builder's bid is signed");
+    // From gloas, with or without builder proposals. Said only on a network
+    // that schedules gloas: elsewhere the factor and the floor do nothing yet,
+    // which an operator who set them without builder proposals (once refused
+    // at startup) is warned of instead.
+    let gloas_epoch = context.config.gloas_fork_epoch;
+    if gloas_epoch == ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+        let builder_settings_given = config.gloas_boost_factor
+            != proposal::DEFAULT_BUILDER_BOOST_FACTOR
+            || config.builder_min_bid > 0;
+        if config.builder.is_none() && builder_settings_given {
+            warn!(
+                boost_factor = config.gloas_boost_factor,
+                min_bid_gwei = config.builder_min_bid,
+                "This network schedules no gloas, and before gloas a boost factor is sent only \
+                 with --builder-proposals: these builder settings do nothing yet"
+            );
+        }
+    } else if config.self_build_only {
+        info!(
+            %gloas_epoch,
+            "Self-build only: from gloas, no block built on a builder's bid is signed"
+        );
     } else {
         info!(
+            %gloas_epoch,
             boost_factor = config.gloas_boost_factor,
             min_bid_gwei = config.builder_min_bid,
             "From gloas, builders' p2p bids compete with the local payload"
