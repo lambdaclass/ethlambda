@@ -769,7 +769,10 @@ message accepted from either side is seen by both.
   published itself whose publish reached no peer: while its slot is ahead, the
   re-send is gossiped again (see `docs/beacon_wire.md`, Gossip). Accepted
   entries are cached
-  (the first per `(proposal slot, dependent root)` wins) and gossiped. If any
+  (the first per `(proposal slot, dependent root)` wins) and gossiped, except
+  that an entry for a slot past the next fork-digest boundary (from gloas on) is
+  gossiped only a slot before that boundary, when every client has joined the
+  new digest's topics; the answer is the same either way. If any
   entry fails the answer is `400`
   `{code, message, failures: [{index, message}]}` and the others were still
   published. The endpoint is not gated on the sync status. A node whose

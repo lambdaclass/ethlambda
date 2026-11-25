@@ -434,12 +434,34 @@ from the Beacon API, and no other way.
 - **An IGNORE verdict is a `400`,** the same as a REJECT, because the API has no
   separate status for it. The message names the verdict and the reason, such as
   `ignore: preferences_unseen`.
-- **An identical resubmission is a `200`** and is not published again.
+- **An identical resubmission is a `200`** and is not published again, except
+  preferences this node still owes a publish (no peer was handed them), which
+  are handed to p2p again while their slot is ahead.
 - **The prose and the rules disagree** on a mismatched fee recipient or gas
   limit: the Beacon API text says the bid is rejected, while consensus-specs
   IGNOREs it. ethlambda follows consensus-specs.
 - **`Eth-Consensus-Version` may be absent** on the bid and preferences posts. If
   present it must name a gloas-compatible fork.
+
+## Preferences for the next fork digest are gossiped a slot before its boundary
+
+- **The specification:** the Beacon API broadcasts accepted
+  `SignedProposerPreferences` at once, and `p2p-interface.md` leaves when a
+  node joins the next digest's topics to the client.
+- **ethlambda:** preferences a validator client submits for a slot past the
+  next fork-digest boundary (from gloas on) are validated, pooled, reported
+  to the chain actor and answered at once, but gossiped only one slot before
+  the boundary (`PREFERENCES_RELEASE_LEAD_SLOTS`). Gossip-delivered
+  preferences are relayed as usual.
+- **Why:** clients join the next digest at different times (this node an epoch
+  ahead, Lighthouse two slots ahead), and gossipsub refuses to publish a
+  message again for `seen_ttl` (two epochs) once any peer has it. Gossiped at
+  once, a preference reaches only the early joiners and never the late ones.
+  A slot ahead every client has joined, and a bid for the boundary's first
+  slot, gossiped during the slot before it, still finds the preference.
+- **Consequence:** an early joiner's builders see the warm-up epoch's
+  preferences only from that slot on, which is when bids for them start to be
+  gossiped anyway.
 
 ## No minimum bid increment or rate limit
 

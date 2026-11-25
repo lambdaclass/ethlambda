@@ -1317,7 +1317,7 @@ async fn cached_preferences_resubmitted_are_a_200_without_a_publish() {
 /// as a republish (no second first-publish, so no second event or chain
 /// report). Once a publish goes out, a re-send is back to a plain 200.
 #[tokio::test]
-async fn a_cached_preference_whose_publish_failed_is_republished_on_resubmission() {
+async fn a_cached_preference_whose_publish_owed_is_republished_on_resubmission() {
     let world = World::new();
     let app = world.app(None);
     let signed = world.preferences(address(0xaa), 30_000_000);
