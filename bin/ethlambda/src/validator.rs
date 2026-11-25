@@ -49,9 +49,9 @@ pub(crate) struct ValidatorOptions {
     /// `--enable-keymanager`; set without it, startup warns.
     ///
     /// Never written or created: a missing file, or one holding fewer than 16
-    /// characters once trimmed or anything but visible ASCII (no spaces
-    /// inside), stops the client at startup rather than being replaced with a
-    /// generated token.
+    /// characters once trimmed or a character an `Authorization` header
+    /// cannot carry (anything but visible ASCII, spaces and tabs), stops the
+    /// client at startup rather than being replaced with a generated token.
     #[arg(long)]
     pub(crate) keymanager_token_file: Option<PathBuf>,
 

@@ -142,16 +142,19 @@ fn load_token_file(path: &Path) -> crate::Result<String> {
 fn checked_token(path: &Path, contents: &str, remedy: &str) -> crate::Result<String> {
     let token = contents.trim();
     // A request carries the token in its `Authorization` header, which
-    // `require_bearer` reads only as visible ASCII, and a bearer token has no
-    // spaces in it (RFC 6750). A token with anything else would start the
-    // client with a keymanager API no request can authenticate to. Checked
-    // first, so the length below counts characters as well as bytes.
-    if let Some(unusable) = token.chars().find(|c| !c.is_ascii_graphic()) {
+    // `require_bearer` reads through `HeaderValue::to_str`: visible ASCII,
+    // spaces and tabs, nothing else. A token with anything else (a non-ASCII
+    // character, a line break) would start the client with a keymanager API
+    // no request can authenticate to. Exactly that set, so a token that
+    // worked before this check still does. Checked first, so the length
+    // below counts characters as well as bytes.
+    let carried = |c: &char| c.is_ascii_graphic() || *c == ' ' || *c == '\t';
+    if let Some(unusable) = token.chars().find(|c| !carried(c)) {
         return Err(Error::Keystore {
             path: path.display().to_string(),
             reason: format!(
-                "the API token file holds {unusable:?}, which a bearer token cannot carry \
-                 (only visible ASCII characters, and no spaces inside); {remedy}"
+                "the API token file holds {unusable:?}, which an Authorization header cannot \
+                 carry (only visible ASCII characters, spaces and tabs); {remedy}"
             ),
         });
     }
@@ -465,12 +468,11 @@ mod token_tests {
     #[test]
     fn a_supplied_token_no_request_could_carry_is_refused() {
         // Long enough, but `require_bearer` reads the header only as visible
-        // ASCII and a bearer token has no spaces, so each would start a
-        // keymanager API no request can authenticate to.
+        // ASCII, spaces and tabs, so each would start a keymanager API no
+        // request can authenticate to.
         for contents in [
             "token-for-all-clients-\u{fc}",
             "a-token-an-operator\npicked",
-            "a-token-an operator-picked",
         ] {
             let dir = tempfile::tempdir().expect("temp dir");
             let path = dir.path().join("keymanager.txt");
@@ -483,6 +485,20 @@ mod token_tests {
             };
             assert!(reason.contains("cannot carry"), "should say why: {reason}");
         }
+    }
+
+    #[test]
+    fn a_supplied_token_with_spaces_inside_is_accepted() {
+        // An `Authorization` header carries spaces and tabs, and
+        // `require_bearer` keeps them after the `Bearer ` prefix, so such a
+        // token authenticates and must not be refused.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keymanager.txt");
+        std::fs::write(&path, "a shared\tkeymanager token\n").expect("writes it");
+
+        let token = load_token_file(&path).expect("accepted");
+
+        assert_eq!(token, "a shared\tkeymanager token");
     }
 
     #[test]
