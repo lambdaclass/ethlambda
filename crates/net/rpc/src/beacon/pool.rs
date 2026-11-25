@@ -101,7 +101,16 @@ async fn post_pool_attestations(
         .and_then(|value| value.to_str().ok())
         == Some(ForkName::Pq.as_str());
     if is_pq {
-        return post_pq_attestations(&store, &p2p, &headers, &body);
+        // Off the executor: every attestation in the batch is a leanXMSS
+        // verification, which would otherwise hold this worker thread, and
+        // every other request queued on it, for the whole batch.
+        let checked = tokio::task::spawn_blocking(move || {
+            post_pq_attestations(&store, &p2p, &headers, &body)
+        })
+        .await;
+        return checked.unwrap_or_else(|_| {
+            ApiError::Internal("PQ attestation validation task failed").into_response()
+        });
     }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
@@ -206,26 +215,41 @@ fn post_pq_attestations(
         .unwrap_or(0);
     let config = store.config();
     // A fresh cache: the node gossips its own validator client's votes once.
+    // Only read by the checks, so the parallel ones below can share it.
     let seen = SeenAttestations::new(std::num::NonZeroUsize::MIN);
+    // Checked in parallel, since each is a leanXMSS verification and a
+    // validator client submits its whole slot's votes as one batch; checked
+    // one after another, the last vote in the batch waited for every other
+    // one's verification before it was published. Published below in the
+    // order submitted, so the failures still name positions in the array.
+    use rayon::prelude::*;
+    let verdicts: Vec<(u64, Outcome)> = attestations
+        .par_iter()
+        .map(|attestation| {
+            let committees_per_slot = store
+                .committee_cache()
+                .committees(&state, attestation.data.target.epoch)
+                .committees_per_slot();
+            let subnet_id = pq_gossip::compute_subnet_for_attestation(
+                committees_per_slot,
+                attestation.data.slot,
+                attestation.committee_index,
+                &config,
+            );
+            let verdict = pq_gossip::attestation_cheap_checks(&seen, store, attestation, now_ms)
+                .err()
+                .unwrap_or_else(|| {
+                    pq_gossip::attestation_stateful_checks(store, attestation, subnet_id)
+                });
+            (subnet_id, verdict)
+        })
+        .collect();
     let mut failures = Vec::new();
-    for (index, attestation) in attestations.into_iter().enumerate() {
+    for (index, (attestation, (subnet_id, verdict))) in
+        attestations.into_iter().zip(verdicts).enumerate()
+    {
         let slot = attestation.data.slot;
         let validator = attestation.attester_index;
-        let committees_per_slot = store
-            .committee_cache()
-            .committees(&state, attestation.data.target.epoch)
-            .committees_per_slot();
-        let subnet_id = pq_gossip::compute_subnet_for_attestation(
-            committees_per_slot,
-            slot,
-            attestation.committee_index,
-            &config,
-        );
-        let verdict = pq_gossip::attestation_cheap_checks(&seen, store, &attestation, now_ms)
-            .err()
-            .unwrap_or_else(|| {
-                pq_gossip::attestation_stateful_checks(store, &attestation, subnet_id)
-            });
         let published = match verdict {
             Outcome::Accept => {
                 // This node's own aggregator may be collecting the committee.

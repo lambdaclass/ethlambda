@@ -3,7 +3,9 @@
 //! Seeded once from the beacon node's genesis, then independent of it. It is
 //! deliberately not driven by the node's event stream: that stream is
 //! best-effort by contract, dropping events for a slow subscriber, and a
-//! dropped event must not mean a missed duty.
+//! dropped event must not mean a missed duty. The stream can only start a duty
+//! earlier than the offset this clock gives (see `crate::head_monitor`); the
+//! offset stays its deadline.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -253,8 +255,9 @@ impl SlotClock {
     /// How long from `now` until the payload timeliness committee's duty for
     /// `slot`, or zero once that instant has passed.
     ///
-    /// The PTC counterpart to [`Self::until_aggregation`]: the loop sleeps on
-    /// it between aggregation and the committee vote.
+    /// The PTC counterpart to [`Self::until_aggregation`]: the committee
+    /// vote's deadline, which it waits for unless a beacon node reports the
+    /// slot's payload available first (see `crate::head_monitor`).
     pub fn until_payload_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
         self.payload_attestation_time(slot)
             .duration_since(now)

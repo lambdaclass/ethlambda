@@ -389,6 +389,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Taken with or without `--builder-proposals`: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 | `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
+| `--disable-event-stream` | off | Read no beacon node's event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between `--disable-beacon-head-monitor` and `--disable-payload-available-monitor`; Prysm's nearest is `--disable-attest-timely`. For a node whose stream is broken, or a proxy in front of it that holds events back. See [Duties start on the block](#duties-start-on-the-block) |
 
 ### What it does today
 
@@ -445,7 +446,9 @@ dependent root.
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, checks that it is
+it. When the slot's block becomes a beacon node's head, or one third into the
+slot at the latest (see [Duties start on the block](#duties-start-on-the-block)),
+it fetches the attestation data, checks that it is
 for the slot it asked about and that its `index` is one the slot's fork allows
 (0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
 every validator due that slot, and submits the batch. A node whose answer fails
@@ -499,21 +502,26 @@ validators it holds, for this epoch and the next when they are gloas ones. The
 gloas fork epoch's are the exception: a node cannot know them before the fork,
 so they are fetched at the fork epoch's first slot rather than as the previous
 epoch's lookahead. When an epoch's schedule could not be fetched, the client
-asks again after each slot's duties until it has one. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
-slot, asks the node for the
+asks again after each slot's duties until it has one. A member waits for a
+node's `execution_payload_available` for the slot, or for
+`PAYLOAD_ATTESTATION_DUE_BPS` of the slot at the latest, asks the node for the
 payload attestation data, signs it under the PTC domain and submits it. A `204`
 (the node knows no block for the slot) means no vote. So a gloas slot runs in
-this order: propose at the boundary, attest at `ATTESTATION_DUE_BPS_GLOAS`,
-aggregate at `AGGREGATE_DUE_BPS_GLOAS`, then the committee vote. The attestation
-and the committee vote are each bounded by the end of the slot.
+this order: propose at the boundary, attest on the block or at
+`ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`, and the
+committee vote on the payload or at its deadline, beside the other two rather
+than after them, since a payload that arrives early can come before the
+aggregation. The attestation and the committee vote are each bounded by the
+end of the slot.
 
 Sync committee duties run beside the attester and committee work, not after it.
 Each epoch the client fetches its sync duties for the current period and the
 next (`POST /eth/v1/validator/duties/sync/{epoch}`, asked at the period's first
 epoch) and posts `sync_committee_subscriptions` for the current period's seats,
 until the period's end, so the node joins the subnets. The next period's are
-added once its boundary is within four epochs. A member sleeps until
-`SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas), reads
+added once its boundary is within four epochs. A member waits for the slot's
+block, or for `SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas)
+at the latest, reads
 `/eth/v1/beacon/blocks/head/root`, signs it and submits one message per
 validator. It refuses to sign when the node reports the head optimistic. A
 member selected by the selection-proof hash for a subnet then waits for
@@ -603,6 +611,46 @@ committee offsets (`SYNC_MESSAGE_DUE_BPS`, `CONTRIBUTION_DUE_BPS` and their
 `SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required
 to agree with itself.
+
+### Duties start on the block
+
+The offsets are deadlines, not start times. The specification has an attester
+sign once it has the slot's block or once the offset has passed, whichever comes
+first, a sync committee member likewise, and a payload timeliness committee
+member as soon as it has seen the payload and its blob data. So the client reads
+every beacon node's `GET /eth/v1/events`, one connection per topic: `head`, and
+on a network that schedules gloas `execution_payload_available` as well.
+
+- A `head` for the current slot, not `execution_optimistic`, starts the slot's
+  attestation and sync committee message.
+- An `execution_payload_available` for the current slot starts its committee
+  vote. The block alone never does.
+- What is signed is still the node's answer, fetched through the usual failover,
+  and the early attempt signs it only if it is about the event's block: the
+  attestation data's `beacon_block_root`, the head root, or payload attestation
+  data that also says `payload_present` and `blob_data_available`. Otherwise
+  nothing is recorded or signed, and the duty asks again on the next report
+  about the slot it has not tried (another node's, or another block's), or
+  runs at its offset if none comes, as it would have with no event. An answer
+  still outstanding at the offset is dropped there, so an event never makes a
+  duty later. Each duty is signed at most once a slot either way.
+- An event from any node starts a duty. The check above is what makes that safe
+  when the node answering has not imported the block yet: that attempt
+  declines, and the answering node's own report of the block starts the next.
+- A stream that drops is opened again after a second, the wait doubling to 12
+  seconds while the node stays unreachable. One silent for a minute is taken
+  for dead and opened again, logged at debug only, since a stream quiet by
+  design (`execution_payload_available` before gloas, on a node that sends no
+  keep-alives) does that every minute. While a stream is down the duties keep
+  their offsets, so a broken stream costs the early start and nothing else.
+- Aggregation and sync contributions keep their own offsets, and nothing waits
+  after the block before attesting.
+
+`ethlambda_validator_duty_triggers_total` counts what started each duty (see
+[Metrics](./metrics.md#validator-client)). An ethlambda beacon node builds its
+`single_attestation` events while any client is subscribed to any topic, so this
+client's subscription turns that work on (see
+[`rpc.md`](rpc.md#get-ethv1events)). `--disable-event-stream` reads no stream.
 
 ### Proposer duties are less durable than attester ones
 

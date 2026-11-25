@@ -205,6 +205,17 @@ pub(crate) struct ValidatorOptions {
     /// instead, about 2.4 s per key across the cores.
     #[arg(long)]
     pub(crate) xmss_cache_url: Option<String>,
+
+    /// Read no beacon node's event stream: every attestation and sync
+    /// committee message waits for its offset into the slot, and every
+    /// payload timeliness committee vote for its deadline, even when the
+    /// slot's block or payload has already arrived.
+    ///
+    /// On by default, the stream lets those duties go out as soon as the
+    /// block (or the payload) does. Off is for a beacon node whose stream is
+    /// broken, or a proxy in front of it that holds events back.
+    #[arg(long, default_value = "false")]
+    pub(crate) disable_event_stream: bool,
 }
 
 impl ValidatorOptions {
@@ -325,6 +336,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         doppelganger_protection: options.enable_doppelganger_protection,
         vrf_state_url: options.vrf_state_url,
         xmss_cache_url: options.xmss_cache_url,
+        event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, stop)
         .await
@@ -356,6 +368,7 @@ mod tests {
             enable_doppelganger_protection: false,
             vrf_state_url: None,
             xmss_cache_url: None,
+            disable_event_stream: false,
         }
     }
 

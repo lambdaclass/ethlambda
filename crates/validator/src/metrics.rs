@@ -7,9 +7,11 @@
 use std::sync::LazyLock;
 
 use ethlambda_metrics::{
-    Histogram, IntCounter, IntGauge, TimingGuard, register_histogram, register_int_counter,
-    register_int_gauge,
+    Histogram, IntCounter, IntCounterVec, IntGauge, TimingGuard, register_histogram,
+    register_int_counter, register_int_counter_vec, register_int_gauge,
 };
+
+use crate::head_monitor::{Duty, Fired};
 
 static VALIDATORS_LOADED: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
@@ -444,6 +446,37 @@ static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .unwrap()
 });
 
+/// What started each slot's attestation, sync committee message and payload
+/// timeliness committee vote, once per duty per slot. See
+/// `crate::head_monitor`.
+///
+/// `event` is the beacon node's event for the slot's block (its payload, for
+/// the vote), confirmed by the node's own data. `deadline` is the clock's
+/// offset with no such event before it, which is every slot with the event
+/// stream off or down. `mismatch` is an event the node's data did not bear
+/// out (or had not answered by the deadline), so the duty waited for its
+/// deadline after all: a rise there points
+/// at beacon nodes that disagree with each other, or a vote whose payload was
+/// announced but not seen present.
+static DUTY_TRIGGERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "ethlambda_validator_duty_triggers_total",
+        "Slot duties by what started them: the beacon node's event, or the clock's deadline",
+        &["duty", "trigger"]
+    )
+    .unwrap()
+});
+
+/// Event streams open, one per beacon node and topic. Zero with
+/// `--disable-event-stream`.
+static EVENT_STREAMS_OPEN: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_event_streams_open",
+        "Beacon node event streams open, one per node and topic"
+    )
+    .unwrap()
+});
+
 /// Register every series with the Prometheus registry so `/metrics` lists them
 /// at zero from startup, rather than only after whatever first touches them.
 ///
@@ -493,6 +526,13 @@ pub fn init() {
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
+    // A labelled series exists only once a label pair is touched.
+    for duty in Duty::ALL {
+        for fired in Fired::ALL {
+            DUTY_TRIGGERS_TOTAL.with_label_values(&[duty.as_str(), fired.as_str()]);
+        }
+    }
+    LazyLock::force(&EVENT_STREAMS_OPEN);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -661,6 +701,33 @@ pub fn time_slashing_protection_write() -> TimingGuard {
 
 pub fn inc_slashing_protection_write_failures() {
     SLASHING_PROTECTION_WRITE_FAILURES_TOTAL.inc();
+}
+
+/// Count what started one slot's `duty`.
+pub fn inc_duty_trigger(duty: Duty, fired: Fired) {
+    DUTY_TRIGGERS_TOTAL
+        .with_label_values(&[duty.as_str(), fired.as_str()])
+        .inc();
+}
+
+/// One event stream counted as open, for as long as this is held.
+///
+/// A guard rather than an increment and a decrement: a reader aborted while
+/// its stream is open (`HeadMonitor`'s drop) never reaches the code after the
+/// stream ends, but its future's locals are still dropped.
+pub struct OpenEventStream(());
+
+impl OpenEventStream {
+    pub fn count() -> Self {
+        EVENT_STREAMS_OPEN.inc();
+        Self(())
+    }
+}
+
+impl Drop for OpenEventStream {
+    fn drop(&mut self) {
+        EVENT_STREAMS_OPEN.dec();
+    }
 }
 
 /// Record how long after a slot's start its attestations were accepted.
