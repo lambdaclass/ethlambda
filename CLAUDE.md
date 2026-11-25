@@ -102,7 +102,9 @@ make test                                    # All tests + forkchoice spec tests
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
 jobs because together they no longer fit a runner's disk. `CONSENSUS_CRATES` in
 the Makefile names the first; `test-node` is the workspace minus it. Run one half
-directly when iterating on it.
+directly when iterating on it. `test-consensus` also runs the PQ fork's
+end-to-end leanVM prover test by name (`leanvm_proofs_merge_and_verify`, ignored
+by a plain `cargo test`, which spends minutes on it unoptimized).
 
 ### Docs-only changes skip CI
 
@@ -303,16 +305,27 @@ actual_slot = finalized_slot + 1 + relative_index
   signatures concatenated), or real leanVM proofs made in process
   (`stark::leanvm`, leanVM `1e997c99`, bindings v0.17.0, the one release
   pq-devnet-1 runs for signer, prover and verifier; `lean_vm` with its
-  experimental prover, `cpu_tiers` off). `run_node` installs leanVM as soon
+  experimental prover). `run_node` installs leanVM as soon
   as `--network` resolves to a network that schedules PQ, on
-  `--pq-prover-threads` threads (0: one per core); the reference is then
-  only what the spec tests run. v0.17.0 removed pq-devnet-0's
+  `--pq-prover-threads` threads (0: one per core, never more than the
+  cores); the reference is then only what the spec tests run. Setup ends
+  with a self-check (one signature proved and verified) that fails startup,
+  and every call into leanVM is wrapped in `leanvm::guarded`, since a panic
+  there would otherwise unwind into the chain actor importing a block: it
+  reads as a proof that does not verify, or was not made. The image builds
+  the prover with leanVM's CPU tiers (`leanvm-cpu-tiers` feature plus
+  leanVM's `scripts/tier-rustc` as `RUSTC_WRAPPER`, fetched by the
+  Dockerfile at the pinned revision), picked at run time; a plain `cargo
+  build` has no tiers and proves on `.cargo/config.toml`'s baseline.
+  `ethlambda pq-prover-check` measures the prover on a host against a
+  seat's 2.4 s proving window. v0.17.0 removed pq-devnet-0's
   `leanvm-sidecar`, so the image builds none, and `ethlambda-pq`
   (`bin/ethlambda/pq/`) is now a shim that execs `ethlambda`, kept for
   launchers that still call it. A proof from another leanVM revision does not
   verify, and nothing on the wire says why; the root `leanvm-revision` file
-  names the pin. The two encodings do not verify each other's proofs. Never
-  pass one scheme's key to the other
+  names the pin (a test holds it equal to the manifest's `rev`s, and the
+  Dockerfile reads it). The two encodings do not verify each other's proofs.
+  Never pass one scheme's key to the other
 - Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
   (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
   constants in `common/crypto/src/signature.rs`
@@ -880,7 +893,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
   `4c296784`, pq-devnet-1's spec: staggered aggregators of `4595f0fc`, VRF
-  secrets of `b5d422b2`, `X_MAX_COMMITTEE_COUNT_PER_SLOT` of `af898d07`,
+  secrets of `b5d422b2`, `X_MAX_COMMITTEE_COUNT_PER_SLOT` of `af898d07` (one
+  per process, selected with the preset: absent it is the preset's
+  `MAX_COMMITTEES_PER_SLOT_PQ`, above that it is refused at startup),
   keccak256 legacy keys of `4c296784`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
@@ -897,8 +912,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   with its own validators: the validator client derives each
   validator's leanXMSS key and VRF seed from its BLS key
   (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
-  in the aggregation committee), casts PTC votes and proposes, each signature
-  at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
+  in the aggregation committee, each seat on its own; the node skips a seat's
+  proof when an earlier seat of its own already proved every vote collected),
+  casts PTC votes and proposes, each signature at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
   `2^31` leaves, each committing to its slot's secret) takes about 100 s of
   every core per key, so a background thread hashes it after startup (in a
   rayon pool of its own: on the global one it starves every leanXMSS

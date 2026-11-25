@@ -165,7 +165,7 @@ something specific here.
 |---|---|---|
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 | `--bootnodes` | none: the network's own list alone | Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network's own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See [Bootnodes on `beacon`](#bootnodes-on-beacon) |
-| `--pq-prover-threads` | `0` | How many threads leanVM's in-process prover runs on, 0 for one per core. Read only on a network that schedules PQ, where the node makes and checks the fork's attestation proofs with leanVM bindings v0.17.0 (`1e997c99`, the release pq-devnet-1 runs; a proof from another revision does not verify). The image's `ethlambda-pq` script, pq-devnet-0's sidecar supervisor, is now a shim that execs `ethlambda` and maps `LEANVM_THREADS` to this flag |
+| `--pq-prover-threads` | `0` | How many threads leanVM's in-process prover runs on, 0 for one per core; more than the machine's cores are lowered to them with a warning. Read only on a network that schedules PQ, where the node makes and checks the fork's attestation proofs with leanVM bindings v0.17.0 (`1e997c99`, the release pq-devnet-1 runs; a proof from another revision does not verify). The node proves and verifies one signature at startup and refuses to start if that fails. The image's `ethlambda-pq` script, pq-devnet-0's sidecar supervisor, is now a shim that execs `ethlambda` and maps `LEANVM_THREADS` to this flag |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,
@@ -969,6 +969,23 @@ falls in. From deneb on that is `CAPELLA_FORK_VERSION` whatever epoch the exit
 names (EIP-7044), an epoch from before deneb included, so a pre-signed exit
 stays valid across every fork to come. The command signs that way, and the
 [keymanager API](#the-keymanager-api)'s `voluntary_exit` route does too.
+
+## `pq-prover-check`
+
+Proves and verifies one PQ-fork aggregate with leanVM on the machine it runs
+on, and reports what it took against an aggregator seat's proving window
+(2.4 s of a 12-second slot). No network and no data directory: it answers
+whether a host keeps up before a devnet's genesis.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--signatures` | `128` | How many signatures the aggregate proves, 1 to 4096: one committee's attesters |
+| `--threads` | `0` | leanVM prover threads, 0 for one per core: the node's `--pq-prover-threads` |
+| `--rounds` | `3` | How many times to prove; the first round pays for whatever the prover sets up on first use |
+
+Each round logs `prove_ms`, `verify_ms` and `proof_bytes`, and the last line
+says whether the slowest round fits the window (a warning when it does not).
+See [`beacon_pq.md`](beacon_pq.md#proofs) for what the prover is built with.
 
 ## `slashing-protection`
 

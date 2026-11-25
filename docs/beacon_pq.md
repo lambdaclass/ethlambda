@@ -157,13 +157,37 @@ proofs through one of two backends, chosen once per process:
   (`MAX_RECURSIONS`) at a time. The node installs it itself, as soon as
   `--network` resolves to a network that schedules PQ, after
   `lean_vm::setup` starts the prover's pool (`--pq-prover-threads`, 0 for
-  one thread per core) and builds its aggregation program. leanVM proves one
-  proof at a time per process; verifying does not wait for a proof.
-  It builds with leanVM's experimental prover (the one pq-devnet-0's
-  sidecar ran; the same proofs as the stable one, faster). leanVM's
-  `cpu_tiers` stays off: it needs leanVM's `scripts/tier-rustc` as the
-  rustc wrapper, and the node's own CPU baseline (`.cargo/config.toml`)
-  already gives the prover its carryless multiply.
+  one thread per core, and never more than the cores) and builds its
+  aggregation program. leanVM proves one proof at a time per process;
+  verifying takes no lock and runs on the calling thread, so it does not
+  wait for a proof.
+- **The self-check.** Setup ends by proving and verifying one throwaway
+  signature, and checking the proof does not verify against another claim.
+  A prover that cannot run on the machine stops the node at startup rather
+  than missing every aggregation duty, and the `leanVM prover ready` line
+  carries what the proof and its check took.
+- **Panics stay inside.** In a sidecar, an input that crashed leanVM cost
+  that process a restart. In the node, the caller is the thread importing a
+  block or judging gossip, and the proof bytes are a peer's. Every call into
+  leanVM is wrapped (`leanvm::guarded`): a panic in the verifier reads as a
+  proof that does not verify, one in the prover as a proof that was not
+  made, and both are logged as `leanVM panicked`.
+- **The build.** leanVM's experimental prover (the one pq-devnet-0's sidecar
+  ran; the same proofs as the stable one, faster). The image builds with the
+  `leanvm-cpu-tiers` feature and leanVM's `scripts/tier-rustc` as
+  `RUSTC_WRAPPER` (the Dockerfile fetches it at the pinned revision): the
+  prover is compiled once more per CPU tier (AVX-512, GFNI and VPCLMULQDQ
+  on x86-64, SHA3 on arm64) and picks the fastest one the host has at run
+  time, as the other clients' leanVM builds do. Every other crate keeps the
+  portable baseline in `.cargo/config.toml`. A build without the feature,
+  which is what `cargo build` gives, proves on that baseline alone, and
+  leanVM says so on stderr at the first proof when the CPU has more.
+- **What it costs.** `ethlambda pq-prover-check` proves and verifies an
+  aggregate of `--signatures` claims (128 by default) on the machine it runs
+  on and reports each round against a seat's proving window, 2.4 s of a
+  12-second slot. On 14 cores of an Apple M4 Max, a `release-fast` build
+  proves 128 signatures in about 0.28 s and 512 in about 0.86 s; verifying
+  takes about 6 ms either way, and the proofs are 160 to 200 KB.
 
 pq-devnet-0 ran the prover as a separate `leanvm-sidecar` (bindings v0.15.0),
 which the image built and its `ethlambda-pq` supervisor started and
@@ -251,10 +275,14 @@ validators into fewer, larger committees. It may not exceed the preset's
 `MAX_COMMITTEES_PER_SLOT_PQ`, the length of `CommitteeBits`. The state
 transition counts committees from a state alone, so the node selects the cap
 once per process from the network's `config.yaml`, beside the preset
-(`network::select_committee_cap`); a value out of range is moved into it
-with a warning, a process that selects none (the spec tests) runs on the
-preset's value, which the specification's own configs equal, and a resume
-refuses a changed cap. The committee cache's `ShufflingKey`
+(`network::select_committee_cap`). A file that omits the key runs on its
+preset's `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification's own
+configs set it to, not on the mainnet 16 an absent key otherwise parses as:
+a minimal network whose file predates the key keeps its four committees. A
+value above the preset's is refused at startup, as the specification
+forbids it; a zero is one committee, as `get_committee_count_per_slot` has
+it. A process that selects no cap (the spec tests) runs on the preset's
+value, and a resume refuses a changed cap. The committee cache's `ShufflingKey`
 carries the cap, since a state either side of the fork names the same epoch and
 deciding block but a different shuffling.
 
@@ -435,8 +463,13 @@ asks for again.
   join the committee's subnet and register it with the aggregating validator,
   the node keeps the validated votes' signatures for registered committees,
   and at each seat's cutoff proves what it has for the committees one of its
-  validators holds that seat in. The client asks for each aggregate at its
-  seat's broadcast time; `GET aggregate_attestation` answers the proved
+  validators holds that seat in. A node holding two seats of one committee
+  proves at the later one only if a vote arrived since the earlier one's
+  proof (`PqSignaturePool::is_proven`): otherwise the aggregate would be the
+  same, for as long again on a prover that makes one proof at a time. The
+  client asks for each aggregate at its seat's broadcast time, every seat on
+  its own, so a request the node holds while a proof is still being made
+  does not delay the seats after it; `GET aggregate_attestation` answers the proved
   aggregate and its proof, or a 404 when an aggregate already broadcast for
   the committee, gossip's or this node's, covers every attester of it
   (`should_broadcast_aggregate`). The client signs the `AggregateAndProof` at
@@ -521,16 +554,24 @@ What the package does for ethlambda on a PQ network:
   (`xmss_pubkey_url`) and the VRF states (`vrf_state_url`); every root
   hashes a whole tree, minutes a validator, and the run is resumable.
 
+Before genesis, `docker run --rm --entrypoint ethlambda ethlambda:pq-local
+pq-prover-check` on a devnet host says whether its prover keeps up with a
+committee of 128 (see [Proofs](#proofs)).
+
 Limits worth knowing:
 
 - **At least 32 validators** on the mainnet preset: gloas's `compute_ptc`
   asserts every slot has an attester, so with fewer, epoch processing fails
   at the first epoch boundary (`compute_balance_weighted_selection: total >
   0`) and the chain stops. The specification does the same.
-- **Memory.** leanVM's prover keeps the pages of its largest proof resident
-  for the life of the process (its jemalloc never decays dirty pages), now
-  inside the node rather than in a sidecar. On Docker Desktop's default 8 GB
-  VM, give a node that only verifies fewer `--pq-prover-threads`.
+- **Memory.** A proof's buffers are now the node's own allocations, on top
+  of everything else it holds, where they were a sidecar's. The node's
+  jemalloc returns them to the kernel some seconds after the proof, as it
+  does any freed memory. leanVM's own builds instead keep them
+  (`dirty_decay_ms:-1`), so the next proof does not fault each page in
+  again, at the price of the process holding its peak; the image's
+  jemalloc reads `MALLOC_CONF`, so `MALLOC_CONF=dirty_decay_ms:-1` trades
+  the same way, for the whole node. Not measured here.
 - **Lighthouse's envelopes over req/resp.** Its `pq-devnet-0` image (last
   checked at `sha256:f571048f`) answered
   `execution_payload_envelopes_by_{range,root}` with a gloas-shaped envelope
