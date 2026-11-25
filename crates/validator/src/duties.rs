@@ -98,6 +98,19 @@ struct EpochDuties<T> {
     duties: Vec<T>,
 }
 
+/// The v2 root an epoch's attester and payload committee schedules were last
+/// checked against (see [`DutiesService::follow_dependent_root`]).
+#[derive(Debug, Clone, Copy)]
+struct Followed {
+    root: Root,
+    /// Whether the checks are done with this root: the schedules hold it, or
+    /// a second refetch for it answered off it too, as a node whose roots
+    /// disagree for good does. Until then each check refetches, so a refetch
+    /// answered from before the reorg (a fallback node that had not caught up,
+    /// say) is made again rather than taken as the node's last word.
+    settled: bool,
+}
+
 pub struct DutiesService<B> {
     beacon_node: Arc<B>,
     /// Validator indices this client signs for, resolved from public keys.
@@ -130,7 +143,7 @@ pub struct DutiesService<B> {
     /// committee schedules were last checked against by
     /// [`Self::follow_dependent_root`], recorded only once the refetches that
     /// check called for answered.
-    followed: HashMap<Epoch, Root>,
+    followed: HashMap<Epoch, Followed>,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -347,15 +360,20 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// # When a root counts as moved
     ///
     /// When it differs from the one the schedule is held with *and* from the
-    /// v2 root the last check of this epoch to get through compared it with
-    /// (`followed`). The second condition is what stops a node whose roots
-    /// disagree for any other reason from costing a refetch, a full shuffle on
-    /// some nodes, every slot: that node's v2 root does not move, so it is
-    /// refetched once at most. A real reorg is still caught: it moves the v2
-    /// root away from the one last followed. That root is recorded only once
-    /// the refetches it called for answered, so one that failed or was cut off
-    /// at the slot's end is made again at the next check, not dropped because
-    /// the proposer schedule (replaced first) already holds the new root.
+    /// v2 root the checks of this epoch settled on (`followed`). The second
+    /// condition is what stops a node whose roots disagree for any other
+    /// reason from costing a refetch, a full shuffle on some nodes, every
+    /// slot: that node's v2 root does not move, so it is refetched twice at
+    /// most. A real reorg is still caught: it moves the v2 root away from the
+    /// one settled on.
+    ///
+    /// A root is settled on only once the refetches it called for answered,
+    /// so one that failed or was cut off at the slot's end is made again at
+    /// the next check, not dropped because the proposer schedule (replaced
+    /// first) already holds the new root. And only once the schedules hold
+    /// it, or a second refetch for it also answered off it: a refetch
+    /// answered from before the reorg, by a fallback node that had not caught
+    /// up, is made again at the next check.
     ///
     /// A schedule not held at all is fetched, so a lookahead fetch that failed
     /// at the epoch refresh is made good within a slot rather than an epoch.
@@ -363,7 +381,9 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         if self.indices.is_empty() {
             return Ok(false);
         }
-        let previous = self.followed.get(&epoch).copied();
+        let followed = self.followed.get(&epoch).copied();
+        let settled = followed.filter(|followed| followed.settled);
+        let previous = settled.map(|followed| followed.root);
         let root = self
             .fetch_proposers(epoch, ProposerDutiesVersion::V2)
             .await?;
@@ -379,7 +399,13 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         if ptc && stale(self.ptc.get(&epoch).map(|held| held.dependent_root)) {
             self.refresh_ptc(epoch).await?;
         }
-        self.followed.insert(epoch, root);
+
+        let holds = |held: Option<Root>| held == Some(root);
+        let agrees = holds(self.by_epoch.get(&epoch).map(|held| held.dependent_root))
+            && (!ptc || holds(self.ptc.get(&epoch).map(|held| held.dependent_root)));
+        let second = followed.is_some_and(|followed| followed.root == root);
+        let settled = agrees || second;
+        self.followed.insert(epoch, Followed { root, settled });
         Ok(moved)
     }
 
@@ -1118,19 +1144,23 @@ mod tests {
     }
 
     /// A node whose attester root never matches its v2 root, for whatever
-    /// reason, costs one attester refetch at most, not one every slot: on an
-    /// ethlambda node each is a full shuffle.
+    /// reason, costs two attester refetches at most, not one every slot: on
+    /// an ethlambda node each is a full shuffle.
     #[tokio::test]
     async fn roots_that_disagree_without_moving_are_not_refetched_every_slot() {
         let node = Arc::new(MockBeaconNode::new());
         let mut service = following(&node).await;
         node.set_proposers_v2(4, root(7), vec![proposer(1337, 131)]);
+        let before = node.duties_call_count();
 
-        service
-            .follow_dependent_root(4, false)
-            .await
-            .expect("checks");
-        let after_first = node.duties_call_count();
+        for _ in 0..2 {
+            service
+                .follow_dependent_root(4, false)
+                .await
+                .expect("checks");
+        }
+        let after_second = node.duties_call_count();
+        assert_eq!(after_second, before + 2, "the second settles it");
         for _ in 0..3 {
             service
                 .follow_dependent_root(4, false)
@@ -1138,8 +1168,32 @@ mod tests {
                 .expect("checks");
         }
 
-        assert_eq!(node.duties_call_count(), after_first);
+        assert_eq!(node.duties_call_count(), after_second);
         assert_eq!(service.at_slot(130, 4).len(), 1, "the schedule is kept");
+    }
+
+    /// A refetch answered from before the reorg, as a fallback node that has
+    /// not caught up answers it, is made again at the next check rather than
+    /// taken as the node's last word.
+    #[tokio::test]
+    async fn a_refetch_answered_from_before_the_reorg_is_made_again() {
+        let node = Arc::new(MockBeaconNode::new());
+        let mut service = following(&node).await;
+        node.set_proposers_v2(4, root(9), vec![proposer(1337, 141)]);
+
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+        assert!(!moved, "the attester answer is still the old one");
+
+        node.set_duties(4, root(9), vec![duty(1337, 140, 5)]);
+        let moved = service
+            .follow_dependent_root(4, false)
+            .await
+            .expect("checks");
+        assert!(moved);
+        assert_eq!(service.at_slot(140, 4)[0].committee_index, 5);
     }
 
     /// A lookahead the epoch refresh failed to fetch is fetched by the next

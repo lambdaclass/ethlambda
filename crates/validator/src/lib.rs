@@ -602,8 +602,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // they need nothing from the refresh below. That lookahead was
             // fetched at the previous epoch's first slot, one slot after the
             // block it depends on, so a one-slot reorg of a late block there
-            // leaves it stale, and this slot acts on it: the refresh below
-            // corrects it from the next slot only.
+            // leaves it stale. From fulu `follow_dependent_roots` refetches it
+            // within the previous epoch; before fulu this slot acts on it, and
+            // the refresh below corrects it from the next slot only.
             let slot_duties = withhold_uncleared(&context, slot, duties.at_slot(slot, epoch));
             let committee = duties.ptc_at_slot(slot, epoch);
             let sync_duties = duties.sync_at_slot(slot);
