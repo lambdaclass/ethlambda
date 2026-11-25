@@ -7,8 +7,13 @@
 //! short would otherwise read as a fast one.
 //!
 //! - [`duties_at_scale`] drives the duty services against [`MockBeaconNode`]
-//!   with thousands of keys over a few epochs, in the order the duty loop in
-//!   [`crate::run`] calls them, with a real slashing-protection file.
+//!   with thousands of keys over a few epochs, with a real
+//!   slashing-protection file. Each slot's duties run in the order the duty
+//!   loop in [`crate::run`] calls them. The epoch's subnet subscriptions and
+//!   builder registrations, which the loop spawns after the slot's proposal,
+//!   run here ahead of the slot and are timed on their own, so the first
+//!   slot's proposal does not compete with their signatures as it does in
+//!   the loop.
 //! - [`keystore_startup`] loads EIP-2335 keystores at the default scrypt
 //!   parameters through [`ValidatorStore::load`], as startup does.
 //!
@@ -26,9 +31,10 @@
 //! ```
 //!
 //! `ETHLAMBDA_SCALE_KEYS` (comma-separated, default `1000,10000`) and
-//! `ETHLAMBDA_SCALE_KEYSTORES` (default 50) change the sizes. Both read
-//! process-wide figures, the metrics registry and the resident memory, so
-//! running them together, or beside other tests, mixes their numbers.
+//! `ETHLAMBDA_SCALE_KEYSTORES` (default 50) change the sizes. Run each alone:
+//! `duties_at_scale` reads process-wide figures, the metrics registry and the
+//! resident memory, and `keystore_startup`'s scrypt threads take most cores
+//! and gigabytes of memory, so either moves the other's numbers.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,7 +63,7 @@ use crate::registration::RegistrationService;
 use crate::signing::SigningContext;
 use crate::slashing_protection::{SharedProtection, SlashingProtection};
 use crate::sync_committee::SyncCommitteeService;
-use crate::test_support::{settings, store_with_keys};
+use crate::test_support::{settings, small_secret, store_with_keys};
 use crate::{Preparations, refresh_epoch, subscriptions};
 
 /// The first epoch run: electra on mainnet's schedule. Not fulu, since the
@@ -84,6 +90,10 @@ const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 
 const KEYSTORE_PASSWORD: &str = "scale-test-password";
+
+/// The most threads the parallel decryption runs on: 16 of them hold 4 GiB of
+/// scrypt buffers at once, whatever the core count.
+const MAX_DECRYPT_THREADS: usize = 16;
 
 const WRITE_SECONDS: &str = "ethlambda_validator_slashing_protection_write_seconds";
 const SIGNING_FAILURES: &str = "ethlambda_validator_signing_failures_total";
@@ -178,7 +188,10 @@ fn keystore_startup() {
         })
         .collect();
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let chunks = keystores.chunks(count.div_ceil(cores));
+    // Each thread holds a 256 MiB scrypt buffer while it derives, so the
+    // threads are capped by memory as well as by cores.
+    let workers = cores.min(MAX_DECRYPT_THREADS);
+    let chunks = keystores.chunks(count.div_ceil(workers));
     let threads = chunks.len();
     let started = Instant::now();
     std::thread::scope(|scope| {
@@ -214,8 +227,9 @@ fn keystore_startup() {
     );
     let per_key_parallel = parallel / count as u32;
     println!(
-        "  decrypted on {threads} threads ({cores} cores): {} ({} per key; 1,000 keys {}, 10,000 \
-         keys {}), holding {} MiB of scrypt buffers at once",
+        "  decryption alone (parsed keystores, no file reads or pubkey derivation) on {threads} \
+         threads ({cores} cores, at most {MAX_DECRYPT_THREADS}): {} ({} per key; 1,000 keys {}, \
+         10,000 keys {}), holding {} MiB of scrypt buffers at once",
         show(parallel),
         show(per_key_parallel),
         show(per_key_parallel * 1_000),
@@ -334,6 +348,11 @@ async fn run_with(keys: usize) {
         rss: [rss_before, rss_setup, rss_after],
         polls,
     });
+    // Over every slot of the run some key is selected for each, so none at
+    // all means the mock stopped answering what the services ask for, and
+    // the times above are of steps that did nothing.
+    assert!(timings.aggregates > 0, "no aggregate published");
+    assert!(timings.contributions > 0, "no sync contribution published");
 }
 
 /// The duties one slot holds, as the duty loop takes them from the schedule.
@@ -344,8 +363,10 @@ struct SlotDuties {
 }
 
 /// What the duty loop does once an epoch, on its first slot: refresh, then
-/// the subnet subscriptions and builder registrations it spawns. Returns the
-/// validators the refresh resolved, whose preparations every slot re-sends.
+/// the subnet subscriptions and builder registrations it spawns. The loop
+/// spawns those two after the slot's proposal; here they are awaited ahead of
+/// the slot, each timed on its own. Returns the validators the refresh
+/// resolved, whose preparations every slot re-sends.
 #[allow(clippy::too_many_arguments)]
 async fn epoch_work(
     node: &Arc<MockBeaconNode>,
@@ -512,7 +533,10 @@ async fn slot_work(
 
     let (writes_after, write_seconds_after) = histogram(WRITE_SECONDS);
     let writes = writes_after - writes_before;
-    let expected = 1 + usize::from(duties.proposer.is_some());
+    // An empty batch writes nothing: below 32 keys some slots have no
+    // attester.
+    let expected =
+        usize::from(!duties.attester.is_empty()) + usize::from(duties.proposer.is_some());
     assert_eq!(
         writes as usize, expected,
         "slot {slot}: one write per block and per batch"
@@ -740,13 +764,6 @@ fn genesis_validators_root() -> Root {
     Root::repeat_byte(0x42)
 }
 
-/// The secret `test_support::store_with_keys` gives its key `index`.
-fn small_secret(index: usize) -> [u8; 32] {
-    let mut secret = [0u8; 32];
-    secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-    secret
-}
-
 /// An EIP-2335 keystore holding `secret` under `derived`, the scrypt key of
 /// [`KEYSTORE_PASSWORD`] and `salt`. Each gets its own IV.
 fn keystore_json(
@@ -807,10 +824,13 @@ fn sizes(variable: &str, default: &[usize]) -> Vec<usize> {
     value
         .split(',')
         .map(|size| {
-            size.trim()
+            let count: usize = size
+                .trim()
                 .replace('_', "")
                 .parse()
-                .unwrap_or_else(|_| panic!("{variable}: {size:?} is not a count"))
+                .unwrap_or_else(|_| panic!("{variable}: {size:?} is not a count"));
+            assert!(count > 0, "{variable}: a size must be at least 1");
+            count
         })
         .collect()
 }
@@ -981,7 +1001,8 @@ impl Timings {
             show(self.refresh.first()),
             self.refresh.summary(true)
         );
-        for (epoch, subscribed) in self.subscriptions.iter().enumerate() {
+        for (index, subscribed) in self.subscriptions.iter().enumerate() {
+            let epoch = START_EPOCH + index as u64;
             println!(
                 "  subnet subscriptions, epoch {epoch}:   {} for {} duties ({} aggregating, \
                  {} proofs past the signing budget)",
@@ -991,19 +1012,25 @@ impl Timings {
                 subscribed.dropped
             );
         }
-        for (epoch, registered) in self.registrations.iter().enumerate() {
-            let what = if epoch == 0 {
+        let timeout = crate::beacon_node::http::REGISTRATION_TIMEOUT;
+        for (index, registered) in self.registrations.iter().enumerate() {
+            let epoch = START_EPOCH + index as u64;
+            let what = if index == 0 {
                 "signs and sends"
             } else {
                 "sends"
             };
+            // A batch that times out ends the send; one answered just under
+            // the timeout does not, which is the longest a send can take.
             println!(
                 "  builder registrations, epoch {epoch}:  {} ({what}: {} batches, {:.0} KiB of \
-                 JSON; at the 12 s timeout per batch a slow node holds it {} s)",
+                 JSON; a node answering each batch just under the {} s timeout holds it up to \
+                 {} s)",
                 show(registered.elapsed),
                 registered.batches,
                 registered.json_bytes as f64 / 1024.0,
-                12 * registered.batches
+                timeout.as_secs(),
+                timeout.as_secs() * registered.batches as u64
             );
         }
         println!("per slot");
