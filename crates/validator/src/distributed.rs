@@ -19,9 +19,11 @@
 //! The middleware serves two Beacon API endpoints for this, which take the
 //! partial proofs and answer the combined ones:
 //!
-//! - `beacon_committee_selections`, for attester duties. Each epoch, in the
-//!   task the subnet subscriptions are sent from, every duty whose slot has
-//!   not passed is signed and sent, the current epoch's in one request and
+//! - `beacon_committee_selections`, for attester duties. Each epoch, and
+//!   whenever else the duty loop owes the subnet subscriptions again (a node
+//!   let back in, a swapped schedule, a dependent root that moved), in the
+//!   task the subscriptions are sent from, every duty whose slot has not
+//!   passed is signed and sent, the current epoch's in one request and
 //!   then the next epoch's in another, and each epoch's subscriptions go out
 //!   once its answer is in. Two requests, as `ethereum/beacon-APIs` asks
 //!   (its PR 573: a request with other slots than the other operators' makes
@@ -144,36 +146,41 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         self.partials().by_duty.retain(|(_, held), _| *held >= slot);
     }
 
-    /// What the duty loop starts each slot once the slot's block is out, in
-    /// place of the subscription task it starts with the mode off.
+    /// The epoch's round at `slot` for `attester_duties`, on a task of its
+    /// own: exchange, then subscribe (see [`Self::subscribe_epoch`]). What
+    /// the duty loop sends its subnet subscriptions through in this mode,
+    /// whatever owes them: a refresh that moved the attester schedule, a node
+    /// let back in, a swapped schedule, or a dependent root that moved.
+    pub fn spawn_round(
+        self: &Arc<Self>,
+        slot: Slot,
+        attester_duties: Vec<AttesterDutyDto>,
+        store: &Arc<RwLock<ValidatorStore>>,
+    ) {
+        let (this, store) = (self.clone(), store.clone());
+        tokio::spawn(async move { this.subscribe_epoch(slot, &attester_duties, &store).await });
+    }
+
+    /// What the duty loop starts each slot once the slot's block is out.
     ///
-    /// When the refresh moved the attester schedule (`resubscribe`), the
-    /// epoch's round: exchange, then subscribe, for `attester_duties`.
-    /// Otherwise a retry for the current epoch's duties still missing a
-    /// combined proof. And the slot's sync committee exchange for
-    /// `sync_duties`, bounded by the slot's contribution deadline, where its
-    /// proofs are read. Each runs on a task of
-    /// its own, so a slow middleware never delays a duty.
+    /// A retry for the current epoch's duties still missing a combined
+    /// proof, unless `round` says the loop has just started a round
+    /// ([`Self::spawn_round`]), which covers them. And the slot's sync
+    /// committee exchange for `sync_duties`, bounded by the slot's
+    /// contribution deadline, where its proofs are read. Each runs on a task
+    /// of its own, so a slow middleware never delays a duty.
     pub fn after_proposal(
         self: &Arc<Self>,
         slot: Slot,
-        resubscribe: bool,
+        round: bool,
         attester_duties: Vec<AttesterDutyDto>,
         sync_duties: Vec<SyncDutyDto>,
         store: &Arc<RwLock<ValidatorStore>>,
         clock: &SlotClock,
     ) {
-        let (this, store_for_attester) = (self.clone(), store.clone());
-        if resubscribe {
-            tokio::spawn(async move {
-                this.subscribe_epoch(slot, &attester_duties, &store_for_attester)
-                    .await
-            });
-        } else {
-            tokio::spawn(async move {
-                this.retry(slot, &attester_duties, &store_for_attester)
-                    .await
-            });
+        if !round {
+            let (this, store) = (self.clone(), store.clone());
+            tokio::spawn(async move { this.retry(slot, &attester_duties, &store).await });
         }
 
         if sync_duties.is_empty() {
