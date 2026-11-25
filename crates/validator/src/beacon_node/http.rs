@@ -143,6 +143,14 @@ fn error_text(text: &str) -> String {
     ethlambda_types::text::one_line(text, ERROR_TEXT_LIMIT)
 }
 
+/// A JSON answer's decode error as [`error_text`] writes it. serde's message
+/// can quote the node's own text, the whole of an unexpected string among
+/// it, so it is bounded and written out like a failed answer's body before
+/// it reaches an error and the log line that prints it.
+fn decode_text(err: &serde_json::Error) -> String {
+    error_text(&err.to_string())
+}
+
 /// [`read_error_body`] as [`error_text`] shows it.
 async fn error_body(response: reqwest::Response) -> String {
     error_text(&read_error_body(response).await)
@@ -575,8 +583,9 @@ impl HttpBeaconNode {
         )?;
         let bytes = Self::answer_bytes(url, response).await?;
         let answer: ProduceBlockV3Response = serde_json::from_slice(&bytes).map_err(|err| {
-            Self::relayed_error(&bytes)
-                .unwrap_or_else(|| Error::Decode(format!("produceBlockV3 JSON answer: {err}")))
+            Self::relayed_error(&bytes).unwrap_or_else(|| {
+                Error::Decode(format!("produceBlockV3 JSON answer: {}", decode_text(&err)))
+            })
         })?;
 
         let fork = match (answer.version, header_version) {
@@ -934,7 +943,7 @@ impl HttpBeaconNode {
         // whole body with no limit (see `ANSWER_READ_LIMIT`).
         let url = response.url().to_string();
         let bytes = Self::answer_bytes(url, response).await?;
-        serde_json::from_slice(&bytes).map_err(|err| Error::Decode(err.to_string()))
+        serde_json::from_slice(&bytes).map_err(|err| Error::Decode(decode_text(&err)))
     }
 }
 
@@ -1448,15 +1457,18 @@ impl BeaconNodeApi for HttpBeaconNode {
                 )));
             }
             ForkName::Electra | ForkName::Fulu => {
-                let dto: AttestationDto = serde_json::from_value(response.data)
-                    .map_err(|err| Error::Decode(format!("electra aggregate: {err}")))?;
+                let dto: AttestationDto = serde_json::from_value(response.data).map_err(|err| {
+                    Error::Decode(format!("electra aggregate: {}", decode_text(&err)))
+                })?;
                 AggregateKind::Electra(Attestation::try_from(&dto)?)
             }
             // Gloas's attestation is its own container, with its own hash tree
             // root, so it is decoded as one and signed over as one.
             ForkName::Gloas => {
                 let attestation: gloas::Attestation = serde_json::from_value(response.data)
-                    .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
+                    .map_err(|err| {
+                        Error::Decode(format!("gloas aggregate: {}", decode_text(&err)))
+                    })?;
                 AggregateKind::Gloas(attestation)
             }
         };
@@ -2239,6 +2251,29 @@ mod tests {
         let text = err.to_string();
         assert!(!text.contains(['\r', '\n', '\u{1b}']), "{text}");
         assert!(text.contains("electra\\r\\n\\u{1b}[31m"), "{text}");
+    }
+
+    /// serde's message for a JSON answer that does not decode quotes the
+    /// node's text, the whole of an unexpected string. It reaches the error
+    /// bounded and written out, however long the string.
+    #[tokio::test]
+    async fn a_json_answer_that_does_not_decode_reaches_the_error_bounded() {
+        let quoted = format!("{}\n\u{1b}[2J", "x".repeat(4 * ERROR_TEXT_LIMIT));
+        let reply = serde_json::json!({ "data": { "is_syncing": quoted } });
+        let reply = serde_json::to_vec(&reply).expect("serialises");
+        let headers = vec![("content-type", "application/json")];
+        let served = serve(200, headers, reply).await;
+        let err = served
+            .node
+            .is_optimistic_or_syncing()
+            .await
+            .expect_err("a string is not a bool");
+        let Error::Decode(text) = err else {
+            panic!("got {err:?}");
+        };
+        assert!(text.len() <= ERROR_TEXT_LIMIT, "{} bytes", text.len());
+        assert!(text.ends_with("..."), "{text}");
+        assert!(!text.contains(['\n', '\u{1b}']), "{text}");
     }
 
     #[tokio::test]
