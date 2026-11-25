@@ -882,8 +882,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        // Quiet: the preferences service reports its own failure once per
-        // epoch, and no duty depends on this answer.
+        // Quiet: both callers report their own failure, the preferences
+        // service once per epoch and the duty loop at each fetch it needs.
         self.try_each_quiet("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
             .await
     }
