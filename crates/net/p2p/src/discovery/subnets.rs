@@ -69,9 +69,20 @@ const HUNT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Long enough for the last hunt's dials to become connections, so the next
 /// one counts them instead of hunting for peers already on their way; a dial
 /// that times out takes ten seconds by itself. On a small network that has no
-/// more peers on a subnet to give, this is also the rate a hunt that finds
-/// nothing is repeated at.
+/// more peers on a subnet to give, this is also the rate a hunt whose walk saw
+/// the network and matched nothing is repeated at. A hunt that never reached
+/// the network waits [`HUNT_RETRY`] instead (see [`pause_after`]).
 const HUNT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Pause after a hunt that handed over nothing and never reached the network:
+/// its walk could not run, or ran and saw no node at all.
+///
+/// That is every node's first hunt, which starts while discovery knows its
+/// bootnodes only as bare endpoints, with no record to match and no contact to
+/// walk from until their first answers land. Such a hunt leaves no dials in
+/// flight for [`HUNT_INTERVAL`] to wait out, so waiting it would only leave the
+/// subscribed subnets unhunted for longer.
+const HUNT_RETRY: Duration = Duration::from_secs(5);
 
 /// How long a peer the hunt handed over stays out of later hunts.
 ///
@@ -187,7 +198,8 @@ fn short_subnets(
         .collect()
 }
 
-/// The hunt task: one hunt per [`HUNT_INTERVAL`] while anything is wanted.
+/// The hunt task: one hunt per [`HUNT_INTERVAL`] while anything is wanted,
+/// sooner while discovery has not reached the network yet ([`pause_after`]).
 ///
 /// A hunt first offers the matches discovery already holds, which costs no
 /// network round trip, and walks the network only for what that left short.
@@ -214,7 +226,7 @@ async fn hunt(
         let cached = handle.records_matching(predicate).await;
         let mut handed = offer(&filter, cached, MAX_HUNT_RESULTS, &mut offered, &found);
 
-        if handed < MAX_HUNT_RESULTS {
+        let walk = if handed < MAX_HUNT_RESULTS {
             // Rebuilt, so the walk does not count the peers just offered.
             let predicate = hunt_predicate(&filter, &subnets, &offered);
             match handle
@@ -239,11 +251,17 @@ async fn hunt(
                         "Subnet hunt finished"
                     );
                     handed += walked;
+                    Walk::Ran {
+                        nodes_seen: result.nodes_seen,
+                    }
                 }
                 // Not running is shutdown or a discovery that failed to start,
                 // and a refusal is a full query slot: either way, the next hunt
-                // asks again.
-                Err(err) => debug!(?subnets, cached = handed, %err, "Subnet hunt could not walk"),
+                // asks again, and soon if this one handed nothing over.
+                Err(err) => {
+                    debug!(?subnets, cached = handed, %err, "Subnet hunt could not walk");
+                    Walk::Failed
+                }
             }
         } else {
             debug!(
@@ -251,12 +269,41 @@ async fn hunt(
                 cached = handed,
                 "Subnet hunt satisfied from known records"
             );
-        }
+            Walk::Skipped
+        };
         if found.is_closed() {
             return;
         }
         crate::metrics::inc_subnet_hunt_peers(handed as u64);
-        tokio::time::sleep(HUNT_INTERVAL).await;
+        tokio::time::sleep(pause_after(handed, walk)).await;
+    }
+}
+
+/// How a hunt's network walk went, for [`pause_after`].
+#[derive(Debug, Clone, Copy)]
+enum Walk {
+    /// Not needed: what discovery already held filled the hunt.
+    Skipped,
+    /// Ran to an answer, having seen this many distinct nodes' records.
+    Ran { nodes_seen: usize },
+    /// Could not run.
+    Failed,
+}
+
+/// How long to wait after a hunt that handed `handed` peers over and whose
+/// walk went as `walk`.
+///
+/// [`HUNT_INTERVAL`] whenever there is something to wait for: finds being
+/// dialed, which the next hunt should count as connections, or a network that
+/// answered and had nothing more to give. [`HUNT_RETRY`] when there is neither,
+/// a hunt that handed nothing over and never reached the network, which is
+/// what a hunt run before discovery has any records looks like.
+fn pause_after(handed: usize, walk: Walk) -> Duration {
+    match walk {
+        Walk::Skipped => HUNT_INTERVAL,
+        _ if handed > 0 => HUNT_INTERVAL,
+        Walk::Ran { nodes_seen } if nodes_seen > 0 => HUNT_INTERVAL,
+        Walk::Ran { .. } | Walk::Failed => HUNT_RETRY,
     }
 }
 
@@ -405,6 +452,31 @@ mod tests {
             assert!(handed.insert(peer.node_id), "handed over twice");
         }
         assert_eq!(handed.len(), 3);
+    }
+
+    #[test]
+    fn a_hunt_that_never_reached_the_network_is_retried_soon() {
+        // The first hunt after startup: discovery knows its bootnodes only as
+        // bare endpoints, so the walk sees nothing, and nothing is being
+        // dialed that the full interval would wait for.
+        assert_eq!(pause_after(0, Walk::Ran { nodes_seen: 0 }), HUNT_RETRY);
+        assert_eq!(pause_after(0, Walk::Failed), HUNT_RETRY);
+    }
+
+    #[test]
+    fn a_hunt_with_dials_in_flight_or_a_network_that_answered_waits_the_interval() {
+        assert_eq!(
+            pause_after(0, Walk::Ran { nodes_seen: 40 }),
+            HUNT_INTERVAL,
+            "the network answered and had no match: asking again at once finds none either"
+        );
+        assert_eq!(
+            pause_after(2, Walk::Failed),
+            HUNT_INTERVAL,
+            "cached finds are being dialed, and the next hunt should count them"
+        );
+        assert_eq!(pause_after(2, Walk::Ran { nodes_seen: 0 }), HUNT_INTERVAL);
+        assert_eq!(pause_after(MAX_HUNT_RESULTS, Walk::Skipped), HUNT_INTERVAL);
     }
 
     #[tokio::test]
