@@ -507,6 +507,38 @@ where
         );
     }
 
+    // Every beacon node's sync status, probed a sixth of a slot ahead of each
+    // boundary on its own clock: the duty loop reads it at the boundary and
+    // never waits for it. Aborted once the client stops. See
+    // `beacon_node::health`.
+    //
+    // It loops for the life of the client, so it ends only by panicking. The
+    // duties then go on as before the check existed (every slot signs, and
+    // requests walk the nodes in command-line order), which is logged here
+    // rather than left to pass unnoticed.
+    let probes = tokio::spawn(crate::beacon_node::health::run(
+        beacon_node.clone(),
+        clock.clone(),
+    ));
+    let stop_probes = probes.abort_handle();
+    tokio::spawn(async move {
+        let ended = probes.await;
+        if !ended
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            let reason = match ended {
+                Err(err) => err.to_string(),
+                Ok(()) => "its task returned".to_string(),
+            };
+            error!(
+                %reason,
+                "The beacon node sync probe stopped; no slot is withheld for a syncing node from \
+                 now on, until the validator client is restarted"
+            );
+        }
+    });
+
     // The check runs on its own clock, three quarters into each slot, so a
     // slow duty never delays it and a slow liveness query never delays a
     // duty. Its handle is kept: the duties race it below, and it is aborted
@@ -569,6 +601,19 @@ where
             let epoch = clock.epoch_of(slot);
             let refresh_due = last_epoch != Some(epoch);
 
+            // The slot's sync check, from the probe taken ahead of this
+            // boundary. A slot it withholds signs nothing and skips the epoch
+            // refresh, which the next slot that passes tries again. Only the
+            // fee recipient re-send goes on, since it signs nothing and a node
+            // restarted mid-sync must be prepared before its first proposal.
+            // Ahead of the readmission read below, so a node let back in
+            // during a withheld slot is still sent what it missed at the next
+            // slot that passes.
+            if !crate::beacon_node::health::slot_signs(beacon_node.health(), slot) {
+                preparations.after_slot(slot, &resolved, &store);
+                continue;
+            }
+
             // Read before the refresh below, so a node let back in, or a
             // schedule swapped, while it runs is seen at the next slot rather
             // than taken as covered by sends the refresh made before it.
@@ -580,8 +625,8 @@ where
             schedule_seen = schedule;
 
             // Snapshot the pubkeys and let the guard drop right here, before
-            // `refresh_epoch`'s awaits (a sync check, the duties fetches, a
-            // validator lookup). Passing the guard itself in used to extend it
+            // `refresh_epoch`'s awaits (the duties fetches, a validator
+            // lookup). Passing the guard itself in used to extend it
             // across that whole call, because `&*store.read().await` as a match
             // scrutinee has its temporary lifetime extended to the entire
             // match. Holding a read lock that long lets the keymanager's write
@@ -669,8 +714,10 @@ where
             // validated. The schedule can be held regardless, prefetched a
             // whole epoch ahead from fulu, where a refresh that checked the
             // node first used to be the only source of an epoch's proposers.
-            // Nothing is asked ahead of the block for this, so an epoch's
-            // first slot proposes on the previous refresh's word.
+            // The slot's own sync check above, from the probe taken ahead of
+            // the boundary, already withheld this slot if every node that
+            // answered was syncing or optimistic; this is the backstop for a
+            // node that refused the last refresh's duties fetch as syncing.
             if let Some(duty) = duties.proposer_at_slot(slot, epoch).cloned() {
                 if node_syncing {
                     warn!(
@@ -942,11 +989,12 @@ where
         &tasks,
     )
     .await;
-    // Whatever stopped the client, the check stops with it rather than
-    // polling the beacon node for a runtime that outlives `run`.
+    // Whatever stopped the client, the check and the probe stop with it rather
+    // than polling the beacon node for a runtime that outlives `run`.
     if let Some(check) = check {
         check.abort();
     }
+    stop_probes.abort();
     chain_check.abort();
     stopped
 }
@@ -1746,6 +1794,9 @@ async fn follow_dependent_roots<B: BeaconNodeApi>(
 /// Sends no subnet subscription and no builder registration itself: both
 /// need signatures, so the duty loop sends them from tasks of their own, off
 /// the path to the slot's block. See [`Refreshed`].
+///
+/// Asks no node whether it is syncing: the duty loop runs this only in a slot
+/// its per-slot sync check passed (see [`beacon_node::health`]).
 async fn refresh_epoch<B: BeaconNodeApi>(
     beacon_node: &Arc<B>,
     duties: &mut DutiesService<B>,
@@ -1765,10 +1816,6 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     if pubkeys.is_empty() {
         duties.set_indices(Vec::new());
         return Ok(Refreshed::default());
-    }
-
-    if beacon_node.is_optimistic_or_syncing().await? {
-        return Err(Error::BeaconNodeSyncing);
     }
 
     // Re-resolved every epoch, not once at startup: a validator can be
@@ -2823,16 +2870,13 @@ mod tests {
     /// A refresh that finds the node syncing or optimistic stops the
     /// proposals until one gets through: the schedule held, prefetched from
     /// fulu, would otherwise have them built on a head the node has not
-    /// validated.
+    /// validated. `refresh_epoch` no longer asks the node's sync status itself
+    /// (the per-slot probe does, see `beacon_node::health`), so what reaches
+    /// `settle_refresh` here is a duties fetch every node refused with a 503,
+    /// which the HTTP client reads as `BeaconNodeSyncing`.
     #[tokio::test]
     async fn a_refresh_that_finds_the_node_syncing_stops_the_proposals() {
-        let mut node = node();
-        node.optimistic = true;
-        let node = Arc::new(node);
-        let mut duties = DutiesService::new(node.clone(), Vec::new());
-        let keys = [pubkey(1), pubkey(2)];
-        let outcome =
-            refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context()).await;
+        let outcome = Err(Error::BeaconNodeSyncing);
 
         let mut last_epoch = Some(2);
         let mut resolved = Arc::default();

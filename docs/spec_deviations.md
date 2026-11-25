@@ -919,6 +919,27 @@ comes first. The validator client signs once, at the deadline
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
 
+## The validator client withholds payload timeliness votes over an optimistic head
+
+- **Specification:** `specs/bellatrix/optimistic-sync.md` says an optimistic
+  validator must not produce a block, attest, or take part in sync
+  committees. It does not name `DOMAIN_PTC_ATTESTER`, and the Beacon API asks
+  for a `503` on `GET /eth/v1/validator/payload_attestation_data` only while a
+  node is syncing. Its answer carries no `execution_optimistic`.
+- **ethlambda:** the validator client asks every configured beacon node
+  `/eth/v1/node/syncing` once a slot, a sixth of a slot before the boundary
+  (`crates/validator/src/beacon_node/health.rs`). It does not ask a node whose
+  last probe reported syncing or optimistic for payload attestation data, and
+  casts no vote when no node is left to ask. A slot in which every node that
+  answered reported syncing or optimistic signs nothing at all, this vote
+  included.
+- **Why:** the vote is signed over the block's root and says whether its
+  payload arrived, which a node tracking an unvalidated payload is in no
+  position to say. ethlambda's own beacon node already refuses the data for an
+  optimistic block (`require_validated` in `crates/net/rpc/src/beacon/ptc.rs`),
+  so this matters against other implementations. A node that turns optimistic
+  between its probe and the vote is not caught by the client.
+
 ## The validator client's builder proposals
 
 With `--builder-proposals` the validator client registers its validators with
