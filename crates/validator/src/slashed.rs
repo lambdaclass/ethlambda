@@ -37,10 +37,10 @@
 //! - The first refresh that finds it logs it at error, with its index, pubkey
 //!   and status, and `ethlambda_validator_validators_slashed` counts it for as
 //!   long as it is loaded.
-//! - It gets no more proposals, attestations or aggregations, the ones the
-//!   chain refuses or does not reward. [`crate::duties::DutiesService`] still
-//!   fetches those duties, and hands none out (see
-//!   [`crate::duties::DutiesService::set_slashed`]).
+//! - It gets no more proposals, attestations or attestation aggregations,
+//!   the ones the chain refuses or does not reward.
+//!   [`crate::duties::DutiesService`] still fetches those duties, and hands
+//!   none out (see [`crate::duties::DutiesService::set_slashed`]).
 //! - It keeps its sync committee and payload timeliness committee duties,
 //!   since the chain still counts both. `process_sync_aggregate` rewards every
 //!   participating member with no slashed check and penalises one that
@@ -128,8 +128,9 @@ impl SlashedValidators {
                 validator = entry.index,
                 pubkey = %encode_hex(&entry.pubkey.0),
                 status = %entry.status,
-                "Validator slashed: it gets no more proposer, attester or aggregation duties, \
-                 builder registrations, fee recipient preparations or proposer preferences. A \
+                "Validator slashed: it gets no more proposer, attester or attestation aggregation \
+                 duties, builder registrations, fee recipient preparations or proposer \
+                 preferences (its sync committee duties go on). A \
                  slashing means the setup is broken (the key running in a second place, slashing \
                  protection bypassed, a leaked key), and every key that shares it is at risk: \
                  find the cause"
@@ -204,7 +205,10 @@ mod tests {
     use crate::duties::DutiesService;
     use crate::proposer_settings::ProposerSettings;
     use crate::signing::SigningContext;
-    use crate::{Refreshed, preparations, refresh_epoch, run_until_stopped, slashing_protection};
+    use crate::{
+        Refreshed, mark_slashed, preparations, refresh_epoch, run_until_stopped,
+        slashing_protection,
+    };
 
     fn pubkey(byte: u8) -> BlsPubkey {
         BlsPubkey([byte; 48])
@@ -440,6 +444,45 @@ mod tests {
             matches!(stopped, Error::ValidatorSlashed { .. }),
             "got {stopped}"
         );
+    }
+
+    /// A node that answers for more keys than it was asked about cannot have
+    /// the client report, or stop over, a slashed validator it does not hold.
+    #[tokio::test]
+    async fn a_slashed_validator_not_asked_about_is_not_observed() {
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let context = context(true);
+
+        let keys = [pubkey(1)];
+        refresh_epoch(&node, &mut duties, &keys, 3, &settings(), &context)
+            .await
+            .expect("only validator 11 was asked about");
+        assert_eq!(context.slashed().count(), 0);
+    }
+
+    /// A refresh that finds a key slashed and then fails leaves the duty loop
+    /// the entries of its last full refresh, which predate the slashing.
+    /// Marked from the tracker, they give the per-slot preparations (and a
+    /// readmitted node's registrations) nothing for that key.
+    #[test]
+    fn kept_entries_are_marked_with_a_slashing_found_since() {
+        let slashed = SlashedValidators::default();
+        let kept = Arc::new(vec![entry(11, 1, false), entry(22, 2, false)]);
+        assert!(
+            Arc::ptr_eq(&mark_slashed(&kept, &slashed), &kept),
+            "nothing to mark"
+        );
+
+        slashed.update(&[entry(22, 2, true)]);
+        let marked = mark_slashed(&kept, &slashed);
+        let flags: Vec<bool> = marked.iter().map(|entry| entry.slashed).collect();
+        assert_eq!(flags, [false, true]);
+        let prepared: Vec<ValidatorIndex> = preparations(marked.iter(), &settings())
+            .iter()
+            .map(|preparation| preparation.validator_index)
+            .collect();
+        assert_eq!(prepared, [11]);
     }
 
     /// The flag alone stops nothing: a refresh with no slashed key goes on.

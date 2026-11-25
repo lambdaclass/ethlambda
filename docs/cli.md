@@ -684,9 +684,10 @@ A key reported slashed:
   that finds it, and counted in `ethlambda_validator_validators_slashed` while
   it stays loaded;
 - gets no more proposals (the chain refuses a block from a slashed proposer),
-  attestations or aggregations (its attestations earn nothing);
-- keeps its sync committee and payload timeliness committee duties, which the
-  chain still counts: a slashed sync committee member is rewarded for taking
+  attestations or attestation aggregations (its attestations earn nothing);
+- keeps its sync committee duties, contributions as a selected aggregator
+  included, and its payload timeliness committee duties, which the chain
+  still counts: a slashed sync committee member is rewarded for taking
   part and penalised for missing, as any other, and nothing in gloas refuses
   or ignores a slashed member's payload attestation;
 - is left out of builder registrations, fee recipient preparations and
@@ -709,6 +710,12 @@ again, so tell the supervisor not to restart on it: systemd's
 per-code equivalent, and restarts the pod into the same stop until the key is
 removed. The flag is off by default, as Teku's
 `--shut-down-when-validator-slashed-enabled` is.
+
+With the flag on, the keymanager API is up only for the moment before the
+stop, too short to delete the slashed key through it. Once the cause is
+found, start the client without `--shut-down-when-slashed`, delete the key
+with `DELETE /eth/v1/keystores` (or `/eth/v1/remotekeys`), and turn the
+flag back on at the next restart.
 
 The answer is one beacon node's: with several `--beacon-nodes` the lookup
 takes the first that answers, and nothing confirms it against another. A node

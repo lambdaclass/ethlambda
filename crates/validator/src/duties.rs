@@ -382,10 +382,11 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .unwrap_or_default()
     }
 
-    /// This client's proposer duty for `slot`, if it has one.
+    /// This client's proposer duty for `slot`, if it has one and its
+    /// validator is not slashed (see [`Self::set_slashed`]).
     ///
-    /// At most one, and not because of any filtering here: a slot has exactly
-    /// one proposer, so two entries would mean the beacon node contradicted
+    /// At most one, and not because of that filter: a slot has exactly one
+    /// proposer, so two entries would mean the beacon node contradicted
     /// itself.
     pub fn proposer_at_slot(&self, slot: Slot, epoch: Epoch) -> Option<&ProposerDutyDto> {
         self.proposers

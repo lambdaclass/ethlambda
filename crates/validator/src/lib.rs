@@ -89,6 +89,7 @@ pub(crate) fn require_unread_preset() -> Result<()> {
         .map_err(|err| Error::Preset(err.to_string()))
 }
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -171,8 +172,8 @@ pub struct ValidatorConfig {
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
     /// Stop the client when the chain reports a loaded key slashed, rather
-    /// than only dropping that key's proposer, attester and aggregation
-    /// duties. See [`slashed`].
+    /// than only dropping that key's proposer, attester and attestation
+    /// aggregation duties. See [`slashed`].
     pub shut_down_when_slashed: bool,
 }
 
@@ -592,6 +593,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     Err(err) if err.is_retryable() => {
                         warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
                         metrics::set_beacon_node_available(false);
+                        // The lookup may have got through and found a key
+                        // slashed before a later request failed. The kept
+                        // entries predate it, and the per-slot preparations
+                        // and a readmitted node's registrations read them.
+                        resolved = mark_slashed(&resolved, context.slashed());
                     }
                     // A slashed key under `--shut-down-when-slashed`, whose
                     // reason `slashed` has already logged. Every other error
@@ -1320,8 +1326,10 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // endpoint reads one as "every validator on the chain".
     if pubkeys.is_empty() {
         // No key loaded is no key slashed: forgets any that keymanager
-        // deletes took out.
+        // deletes took out, in the duties service too, so a key imported
+        // again before the next refresh is not withheld there alone.
         context.slashed().observe(&[])?;
+        duties.set_slashed(context.slashed().indices());
         return Ok(Refreshed::default());
     }
 
@@ -1350,8 +1358,16 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     duties.set_indices(indices);
     // Before anything is fetched or sent for the epoch, so a key found slashed
     // has no duty, preparation or registration from here on, and
-    // `--shut-down-when-slashed` stops the client ahead of all of them.
-    context.slashed().observe(&entries)?;
+    // `--shut-down-when-slashed` stops the client ahead of all of them. Only
+    // the keys asked for: a node that answers for more must not have this
+    // client report, or stop over, a validator it does not hold.
+    let asked: HashSet<&BlsPubkey> = pubkeys.iter().collect();
+    let held: Vec<ValidatorEntry> = entries
+        .iter()
+        .filter(|entry| asked.contains(&entry.pubkey))
+        .cloned()
+        .collect();
+    context.slashed().observe(&held)?;
     duties.set_slashed(context.slashed().indices());
 
     // Sent here, ahead of the epoch's duties, and then again every slot by the
@@ -1576,6 +1592,23 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
 fn is_registrable(entry: &ValidatorEntry) -> bool {
     let status = entry.status.as_str();
     !entry.slashed && (status.starts_with("pending") || status.starts_with("active"))
+}
+
+/// `resolved` with every key `slashed` holds marked slashed, or `resolved`
+/// itself when it already says so for each of them.
+fn mark_slashed(
+    resolved: &Arc<Vec<ValidatorEntry>>,
+    slashed: &slashed::SlashedValidators,
+) -> Arc<Vec<ValidatorEntry>> {
+    let found = |entry: &ValidatorEntry| !entry.slashed && slashed.contains(&entry.pubkey);
+    if !resolved.iter().any(found) {
+        return resolved.clone();
+    }
+    let marked = resolved.iter().map(|entry| ValidatorEntry {
+        slashed: entry.slashed || found(entry),
+        ..entry.clone()
+    });
+    Arc::new(marked.collect())
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,

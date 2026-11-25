@@ -108,7 +108,7 @@ pub struct SigningContext {
     /// See [`Self::doppelganger_allows`].
     doppelganger: Option<Arc<Doppelganger>>,
     /// The loaded keys the chain reports slashed, which get no more proposer,
-    /// attester or aggregation duties.
+    /// attester or attestation aggregation duties.
     /// See [`Self::slashed`].
     slashed: SlashedValidators,
 }

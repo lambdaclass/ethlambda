@@ -196,10 +196,11 @@ pub(crate) struct ValidatorOptions {
     ///
     /// Without it a slashed key is logged at error, counted in
     /// `ethlambda_validator_validators_slashed` and given no more proposer,
-    /// attester or aggregation duties, while the other keys go on. A slashing
-    /// usually means the setup is broken (a key running in a second place,
-    /// slashing protection bypassed, a leaked key), and the keys that share it
-    /// are next: do not restart until the cause is found.
+    /// attester or attestation aggregation duties (its sync committee duties
+    /// go on), while the other keys go on. A slashing usually means the setup
+    /// is broken (a key running in a second place, slashing protection
+    /// bypassed, a leaked key), and the keys that share it are next: do not
+    /// restart until the cause is found.
     #[arg(long, default_value = "false")]
     pub(crate) shut_down_when_slashed: bool,
 }
