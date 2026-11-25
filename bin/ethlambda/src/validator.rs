@@ -44,6 +44,17 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "5062")]
     pub(crate) keymanager_port: u16,
 
+    /// File holding the keymanager API's bearer token, read in place of
+    /// `api-token.txt` in `--validators-dir`. Only read with
+    /// `--enable-keymanager`; set without it, startup warns.
+    ///
+    /// Never written or created: a missing file, or one holding fewer than 16
+    /// characters once trimmed or a character an `Authorization` header
+    /// cannot carry (anything but visible ASCII, spaces and tabs), stops the
+    /// client at startup rather than being replaced with a generated token.
+    #[arg(long)]
+    pub(crate) keymanager_token_file: Option<PathBuf>,
+
     /// Port for the Prometheus metrics server.
     #[arg(long, default_value = "5064")]
     pub(crate) metrics_port: u16,
@@ -277,6 +288,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        keymanager_token_file: options.keymanager_token_file,
         web3signer_url: options.web3signer_url,
         gas_limit: options.gas_limit,
         builder,
@@ -299,6 +311,7 @@ mod tests {
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
             keymanager_port: 5062,
+            keymanager_token_file: None,
             metrics_port: 5064,
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
@@ -349,6 +362,25 @@ mod tests {
     #[test]
     fn the_gas_limit_does_not_need_builder_proposals() {
         parse(&["--gas-limit", "30000000"]).expect("parses alone");
+    }
+
+    /// Without the flag the token stays in `--validators-dir`. With it the path
+    /// is taken as given, and, like `--keymanager-port`, accepted without
+    /// `--enable-keymanager`, which is what decides whether it is read.
+    #[test]
+    fn the_keymanager_token_file_is_optional_and_taken_as_given() {
+        assert_eq!(parse(&[]).expect("parses").keymanager_token_file, None);
+
+        let flags = [
+            "--enable-keymanager",
+            "--keymanager-token-file",
+            "/tmp/keymanager.txt",
+        ];
+        let options = parse(&flags).expect("parses");
+        let expected = PathBuf::from("/tmp/keymanager.txt");
+        assert_eq!(options.keymanager_token_file, Some(expected));
+
+        parse(&flags[1..]).expect("parses without --enable-keymanager");
     }
 
     #[test]

@@ -382,6 +382,7 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--keymanager-token-file` | `api-token.txt` in `--validators-dir` | File to read the keymanager API's bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an `Authorization` header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with `--enable-keymanager`; set without it, startup warns. See [The keymanager API](#the-keymanager-api) |
 | `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
 | `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in `produceBlockV4`. Without it that factor is `0`, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do |
 | `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is also sent in `produceBlockV4`'s body, so a pooled p2p bid can win on value; without `--builder-proposals` the body carries `0`, which still lets a node whose local build fails build on such a bid. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
@@ -732,7 +733,14 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 `DELETE /eth/v1/keystores`, authenticated with a bearer token read from
 `api-token.txt` in the validators directory and generated there on first start
 if absent. The token file is written `0600` and a file too short to be a real
-token is refused rather than accepted.
+token, or holding a character an `Authorization` header cannot carry (anything
+but visible ASCII, spaces and tabs), is refused rather than accepted.
+
+`--keymanager-token-file` names another file to read the token from instead,
+and `api-token.txt` is then neither read nor written. That file is the
+operator's: the client only reads it, trimmed and held to the same checks, and
+a missing or refused one stops it at startup rather than being replaced with a
+generated token.
 
 It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
 Web3Signer holds. The two routes partition the store: `/keystores` lists and
