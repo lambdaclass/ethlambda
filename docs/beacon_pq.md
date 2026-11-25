@@ -389,7 +389,13 @@ A start drops the leaves of slots more than two epochs back, which nothing
 asks for again.
 
 - **Attesting**: a `SingleAttestation` signed at the target epoch's leaf,
-  published on one of PQ's 16 subnets.
+  published on one of PQ's 16 subnets. The client votes as soon as its first
+  beacon node reports a `head` event at the slot, or at the attestation
+  deadline if none arrives first (`head_events`), as the honest-validator
+  guide asks; it used to wait for the deadline every slot, which put its
+  votes behind every client that votes on the block. The node checks a
+  submitted batch in parallel, off the async executor, and publishes it in
+  submission order.
 - **The PTC vote**: as gloas's, signed at the slot's PTC leaf.
 - **Proposing**: the client sends its VRF proof for the slot (the RANDAO
   reveal) to `POST /eth/v1/validator/pq_blocks/{slot}`, signs the block and

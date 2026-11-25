@@ -36,6 +36,9 @@ jemalloc_pprof.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 futures-util = "0.3"
+# A submitted batch of PQ attestations is checked in parallel: each one is a
+# leanXMSS verification (`beacon::pool::post_pq_attestations`).
+rayon.workspace = true
 
 [dev-dependencies]
 ethlambda-validator = { workspace = true, features = ["test-utils"] }
