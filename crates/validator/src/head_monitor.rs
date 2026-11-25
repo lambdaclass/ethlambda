@@ -274,6 +274,9 @@ async fn follow(
     let mut backoff = RECONNECT_MIN;
     // Failures to open in a row, so a node that stays down warns once.
     let mut refused: u32 = 0;
+    // Streams in a row that broke or closed before delivering an event, so a
+    // node that keeps handing out streams that end at once warns once too.
+    let mut fruitless: u32 = 0;
     // The last stream went quiet rather than broke, so opening it again is
     // routine: a stream silent by design, on a node that sends no
     // keep-alives, does it every `IDLE_TIMEOUT`.
@@ -281,13 +284,13 @@ async fn follow(
     loop {
         match source.subscribe(&[topic]).await {
             Ok(mut stream) => {
-                if went_quiet {
+                if went_quiet || fruitless > 1 {
                     debug!(node = %name, topic = topic.as_str(), "Event stream reopened");
                 } else {
                     info!(node = %name, topic = topic.as_str(), "Reading the beacon node's event stream");
                 }
                 refused = 0;
-                metrics::inc_event_streams_open();
+                let open = metrics::OpenEventStream::count();
                 let opened = Instant::now();
                 let mut delivered = false;
                 let broken = loop {
@@ -300,14 +303,32 @@ async fn follow(
                         Err(err) => break Some(err),
                     }
                 };
-                metrics::dec_event_streams_open();
+                drop(open);
                 went_quiet = broken.as_ref().is_some_and(is_idle_timeout);
+                fruitless = if delivered || went_quiet {
+                    0
+                } else {
+                    fruitless + 1
+                };
                 match broken {
                     Some(err) if went_quiet => debug!(
                         node = %name,
                         topic = topic.as_str(),
                         %err,
                         "Event stream went quiet; opening it again"
+                    ),
+                    Some(err) if fruitless > 1 => debug!(
+                        node = %name,
+                        topic = topic.as_str(),
+                        %err,
+                        fruitless,
+                        "Event stream broke again before delivering an event"
+                    ),
+                    None if fruitless > 1 => debug!(
+                        node = %name,
+                        topic = topic.as_str(),
+                        fruitless,
+                        "Event stream closed again before delivering an event"
                     ),
                     Some(err) => warn!(
                         node = %name,

@@ -990,10 +990,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   boundary (block published bare, then the proposer-signed envelope with
   `Eth-Blob-Data-Included: true`, both inside the proposal's attester-offset
   budget; an envelope failure is logged and counted, not a failed proposal),
-  attest at `ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`,
-  then the PTC vote at `PAYLOAD_ATTESTATION_DUE_BPS`. Sync committee duties
+  attest on the slot's block (a node's `head` event) or at `ATTESTATION_DUE_BPS_GLOAS`
+  at the latest, aggregate at `AGGREGATE_DUE_BPS_GLOAS`, and, beside those rather
+  than after them, the PTC vote on its payload (`execution_payload_available`) or at
+  `PAYLOAD_ATTESTATION_DUE_BPS` at the latest (`crate::head_monitor`; see
+  `docs/cli.md`, "Duties start on the block"). Sync committee duties
   (`SyncCommitteeService`, `crates/validator/src/sync_committee.rs`) run at every fork:
-  one message per validator over the head root at `SYNC_MESSAGE_DUE_BPS(_GLOAS)`
+  one message per validator over the head root, on the block or at
+  `SYNC_MESSAGE_DUE_BPS(_GLOAS)` at the latest
   (refused while the head is optimistic), then contributions for each selected
   (validator, subnet) pair at `CONTRIBUTION_DUE_BPS(_GLOAS)`, with subscriptions
   re-sent every epoch for the current and next period. The node pools the messages

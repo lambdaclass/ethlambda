@@ -709,12 +709,24 @@ pub fn inc_duty_trigger(duty: Duty, fired: Fired) {
         .inc();
 }
 
-pub fn inc_event_streams_open() {
-    EVENT_STREAMS_OPEN.inc();
+/// One event stream counted as open, for as long as this is held.
+///
+/// A guard rather than an increment and a decrement: a reader aborted while
+/// its stream is open (`HeadMonitor`'s drop) never reaches the code after the
+/// stream ends, but its future's locals are still dropped.
+pub struct OpenEventStream(());
+
+impl OpenEventStream {
+    pub fn count() -> Self {
+        EVENT_STREAMS_OPEN.inc();
+        Self(())
+    }
 }
 
-pub fn dec_event_streams_open() {
-    EVENT_STREAMS_OPEN.dec();
+impl Drop for OpenEventStream {
+    fn drop(&mut self) {
+        EVENT_STREAMS_OPEN.dec();
+    }
 }
 
 /// Record how long after a slot's start its attestations were accepted.

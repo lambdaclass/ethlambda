@@ -821,13 +821,14 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
             }
 
             // The proposer preparations again, for a beacon node that restarted
-            // since the refresh sent them and so builds for the zero address
-            // until it hears from this client. Once the slot's duties are done,
-            // so they reach the node ahead of the next slot's proposal rather
-            // than racing this one's: a third of the way in on a slot with no
-            // duties, after the aggregation or the payload vote on one with
-            // them. Off the slot loop like the sends above. The refresh's slot
-            // too, although its refresh sent them: see `Preparations`.
+            // since the refresh sent them and so builds for its fallback fee
+            // recipient (the zero address without one) until it hears from
+            // this client. Once the slot's duties are done, so they reach the
+            // node ahead of the next slot's proposal rather than racing this
+            // one's: on the slot's block or a third of the way in on a slot
+            // with no duties, after the aggregation or the payload vote on one
+            // with them. Off the slot loop like the sends above. The refresh's
+            // slot too, although its refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
 
             // This epoch's payload committee schedule again, while none is
