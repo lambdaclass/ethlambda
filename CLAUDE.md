@@ -949,7 +949,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   nodes by `health::Tier` (synced; optimistic or `el_offline`; syncing or
   `sync_distance` > 8; unprobed; failing), `--beacon-nodes` order breaking
   ties, and a request that timed out or could not connect ranks its node
-  failing until a later probe answers; and the head root and PTC data are
+  failing until a probe sent after it answers; and the head root and PTC data are
   never asked of a node whose last probe said syncing or optimistic, or got
   no answer. No rule that stops a duty reads the head's age. `--broadcast`
   (`fallback::Broadcast`) sends attestations, blocks (envelopes producer

@@ -35,7 +35,7 @@
 //!   blinded block still goes back to the node that produced it.
 //! - **The last real request** ([`NodeHealth::record_request_failure`]). A
 //!   request to a node that timed out or could not connect ranks it failing
-//!   until a probe recorded after it answers, so a node that hangs costs at
+//!   until a probe sent after it answers, so a node that hangs costs at
 //!   most one request timeout per probe, not one per request.
 //! - **Two calls the Beacon API leaves ungated.** No 503 covers a syncing
 //!   node's head root, or an optimistic node's payload attestation data, so the
@@ -222,7 +222,7 @@ impl Tier {
 }
 
 /// A request to a node that got no answer, which ranks the node
-/// [`Tier::Failing`] until a probe recorded after it answers.
+/// [`Tier::Failing`] until a probe sent after it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestFailure {
     at: SystemTime,
@@ -325,12 +325,22 @@ impl NodeHealth {
 
     /// Keep that a request to the node at `position` failed with `err`, when
     /// that failure says the node is not answering ([`ranks_failing`]): the
-    /// node then ranks [`Tier::Failing`] until a probe recorded after this
+    /// node then ranks [`Tier::Failing`] until a probe sent after this
     /// answers. Logged once, when the node starts being passed over.
     pub fn record_request_failure(&self, position: usize, what: &'static str, err: &Error) {
-        if !ranks_failing(err) {
-            return;
+        if ranks_failing(err) {
+            self.mark_failing(position, what, err);
         }
+    }
+
+    /// Keep that the node at `position` had not answered a broadcast by the
+    /// time the broadcast stopped waiting for it, a moment after another node
+    /// accepted: it ranks [`Tier::Failing`] as for a request that timed out.
+    pub fn record_no_answer(&self, position: usize, what: &'static str) {
+        self.mark_failing(position, what, &"no answer while another node accepted");
+    }
+
+    fn mark_failing(&self, position: usize, what: &'static str, err: &dyn std::fmt::Display) {
         let already = {
             let mut records = self.write();
             let Some(record) = records.get_mut(position) else {
@@ -383,11 +393,13 @@ impl NodeHealth {
             let Some(record) = records.get_mut(position) else {
                 return;
             };
-            let cleared = if answered {
-                record.failure.take().is_some()
-            } else {
-                false
-            };
+            // Only by a probe sent after the failure: one already on its way
+            // when the request failed says nothing about the node since.
+            let cleared = answered
+                && record
+                    .failure
+                    .take_if(|failure| probe.at >= failure.at)
+                    .is_some();
             let was_el_offline = record.el_offline;
             if answered {
                 record.el_offline = el_offline;
@@ -563,9 +575,9 @@ fn is_lagging(probe: &Probe) -> bool {
 
 /// What orders the nodes of one [`Tier`], before command-line order: one that
 /// reports syncing last, and one optimistic or with its execution client
-/// offline after the rest, as Lighthouse orders them inside each distance
-/// tier. Only [`Tier::Behind`] mixes them: once a stall puts every node past
-/// the tolerance, a synced node still goes ahead of a syncing one.
+/// offline after the rest. Only [`Tier::Behind`] mixes them: once a stall
+/// puts every node past the tolerance, a synced node still goes ahead of a
+/// syncing one.
 fn within_tier(probe: Option<&Probe>) -> (bool, bool) {
     match probe.map(|probe| &probe.outcome) {
         Some(Ok(status)) => (status.is_syncing, status.is_optimistic || status.el_offline),
@@ -957,6 +969,35 @@ mod tests {
 
         health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Connect));
         assert_eq!(order(&health), vec![1, 0]);
+    }
+
+    /// A probe already on its way when the request failed, answered after it,
+    /// says nothing about the node since, and leaves it failing; one sent
+    /// after the failure clears it.
+    #[test]
+    fn only_a_probe_sent_after_a_request_failure_clears_it() {
+        let health = health(vec![synced(3), synced(3)]);
+        let sent_before = SystemTime::now() - Duration::from_secs(1);
+        health.record_request_failure(0, "attestation_data", &failed(BeaconNodeFailure::Timeout));
+        health.record(
+            0,
+            Probe {
+                at: sent_before,
+                ..synced(4)
+            },
+        );
+        assert_eq!(order(&health), vec![1, 0], "still failing");
+        health.record(0, synced(5));
+        assert_eq!(order(&health), vec![0, 1]);
+    }
+
+    /// A broadcast that stopped waiting for a node ranks it failing, as a
+    /// timed-out request does.
+    #[test]
+    fn a_node_cut_off_by_a_broadcast_ranks_failing() {
+        let health = health(vec![synced(3), synced(3)]);
+        health.record_no_answer(0, "publish_block");
+        assert_eq!(health.tiers()[1], (0, Tier::Failing));
     }
 
     /// A request failure is read for as long as a probe is: a probe task that

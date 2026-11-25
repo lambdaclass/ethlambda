@@ -609,7 +609,7 @@ they only reorder nodes that are all behind, which in practice means a stalled
 network, where every node is behind by about as much.
 
 A request that times out, or whose connection cannot be made, ranks its node
-failing at once, until a later probe answers. So a node that takes requests
+failing at once, until a probe sent after it answers. So a node that takes requests
 and never answers costs one request timeout (8 s) and then nothing until it
 answers again, rather than a timeout on every request: an attestation duty
 used to wait out the whole timeout on a hung first node every slot, which
@@ -633,6 +633,10 @@ change nothing.
 - **Failing nodes are sent it last.** A node ranked failing is sent a
   broadcast only when no other node took it, so a hung node does not hold
   every broadcast back by a request timeout.
+- **Half a second after the first acceptance, the rest are cut off.** A node
+  still sending by then is not waited for and is ranked failing, so a node
+  that hangs for the first time costs a broadcast half a second, not a
+  request timeout a proposal's deadline would cut short.
 - **A block reports the best answer**: imported (`200`) over broadcast but
   not imported (`202`) over refused, each node's answer logged. A blinded
   block still goes only to the node that produced it.
@@ -641,7 +645,9 @@ change nothing.
   block the envelope reveals; a node that has not imported it yet queues or
   drops the envelope, and waiting for the producer's answer gives each a
   round trip longer to import it. An envelope sent without its blobs goes to
-  the producer alone, since only it cached them, with or without the flag.
+  the producer first, with or without the flag, since only it cached them;
+  if it does not take it, the other nodes are tried in rank order, since a
+  block with no blobs can be revealed through any of them.
 - **Signed once.** Every message is signed, and recorded by slashing
   protection, before it is sent, however many nodes it is sent to.
 
