@@ -895,7 +895,13 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// defaults, so nothing in this client may rely on those.
     async fn spec(&self) -> Result<Config> {
         let response: DataResponse<serde_json::Value> = self.get("/eth/v1/config/spec").await?;
-        config_from_spec_response(&response.data)
+        // A body that parsed as JSON is the node's own answer, so a spec it
+        // cannot be read from is told apart from a body that is not JSON at
+        // all: startup gives up on the one and waits out the other.
+        config_from_spec_response(&response.data).map_err(|err| match err {
+            Error::Decode(detail) => Error::UnreadableSpec(detail),
+            other => other,
+        })
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
@@ -909,14 +915,14 @@ impl BeaconNodeApi for HttpBeaconNode {
         // the node reports it as optimistic instead.
         if response.data.el_offline.unwrap_or(false) {
             warn!(
-                url = %self.base_url,
+                url = %self.describe(),
                 "Beacon node reports its execution client is offline; it will go optimistic if it \
                  has not already"
             );
         }
         if optimistic && !syncing {
             warn!(
-                url = %self.base_url,
+                url = %self.describe(),
                 "Beacon node has finished syncing but is tracking an unvalidated head; refusing \
                  to sign against it"
             );
@@ -1124,7 +1130,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             } else {
                 Error::BlindedUnconfirmed {
                     status: None,
-                    detail: format!("{url}: {err}"),
+                    detail: format!("{}: {err}", without_credentials(&url)),
                 }
             }
         })?;
@@ -1140,7 +1146,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE {
             return Err(Error::BlindedUnconfirmed {
                 status: Some(status.as_u16()),
-                detail: format!("{url} answered {status}: {body}"),
+                detail: format!("{} answered {status}: {body}", without_credentials(&url)),
             });
         }
         Err(Error::BeaconNodeStatus {

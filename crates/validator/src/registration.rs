@@ -512,8 +512,39 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             );
             return;
         };
-        // Waits out a per-slot send rather than skipping: that one is short,
-        // and the full set is sent once an epoch.
+        self.send_all(pubkeys, store).await;
+    }
+
+    /// [`Self::register_all`] for a beacon node the chain check let back in,
+    /// which every earlier send skipped.
+    ///
+    /// Waits for a full send that is still running rather than skipping, as
+    /// the epoch's does: that send may already have reached the nodes before
+    /// this one was let back in, and skipping would leave it with no
+    /// registrations until next epoch's. Readmissions are rare, so these do
+    /// not pile up the way a skipped epoch send would behind a slow node.
+    pub async fn register_all_again(
+        self: Arc<Self>,
+        epoch: Epoch,
+        pubkeys: Vec<BlsPubkey>,
+        store: Arc<RwLock<ValidatorStore>>,
+    ) {
+        if self.is_gloas(epoch) {
+            return;
+        }
+        self.send_all(pubkeys, store).await;
+    }
+
+    /// What [`Self::register_all`] and [`Self::register_all_again`] share:
+    /// sign and send every registration, once no other send is running.
+    async fn send_all(
+        self: &Arc<Self>,
+        pubkeys: Vec<BlsPubkey>,
+        store: Arc<RwLock<ValidatorStore>>,
+    ) {
+        // Waits out a per-slot send, or a running full send, rather than
+        // skipping: the former is short, and the full set is sent once an
+        // epoch (or on a readmission).
         let _sending = self.sending.lock().await;
         // Read before signing, so a change that lands while this runs is seen
         // by the next `register_changed` rather than lost.

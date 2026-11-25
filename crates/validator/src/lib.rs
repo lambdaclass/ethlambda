@@ -421,8 +421,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // in flight, and `run` waits for it before returning.
     let shutdown = CancellationToken::new();
     // The per-node chain check and the schedule follower, on a task of their
-    // own so a node that hangs until its timeout never delays a duty.
-    tokio::spawn(chain_check::run(
+    // own so a node that hangs until its timeout never delays a duty. Its
+    // handle is kept: the duties race it below, as they do the doppelganger
+    // check.
+    let mut chain_check = tokio::spawn(chain_check::run(
         beacon_node.clone(),
         genesis,
         clock.clone(),
@@ -528,6 +530,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // resolved.
             let mut resubscribe = false;
             let mut to_register = None;
+            // Whether `to_register` is a readmitted node's resend rather than
+            // the epoch's own send: see `RegistrationService::register_all_again`.
+            let mut register_again = false;
             if last_epoch != Some(epoch) {
                 // Snapshot the pubkeys and let the guard drop right here, before
                 // `refresh_epoch`'s awaits (a sync check, two duties fetches, a
@@ -606,6 +611,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     .filter(|entry| is_registrable(&entry.status))
                     .map(|entry| entry.pubkey);
                 to_register = Some(registrable.collect());
+                register_again = true;
                 resend_sync = Some(sync_subscriptions_owed(&duties, epoch));
             }
 
@@ -681,7 +687,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // block, never a duty.
             if let (Some(registration), Some(registrable)) = (&registration, to_register) {
                 let registration = registration.clone();
-                tokio::spawn(registration.register_all(epoch, registrable, store.clone()));
+                let store = store.clone();
+                if register_again {
+                    tokio::spawn(registration.register_all_again(epoch, registrable, store));
+                } else {
+                    tokio::spawn(registration.register_all(epoch, registrable, store));
+                }
             }
 
             // The rest of the way to the first of the slot's remaining duties:
@@ -754,9 +765,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // client, so it ends only by panicking, which would leave every key it
     // had not cleared withheld for good with nothing to say why; stopping
     // hands the supervisor the restart, as an unusable record does.
-    let duties = async {
+    let doppelganger_watch = async {
         let (Some(doppelganger), Some(check)) = (&doppelganger, &mut check) else {
-            return duty_loop.await;
+            return std::future::pending().await;
         };
         tokio::select! {
             // A sighting is reported as one even when the check's task ends
@@ -779,6 +790,27 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 error!(%err, "Stopping so the validator client can be restarted");
                 err
             }
+        }
+    };
+    // The chain check's task ending stops them for the same reason. It runs
+    // until `shutdown`, which is cancelled only once the duties have stopped,
+    // so it ends before that only by panicking. Left running without it, the
+    // duties would go on with every node it took out still out, none let
+    // back in, and no later fork followed, so the client would stop signing
+    // valid messages at the next fork with nothing to say why.
+    let duties = async {
+        tokio::select! {
+            biased;
+            err = doppelganger_watch => err,
+            ended = &mut chain_check => {
+                let reason = match ended {
+                    Err(err) => err.to_string(),
+                    Ok(()) => "its task returned".to_string(),
+                };
+                let err = Error::ChainCheckStopped { reason };
+                error!(%err, "Stopping so the validator client can be restarted");
+                err
+            }
             err = duty_loop => err,
         }
     };
@@ -789,6 +821,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     if let Some(check) = check {
         check.abort();
     }
+    chain_check.abort();
     Err(stopped)
 }
 

@@ -108,6 +108,14 @@ pub struct SigningContext {
     doppelganger: Option<Arc<Doppelganger>>,
 }
 
+/// Whether `a` and `b` give every fork the same epoch and version, and so
+/// every message the same domain. The genesis version is phase0's.
+fn same_fork_schedule(a: &Config, b: &Config) -> bool {
+    ForkName::ALL.iter().all(|&fork| {
+        a.fork_epoch(fork) == b.fork_epoch(fork) && a.fork_version(fork) == b.fork_version(fork)
+    })
+}
+
 /// How long a selection proof is remembered past its slot: the duty
 /// schedule holds the current epoch and the next, so a proof computed for a
 /// subscription at the start of an epoch is still wanted by the aggregation
@@ -254,17 +262,27 @@ impl SigningContext {
     /// never the old proofs beside the new schedule, and a proof that was
     /// being signed across the swap finds the generation moved and is not
     /// remembered.
+    ///
+    /// A swap that moves no fork epoch or version (only the duty offsets,
+    /// which the chain check also follows) changes no domain: the proofs are
+    /// kept and the generation stays, so the duty loop does not resubscribe
+    /// every duty and re-sign every proof (a round trip each for a remote key)
+    /// for nothing.
     pub fn replace_config(&self, config: Config) {
         let mut proofs = self.selection_proofs();
+        let domains_moved = !same_fork_schedule(&self.config.load(), &config);
         self.config.store(config);
-        self.schedule_generation.fetch_add(1, Ordering::Release);
-        proofs.clear();
+        if domains_moved {
+            self.schedule_generation.fetch_add(1, Ordering::Release);
+            proofs.clear();
+        }
     }
 
-    /// How many times [`Self::replace_config`] has swapped the schedule. The
-    /// duty loop sends its attestation subnet subscriptions again when this
-    /// moves: each one's `is_aggregator` came from a selection proof signed
-    /// under the old schedule's domain, which a moved fork can change.
+    /// How many times [`Self::replace_config`] has swapped in a schedule that
+    /// moved a fork. The duty loop sends its attestation subnet subscriptions
+    /// again when this moves: each one's `is_aggregator` came from a
+    /// selection proof signed under the old schedule's domain, which a moved
+    /// fork can change.
     pub fn schedule_generation(&self) -> u64 {
         self.schedule_generation.load(Ordering::Acquire)
     }
@@ -297,7 +315,12 @@ impl SigningContext {
 
     /// The domain for `domain_type` as of `epoch`.
     pub fn domain(&self, domain_type: DomainType, epoch: Epoch) -> Domain {
-        let config = self.config();
+        self.domain_in(&self.config(), domain_type, epoch)
+    }
+
+    /// [`Self::domain`] under `config`, for a caller that reads other fields
+    /// from the same snapshot.
+    fn domain_in(&self, config: &Config, domain_type: DomainType, epoch: Epoch) -> Domain {
         let fork = config.fork_at_epoch(epoch);
         compute_domain(
             domain_type,
@@ -442,7 +465,11 @@ impl SigningContext {
     /// effect. Phase0 has no predecessor and names itself twice, as the
     /// genesis state's own `Fork` does.
     pub fn fork_info(&self, epoch: Epoch) -> ForkInfo {
-        let config = self.config();
+        self.fork_info_in(&self.config(), epoch)
+    }
+
+    /// [`Self::fork_info`] under `config`: see [`Self::domain_in`].
+    fn fork_info_in(&self, config: &Config, epoch: Epoch) -> ForkInfo {
         let fork = config.fork_at_epoch(epoch);
         let current_version = config.fork_version(fork);
         let previous_version = fork
@@ -537,25 +564,37 @@ impl SigningContext {
         }
     }
 
-    /// Sign an already-computed signing root on behalf of `pubkey`.
+    /// Sign `message_root` under `domain_type`, the domain at `epoch`, on
+    /// behalf of `pubkey`.
     ///
-    /// Every public signing method funnels through here, so there is one place
-    /// a signature is actually produced. Deliberately private: a caller that
-    /// can hand in an arbitrary root can make this client sign anything at
-    /// all, and the domain separation that keeps an attestation from being
-    /// read as a block lives in the callers above.
+    /// Every public signing method but two funnels through here, so there is
+    /// one place a signature is actually produced. Deliberately private: a
+    /// caller that can hand in an arbitrary root can make this client sign
+    /// anything at all, and the domain separation that keeps an attestation
+    /// from being read as a block lives in the callers above.
     ///
-    /// `epoch` is the epoch the root's domain was taken at, and `body` the
-    /// message itself; a local key needs neither, a remote signer needs both.
+    /// The signing root and the fork a remote signer is told are read from
+    /// one snapshot of the schedule. Read apart, a swap by the chain check
+    /// landing between the two would send the signer a fork the root was not
+    /// computed under: it would sign the root it derives for that fork, and
+    /// the signature would then fail the check against this one, costing the
+    /// duty its signature.
+    ///
+    /// `body` is the message itself; a local key does not need it, a remote
+    /// signer does.
     async fn sign(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        root: Root,
+        domain_type: DomainType,
+        message_root: Root,
         epoch: Epoch,
         body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
-        let fork_info = self.fork_info(epoch);
+        let config = self.config();
+        let domain = self.domain_in(&config, domain_type, epoch);
+        let root = compute_signing_root(message_root, domain);
+        let fork_info = self.fork_info_in(&config, epoch);
         self.sign_under(store, pubkey, root, epoch, Some(fork_info), body)
             .await
     }
@@ -644,7 +683,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.attestation_signing_root(data),
+            DOMAIN_BEACON_ATTESTER,
+            data.hash_tree_root(),
             data.target.epoch,
             SigningBody::Attestation { attestation: data },
         )
@@ -672,7 +712,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.randao_signing_root(epoch),
+            DOMAIN_RANDAO,
+            epoch.hash_tree_root(),
             epoch,
             SigningBody::RandaoReveal {
                 randao_reveal: RandaoReveal { epoch },
@@ -720,7 +761,8 @@ impl SigningContext {
                 .sign(
                     store,
                     pubkey,
-                    self.selection_proof_signing_root(slot),
+                    DOMAIN_SELECTION_PROOF,
+                    slot.hash_tree_root(),
                     compute_epoch_at_slot(slot),
                     SigningBody::AggregationSlot {
                         aggregation_slot: AggregationSlot { slot },
@@ -781,7 +823,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.aggregate_and_proof_signing_root(message.hash_tree_root(), slot),
+            DOMAIN_AGGREGATE_AND_PROOF,
+            message.hash_tree_root(),
             epoch,
             SigningBody::AggregateAndProof {
                 aggregate_and_proof: Versioned {
@@ -811,7 +854,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.envelope_signing_root(envelope, slot),
+            DOMAIN_BEACON_BUILDER,
+            envelope.hash_tree_root(),
             compute_epoch_at_slot(slot),
             SigningBody::ExecutionPayloadEnvelope {
                 execution_payload_envelope: Versioned {
@@ -884,12 +928,11 @@ impl SigningContext {
         preferences: &ProposerPreferences,
     ) -> Result<BlsSignature> {
         let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
-        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
-        let root = compute_signing_root(preferences.hash_tree_root(), domain);
         self.sign(
             store,
             pubkey,
-            root,
+            DOMAIN_PROPOSER_PREFERENCES,
+            preferences.hash_tree_root(),
             proposal_epoch,
             SigningBody::ProposerPreferences {
                 proposer_preferences: Versioned {
@@ -915,7 +958,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.payload_attestation_signing_root(data),
+            DOMAIN_PTC_ATTESTER,
+            data.hash_tree_root(),
             compute_epoch_at_slot(data.slot),
             SigningBody::PayloadAttestationMessage {
                 payload_attestation_message: Versioned {
@@ -942,7 +986,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.sync_committee_message_signing_root(slot, beacon_block_root),
+            DOMAIN_SYNC_COMMITTEE,
+            beacon_block_root,
             compute_epoch_at_slot(slot),
             SigningBody::SyncCommitteeMessage {
                 sync_committee_message: SyncCommitteeMessage {
@@ -964,16 +1009,18 @@ impl SigningContext {
         slot: Slot,
         subcommittee_index: u64,
     ) -> Result<BlsSignature> {
+        let data = SyncAggregatorSelectionData {
+            slot,
+            subcommittee_index,
+        };
         self.sign(
             store,
             pubkey,
-            self.sync_selection_proof_signing_root(slot, subcommittee_index),
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            data.hash_tree_root(),
             compute_epoch_at_slot(slot),
             SigningBody::SyncCommitteeSelectionProof {
-                sync_aggregator_selection_data: SyncAggregatorSelectionData {
-                    slot,
-                    subcommittee_index,
-                },
+                sync_aggregator_selection_data: data,
             },
         )
         .await
@@ -989,7 +1036,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.contribution_and_proof_signing_root(message),
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            message.hash_tree_root(),
             compute_epoch_at_slot(message.contribution.slot),
             SigningBody::SyncCommitteeContributionAndProof {
                 contribution_and_proof: message,
@@ -1055,7 +1103,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.block_signing_root(header.hash_tree_root(), header.slot),
+            DOMAIN_BEACON_PROPOSER,
+            header.hash_tree_root(),
             epoch,
             SigningBody::Block {
                 beacon_block: VersionedHeader {
@@ -1101,6 +1150,25 @@ mod tests {
 
         assert_ne!(before, after, "the swap reaches the domains");
         assert!(context.selection_proofs().is_empty());
+    }
+
+    /// A swap that moves only the duty offsets moves no domain: the proofs
+    /// stay, and the generation the duty loop resubscribes on does not move.
+    #[test]
+    fn replacing_only_the_offsets_keeps_remembered_proofs() {
+        let context = context();
+        context
+            .selection_proofs()
+            .insert((BlsPubkey([1; 48]), 5), BlsSignature([2; 96]));
+        let generation = context.schedule_generation();
+
+        let mut offsets_only = Config::mainnet();
+        offsets_only.attestation_due_bps_gloas = 2_000;
+        context.replace_config(offsets_only);
+
+        assert_eq!(context.config().attestation_due_bps_gloas, 2_000);
+        assert_eq!(context.selection_proofs().len(), 1);
+        assert_eq!(context.schedule_generation(), generation);
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {

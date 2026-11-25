@@ -964,8 +964,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   epoch read then, so a hung node holds back only its own.
   Every round follows a fork the compatible nodes newly
   schedule, merged from what each usable node last served
-  (`FallbackBeaconNode::served_configs`; only nodes that answered their latest
-  check have a say: an unscheduled fork is taken only when all of them schedule
+  (`FallbackBeaconNode::served_configs`; only nodes that answered one of their last
+  `MISSES_BEFORE_SAY_IS_LOST` (3) checks have a say, so one timeout cannot hand the
+  schedule to another node: an unscheduled fork is taken only when all of them schedule
   it alike, a scheduled one moves only when every one scheduling it agrees, and
   is never unscheduled; only a fork still in the future may change), into the
   `SharedConfig` the slot clock and signing

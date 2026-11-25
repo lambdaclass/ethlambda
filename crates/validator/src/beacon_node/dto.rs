@@ -552,13 +552,13 @@ fn spec_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
 }
 
 /// The key a spec response names a fork's activation epoch under.
-fn fork_epoch_key(fork: ForkName) -> String {
+pub(crate) fn fork_epoch_key(fork: ForkName) -> String {
     format!("{}_FORK_EPOCH", fork.as_str().to_uppercase())
 }
 
 /// The key a spec response names a fork's version under. Phase0's is
 /// `GENESIS_FORK_VERSION`, since it has no fork to be named after.
-fn fork_version_key(fork: ForkName) -> String {
+pub(crate) fn fork_version_key(fork: ForkName) -> String {
     match fork {
         ForkName::Phase0 => "GENESIS_FORK_VERSION".to_string(),
         other => format!("{}_FORK_VERSION", other.as_str().to_uppercase()),

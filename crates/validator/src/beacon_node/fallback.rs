@@ -59,9 +59,26 @@ const NO_USABLE_NODE: &str = "no configured beacon node is on this client's chai
 /// How many epochs after a node's last answer the configuration it served is
 /// still kept: the epoch it answered in and the one after, which covers a node
 /// that misses a round or restarts. It is what the duty offsets are read from;
-/// a say in the fork schedule needs an answer to the node's latest check (see
-/// [`Served::say`]).
+/// a say in the fork schedule needs a more recent answer (see
+/// [`MISSES_BEFORE_SAY_IS_LOST`]).
 const SERVED_FOR_EPOCHS: u64 = 1;
+
+/// How many checks in a row a node may fail before it loses its say in the
+/// fork schedule (see [`Served::say`]). A check runs every slot, so this is a
+/// few slots.
+///
+/// Losing the say on the first failure let one timeout of a correct node
+/// leave a single misconfigured one to put a fork on the client's schedule,
+/// or postpone one, for good: the merge never unschedules a fork, so the
+/// correct node was then refused once the fork's epoch came. A node that
+/// restarts for an upgrade is away for longer than this, so it still loses
+/// its say in time for the upgraded nodes' schedule to be followed, unless
+/// the change comes within this many slots of the fork's epoch.
+pub(crate) const MISSES_BEFORE_SAY_IS_LOST: u64 = 3;
+
+/// [`NodeState::misses`] for a node that has not answered a check on this
+/// client's chain since it was configured or last found on another one.
+const NEVER_ANSWERED: u64 = u64::MAX;
 
 /// How long startup waits between rounds while no beacon node answers, as
 /// Lighthouse's validator client does (`RETRY_DELAY`).
@@ -103,36 +120,62 @@ fn classify(ours: &ChainId, asked: Result<ChainId>, current_epoch: u64) -> NodeA
     }
 }
 
+/// What the chain check keeps about one configured node, beside it in
+/// [`FallbackBeaconNode::states`].
+struct NodeState {
+    /// Whether the node is on this client's chain. Every call skips a node
+    /// whose flag is down.
+    usable: AtomicBool,
+    /// The epoch the node's last unusable-node warning was for, so a node
+    /// that stays unusable warns once per epoch rather than once per slot.
+    /// `u64::MAX` is never.
+    warned_at: AtomicU64,
+    /// The configuration the node last served while on this client's chain,
+    /// with the epoch it served it in: what the schedule is followed from.
+    /// Kept through a check the node does not answer, so one missed round
+    /// does not drop its schedule, but only for [`SERVED_FOR_EPOCHS`]: a node
+    /// that stays away has no say in a schedule the network may have moved
+    /// since. Dropped when the node turns out to be on another chain.
+    served: Mutex<Option<(Config, u64)>>,
+    /// How many checks of the node have failed in a row since it last
+    /// answered one on this client's chain, or [`NEVER_ANSWERED`]. Fewer than
+    /// [`MISSES_BEFORE_SAY_IS_LOST`] is what gives it a say in the fork
+    /// schedule (see [`Served::say`]).
+    misses: AtomicU64,
+}
+
+impl NodeState {
+    /// Usable, as every node starts: see [`FallbackBeaconNode::new`].
+    fn new() -> Self {
+        Self {
+            usable: AtomicBool::new(true),
+            warned_at: AtomicU64::new(u64::MAX),
+            served: Mutex::new(None),
+            misses: AtomicU64::new(NEVER_ANSWERED),
+        }
+    }
+
+    fn set_served(&self, config: Option<(Config, u64)>) {
+        *self.served.lock().unwrap_or_else(PoisonError::into_inner) = config;
+    }
+
+    fn has_say(&self) -> bool {
+        self.misses.load(Ordering::SeqCst) < MISSES_BEFORE_SAY_IS_LOST
+    }
+}
+
 /// A `BeaconNodeApi` backed by an ordered list of others, answering from the
 /// first one that succeeds.
 pub struct FallbackBeaconNode<B> {
     /// In the order given, which never changes: a [`Producer`] is a position
     /// in it, so a blinded block goes back to the node that produced it.
     nodes: Vec<B>,
-    /// Whether each node, by position, is on this client's chain. Every call
-    /// skips a node whose flag is down.
-    usable: Vec<AtomicBool>,
-    /// The epoch each node's last unusable-node warning was for, by position,
-    /// so a node that stays unusable warns once per epoch rather than once per
-    /// slot. `u64::MAX` is never.
-    warned_at: Vec<AtomicU64>,
+    /// The chain check's state of each node, by position in `nodes`. Built
+    /// with it and never resized, so the two always line up.
+    states: Vec<NodeState>,
     /// How many times a node has been let back in (its usable flag raised
     /// from down): see [`BeaconNodeApi::readmissions`].
     readmissions: AtomicU64,
-    /// The configuration each node last served while on this client's chain,
-    /// by position, with the epoch it served it in: what the schedule is
-    /// followed from. Kept through a check the node does not answer, so one
-    /// missed round does not drop its schedule, but only for
-    /// [`SERVED_FOR_EPOCHS`]: a node that stays away has no say in a schedule
-    /// the network may have moved since. Dropped when the node turns out to
-    /// be on another chain.
-    served: Vec<Mutex<Option<(Config, u64)>>>,
-    /// Whether each node, by position, answered its most recent check on
-    /// this client's chain: what gives it a say in the fork schedule (see
-    /// [`Served::say`]). Down from the moment a check of it fails, unlike
-    /// `served`, so a node that stops answering cannot hold a fork where it
-    /// last saw it.
-    answered: Vec<AtomicBool>,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
@@ -141,28 +184,16 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// [`Self::establish`] is what takes a node out.
     pub fn new(nodes: Vec<B>) -> Self {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
-        let usable = nodes.iter().map(|_| AtomicBool::new(true)).collect();
-        let warned_at = nodes.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
-        let served = nodes.iter().map(|_| Mutex::new(None)).collect();
-        let answered = nodes.iter().map(|_| AtomicBool::new(false)).collect();
+        let states = nodes.iter().map(|_| NodeState::new()).collect();
         Self {
             nodes,
-            usable,
-            warned_at,
+            states,
             readmissions: AtomicU64::new(0),
-            served,
-            answered,
         }
     }
 
     fn is_usable(&self, position: usize) -> bool {
-        self.usable[position].load(Ordering::SeqCst)
-    }
-
-    fn set_served(&self, position: usize, config: Option<(Config, u64)>) {
-        *self.served[position]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = config;
+        self.states[position].usable.load(Ordering::SeqCst)
     }
 
     /// What [`crate::chain_check::follow_schedule`] merges at `current_epoch`:
@@ -174,16 +205,20 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// [`SERVED_FOR_EPOCHS`]: the duty offsets are read from the first one
     /// left, so the first node keeps its place through a round it misses.
     ///
-    /// A say needs more: an answer to the node's most recent check. A node
-    /// whose check has just failed keeps its configuration for the offsets,
-    /// but not its say, so a node that stops answering cannot pin a fork at
-    /// the epoch it last reported against every node that follows a
-    /// postponement. When that epoch came, the client would activate the fork
-    /// alone and refuse them all.
+    /// A say needs more: an answer to one of the node's last
+    /// [`MISSES_BEFORE_SAY_IS_LOST`] checks. A node that stops answering
+    /// keeps its configuration for the offsets, but loses its say after that
+    /// many slots, so it cannot pin a fork at the epoch it last reported
+    /// against every node that follows a postponement. When that epoch came,
+    /// the client would activate the fork alone and refuse them all. It does
+    /// not lose it on the first miss, so one timeout of a correct node does
+    /// not leave a misconfigured one to move the schedule alone.
     pub fn served_configs(&self, current_epoch: u64) -> Served {
         let mut served = Served::default();
         for (position, _) in self.usable_nodes() {
-            let config = self.served[position]
+            let state = &self.states[position];
+            let config = state
+                .served
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
@@ -193,7 +228,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 continue;
             };
             served.configs.push((position, config));
-            if self.answered[position].load(Ordering::SeqCst) {
+            if state.has_say() {
                 served.say.push(position);
             }
         }
@@ -226,7 +261,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// Whether a warning for `position` at `epoch` is due: the first one for
     /// that epoch. Marks it said.
     fn warning_due(&self, position: usize, epoch: u64) -> bool {
-        self.warned_at[position].swap(epoch, Ordering::Relaxed) != epoch
+        self.states[position]
+            .warned_at
+            .swap(epoch, Ordering::Relaxed)
+            != epoch
     }
 
     /// Set `position`'s flag from what its check found, and say so when that
@@ -234,14 +272,26 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// out, then again at most once per epoch for as long as it stays out.
     fn record(&self, position: usize, answer: &NodeAnswer, epoch: u64) {
         let node = self.nodes[position].describe();
+        let state = &self.states[position];
         // Before the flag and the configuration: a merge that reads the node
         // as usable with what it served reads its say as of this answer.
-        let answered = matches!(answer, NodeAnswer::Compatible(_));
-        self.answered[position].store(answered, Ordering::SeqCst);
+        match answer {
+            NodeAnswer::Compatible(_) => state.misses.store(0, Ordering::SeqCst),
+            NodeAnswer::Incompatible(_) => state.misses.store(NEVER_ANSWERED, Ordering::SeqCst),
+            NodeAnswer::Unreachable(_) => {
+                // `NEVER_ANSWERED` saturates, so a node never heard from
+                // stays that way.
+                let _ = state
+                    .misses
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |misses| {
+                        Some(misses.saturating_add(1))
+                    });
+            }
+        }
         match answer {
             NodeAnswer::Compatible(config) => {
-                self.set_served(position, Some(((**config).clone(), epoch)));
-                if !self.usable[position].swap(true, Ordering::SeqCst) {
+                state.set_served(Some(((**config).clone(), epoch)));
+                if !state.usable.swap(true, Ordering::SeqCst) {
                     // After the flag: a caller that reads the new count then
                     // selects the usable nodes finds this one among them.
                     self.readmissions.fetch_add(1, Ordering::SeqCst);
@@ -249,8 +299,8 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 }
             }
             NodeAnswer::Incompatible(difference) => {
-                self.set_served(position, None);
-                let was_usable = self.usable[position].swap(false, Ordering::Relaxed);
+                state.set_served(None);
+                let was_usable = state.usable.swap(false, Ordering::Relaxed);
                 let due = self.warning_due(position, epoch);
                 if was_usable || due {
                     warn!(
@@ -329,10 +379,12 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             // A node that answered with a preset this client cannot run on, or
             // a spec it cannot read (a required key absent, say), answered:
             // asking it again gives the same answer. Waiting is for a node
-            // that has not answered yet.
+            // that has not answered yet, and for one whose answer was not the
+            // node's at all: a body that is not JSON (`Error::Decode`), such
+            // as a proxy's maintenance page while the node boots.
             if asked
                 .iter()
-                .all(|answer| matches!(answer, Err(Error::Preset(_) | Error::Decode(_))))
+                .all(|answer| matches!(answer, Err(Error::Preset(_) | Error::UnreadableSpec(_))))
             {
                 warn!(%detail, "No configured beacon node serves a chain this client can run on");
                 return Err(Error::AllBeaconNodesFailed(detail));
@@ -363,7 +415,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 classify(&reference, answer, epoch)
             };
             if matches!(answer, NodeAnswer::Unreachable(_)) {
-                self.usable[position].store(false, Ordering::Relaxed);
+                self.states[position].usable.store(false, Ordering::Relaxed);
             }
             self.record(position, &answer, epoch);
         }

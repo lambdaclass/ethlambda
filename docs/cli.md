@@ -379,7 +379,8 @@ list order that answers both `/eth/v1/beacon/genesis` and
 said, and asks them all again every 2 seconds, as Lighthouse's validator client
 does, rather than exiting: a client started beside its beacon node otherwise
 exits before the node's API is up. Only when every node answered, each with a
-preset this client cannot run on or a spec it cannot read, does startup fail. A
+preset this client cannot run on or a spec it cannot read, does startup fail; a
+body that is not JSON at all (a proxy's page while the node boots) is waited out. A
 response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
@@ -405,23 +406,28 @@ while a node was answering counts as arrived rather than as still ahead.
 
 As each answer arrives, a fork the compatible nodes schedule and the client does
 not have yet is adopted by the slot clock and every signing domain together, and
-the client logs at `warn` which fields moved. Only nodes that answered their most
-recent check have a say in this. A fork the client does not have is taken only
-when every one of them schedules it, at the same epoch and with the same version:
+the client logs at `warn` which fields moved. Only nodes that answered one of
+their last three checks have a say in this. A fork the client does not have is
+taken only when every one of them schedules it, at the same epoch and with the
+same version:
 one node, misconfigured or not, cannot put a fork on the client's schedule that
 the others do not have. So while a node not yet upgraded still answers, the fork
 waits; it is taken once that node is upgraded, or once it stops answering
-(restarting for the upgrade, say) and so loses its say. A warning names the nodes
+(restarting for the upgrade, say) for three slots and so loses its say. One missed
+check does not cost a node its say, so a single timeout of a correct node does not
+leave a misconfigured one to move the schedule alone. A warning names the nodes
 that disagree, once per epoch, and a node without the client's epoch stops being
 used when the fork's epoch arrives. Once the client has a fork scheduled, it
 moves only when every node with a say that schedules it agrees on the new epoch
 and version, so one node cannot pull it elsewhere, and it is never unscheduled:
 a node reporting it unscheduled may only be the one not upgraded yet, while the
 upgraded one is restarting. A fork the network cancels therefore needs a
-restart. A node that stops answering loses its say at once, so it cannot hold a
-fork at an epoch the network has postponed; the duty offsets are still read from
-the first node through a round it misses. A fork that is already active is never
-moved: a node that reports another epoch or version for it is on another chain.
+restart. A node that stops answering loses its say after three slots, so it cannot
+hold a fork at an epoch the network has postponed (unless the postponement comes in
+the fork's last three slots); the duty offsets are still read from the first node
+through a round it misses. A merge that would put a fork before the one it follows
+is refused whole and warned about. A fork that is already active is never moved: a
+node that reports another epoch or version for it is on another chain.
 The client does not need a restart for a fork the network schedules after it
 started.
 

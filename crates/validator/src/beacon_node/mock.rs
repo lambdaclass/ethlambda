@@ -61,6 +61,10 @@ pub struct MockBeaconNode {
     /// What `spec` answers with. `None` is mainnet's. A test changes it to
     /// have a node start reporting a new schedule after startup.
     pub spec_config: Mutex<Option<Config>>,
+    /// When set, `spec` fails with what this builds, for the errors a real
+    /// node's answer raises (a body that is not JSON, a spec missing a key)
+    /// rather than the request failure `failures` stands for.
+    pub spec_error: Mutex<Option<fn() -> Error>>,
     /// How many times `genesis` and `spec` were called, for a test that
     /// checks a node was (or was not) asked.
     pub genesis_calls: std::sync::atomic::AtomicUsize,
@@ -869,6 +873,9 @@ impl BeaconNodeApi for MockBeaconNode {
             tokio::time::sleep(delay).await;
         }
         self.guard("spec")?;
+        if let Some(error) = *self.spec_error.lock().expect("lock") {
+            return Err(error());
+        }
         Ok(self
             .spec_config
             .lock()
