@@ -52,7 +52,7 @@ use libssz_types::SszList;
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
-use crate::beacon::preset::Preset;
+use crate::beacon::preset::{self, Preset};
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
 use crate::chain_config::ChainConfig;
 use crate::constants::INTERVALS_PER_SLOT;
@@ -508,6 +508,15 @@ pub struct Config {
     /// builder-registry value; see [`Self::churn_limit_quotient_gloas`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_per_epoch_activation_churn_limit_gloas: Gwei,
+    /// PQ (consensus-specs pq `af898d07`): the most committees a PQ slot has,
+    /// `MAX_COMMITTEES_PER_SLOT_PQ` replaced in `get_committee_count_per_slot`.
+    /// Temporary and testing-only: a devnet lowers it to put its validators
+    /// into fewer, larger committees. It may not exceed the preset's
+    /// `MAX_COMMITTEES_PER_SLOT_PQ`, the length of `CommitteeBits`; the
+    /// state transition reads it through
+    /// [`x_max_committee_count_per_slot`], which the node sets from this.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub x_max_committee_count_per_slot: u64,
 
     // -- Fork choice ---------------------------------------------------------
     /// Percentage boost, relative to a single committee's weight, given to a
@@ -678,6 +687,45 @@ pub struct Config {
 /// configuration for a missing key, and a network that predates a field should
 /// still load. Mainnet is the right fallback because every other network is
 /// described as a deviation from it.
+/// The PQ committee cap this process runs on, `0` until
+/// [`select_x_max_committee_count_per_slot`] sets one.
+static X_MAX_COMMITTEE_COUNT_PER_SLOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Makes `config`'s `X_MAX_COMMITTEE_COUNT_PER_SLOT` the cap every PQ
+/// committee count of this process uses, and returns it.
+///
+/// One per process, like the preset (see `beacon::preset`): the state
+/// transition reads it from a state alone, which carries no config. A value
+/// above the preset's `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification
+/// forbids and `CommitteeBits` cannot hold, is lowered to it, and a zero is
+/// raised to one; the caller warns when the returned value differs from the
+/// file's.
+pub fn select_x_max_committee_count_per_slot(config: &Config) -> u64 {
+    let cap = committee_cap_within_preset(
+        config.x_max_committee_count_per_slot,
+        preset::max_committees_per_slot_pq() as u64,
+    );
+    X_MAX_COMMITTEE_COUNT_PER_SLOT.store(cap, std::sync::atomic::Ordering::Relaxed);
+    cap
+}
+
+/// `declared` moved into `1..=max_committees_per_slot_pq`.
+fn committee_cap_within_preset(declared: u64, max_committees_per_slot_pq: u64) -> u64 {
+    declared.clamp(1, max_committees_per_slot_pq)
+}
+
+/// `X_MAX_COMMITTEE_COUNT_PER_SLOT` as selected for this process, or the
+/// preset's `MAX_COMMITTEES_PER_SLOT_PQ` when none was: the specification's
+/// own configs set the two equal, so a process that never selects one (a
+/// spec test, a lean node) runs on the specification's value.
+pub fn x_max_committee_count_per_slot() -> u64 {
+    match X_MAX_COMMITTEE_COUNT_PER_SLOT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => preset::max_committees_per_slot_pq() as u64,
+        cap => cap,
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self::mainnet()
@@ -807,6 +855,7 @@ impl Config {
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             churn_limit_quotient_gloas: 32_768,
             max_per_epoch_activation_churn_limit_gloas: 256_000_000_000,
+            x_max_committee_count_per_slot: 16,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -950,6 +999,7 @@ impl Config {
             max_per_epoch_activation_exit_churn_limit: 128_000_000_000,
             churn_limit_quotient_gloas: 16,
             max_per_epoch_activation_churn_limit_gloas: 128_000_000_000,
+            x_max_committee_count_per_slot: 4,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -1327,6 +1377,26 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
         assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
         assert_eq!(config.max_request_payloads, 128);
+    }
+
+    #[test]
+    fn the_pq_committee_cap_is_claimed_and_parses() {
+        assert_eq!(Config::mainnet().x_max_committee_count_per_slot, 16);
+        assert_eq!(Config::minimal().x_max_committee_count_per_slot, 4);
+        let config: Config =
+            serde_yaml_ng::from_str("X_MAX_COMMITTEE_COUNT_PER_SLOT: 1\n").unwrap();
+        assert_eq!(config.x_max_committee_count_per_slot, 1);
+        // Absent, it is mainnet's, like every other key a file omits.
+        let config: Config = serde_yaml_ng::from_str("CONFIG_NAME: x\n").unwrap();
+        assert_eq!(config.x_max_committee_count_per_slot, 16);
+    }
+
+    #[test]
+    fn the_pq_committee_cap_stays_within_committee_bits() {
+        assert_eq!(committee_cap_within_preset(4, 16), 4);
+        assert_eq!(committee_cap_within_preset(16, 16), 16);
+        assert_eq!(committee_cap_within_preset(16, 4), 4);
+        assert_eq!(committee_cap_within_preset(0, 16), 1);
     }
 
     #[test]

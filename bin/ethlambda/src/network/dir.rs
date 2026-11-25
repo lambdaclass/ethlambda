@@ -97,6 +97,7 @@ impl NetworkDir {
             path: config_path.clone(),
             source,
         })?;
+        super::select_committee_cap(&parsed.config);
 
         let genesis_path = base.join(GENESIS_STATE_FILE);
         let genesis_bytes = read_required_bytes(&genesis_path)?;

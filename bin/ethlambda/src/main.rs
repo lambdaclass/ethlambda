@@ -2105,6 +2105,9 @@ fn first_config_difference(
         max_per_epoch_activation_exit_churn_limit: _,
         churn_limit_quotient_gloas: _,
         max_per_epoch_activation_churn_limit_gloas: _,
+        // Compared below: PQ's committee cap decides every PQ committee, so
+        // which attestations and aggregates a block may carry.
+        x_max_committee_count_per_slot: _,
 
         // Fork choice: weighting/timing knobs a node applies to its own view
         // of the chain. They change which head a node *prefers*, not which
@@ -2256,6 +2259,7 @@ fn first_config_difference(
         max_per_epoch_activation_exit_churn_limit,
         churn_limit_quotient_gloas,
         max_per_epoch_activation_churn_limit_gloas,
+        x_max_committee_count_per_slot,
         consolidation_churn_limit_quotient,
         max_blobs_per_block_deneb,
         max_blobs_per_block_electra,

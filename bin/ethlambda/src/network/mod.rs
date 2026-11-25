@@ -107,6 +107,26 @@ pub(crate) fn select_preset(declared: &str) -> Result<Preset, PresetSelectError>
     Ok(preset)
 }
 
+/// Makes the network's `X_MAX_COMMITTEE_COUNT_PER_SLOT` the cap every PQ
+/// committee count of this process uses (consensus-specs pq `af898d07`).
+/// After [`select_preset`], whose `MAX_COMMITTEES_PER_SLOT_PQ` bounds it: a
+/// value above that, or zero, is moved into range with a warning rather than
+/// refused, since the key is a testing knob and `CommitteeBits` could not
+/// hold more committees anyway.
+pub(crate) fn select_committee_cap(config: &Config) {
+    let declared = config.x_max_committee_count_per_slot;
+    let cap = ethlambda_types::beacon::config::select_x_max_committee_count_per_slot(config);
+    if cap != declared {
+        tracing::warn!(
+            declared,
+            used = cap,
+            max_committees_per_slot_pq =
+                ethlambda_types::beacon::preset::max_committees_per_slot_pq(),
+            "X_MAX_COMMITTEE_COUNT_PER_SLOT is outside 1..=MAX_COMMITTEES_PER_SLOT_PQ; using the nearest value"
+        );
+    }
+}
+
 /// One `config.yaml` key that the node runs on a compile-time constant for,
 /// set to another value.
 #[derive(Debug)]

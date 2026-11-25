@@ -142,7 +142,9 @@ pub fn committee_count_per_slot(active_count: u64) -> u64 {
 }
 
 /// The most committees a slot of `fork` has: `MAX_COMMITTEES_PER_SLOT`, or
-/// the PQ fork's `MAX_COMMITTEES_PER_SLOT_PQ`.
+/// the PQ fork's `X_MAX_COMMITTEE_COUNT_PER_SLOT` (consensus-specs pq
+/// `af898d07`; at most `MAX_COMMITTEES_PER_SLOT_PQ`, and equal to it unless a
+/// devnet lowers it).
 ///
 /// The PQ fork's cap applies to every epoch a PQ state is asked about,
 /// including a previous epoch that ran before the fork: the specification's
@@ -150,7 +152,7 @@ pub fn committee_count_per_slot(active_count: u64) -> u64 {
 /// are recomputed under the new cap.
 pub fn max_committees_per_slot(fork: ForkName) -> u64 {
     if fork == ForkName::Pq {
-        preset::max_committees_per_slot_pq() as u64
+        ethlambda_types::beacon::config::x_max_committee_count_per_slot()
     } else {
         preset::max_committees_per_slot() as u64
     }
