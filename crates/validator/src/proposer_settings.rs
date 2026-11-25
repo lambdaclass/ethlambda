@@ -189,7 +189,8 @@ pub struct ProposerSettings {
     /// the lock: it is only a path, and each read parses the file afresh.
     graffiti_file: Option<GraffitiFile>,
     /// Whether the last read of [`Self::graffiti_file`] failed, so a run of
-    /// failures is warned about once. See [`Self::graffiti_file_table`].
+    /// failures `GET graffiti` meets is warned about once. See
+    /// [`Self::graffiti_file_table`].
     graffiti_file_failing: AtomicBool,
 }
 
@@ -319,47 +320,65 @@ impl ProposerSettings {
     /// validator's own graffiti too. `None` when none is set: the request then
     /// carries no graffiti, and the beacon node applies its own default.
     ///
-    /// The file is read afresh on every call, on the blocking pool. One that
-    /// cannot be read or no longer parses is skipped with a warning, and the
-    /// next source applies.
+    /// The file is read afresh on every call, off the runtime (see
+    /// [`GraffitiFile::read`]). One that cannot be read or no longer parses
+    /// is skipped with a warning, every time, since this is what a proposal
+    /// calls; the next source applies.
     pub async fn next_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
+        self.graffiti_through_file(pubkey, false).await
+    }
+
+    /// [`Self::next_graffiti`]'s answer, for the keymanager API's
+    /// `GET graffiti`. Only the logging differs: a failed read of the file is
+    /// warned about at the first of a run of them and logged at debug after
+    /// that, so a client polling the route does not repeat the warning every
+    /// poll.
+    pub async fn reported_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
+        self.graffiti_through_file(pubkey, true).await
+    }
+
+    /// The order [`Self::next_graffiti`] gives. `quiet_repeats` logs a failed
+    /// read of the file at debug when the one before it failed too.
+    async fn graffiti_through_file(
+        &self,
+        pubkey: &BlsPubkey,
+        quiet_repeats: bool,
+    ) -> Option<Bytes32> {
         let from_file = match &self.graffiti_file {
             Some(file) => self
-                .graffiti_file_table(file.read().await)
+                .graffiti_file_table(file.read().await, quiet_repeats)
                 .and_then(|table| table.graffiti(pubkey)),
             None => None,
         };
         from_file.or_else(|| self.graffiti(pubkey))
     }
 
-    /// One read of the graffiti file, or `None` when it failed. The first
-    /// failure in a run of them is logged at warn and the rest at debug, so a
-    /// keymanager client polling `GET graffiti` does not repeat it every
-    /// poll; the read that ends the run is logged too.
+    /// One read of the graffiti file, or `None` when it failed, which is
+    /// logged at warn, or at debug for a repeat under `quiet_repeats`. The
+    /// read that ends a run of failures is logged too.
     fn graffiti_file_table(
         &self,
         read: Result<GraffitiTable, GraffitiFileError>,
+        quiet_repeats: bool,
     ) -> Option<GraffitiTable> {
-        match read {
-            Ok(table) => {
-                if self.graffiti_file_failing.swap(false, Ordering::Relaxed) {
-                    info!("Graffiti file read again; its graffiti applies from now on");
-                }
-                Some(table)
+        read.inspect(|_| {
+            if self.graffiti_file_failing.swap(false, Ordering::Relaxed) {
+                info!("Graffiti file read again; its graffiti applies from now on");
             }
-            Err(err) => {
-                if self.graffiti_file_failing.swap(true, Ordering::Relaxed) {
-                    debug!(%err, "Graffiti file still skipped");
-                } else {
-                    warn!(
-                        %err,
-                        "Graffiti file skipped until it reads again; the validator's own graffiti \
-                         applies, else --graffiti, else none"
-                    );
-                }
-                None
+        })
+        .inspect_err(|err| {
+            let repeat = self.graffiti_file_failing.swap(true, Ordering::Relaxed);
+            if repeat && quiet_repeats {
+                debug!(%err, "Graffiti file still skipped");
+            } else {
+                warn!(
+                    %err,
+                    "Graffiti file skipped; the validator's own graffiti applies, else \
+                     --graffiti, else none"
+                );
             }
-        }
+        })
+        .ok()
     }
 
     /// The gas limit `pubkey` reports.

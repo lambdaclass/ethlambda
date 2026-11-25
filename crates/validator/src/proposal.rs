@@ -445,13 +445,18 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         .await;
         refuse_unless_safe(slot, duty.validator_index, "consult", checked)?;
 
-        let randao_reveal = self.context.sign_randao(store, &pubkey, epoch).await?;
-
-        // Both read once, before the block is asked for, so the check below
-        // compares against the address in force when the request went out.
         // The graffiti reads `--graffiti-file` afresh, so an edit to the file
-        // reaches this proposal.
-        let graffiti = self.settings.next_graffiti(&pubkey).await;
+        // reaches this proposal. Alongside the RANDAO signature, a round trip
+        // when a remote signer holds the key, so a slow file costs the block
+        // request no time of its own.
+        let (randao_reveal, graffiti) = tokio::join!(
+            self.context.sign_randao(store, &pubkey, epoch),
+            self.settings.next_graffiti(&pubkey)
+        );
+        let randao_reveal = randao_reveal?;
+
+        // Read once, before the block is asked for, so the check below
+        // compares against the address in force when the request went out.
         let fee_recipient = self.settings.fee_recipient(&pubkey);
         let request = BlockRequest {
             slot,

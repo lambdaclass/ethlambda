@@ -13,9 +13,9 @@
 //!
 //! Graffiti also has `--graffiti-file`, read ahead of the validator's own
 //! value, and `GET graffiti` answers what the next proposal would carry, the
-//! file included (see `ProposerSettings::next_graffiti`). A `POST` or `DELETE`
-//! is written and applied as usual while the file is set, and shows in
-//! proposals and in `GET` whenever the file names neither the key nor a
+//! file included (see `ProposerSettings::reported_graffiti`). A `POST` or
+//! `DELETE` is written and applied as usual while the file is set, and shows
+//! in proposals and in `GET` whenever the file names neither the key nor a
 //! `default`.
 //!
 //! Every route answers 404 for a key this client does not hold. The check and
@@ -346,8 +346,9 @@ pub async fn get_graffiti(
     // What the next proposal would carry, the graffiti file included. With
     // no graffiti anywhere a proposal sends none and the beacon node applies
     // its own; the specification has no way to say so, and an empty string
-    // is the nearest answer.
-    let graffiti = context.settings.next_graffiti(&pubkey).await;
+    // is the nearest answer. `reported_graffiti` is `next_graffiti` warning
+    // only once about a run of failed reads, since clients poll this route.
+    let graffiti = context.settings.reported_graffiti(&pubkey).await;
     Ok(Json(Data {
         data: GraffitiEntry {
             pubkey: encode_hex(&pubkey.0),

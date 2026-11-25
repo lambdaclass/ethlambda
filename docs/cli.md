@@ -876,12 +876,19 @@ reads it half-written.
 
 A file that cannot be read or does not parse, a graffiti over 32 bytes among
 them, refuses startup, as an over-long `--graffiti` does. So does a file over
-16 MiB. Once the client is running, the same failure costs only the file: the
-proposal takes its graffiti from the next source in the list, and the client
-logs a warning at the first failed read and an info line once it reads
-again. A read that takes longer than 250 ms is given up on the same way, so a
-stalled mount cannot cost a proposal its slot. A UTF-8 byte-order mark at the
-start of the file is ignored.
+16 MiB, and one not read within 5 seconds, so a stalled mount or a FIFO in the
+file's place refuses startup rather than hang it. Once the client is running,
+the same failure costs only the file: the proposal takes its graffiti from the
+next source in the list and logs a warning, and the client logs an info line
+once the file reads again. `GET graffiti` skips the file the same way, but
+warns only at the first of a run of failed reads, so a client polling it does
+not repeat the warning. A read that takes longer than 250 ms is given up on
+the same way, so a stalled mount cannot cost a proposal its slot; the read
+runs alongside the RANDAO signature, so it adds nothing when that takes as
+long. Each read runs on a thread of its own, at most four at once, so a
+stalled file holds four threads at most and never the ones slashing
+protection runs on. A UTF-8 byte-order mark at the start of the file is
+ignored.
 
 Two things differ from Lighthouse besides the reload. `--graffiti-file` and
 `--graffiti` may be given together, since the flag is where the file's misses
