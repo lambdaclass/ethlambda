@@ -6,14 +6,16 @@
 //! acting on the old schedule would attest from the wrong committee.
 //!
 //! Proposer duties are held alongside them, in a separate map and on
-//! deliberately different terms. Three differences, all of them consequences of
-//! the proposer shuffling being fixed a whole epoch later than the committee
-//! shuffling:
+//! deliberately different terms:
 //!
-//! - **No lookahead.** Asking for the next epoch's proposers returns an answer
-//!   that the end of this epoch will rewrite, so holding it would be holding a
-//!   guess. Attester duties for the next epoch are already settled, which is
-//!   why those *are* prefetched.
+//! - **A lookahead only from fulu.** Since fulu, the state's
+//!   `proposer_lookahead` fixes an epoch's proposers by the end of the epoch
+//!   before it, so the next epoch's are fetched as the attester ones are, with
+//!   v2's `dependent_root` (see [`ProposerDutiesVersion`]). That is what lets
+//!   the duty loop propose at an epoch's first slot without asking the node
+//!   anything first. Before fulu the next epoch's proposers are not decided
+//!   until this one ends, so an answer now would be a guess: the current
+//!   epoch's are fetched at its first slot, with v1's root.
 //! - **Filtered on arrival.** The endpoint answers for every proposer in the
 //!   epoch, not for a submitted list, so all but this client's own entries are
 //!   dropped as they come in rather than at every lookup.
@@ -28,10 +30,12 @@
 //! this service holds no fork schedule, and so is holding off the gloas fork
 //! epoch's until the fork, before which a node cannot know them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::GENESIS_SLOT;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::{epochs_per_sync_committee_period, slots_per_epoch};
 use ethlambda_types::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 use tracing::{info, warn};
@@ -45,10 +49,50 @@ pub fn sync_committee_period(epoch: Epoch) -> u64 {
     epoch / epochs_per_sync_committee_period()
 }
 
+/// Which proposer duties endpoint an epoch's schedule is fetched from.
+///
+/// The two list the same proposers and differ in the `dependent_root` they
+/// name: v1's is the last block before the epoch, v2's the last block before
+/// the epoch before it, the block fulu's `proposer_lookahead` fixes the
+/// epoch's proposers from. One epoch is always fetched from the same one, so
+/// the roots held for it compare like with like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposerDutiesVersion {
+    V1,
+    V2,
+}
+
+impl ProposerDutiesVersion {
+    /// v2 for an epoch whose proposers the epoch before it already fixed,
+    /// that is one whose previous epoch is fulu or later; v1 otherwise. The
+    /// fulu fork epoch itself is v1: its lookahead is computed at the fork,
+    /// not during the epoch before it.
+    pub fn for_epoch(config: &Config, epoch: Epoch) -> Self {
+        match epoch.checked_sub(1) {
+            Some(previous) if config.fork_at_epoch(previous) >= ForkName::Fulu => Self::V2,
+            _ => Self::V1,
+        }
+    }
+
+    /// Whether `epoch`'s proposers can be fetched during the epoch before it,
+    /// because they are already fixed.
+    pub fn fixed_ahead(config: &Config, epoch: Epoch) -> bool {
+        Self::for_epoch(config, epoch) == Self::V2
+    }
+}
+
 /// One epoch's schedule of some kind, and the block root it is derived from.
 #[derive(Debug, Clone)]
 struct EpochDuties<T> {
     dependent_root: Root,
+    /// [`DutiesService::indices_grown`] when the schedule was fetched. A
+    /// schedule narrowed to the indices held then lacks every validator added
+    /// since, whatever its root says, so the proposer and payload committee
+    /// schedules are replaced once this falls behind: from fulu an epoch's
+    /// proposers are fetched an epoch ahead, before that epoch's refresh
+    /// resolves a key imported meanwhile. The attester schedule is stamped
+    /// too but still keyed on its root alone.
+    indices_seen: u64,
     duties: Vec<T>,
 }
 
@@ -67,6 +111,19 @@ pub struct DutiesService<B> {
     /// with no `dependent_root` because the endpoint sends none: the committee
     /// is fixed a period ahead, so each refresh simply replaces what is held.
     sync: HashMap<u64, Vec<SyncDutyDto>>,
+    /// How many times `indices` has gained a validator it did not hold
+    /// before. Stamped on each schedule fetched (see
+    /// [`EpochDuties::indices_seen`]). A set that only shrank does not count:
+    /// a key that failed to resolve for a moment must not cost a good
+    /// schedule, and the duties of one removed for good find no key to sign.
+    indices_grown: u64,
+    /// Whether the attester schedule changed since
+    /// [`Self::take_attesters_moved`] last asked. [`Self::refresh`] reports
+    /// each change to its caller too, but a caller cut off before it acts on
+    /// one (the duty loop abandons a refresh at the end of its slot) would
+    /// lose it, since the next attempt fetches the same root and reports no
+    /// change. Kept here, the move waits for whoever sends the subscriptions.
+    attesters_moved: bool,
     /// Whether the "no validator indices resolved" warning has already fired.
     /// Without this, an idle client would repeat it every epoch forever; with
     /// it, the operator still gets exactly one signal that duties are not
@@ -83,6 +140,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             proposers: HashMap::new(),
             ptc: HashMap::new(),
             sync: HashMap::new(),
+            indices_grown: 0,
+            attesters_moved: false,
             warned_no_indices: false,
         }
     }
@@ -93,7 +152,17 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         if !indices.is_empty() {
             self.warned_no_indices = false;
         }
+        let held: HashSet<&ValidatorIndex> = self.indices.iter().collect();
+        if indices.iter().any(|index| !held.contains(index)) {
+            self.indices_grown += 1;
+        }
         self.indices = indices;
+    }
+
+    /// Whether the attester schedule changed since this was last called,
+    /// which owes the node this client's subnet subscriptions again.
+    pub fn take_attesters_moved(&mut self) -> bool {
+        std::mem::take(&mut self.attesters_moved)
     }
 
     pub fn indices(&self) -> &[ValidatorIndex] {
@@ -138,10 +207,12 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
         if changed {
             info!(%epoch, count = fetched.duties.len(), "Attester duties updated");
+            self.attesters_moved = true;
             self.by_epoch.insert(
                 epoch,
                 EpochDuties {
                     dependent_root: fetched.dependent_root,
+                    indices_seen: self.indices_grown,
                     duties: fetched.duties,
                 },
             );
@@ -162,7 +233,14 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// holds none of them, so keeping the whole list would mean storing
     /// thirty-two entries an epoch to answer "not us" with, and re-deciding
     /// that at every slot lookup instead of once here.
-    pub async fn refresh_proposers(&mut self, epoch: Epoch) -> Result<()> {
+    ///
+    /// `version` must be the same every time one epoch is fetched (see
+    /// [`ProposerDutiesVersion::for_epoch`]): the two name different roots.
+    pub async fn refresh_proposers(
+        &mut self,
+        epoch: Epoch,
+        version: ProposerDutiesVersion,
+    ) -> Result<()> {
         if self.indices.is_empty() {
             // Silent, unlike the attester path's one-shot warning: that
             // warning already fired for the same cause, and saying it twice
@@ -170,12 +248,14 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             return Ok(());
         }
 
-        let fetched = self.beacon_node.proposer_duties(epoch).await?;
+        let fetched = match version {
+            ProposerDutiesVersion::V1 => self.beacon_node.proposer_duties(epoch).await?,
+            ProposerDutiesVersion::V2 => self.beacon_node.proposer_duties_v2(epoch).await?,
+        };
 
-        let unchanged = self
-            .proposers
-            .get(&epoch)
-            .is_some_and(|held| held.dependent_root == fetched.dependent_root);
+        let unchanged = self.proposers.get(&epoch).is_some_and(|held| {
+            held.dependent_root == fetched.dependent_root && held.indices_seen == self.indices_grown
+        });
         if unchanged {
             return Ok(());
         }
@@ -214,6 +294,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             epoch,
             EpochDuties {
                 dependent_root: fetched.dependent_root,
+                indices_seen: self.indices_grown,
                 duties: mine,
             },
         );
@@ -234,15 +315,14 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
         let fetched = self.beacon_node.ptc_duties(epoch, &self.indices).await?;
 
-        let held = self.ptc.get(&epoch);
-        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
-            return Ok(());
-        }
-        if held.is_some() {
-            warn!(
+        match self.ptc.get(&epoch) {
+            Some(held) if held.dependent_root != fetched.dependent_root => warn!(
                 %epoch,
                 "Payload timeliness committee duties invalidated by a reorg; replacing the schedule"
-            );
+            ),
+            // The same root: kept, unless a validator was added since.
+            Some(held) if held.indices_seen == self.indices_grown => return Ok(()),
+            _ => {}
         }
 
         // The node was asked about these indices only, but a node that answers
@@ -262,6 +342,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             epoch,
             EpochDuties {
                 dependent_root: fetched.dependent_root,
+                indices_seen: self.indices_grown,
                 duties: mine,
             },
         );
@@ -320,6 +401,18 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         self.ptc.contains_key(&epoch)
     }
 
+    /// Whether an attester schedule is held for `epoch`, an empty one
+    /// included.
+    pub fn holds_attesters(&self, epoch: Epoch) -> bool {
+        self.by_epoch.contains_key(&epoch)
+    }
+
+    /// Whether a proposer schedule is held for `epoch`, an empty one
+    /// included: "none of ours" is an answer too.
+    pub fn holds_proposers(&self, epoch: Epoch) -> bool {
+        self.proposers.contains_key(&epoch)
+    }
+
     /// Forget payload timeliness committee duties for epochs before `epoch`.
     pub fn prune_ptc_before(&mut self, epoch: Epoch) {
         self.ptc.retain(|held, _| *held >= epoch);
@@ -356,7 +449,8 @@ impl<B: BeaconNodeApi> DutiesService<B> {
 
     /// Refresh the current epoch and the one after it, and forget anything
     /// older. The lookahead is what lets subnet subscriptions be sent before
-    /// the duty slot arrives.
+    /// the duty slot arrives, and, from fulu, what lets the duty loop propose
+    /// at the next epoch's first slot without asking the node anything first.
     ///
     /// A failed lookahead fetch is logged and shrugged off rather than
     /// propagated: it is speculative, so losing it must never mask a genuine
@@ -368,35 +462,50 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// never leaves a partial schedule behind either: this module is
     /// recoverable by construction, not by explicit retry logic, and the next
     /// call simply tries again.
-    pub async fn refresh_around(&mut self, current_epoch: Epoch) -> Result<bool> {
-        let mut changed = self.refresh(current_epoch).await?;
-
-        match self.refresh(current_epoch + 1).await {
-            Ok(lookahead_changed) => changed |= lookahead_changed,
-            Err(err) => warn!(
-                epoch = current_epoch + 1,
-                %err,
-                "Lookahead duties fetch failed; keeping the current epoch's result"
-            ),
-        }
-
-        // The current epoch only, and never the lookahead: next epoch's
-        // proposers are not decided until this one ends, so an answer now is a
-        // guess that would be overwritten anyway.
+    pub async fn refresh_around(&mut self, current_epoch: Epoch, config: &Config) -> Result<bool> {
+        // Proposers first: the one schedule a block can be waiting on. The
+        // next epoch's only once they are fixed (see the module doc).
         //
-        // Shrugged off like the lookahead rather than propagated, and for a
-        // sharper reason: the attester schedule for this epoch has already been
-        // fetched successfully by the time this runs, and returning an error
-        // here would throw that away and leave the caller holding the previous
-        // epoch's attester duties. Losing the proposer schedule costs at most a
-        // block; losing the attester one costs every validator's vote, every
+        // Shrugged off like the attester lookahead rather than propagated:
+        // returning an error here would throw away the attester fetches below
+        // and leave the caller holding the previous epoch's attester duties.
+        // Losing the proposer schedule costs at most a block, and the duty
+        // loop asks for it again before each slot's proposal while none is
+        // held; losing the attester one costs every validator's vote, every
         // slot, until the next refresh succeeds.
-        if let Err(err) = self.refresh_proposers(current_epoch).await {
+        let next_epoch = current_epoch + 1;
+        let current = ProposerDutiesVersion::for_epoch(config, current_epoch);
+        let fetched = self.refresh_proposers(current_epoch, current).await;
+        let _ = fetched.inspect_err(|err| {
             warn!(
                 epoch = current_epoch,
                 %err,
-                "Proposer duties fetch failed; this epoch's blocks will not be proposed"
+                "Proposer duties fetch failed; trying again before each slot's proposal"
             );
+        });
+        if ProposerDutiesVersion::fixed_ahead(config, next_epoch) {
+            let fetched = self
+                .refresh_proposers(next_epoch, ProposerDutiesVersion::V2)
+                .await;
+            let _ = fetched.inspect_err(|err| {
+                warn!(
+                    epoch = next_epoch,
+                    %err,
+                    "Lookahead proposer duties fetch failed; they are asked for again at that \
+                     epoch's first slot, ahead of its block"
+                );
+            });
+        }
+
+        let mut changed = self.refresh(current_epoch).await?;
+
+        match self.refresh(next_epoch).await {
+            Ok(lookahead_changed) => changed |= lookahead_changed,
+            Err(err) => warn!(
+                epoch = next_epoch,
+                %err,
+                "Lookahead duties fetch failed; keeping the current epoch's result"
+            ),
         }
 
         self.by_epoch.retain(|epoch, _| *epoch >= current_epoch);
@@ -518,10 +627,16 @@ mod tests {
             .with_duties(5, root(3), vec![duty(1337, 165, 2)]);
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
 
-        service.refresh_around(3).await.expect("epoch 3");
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("epoch 3");
         assert!(!service.at_slot(96, 3).is_empty());
 
-        service.refresh_around(4).await.expect("epoch 4");
+        service
+            .refresh_around(4, &Config::mainnet())
+            .await
+            .expect("epoch 4");
         assert!(
             service.at_slot(96, 3).is_empty(),
             "epoch 3 must have been dropped"
@@ -536,7 +651,10 @@ mod tests {
             .with_duties(4, root(2), vec![duty(1337, 130, 2)]);
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
 
-        service.refresh_around(3).await.expect("epoch 3");
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("epoch 3");
 
         // Epoch 4 must already be held before it is ever the current epoch:
         // that is the entire point of the lookahead, to have the schedule in
@@ -580,7 +698,10 @@ mod tests {
             vec![proposer(1337, 96), proposer(42, 97), proposer(1337, 98)],
         );
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
-        service.refresh_proposers(3).await.expect("refreshes");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("refreshes");
 
         assert_eq!(
             service.proposer_at_slot(96, 3).map(|d| d.validator_index),
@@ -600,7 +721,10 @@ mod tests {
     async fn a_slot_with_no_proposer_duty_of_ours_answers_none() {
         let node = MockBeaconNode::new().with_proposers(3, root(1), vec![proposer(1337, 96)]);
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
-        service.refresh_proposers(3).await.expect("refreshes");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("refreshes");
 
         assert!(service.proposer_at_slot(97, 3).is_none());
         // Right slot, wrong epoch: the lookup must be scoped, not blurred.
@@ -612,13 +736,19 @@ mod tests {
         let node =
             Arc::new(MockBeaconNode::new().with_proposers(3, root(1), vec![proposer(1337, 96)]));
         let mut service = DutiesService::new(node.clone(), vec![1337]);
-        service.refresh_proposers(3).await.expect("first");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("first");
 
         // Same dependent root, different content. A node that answers this way
         // is contradicting itself, and the held schedule must win: the root is
         // what the schedule is keyed on.
         node.set_proposers(3, root(1), vec![proposer(1337, 99)]);
-        service.refresh_proposers(3).await.expect("second");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("second");
 
         assert!(service.proposer_at_slot(96, 3).is_some());
         assert!(service.proposer_at_slot(99, 3).is_none());
@@ -629,13 +759,19 @@ mod tests {
         let node =
             Arc::new(MockBeaconNode::new().with_proposers(3, root(1), vec![proposer(1337, 96)]));
         let mut service = DutiesService::new(node.clone(), vec![1337]);
-        service.refresh_proposers(3).await.expect("first");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("first");
 
         // A reorg past the last slot of epoch 2 re-shuffles this epoch's
         // proposers, which is a far shallower reorg than the one that would
         // move an attester.
         node.set_proposers(3, root(2), vec![proposer(1337, 99)]);
-        service.refresh_proposers(3).await.expect("second");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("second");
 
         assert!(
             service.proposer_at_slot(96, 3).is_none(),
@@ -659,7 +795,7 @@ mod tests {
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
 
         service
-            .refresh_around(3)
+            .refresh_around(3, &Config::mainnet())
             .await
             .expect("a failed proposer fetch must not fail the refresh");
         assert!(
@@ -669,12 +805,13 @@ mod tests {
         assert!(service.proposer_at_slot(96, 3).is_none());
     }
 
-    /// Proposer duties for the next epoch are not decided until this one ends,
-    /// so prefetching them would hold a guess that the epoch boundary
-    /// overwrites. Attester duties *are* prefetched, which is why this has to
-    /// be asserted rather than assumed.
+    /// Before fulu, proposer duties for the next epoch are not decided until
+    /// this one ends, so prefetching them would hold a guess that the epoch
+    /// boundary overwrites. Attester duties *are* prefetched, which is why this
+    /// has to be asserted rather than assumed. (Mainnet's config puts epoch 3
+    /// long before fulu.)
     #[tokio::test]
-    async fn proposer_duties_are_not_prefetched_for_the_lookahead_epoch() {
+    async fn before_fulu_proposer_duties_are_not_prefetched_for_the_lookahead_epoch() {
         let node = Arc::new(
             MockBeaconNode::new()
                 .with_duties(3, root(1), vec![duty(1337, 96, 2)])
@@ -683,7 +820,10 @@ mod tests {
                 .with_proposers(4, root(2), vec![proposer(1337, 130)]),
         );
         let mut service = DutiesService::new(node.clone(), vec![1337]);
-        service.refresh_around(3).await.expect("epoch 3");
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("epoch 3");
 
         assert_eq!(
             node.proposer_duties_call_count(),
@@ -697,6 +837,83 @@ mod tests {
         );
     }
 
+    /// A config with fulu from genesis, so every epoch after the first has its
+    /// proposers fixed an epoch ahead.
+    fn fulu_config() -> Config {
+        [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+        ]
+        .into_iter()
+        .fold(Config::mainnet(), |config, fork| {
+            config.with_fork_epoch(fork, 0)
+        })
+    }
+
+    #[test]
+    fn proposer_duties_are_v2_once_the_epoch_before_is_fulu() {
+        let mut config = fulu_config();
+        config.fulu_fork_epoch = 10;
+        let version = |epoch| ProposerDutiesVersion::for_epoch(&config, epoch);
+        assert_eq!(version(0), ProposerDutiesVersion::V1, "no epoch before");
+        assert_eq!(version(10), ProposerDutiesVersion::V1, "the fork epoch");
+        assert_eq!(version(11), ProposerDutiesVersion::V2);
+        assert!(!ProposerDutiesVersion::fixed_ahead(&config, 10));
+        assert!(ProposerDutiesVersion::fixed_ahead(&config, 11));
+    }
+
+    /// From fulu the next epoch's proposers are fixed, so they are fetched
+    /// with the lookahead, from v2, and the duty loop holds them before that
+    /// epoch's first slot.
+    #[tokio::test]
+    async fn from_fulu_the_next_epochs_proposers_are_prefetched_from_v2() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(1), vec![duty(1337, 96, 2)])
+                .with_duties(4, root(2), vec![duty(1337, 130, 2)])
+                .with_proposers_v2(3, root(1), vec![proposer(1337, 97)])
+                .with_proposers_v2(4, root(2), vec![proposer(1337, 128)]),
+        );
+        let mut service = DutiesService::new(node.clone(), vec![1337]);
+        service
+            .refresh_around(3, &fulu_config())
+            .await
+            .expect("epoch 3");
+
+        assert_eq!(node.proposer_duties_call_count(), 0, "no v1 request");
+        assert_eq!(node.proposer_duties_v2_call_count(), 2);
+        assert!(service.proposer_at_slot(97, 3).is_some());
+        assert!(service.holds_proposers(4));
+        assert!(
+            service.proposer_at_slot(128, 4).is_some(),
+            "the next epoch's first slot is known before it starts"
+        );
+    }
+
+    /// A failed lookahead proposer fetch costs nothing else: the duty loop
+    /// asks again at the epoch's first slot.
+    #[tokio::test]
+    async fn a_failed_proposer_prefetch_does_not_fail_the_refresh() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(1), vec![duty(1337, 96, 2)])
+                .with_duties(4, root(2), vec![duty(1337, 130, 2)])
+                .with_proposers_v2(3, root(1), vec![proposer(1337, 97)]),
+        );
+        let mut service = DutiesService::new(node, vec![1337]);
+        service
+            .refresh_around(3, &fulu_config())
+            .await
+            .expect("refreshes");
+
+        assert!(service.holds_attesters(4));
+        assert!(!service.holds_proposers(4));
+    }
+
     #[tokio::test]
     async fn refreshing_around_an_epoch_forgets_the_previous_ones_proposers() {
         let node = MockBeaconNode::new()
@@ -707,10 +924,16 @@ mod tests {
             .with_proposers(4, root(2), vec![proposer(1337, 130)]);
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
 
-        service.refresh_around(3).await.expect("epoch 3");
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("epoch 3");
         assert!(service.proposer_at_slot(96, 3).is_some());
 
-        service.refresh_around(4).await.expect("epoch 4");
+        service
+            .refresh_around(4, &Config::mainnet())
+            .await
+            .expect("epoch 4");
         assert!(
             service.proposer_at_slot(96, 3).is_none(),
             "epoch 3's proposers must have been pruned"
@@ -730,7 +953,10 @@ mod tests {
             vec![proposer(1337, 0), proposer(1337, 3)],
         );
         let mut service = DutiesService::new(Arc::new(node), vec![1337]);
-        service.refresh_proposers(0).await.expect("refreshes");
+        service
+            .refresh_proposers(0, ProposerDutiesVersion::V1)
+            .await
+            .expect("refreshes");
 
         assert!(
             service.proposer_at_slot(0, 0).is_none(),
@@ -746,8 +972,59 @@ mod tests {
     async fn with_no_validators_no_proposer_duties_are_fetched() {
         let node = Arc::new(MockBeaconNode::new());
         let mut service = DutiesService::new(node.clone(), vec![]);
-        service.refresh_proposers(3).await.expect("no-op");
+        service
+            .refresh_proposers(3, ProposerDutiesVersion::V1)
+            .await
+            .expect("no-op");
         assert_eq!(node.proposer_duties_call_count(), 0);
+    }
+
+    /// From fulu an epoch's proposers are fetched an epoch ahead, so a key
+    /// imported meanwhile is resolved after its epoch's schedule was narrowed
+    /// without it. The same root must not keep that schedule: the validator's
+    /// slots would go unproposed for the whole epoch. Its payload committee
+    /// seats likewise.
+    #[tokio::test]
+    async fn a_schedule_narrowed_before_an_index_was_added_is_replaced() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_proposers_v2(4, root(2), vec![proposer(1337, 128), proposer(42, 129)])
+                .with_ptc_duties(4, root(2), vec![ptc_duty(1337, 130), ptc_duty(42, 131)]),
+        );
+        let mut service = DutiesService::new(node, vec![1337]);
+        let v2 = ProposerDutiesVersion::V2;
+        service.refresh_proposers(4, v2).await.expect("first");
+        service.refresh_ptc(4).await.expect("first");
+        assert!(service.proposer_at_slot(129, 4).is_none());
+
+        service.set_indices(vec![1337, 42]);
+        service.refresh_proposers(4, v2).await.expect("second");
+        service.refresh_ptc(4).await.expect("second");
+
+        assert_eq!(
+            service.proposer_at_slot(129, 4).map(|d| d.validator_index),
+            Some(42)
+        );
+        assert!(service.proposer_at_slot(128, 4).is_some());
+        assert_eq!(service.ptc_at_slot(131, 4).len(), 1);
+    }
+
+    /// A set that only shrank, as one with a key that failed to resolve for a
+    /// moment does, keeps the schedule held for the same root.
+    #[tokio::test]
+    async fn an_index_set_that_only_shrank_keeps_the_held_schedule() {
+        let node =
+            Arc::new(MockBeaconNode::new().with_proposers(3, root(1), vec![proposer(1337, 96)]));
+        let mut service = DutiesService::new(node.clone(), vec![1337, 42]);
+        let v1 = ProposerDutiesVersion::V1;
+        service.refresh_proposers(3, v1).await.expect("first");
+
+        service.set_indices(vec![1337]);
+        node.set_proposers(3, root(1), vec![proposer(1337, 99)]);
+        service.refresh_proposers(3, v1).await.expect("second");
+
+        assert!(service.proposer_at_slot(96, 3).is_some());
+        assert!(service.proposer_at_slot(99, 3).is_none());
     }
 
     fn ptc_duty(validator_index: ValidatorIndex, slot: Slot) -> PtcDutyDto {
