@@ -787,7 +787,6 @@ mod tests {
         use crate::beacon_node::ValidatorEntry;
         use crate::beacon_node::dto::{PtcDutyDto, SyncDutyDto, encode_hex};
         use crate::duties::DutiesService;
-        use crate::keys::ValidatorStore;
         use crate::payload_attestation::PayloadAttestationService;
         use crate::proposer_settings::ProposerSettings;
         use crate::signing::SigningContext;
@@ -835,9 +834,13 @@ mod tests {
             "the next slot signs nothing"
         );
 
-        let store = RwLock::new(ValidatorStore::new());
+        // A real key, so a node that did serve the head root or the payload
+        // data would get a signed message submitted, which the asserts below
+        // catch. With no key the services sign nothing either way.
+        let (store, pubkeys) = crate::test_support::store_with_keys(1);
+        let store = RwLock::new(store);
         let sync_duty = SyncDutyDto {
-            pubkey: encode_hex(&[1u8; 48]),
+            pubkey: encode_hex(&pubkeys[0].0),
             validator_index: 11,
             validator_sync_committee_indices: vec![0],
         };
@@ -849,7 +852,7 @@ mod tests {
         assert!(root.is_none(), "no head root to sign");
 
         let ptc_duty = PtcDutyDto {
-            pubkey: encode_hex(&[1u8; 48]),
+            pubkey: encode_hex(&pubkeys[0].0),
             validator_index: 11,
             slot: slot + 1,
         };
@@ -877,7 +880,6 @@ mod tests {
         use tokio::sync::RwLock;
 
         use crate::beacon_node::dto::{SyncDutyDto, encode_hex};
-        use crate::keys::ValidatorStore;
         use crate::signing::SigningContext;
         use crate::sync_committee::SyncCommitteeService;
 
@@ -890,12 +892,15 @@ mod tests {
             ethlambda_types::beacon::config::Config::mainnet(),
             Root::ZERO,
         ));
+        // A real key, so a stale root that reached the service would be signed
+        // and submitted, which the assert below catches.
+        let (store, pubkeys) = crate::test_support::store_with_keys(1);
+        let store = RwLock::new(store);
         let duty = SyncDutyDto {
-            pubkey: encode_hex(&[1u8; 48]),
+            pubkey: encode_hex(&pubkeys[0].0),
             validator_index: 11,
             validator_sync_committee_indices: vec![0],
         };
-        let store = RwLock::new(ValidatorStore::new());
 
         for nodes in [vec![stale()], vec![failing_synced, stale()]] {
             let beacon_node = Arc::new(fallback(nodes));
