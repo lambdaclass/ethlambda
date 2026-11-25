@@ -148,7 +148,7 @@ fn error_text(text: &str) -> String {
 /// can quote the node's own text, the whole of an unexpected string among
 /// it, so it is bounded and written out like a failed answer's body before
 /// it reaches an error and the log line that prints it.
-fn decode_text(err: &serde_json::Error) -> String {
+pub(crate) fn decode_text(err: &serde_json::Error) -> String {
     error_text(&err.to_string())
 }
 

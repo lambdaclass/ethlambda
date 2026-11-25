@@ -839,8 +839,12 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         .get("GAS_LIMIT_SCHEDULE")
         .filter(|field| !field.is_null());
     if let Some(field) = schedule {
-        config.gas_limit_schedule = serde_json::from_value(field.clone())
-            .map_err(|err| Error::Decode(format!("config/spec: GAS_LIMIT_SCHEDULE: {err}")))?;
+        // serde's message can quote the node's own text, so it is written out
+        // and bounded like every other JSON decode error from a node.
+        config.gas_limit_schedule = serde_json::from_value(field.clone()).map_err(|err| {
+            let detail = super::http::decode_text(&err);
+            Error::Decode(format!("config/spec: GAS_LIMIT_SCHEDULE: {detail}"))
+        })?;
     }
 
     let genesis_version = required(
@@ -1624,6 +1628,17 @@ mod tests {
         let response = complete_spec(&[("GAS_LIMIT_SCHEDULE", "200000000")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+
+        // serde quotes the node's string in its message: written out on one
+        // line and bounded, as every node's decode error is.
+        let quoted = format!("{}\n\u{1b}[2J", "x".repeat(4_096));
+        let response = complete_spec(&[("GAS_LIMIT_SCHEDULE", &quoted)]);
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        let Error::Decode(text) = err else {
+            panic!("got {err:?}");
+        };
+        assert!(text.len() <= 1_024 + 64, "{} bytes", text.len());
+        assert!(!text.contains(['\n', '\u{1b}']), "{text}");
     }
 
     #[test]
