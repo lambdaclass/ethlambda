@@ -466,9 +466,12 @@ the chain actor writes, so no request waits on the actor.
   next slot's block is asked for. Entries more than an epoch old are dropped
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
-  memory, so a restart forgets it and the node builds its own payloads for the
-  zero address until the next call. ethlambda's validator client repeats the
-  call every slot, as Lighthouse's does.
+  memory, so a restart forgets it and the node builds its own payloads for
+  `beacon --fallback-fee-recipient` (the zero address without it) until the
+  next call. ethlambda's validator client repeats the call every slot, as
+  Lighthouse's does. The fallback pays any proposer no validator client named
+  a recipient for, but does not register it: the `payload_attributes` event
+  still follows `prepare_beacon_proposer`.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
@@ -890,9 +893,9 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
 The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.
 
-A `cl_type: ethlambda` participant in our ethereum-package fork
-([`lambdaclass/ethereum-package`](https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda),
-branch `add-ethlambda`) runs an ethlambda validator client that, by default,
+A `cl_type: ethlambda` participant in
+[`ethpandaops/ethereum-package`](https://github.com/ethpandaops/ethereum-package)
+runs an ethlambda validator client that, by default,
 talks to this node alone, so every block its validators propose is one this
 node built.
 
@@ -1158,10 +1161,11 @@ How `payload_attributes` behaves:
 - **What it carries** is what `produceBlockV3`/`produceBlockV4` would send the
   execution client for a block at `proposal_slot` on the current head, from
   the same code: the head state advanced to the slot, the fee recipient
-  (gloas: the proposer's signed preferences, else `prepare_beacon_proposer`'s,
-  else the zero address), and on gloas the parent payload fork choice selects
-  (the head's payload status, and for a head at the previous slot the PTC's
-  votes on its payload) and the preferences' gas target. `payload_attributes`
+  (on gloas the proposer's signed preferences first, then on every fork
+  `prepare_beacon_proposer`'s, else `--fallback-fee-recipient`, else the zero
+  address), and on gloas the parent payload fork choice selects (the head's
+  payload status, and for a head at the previous slot the PTC's votes on its
+  payload) and the preferences' gas target. `payload_attributes`
   is the execution API's `PayloadAttributesV3` (`V4` from gloas) in
   `snake_case` with quoted integers.
 - **When**: at two thirds of each slot (Lighthouse's default

@@ -720,13 +720,14 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             }
 
             // The proposer preparations again, for a beacon node that restarted
-            // since the refresh sent them and so builds for the zero address
-            // until it hears from this client. Once the slot's duties are done,
-            // so they reach the node ahead of the next slot's proposal rather
-            // than racing this one's: a third of the way in on a slot with no
-            // duties, after the aggregation or the payload vote on one with
-            // them. Off the slot loop like the sends above. The refresh's slot
-            // too, although its refresh sent them: see `Preparations`.
+            // since the refresh sent them and so builds for its fallback fee
+            // recipient (the zero address without one) until it hears from
+            // this client. Once the slot's duties are done, so they reach the
+            // node ahead of the next slot's proposal rather than racing this
+            // one's: a third of the way in on a slot with no duties, after the
+            // aggregation or the payload vote on one with them. Off the slot
+            // loop like the sends above. The refresh's slot too, although its
+            // refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
 
             // This epoch's payload committee schedule again, while none is
@@ -1367,7 +1368,8 @@ fn preparations<'a>(
 ///
 /// As Lighthouse's validator client does. A node keeps a preparation for the
 /// epoch it arrived in and two more, and loses all of them when it restarts;
-/// until the next one arrives it builds its own payloads for the zero address.
+/// until the next one arrives it builds its own payloads for its fallback fee
+/// recipient, which is the zero address unless its operator set one.
 /// Sent only by the epoch refresh, a restart mid-epoch cost the rest of that
 /// epoch's local blocks their execution-layer rewards: six blocks on a devnet,
 /// from a beacon node killed 14 slots into its epoch. Sent every slot, a
@@ -1783,7 +1785,8 @@ mod tests {
     /// included, the refresh's validators again, with the addresses the
     /// settings name by then. That re-send is what a beacon node restarted
     /// mid-epoch hears from first: sent only by the refresh, its local blocks
-    /// paid the zero address for the rest of the epoch.
+    /// paid its fallback fee recipient (the zero address without one) for the
+    /// rest of the epoch.
     ///
     /// On the refresh's own slot it puts the current address back when the
     /// refresh's send was overtaken, here by the previous slot's re-send

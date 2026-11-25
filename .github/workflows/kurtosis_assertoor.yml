@@ -29,10 +29,11 @@ concurrency:
 env:
   IMAGE_REPO: ghcr.io/lambdaclass/ethlambda
   KURTOSIS_VERSION: "1.23.0"
-  # The fork of ethpandaops/ethereum-package that adds `cl_type: ethlambda` and
-  # `vc_type: ethlambda`, pinned to a commit. Bump it deliberately.
-  ETHEREUM_PACKAGE_REPO: https://github.com/lambdaclass/ethereum-package.git
-  ETHEREUM_PACKAGE_REF: 8378c1e3030ef4d41306aea9a0ba13d19372d125
+  # ethpandaops/ethereum-package, which has `cl_type: ethlambda` and
+  # `vc_type: ethlambda` since ethpandaops/ethereum-package#1515, pinned to a
+  # commit. Bump it deliberately.
+  ETHEREUM_PACKAGE_REPO: https://github.com/ethpandaops/ethereum-package.git
+  ETHEREUM_PACKAGE_REF: 90d0f4e795cd4c3298753b428bb588ed7999d4da
   ENCLAVE: ethlambda-assertoor
 
 jobs:
@@ -98,9 +99,8 @@ jobs:
           kurtosis analytics disable
           kurtosis version
 
-      # Run the package from a clone, not as `github.com/...@<ref>`: kurtosis
-      # refuses a remote package whose kurtosis.yml names another repository,
-      # and the fork's still says ethpandaops/ethereum-package.
+      # Run the package from a clone checked against the pinned commit, so the
+      # run uses exactly that commit.
       - name: Fetch ethereum-package at the pinned commit
         run: |
           git init "$RUNNER_TEMP/ethereum-package"
