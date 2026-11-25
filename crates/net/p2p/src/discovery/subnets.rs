@@ -80,10 +80,11 @@ const HUNT_INTERVAL: Duration = Duration::from_secs(30);
 /// Pause after a hunt that handed over nothing and never reached the network:
 /// its walk could not run, or ran and saw no node at all.
 ///
-/// That is every node's first hunt, which starts while discovery knows its
-/// bootnodes only as bare endpoints, with no record to match and no contact to
-/// walk from until their first answers land. Such a hunt leaves no dials in
-/// flight for [`HUNT_INTERVAL`] to wait out, so waiting it would only leave the
+/// That is a hunt run before the network has answered: the first one starts
+/// while discovery knows its bootnodes only as bare endpoints, with no record
+/// to match, and its walk sees nothing until one of them replies (or none
+/// answers at all). Such a hunt leaves no dials in flight for
+/// [`HUNT_INTERVAL`] to wait out, so waiting it would only leave the
 /// subscribed subnets unhunted for longer.
 const HUNT_RETRY: Duration = Duration::from_secs(5);
 
@@ -322,7 +323,7 @@ enum Walk {
 /// dialed, which the next hunt should count as connections, or a network that
 /// answered and had nothing more to give. [`HUNT_RETRY`] when there is neither,
 /// a hunt that handed nothing over and never reached the network, which is
-/// what a hunt run before discovery has any records looks like.
+/// what a hunt run before any node has answered discovery looks like.
 fn pause_after(handed: usize, walk: Walk) -> Duration {
     match walk {
         Walk::Skipped => HUNT_INTERVAL,
@@ -481,9 +482,9 @@ mod tests {
 
     #[test]
     fn a_hunt_that_never_reached_the_network_is_retried_soon() {
-        // The first hunt after startup: discovery knows its bootnodes only as
-        // bare endpoints, so the walk sees nothing, and nothing is being
-        // dialed that the full interval would wait for.
+        // A hunt run before any bootnode has answered: nothing cached matched,
+        // the walk saw no node, and nothing is being dialed that the full
+        // interval would wait for.
         assert_eq!(pause_after(0, Walk::Ran { nodes_seen: 0 }), HUNT_RETRY);
         assert_eq!(pause_after(0, Walk::Failed), HUNT_RETRY);
     }

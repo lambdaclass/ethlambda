@@ -237,8 +237,8 @@ ethrex's predicate queries (Lighthouse does the same with sigp/discv5's
   discovery already holds, then a walk of up to 10 s for the rest, at most 6
   peers per hunt, then a 30 s pause. A hunt that handed nothing over and never
   reached the network (its walk failed, or saw no node at all) is retried after
-  5 s instead: that is the first hunt after startup, while discovery knows its
-  bootnodes only as bare endpoints. Nothing is hunted while the dial loop has
+  5 s instead: that is a hunt run before any bootnode has answered, since
+  discovery starts out knowing them only as bare endpoints. Nothing is hunted while the dial loop has
   no budget to dial a find. A peer a hunt handed over is left out of hunts for
   10 minutes, since discovery keeps offering a mainnet peer that connected and
   said goodbye.
