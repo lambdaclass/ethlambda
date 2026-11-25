@@ -642,18 +642,6 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 }
             }
 
-            // Whether a reorg moved a held schedule since it was fetched, so
-            // the next slot's duties run on the chain the node follows now.
-            // After the slot's duties and bounded by the slot's end, so it
-            // delays none of them. Not on a slot whose refresh was due: that
-            // refresh compared every root itself, or failed and runs again.
-            if !refresh_due {
-                let budget = clock.remaining_in(slot, SystemTime::now());
-                if follow_dependent_roots(&mut duties, epoch, budget, &context.config).await {
-                    resubscribe(epoch, &beacon_node, &duties, &store, &context);
-                }
-            }
-
             // Off the slot loop, like the epoch's full send: a keymanager change
             // to a fee recipient or gas limit reaches the builder within a slot,
             // and a slow node cannot delay the next slot's duties.
@@ -671,6 +659,21 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // loop like the sends above. The refresh's slot too, although its
             // refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
+
+            // Whether a reorg moved a held schedule since it was fetched, so
+            // the next slot's duties run on the chain the node follows now.
+            // After the slot's duties and bounded by the slot's end, so it
+            // delays none of them, and after the sends above, so a slow node
+            // cannot hold them to the slot's end either. Not on a slot whose
+            // refresh was due: that refresh compared every root itself, or
+            // failed and runs again.
+            if !refresh_due {
+                let budget = clock.remaining_in(slot, SystemTime::now());
+                if follow_dependent_roots(&mut duties, epoch, budget, &context.config).await {
+                    metrics::set_duties_held(duties.all().len() as u64);
+                    resubscribe(epoch, &beacon_node, &duties, &store, &context);
+                }
+            }
         }
     };
 
