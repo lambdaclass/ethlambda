@@ -620,10 +620,28 @@ impl HttpBeaconNode {
     }
 }
 
+/// `url` with its user name and password removed, for a log line. Anything
+/// that does not parse as a URL is returned as it is: it cannot be a URL that
+/// carries credentials a request would send.
+fn without_credentials(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            // Neither fails on a URL that already has a user name or password.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.as_str().trim_end_matches('/').to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
 #[async_trait]
 impl BeaconNodeApi for HttpBeaconNode {
+    /// The base URL without any credentials it carries
+    /// (`https://user:password@host`), since this is what the chain check logs
+    /// a node by, at `info` and `warn`.
     fn describe(&self) -> String {
-        self.base_url.clone()
+        without_credentials(&self.base_url)
     }
 
     /// Fetches the chain's genesis time and validators root.
@@ -1387,6 +1405,16 @@ mod tests {
     fn new_trims_a_trailing_slash_from_the_base_url() {
         let node = HttpBeaconNode::new("http://x/").expect("builds");
         assert_eq!(node.base_url(), "http://x");
+    }
+
+    /// The chain check logs a node by `describe`, so a password in its URL
+    /// must not reach the log.
+    #[test]
+    fn a_node_is_described_without_its_credentials() {
+        let node = HttpBeaconNode::new("https://user:secret@node.example:5052").expect("builds");
+        assert_eq!(node.describe(), "https://node.example:5052");
+        let plain = HttpBeaconNode::new("http://127.0.0.1:5052").expect("builds");
+        assert_eq!(plain.describe(), "http://127.0.0.1:5052");
     }
 
     /// An `IndexedErrorMessage` naming fewer failures than the batch size is

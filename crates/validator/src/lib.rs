@@ -282,10 +282,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
 
-    // The chain the client runs on is the first node's that answers; every
-    // other node is checked against it, and a node on another chain is not
-    // used. A fork still in the future is already the compatible nodes'
-    // here, as after every later epoch check. See `chain_check`.
+    // The chain the client runs on is the first node's that answers, waiting
+    // for one while none does; every other node is checked against it, and a
+    // node on another chain is not used. The schedule is the reference's: a
+    // fork another node schedules is taken by the background check once every
+    // node answering schedules it alike. See `chain_check`.
     let ChainId {
         genesis,
         config: spec,
@@ -483,6 +484,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // The beacon node's readmission count as of the last slot, so a node
+        // the chain check let back in since then is sent what it missed.
+        let mut readmissions_seen = beacon_node.readmissions();
 
         loop {
             // One wake per slot, at the slot boundary, rather than one at the
@@ -564,6 +568,31 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 }
             }
 
+            // A node the chain check let back in since the last slot was
+            // skipped by every send before that: it holds none of the epoch's
+            // subnet subscriptions, sync committee subscriptions or builder
+            // registrations, and an aggregate or a contribution it is failed
+            // over to for needs the votes those subnets carry. All three go to
+            // every usable node again, after the block like the refresh's own;
+            // a node that has them already takes them again. What a refresh
+            // this slot sent is not sent twice, and before any refresh got
+            // through there is nothing held to send.
+            let mut resend_sync = None;
+            let readmissions = beacon_node.readmissions();
+            if std::mem::replace(&mut readmissions_seen, readmissions) != readmissions
+                && last_epoch.is_some()
+            {
+                resubscribe = true;
+                if to_register.is_none() {
+                    let registrable = resolved
+                        .iter()
+                        .filter(|entry| is_registrable(&entry.status))
+                        .map(|entry| entry.pubkey);
+                    to_register = Some(registrable.collect());
+                    resend_sync = Some(sync_subscriptions_owed(&duties, epoch));
+                }
+            }
+
             // A block is due now, at the boundary this iteration woke on.
             //
             // Cloned out of `duties` so the borrow ends before the await: the duty
@@ -618,6 +647,12 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                         metrics::set_beacon_node_available(false);
                     });
                 });
+            }
+            // The sync committee subscriptions a node let back in missed,
+            // when no refresh this slot sent them (see above).
+            if let Some(owed) = resend_sync {
+                let beacon_node = beacon_node.clone();
+                tokio::spawn(async move { send_sync_subscriptions(&beacon_node, &owed).await });
             }
 
             // The epoch's full registration send, after the block for the
@@ -1551,7 +1586,6 @@ async fn refresh_sync<B: BeaconNodeApi>(
     context: &SigningContext,
 ) {
     use ethlambda_types::beacon::fork::ForkName;
-    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
 
     if context.config().fork_at_epoch(epoch) < ForkName::Altair {
         return;
@@ -1569,18 +1603,45 @@ async fn refresh_sync<B: BeaconNodeApi>(
     duties.prune_sync_before(period);
     metrics::set_sync_duties_held(duties.sync_for_period(period).len() as u64);
 
-    let current = duties.sync_for_period(period);
-    if let Err(err) =
-        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * period_epochs()).await
-    {
-        warn!(%err, "Failed to subscribe to sync committee subnets");
-    }
+    send_sync_subscriptions(beacon_node, &sync_subscriptions_owed(duties, epoch)).await;
+}
+
+/// The sync committee subscriptions owed at `epoch`, from the duties held:
+/// the current period's seats until the period ends, and the next period's
+/// once its boundary is within [`SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS`], until
+/// that one ends. Each with the epoch it runs until.
+///
+/// What [`refresh_sync`] sends every epoch, and what the duty loop sends again
+/// to a node the chain check let back in.
+fn sync_subscriptions_owed<B: BeaconNodeApi>(
+    duties: &DutiesService<B>,
+    epoch: u64,
+) -> Vec<(Vec<crate::beacon_node::dto::SyncDutyDto>, u64)> {
+    use ethlambda_types::beacon::preset::epochs_per_sync_committee_period as period_epochs;
+
+    let period = crate::duties::sync_committee_period(epoch);
+    let mut owed = vec![(
+        duties.sync_for_period(period),
+        (period + 1) * period_epochs(),
+    )];
     if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * period_epochs() {
-        let next = duties.sync_for_period(period + 1);
-        if let Err(err) =
-            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * period_epochs()).await
-        {
-            warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
+        owed.push((
+            duties.sync_for_period(period + 1),
+            (period + 2) * period_epochs(),
+        ));
+    }
+    owed
+}
+
+/// Send each of `owed` (see [`sync_subscriptions_owed`]), warning about any
+/// no node took.
+async fn send_sync_subscriptions<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    owed: &[(Vec<crate::beacon_node::dto::SyncDutyDto>, u64)],
+) {
+    for (seats, until_epoch) in owed {
+        if let Err(err) = subscriptions::subscribe_sync(beacon_node, seats, *until_epoch).await {
+            warn!(until_epoch, %err, "Failed to subscribe to sync committee subnets");
         }
     }
 }

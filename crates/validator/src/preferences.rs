@@ -1627,7 +1627,7 @@ mod tests {
         assert!(held(1).is_empty());
 
         fallback.nodes()[1].failures.lock().expect("lock").clear();
-        fallback.check_nodes(&chain, || 0).await;
+        fallback.check_nodes(|| chain.clone(), || 0, |_| {}).await;
         let counted = service
             .publish_epoch(current + 2, GLOAS_EPOCH, &snapshot, &store)
             .await;

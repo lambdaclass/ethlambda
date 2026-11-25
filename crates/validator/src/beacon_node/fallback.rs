@@ -41,7 +41,7 @@ use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
-use crate::chain_check::{ChainId, first_chain_difference, follow_schedule};
+use crate::chain_check::{ChainId, Served, first_chain_difference};
 use crate::error::{Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
@@ -56,10 +56,16 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// (or not yet known to be on this one), so no request was made at all.
 const NO_USABLE_NODE: &str = "no configured beacon node is on this client's chain";
 
-/// How many epochs after a node's last answer the schedule it served still
-/// counts in the merge: the epoch it answered in and the one after, which
-/// covers a node that misses a round or restarts.
+/// How many epochs after a node's last answer the configuration it served is
+/// still kept: the epoch it answered in and the one after, which covers a node
+/// that misses a round or restarts. It is what the duty offsets are read from;
+/// a say in the fork schedule needs an answer to the node's latest check (see
+/// [`Served::say`]).
 const SERVED_FOR_EPOCHS: u64 = 1;
+
+/// How long startup waits between rounds while no beacon node answers, as
+/// Lighthouse's validator client does (`RETRY_DELAY`).
+const STARTUP_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What asking one node about its chain came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +127,12 @@ pub struct FallbackBeaconNode<B> {
     /// the network may have moved since. Dropped when the node turns out to
     /// be on another chain.
     served: Vec<Mutex<Option<(Config, u64)>>>,
+    /// Whether each node, by position, answered its most recent check on
+    /// this client's chain: what gives it a say in the fork schedule (see
+    /// [`Served::say`]). Down from the moment a check of it fails, unlike
+    /// `served`, so a node that stops answering cannot hold a fork where it
+    /// last saw it.
+    answered: Vec<AtomicBool>,
 }
 
 impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
@@ -132,12 +144,14 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         let usable = nodes.iter().map(|_| AtomicBool::new(true)).collect();
         let warned_at = nodes.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
         let served = nodes.iter().map(|_| Mutex::new(None)).collect();
+        let answered = nodes.iter().map(|_| AtomicBool::new(false)).collect();
         Self {
             nodes,
             usable,
             warned_at,
             readmissions: AtomicU64::new(0),
             served,
+            answered,
         }
     }
 
@@ -151,29 +165,39 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             .unwrap_or_else(PoisonError::into_inner) = config;
     }
 
-    /// The configuration each usable node last served, with its position, in
-    /// list order: what [`crate::chain_check::follow_schedule`] merges at
-    /// `current_epoch`. A usable node that has never answered a check has
-    /// none and is left out, and so is one whose last answer is older than
-    /// [`SERVED_FOR_EPOCHS`].
+    /// What [`crate::chain_check::follow_schedule`] merges at `current_epoch`:
+    /// the configuration each usable node last served, with its position, in
+    /// list order, and which of those nodes have a say in the fork schedule.
     ///
-    /// The age limit is what keeps an unreachable node from pinning a fork
-    /// the network postponed. The merge takes the lowest epoch reported, so
-    /// a schedule remembered without limit would hold the old epoch against
-    /// every node that follows the postponement, and when that epoch came the
-    /// client would activate the fork alone and refuse them all.
-    pub fn served_configs(&self, current_epoch: u64) -> Vec<(usize, Config)> {
-        self.usable_nodes()
-            .filter_map(|(position, _)| {
-                let served = self.served[position]
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                served
-                    .as_ref()
-                    .filter(|(_, answered)| answered + SERVED_FOR_EPOCHS >= current_epoch)
-                    .map(|(config, _)| (position, config.clone()))
-            })
-            .collect()
+    /// A usable node that has never answered a check has no configuration
+    /// and is left out, and so is one whose last answer is older than
+    /// [`SERVED_FOR_EPOCHS`]: the duty offsets are read from the first one
+    /// left, so the first node keeps its place through a round it misses.
+    ///
+    /// A say needs more: an answer to the node's most recent check. A node
+    /// whose check has just failed keeps its configuration for the offsets,
+    /// but not its say, so a node that stops answering cannot pin a fork at
+    /// the epoch it last reported against every node that follows a
+    /// postponement. When that epoch came, the client would activate the fork
+    /// alone and refuse them all.
+    pub fn served_configs(&self, current_epoch: u64) -> Served {
+        let mut served = Served::default();
+        for (position, _) in self.usable_nodes() {
+            let config = self.served[position]
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|(_, answered)| answered + SERVED_FOR_EPOCHS >= current_epoch)
+                .map(|(config, _)| config.clone());
+            let Some(config) = config else {
+                continue;
+            };
+            served.configs.push((position, config));
+            if self.answered[position].load(Ordering::SeqCst) {
+                served.say.push(position);
+            }
+        }
+        served
     }
 
     /// The nodes calls may go to, with their positions.
@@ -210,6 +234,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// out, then again at most once per epoch for as long as it stays out.
     fn record(&self, position: usize, answer: &NodeAnswer, epoch: u64) {
         let node = self.nodes[position].describe();
+        // Before the flag and the configuration: a merge that reads the node
+        // as usable with what it served reads its say as of this answer.
+        let answered = matches!(answer, NodeAnswer::Compatible(_));
+        self.answered[position].store(answered, Ordering::SeqCst);
         match answer {
             NodeAnswer::Compatible(config) => {
                 self.set_served(position, Some(((**config).clone(), epoch)));
@@ -256,14 +284,22 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// both requests and passes the preset check. Every other node is judged
     /// against it. A node that did not answer is marked unusable, not
     /// assumed fine: it has never been checked, so it is not failed over to
-    /// until a later [`Self::check_nodes`] round verifies it. Fails when no
-    /// node answers, naming what each said.
+    /// until a later [`Self::check_nodes`] round verifies it.
     ///
-    /// The chain returned is the reference's with the schedule the compatible
-    /// nodes serve already followed
-    /// ([`crate::chain_check::follow_schedule`]): a fork still in the future
-    /// takes the lowest epoch any of them reports, exactly as at every later
-    /// epoch check.
+    /// While no node answers, this warns, naming what each said, and asks
+    /// every node again after [`STARTUP_RETRY`], for as long as it takes, as
+    /// Lighthouse's validator client does: a client started beside its
+    /// beacon node (one container restart, one systemd target) would
+    /// otherwise exit before the node's API is up, and read its keystores
+    /// again on every restart. Only when every node answered with a preset
+    /// this client cannot run on does it fail, since waiting cannot change
+    /// that.
+    ///
+    /// The chain returned is the reference's, schedule included. A fork
+    /// another node schedules and the reference lacks is not taken: the
+    /// reference has a say, and a fork is taken only when every node with one
+    /// schedules it alike ([`crate::chain_check::merge_schedule`]), so one
+    /// node alone cannot put a fork on the client's schedule.
     ///
     /// `with_reference` runs once the reference is chosen, and gives the epoch
     /// the wall clock is in on that chain, which decides which forks are still
@@ -274,8 +310,11 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         &self,
         with_reference: impl FnOnce(&ChainId) -> Result<u64>,
     ) -> Result<ChainId> {
-        let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
-        let Some(reference_at) = asked.iter().position(|answer| answer.is_ok()) else {
+        let (reference_at, asked) = loop {
+            let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
+            if let Some(reference_at) = asked.iter().position(|answer| answer.is_ok()) {
+                break (reference_at, asked);
+            }
             let detail = asked
                 .iter()
                 .enumerate()
@@ -287,8 +326,19 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            warn!(%detail, "No configured beacon node could be used as the chain reference");
-            return Err(Error::AllBeaconNodesFailed(detail));
+            if asked
+                .iter()
+                .all(|answer| matches!(answer, Err(Error::Preset(_))))
+            {
+                warn!(%detail, "No configured beacon node is on a preset this client can run on");
+                return Err(Error::AllBeaconNodesFailed(detail));
+            }
+            warn!(
+                %detail,
+                retry_in_secs = STARTUP_RETRY.as_secs(),
+                "No configured beacon node answered; waiting for one"
+            );
+            tokio::time::sleep(STARTUP_RETRY).await;
         };
         let reference = asked[reference_at]
             .as_ref()
@@ -314,50 +364,61 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             self.record(position, &answer, epoch);
         }
 
-        // Follow the schedule now, not at the next epoch's check: a reference
-        // that has not been upgraded would otherwise start the client without
-        // a fork another node already schedules, and if that fork's epoch came
-        // before the next check, the upgraded node would be the one refused.
-        let mut chain = reference;
-        let served = self.served_configs(epoch);
-        if let Some(config) = follow_schedule(&chain.config, &served, epoch, true) {
-            chain.config = config;
-        }
-        Ok(chain)
+        // The reference's schedule is the client's: nothing to follow yet.
+        // It answered, so it has a say, and a fork moves or is taken only
+        // with every node that has one (see `merge_schedule`), so a merge
+        // here could only give the reference's schedule back. The first
+        // background check, a slot from now, merges and warns about any
+        // disagreement.
+        Ok(reference)
     }
 
     /// Ask every node about its chain, all at once and directly (not through
     /// the failover helpers, which would skip exactly the nodes being asked),
     /// and set each one's flag from the answer.
     ///
-    /// A node whose chain matches `ours` is usable; one that differs, or is on
-    /// another preset, is not. A node that did not answer keeps its flag: an
-    /// outage says nothing about the chain. A node going out is warned about
-    /// with the first field that differs, then again at most once per epoch.
+    /// A node whose chain matches `ours()` is usable; one that differs, or is
+    /// on another preset, is not. A node that did not answer keeps its flag:
+    /// an outage says nothing about the chain. A node going out is warned
+    /// about with the first field that differs, then again at most once per
+    /// epoch.
     ///
-    /// The answers are judged at `epoch_now()` as read once they are all in,
-    /// not when the requests went out, so a fork whose epoch passed while a
-    /// node took its time answering counts as arrived (see
+    /// Each answer is judged the moment it arrives, at `epoch_now()` as read
+    /// then and against `ours()` as it is then, and `after_each` runs right
+    /// after it is recorded, with that epoch: the caller follows the schedule
+    /// there. A node that hangs until its request timeout therefore holds back
+    /// only its own answer. Judged after every answer was in, a prompt answer
+    /// reporting a fork while it was still ahead would be judged after the
+    /// fork's epoch, if the slow node's timeout crossed it, and refused for
+    /// the fork. A fork whose epoch passed while a node took its time
+    /// answering still counts as arrived for that node (see
     /// [`crate::chain_check::check_once`]).
     ///
-    /// Returns one answer per node, with its position, and the epoch they were
-    /// judged at. The schedule is followed from [`Self::served_configs`], which
-    /// this keeps current.
+    /// Returns one answer per node, with its position, in list order. The
+    /// schedule is followed from [`Self::served_configs`], which this keeps
+    /// current.
     pub async fn check_nodes(
         &self,
-        ours: &ChainId,
+        ours: impl Fn() -> ChainId,
         epoch_now: impl Fn() -> u64,
-    ) -> (Vec<(usize, NodeAnswer)>, u64) {
-        let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
-        let current_epoch = epoch_now();
-
-        let mut answers = Vec::with_capacity(self.nodes.len());
-        for (position, asked) in asked.into_iter().enumerate() {
-            let answer = classify(ours, asked, current_epoch);
-            self.record(position, &answer, current_epoch);
-            answers.push((position, answer));
-        }
-        (answers, current_epoch)
+        after_each: impl Fn(u64),
+    ) -> Vec<(usize, NodeAnswer)> {
+        let (ours, epoch_now, after_each) = (&ours, &epoch_now, &after_each);
+        let rounds = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(position, node)| async move {
+                let asked = ask(node).await;
+                // Nothing below awaits, so no other node's answer is judged or
+                // merged in between.
+                let epoch = epoch_now();
+                let answer = classify(&ours(), asked, epoch);
+                self.record(position, &answer, epoch);
+                after_each(epoch);
+                (position, answer)
+            });
+        futures_util::future::join_all(rounds).await
     }
 
     /// The nodes, in order, for a test outside this module that drives a
@@ -367,7 +428,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         &self.nodes
     }
 
-    /// Try each node in order, returning the first success.
+    /// Try each usable node in order, returning the first success. A node
+    /// whose usable flag is down (on another chain, or not checked yet) is
+    /// skipped without a request.
     ///
     /// "Success" means the node returned `Ok`, nothing more. That is the right
     /// rule only where an `Ok` is an answer this client can act on, which is
@@ -394,9 +457,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         self.try_each_at(what, call).await.map(|(_, value)| value)
     }
 
-    /// [`Self::try_each`], also returning the position of the node that
-    /// answered, for the calls whose follow-up must go to the same node. The
-    /// logging and the final `warn!` live here so the two cannot drift.
+    /// [`Self::try_each`] (usable nodes only, in order), also returning the
+    /// position of the node that answered, for the calls whose follow-up must
+    /// go to the same node. The logging and the final `warn!` live here so the
+    /// two cannot drift.
     async fn try_each_at<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<(usize, T)>
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,

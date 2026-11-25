@@ -223,7 +223,13 @@ impl SlotClock {
     /// milliseconds, multiplying before dividing. Doing it in `Duration`
     /// instead would keep nanoseconds and land 0.4 ms past the spec's answer on
     /// mainnet, which is wrong in the direction that matters for a deadline.
+    ///
+    /// No offset lands past the end of the slot: the offsets are read from a
+    /// beacon node's spec, at startup and again by the chain check, and one
+    /// above [`BASIS_POINTS`] would otherwise park the duty loop on a sleep
+    /// that changing the configuration later does not shorten.
     fn offset_into(&self, slot: Slot, bps: u64) -> SystemTime {
+        let bps = bps.min(BASIS_POINTS);
         let offset_ms = bps.saturating_mul(self.slot_duration_ms) / BASIS_POINTS;
         self.start_of(slot) + Duration::from_millis(offset_ms)
     }
@@ -402,6 +408,15 @@ mod tests {
 
     fn at(offset_secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(GENESIS + offset_secs)
+    }
+
+    /// An offset a node serves past the end of the slot is held to the end of
+    /// the slot, rather than parking a duty for as long as the number says.
+    #[test]
+    fn an_offset_past_the_slot_lands_at_its_end() {
+        let clock = SlotClock::new(GENESIS, SECONDS_PER_SLOT * 1_000, u64::MAX, 20_000);
+        assert_eq!(clock.attestation_time(10), clock.end_of(10));
+        assert_eq!(clock.aggregation_time(10), clock.end_of(10));
     }
 
     #[test]

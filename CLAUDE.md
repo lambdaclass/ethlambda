@@ -946,17 +946,22 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
   unguarded. The client checks every beacon node against the chain it runs on
   (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
-  the first node that answers at startup, and a node whose genesis, preset, slot
+  the first node that answers at startup (startup waits, retrying every 2 s,
+  while none does), and a node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks
-  every node every slot, judging the answers at the epoch read once they are in.
-  The startup check and every round follow a fork the compatible nodes newly
+  every node every slot, judging and merging each answer as it arrives, at the
+  epoch read then, so a hung node holds back only its own.
+  Every round follows a fork the compatible nodes newly
   schedule, merged from what each usable node last served
-  (`FallbackBeaconNode::served_configs`; only a fork still in the future may
-  change, a scheduled one moves only when every node scheduling it agrees, and
-  is never unscheduled), into the `SharedConfig` the slot clock and signing
+  (`FallbackBeaconNode::served_configs`; only nodes that answered their latest
+  check have a say: an unscheduled fork is taken only when all of them schedule
+  it alike, a scheduled one moves only when every one scheduling it agrees, and
+  is never unscheduled; only a fork still in the future may change), into the
+  `SharedConfig` the slot clock and signing
   domains read, logging the change at `warn`. `Delivery::Everywhere` means every
-  usable node; `BeaconNodeApi::readmissions` tells the preferences service to
+  usable node; `BeaconNodeApi::readmissions` tells the preferences service, and
+  the duty loop (subnet and sync subscriptions, builder registrations), to
   resend when a skipped node is let back in. The spec parser requires the slot duration and every altair
   to fulu epoch and version rather than defaulting them to mainnet.
   `--enable-doppelganger-protection` (`crate::doppelganger`,

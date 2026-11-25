@@ -374,7 +374,11 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 The client learns its chain, the preset, genesis, slot duration and fork
 schedule, from `--beacon-nodes` at startup: the reference is the first node in
 list order that answers both `/eth/v1/beacon/genesis` and
-`/eth/v1/config/spec`. Startup fails when none does. A response without the slot
+`/eth/v1/config/spec`. While none does, the client warns, naming what each node
+said, and asks them all again every 2 seconds, as Lighthouse's validator client
+does, rather than exiting: a client started beside its beacon node otherwise
+exits before the node's API is up. Only when every node answered with a preset
+this client cannot run on does startup fail. A response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
 absent, meaning unscheduled.
@@ -392,34 +396,46 @@ fails with an error that says no configured node is on the client's chain.
 
 A background task, separate from the duty loop, repeats the check for every node
 at the start of every slot, so a node upgraded partway through an epoch for a fork
-at the next one is read while that fork is still ahead. The epoch the answers are
-judged at is read once they are in, so a fork whose epoch passed while a node was
-answering counts as arrived rather than as still ahead. After every check, a fork
-the compatible nodes schedule and the client does not have yet is adopted by the
-slot clock and every signing domain together, and the client logs at `warn`
-which fields moved. A fork scheduled by one node and not another is taken from
-the node that has it; when the nodes that schedule it disagree, and the client
-does not have it yet, the lowest epoch wins. Either way a warning names the nodes,
-once per epoch, and a node without the client's epoch stops being used when the
-fork's epoch arrives. Once the client has a fork scheduled, it moves only when
-every node that schedules it agrees on the new epoch and version, so one node
-cannot pull it elsewhere, and it is never unscheduled: a node reporting it
-unscheduled may only be the one not upgraded yet, while the upgraded one is
-restarting. A fork the network cancels therefore needs a restart. A node that
-stops answering keeps its say in the merge for one more epoch and then loses it,
-so an unreachable node cannot hold a fork at an epoch the network has postponed.
-A fork that is already active is never moved: a node that reports another epoch
-or version for it is on another chain. The client does not need a restart for a
-fork the network schedules after it started.
+at the next one is read while that fork is still ahead. Each node's answer is
+judged the moment it arrives, at the epoch read then, so a node that hangs until
+its request timeout holds back only its own answer, and a fork whose epoch passed
+while a node was answering counts as arrived rather than as still ahead.
+
+As each answer arrives, a fork the compatible nodes schedule and the client does
+not have yet is adopted by the slot clock and every signing domain together, and
+the client logs at `warn` which fields moved. Only nodes that answered their most
+recent check have a say in this. A fork the client does not have is taken only
+when every one of them schedules it, at the same epoch and with the same version:
+one node, misconfigured or not, cannot put a fork on the client's schedule that
+the others do not have. So while a node not yet upgraded still answers, the fork
+waits; it is taken once that node is upgraded, or once it stops answering
+(restarting for the upgrade, say) and so loses its say. A warning names the nodes
+that disagree, once per epoch, and a node without the client's epoch stops being
+used when the fork's epoch arrives. Once the client has a fork scheduled, it
+moves only when every node with a say that schedules it agrees on the new epoch
+and version, so one node cannot pull it elsewhere, and it is never unscheduled:
+a node reporting it unscheduled may only be the one not upgraded yet, while the
+upgraded one is restarting. A fork the network cancels therefore needs a
+restart. A node that stops answering loses its say at once, so it cannot hold a
+fork at an epoch the network has postponed; the duty offsets are still read from
+the first node through a round it misses. A fork that is already active is never
+moved: a node that reports another epoch or version for it is on another chain.
+The client does not need a restart for a fork the network schedules after it
+started.
 
 A send that has to reach every node (proposer preferences) counts as delivered
 everywhere once every node in use took it: a node skipped for being on another
 chain is not a refusal. When a check lets a skipped node back in, the client
-sends it what it missed at the next poll.
+sends it what it missed: the proposer preferences at the next poll, and the
+epoch's attestation subnet subscriptions, sync committee subscriptions and
+builder registrations at the next slot.
+
+Offsets into the slot (`*_DUE_BPS`) above 10000 basis points are held to the
+slot's end, so a node serving a wrong one cannot park a duty past its slot.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
+| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first usable node that answers serves the request (a node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check)), so the order is a preference, not load balancing |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |

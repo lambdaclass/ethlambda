@@ -240,6 +240,8 @@ pub struct MockBeaconNode {
     pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
     /// How long `liveness` takes before it answers, as a hung node would.
     pub liveness_delay: Option<std::time::Duration>,
+    /// How long `spec` takes before it answers, as a hung node would.
+    pub spec_delay: Option<std::time::Duration>,
 }
 
 impl MockBeaconNode {
@@ -489,6 +491,12 @@ impl MockBeaconNode {
     /// Make `liveness` take `delay` before it answers.
     pub fn with_liveness_delay(mut self, delay: std::time::Duration) -> Self {
         self.liveness_delay = Some(delay);
+        self
+    }
+
+    /// Make `spec` take `delay` before it answers.
+    pub fn with_spec_delay(mut self, delay: std::time::Duration) -> Self {
+        self.spec_delay = Some(delay);
         self
     }
 
@@ -857,6 +865,9 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn spec(&self) -> Result<Config> {
         self.spec_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(delay) = self.spec_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.guard("spec")?;
         Ok(self
             .spec_config
