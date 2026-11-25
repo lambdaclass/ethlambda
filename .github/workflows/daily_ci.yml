@@ -26,8 +26,8 @@ permissions:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
-  # See the same setting in ci.yml. This workflow runs the identical job, so it
-  # is under the identical disk pressure.
+  # See the same setting in ci.yml. This workflow runs the identical job, so
+  # the same reasoning applies.
   CARGO_INCREMENTAL: "0"
 
 jobs:
