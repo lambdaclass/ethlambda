@@ -862,6 +862,16 @@ impl MockBeaconNode {
         self.failures.lock().expect("lock").remove(what);
     }
 
+    /// Start failing the named method mid-test, the converse of
+    /// [`Self::stop_failing`]: for a call that must answer during a test's
+    /// setup and fail after it.
+    pub fn start_failing(&self, what: &'static str, message: &str) {
+        self.failures
+            .lock()
+            .expect("lock")
+            .insert(what, message.to_string());
+    }
+
     /// The attestations submitted so far, in submission order.
     pub fn submitted(&self) -> Vec<SingleAttestationDto> {
         self.submitted.lock().expect("lock").clone()
