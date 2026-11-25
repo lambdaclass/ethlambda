@@ -436,7 +436,8 @@ scored by its role:
   but its mesh, formed before the boundary, can already be past the
   deliveries' activation (one epoch for blocks and aggregates). P3 on the new
   digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
-  Lighthouse joins two slots ahead, so activation alone covers it there.
+  Lighthouse before v8.3.0 joins two slots ahead, so activation alone covers
+  it there.
 
 ## Aggregate attestations
 
