@@ -371,7 +371,7 @@ async fn post_prepare_beacon_proposer(
     axum::http::StatusCode::OK.into_response()
 }
 
-/// Record `indices` as attached to this node at the store clock's epoch.
+/// Record `indices` as attached to this node at the wall clock's epoch.
 ///
 /// The set is optional so a router built without it (a test's, say) still
 /// answers both endpoints: without the p2p layer that reads it, nothing would.
@@ -380,8 +380,12 @@ fn record_attached(
     attached: Option<Extension<AttachedValidators>>,
     indices: impl IntoIterator<Item = ValidatorIndex>,
 ) {
+    // The wall clock's epoch, the one validator custody expires the set by:
+    // the store's clock trails it while the chain actor's mailbox is backed
+    // up, and a mention stamped with it would be dropped as already old.
     if let Some(Extension(attached)) = attached {
-        attached.record(indices, compute_epoch_at_slot(store.current_slot()));
+        let epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(store));
+        attached.record(indices, epoch);
     }
 }
 
@@ -1509,12 +1513,12 @@ mod tests {
     }
 
     /// Both calls a validator client repeats every epoch record the validators
-    /// they name as attached, at the store clock's epoch: every subscription
+    /// they name as attached, at the wall clock's epoch: every subscription
     /// (an aggregator's or not) and every preparation.
     #[tokio::test]
     async fn subscriptions_and_preparations_record_the_attached_validators() {
         let (store, _) = beacon_store_at(fulu_state());
-        let epoch = compute_epoch_at_slot(store.current_slot());
+        let epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&store));
         let attached = AttachedValidators::default();
         let p2p: RpcToP2PRef = Arc::new(crate::test_utils::RecordingNetwork::default());
         let app = routes()

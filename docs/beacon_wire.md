@@ -673,8 +673,10 @@ Both per-item lookups are lenient the way the block protocols are: a column
 this node never custodied, or a root it holds no header for, is left out of
 the answer rather than turned into an error, since the spec's own words are
 "Clients MUST respond with at least one sidecar, if they have it." A
-`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`
-gets `RESOURCE_UNAVAILABLE` instead of a merely-empty answer, the same
+`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`,
+or before the later slot from which a custody set grown at startup is complete
+(see Validator custody below), gets `RESOURCE_UNAVAILABLE` instead of a
+merely-empty answer, the same
 distinction the block-range handler draws and for the same reason: an empty
 window this node's canonical chain skipped is normal, but a window below where
 this node's chain begins cannot be served from any point onward. That floor is
@@ -962,7 +964,7 @@ yet:
 | Piece | Where | What it does |
 | --- | --- | --- |
 | Attached validators | `ethlambda_network_api::AttachedValidators`, filled by the Beacon API | Every index named to `beacon_committee_subscriptions` (aggregator or not) and `prepare_beacon_proposer`, with the epoch it was last named in. One not named again for `EXPIRY_EPOCHS` (2) epochs stops counting, so a detached validator client stops raising custody |
-| Requirement | `das::get_validators_custody_requirement` | Off the latest finalized state's effective balances, as the specification says, once an epoch. Not the head's: the record never falls, so a raise read off a branch that is later reorged out would stay for good. The p2p actor (`beacon::validator_custody::refresh`) starts the run; the state read and the computation go to a `spawn_blocking` task (`compute`), since the finalized state may not be cached and a rebuild would stall the actor, and the outcome comes back as `ValidatorCustodyComputed` (`finish`). An unreadable state retries the run at the next slot. With no attached validator in the registry there is no requirement at all, not the floor of 8: a plain follower is never raised. Indices the state does not know are skipped |
+| Requirement | `das::get_validators_custody_requirement` | Off the latest finalized state's effective balances, as the specification says, once an epoch. Not the head's: the record never falls, so a raise read off a branch that is later reorged out would stay for good. The p2p actor (`beacon::validator_custody::refresh`) starts the run; the computation goes to a `spawn_blocking` task (`compute`), which takes the effective balances from the fork choice's `JustifiedBalances` snapshot for the finalized checkpoint when it is cached (it keeps the last 8 epoch boundaries) and otherwise reads the finalized state, whose rebuild would stall the actor; a panic there reports the run unavailable. The outcome comes back as `ValidatorCustodyComputed` (`finish`). An unreadable state retries the run at the next slot. With no attached validator in the registry there is no requirement at all, not the floor of 8: a plain follower is never raised. Indices the state does not know are skipped |
 | Highest count | `Store::raise_validator_custody_count`, metadata key `validator_custody_count` | Only ever raised. Absent in an older directory, which reads as nothing recorded; `DB_VERSION` did not change |
 | Startup | `beacon::startup_custody` in the binary | Custodies and advertises the larger of `--custody-group-count` and the recorded count. The record is the validators' requirement alone, so the flag stays the operator's floor above it |
 | Runtime | `beacon::validator_custody::apply` | Raises `MetaData` v3's `custody_group_count` (and `/eth/v1/node/identity`'s copy), under a new sequence number, up to the startup count's `sampling_size`: groups the node already subscribes to, stores, requires for availability and serves. At the default count that is 8, all one attached validator requires. A requirement past it is recorded and warned about; the next start applies it |

@@ -14,9 +14,12 @@
 //! and records the highest count ever required in the data directory
 //! (`Store::raise_validator_custody_count`). The finalized state, not the
 //! head's: the record never falls, so a raise read off a branch that is later
-//! reorged out would stay for good. The read is off the actor because the
-//! finalized state may not be cached, and rebuilding a mainnet state would
-//! stall it; the outcome comes back through the actor's mailbox ([`finish`]).
+//! reorged out would stay for good. The balances come from the fork choice's
+//! snapshot for the finalized checkpoint when it still holds one, which it
+//! usually does, since it keeps the last few epoch boundaries; only otherwise
+//! is the state read. The work is off the actor because that read may rebuild
+//! a mainnet state from disk, which would stall it; the outcome comes back
+//! through the actor's mailbox ([`finish`]).
 //! Startup custodies and advertises the larger of `--custody-group-count` and
 //! that recorded count.
 //!
@@ -41,9 +44,9 @@ use ethlambda_network_api::AttachedValidators;
 use ethlambda_state_transition::beacon::das;
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::containers::BeaconState;
+use ethlambda_types::beacon::containers::{BeaconState, Checkpoint};
+use ethlambda_types::beacon::fork_choice::JustifiedBalances;
 use ethlambda_types::beacon::primitives::{Epoch, ValidatorIndex};
-use ethlambda_types::primitives::H256;
 use ethlambda_types::time::unix_now_ms;
 use spawned_concurrency::tasks::Context;
 use tracing::{debug, info, warn};
@@ -180,10 +183,21 @@ pub(crate) fn refresh(server: &mut P2PServer, ctx: &Context<P2PServer>) {
 
     custody.in_flight = Some(epoch);
     let store = server.store.clone();
-    let finalized_root = store.beacon_finalized_checkpoint().root;
+    let finalized = store.beacon_finalized_checkpoint();
     let back = ctx.clone();
     tokio::task::spawn_blocking(move || {
-        let run = compute(&store, finalized_root, &attached);
+        // A panic would otherwise never report back, leaving `in_flight` set
+        // and every later epoch unrun until a restart.
+        let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute(&store, finalized, &attached)
+        }));
+        let run = computed.unwrap_or_else(|_| {
+            warn!(
+                epoch,
+                "Validator custody run panicked; trying again next slot"
+            );
+            CustodyRun::Unavailable
+        });
         let message = p2p_protocol::ValidatorCustodyComputed { epoch, run };
         let _ = back
             .send(message)
@@ -191,14 +205,20 @@ pub(crate) fn refresh(server: &mut P2PServer, ctx: &Context<P2PServer>) {
     });
 }
 
-/// A run's blocking half: read the state finalized at `finalized_root` and
-/// [`conclude`] from it. May rebuild the state from disk, which is why it is
-/// never called on the actor.
+/// A run's blocking half: the attached validators' effective balances at
+/// `finalized`, from the fork choice's balances snapshot for it when one is
+/// cached ([`conclude_from_balances`]), else from the state finalized there
+/// ([`conclude`]). Reading the state may rebuild it from disk, which is why
+/// this is never called on the actor.
 pub(crate) fn compute(
     store: &Store,
-    finalized_root: H256,
+    finalized: Checkpoint,
     attached: &[ValidatorIndex],
 ) -> CustodyRun {
+    if let Some(balances) = store.justified_balances(&finalized) {
+        return conclude_from_balances(store, &balances, attached);
+    }
+    let finalized_root = finalized.root;
     match store.get_state(&finalized_root) {
         Ok(Some(state)) => conclude(store, &state, attached),
         Ok(None) => {
@@ -223,7 +243,34 @@ pub(crate) fn conclude(
     attached: &[ValidatorIndex],
 ) -> CustodyRun {
     let config = store.config();
-    match das::get_validators_custody_requirement(state, attached, &config) {
+    let required = das::get_validators_custody_requirement(state, attached, &config);
+    record(store, required)
+}
+
+/// [`conclude`] off the fork choice's balances snapshot for the finalized
+/// checkpoint: the same effective balances, without a state. An index the
+/// checkpoint's registry did not hold is skipped, as the state's would be.
+pub(crate) fn conclude_from_balances(
+    store: &Store,
+    balances: &JustifiedBalances,
+    attached: &[ValidatorIndex],
+) -> CustodyRun {
+    let known = attached.iter().filter(|&&index| {
+        usize::try_from(index).is_ok_and(|index| index < balances.validator_count())
+    });
+    let mut any = false;
+    let total = known.fold(0u64, |total, &index| {
+        any = true;
+        total.saturating_add(balances.effective_balance(index))
+    });
+    let config = store.config();
+    let required = any.then(|| das::validators_custody_requirement(total, &config));
+    record(store, required)
+}
+
+/// Record a requirement, when there is one, as the highest yet.
+fn record(store: &Store, required: Option<u64>) -> CustodyRun {
+    match required {
         Some(required) => CustodyRun::Required {
             required,
             highest: store.raise_validator_custody_count(required),
@@ -421,10 +468,41 @@ mod tests {
     #[test]
     fn a_run_without_a_finalized_state_is_unavailable() {
         let store = empty_store();
-        let finalized_root = store.beacon_finalized_checkpoint().root;
+        let finalized = store.beacon_finalized_checkpoint();
+        assert_eq!(compute(&store, finalized, &[0]), CustodyRun::Unavailable);
+    }
+
+    /// With the fork choice's balances snapshot for the finalized checkpoint
+    /// cached, a run reads the effective balances off it and needs no state:
+    /// ten validators at 32 ETH require ten groups, an index the snapshot's
+    /// registry did not hold is skipped, and none known records nothing.
+    #[test]
+    fn a_run_reads_the_finalized_balances_snapshot_without_a_state() {
+        let store = empty_store();
+        let finalized = store.beacon_finalized_checkpoint();
+        let validators = 16;
+        let total = 32_000_000_000 * validators as u64;
+        let balances = JustifiedBalances::new(
+            finalized,
+            vec![32_000_000_000; validators].into(),
+            total,
+            vec![32; validators].into(),
+            Box::new([]),
+            total,
+        );
+        store.insert_justified_balances(std::sync::Arc::new(balances));
+
+        let attached: Vec<ValidatorIndex> = (0..10).chain([1_000]).collect();
         assert_eq!(
-            compute(&store, finalized_root, &[0]),
-            CustodyRun::Unavailable
+            compute(&store, finalized, &attached),
+            CustodyRun::Required {
+                required: 10,
+                highest: 10,
+            }
+        );
+        assert_eq!(
+            compute(&store, finalized, &[1_000]),
+            CustodyRun::NoneAttached
         );
     }
 

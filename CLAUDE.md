@@ -398,8 +398,9 @@ actual_slot = finalized_slot + 1 + relative_index
     epochs), and the p2p actor, once an epoch, has a `spawn_blocking` task compute
     `das::get_validators_custody_requirement` off the latest finalized state, as the spec
     says (not the head: the record never falls, so a reorged-out branch must not raise it;
-    the finalized state may need a rebuild, hence off the actor; the outcome returns as
-    `ValidatorCustodyComputed`). None with no attached validator in the registry, so a
+    the balances come from the fork choice's `JustifiedBalances` snapshot for the
+    finalized checkpoint when cached, else the finalized state, which may need a rebuild,
+    hence off the actor; the outcome returns as `ValidatorCustodyComputed`). None with no attached validator in the registry, so a
     plain follower is never raised to 8. It records the highest count in `Metadata`
     (`Store::raise_validator_custody_count`, never lowered).
     `beacon::startup_custody` starts the node at the larger of `--custody-group-count` and

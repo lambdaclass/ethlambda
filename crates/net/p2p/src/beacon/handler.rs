@@ -61,6 +61,14 @@ pub fn build_status_v2(store: &Store, wire: &BeaconWire) -> StatusV2 {
     status_at_head(store, wire, store.beacon_head())
 }
 
+/// The first slot from which this node holds every column it custodies: the
+/// later of where its chain begins and where its custody set became complete
+/// (see [`BeaconWire::custody_since_slot`]). What `Status` v2 advertises, and
+/// the floor `DataColumnSidecarsByRange` refuses below, so the two agree.
+pub fn earliest_available_slot(store: &Store, wire: &BeaconWire) -> u64 {
+    store.anchor_slot().max(wire.custody_since_slot)
+}
+
 /// [`build_status_v2`] off a head already read through
 /// [`Store::beacon_head`]: `None` gives the all-zero `Status` of a store with
 /// no head block yet.
@@ -79,7 +87,7 @@ pub fn status_at_head(store: &Store, wire: &BeaconWire, head: Option<(u64, Root)
                 // started with more custody groups than its directory held
                 // has the new groups' columns only from then on, and nothing
                 // backfills the older ones.
-                let earliest_available_slot = store.anchor_slot().max(wire.custody_since_slot);
+                let earliest_available_slot = earliest_available_slot(store, wire);
                 (
                     finalized.root,
                     finalized.epoch,
