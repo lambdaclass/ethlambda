@@ -791,8 +791,12 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     }
     // The default gas limit, per epoch, when `--gas-limit` names none. Absent
     // (a node that does not serve it) leaves the schedule empty, which is what
-    // falls back to `DEFAULT_GAS_LIMIT`.
-    if let Some(field) = value.get("GAS_LIMIT_SCHEDULE") {
+    // falls back to `DEFAULT_GAS_LIMIT`. So does `null`, which is how Go's
+    // JSON encoder writes a nil slice.
+    let schedule = value
+        .get("GAS_LIMIT_SCHEDULE")
+        .filter(|field| !field.is_null());
+    if let Some(field) = schedule {
         config.gas_limit_schedule = serde_json::from_value(field.clone())
             .map_err(|err| Error::Decode(format!("config/spec: GAS_LIMIT_SCHEDULE: {err}")))?;
     }
@@ -1538,6 +1542,10 @@ mod tests {
         let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
         assert!(config.gas_limit_schedule.is_empty());
         let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": [] });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+        // Go's encoder writes a nil slice as `null`.
+        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": null });
         let config = config_from_spec_response(&response).expect("builds");
         assert!(config.gas_limit_schedule.is_empty());
 
