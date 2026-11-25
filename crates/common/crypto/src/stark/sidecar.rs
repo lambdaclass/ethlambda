@@ -27,13 +27,18 @@
 //! - A merge folds the children [`MAX_CHILDREN_PER_AGGREGATE`] at a time,
 //!   round after round, until one proof remains.
 //!
-//! Two connections are kept, opened on first use and reopened after a
-//! failure: one for proving, where requests queue in the sidecar, and one for
-//! verifying, which the sidecar answers without waiting for proofs in
-//! progress.
+//! Connections are reopened after a failure. One is for proving, where
+//! requests queue in the sidecar. The others, [`SidecarConfig::verify_connections`]
+//! of them, are for verifying, which the sidecar answers without waiting for
+//! proofs in progress: it serves each connection on a thread of its own and
+//! verifies there, so verifications on different connections run at once.
+//! A verification takes a free connection and waits on one only when every
+//! one is busy, so the node's gossip checks, imports and block production do
+//! not queue behind each other's round trips.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use leanvm_claims::{AggregateClaims, OutputClaims};
@@ -93,16 +98,25 @@ pub struct SidecarConfig {
     pub prove_timeout: Duration,
     /// How long one verify request may wait on the sidecar.
     pub verify_timeout: Duration,
+    /// How many connections verify at once, at least one. The sidecar serves
+    /// at most 16 connections, the proving one among them.
+    pub verify_connections: usize,
 }
 
+/// How many verifications run at once by default: enough that a burst of
+/// gossip aggregates does not hold up a block's proof, few enough to leave
+/// the prover its cores and the sidecar its connection limit.
+pub const DEFAULT_VERIFY_CONNECTIONS: usize = 4;
+
 impl SidecarConfig {
-    /// Lighthouse's defaults.
+    /// Lighthouse's defaults, and [`DEFAULT_VERIFY_CONNECTIONS`].
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
             log_inv_rate: 2,
             prove_timeout: Duration::from_secs(300),
             verify_timeout: Duration::from_secs(30),
+            verify_connections: DEFAULT_VERIFY_CONNECTIONS,
         }
     }
 }
@@ -110,27 +124,55 @@ impl SidecarConfig {
 pub struct SidecarBackend {
     config: SidecarConfig,
     prove_connection: Mutex<Option<Client>>,
-    verify_connection: Mutex<Option<Client>>,
+    /// Never empty. Each opened on first use, but for the first.
+    verify_connections: Vec<Mutex<Option<Client>>>,
+    /// Where the next verification starts looking for a free connection, so
+    /// the waits spread over all of them when every one is busy.
+    next_verify: AtomicUsize,
 }
 
 impl SidecarBackend {
-    /// Opens both connections now, checking each hello (magic, protocol
-    /// version, verifier tag), so a missing or incompatible sidecar is
-    /// reported at startup.
+    /// Opens the proving connection and the first verifying one now, checking
+    /// each hello (magic, protocol version, verifier tag), so a missing or
+    /// incompatible sidecar is reported at startup. The other verifying
+    /// connections open on first use.
     pub fn connect(config: SidecarConfig) -> Result<Self, Error> {
         let prove_connection = open(&config, config.prove_timeout)?;
-        let verify_connection = open(&config, config.verify_timeout)?;
+        let first_verify = open(&config, config.verify_timeout)?;
         tracing::info!(
             socket = %config.socket.display(),
             prover = prove_connection.prover(),
             client_leanvm_rev = LEANVM_REV,
+            verify_connections = config.verify_connections.max(1),
             "Connected to the leanVM prover sidecar"
         );
+        let verify_connections = std::iter::once(Some(first_verify))
+            .chain(std::iter::repeat_with(|| None))
+            .take(config.verify_connections.max(1))
+            .map(Mutex::new)
+            .collect();
         Ok(Self {
             config,
             prove_connection: Mutex::new(Some(prove_connection)),
-            verify_connection: Mutex::new(Some(verify_connection)),
+            verify_connections,
+            next_verify: AtomicUsize::new(0),
         })
+    }
+
+    /// A free verifying connection, or, when every one is busy, the next one
+    /// in turn once it frees.
+    fn verify_connection(&self) -> MutexGuard<'_, Option<Client>> {
+        let count = self.verify_connections.len();
+        let start = self.next_verify.fetch_add(1, Ordering::Relaxed) % count;
+        let in_turn = (0..count).map(|offset| &self.verify_connections[(start + offset) % count]);
+        for connection in in_turn {
+            match connection.try_lock() {
+                Ok(guard) => return guard,
+                Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        lock(&self.verify_connections[start])
     }
 
     pub(super) fn prove<S: AsRef<[u8]>>(
@@ -219,7 +261,7 @@ impl SidecarBackend {
         }
         with_connection(
             &self.config,
-            &self.verify_connection,
+            self.verify_connection(),
             self.config.verify_timeout,
             |client| client.verify(&claims, proof),
         )
@@ -236,7 +278,7 @@ impl SidecarBackend {
         let started = Instant::now();
         let (claims, proof) = with_connection(
             &self.config,
-            &self.prove_connection,
+            lock(&self.prove_connection),
             self.config.prove_timeout,
             |client| {
                 client.aggregate(
@@ -315,19 +357,25 @@ fn open(config: &SidecarConfig, timeout: Duration) -> Result<Client, Error> {
     Ok(client)
 }
 
-/// Runs `call` on the connection in `slot`, opening it first if needed. A
-/// connection that fails is dropped, as the protocol requires after anything
-/// but a rejection; if a reused one failed other than by timing out, the
-/// sidecar may have restarted, so this reconnects and tries once more.
+/// `connection`'s lock. A panic while it was held leaves the connection as
+/// it was, which the next call reuses or reopens like any other.
+fn lock(connection: &Mutex<Option<Client>>) -> MutexGuard<'_, Option<Client>> {
+    connection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs `call` on the connection in `slot`, held for the whole call, opening
+/// it first if needed. A connection that fails is dropped, as the protocol
+/// requires after anything but a rejection; if a reused one failed other than
+/// by timing out, the sidecar may have restarted, so this reconnects and
+/// tries once more.
 fn with_connection<T>(
     config: &SidecarConfig,
-    slot: &Mutex<Option<Client>>,
+    mut slot: MutexGuard<'_, Option<Client>>,
     timeout: Duration,
     mut call: impl FnMut(&mut Client) -> Result<T, SidecarError>,
 ) -> Result<T, Error> {
-    let mut slot = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut reused = slot.is_some();
     loop {
         let client = match slot.as_mut() {
@@ -360,6 +408,57 @@ fn with_connection<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backend with `count` verifying connections, none opened.
+    fn unconnected(count: usize) -> SidecarBackend {
+        SidecarBackend {
+            config: SidecarConfig::new("/nonexistent"),
+            prove_connection: Mutex::new(None),
+            verify_connections: (0..count).map(|_| Mutex::new(None)).collect(),
+            next_verify: AtomicUsize::new(0),
+        }
+    }
+
+    /// A verification takes a free connection rather than wait on a busy
+    /// one, so verifications run side by side.
+    #[test]
+    fn a_verification_takes_a_free_connection_past_busy_ones() {
+        let backend = unconnected(3);
+        let first = backend.verify_connection();
+        let second = backend.verify_connection();
+        let third = backend.verify_connection();
+        // Three at once, none waiting: each took its own connection.
+        assert!(
+            backend
+                .verify_connections
+                .iter()
+                .all(|c| c.try_lock().is_err())
+        );
+        drop(second);
+        // With two busy, the next one finds the free one wherever the
+        // rotation starts.
+        let again = backend.verify_connection();
+        assert!(
+            backend
+                .verify_connections
+                .iter()
+                .all(|c| c.try_lock().is_err())
+        );
+        drop((first, third, again));
+    }
+
+    #[test]
+    fn at_least_one_connection_verifies() {
+        let config = SidecarConfig {
+            verify_connections: 0,
+            ..SidecarConfig::new("/nonexistent")
+        };
+        assert_eq!(config.verify_connections.max(1), 1);
+        assert_eq!(
+            SidecarConfig::new("/x").verify_connections,
+            DEFAULT_VERIFY_CONNECTIONS
+        );
+    }
 
     fn statement(
         pubkeys: &[[u8; PUBKEY_SIZE]],
