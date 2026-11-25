@@ -455,8 +455,8 @@ from the Beacon API, and no other way.
   the boundary (`PREFERENCES_RELEASE_LEAD_SLOTS`). Gossip-delivered
   preferences are relayed as usual.
 - **Why:** clients join the next digest at different times (this node an epoch
-  ahead, Lighthouse two slots ahead), and gossipsub refuses to publish a
-  message again for `seen_ttl` (two epochs) once any peer has it. Gossiped at
+  ahead, Lighthouse before v8.3.0 two slots ahead), and gossipsub refuses to
+  publish a message again for `seen_ttl` (two epochs) once any peer has it. Gossiped at
   once, a preference reaches only the early joiners and never the late ones.
   A slot ahead every client has joined, and a bid for the boundary's first
   slot, gossiped during the slot before it, still finds the preference.

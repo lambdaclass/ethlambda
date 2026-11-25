@@ -116,7 +116,8 @@ before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
 
 Peers join that digest when their own client decides to: this node an epoch
-ahead, Lighthouse only two slots before the boundary. A message's gossipsub id
+ahead, as Lighthouse does since v8.3.0, but Lighthouse before it only two slots
+before the boundary, and Grandine 2.0.6 five. A message's gossipsub id
 is its topic and payload alone, and gossipsub keeps the id of every message it
 handed to a peer, or received from one, for `seen_ttl` (two epochs) and refuses
 to publish it again until then (`Duplicate`). So a preference gossiped in the
@@ -128,7 +129,7 @@ digest (`is_held_back` in `p2p/src/beacon/builder_market.rs`), from gloas on,
 at every digest boundary (a blob-parameter-only one too). They are accepted,
 pooled in the market and reported to the chain actor as usual, and the Beacon
 API answers as it would for any other, but they are not gossiped until
-`PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary. By then Lighthouse
+`PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary. By then every client
 has joined, and a bid for the boundary's first slot, which is gossiped during
 the slot before it, still finds them. At that moment a timer the fork schedule
 arms once the next digest's topics are joined

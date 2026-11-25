@@ -224,10 +224,11 @@ pub(crate) async fn republish_proposer_preferences(
 /// preferences it held back for slots past it.
 ///
 /// Peers join the next digest's topics when their own client decides to:
-/// this node an epoch ahead (`SUBSCRIBE_LEAD_EPOCHS`), Lighthouse two slots
-/// ahead. Gossipsub refuses to publish a message again for `seen_ttl` (two
-/// epochs) once any peer has it, so preferences gossiped to the early joiners
-/// could never reach the late ones. One slot ahead, Lighthouse has joined,
+/// this node an epoch ahead (`SUBSCRIBE_LEAD_EPOCHS`), as Lighthouse does
+/// since v8.3.0, while Lighthouse before it joins two slots ahead and
+/// Grandine 2.0.6 five. Gossipsub refuses to publish a message again for
+/// `seen_ttl` (two epochs) once any peer has it, so preferences gossiped to
+/// the early joiners could never reach the late ones. One slot ahead, every client has joined,
 /// and the preferences still arrive in time for the boundary's first slot: a
 /// bid for a slot is gossiped during that slot or the one before it.
 pub(crate) const PREFERENCES_RELEASE_LEAD_SLOTS: Slot = 1;

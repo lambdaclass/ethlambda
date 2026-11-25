@@ -375,8 +375,8 @@ actual_slot = finalized_slot + 1 + relative_index
     (`new_proposer_preferences`), for `payload_attributes`. The four gloas topics' own publishes
     read gossipsub's answer back (`SwarmHandle::publish_reporting`): `info` only once a peer has
     the message, `warn` when none was handed it. A preference gossiped to early joiners of the next
-    digest can never reach late ones (Lighthouse joins two slots ahead): gossipsub's id is topic
-    plus payload, and its duplicate cache refuses it for `seen_ttl` (two epochs). So the node holds
+    digest can never reach late ones (Lighthouse before v8.3.0 joins two slots ahead): gossipsub's
+    id is topic plus payload, and its duplicate cache refuses it for `seen_ttl` (two epochs). So the node holds
     back its own preferences for the next digest's slots (`is_held_back`, gloas on, every digest
     boundary): pooled, reported to the chain actor and answered as usual, but gossiped only
     `PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary, by a timer the fork schedule arms
