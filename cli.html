@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0ad0df5d.js";
+            window.path_to_searchindex_js = "searchindex-42a2a434.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -558,13 +558,77 @@ brings its history with <a href="#slashing-protection"><code>slashing-protection
 or in the same keymanager API request that imports the key. See
 <a href="./spec_deviations.html#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history">Spec Deviations</a>.</p>
 </blockquote>
+<h3 id="several-beacon-nodes-the-chain-check"><a class="header" href="#several-beacon-nodes-the-chain-check">Several beacon nodes: the chain check</a></h3>
+<p>The client learns its chain, the preset, genesis, slot duration and fork
+schedule, from <code>--beacon-nodes</code> at startup: the reference is the first node in
+list order that answers both <code>/eth/v1/beacon/genesis</code> and
+<code>/eth/v1/config/spec</code>. While none does, the client warns, naming what each node
+said, and asks them all again every 2 seconds, as Lighthouse’s validator client
+does, rather than exiting: a client started beside its beacon node otherwise
+exits before the node’s API is up. Only when every node answered, each with a
+preset this client cannot run on or a spec it cannot read, does startup fail; a
+body that is not JSON at all (a proxy’s page while the node boots) is waited out. A
+response without the slot
+duration, <code>GENESIS_FORK_VERSION</code>, or the epoch and version of any fork from
+altair to fulu is refused rather than filled in from mainnet; only gloas may be
+absent, meaning unscheduled.</p>
+<p>Every other node is compared with the reference, and one that differs is not
+used: not for a duty, not for failover, not for a subscription. The comparison
+names the first field that differs: <code>PRESET_BASE</code>, <code>genesis_time</code>,
+<code>genesis_validators_root</code>, the slot duration, <code>GENESIS_FORK_VERSION</code>, or the
+epoch or version of a fork. A fork may differ only while it is still in the
+future under both schedules, which is how a node upgraded ahead of the others
+stays in use. A node that did not answer at startup is not used until a check
+has verified it. The warning names the node and the field, when the state
+changes and then at most once per epoch. If no node is usable, every request
+fails with an error that says no configured node is on the client’s chain.</p>
+<p>A background task, separate from the duty loop, repeats the check for every node
+at the start of every slot, so a node upgraded partway through an epoch for a fork
+at the next one is read while that fork is still ahead. Each node’s answer is
+judged the moment it arrives, at the epoch read then, so a node that hangs until
+its request timeout holds back only its own answer, and a fork whose epoch passed
+while a node was answering counts as arrived rather than as still ahead.</p>
+<p>As each answer arrives, a fork the compatible nodes schedule and the client does
+not have yet is adopted by the slot clock and every signing domain together, and
+the client logs at <code>warn</code> which fields moved. Only nodes that answered one of
+their last three checks have a say in this. A fork the client does not have is
+taken only when every one of them schedules it, at the same epoch and with the
+same version:
+one node, misconfigured or not, cannot put a fork on the client’s schedule that
+the others do not have. So while a node not yet upgraded still answers, the fork
+waits; it is taken once that node is upgraded, or once it stops answering
+(restarting for the upgrade, say) for three slots and so loses its say. One missed
+check does not cost a node its say, so a single timeout of a correct node does not
+leave a misconfigured one to move the schedule alone. A warning names the nodes
+that disagree, once per epoch, and a node without the client’s epoch stops being
+used when the fork’s epoch arrives. Once the client has a fork scheduled, it
+moves only when every node with a say that schedules it agrees on the new epoch
+and version, so one node cannot pull it elsewhere, and it is never unscheduled:
+a node reporting it unscheduled may only be the one not upgraded yet, while the
+upgraded one is restarting. A fork the network cancels therefore needs a
+restart. A node that stops answering loses its say after three slots, so it cannot
+hold a fork at an epoch the network has postponed (unless the postponement comes in
+the fork’s last three slots); the duty offsets are still read from the first node
+through a round it misses. A merge that would put a fork before the one it follows
+is refused whole and warned about. A fork that is already active is never moved: a
+node that reports another epoch or version for it is on another chain.
+The client does not need a restart for a fork the network schedules after it
+started.</p>
+<p>A send that has to reach every node (proposer preferences) counts as delivered
+everywhere once every node in use took it: a node skipped for being on another
+chain is not a refusal. When a check lets a skipped node back in, the client
+sends it what it missed: the proposer preferences at the next poll, and the
+epoch’s attestation subnet subscriptions, sync committee subscriptions and
+builder registrations at the next slot.</p>
+<p>Offsets into the slot (<code>*_DUE_BPS</code>) above 10000 basis points are held to the
+slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing</td></tr>
+<tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first usable node that answers serves the request (a node on another chain, or not checked yet, is skipped: see <a href="#several-beacon-nodes-the-chain-check">the chain check</a>), so the order is a preference, not load balancing</td></tr>
 <tr><td><code>--validators-dir</code></td><td>required</td><td>Directory holding the EIP-2335 keystores and <code>validator_definitions.yml</code>, which also lists the keys a remote signer holds (see <a href="#remote-signing-web3signer">Remote signing</a>). Without that file, keystores in the Lighthouse layout (<code>&lt;0xpubkey&gt;/voting-keystore.json</code>, password in <code>--secrets-dir/&lt;0xpubkey&gt;</code>) are discovered and the file is written</td></tr>
 <tr><td><code>--secrets-dir</code></td><td>required</td><td>Directory holding one password file per keystore, named after the validator’s public key</td></tr>
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
