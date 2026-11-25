@@ -694,15 +694,19 @@ the combined proofs and decides on those:
 - At the start of each slot it sends the partial proof of every sync
   committee subnet its validators sit in to
   `POST /eth/v1/validator/sync_committee_selections`, and the contribution
-  deadline acts on the answer.
+  deadline acts on the answer. An answer that has not come by that deadline
+  is given up on, with a warning: the slot's contributions go without it.
 
 A duty with no combined proof aggregates for nobody: its subscription goes
 out without the role and no aggregate or contribution is asked for. The
 current epoch's attester duties still missing one are asked for again every
-slot, and subscribed again with the role once they have one. Charon answers
+slot, and subscribed again with the role once they have one. Each partial
+proof is signed once and sent again as it was, so a retry costs a remote
+signer nothing. Charon answers
 a request only once it has combined every entry in it, so the next-epoch
 request can go unanswered when the other operators' clients do not look an
-epoch ahead; those duties are asked for again as the current epoch's.
+epoch ahead; those duties are asked for again as the current epoch's, and
+that request's failure or short answer is logged at debug, not warned about.
 
 `--enable-doppelganger-protection` is refused with it: the other operators
 keep the validator live, so the check would stop the client. Not yet run

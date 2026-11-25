@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Slot, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Slot, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -85,6 +85,14 @@ pub struct Distributed<B> {
     /// epoch's round waits for it, since its subscriptions must go out; a
     /// retry that finds it held skips the slot.
     attester: Mutex<()>,
+    /// The share's own partial attester selection proofs already signed, by
+    /// key and slot, so a retry or the next epoch's round sends them again
+    /// without asking the signer. A middleware that keeps failing would
+    /// otherwise cost a signature per missing duty every slot, a round trip
+    /// each for a remote key, queued with the slot's attestations at the
+    /// same signer. Never read to decide a selection: that is the combined
+    /// proof, held in the [`SigningContext`].
+    partials: std::sync::Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
 }
 
 impl<B: BeaconNodeApi + 'static> Distributed<B> {
@@ -100,7 +108,22 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             beacon_node,
             context,
             attester: Mutex::new(()),
+            partials: std::sync::Mutex::default(),
         }
+    }
+
+    /// The partial proofs signed so far. A poisoned map is still a map of
+    /// signatures.
+    fn partials(&self) -> std::sync::MutexGuard<'_, HashMap<(BlsPubkey, Slot), BlsSignature>> {
+        self.partials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Drop the partial proofs of duties before `slot`, which no exchange
+    /// sends again.
+    fn forget_partials_before(&self, slot: Slot) {
+        self.partials().retain(|(_, held), _| *held >= slot);
     }
 
     /// What the duty loop starts each slot once the slot's block is out, in
@@ -110,7 +133,8 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     /// epoch's round: exchange, then subscribe, for `attester_duties`.
     /// Otherwise a retry for the current epoch's duties still missing a
     /// combined proof. And the slot's sync committee exchange for
-    /// `sync_duties`, bounded by the end of the slot. Each runs on a task of
+    /// `sync_duties`, bounded by the slot's contribution deadline, where its
+    /// proofs are read. Each runs on a task of
     /// its own, so a slow middleware never delays a duty.
     pub fn after_proposal(
         self: &Arc<Self>,
@@ -136,7 +160,10 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
 
         if !sync_duties.is_empty() {
             let (this, store) = (self.clone(), store.clone());
-            let budget = clock.remaining_in(slot, SystemTime::now());
+            // Until the contribution deadline, where the proofs are read: one
+            // that lands after it decides nothing, so it is reported as missed
+            // rather than remembered for no one.
+            let budget = clock.until_contribution(slot, SystemTime::now());
             tokio::spawn(async move {
                 let exchange = this.exchange_sync(slot, &sync_duties, &store);
                 match tokio::time::timeout(budget, exchange).await {
@@ -150,7 +177,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
                     Err(_) => warn!(
                         %slot,
                         "Middleware did not combine the sync committee selection proofs before \
-                         the slot ended; no contribution this slot"
+                         the contribution deadline; no contribution this slot"
                     ),
                 }
             });
@@ -173,6 +200,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         store: &RwLock<ValidatorStore>,
     ) {
         let _exchanging = self.attester.lock().await;
+        self.forget_partials_before(slot);
         let epoch = compute_epoch_at_slot(slot);
         for round in [epoch, epoch + 1] {
             let owed: Vec<AttesterDutyDto> = duties
@@ -183,15 +211,30 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             if owed.is_empty() {
                 continue;
             }
-            let exchanged = self.exchange_attester(&owed, store).await;
+            // The next epoch's request is one the middleware may rightly
+            // leave unanswered (see the module doc), so its failure is no
+            // warning: those duties are asked for again as the next epoch's
+            // current ones.
+            let lookahead = round != epoch;
+            let exchanged = self.exchange_attester(&owed, store, lookahead).await;
             let _ = exchanged.inspect_err(|err| {
-                warn!(
-                    %slot,
-                    epoch = round,
-                    %err,
-                    "Middleware did not combine the attester selection proofs; subscribing \
-                     without the aggregator role"
-                );
+                if lookahead {
+                    debug!(
+                        %slot,
+                        epoch = round,
+                        %err,
+                        "Middleware did not combine the next epoch's attester selection proofs; \
+                         subscribing without the aggregator role until its round"
+                    );
+                } else {
+                    warn!(
+                        %slot,
+                        epoch = round,
+                        %err,
+                        "Middleware did not combine the attester selection proofs; subscribing \
+                         without the aggregator role"
+                    );
+                }
             });
             self.subscribe(round, &owed, store).await;
         }
@@ -215,6 +258,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             debug!(%slot, "Attester selection exchange still in flight; not retrying this slot");
             return;
         };
+        self.forget_partials_before(slot);
         let epoch = compute_epoch_at_slot(slot);
         let missing: Vec<AttesterDutyDto> = duties
             .iter()
@@ -232,7 +276,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         if missing.is_empty() {
             return;
         }
-        match self.exchange_attester(&missing, store).await {
+        match self.exchange_attester(&missing, store, false).await {
             Ok(0) => {}
             Ok(_) => {
                 let combined: Vec<AttesterDutyDto> = missing
@@ -261,30 +305,74 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     ///
     /// A duty whose proof could not be signed is left out of the request, and
     /// one the middleware leaves out of its answer gets no combined proof:
-    /// both aggregate for nothing until a later exchange covers them.
+    /// both aggregate for nothing until a later exchange covers them. A
+    /// partial proof signed before is sent again as it was, while its key is
+    /// still held, rather than signed anew.
+    ///
+    /// `lookahead` is for the next epoch's duties, which the middleware may
+    /// rightly leave unanswered, so an answer short of them is logged at
+    /// debug rather than warned about.
     pub async fn exchange_attester(
         &self,
         duties: &[AttesterDutyDto],
         store: &RwLock<ValidatorStore>,
+        lookahead: bool,
     ) -> Result<usize> {
-        // An unreadable pubkey is warned about by the subscription that
-        // follows, which still sends that duty.
+        // An unreadable pubkey is left out here, and warned about by the
+        // epoch round's subscription, which still sends the duty. A retry
+        // never asks for one.
         let keyed: Vec<(&AttesterDutyDto, BlsPubkey)> = duties
             .iter()
             .filter_map(|duty| Some((duty, parse_pubkey(&duty.pubkey).ok()?)))
             .collect();
+        // The partial proofs signed before, for keys still held. Checked
+        // here because reusing one skips `sign_selection_proof`, which is
+        // where a deleted key is found.
+        let reused: Vec<Option<BlsSignature>> = {
+            let held = store.read().await;
+            let partials = self.partials();
+            keyed
+                .iter()
+                .map(|(duty, pubkey)| {
+                    let partial = partials.get(&(*pubkey, duty.slot)).copied()?;
+                    held.contains(pubkey).then_some(partial)
+                })
+                .collect()
+        };
         // The subscription's budget, for its reason: this runs off the slot
         // loop ahead of the subscriptions, with no slot deadline behind it.
-        let partials = sign_all_within(
+        let signed = sign_all_within(
             SUBSCRIPTION_SIGNING_BUDGET,
-            keyed.iter().map(|(duty, pubkey)| {
-                (
-                    *pubkey,
-                    self.context.sign_selection_proof(store, pubkey, duty.slot),
-                )
-            }),
+            keyed
+                .iter()
+                .zip(&reused)
+                .filter(|(_, reused)| reused.is_none())
+                .map(|((duty, pubkey), _)| {
+                    (
+                        *pubkey,
+                        self.context.sign_selection_proof(store, pubkey, duty.slot),
+                    )
+                }),
         )
         .await;
+        let mut signed = signed.into_iter();
+        let partials: Vec<Result<BlsSignature>> = reused
+            .into_iter()
+            .map(|reused| match reused {
+                Some(partial) => Ok(partial),
+                None => signed.next().unwrap_or_else(|| {
+                    unreachable!("`sign_all_within` answers every request it is given")
+                }),
+            })
+            .collect();
+        {
+            let mut held = self.partials();
+            for ((duty, pubkey), partial) in keyed.iter().zip(&partials) {
+                if let Ok(partial) = partial {
+                    held.insert((*pubkey, duty.slot), *partial);
+                }
+            }
+        }
 
         let mut asked = Vec::with_capacity(keyed.len());
         let mut pubkeys: HashMap<(ValidatorIndex, Slot), BlsPubkey> = HashMap::new();
@@ -334,7 +422,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
                 combined += 1;
             }
         }
-        if combined < asked.len() {
+        if combined < asked.len() && !lookahead {
             warn!(
                 asked = asked.len(),
                 combined, "Middleware left some duties without a combined selection proof"
@@ -342,7 +430,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         }
         debug!(
             asked = asked.len(),
-            combined, "Exchanged attester selection proofs"
+            combined, lookahead, "Exchanged attester selection proofs"
         );
         Ok(combined)
     }
@@ -828,6 +916,77 @@ mod tests {
         // Nothing is missing any more, so the slot after asks for nothing.
         distributed.retry(EPOCH_START + 2, &duties, &store).await;
         assert_eq!(node.selection_requests().len(), 1);
+    }
+
+    /// A partial proof signed for an exchange that failed is sent again as
+    /// it was by the retry, not signed anew, and forgotten once its slot has
+    /// passed.
+    #[tokio::test]
+    async fn a_retry_sends_the_partial_proof_signed_before() {
+        let (store, pubkey) = store();
+        let current = EPOCH_START + 5;
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .failing_call("beacon_committee_selections", "middleware down")
+                .with_combined_selection(1, current, attester_proof(true)),
+        );
+        let distributed = Distributed::new(node.clone(), distributed_context());
+        let duties = vec![duty(&pubkey, 1, current)];
+
+        distributed
+            .subscribe_epoch(EPOCH_START, &duties, &store)
+            .await;
+        assert!(
+            distributed.partials().contains_key(&(pubkey, current)),
+            "kept although the exchange failed"
+        );
+
+        // Stands in for the kept signature, so the request shows which one
+        // went out.
+        let kept = BlsSignature([9; 96]);
+        distributed.partials().insert((pubkey, current), kept);
+        node.failures
+            .lock()
+            .expect("lock")
+            .remove("beacon_committee_selections");
+        distributed.retry(EPOCH_START + 1, &duties, &store).await;
+
+        let requests = node.selection_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0][0].selection_proof, kept, "sent as kept");
+
+        distributed.retry(current + 1, &duties, &store).await;
+        assert!(distributed.partials().is_empty(), "its slot has passed");
+    }
+
+    /// A partial proof kept for a key the keymanager has since deleted is
+    /// not sent: reusing it skips the signer, which is where a deleted key
+    /// is otherwise found.
+    #[tokio::test]
+    async fn a_kept_partial_proof_is_not_sent_for_a_deleted_key() {
+        let (store, pubkey) = store();
+        let current = EPOCH_START + 5;
+        let node = Arc::new(
+            MockBeaconNode::new().failing_call("beacon_committee_selections", "middleware down"),
+        );
+        let distributed = Distributed::new(node.clone(), distributed_context());
+        let duties = vec![duty(&pubkey, 1, current)];
+        distributed
+            .subscribe_epoch(EPOCH_START, &duties, &store)
+            .await;
+        assert!(distributed.partials().contains_key(&(pubkey, current)));
+
+        assert!(store.write().await.remove(&pubkey));
+        node.failures
+            .lock()
+            .expect("lock")
+            .remove("beacon_committee_selections");
+        distributed.retry(EPOCH_START + 1, &duties, &store).await;
+
+        assert!(
+            node.selection_requests().is_empty(),
+            "nothing is asked for a key no longer held"
+        );
     }
 
     /// The seat with no combined proof is never asked for a contribution,

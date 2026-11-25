@@ -95,7 +95,10 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         // the last third of the slot left, a round trip per duty in series
         // could run the whole duty out. Usually no request is made at all,
         // since the proof was already produced for this epoch's subscription
-        // and `sign_selection_proof` remembers it.
+        // and `sign_selection_proof` remembers it. With distributed mode on,
+        // none is ever made: the proof is the middleware's combined one,
+        // read from memory, and a duty with none aggregates for nobody (see
+        // `crate::distributed`).
         let mut keyed = Vec::with_capacity(duties.len());
         for duty in duties {
             match parse_pubkey(&duty.pubkey) {
