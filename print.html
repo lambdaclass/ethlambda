@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6045e438.js";
+            window.path_to_searchindex_js = "searchindex-0ad0df5d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -4745,6 +4745,7 @@ or in the same keymanager API request that imports the key. See
 <tr><td><code>--gas-limit</code></td><td><code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. <strong>Sepolia and Platåberget schedule <code>200000000</code></strong> (their <code>config.yaml</code>’s <code>GAS_LIMIT_SCHEDULE</code>, which this client does not read yet, <a href="https://github.com/lambdaclass/ethlambda/issues/795">#795</a>), so on either pass <code>--gas-limit 200000000</code>. Must be positive</td></tr>
 <tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, remote keys, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
+<tr><td><code>--keymanager-token-file</code></td><td><code>api-token.txt</code> in <code>--validators-dir</code></td><td>File to read the keymanager API’s bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an <code>Authorization</code> header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with <code>--enable-keymanager</code>; set without it, startup warns. See <a href="#the-keymanager-api">The keymanager API</a></td></tr>
 <tr><td><code>--web3signer-url</code></td><td>none</td><td>Base URL of a Web3Signer (<code>https://signer:9000</code>): the signer a remote key imported through <code>POST /eth/v1/remotekeys</code> without a <code>url</code> of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default</td></tr>
 <tr><td><code>--builder-proposals</code></td><td>off</td><td>Propose builder blocks: register each validator with the beacon node’s builder (an ethlambda node: <code>--builder</code>) and accept a blinded block when the builder’s bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in <code>produceBlockV4</code>. Without it that factor is <code>0</code>, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do</td></tr>
 <tr><td><code>--builder-boost-factor</code></td><td><code>100</code></td><td>How a builder’s bid is weighed against the local payload: the local payload wins iff <code>local &gt;= factor * bid / 100</code>. <code>0</code> prefers the local payload unless it cannot be built. From gloas it is also sent in <code>produceBlockV4</code>’s body, so a pooled p2p bid can win on value; without <code>--builder-proposals</code> the body carries <code>0</code>, which still lets a node whose local build fails build on such a bid. Requires <code>--builder-proposals</code>; conflicts with <code>--prefer-builder-proposals</code></td></tr>
@@ -5060,7 +5061,13 @@ over plain HTTP on a private network.</p>
 <code>DELETE /eth/v1/keystores</code>, authenticated with a bearer token read from
 <code>api-token.txt</code> in the validators directory and generated there on first start
 if absent. The token file is written <code>0600</code> and a file too short to be a real
-token is refused rather than accepted.</p>
+token, or holding a character an <code>Authorization</code> header cannot carry (anything
+but visible ASCII, spaces and tabs), is refused rather than accepted.</p>
+<p><code>--keymanager-token-file</code> names another file to read the token from instead,
+and <code>api-token.txt</code> is then neither read nor written. That file is the
+operator’s: the client only reads it, trimmed and held to the same checks, and
+a missing or refused one stops it at startup rather than being replaced with a
+generated token.</p>
 <p>It serves <code>GET</code>, <code>POST</code> and <code>DELETE /eth/v1/remotekeys</code> for the keys a
 Web3Signer holds. The two routes partition the store: <code>/keystores</code> lists and
 deletes local keys only, <code>/remotekeys</code> remote keys only, and a key asked of the
