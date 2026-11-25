@@ -80,6 +80,14 @@ const MAX_ROUND_TRIP: Duration = Duration::from_secs(1);
 /// second the node's clock was in, anywhere in it. Its middle is the estimate.
 const HALF_SECOND: Duration = Duration::from_millis(500);
 
+/// The least offset a slot comparison must prove to count: half a second,
+/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`. A comparison proves only the distance
+/// from one of this client's timestamps to the node's slot boundary, and a
+/// long round trip that ends just short of a boundary the node, a few
+/// milliseconds ahead, had already crossed would otherwise flag clocks that
+/// agree.
+const SLOT_SKEW_MIN_SECS: f64 = 0.5;
+
 /// How much more or less the wall clock must move than the monotonic clock,
 /// over one pass of the duty loop, to count as a step. Half a second,
 /// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`: the smallest error that already costs a
@@ -219,7 +227,8 @@ impl SlotSkew {
 
 /// Whether the node's answer to a probe sent at `sent` and answered at
 /// `received` puts its clock in another slot than this client's. `None` when
-/// the clocks agree to the slot, or the answer cannot say.
+/// the clocks agree to the slot, the answer cannot say, or the slots prove
+/// less than [`SLOT_SKEW_MIN_SECS`] apart.
 ///
 /// Two rules, read by what the node reported:
 ///
@@ -255,10 +264,10 @@ pub fn compare_slots(
     let distance = status
         .sync_distance
         .filter(|&distance| distance > 0 && !status.is_syncing);
-    if let Some(distance) = distance {
+    let skew = if let Some(distance) = distance {
         let node_slot = head.checked_add(distance)?;
         // The node read its clock between `sent` and `received`.
-        return if node_slot > received_slot {
+        if node_slot > received_slot {
             Some(SlotSkew {
                 node_slot,
                 client_slot: received_slot,
@@ -272,15 +281,20 @@ pub fn compare_slots(
             })
         } else {
             None
-        };
-    }
-    // With a slot of tolerance, the node's clock is at least in the slot
-    // before its head's.
-    (head > received_slot.saturating_add(1)).then(|| SlotSkew {
-        node_slot: head,
-        client_slot: received_slot,
-        offset_bound: seconds_between(clock.start_of(head - 1), received),
-    })
+        }
+    } else {
+        // With a slot of tolerance, the node's clock is at least in the slot
+        // before its head's.
+        (head > received_slot.saturating_add(1)).then(|| SlotSkew {
+            node_slot: head,
+            client_slot: received_slot,
+            offset_bound: seconds_between(clock.start_of(head - 1), received),
+        })
+    };
+    // A round trip that ends just short of this client's boundary, from a
+    // node a few milliseconds ahead that crossed it, proves no more than
+    // those milliseconds.
+    skew.filter(|skew| skew.offset_bound.abs() >= SLOT_SKEW_MIN_SECS)
 }
 
 /// What one node's answer to one probe says about the two clocks.
@@ -886,6 +900,17 @@ mod tests {
             compare_slots(&clock, &status(11, 1), sent, received).map(|skew| skew.node_slot),
             Some(12)
         );
+    }
+
+    /// A long round trip that ends 9 ms short of this client's boundary, from
+    /// a node 10 ms ahead that already crossed it, proves only those
+    /// milliseconds, and is not a disagreement.
+    #[test]
+    fn a_disagreement_of_a_few_milliseconds_is_not_one() {
+        let clock = clock();
+        let sent = at_ms(slot_ms(10) - 2_000);
+        let received = at_ms(slot_ms(10) - 9);
+        assert_eq!(compare_slots(&clock, &status(9, 1), sent, received), None);
     }
 
     /// A distance of zero, or one a syncing node reports, is not read as the

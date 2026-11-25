@@ -686,7 +686,12 @@ on one host share a clock, so between the two only a split setup is caught.
 The warnings name the node by its position in `--beacon-nodes`, from 0, and
 recur at most once an epoch while the clocks disagree.
 `ethlambda_validator_beacon_node_clock_offset_seconds` carries each node's
-offset.
+offset. A warning from the slots alone shows there only the offset the slots
+prove, which can read under 2 (about 1.9 s on 12 s slots when this client is
+behind), so an alert meant to match the warnings fires lower; see
+[Metrics](./metrics.md#validator-client). A slot disagreement proving less
+than half a second, a boundary crossed inside a long round trip, is not
+warned about.
 
 ### Doppelganger protection
 
