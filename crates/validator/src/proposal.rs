@@ -258,18 +258,34 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// duty loop, so a slow node never delays a duty. Without the clock there
     /// is no knowing when that is, and nothing is checked.
     fn check_later(&self, slot: Slot, validator: u64, block_root: Root) {
+        if let Some(check) = self.later_check(slot, validator, block_root) {
+            check();
+        }
+    }
+
+    /// [`Self::check_later`], for a task that outlives the call to start
+    /// once it knows the block may be out. `None` when nothing is checked.
+    fn later_check(
+        &self,
+        slot: Slot,
+        validator: u64,
+        block_root: Root,
+    ) -> Option<impl FnOnce() + Send + 'static> {
         let (Some(performance), Some(clock)) = (&self.performance, &self.clock) else {
-            return;
+            return None;
         };
         let at = clock.start_of(slot + CHECK_DELAY_SLOTS);
-        tokio::spawn(check_proposal_at(
-            self.beacon_node.clone(),
-            performance.clone(),
-            slot,
-            validator,
-            block_root,
-            at,
-        ));
+        let (beacon_node, performance) = (self.beacon_node.clone(), performance.clone());
+        Some(move || {
+            tokio::spawn(check_proposal_at(
+                beacon_node,
+                performance,
+                slot,
+                validator,
+                block_root,
+                at,
+            ));
+        })
     }
 
     /// Send `min_bid` (gwei) with every gloas block request, so the node
@@ -451,6 +467,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             self.publish_blinded(
                 slot,
                 validator,
+                block_root,
                 signed.producer,
                 signed.fork,
                 signed.body,
@@ -464,9 +481,16 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         };
         // A published block is counted where the node accepts it, beside
         // `blocks_proposed_total`. Here: a failure, and the check of any block
-        // that may be out, an unconfirmed blinded one included.
+        // that may be out, an unconfirmed blinded one included. A blinded
+        // block still publishing is checked by its publish task once the node
+        // has answered, and only if it did not refuse the block; a full block
+        // whose publish ran past the deadline, by `publish_full`.
         proposed
-            .inspect(|_| self.check_later(slot, validator, block_root))
+            .inspect(|proposed| {
+                if !matches!(proposed, Proposed::Blinded(BlindedOutcome::StillPublishing)) {
+                    self.check_later(slot, validator, block_root)
+                }
+            })
             .inspect_err(|_| self.record(slot, validator, Outcome::Failed))
     }
 
@@ -665,7 +689,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             ..
         } = signed;
         let publish = self.publish(fork, &body, slot, validator);
-        let published = before(deadline, slot, publish).await?;
+        let published = before(deadline, slot, publish).await.inspect_err(|err| {
+            // Cut while the request was in flight: the node may still import
+            // the block, so it is checked like one that is out. A refusal is
+            // not.
+            if matches!(err, Error::ProposalDeadline { .. }) {
+                self.check_later(slot, validator, block_root);
+            }
+        })?;
         crate::metrics::inc_blocks_proposed();
         self.record(slot, validator, Outcome::Published);
         // Taken here, not by the caller, which hears back only once a gloas
@@ -788,10 +819,12 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// (a 4xx, a 503, a connection never made; see
     /// [`BeaconNodeApi::publish_blinded_block`]) is an error, a failed
     /// proposal.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_blinded(
         &self,
         slot: Slot,
         validator: u64,
+        block_root: Root,
         producer: Producer,
         fork: ForkName,
         body: Vec<u8>,
@@ -800,6 +833,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let beacon_node = self.beacon_node.clone();
         let performance = self.performance.clone();
         let slot_start = self.clock.as_ref().map(|clock| clock.start_of(slot));
+        // Started by the task when nobody waits for its outcome any more,
+        // since the proposal then returned `StillPublishing` and started no
+        // check of its own.
+        let check = self.later_check(slot, validator, block_root);
         let (handoff, mut outcome) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let bytes = body.len();
@@ -812,9 +849,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
                 observe_publication_delay_since(start);
             }
             // Fails once the receiving side has stopped waiting, which hands
-            // the outcome back here to report.
+            // the outcome back here to report, and the block to check unless
+            // the node refused it.
             if let Err(outcome) = handoff.send(outcome) {
+                let may_be_out = outcome.is_ok();
                 report_unawaited(slot, validator, outcome, performance.as_deref());
+                if may_be_out && let Some(check) = check {
+                    check();
+                }
             }
         });
 

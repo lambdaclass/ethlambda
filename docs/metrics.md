@@ -1017,11 +1017,14 @@ and payload vote counterparts return a count, so no validator is credited with
 an outcome that may be another's.
 
 `proposal_checks_total` counts one check of each block this client handed to a
-node, an unconfirmed blinded block included, made when the fourth slot after
-the block's starts, through `GET /eth/v1/beacon/headers/{slot}`. It runs on a
-task of its own, so it never delays a duty. `canonical` means the canonical
-chain holds this block at the slot, `replaced` another block, `orphaned` none,
-and `unknown` that no node answered. The first node to answer is believed, so a node four
+node, made when the fourth slot after the block's starts, through
+`GET /eth/v1/beacon/headers/{slot}`. That includes an unconfirmed blinded block,
+a blinded block still publishing when the proposal stopped waiting unless the
+node then refused it, and a full block whose publish ran past the proposal's
+deadline. It runs on a task of its own, so it never delays a duty. `canonical`
+means the canonical chain holds this block at the slot, `replaced` another
+block, `orphaned` none (a 404, or a node answering with the block before the
+slot), and `unknown` that no node answered. The first node to answer is believed, so a node four
 slots behind the chain that does not report itself syncing reads as `orphaned`.
 Each check is also logged, at info when canonical and at warn otherwise.
 
@@ -1034,8 +1037,10 @@ does not serve yet.
 The same cap governs the log. When the first outcome of an epoch is recorded,
 every earlier epoch is summarized at info: one `Validator epoch summary` line
 per labelled validator with an outcome in it, each duty as `published/attempted`,
-and one more line for `other` when it has any. So a client writes at most 65 of
-these lines an epoch however many keys it holds.
+and one more line for `other` when it has any. Its `validators` field counts the
+validators `other` covers: those past the cap, and those of a batch accepted in
+part. So a client writes at most 65 of these lines an epoch however many keys it
+holds.
 
 ## Troubleshooting
 

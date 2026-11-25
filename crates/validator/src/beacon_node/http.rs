@@ -1471,7 +1471,13 @@ impl BeaconNodeApi for HttpBeaconNode {
             return Ok(None);
         };
         let answered = response.data.header.message.slot;
-        if answered != slot {
+        // A node may answer an empty slot with the last block before it
+        // rather than a 404. Either way the slot holds no block. A block from
+        // a later slot answers another question.
+        if answered < slot {
+            return Ok(None);
+        }
+        if answered > slot {
             return Err(Error::InconsistentResponse(format!(
                 "asked for the block at slot {slot}, node answered with one at slot {answered}"
             )));
@@ -2345,8 +2351,9 @@ mod tests {
     }
 
     /// The header endpoint's answer, in the shape the specification gives
-    /// it, read for its root; a 404 is no block at the slot, and a header for
-    /// another slot is an answer to another question.
+    /// it, read for its root. A 404, or a header for an earlier slot, is no
+    /// block at the slot; a header for a later one is an answer to another
+    /// question.
     #[tokio::test]
     async fn a_canonical_block_root_is_read_off_the_header_at_the_slot() {
         let root = format!("0x{}", "ab".repeat(32));
@@ -2388,12 +2395,19 @@ mod tests {
             None
         );
 
-        let served = serve(200, json, header(40)).await;
+        let served = serve(200, json.clone(), header(40)).await;
+        assert_eq!(
+            served.node.canonical_block_root(41).await.expect("answers"),
+            None,
+            "the block before an empty slot"
+        );
+
+        let served = serve(200, json, header(42)).await;
         let err = served
             .node
             .canonical_block_root(41)
             .await
-            .expect_err("a header for another slot");
+            .expect_err("a header for a later slot");
         assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
     }
 

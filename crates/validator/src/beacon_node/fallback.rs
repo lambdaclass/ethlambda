@@ -693,8 +693,10 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    // Quiet: the proposal check is no duty, and it logs and counts a failure
+    // as `unknown` itself.
     async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
-        self.try_each("canonical_block_root", |node| {
+        self.try_each_quiet("canonical_block_root", |node| {
             node.canonical_block_root(slot)
         })
         .await

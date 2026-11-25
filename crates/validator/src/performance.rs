@@ -284,8 +284,9 @@ struct EpochTally {
     validators: BTreeMap<ValidatorIndex, Tally>,
     /// Every outcome counted under `other`.
     other: Tally,
-    /// The validators past the cap among them, for the summary to say how
-    /// many `other` covers.
+    /// The validators those outcomes are of, for the summary to say how many
+    /// `other` covers: the ones past the cap, and those of a batch accepted
+    /// in part.
     other_validators: BTreeSet<ValidatorIndex>,
 }
 
@@ -320,14 +321,21 @@ impl Performance {
 
     /// Count one of `validator`'s duties at `slot`.
     pub fn record(&self, duty: Duty, slot: Slot, validator: ValidatorIndex, outcome: Outcome) {
-        self.count(duty, slot, Some(validator), outcome, 1);
+        self.count(duty, slot, Some(validator), &[], outcome, 1);
     }
 
-    /// Count `published` and `failed` duties at `slot` that no single
-    /// validator can be credited with, under `other`.
-    fn record_unattributed(&self, duty: Duty, slot: Slot, published: u64, failed: u64) {
-        self.count(duty, slot, None, Outcome::Published, published);
-        self.count(duty, slot, None, Outcome::Failed, failed);
+    /// Count `published` and `failed` duties of `validators` at `slot` that
+    /// no single one of them can be credited with, under `other`.
+    fn record_unattributed(
+        &self,
+        duty: Duty,
+        slot: Slot,
+        validators: &[ValidatorIndex],
+        published: u64,
+        failed: u64,
+    ) {
+        self.count(duty, slot, None, validators, Outcome::Published, published);
+        self.count(duty, slot, None, validators, Outcome::Failed, failed);
     }
 
     /// Count one proposal check. Not in the epoch summary: each check is
@@ -350,11 +358,14 @@ impl Performance {
         holds.then(|| validator.to_string())
     }
 
+    /// Count `count` outcomes, `validator`'s or, for `None`, those of
+    /// `unattributed` that none of them is credited with.
     fn count(
         &self,
         duty: Duty,
         slot: Slot,
         validator: Option<ValidatorIndex>,
+        unattributed: &[ValidatorIndex],
         outcome: Outcome,
         count: u64,
     ) {
@@ -398,6 +409,7 @@ impl Performance {
                 (validator, _) => {
                     tally.other.add(duty, outcome, count);
                     tally.other_validators.extend(validator);
+                    tally.other_validators.extend(unattributed);
                 }
             }
             earlier
@@ -517,7 +529,8 @@ impl Batch {
             }
         } else {
             let failed = sent.len() - accepted;
-            performance.record_unattributed(self.duty, self.slot, accepted as u64, failed as u64);
+            let (accepted, failed) = (accepted as u64, failed as u64);
+            performance.record_unattributed(self.duty, self.slot, sent, accepted, failed);
         }
     }
 }
