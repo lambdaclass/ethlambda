@@ -693,21 +693,28 @@ fn clear(node: &MockBeaconNode) {
 }
 
 /// Every key's attester duty in `epoch`: key `i` at the epoch's slot `i % 32`,
-/// each slot's keys dealt round-robin into its committees.
+/// each slot's keys dealt round-robin into its committees. Each duty names its
+/// own committee's length: when the keys do not divide evenly the committees
+/// differ by one, and the aggregator selection reads the length.
 fn attester_duties(epoch: Epoch, hex: &[String]) -> Vec<AttesterDutyDto> {
     let slots = preset::slots_per_epoch();
+    let keys = hex.len() as u64;
     let committees = committees_per_slot(hex.len());
-    let committee_length = (hex.len() as u64).div_ceil(slots).div_ceil(committees);
+    // How many keys a slot of the epoch holds, and how many of those its
+    // committee `committee` gets when they are dealt round-robin.
+    let at_slot = |slot: u64| keys / slots + u64::from(slot < keys % slots);
+    let members = |held: u64, committee: u64| (held + committees - 1 - committee) / committees;
     hex.iter()
         .enumerate()
         .map(|(index, pubkey)| {
             let index = index as u64;
             let position = index / slots;
+            let committee_index = position % committees;
             AttesterDutyDto {
                 pubkey: pubkey.clone(),
                 validator_index: index,
-                committee_index: position % committees,
-                committee_length,
+                committee_index,
+                committee_length: members(at_slot(index % slots), committee_index),
                 committees_at_slot: committees,
                 validator_committee_index: position / committees,
                 slot: epoch * slots + index % slots,
