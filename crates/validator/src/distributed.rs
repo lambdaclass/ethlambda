@@ -98,7 +98,19 @@ pub struct Distributed<B> {
     /// each for a remote key, queued with the slot's attestations at the
     /// same signer. Never read to decide a selection: that is the combined
     /// proof, held in the [`SigningContext`].
-    partials: std::sync::Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+    partials: std::sync::Mutex<Partials>,
+}
+
+/// The share's partial attester selection proofs [`Distributed`] keeps, and
+/// the schedule they were signed under.
+#[derive(Default)]
+struct Partials {
+    /// [`SigningContext::schedule_generation`] when the proofs held were
+    /// signed. A schedule the chain check swaps can move a proof's domain,
+    /// and the middleware refuses a partial under the old one, so a kept
+    /// proof is sent again only while the schedule has not moved.
+    generation: u64,
+    by_duty: HashMap<(BlsPubkey, Slot), BlsSignature>,
 }
 
 impl<B: BeaconNodeApi + 'static> Distributed<B> {
@@ -120,7 +132,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
 
     /// The partial proofs signed so far. A poisoned map is still a map of
     /// signatures.
-    fn partials(&self) -> std::sync::MutexGuard<'_, HashMap<(BlsPubkey, Slot), BlsSignature>> {
+    fn partials(&self) -> std::sync::MutexGuard<'_, Partials> {
         self.partials
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -129,7 +141,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     /// Drop the partial proofs of duties before `slot`, which no exchange
     /// sends again.
     fn forget_partials_before(&self, slot: Slot) {
-        self.partials().retain(|(_, held), _| *held >= slot);
+        self.partials().by_duty.retain(|(_, held), _| *held >= slot);
     }
 
     /// What the duty loop starts each slot once the slot's block is out, in
@@ -386,14 +398,20 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             .collect();
         // The partial proofs signed before, for keys still held. Checked
         // here because reusing one skips `sign_selection_proof`, which is
-        // where a deleted key is found.
+        // where a deleted key is found. None survives a schedule swap that
+        // moved a fork, since a proof may then be over the old domain.
+        let generation = self.context.schedule_generation();
         let reused: Vec<Option<BlsSignature>> = {
             let held = store.read().await;
-            let partials = self.partials();
+            let mut partials = self.partials();
+            if partials.generation != generation {
+                partials.by_duty.clear();
+                partials.generation = generation;
+            }
             keyed
                 .iter()
                 .map(|(duty, pubkey)| {
-                    let partial = partials.get(&(*pubkey, duty.slot)).copied()?;
+                    let partial = partials.by_duty.get(&(*pubkey, duty.slot)).copied()?;
                     held.contains(pubkey).then_some(partial)
                 })
                 .collect()
@@ -424,11 +442,17 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
                 }),
             })
             .collect();
+        // Kept only if the schedule did not move while they were signed:
+        // one signed across a swap may be over either domain. Checked under
+        // the lock that clears them, so a swap seen by a later exchange
+        // cannot be followed by an insert from this one.
         {
             let mut held = self.partials();
-            for ((duty, pubkey), partial) in keyed.iter().zip(&partials) {
-                if let Ok(partial) = partial {
-                    held.insert((*pubkey, duty.slot), *partial);
+            if self.context.schedule_generation() == generation {
+                for ((duty, pubkey), partial) in keyed.iter().zip(&partials) {
+                    if let Ok(partial) = partial {
+                        held.by_duty.insert((*pubkey, duty.slot), *partial);
+                    }
                 }
             }
         }
@@ -613,6 +637,7 @@ mod tests {
         SyncCommitteeContribution, sync_subcommittee_size,
     };
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
+    use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::{BlsSignature, Root};
     use sha2::{Digest, Sha256};
@@ -1042,14 +1067,20 @@ mod tests {
             .subscribe_epoch(EPOCH_START, &duties, &store)
             .await;
         assert!(
-            distributed.partials().contains_key(&(pubkey, current)),
+            distributed
+                .partials()
+                .by_duty
+                .contains_key(&(pubkey, current)),
             "kept although the exchange failed"
         );
 
         // Stands in for the kept signature, so the request shows which one
         // went out.
         let kept = BlsSignature([9; 96]);
-        distributed.partials().insert((pubkey, current), kept);
+        distributed
+            .partials()
+            .by_duty
+            .insert((pubkey, current), kept);
         node.failures
             .lock()
             .expect("lock")
@@ -1061,7 +1092,47 @@ mod tests {
         assert_eq!(requests[0][0].selection_proof, kept, "sent as kept");
 
         distributed.retry(current + 1, &duties, &store).await;
-        assert!(distributed.partials().is_empty(), "its slot has passed");
+        assert!(
+            distributed.partials().by_duty.is_empty(),
+            "its slot has passed"
+        );
+    }
+
+    /// A schedule swap that moves a fork forgets the kept partial proofs,
+    /// which may be over the old domain: the retry signs the share's proof
+    /// anew, under the new schedule.
+    #[tokio::test]
+    async fn a_schedule_swap_forgets_the_kept_partial_proofs() {
+        let (store, pubkey) = store();
+        let current = EPOCH_START + 5;
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .failing_call("beacon_committee_selections", "middleware down")
+                .with_combined_selection(1, current, attester_proof(true)),
+        );
+        let context = distributed_context();
+        let distributed = Distributed::new(node.clone(), context.clone());
+        let duties = vec![duty(&pubkey, 1, current)];
+        distributed
+            .subscribe_epoch(EPOCH_START, &duties, &store)
+            .await;
+        let kept = BlsSignature([9; 96]);
+        distributed
+            .partials()
+            .by_duty
+            .insert((pubkey, current), kept);
+
+        context.replace_config(Config::mainnet().with_fork_version(ForkName::Phase0, [9, 9, 9, 9]));
+        node.failures
+            .lock()
+            .expect("lock")
+            .remove("beacon_committee_selections");
+        distributed.retry(EPOCH_START + 1, &duties, &store).await;
+
+        let requests = node.selection_requests();
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0][0].selection_proof, kept, "signed anew");
+        assert_partials_are_the_shares_own(&node, &pubkey, &context);
     }
 
     /// A partial proof kept for a key the keymanager has since deleted is
@@ -1079,7 +1150,12 @@ mod tests {
         distributed
             .subscribe_epoch(EPOCH_START, &duties, &store)
             .await;
-        assert!(distributed.partials().contains_key(&(pubkey, current)));
+        assert!(
+            distributed
+                .partials()
+                .by_duty
+                .contains_key(&(pubkey, current))
+        );
 
         assert!(store.write().await.remove(&pubkey));
         node.failures
