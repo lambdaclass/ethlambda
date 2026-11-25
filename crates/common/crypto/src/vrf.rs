@@ -1,31 +1,36 @@
 //! The Beacon Chain PQ fork's VRF tree (consensus-specs
 //! `specs/_features/pq/{beacon-chain,validator}.md`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`, the pq-devnet-0 spec).
+//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
 //!
 //! XMSS signatures are not unique, so a proposer could grind a signature-based
-//! RANDAO reveal. A validator instead registers as its VRF root the root of a
-//! Merkle tree of depth [`VRF_TREE_DEPTH`], hashed with Keccak-256, whose leaf
-//! for a slot is `keccak256(vrf_seed || le64(slot))`. Its reveal is the leaf
-//! followed by the leaf's branch (a `VRFProof`).
+//! RANDAO reveal. A validator instead has a secret for each slot, derived from
+//! its VRF seed, and registers as its VRF root the root of a Merkle tree of
+//! depth [`VRF_TREE_DEPTH`], hashed with Keccak-256, whose leaf for a slot
+//! commits to that slot's secret. Its reveal is the secret followed by the
+//! leaf's branch (a `VRFProof`). The branch holds only commitments, so
+//! proposing at one slot reveals no other slot's secret.
 //!
-//! The verifying half ([`fold_vrf_branch`]) is the state transition's
-//! `is_valid_vrf_proof`. The deriving half ([`compute_vrf_leaf`],
-//! [`compute_vrf_node`], [`VrfTree`]) is the validator's.
+//! The verifying half ([`compute_vrf_leaf`], [`fold_vrf_branch`]) is the
+//! state transition's `is_valid_vrf_proof`. The deriving half
+//! ([`compute_vrf_secret`], [`compute_vrf_node`], [`VrfTree`]) is the
+//! validator's.
 //!
 //! # Cost
 //!
-//! A leaf hashes its index with the seed, so no two leaves are equal and
-//! nothing but hashing all `2^31` of them yields the root: about two
-//! Keccak-256 calls a leaf, 4.3 billion a tree. [`VrfTree::build`] runs them
-//! across cores and keeps the `2^15` nodes [`SUBTREE_DEPTH`] levels above the
-//! leaves (1 MiB), from which a proof rebuilds one `2^16`-leaf subtree.
-//! [`VrfTree::to_bytes`] and [`VrfTree::from_bytes`] carry those nodes, so a
-//! tree is hashed once per seed, not once per start. ethereum-package
-//! publishes each genesis validator's root and leaf 0's branch, from which
-//! [`VrfTree::from_state_record`] proves without hashing the tree.
+//! A leaf commits to its index as well as its secret, so no two leaves are
+//! equal and nothing but hashing all `2^31` of them yields the root: three
+//! Keccak-256 calls a leaf, about 6.4 billion a tree. [`VrfTree::build`] runs
+//! them across cores and keeps the `2^15` nodes [`SUBTREE_DEPTH`] levels
+//! above the leaves (1 MiB), from which a proof rebuilds one `2^16`-leaf
+//! subtree. [`VrfTree::to_bytes`] and [`VrfTree::from_bytes`] carry those
+//! nodes, so a tree is hashed once per seed, not once per start. On an Apple
+//! M4 Max's 14 cores a tree takes about 100 seconds and a proof 30 ms.
 
-use ethlambda_types::beacon::constants::VRF_TREE_DEPTH;
+use ethlambda_types::beacon::constants::{VRF_LEAF_DOMAIN, VRF_TREE_DEPTH};
 use rayon::prelude::*;
+
+/// The specification's `VRF_SECRET_DOMAIN` (`validator.md`).
+pub const VRF_SECRET_DOMAIN: &[u8] = b"VRF_SECRET";
 
 /// How many levels above the leaves the nodes a [`VrfTree`] keeps are: a
 /// proof rebuilds one subtree of this depth, about 200,000 hashes.
@@ -36,7 +41,7 @@ const SUBTREE_DEPTH: usize = 16;
 /// [`VrfTree::from_state_record`].
 pub const STATE_RECORD_SIZE: usize = 32 + 4 + 32 * VRF_TREE_DEPTH;
 
-/// A node of the tree, or a seed.
+/// A node of the tree, a secret, or a seed.
 pub type Node = [u8; 32];
 
 /// Keccak-256's rate: the bytes one permutation absorbs.
@@ -44,8 +49,8 @@ const KECCAK_RATE: usize = 136;
 
 /// The specification's `keccak256`, over the concatenation of `parts`.
 ///
-/// Every input the tree hashes (a leaf's preimage, a pair of nodes) is at
-/// most 64 bytes, under one block, so this pads it into a
+/// Every input the tree hashes (a secret's preimage, a leaf's, a pair of
+/// nodes) is at most 64 bytes, under one block, so this pads it into a
 /// single block and runs the permutation once rather than going through a
 /// streaming hasher, which the full tree's billions of calls notice.
 ///
@@ -79,10 +84,16 @@ fn hash_pair(left: &Node, right: &Node) -> Node {
     keccak256(&[left, right])
 }
 
-/// `compute_vrf_leaf`: the leaf at `index` of the VRF tree derived from
-/// `vrf_seed`, `keccak256(vrf_seed || uint_to_bytes(index))`.
-pub fn compute_vrf_leaf(vrf_seed: &Node, index: u64) -> Node {
-    keccak256(&[vrf_seed, &index.to_le_bytes()])
+/// `compute_vrf_secret`: the secret for `index` of the VRF tree derived from
+/// `vrf_seed`.
+pub fn compute_vrf_secret(vrf_seed: &Node, index: u64) -> Node {
+    keccak256(&[VRF_SECRET_DOMAIN, vrf_seed, &index.to_le_bytes()])
+}
+
+/// `compute_vrf_leaf`: the leaf at `index` of a VRF tree, which commits to
+/// `secret`.
+pub fn compute_vrf_leaf(secret: &Node, index: u64) -> Node {
+    keccak256(&[VRF_LEAF_DOMAIN, secret, &index.to_le_bytes()])
 }
 
 /// `compute_vrf_node`: the node at `index` among the nodes `height` levels
@@ -104,7 +115,7 @@ pub fn compute_vrf_node(vrf_seed: &Node, height: usize, index: u64) -> Node {
     let mut finished: Vec<Node> = Vec::with_capacity(height + 1);
     for offset in 0..1u64 << height {
         let leaf_index = first_leaf + offset;
-        let mut node = compute_vrf_leaf(vrf_seed, leaf_index);
+        let mut node = compute_vrf_leaf(&compute_vrf_secret(vrf_seed, leaf_index), leaf_index);
         // Each trailing one bit of `offset` is a level whose left sibling is
         // already finished.
         for _ in 0..offset.trailing_ones() {
@@ -116,16 +127,16 @@ pub fn compute_vrf_node(vrf_seed: &Node, height: usize, index: u64) -> Node {
     finished.pop().expect("the last leaf folds up to the node")
 }
 
-/// The root a `VRFProof` folds to at `slot`: its revealed `leaf`, hashed up
-/// through `branch` (siblings bottom-up) on the side each bit of `slot`
-/// gives. `is_valid_vrf_proof` is this compared with the proposer's
-/// registered VRF root.
+/// The root a `VRFProof` folds to at `slot`: the leaf committing to `secret`
+/// at index `slot`, hashed up through `branch` (siblings bottom-up) on the
+/// side each bit of `slot` gives. `is_valid_vrf_proof` is this compared with
+/// the proposer's registered VRF root.
 pub fn fold_vrf_branch<'a>(
-    leaf: &Node,
+    secret: &Node,
     branch: impl IntoIterator<Item = &'a Node>,
     slot: u64,
 ) -> Node {
-    let mut value = *leaf;
+    let mut value = compute_vrf_leaf(secret, slot);
     for (height, sibling) in branch.into_iter().enumerate() {
         value = if (slot >> height) & 1 == 1 {
             hash_pair(sibling, &value)
@@ -220,7 +231,7 @@ impl VrfTree {
                 actual: 32 * branch.len(),
             });
         }
-        if fold_vrf_branch(&compute_vrf_leaf(&vrf_seed, 0), &branch, 0) != root {
+        if fold_vrf_branch(&compute_vrf_secret(&vrf_seed, 0), &branch, 0) != root {
             return Err(VrfTreeError::WrongSeed);
         }
         Ok(Self {
@@ -303,9 +314,9 @@ impl VrfTree {
         }
     }
 
-    /// `compute_vrf_proof`: the leaf at index `slot`, then its branch,
-    /// siblings bottom-up. `None` for a slot past the tree's last leaf, which
-    /// no proof exists for.
+    /// `compute_vrf_proof`: the secret for `slot`, then the branch of the leaf
+    /// at index `slot`, siblings bottom-up. `None` for a slot past the tree's
+    /// last leaf, which no proof exists for.
     pub fn proof(&self, slot: u64) -> Option<Vec<Node>> {
         if slot >> self.depth != 0 {
             return None;
@@ -314,9 +325,9 @@ impl VrfTree {
         let subtree = slot >> subtree_depth;
         let first_leaf = subtree << subtree_depth;
         let mut proof = Vec::with_capacity(self.depth + 1);
-        proof.push(compute_vrf_leaf(&self.seed, slot));
+        proof.push(compute_vrf_secret(&self.seed, slot));
         let mut nodes: Vec<Node> = (first_leaf..first_leaf + (1 << subtree_depth))
-            .map(|index| compute_vrf_leaf(&self.seed, index))
+            .map(|index| compute_vrf_leaf(&compute_vrf_secret(&self.seed, index), index))
             .collect();
         reduce(&mut nodes, (slot - first_leaf) as usize, &mut proof);
         match &self.kept {
@@ -343,7 +354,8 @@ impl VrfTree {
     /// What the tree keeps, then its root: everything [`Self::from_bytes`]
     /// needs beside the seed. A tree hashed in full keeps its nodes
     /// [`SUBTREE_DEPTH`] levels up (1 MiB), one restored from a compact
-    /// state keeps leaf 0's branch (1 KiB).
+    /// state keeps leaf 0's branch (1 KiB). They are commitments, so the
+    /// bytes reveal no secret.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = match &self.kept {
             Kept::Subtrees(subtree_roots) => subtree_roots.concat(),
@@ -411,6 +423,7 @@ fn reduce(nodes: &mut Vec<Node>, mut index: usize, branch: &mut Vec<Node>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn hex32(text: &str) -> Node {
         hex::decode(text).unwrap().try_into().unwrap()
@@ -424,7 +437,7 @@ mod tests {
     /// The specification's `compute_vrf_node`, as it is written.
     fn recursive_node(vrf_seed: &Node, height: usize, index: u64) -> Node {
         if height == 0 {
-            return compute_vrf_leaf(vrf_seed, index);
+            return compute_vrf_leaf(&compute_vrf_secret(vrf_seed, index), index);
         }
         let left = recursive_node(vrf_seed, height - 1, 2 * index);
         let right = recursive_node(vrf_seed, height - 1, 2 * index + 1);
@@ -473,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn a_proof_reveals_its_slots_leaf_and_folds_to_the_root() {
+    fn a_proof_reveals_its_slots_secret_and_folds_to_the_root() {
         let seed = seed();
         let depth = SUBTREE_DEPTH + 2;
         let tree = VrfTree::with_depth(seed, depth);
@@ -482,90 +495,88 @@ mod tests {
         for slot in [0, 1, 5, (1 << SUBTREE_DEPTH) - 1, 1 << SUBTREE_DEPTH, last] {
             let proof = tree.proof(slot).unwrap();
             assert_eq!(proof.len(), depth + 1);
-            assert_eq!(proof[0], compute_vrf_leaf(&seed, slot), "slot {slot}");
+            assert_eq!(proof[0], compute_vrf_secret(&seed, slot), "slot {slot}");
             assert_eq!(
                 fold_vrf_branch(&proof[0], &proof[1..], slot),
                 root,
                 "slot {slot}"
             );
-            // The branch opens this leaf only: not at the neighbouring index,
-            // and not another leaf at this one.
+            // The leaf commits to its index: the same secret and branch do not
+            // open the neighbouring leaf, nor does another secret this one.
             assert_ne!(fold_vrf_branch(&proof[0], &proof[1..], slot ^ 1), root);
             assert_ne!(fold_vrf_branch(&[1; 32], &proof[1..], slot), root);
         }
         assert!(tree.proof(last + 1).is_none());
     }
 
-    /// Validator 0 of ethereum-package's default mnemonic: its VRF root and
-    /// leaf 0's branch as the package publishes them
-    /// (`static_files/xmss-keys/b9dec4e1daa17dfe.vrf`, record 0, from
-    /// eth-beacon-genesis, an independent implementation), and the VRF seed
-    /// its signing key derives.
-    const PUBLISHED_ROOT: &str = "2c8d6a710d3a22803be6490fef9c9247e30ac68793bffb7cbc151d17f8313cb0";
-    const PUBLISHED_BRANCH: [&str; VRF_TREE_DEPTH] = [
-        "3b553e1e307ad6190a1c81579244b4cc5ef3689bb306e406c286df6f149f3385",
-        "bdff49fdadccf691e8463ad83c9144bb1f1dd3be2cc65d61cb65194a11d44778",
-        "b3188264c7dbdfc2097fef24d373f8f0fdde3700f1c7dda868d4d1dfff3ea735",
-        "bc747d9befb30d217afb5ef24b2130b3939a18cbb12e8ff9cad8ea43d666f328",
-        "2826365c053905094470eb39f801babe15bb56dfede5d3d89c60f94bec94c6cc",
-        "b054a7ce37d45e7dc9574b25815b33ef9d5d02dfba2c5867c15c6ce6ce4f87e0",
-        "8d48edeef8615159f8e9a5c3ff7d59dc13063cb5a246dec9caf01573514257d9",
-        "410a426beda2a00182b63294eac078460157987ce4f7c8d16008d6a82970b278",
-        "c01def0ca03beffc51029b7e13f50e39169df10c82f7130d5f7b9c5e8f876d28",
-        "5a29cca22a1043e0724dc105e1204f0c2f1956e4d634b7fda4f124f0f3dbe7ae",
-        "cd69bff80485b514887c3282ba6e7411e745928f4d253a12b1cc6b658b362a87",
-        "f79eb3ba9c7015ff12e965a793f36930aa667af852669424018c1e652742ec76",
-        "7b577ddefc00fab0447df555c5d59f76e4e49656fb0f6e565969cccae4ce7dcc",
-        "a82515f2a8c036495e924da314d087473d1d7d4acc6a97ec767bcf16e97292f2",
-        "36d25a6b0464f79c531d9338e6645fb0559816f66aa3ea7616c5194cc0da924a",
-        "438ab193ca00bdf0e5b75855f94bb32e778fbffe85d370284b878b8835968dd6",
-        "1305124c8db86859bcf9110c72a2231bce1bc2bf44443032775d90d1e76b3667",
-        "ece380acfc342142a937a48d3ea84e3397421f3db74a9122bcea245a4fceb43e",
-        "a8e932e0dd6ec363635fdb0b30ea60d24cc1a861904c879e236c0e77f9efa562",
-        "123e8cef55f55b0dd4f3d0758fd52aa270c53d3f230393112a404216fc10743f",
-        "760a6fcab9db4b616b94ad3882dea4d434a849f6d1a03fa507c648d904ec641d",
-        "32a9196616c33e77daecac4d5fbafd131b0968899e1a440cb4f05d868a0deb7f",
-        "0a9cf6b998c2736cc5c5a137b335261b1ee68671345b1c9a17f208026f4146a5",
-        "cb310e30dc647396390e107f0ec081689d9b84c965b340b7d6949b4be00fe461",
-        "fc097343ba9eed74f88793de989d6f250eb852eacb7d70a76f65ffbbbde906ee",
-        "1d7fd2ea64087c2a054a78558ed0e578047c06c2fa033dd0cbc3c2a33b88b06e",
-        "44d7360b2aacc44b9c969859104c1ecfa4d8da6c410fab927969d28bf6335e38",
-        "d8af842dfc83814f0291c4ad67ce2b74e83cefbddf870d1a7352793d027abc6f",
-        "6de1e6d637d9a2965eff8b036c0a8c37dcdd85f95f4327a87821b1c10f1eefeb",
-        "1b4c477849c185cb826bd541d5a31d83cc5d603b8d5b5d137de2babe4535705d",
-        "d1ed2b30f968fa3b5daac6544cf01bb549ad0c70b50a2f56057e89dbbf4e7d72",
-    ];
-
-    fn published_seed() -> Node {
-        crate::pq_keys::vrf_seed(&hex32(
-            "0dce41fa73ae9f6bdfd51df4d422d75eee174553dba5fd450c4437e4ed3fc903",
-        ))
+    /// A proof's branch holds commitments only: no node of it is a secret of
+    /// the tree, in particular not the neighbouring slot's, which the leaf
+    /// sibling was before leaves committed to secrets.
+    #[test]
+    fn a_proof_reveals_no_other_secret() {
+        let seed = seed();
+        let tree = VrfTree::with_depth(seed, 4);
+        let proof = tree.proof(6).unwrap();
+        let secrets: Vec<Node> = (0..16)
+            .map(|index| compute_vrf_secret(&seed, index))
+            .collect();
+        assert!(proof[1..].iter().all(|node| !secrets.contains(node)));
+        assert_eq!(proof[1], compute_vrf_leaf(&secrets[7], 7));
     }
 
-    /// The leaf rule, the little-endian index and the fold's order, against
-    /// what ethPandaOps' genesis tooling registered: the branch's lower
-    /// levels are this seed's nodes, and leaf 0 folds through the whole
-    /// branch to the published root, so the published state restores.
+    /// Known answers from a transcription of the specification's functions
+    /// over an independent Keccak-256, for the seed `00 01 .. 1f`: the domain
+    /// tags, the little-endian index and the order of every concatenation.
     #[test]
-    fn matches_ethereum_packages_published_state() {
-        let seed = published_seed();
-        let branch: Vec<Node> = PUBLISHED_BRANCH.iter().map(|node| hex32(node)).collect();
-        for (height, sibling) in branch.iter().enumerate().take(11) {
-            assert_eq!(
-                compute_vrf_node(&seed, height, 1),
-                *sibling,
-                "height {height}"
-            );
-        }
-        let root = hex32(PUBLISHED_ROOT);
+    fn known_answers() {
+        let seed = seed();
+        let secret = compute_vrf_secret(&seed, 0);
         assert_eq!(
-            fold_vrf_branch(&compute_vrf_leaf(&seed, 0), &branch, 0),
-            root
+            secret,
+            hex32("568e22331e25e613a84a6a86df3f442e2f7f994ccce0b746088fb737c2bc0e20")
         );
-        let tree = VrfTree::from_compact_state(seed, root, branch).unwrap();
-        let proof = tree.proof(9).unwrap();
-        assert_eq!(proof[0], compute_vrf_leaf(&seed, 9));
-        assert_eq!(fold_vrf_branch(&proof[0], &proof[1..], 9), root);
+        assert_eq!(
+            compute_vrf_secret(&seed, (1 << 31) - 1),
+            hex32("7d65715bc75677b7ae70b0e3a287a883b6424dbdc7fe12476e14a2a28e5f4a72")
+        );
+        assert_eq!(
+            compute_vrf_leaf(&secret, 0),
+            hex32("7858a2fe40f519a1db8508fba150a5d89a2f8e6e5c784eb6b5c36728a4364af2")
+        );
+        assert_eq!(
+            compute_vrf_node(&seed, 4, 5),
+            hex32("e216d7728aa69ed5ff228641a373039fb56c1bdda676edf8e012443af726e8c6")
+        );
+        assert_eq!(
+            compute_vrf_node(&seed, 3, (1 << 28) - 1),
+            hex32("c70649c366c4690b4d9977254f45cef88aa2cb4f0b0a0b08e8d42a6f95a5020e")
+        );
+
+        // A depth-10 tree's proofs are the first eleven nodes of the full
+        // tree's `compute_vrf_proof`. SHA-256 fingerprints their bytes.
+        let tree = VrfTree::with_depth(seed, 10);
+        assert_eq!(
+            tree.root(),
+            hex32("e2fd22f54650f9bb431288d5632b94b406024a411db4fef773eacec0fae253bb")
+        );
+        for (slot, fingerprint) in [
+            (
+                0,
+                "53b437b21a44e9def0f0a202bf515f0182f652a758a0446318262d9d612687db",
+            ),
+            (
+                5,
+                "f22b4ec50f24ae2754eddd04eefd08e52d63b1c13aa863f6b9c4df064afaf9f8",
+            ),
+            (
+                1023,
+                "dc21b0ac18f3119cc77117d501050a2c4fa90299aa285bb5e9cd8b90bd575d07",
+            ),
+        ] {
+            let proof = tree.proof(slot).unwrap().concat();
+            let digest: Node = sha2::Sha256::digest(proof).into();
+            assert_eq!(digest, hex32(fingerprint), "slot {slot}");
+        }
     }
 
     #[test]
@@ -665,7 +676,7 @@ mod tests {
         let seed = seed();
         let mut branch = VrfTree::with_depth(seed, SUBTREE_DEPTH).compact_state().1;
         branch.extend((SUBTREE_DEPTH..VRF_TREE_DEPTH).map(|height| [height as u8; 32]));
-        let root = fold_vrf_branch(&compute_vrf_leaf(&seed, 0), &branch, 0);
+        let root = fold_vrf_branch(&compute_vrf_secret(&seed, 0), &branch, 0);
         let tree = VrfTree::from_compact_state(seed, root, branch).unwrap();
 
         let record = tree.to_state_record();

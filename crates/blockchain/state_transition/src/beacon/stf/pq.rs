@@ -1,6 +1,6 @@
 //! The PQ fork's block processing (consensus-specs
 //! `specs/_features/pq/beacon-chain.md`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
+//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
 //!
 //! Gloas's block processing with leanXMSS in place of BLS:
 //!
@@ -9,7 +9,7 @@
 //!   (`compute_xmss_leaf_index`), a bid at any of the bid leaves;
 //! - attestations carry no signature: the block's `proof` covers all of them,
 //!   checked once in [`process_stark`] after every attestation is processed;
-//! - the RANDAO reveal is a VRF proof, the leaf the proposer's committed
+//! - the RANDAO reveal is a VRF proof, the secret the proposer's committed
 //!   tree holds for the slot ([`process_randao`]);
 //! - voluntary exits are execution-layer requests, and the body loses
 //!   `voluntary_exits`, `sync_aggregate`, `bls_to_execution_changes` and
@@ -135,8 +135,8 @@ pub fn verify_block_signature(state: &BeaconState, signed_block: &pq::SignedBeac
 }
 
 /// `process_randao` (modified in PQ): the reveal is the proposer's VRF proof
-/// for the slot, and the leaf it reveals is mixed in. The proposer committed
-/// to its leaves when it registered its VRF root, so it cannot grind the
+/// for the slot, and the secret it reveals is mixed in. The proposer committed
+/// to its secrets when it registered its VRF root, so it cannot grind the
 /// reveal and can only withhold its block, as with BLS.
 pub fn process_randao(
     state: &mut BeaconState,
@@ -995,17 +995,17 @@ mod tests {
         )
     }
 
-    /// A VRF proof for `slot` under a root it determines: the leaf and every
-    /// sibling chosen, the root folded up from the leaf, as
-    /// `is_valid_vrf_proof` folds.
-    fn vrf_proof_and_root(slot: Slot, leaf: Bytes32) -> (pq::VrfProof, Root) {
+    /// A VRF proof for `slot` under a root it determines: the secret and
+    /// every sibling chosen, the root folded up from the leaf committing to
+    /// the secret, as `is_valid_vrf_proof` folds.
+    fn vrf_proof_and_root(slot: Slot, secret: Bytes32) -> (pq::VrfProof, Root) {
         let siblings: Vec<Bytes32> = (0..constants::VRF_TREE_DEPTH)
             // Distinct from any node a test folds, so no level's order is moot.
             .map(|level| Bytes32::repeat_byte(level as u8 + 0x40))
             .collect();
         let branch = siblings.iter().map(|sibling| &sibling.0);
-        let root = ethlambda_crypto::vrf::fold_vrf_branch(&leaf.0, branch, slot);
-        let mut proof = vec![leaf];
+        let root = ethlambda_crypto::vrf::fold_vrf_branch(&secret.0, branch, slot);
+        let mut proof = vec![secret];
         proof.extend(siblings);
         (
             pq::VrfProof::try_from(proof).expect("VRF_TREE_DEPTH + 1 roots"),
@@ -1026,44 +1026,50 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_vrf_proof_mixes_its_leaf_in() {
+    fn a_valid_vrf_proof_mixes_its_secret_in() {
         let mut state = with_validators_at(ForkName::Pq, 64);
         let slot = state.slot();
         let proposer = get_beacon_proposer_index(&state).unwrap();
-        let leaf = Bytes32::repeat_byte(0xab);
-        let (proof, root) = vrf_proof_and_root(slot, leaf);
+        let secret = Bytes32::repeat_byte(0xab);
+        let (proof, root) = vrf_proof_and_root(slot, secret);
         set_key(&mut state, proposer, XmssPubkey::default(), root);
 
         let epoch = get_current_epoch(&state);
         let previous = get_randao_mix(&state, epoch);
         process_randao(&mut state, &proof, RandaoVerification::Verify).unwrap();
-        let expected = hash(&[&previous.0[..], &leaf.0, &constants::DOMAIN_RANDAO].concat());
+        let expected = hash(&[&previous.0[..], &secret.0, &constants::DOMAIN_RANDAO].concat());
         assert_eq!(get_randao_mix(&state, epoch), expected);
     }
 
     #[test]
-    fn a_vrf_proof_for_another_slot_or_leaf_is_refused() {
+    fn a_vrf_proof_for_another_slot_or_secret_is_refused() {
         let mut state = with_validators_at(ForkName::Pq, 64);
         let slot = state.slot();
         let proposer = get_beacon_proposer_index(&state).unwrap();
-        // A root opening the leaf at the next slot: the same leaf and branch
-        // revealed at this slot fold to a different root.
+        // A root committing to the secret at the next slot: the same secret
+        // and branch revealed at this slot fold to a different root.
         let (proof, next_slot_root) = vrf_proof_and_root(slot + 1, Bytes32::repeat_byte(1));
         set_key(&mut state, proposer, XmssPubkey::default(), next_slot_root);
         assert!(process_randao(&mut state.clone(), &proof, RandaoVerification::Verify).is_err());
 
         let (_, root) = vrf_proof_and_root(slot, Bytes32::repeat_byte(1));
         set_key(&mut state, proposer, XmssPubkey::default(), root);
-        let (wrong_leaf, _) = vrf_proof_and_root(slot, Bytes32::repeat_byte(2));
+        let (wrong_secret, _) = vrf_proof_and_root(slot, Bytes32::repeat_byte(2));
         assert!(
-            process_randao(&mut state.clone(), &wrong_leaf, RandaoVerification::Verify).is_err()
+            process_randao(
+                &mut state.clone(),
+                &wrong_secret,
+                RandaoVerification::Verify
+            )
+            .is_err()
         );
         // Block production's skip still mixes the reveal in, unchecked.
-        assert!(process_randao(&mut state, &wrong_leaf, RandaoVerification::Skip).is_ok());
+        assert!(process_randao(&mut state, &wrong_secret, RandaoVerification::Skip).is_ok());
     }
 
-    /// The tree is hashed with Keccak-256 (`2f43bc0f`). A proof whose root is
-    /// folded with SHA-256, the rule before it, is refused.
+    /// The tree is hashed with Keccak-256 and its leaf commits to the secret
+    /// and the slot. A proof whose root is folded with SHA-256 from the
+    /// secret itself, the rule before both changes, is refused.
     #[test]
     fn a_vrf_proof_under_the_earlier_sha256_tree_is_refused() {
         let mut state = with_validators_at(ForkName::Pq, 64);
@@ -1083,6 +1089,20 @@ mod tests {
                 });
         set_key(&mut state, proposer, XmssPubkey::default(), sha256_root);
         assert!(process_randao(&mut state, &proof, RandaoVerification::Verify).is_err());
+    }
+
+    /// The leaf commits to the whole slot, while the branch reads only its
+    /// low `VRF_TREE_DEPTH` bits: a proof for `slot` does not also open
+    /// `slot + 2^31`, which walks the same path.
+    #[test]
+    fn a_vrf_leaf_commits_to_its_whole_slot() {
+        let mut state = with_validators_at(ForkName::Pq, 64);
+        let slot = state.slot();
+        let (proof, root) = vrf_proof_and_root(slot, Bytes32::repeat_byte(0xab));
+        set_key(&mut state, 0, XmssPubkey::default(), root);
+        assert!(is_valid_vrf_proof(&state, 0, slot, &proof).unwrap());
+        let same_path = slot + (1 << constants::VRF_TREE_DEPTH);
+        assert!(!is_valid_vrf_proof(&state, 0, same_path, &proof).unwrap());
     }
 
     #[test]

@@ -878,7 +878,6 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   validation, deneb's and fulu's data availability, and gloas's payload-aware
   suites.
 - **EIP-8483 and PQ** (consensus-specs' `pq` branch feature forks, pinned at
-  `2f43bc0f`, the pq-devnet-0 spec; branch `pq-devnet-0-b5d422b2` follows
   `b5d422b2`) are `ForkName::Eip8483` and `ForkName::Pq` after gloas, selectors
   8 and 9, implemented in the state transition and fork choice
   (`stf/{eip8483,pq}.rs`, `stf/epoch/pq.rs`, `helpers/pq.rs`, `upgrade_to_*`)
@@ -897,7 +896,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
   in the aggregation committee), casts PTC votes and proposes, each signature
   at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
-  `2^31` leaves, each `keccak256(vrf_seed || le64(slot))`) takes minutes of
+  `2^31` leaves, each committing to its slot's secret) takes about 100 s of
   every core per key, so a background thread hashes it after startup (in a
   rayon pool of its own: on the global one it starves every leanXMSS
   signature until done) and stores its upper nodes in

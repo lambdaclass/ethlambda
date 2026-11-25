@@ -1005,7 +1005,7 @@ signature, whichever way the node answered. Three departures:
 
 ## EIP-8483 and PQ run on a newer gloas than the gloas fork does
 
-consensus-specs' `pq` branch (`2f43bc0f989f47af81df390a90bc1f78e2436323`) is
+consensus-specs' `pq` branch (`b5d422b255db80c9bbc48f515370655ecc8bf6e5`) is
 based on a `master` newer than this repository's pin (`v1.7.0-beta.2`). Across
 every fork's `beacon-chain.md`, `fork.md` and `fork-choice.md`, the rules that
 changed in between are the three state-transition rules below, the four

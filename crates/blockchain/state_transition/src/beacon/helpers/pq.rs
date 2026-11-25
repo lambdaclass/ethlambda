@@ -1,6 +1,6 @@
 //! Helpers the PQ fork adds or modifies (consensus-specs
 //! `specs/_features/pq/beacon-chain.md`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
+//! `b5d422b255db80c9bbc48f515370655ecc8bf6e5`).
 //!
 //! # Keys
 //!
@@ -188,11 +188,14 @@ pub fn is_builder_bid_leaf_index(leaf_index: u64) -> bool {
     (start..start + constants::XMSS_BUILDER_BID_LEAVES).contains(&leaf_index)
 }
 
-/// `is_valid_vrf_proof`: whether `proof` opens the leaf at index `slot` of the
-/// tree under the VRF root of the validator at `validator_index`.
+/// `is_valid_vrf_proof`: whether `proof` reveals the secret that the leaf at
+/// index `slot` of the tree under the VRF root of the validator at
+/// `validator_index` commits to.
 ///
 /// The tree is hashed with Keccak-256, not the SHA-256 of
-/// `is_valid_merkle_branch`, and `proof[0]` is the leaf itself.
+/// `is_valid_merkle_branch`, and its leaf is `compute_vrf_leaf` of the
+/// revealed secret and the slot: the branch holds only commitments, so a
+/// reveal gives away no other slot's secret.
 pub fn is_valid_vrf_proof(
     state: &BeaconState,
     validator_index: ValidatorIndex,
