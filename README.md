@@ -372,7 +372,7 @@ Metrics are served on `--metrics-port` (default `5064`). See
 [`docs/cli.md`](./docs/cli.md#validator-flags) for the remaining flags and what
 the client does each slot.
 
-Stop the client with `Ctrl+C` or SIGTERM. Once its duties have started, either
+Stop the client with `Ctrl+C` or SIGTERM. Once its startup is done, either
 one stops it cleanly: it starts no other slot, gives the slot in progress and a
 blinded block's publish up to 8 s, gives a keymanager request in flight up to a
 minute more, and exits 0. Under systemd that needs no setting: SIGTERM is the

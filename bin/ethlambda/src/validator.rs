@@ -260,12 +260,39 @@ impl ValidatorOptions {
 /// onto one runtime shared with the others.
 ///
 /// SIGINT and SIGTERM are listened for from the first line on
-/// ([`listen_for_stop`]). Before the duties start, either one ends the
-/// process at once; from then on it stops the client cleanly (see
-/// `ethlambda_validator::run`), and three more end it at once, as they end
-/// the node ([`ShutdownSignals::force_exit_on_repeats`]).
-#[tokio::main]
-pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
+/// ([`listen_for_stop`]). During startup either one ends the process at once;
+/// from then on it stops the client cleanly (see `ethlambda_validator::run`),
+/// and three more end it at once, as they end the node
+/// ([`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// The runtime is built here rather than by `#[tokio::main]` so its teardown
+/// is bounded (see [`RUNTIME_SHUTDOWN`]).
+pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .wrap_err("failed to start the tokio runtime")?;
+    let ran = runtime.block_on(run_client(options));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    ran
+}
+
+/// How long the runtime's teardown waits for what is still running on its
+/// threads once the client has returned.
+///
+/// Dropping the runtime would wait with no limit: for a worker still in a
+/// keymanager import's synchronous decryption after the client's own drain
+/// gave up on it, or for a slashing-protection write stuck on a slow disk.
+/// Neither signal could end the process meanwhile. Their handlers stay
+/// installed for the life of the process, and the tasks that read them, the
+/// repeat counter among them, go with the runtime. What still runs here, the
+/// client has already given up on (see `ethlambda_validator::run`). A record
+/// write cut here leaves the previous file, since the new one is renamed into
+/// place, and that write takes milliseconds when the disk answers.
+const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`run`]'s body, on the runtime it builds.
+async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // First, so that no point of startup leaves a signal its default action,
     // which for a container's PID 1 is to be ignored.
     let stop = listen_for_stop();
@@ -297,91 +324,110 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
     };
-    ethlambda_validator::run(config, stop)
+    ethlambda_validator::run(config, || stop.start())
         .await
         .map_err(Into::into)
 }
 
-/// Listen for SIGINT and SIGTERM from here on, and return the `stop` future
-/// `ethlambda_validator::run` takes.
+/// Listen for SIGINT and SIGTERM from here on, and return what makes the
+/// `stop` argument of `ethlambda_validator::run`.
 ///
 /// A task of its own waits for the first signal. What it does with it
-/// depends on whether the client's duties have started, which the client
-/// marks by first polling `stop` (see [`Handoff`]):
+/// depends on whether the client's startup is done, which the client marks
+/// by calling `stop` (see [`Handoff`]):
 ///
-/// - Before, it ends the process at once, with exit code 0. Nothing needs
-///   draining yet: no duty has run, so nothing is signed, and the client is
-///   still decrypting its keystores or first asking its beacon node for the
-///   chain. Ending there is what the signal's default action did outside a
-///   container, and still does for the node until it has started (see the
-///   `shutdown` module). As a container's PID 1, where the default action is
-///   to ignore the signal, it is what lets `docker stop` work during startup.
-/// - After, it hands the signal to `stop`: the client finishes the work in
-///   flight and `run` returns `Ok(())`. Three more signals end the process
-///   with exit code 1 ([`ShutdownSignals::force_exit_on_repeats`]).
+/// - During startup, it ends the process at once, with exit code 0. Nothing
+///   needs draining yet: no duty has run, so nothing is signed, and the
+///   keymanager has taken no request; the client is still decrypting its
+///   keystores or first asking its beacon node for the chain. Ending there
+///   is what the signal's default action did outside a container, and still
+///   does for the node until it has started (see the `shutdown` module). As
+///   a container's PID 1, where the default action is to ignore the signal,
+///   it is what lets `docker stop` work during startup.
+/// - After, it hands the signal to the future `stop` returned: the client
+///   finishes the work in flight and returns `Ok(())`. Three more signals end
+///   the process with exit code 1
+///   ([`ShutdownSignals::force_exit_on_repeats`]).
 ///
-/// The task ends the process itself, rather than `run` racing startup
-/// against the signal: startup decrypts the keystores inline, so `run` polls
-/// nothing until that is done. The task runs meanwhile on a worker thread of
-/// this multi-threaded runtime, since `run` blocks only the main one.
-fn listen_for_stop() -> impl Future<Output = &'static str> {
+/// The task ends the process itself, rather than `run_client` racing startup
+/// against the signal: startup decrypts the keystores inline, so the client
+/// polls nothing until that is done. The task runs meanwhile on a worker
+/// thread of this multi-threaded runtime, since the client blocks only the
+/// main one.
+fn listen_for_stop() -> Start {
     let mut signals = ShutdownSignals::listen();
-    let (stop, handoff) = Handoff::new();
+    let (start, handoff) = Handoff::new();
     tokio::spawn(async move {
         if let Some(signal) = handoff.route(signals.recv()).await {
-            info!(
-                signal,
-                "Shutdown signal received before the duties started; exiting"
-            );
+            info!(signal, "Shutdown signal received during startup; exiting");
             std::process::exit(0);
         }
         signals.force_exit_on_repeats();
     });
-    stop
+    start
 }
 
-/// The signal listener's side of the client's `stop` future.
-struct Handoff {
-    /// Resolves once the client first polls `stop`, which it does when its
-    /// duties start, or drops it unpolled, which it does when it stops before
-    /// that.
-    started: oneshot::Receiver<()>,
-    /// Where a signal goes once the duties have started.
-    stop: oneshot::Sender<&'static str>,
+/// The client's side of the handoff: what it calls once startup is done.
+struct Start {
+    mark_started: oneshot::Sender<()>,
+    signal: oneshot::Receiver<&'static str>,
 }
 
-impl Handoff {
-    /// A `stop` future for `ethlambda_validator::run`, and the handoff that
-    /// feeds it.
-    fn new() -> (impl Future<Output = &'static str>, Self) {
-        let (mark_started, started) = oneshot::channel();
-        let (stop, signal) = oneshot::channel();
-        let stop_future = async move {
-            let _ = mark_started.send(());
+impl Start {
+    /// Mark startup done, so a signal from now on stops the client rather
+    /// than ending the process, and return the future the signal resolves.
+    fn start(self) -> impl Future<Output = &'static str> {
+        let Self {
+            mark_started,
+            signal,
+        } = self;
+        let _ = mark_started.send(());
+        async move {
             match signal.await {
                 Ok(signal) => signal,
                 // The listener is gone without handing one on: it ended the
                 // process, or the runtime is shutting down.
                 Err(_) => std::future::pending().await,
             }
+        }
+    }
+}
+
+/// The signal listener's side of the handoff.
+struct Handoff {
+    /// Resolves once the client calls [`Start::start`], or drops its
+    /// [`Start`] uncalled, which it does when it stops before startup is
+    /// done.
+    started: oneshot::Receiver<()>,
+    /// Where a signal goes once startup is done.
+    stop: oneshot::Sender<&'static str>,
+}
+
+impl Handoff {
+    /// The client's side of the handoff and the listener's.
+    fn new() -> (Start, Self) {
+        let (mark_started, started) = oneshot::channel();
+        let (stop, signal) = oneshot::channel();
+        let start = Start {
+            mark_started,
+            signal,
         };
-        (stop_future, Self { started, stop })
+        (start, Self { started, stop })
     }
 
-    /// Wait for `signal`, and return it if the client's duties have not
-    /// started, for the caller to end the process. Once they have, it is
-    /// handed to `stop` instead, and `None` is returned.
+    /// Wait for `signal`, and return it if the client's startup is not done,
+    /// for the caller to end the process. Once it is, the signal is handed to
+    /// the client instead, and `None` is returned.
     ///
-    /// A client that dropped `stop` unpolled counts as started: it is already
-    /// stopping on an error, and may be letting a keymanager request finish,
-    /// which an exit would cut and report as a clean stop. Such a signal goes
-    /// nowhere and is only logged.
+    /// A client that dropped its [`Start`] uncalled counts as started: it is
+    /// already stopping on an error. Such a signal goes nowhere and is only
+    /// logged.
     async fn route(self, signal: impl Future<Output = &'static str>) -> Option<&'static str> {
         let Self { started, stop } = self;
         let mut signal = std::pin::pin!(signal);
         tokio::select! {
             // A start and a signal seen in the same poll count as a start:
-            // the duties have started by now, so the signal is theirs to
+            // startup is done by now, so the signal is the client's to
             // drain.
             biased;
             _ = started => {}
@@ -446,45 +492,42 @@ mod tests {
         Cli::try_parse_from(base.iter().chain(extra)).map(|cli| cli.options)
     }
 
-    /// A signal before the client first polls `stop`, so before its duties
-    /// start, is returned for the listener to end the process with, and
-    /// `stop` never hears of it.
+    /// A signal before the client calls `stop`, so during startup, is
+    /// returned for the listener to end the process with, and the client
+    /// never hears of it.
     #[tokio::test(start_paused = true)]
-    async fn a_signal_before_the_duties_start_ends_the_process_instead_of_reaching_stop() {
-        let (stop, handoff) = Handoff::new();
+    async fn a_signal_during_startup_ends_the_process_instead_of_reaching_the_client() {
+        let (start, handoff) = Handoff::new();
         let routed = handoff.route(async { "SIGTERM" }).await;
         assert_eq!(routed, Some("SIGTERM"), "the listener ends the process");
-        let heard = tokio::time::timeout(std::time::Duration::from_secs(60), stop).await;
-        assert!(heard.is_err(), "stop never resolves on that signal");
+        let heard = tokio::time::timeout(std::time::Duration::from_secs(60), start.start()).await;
+        assert!(heard.is_err(), "the client never hears of that signal");
     }
 
-    /// Once the client has polled `stop`, which it does when its duties
-    /// start, a signal is handed to `stop`, for the client to drain, rather
-    /// than ending the process.
+    /// Once the client has called `stop`, which it does when startup is
+    /// done, a signal is handed to it to drain, rather than ending the
+    /// process.
     #[tokio::test]
-    async fn a_signal_once_the_duties_have_started_is_handed_to_stop() {
-        let (stop, handoff) = Handoff::new();
+    async fn a_signal_once_startup_is_done_is_handed_to_the_client() {
+        let (start, handoff) = Handoff::new();
         let (send_signal, signal) = oneshot::channel();
         let signal = async move { signal.await.expect("one is sent") };
         let routed = tokio::spawn(handoff.route(signal));
-        let mut stop = std::pin::pin!(stop);
-        // The client's first poll: its duties start.
-        let first = std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx))).await;
-        assert!(first.is_pending(), "no signal yet");
-        // Possibly before the listener has seen the start: a start and a
-        // signal seen together count as a start.
+        let stop = start.start();
+        // Sent before the listener has run, so it sees the start and the
+        // signal together, which count as a start.
         send_signal.send("SIGINT").expect("the listener waits");
         assert_eq!(stop.await, "SIGINT");
         assert_eq!(routed.await.expect("the listener ends"), None);
     }
 
-    /// A client that drops `stop` unpolled is stopping on its own, with an
-    /// error, so a signal then does not end the process as if nothing had
-    /// started.
+    /// A client that drops `stop` uncalled is stopping on an error during
+    /// startup, so a signal then does not end the process with exit code 0
+    /// in its place.
     #[tokio::test]
-    async fn a_signal_once_the_client_dropped_stop_unpolled_does_not_end_the_process() {
-        let (stop, handoff) = Handoff::new();
-        drop(stop);
+    async fn a_signal_once_the_client_dropped_stop_uncalled_does_not_end_the_process() {
+        let (start, handoff) = Handoff::new();
+        drop(start);
         assert_eq!(handoff.route(async { "SIGTERM" }).await, None);
     }
 

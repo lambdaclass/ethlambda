@@ -175,18 +175,25 @@ pub struct BuilderProposals {
     pub boost_factor: u64,
 }
 
-/// Run the validator client until `stop` resolves, or until something stops
-/// it with an error.
+/// Run the validator client until the future `stop` returns resolves, or
+/// until something stops it with an error.
 ///
-/// `stop` resolves with the name of what asked the client to stop, a signal
-/// in the binary. It is first polled once startup is done, when the duties
-/// start, and not before, and a caller may read that first poll as the start
-/// of the duties: the binary ends the process at once on a signal that comes
-/// before it, since nothing is signed yet. A client that stops before then
-/// drops `stop` unpolled. Once it resolves the client starts no
-/// other slot, lets the work in flight finish, and returns `Ok(())` (see
+/// `stop` is called once, when startup is done: after the keystores are
+/// decrypted and the slashing-protection record is open, and before the
+/// keymanager serves its first request or any duty runs. A caller may read
+/// that call as the end of startup: the binary ends the process at once on a
+/// signal that comes before it, since nothing is signed and no keymanager
+/// request is in flight yet. A client that stops before then drops `stop`
+/// uncalled.
+///
+/// The future it returns resolves with the name of what asked the client to
+/// stop, a signal in the binary. Once it does the client starts no other
+/// slot, lets the work in flight finish, and returns `Ok(())` (see
 /// [`run_until_stopped`]). Every other way the client stops is an `Err`.
-pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static str>) -> Result<()> {
+pub async fn run<S>(config: ValidatorConfig, stop: impl FnOnce() -> S) -> Result<()>
+where
+    S: Future<Output = &'static str>,
+{
     metrics::init();
 
     // Said at startup, where an operator reads it: an operator
@@ -409,6 +416,15 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
              payload cannot be built"
         );
     }
+
+    // Startup is done: nothing is signed yet, and the keymanager is not
+    // serving. From here a signal stops the client by draining rather than
+    // ending the process (see this function's doc), so this comes before the
+    // keymanager can take a request that ending the process would cut, such
+    // as an import between saving its keys and registering them. A signal
+    // that arrives before `run_until_stopped` first polls the future is held
+    // for it.
+    let stop = stop();
 
     // Cancelled when the client stops, whatever stopped it: the keymanager
     // server then stops accepting requests and finishes the ones in flight,
@@ -731,12 +747,6 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
         }
     };
 
-    // `stop` is first polled in here, which the binary reads as the start of
-    // the duties (see this function's doc). The keymanager is already
-    // serving, so keep this call right after its spawn, with no await
-    // between: until here a signal ends the process at once, and could cut
-    // an import between saving its keys and registering them, leaving keys
-    // the next start refuses.
     let stopped = run_until_stopped(
         duties,
         &protection,

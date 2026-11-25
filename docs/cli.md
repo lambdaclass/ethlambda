@@ -826,9 +826,9 @@ default; exposing it further means putting a TLS terminator in front.
 
 ### Stopping
 
-SIGINT or SIGTERM stops the client cleanly once its duties have started. It
-logs `Shutdown signal received`, starts no other slot, and lets the work in
-flight finish:
+SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
+`Shutdown signal received`, starts no other slot, and lets the work in flight
+finish:
 
 - The slot in progress, with its proposal, gloas envelope and attestations,
   and a signed blinded block's publish, get up to 8 s after the signal, which
@@ -844,15 +844,17 @@ flight finish:
   waited for.
 
 It then logs `Shutdown complete` and exits 0. Three more signals end it at
-once, with exit code 1.
+once, with exit code 1. Anything still running on the client's threads by
+then, such as an import the keymanager wait gave up on, gets up to 2 s more
+before the process exits; signals do nothing in those 2 s.
 
 Both signals are listened for from the moment the client starts. One sent
 during startup, while the keystores are decrypted and the beacon node is
-first asked for the chain, logs `Shutdown signal received before the duties
-started` and ends the process at once with exit code 0: no duty has run, so
-nothing is signed and there is nothing to wait for. That holds in a
-container too, where the client is PID 1 and a signal with no handler is
-ignored.
+first asked for the chain, logs `Shutdown signal received during startup`
+and ends the process at once with exit code 0: no duty has run and the
+keymanager API has taken no request, so nothing is signed and there is
+nothing to wait for. That holds in a container too, where the client is
+PID 1 and a signal with no handler is ignored.
 
 A signal sent while the client stops on an error (an unusable
 slashing-protection record, a doppelganger) does not cut its keymanager wait

@@ -14,9 +14,10 @@
 //! up on a signal.
 //!
 //! The validator client listens from the top of `validator::run` instead, and
-//! a signal before its duties start ends it at once, from a task of its own
-//! (`validator::listen_for_stop`). It can: nothing is signed before the first
-//! duty, so there is nothing to drain.
+//! a signal during its startup ends it at once, from a task of its own
+//! (`validator::listen_for_stop`). It can: until startup is done nothing is
+//! signed and the keymanager has taken no request, so there is nothing to
+//! drain.
 
 #[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
