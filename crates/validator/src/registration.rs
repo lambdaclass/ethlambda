@@ -519,7 +519,7 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
             );
             return;
         };
-        self.send_all(pubkeys, store).await;
+        self.send_all(epoch, pubkeys, store).await;
     }
 
     /// [`Self::register_all`] for a beacon node the chain check let back in,
@@ -539,13 +539,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if self.is_gloas(epoch) {
             return;
         }
-        self.send_all(pubkeys, store).await;
+        self.send_all(epoch, pubkeys, store).await;
     }
 
     /// What [`Self::register_all`] and [`Self::register_all_again`] share:
-    /// sign and send every registration, once no other send is running.
+    /// sign and send every registration, with the gas limit for `epoch`, once
+    /// no other send is running.
     async fn send_all(
         self: &Arc<Self>,
+        epoch: Epoch,
         pubkeys: Vec<BlsPubkey>,
         store: Arc<RwLock<ValidatorStore>>,
     ) {

@@ -1526,12 +1526,17 @@ mod tests {
     /// serve the key, or serves it empty, schedules nothing.
     #[test]
     fn the_gas_limit_schedule_is_read_and_defaults_to_empty() {
-        let response = serde_json::json!({
-            "GAS_LIMIT_SCHEDULE": [
-                {"EPOCH": "353024", "GAS_LIMIT": "200000000"},
-                {"EPOCH": "400000", "GAS_LIMIT": "300000000"},
-            ],
-        });
+        // A complete response with `GAS_LIMIT_SCHEDULE` set to `schedule`.
+        let serving = |schedule: serde_json::Value| {
+            let mut response = complete_spec(&[]);
+            response["GAS_LIMIT_SCHEDULE"] = schedule;
+            response
+        };
+
+        let response = serving(serde_json::json!([
+            {"EPOCH": "353024", "GAS_LIMIT": "200000000"},
+            {"EPOCH": "400000", "GAS_LIMIT": "300000000"},
+        ]));
         let config = config_from_spec_response(&response).expect("builds");
         let schedule = &config.gas_limit_schedule;
         assert_eq!(schedule.entries().len(), 2);
@@ -1539,17 +1544,17 @@ mod tests {
         assert_eq!(schedule.gas_limit_at(353_024), Some(200_000_000));
         assert_eq!(schedule.gas_limit_at(400_000), Some(300_000_000));
 
-        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
         assert!(config.gas_limit_schedule.is_empty());
-        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": [] });
+        let response = serving(serde_json::json!([]));
         let config = config_from_spec_response(&response).expect("builds");
         assert!(config.gas_limit_schedule.is_empty());
         // Go's encoder writes a nil slice as `null`.
-        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": null });
+        let response = serving(serde_json::Value::Null);
         let config = config_from_spec_response(&response).expect("builds");
         assert!(config.gas_limit_schedule.is_empty());
 
-        let response = serde_json::json!({ "GAS_LIMIT_SCHEDULE": "200000000" });
+        let response = complete_spec(&[("GAS_LIMIT_SCHEDULE", "200000000")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
