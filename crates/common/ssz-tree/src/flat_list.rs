@@ -13,7 +13,7 @@
 //! Here every level of the tree above the chunks is stored, so a root rehashes
 //! only the paths of the chunks written since the last one: the dirty chunks'
 //! parents, then theirs, one level at a time. Each level's pairs are gathered
-//! into one buffer and hashed in one call (see [`hash_pairs_into`]), wide
+//! into one buffer and hashed in one call (see [`hash_pairs`]), wide
 //! enough for multi-message SHA-256 kernels. Values and levels live in 4 KiB
 //! pages shared through `Arc`, so a clone copies only page pointers, and a
 //! write copies only the pages it changes.
@@ -24,9 +24,8 @@ use std::sync::Arc;
 
 use libssz_merkle::{Sha2Hasher, ZERO_HASHES, mix_in_length};
 use libssz_types::TypeError;
-use rayon::prelude::*;
 
-use crate::batch::hash_pairs_into;
+use crate::batch::{hash_pairs, hash_pairs_into};
 use crate::{Const, Hash256, Length, Value, is_packed, packing_factor, tree_depth};
 
 /// Nodes per level page, and chunks' worth of values per value page: 4 KiB
@@ -35,12 +34,6 @@ const PAGE_NODES: usize = 128;
 
 /// One page of a level.
 type NodePage = [Hash256; PAGE_NODES];
-
-/// At or above this many pairs in one level, the pairs are hashed on rayon.
-const PARALLEL_PAIRS: usize = 4096;
-
-/// Pairs per rayon task when a level is hashed in parallel.
-const PARALLEL_BLOCK: usize = 1024;
 
 /// An SSZ list of at most `L::get()` elements of a packed type, every level
 /// of its Merkle tree kept flat. See the module documentation.
@@ -327,18 +320,6 @@ fn take_dirty(dirty: &mut Vec<u64>, chunks: usize) -> Vec<usize> {
     // bitset.
     *dirty = Vec::new();
     indices
-}
-
-/// Hashes the pairs, on rayon when there are many.
-fn hash_pairs(pairs: &[Hash256], hashes: &mut [Hash256]) {
-    if hashes.len() >= PARALLEL_PAIRS && rayon::current_num_threads() > 1 {
-        pairs
-            .par_chunks(2 * PARALLEL_BLOCK)
-            .zip(hashes.par_chunks_mut(PARALLEL_BLOCK))
-            .for_each(|(pairs, hashes)| hash_pairs_into(pairs, hashes));
-    } else {
-        hash_pairs_into(pairs, hashes);
-    }
 }
 
 /// Writes `hashes[i]` to node `nodes[i]` of `level`, copying each page that
