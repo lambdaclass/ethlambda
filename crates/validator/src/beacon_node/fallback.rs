@@ -2161,13 +2161,13 @@ mod tests {
     }
 
     fn request(slot: Slot, proposer_index: ValidatorIndex) -> BlockRequest {
-        use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32};
+        use ethlambda_types::beacon::primitives::BlsSignature;
         BlockRequest {
             slot,
             fork: ForkName::Electra,
             proposer_index,
             randao_reveal: BlsSignature([0; 96]),
-            graffiti: Bytes32::default(),
+            graffiti: None,
             builder_boost_factor: None,
             builder_min_bid: 0,
         }

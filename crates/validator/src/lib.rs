@@ -35,6 +35,7 @@ pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
+pub mod graffiti_file;
 pub mod head_monitor;
 pub mod http_api;
 pub(crate) mod in_flight;
@@ -132,11 +133,15 @@ pub struct ValidatorConfig {
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub metrics: std::net::SocketAddr,
-    /// The graffiti every validator proposes with unless the keymanager API
-    /// gives it its own. Consensus never reads it. An ethlambda beacon node
-    /// appends both clients' versions to it; other nodes follow their own
-    /// policy.
-    pub graffiti: Bytes32,
+    /// The graffiti every validator proposes with unless the graffiti file or
+    /// the keymanager API gives it its own. Consensus never reads it. An
+    /// ethlambda beacon node appends both clients' versions to it; other nodes
+    /// follow their own policy. `None` sends no graffiti, so the beacon node
+    /// applies its own default.
+    pub graffiti: Option<Bytes32>,
+    /// `--graffiti-file`, read before every proposal ahead of every other
+    /// graffiti source. See [`graffiti_file`].
+    pub graffiti_file: Option<graffiti_file::GraffitiFile>,
     /// Where execution-layer block rewards should be paid, for every validator
     /// the keymanager API gives no address of its own.
     ///
@@ -251,7 +256,8 @@ where
     }
     let settings = Arc::new(
         ProposerSettings::new(config.graffiti, config.suggested_fee_recipient)
-            .with_default_gas_limit(config.gas_limit),
+            .with_default_gas_limit(config.gas_limit)
+            .with_graffiti_file(config.graffiti_file),
     );
 
     // The directory's lock first, before any key is read: held from here,

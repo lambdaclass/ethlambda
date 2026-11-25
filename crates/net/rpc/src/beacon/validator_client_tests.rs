@@ -827,7 +827,7 @@ async fn produce_with_pool(
         fork: ForkName::Fulu,
         proposer_index: proposer,
         randao_reveal,
-        graffiti: ethlambda_types::primitives::H256(graffiti),
+        graffiti: Some(ethlambda_types::primitives::H256(graffiti)),
         builder_boost_factor: None,
         builder_min_bid: 0,
     };
@@ -1019,6 +1019,22 @@ async fn a_node_failing_block_production_behind_blobber_is_still_syncing() {
     assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
     assert!(err.is_retryable());
+}
+
+/// A validator client with no graffiti set sends none, and this node then
+/// applies its own default: the two clients' codes and commits alone, with no
+/// leading space.
+#[tokio::test]
+async fn a_block_request_without_graffiti_gets_the_version_suffix_alone() {
+    let p = produce_for_proposer(0).await;
+    let request = BlockRequest {
+        graffiti: None,
+        ..p.request.clone()
+    };
+    let produced = p.client.produce_block(&request).await.unwrap();
+    let mut expected = [0u8; 32];
+    expected[..12].copy_from_slice(b"RH1a2bLA3c4d");
+    assert_eq!(fulu_block(&produced).body.graffiti.0, expected);
 }
 
 /// A voluntary exit in the node's pool rides in the block it produces. The
@@ -2155,7 +2171,7 @@ mod builder_flow {
                 fork: ForkName::Fulu,
                 proposer_index: self.proposer,
                 randao_reveal,
-                graffiti: ethlambda_types::primitives::H256([0; 32]),
+                graffiti: Some(ethlambda_types::primitives::H256([0; 32])),
                 builder_boost_factor,
                 builder_min_bid: 0,
             };
