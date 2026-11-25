@@ -311,7 +311,9 @@ mod tests {
                 Root::repeat_byte(2),
                 vec![attester(11, 130), attester(22, 131)],
             )
-            .with_proposers(
+            // From fulu an epoch's proposers come from the v2 endpoint, which
+            // names the root of the epoch before.
+            .with_proposers_v2(
                 3,
                 Root::repeat_byte(1),
                 vec![proposer(11, 97), proposer(22, 98)],
