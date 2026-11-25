@@ -897,9 +897,10 @@ async fn the_validator_client_can_propose_through_this_node() {
 /// The `Content-Type` of every block production answer [`blobber`] relayed.
 type Relayed = Arc<std::sync::Mutex<Vec<String>>>;
 
-/// A stand-in for ethereum-package's blobber (marioevz/blobber v1.1.0,
-/// `validator_proxy/proxy.go`) in front of the node at `node`: a client for
-/// it, and what it relayed.
+/// A stand-in for ethereum-package's blobber (marioevz/blobber v1.1.0's
+/// [`validator_proxy/proxy.go`](https://github.com/marioevz/blobber/blob/v1.1.0/validator_proxy/proxy.go),
+/// a file of that repository, not this one) in front of the node at `node`: a
+/// client for it, and what it relayed.
 ///
 /// Like blobber, it rewrites `Accept` to `application/json` on
 /// `produceBlockV3` and hands the node's headers and body back unchanged, but

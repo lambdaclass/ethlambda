@@ -119,6 +119,13 @@ pub enum Error {
     /// `ProposalService::propose_by`).
     #[error("proposal for slot {slot} ran past the point attesters stop waiting for its block")]
     ProposalDeadline { slot: u64 },
+    /// An epoch's duty refresh, run after the slot's block with a schedule
+    /// already held, ran past the end of the slot it started in and was
+    /// abandoned, so that a slow beacon node holds the duty loop for one slot
+    /// at most. Retryable: the refresh runs again at the next slot. A refresh
+    /// run with nothing held is never cut off (see `ahead_of_block`).
+    #[error("duty refresh for epoch {epoch} ran past the end of slot {slot}")]
+    DutyRefreshDeadline { epoch: u64, slot: u64 },
     /// Slashing protection refused to sign a block for this slot, or could not
     /// record it.
     ///
@@ -289,6 +296,7 @@ impl Error {
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
             | Self::ProposalDeadline { .. }
+            | Self::DutyRefreshDeadline { .. }
             | Self::Decode(_) => true,
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.
