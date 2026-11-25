@@ -300,6 +300,9 @@ enum ChainActor {
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
+        /// This start's custody set, recorded in the data directory just
+        /// before the chain actor spawns (see `StartupCustody::record`).
+        custody_record: ethlambda_storage::CustodyRecord,
     },
 }
 
@@ -816,6 +819,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .safe_slots_to_import_optimistically,
                     always_prepare_payload: mainnet.always_prepare_payload,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
+                    custody_record: custody.record(),
                 },
             }
         }
@@ -1017,8 +1021,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             safe_slots_to_import_optimistically,
             always_prepare_payload,
             anchor_envelope_urls,
+            custody_record,
         } => {
             check_custody_set(&custody_columns)?;
+            // The last fallible step is behind us and the chain actor, the
+            // only importer of blocks and columns, starts next: from here on
+            // this start holds its custody set, so the next start compares
+            // against it. A start that failed earlier recorded nothing, so
+            // it cannot move the next one's `earliest_available_slot`.
+            setup.store.set_custody_record(custody_record);
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
                 .filter(|_| !anchor_envelope_urls.is_empty())
                 .map(|root| (anchor_envelope_urls, root));

@@ -134,8 +134,28 @@ pub struct StartupCustody {
     pub since_slot: Slot,
 }
 
+impl StartupCustody {
+    /// What the data directory records about this start's custody set: the
+    /// groups it holds (the sampling size, not the advertised count) and
+    /// since when. The next start compares against it to tell whether its
+    /// set grew.
+    ///
+    /// Written by `run_node` only once the start can no longer fail before the
+    /// chain actor imports a block, not by [`startup_custody`]: a start that
+    /// failed on a later step (a bad JWT path, a port in use) never held the
+    /// set, and recording it would move the next start's
+    /// `earliest_available_slot` for good.
+    pub fn record(&self) -> CustodyRecord {
+        CustodyRecord {
+            group_count: das::sampling_size(self.group_count),
+            since_slot: self.since_slot,
+        }
+    }
+}
+
 /// Settle the custody this start runs with, from `--custody-group-count` and
-/// what `store`'s directory recorded, and record it.
+/// what `store`'s directory recorded. Writes nothing: see
+/// [`StartupCustody::record`].
 ///
 /// The count is the larger of the flag and the highest count the attached
 /// validators have ever required (fulu `validator.md`, "Validator custody"),
@@ -144,8 +164,10 @@ pub struct StartupCustody {
 /// requirement is the validators' alone, so the flag stays the operator's own
 /// floor, lowered or raised freely above it.
 ///
-/// The slot is [`custody_since_slot`]'s, persisted with the held count so the
-/// next start can tell whether its set grew.
+/// The slot is [`custody_since_slot`]'s. When the set grew, it is the slot
+/// after the highest block the directory holds, not after the head: a stored
+/// block on a branch that is not the head's was imported with the old set's
+/// columns only, and may become canonical after the restart.
 pub fn startup_custody(store: &Store, flag: u64) -> StartupCustody {
     let required = store.validator_custody_count();
     let group_count = flag
@@ -162,9 +184,14 @@ pub fn startup_custody(store: &Store, flag: u64) -> StartupCustody {
 
     let held = das::sampling_size(group_count);
     let anchor_slot = store.anchor_slot();
-    let next_slot = store
-        .beacon_head()
-        .map_or(anchor_slot, |(head_slot, _)| head_slot + 1);
+    // Every stored block has a `LiveChain` row until finalization prunes it,
+    // and the head is never below the finalized block, so this is the
+    // highest block the directory holds.
+    let highest_stored = store
+        .max_live_chain_slot()
+        .expect("live chain scan")
+        .max(store.beacon_head().map(|(head_slot, _)| head_slot));
+    let next_slot = highest_stored.map_or(anchor_slot, |slot| slot + 1);
     let previous = store.custody_record();
     let since_slot = custody_since_slot(previous, held, anchor_slot, next_slot);
     if let Some(previous) = previous
@@ -179,10 +206,6 @@ pub fn startup_custody(store: &Store, flag: u64) -> StartupCustody {
              the older ones)"
         );
     }
-    store.set_custody_record(CustodyRecord {
-        group_count: held,
-        since_slot,
-    });
 
     StartupCustody {
         group_count,
@@ -198,8 +221,8 @@ pub fn startup_custody(store: &Store, flag: u64) -> StartupCustody {
 ///   the node assumed before it kept a record.
 /// - More groups than recorded: the new groups' columns are held only for
 ///   blocks imported from now on, so from `next_slot` (the slot after the
-///   head; range sync and the availability check fetch and require the whole
-///   new set for every block past it).
+///   highest stored block; range sync and the availability check fetch and
+///   require the whole new set for every block past it).
 /// - As many or fewer: the record's slot stands. Fewer groups are a subset of
 ///   the recorded ones, since a larger count extends the same selection.
 pub fn custody_since_slot(
@@ -377,7 +400,8 @@ mod tests {
     }
 
     /// A beacon store anchored at `anchor_slot`, with no block inserted, so
-    /// it has no head: [`startup_custody`] then counts from the anchor.
+    /// it has no head: [`startup_custody`] then counts from the anchor until
+    /// a block is stored.
     fn store_anchored_at(anchor_slot: Slot) -> Store {
         Store::init_beacon(
             std::sync::Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
@@ -395,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grown_custody_set_is_held_from_the_slot_after_the_head() {
+    fn a_grown_custody_set_is_held_from_the_slot_after_the_highest_block() {
         let previous = CustodyRecord {
             group_count: 8,
             since_slot: 100,
@@ -413,12 +437,44 @@ mod tests {
         assert_eq!(custody_since_slot(Some(previous), 8, 100, 500), 300);
     }
 
+    /// Store a block at `slot` that is not the head (the store's head names
+    /// the zero root, which has no block): a branch the fork choice did not
+    /// pick, as far as [`startup_custody`] can tell.
+    fn store_block_at(store: &mut Store, slot: Slot) {
+        use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
+
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Root::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        });
+        let root = block.message_hash_tree_root();
+        store
+            .insert_signed_block(root, block)
+            .expect("insert block");
+    }
+
     /// The count a start runs with is the larger of the flag and the recorded
-    /// requirement, and the record it leaves is what the next start compares
-    /// against.
+    /// requirement, and the record it leaves (written once the start is
+    /// committed, which this test does by hand) is what the next start
+    /// compares against.
     #[test]
     fn startup_applies_the_recorded_validator_custody_count() {
-        let store = store_anchored_at(64);
+        let mut store = store_anchored_at(64);
 
         // Fresh directory, default flag: the flag's count, held since the
         // anchor, and recorded at its sampling size.
@@ -430,13 +486,19 @@ mod tests {
                 since_slot: 64,
             }
         );
+        // Settling the custody writes nothing.
+        assert_eq!(store.custody_record(), None);
         assert_eq!(
-            store.custody_record(),
-            Some(CustodyRecord {
+            first.record(),
+            CustodyRecord {
                 group_count: das::sampling_size(CUSTODY_REQUIREMENT),
                 since_slot: 64,
-            })
+            }
         );
+        store.set_custody_record(first.record());
+
+        // A block is stored above the anchor while the old set is held.
+        store_block_at(&mut store, 80);
 
         // Validators required 8: the count rises, but 8 groups were already
         // held (the sampling size of 4), so the slot does not move.
@@ -444,18 +506,35 @@ mod tests {
         let second = startup_custody(&store, CUSTODY_REQUIREMENT);
         assert_eq!(second.group_count, 8);
         assert_eq!(second.since_slot, 64);
+        store.set_custody_record(second.record());
 
         // Validators required 64: more groups than held, so they are held
-        // from the slot after the head (here the anchor, with no head).
+        // from the slot after the highest stored block, which is not the
+        // head's (there is no head here).
         store.raise_validator_custody_count(64);
         let third = startup_custody(&store, CUSTODY_REQUIREMENT);
         assert_eq!(third.group_count, 64);
-        assert_eq!(third.since_slot, 64);
-        assert_eq!(store.custody_record().unwrap().group_count, 64);
+        assert_eq!(third.since_slot, 81);
+        store.set_custody_record(third.record());
+        assert_eq!(
+            store.custody_record(),
+            Some(CustodyRecord {
+                group_count: 64,
+                since_slot: 81,
+            })
+        );
 
         // A flag above the requirement wins.
+        store_block_at(&mut store, 90);
         let fourth = startup_custody(&store, 128);
         assert_eq!(fourth.group_count, 128);
+        assert_eq!(fourth.since_slot, 91);
+
+        // That start failed before recording its custody, so the next one
+        // still compares against the 64 groups held since slot 81.
+        let fifth = startup_custody(&store, CUSTODY_REQUIREMENT);
+        assert_eq!(fifth.group_count, 64);
+        assert_eq!(fifth.since_slot, 81);
     }
 
     fn mainnet_gvr() -> Root {

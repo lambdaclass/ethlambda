@@ -358,8 +358,10 @@ pub(crate) struct MainnetOptions {
     ///
     /// Changing it changes which columns this node custodies, so sidecars
     /// already on disk belong to the old set. Nothing is corrupted by that,
-    /// but the node serves a set it has not finished filling until it has
-    /// backfilled the difference.
+    /// and nothing backfills the difference: a start that holds more groups
+    /// than the data directory did reports the slot after the highest block it
+    /// had stored as `Status`'s `earliest_available_slot`, and refuses column
+    /// ranges that start below it.
     #[arg(
         long = "custody-group-count",
         default_value_t = ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,

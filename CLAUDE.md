@@ -410,7 +410,8 @@ actual_slot = finalized_slot + 1 + relative_index
     larger requirement waits for a restart, so the node never advertises what it does not
     hold. Same **known gap** as `eth2`: the ENR's `cgc` keeps its startup value. A start that
     holds more groups than the directory's `CustodyRecord` moves `Status`'s
-    `earliest_available_slot` to the slot after its head (no backfill)
+    `earliest_available_slot` to the slot after the highest stored block (no backfill); the
+    record is written just before the chain actor spawns, so a failed start leaves it alone
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
@@ -419,7 +420,8 @@ actual_slot = finalized_slot + 1 + relative_index
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
-    (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
+    (head, finalized checkpoint, and as `earliest_available_slot` the anchor's slot, or the
+    later slot a custody set grown at startup is complete from), so peers
     have a reason to ask. Asking runs too: a peer's Status starts a range session from the
     higher of `P2PServer::range_fetched_through` (the highest slot a range answer handed to
     the chain actor, since the store's head trails a delivered batch by the whole actor

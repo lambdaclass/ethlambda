@@ -159,10 +159,12 @@ pub(crate) fn apply(wire: &mut BeaconWire, highest_required: u64) -> Decision {
 /// The once-an-epoch run. Called every slot; returns at once unless the wall
 /// clock has entered an epoch not yet run and no run is in flight.
 ///
-/// A run with no validator attached concludes nothing and records nothing,
-/// on the actor: the requirement applies to a node with at least one
-/// validator attached, so a plain follower is never raised to
-/// `VALIDATOR_CUSTODY_REQUIREMENT`. Otherwise the state read and the
+/// With no validator attached there is nothing to run, and the epoch is left
+/// unrun: the requirement applies to a node with at least one validator
+/// attached, so a plain follower is never raised to
+/// `VALIDATOR_CUSTODY_REQUIREMENT`, and a validator client that attaches later
+/// in the epoch (after a node's first slot tick, say) is counted at the next
+/// slot's check rather than an epoch later. Otherwise the state read and the
 /// computation go to a blocking task ([`compute`]), which sends what it
 /// concluded back as `ValidatorCustodyComputed`; [`finish`] acts on it.
 pub(crate) fn refresh(server: &mut P2PServer, ctx: &Context<P2PServer>) {
@@ -177,7 +179,6 @@ pub(crate) fn refresh(server: &mut P2PServer, ctx: &Context<P2PServer>) {
 
     let attached = custody.attached.at(epoch);
     if attached.is_empty() {
-        custody.last_run = Some(epoch);
         return;
     }
 

@@ -148,9 +148,12 @@ lookup finds a custodian at all.
 Changing it changes which columns this node custodies, since the custody set is
 a function of the node id *and* the count. Sidecars already on disk belong to
 the old set: nothing is corrupted, and nothing backfills the difference, so a
-start with more groups than the data directory held records the slot after its
-head and reports it in `Status` as `earliest_available_slot` (peers do not
-ask it for older columns of the new groups).
+start with more groups than the data directory held records the slot after the
+highest block it holds (the head's or a side branch's) and reports it in
+`Status` as `earliest_available_slot` (peers do not ask it for older columns of
+the new groups). The record is written only once the start is past its last
+fallible step, just before the chain actor spawns, so a start that fails
+earlier leaves it as it was.
 
 **Validator custody.** Fulu `validator.md` has a node with validators attached
 custody one group per 32 ETH of their total effective balance, at least 8 and
@@ -344,7 +347,7 @@ not chain-specific, branches once, and shares the shutdown:
 | **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | checkpoint sync or resume onto the same backend, then `beacon::startup_custody` (the custody count, from the flag and the directory's recorded validator custody), then `beacon::wire_params` (genesis metadata, epoch, fork digest, custody columns) |
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
-| spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
+| spawn the chain actor and wire it to P2P | yes | yes: record this start's custody set in the data directory (`StartupCustody::record`), then `BlockChain::spawn_beacon` |
 | ctrl-c or SIGTERM, stop and join the actors | shared | shared |
 
 `ChainSetup` is what the `match` produces: the wire configuration, the ENR

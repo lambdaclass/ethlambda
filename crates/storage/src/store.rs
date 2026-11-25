@@ -113,7 +113,8 @@ impl ForkCheckpoints {
 ///
 /// A node that starts with more custody groups than its directory was last
 /// run with holds the new groups' columns only for blocks it imports from
-/// then on; nothing backfills the older ones. `since_slot` is what its
+/// then on, so from the slot after the highest block already stored; nothing
+/// backfills the older ones. `since_slot` is what its
 /// `Status` `earliest_available_slot` reports, so peers do not ask it for
 /// columns it never stored. Persisted under [`KEY_CUSTODIED_GROUP_COUNT`] and
 /// [`KEY_CUSTODY_SINCE_SLOT`].
@@ -222,7 +223,8 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// Adding it did not bump [`DB_VERSION`]: an older directory simply has no row.
 const KEY_VALIDATOR_CUSTODY_COUNT: &[u8] = b"validator_custody_count";
 /// The number of custody groups whose columns this directory holds, as of the
-/// last startup: the sampling size the node ran with. Its value has type
+/// last start that got as far as spawning its chain actor: the sampling size
+/// the node ran with. Its value has type
 /// [`u64`] and it's SSZ-encoded. Written with [`KEY_CUSTODY_SINCE_SLOT`], in
 /// one batch; see [`CustodyRecord`].
 const KEY_CUSTODIED_GROUP_COUNT: &[u8] = b"custodied_group_count";
