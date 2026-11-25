@@ -25,6 +25,12 @@
 //! over an optimistic head, so [`BeaconNodeApi::head_block_root`] fails with
 //! `BeaconNodeSyncing` for one, and nothing is signed.
 //!
+//! A node that is syncing but not optimistic answers its stale head with
+//! `execution_optimistic: false`, and the Beacon API has no 503 for it. The
+//! fallback therefore does not ask a node whose last sync probe reported
+//! syncing or optimistic for the head (see [`crate::beacon_node::health`]):
+//! with every node in that state, the fetch answers `BeaconNodeSyncing` too.
+//!
 //! # Duplicates
 //!
 //! Not slashable. The slot is recorded per validator at signing time only so a

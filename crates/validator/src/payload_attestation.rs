@@ -27,6 +27,16 @@
 //! nothing is signed. Voting `payload_present = false` for a block this client
 //! never saw would be a claim about a block it cannot name.
 //!
+//! # Optimistic heads
+//!
+//! The optimistic-sync specification does not name `DOMAIN_PTC_ATTESTER`, and
+//! the Beacon API asks for a 503 on the data only while a node syncs. This
+//! client withholds the vote over an optimistic head anyway. The fallback does
+//! not ask a node whose last sync probe reported syncing or optimistic for the
+//! data (see [`crate::beacon_node::health`]), and with no node left to ask,
+//! nothing is signed. A node that goes optimistic between its probe and the
+//! vote is not caught here; ethlambda's own node refuses the data then.
+//!
 //! # Duplicates
 //!
 //! The specification attaches no slashing condition to a PTC vote, but a second,
@@ -48,7 +58,7 @@ use tracing::{error, info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{PtcDutyDto, parse_pubkey};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::{SigningContext, sign_all};
 
@@ -97,9 +107,19 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             return Ok(0);
         }
 
-        let Some(data) = self.data(slot).await? else {
-            info!(%slot, "No block known for this slot; not voting on its payload");
-            return Ok(0);
+        let data = match self.data(slot).await {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                info!(%slot, "No block known for this slot; not voting on its payload");
+                return Ok(0);
+            }
+            // Every node's last sync probe said syncing or optimistic, so none
+            // was asked: see "Optimistic heads" above.
+            Err(Error::BeaconNodeSyncing) => {
+                warn!(%slot, "Every beacon node is syncing or on an optimistic head; not voting on this slot's payload");
+                return Ok(0);
+            }
+            Err(err) => return Err(err),
         };
         self.attest_with(slot, duties, store, data).await
     }
