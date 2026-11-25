@@ -1,26 +1,34 @@
 //! The persistent Merkle tree behind [`List`](crate::List) and
 //! [`Vector`](crate::Vector).
 
+use std::collections::HashSet;
 use std::iter::Peekable;
 use std::sync::{Arc, OnceLock};
 
-use libssz::SszEncode;
-use libssz_merkle::{HashTreeRoot, Sha2Hasher, ZERO_HASHES, pack};
+use libssz_merkle::{HashTreeRoot, Sha2Hasher, ZERO_HASHES};
 use rayon::prelude::*;
 
-use crate::batch::{hash_layer, hash_pairs_into, merkleize};
+use crate::batch::hash_pairs;
 use crate::{
     Hash256, NODE_LEVELS, Value, child_height, is_packed, leaf_height, max_leaf_height,
     packing_factor,
 };
 
-/// Height at or above which a node with no cached hash hashes its children in
-/// parallel.
-///
-/// Below it a subtree has fewer than 2^12 chunks, few enough that handing parts
-/// of it to other threads costs more than hashing it on this one. A starting
-/// value, measured by the `tree_bench` benchmark in `ethlambda-types`.
+/// Height at or above which a node hashes its changed child subtrees in
+/// parallel (see [`Tree::hash`]). Below it a subtree has fewer than 2^12
+/// chunks, few enough that handing parts of it to other threads costs more
+/// than hashing it on this one.
 const PARALLEL_HASH_HEIGHT: usize = 12;
+
+/// At most this many bottom-level nodes per group of subtrees hashed together
+/// (see [`Tree::hash`]), so a group's buffers stay in cache.
+const GROUP_NODES: usize = 8192;
+
+/// At least this many leaves per group, so even a group's top level, one
+/// pair per leaf, fills a 16-message SHA-256 call. Inner nodes have no such
+/// floor: a block dirties a few dozen, each with several changed paths, and
+/// spreading them over the threads gains more than wider top levels.
+const MIN_LEAF_GROUP: usize = 16;
 
 /// A Merkle tree with the shape of the SSZ one, whose nodes cache their own
 /// hash.
@@ -64,7 +72,7 @@ pub(crate) struct Node<T> {
     /// The root of the node's subtree.
     pub(crate) hash: OnceLock<Hash256>,
     /// Every binary level from the children's roots up to this node's root,
-    /// bottom first (see [`fold_levels`]), kept once the node is hashed. A node
+    /// bottom first (see [`Job`]), kept once the node is hashed. A node
     /// rebuilt from this one starts from them and rehashes only the paths of
     /// the children it replaced, rather than all of a node's binary levels for
     /// one changed child (511 hashes for a full node).
@@ -130,24 +138,29 @@ impl<T> Tree<T> {
 }
 
 impl<T: Value> Leaf<T> {
-    /// The root of this leaf's subtree, which has height `height`.
-    fn root(&self, height: usize) -> Hash256 {
-        let chunks = 1 << height;
-        if is_packed::<T>() {
-            // In bulk: a memcpy for the integer types on a little-endian host,
-            // where appending element by element was a call per byte of a
-            // participation leaf.
-            let mut bytes = Vec::with_capacity(self.values.len() * <T as SszEncode>::fixed_size());
-            T::ssz_append_fixed_slice(&self.values, &mut bytes);
-            return merkleize(&pack(&bytes), chunks);
+    /// The bottom level of this leaf's subtree: its chunks for a packed type
+    /// (the last one zero-padded), its elements' roots for a composite.
+    fn chunks(&self, bytes: &mut Vec<u8>) -> Vec<Hash256> {
+        if !is_packed::<T>() {
+            return self.element_roots().to_vec();
         }
-        merkleize(self.element_roots(), chunks)
+        // In bulk: a memcpy for the integer types on a little-endian host,
+        // where appending element by element was a call per byte of a
+        // participation leaf.
+        bytes.clear();
+        T::ssz_append_fixed_slice(&self.values, bytes);
+        let mut chunks = vec![[0u8; 32]; bytes.len().div_ceil(32)];
+        chunks.as_flattened_mut()[..bytes.len()].copy_from_slice(bytes);
+        chunks
     }
 
     /// Each element's root, computed and kept on first use.
     ///
-    /// `get` and `set` rather than `get_or_init`, for the reason [`cached`]
-    /// gives: an element's `hash_tree_root` may itself run on rayon.
+    /// `get` and `set` rather than `get_or_init`, which would hold the cell's
+    /// lock while computing: an element's `hash_tree_root` may itself run on
+    /// rayon, and a worker blocked on a cell another worker is filling may be
+    /// the very worker that one waits on. Racing workers each compute the same
+    /// roots, so the cost of a race is wasted work, never a wrong root.
     fn element_roots(&self) -> &[Hash256] {
         if let Some(roots) = self.roots.get() {
             return roots;
@@ -340,27 +353,49 @@ impl<T: Value> Tree<T> {
 
     /// This subtree's root, computing and caching whatever is not cached yet.
     ///
-    /// `height` is this node's height. An inner node folds its children's
-    /// roots up its binary levels, hashing the children in parallel at or
-    /// above [`PARALLEL_HASH_HEIGHT`].
+    /// `height` is this node's height. Above the bottom inner nodes (those
+    /// whose children are leaves), a node hashes its changed children first,
+    /// in parallel at or above [`PARALLEL_HASH_HEIGHT`], then itself: each
+    /// subtree is a task of its own, with no barrier between them. A bottom
+    /// node and its leaves are hashed together instead, level by level, as a
+    /// flat array of levels would be: every unhashed leaf, one binary level at
+    /// a time, each level's pairs in one call, then the node. Each call is then
+    /// wide enough for multi-message SHA-256 kernels, where one leaf at a time
+    /// was a handful of pairs. A node rebuilt from a hashed one rehashes only
+    /// the paths of the children it replaced (see [`Base`]).
     pub(crate) fn hash(&self, height: usize) -> Hash256 {
+        if let Some(hash) = self.cached_hash() {
+            return hash;
+        }
         match self {
-            Tree::Zero(zero_height) => ZERO_HASHES[*zero_height],
-            Tree::Leaf(leaf) => cached(&leaf.hash, || leaf.root(height)),
-            Tree::Node(inner) => cached(&inner.hash, || {
+            Tree::Node(inner) if child_height::<T>(height) > max_leaf_height::<T>() => {
                 let below = child_height::<T>(height);
-                let levels = match &inner.base {
-                    Some(base) => inner.rehash_changed(base, below, height),
+                let all: Vec<usize>;
+                let slots = match &inner.base {
+                    Some(base) => &base.changed,
                     None => {
-                        let all: Vec<usize> = (0..inner.children.len()).collect();
-                        fold_levels(inner.child_roots(&all, below, height), below, height)
+                        all = (0..inner.children.len()).collect();
+                        &all
                     }
                 };
-                let root = *levels.last().expect("a node has a root level");
-                let _ = inner.levels.set(levels.into());
-                root
-            }),
+                let hash_child = |&slot: &usize| {
+                    inner.children[slot].hash(below);
+                };
+                if height >= PARALLEL_HASH_HEIGHT && slots.len() > 1 {
+                    slots.par_iter().for_each(hash_child);
+                } else {
+                    slots.iter().for_each(hash_child);
+                }
+                hash_nodes(&[inner], height);
+            }
+            _ => {
+                let mut work = Work::default();
+                work.collect(self, height);
+                work.run();
+            }
         }
+        self.cached_hash()
+            .expect("the subtree was hashed just above")
     }
 
     /// The hash this node already has, if any. A [`Tree::Zero`] always has one.
@@ -545,67 +580,260 @@ impl<T> LeafSource<T> for LeafReplacements<T> {
     }
 }
 
-impl<T: Value> Node<T> {
-    /// The roots of the children in `slots`, in that order: on rayon for a
-    /// node high enough that its children are large subtrees.
-    fn child_roots(&self, slots: &[usize], below: usize, height: usize) -> Vec<Hash256> {
-        if height >= PARALLEL_HASH_HEIGHT && slots.len() > 1 {
-            slots
-                .par_iter()
-                .map(|&slot| self.children[slot].hash(below))
-                .collect()
-        } else {
-            slots
-                .iter()
-                .map(|&slot| self.children[slot].hash(below))
-                .collect()
-        }
-    }
+/// Every leaf and inner node of a subtree still to be hashed.
+struct Work<'a, T> {
+    /// Shared subtrees (a [`Tree::repeat`] reuses one node many times) are
+    /// collected once.
+    seen: HashSet<usize>,
+    /// Unhashed leaves and their heights.
+    leaves: Vec<(&'a Leaf<T>, usize)>,
+    /// Unhashed inner nodes and their heights.
+    nodes: Vec<(&'a Node<T>, usize)>,
+}
 
-    /// This node's levels: `base`'s, with the paths of the changed children
-    /// rehashed, one hash per changed pair per level rather than a full fold.
-    fn rehash_changed(&self, base: &Base, below: usize, height: usize) -> Vec<Hash256> {
-        let mut levels = base.levels.to_vec();
-        debug_assert_eq!(
-            levels.len(),
-            levels_len(self.children.len(), height - below),
-            "the base describes as many children"
-        );
-        let roots = self.child_roots(&base.changed, below, height);
-        for (&slot, root) in base.changed.iter().zip(roots) {
-            levels[slot] = root;
+impl<T> Default for Work<'_, T> {
+    fn default() -> Self {
+        Self {
+            seen: HashSet::new(),
+            leaves: Vec::new(),
+            nodes: Vec::new(),
         }
-        let mut dirty = base.changed.clone();
-        let (mut start, mut size) = (0, self.children.len());
-        let mut pairs = Vec::with_capacity(2 * dirty.len());
-        let mut parents = Vec::with_capacity(dirty.len());
-        for zero in &ZERO_HASHES[below..height] {
-            dirty.iter_mut().for_each(|slot| *slot /= 2);
-            dirty.dedup();
-            pairs.clear();
-            for &parent in &dirty {
-                pairs.push(levels[start + 2 * parent]);
-                let right = 2 * parent + 1;
-                pairs.push(if right < size {
-                    levels[start + right]
-                } else {
-                    *zero
-                });
-            }
-            parents.clear();
-            parents.resize(dirty.len(), [0; 32]);
-            hash_pairs_into(&pairs, &mut parents);
-            let next = start + size;
-            for (&parent, &hash) in dirty.iter().zip(&parents) {
-                levels[next + parent] = hash;
-            }
-            (start, size) = (next, size.div_ceil(2));
-        }
-        levels
     }
 }
 
-/// How many hashes [`fold_levels`] keeps for `children` roots folded up
+impl<'a, T: Value> Work<'a, T> {
+    fn collect(&mut self, tree: &'a Tree<T>, height: usize) {
+        match tree {
+            Tree::Zero(_) => {}
+            Tree::Leaf(leaf) => {
+                if leaf.hash.get().is_none() && self.seen.insert(std::ptr::from_ref(leaf).addr()) {
+                    self.leaves.push((leaf, height));
+                }
+            }
+            Tree::Node(inner) => {
+                if inner.hash.get().is_some() || !self.seen.insert(std::ptr::from_ref(inner).addr())
+                {
+                    return;
+                }
+                let below = child_height::<T>(height);
+                // A rebuilt node's unchanged children are the hashed node's,
+                // whose roots its base already holds.
+                match &inner.base {
+                    Some(base) => {
+                        for &slot in &base.changed {
+                            self.collect(&inner.children[slot], below);
+                        }
+                    }
+                    None => {
+                        for child in &inner.children {
+                            self.collect(child, below);
+                        }
+                    }
+                }
+                self.nodes.push((inner, height));
+            }
+        }
+    }
+
+    /// Hashes the leaves, then the inner nodes from the lowest height up, so
+    /// every node finds its changed children hashed.
+    fn run(mut self) {
+        self.leaves.sort_by_key(|&(_, height)| height);
+        for group in self.leaves.chunk_by(|a, b| a.1 == b.1) {
+            let height = group[0].1;
+            let leaves: Vec<&Leaf<T>> = group.iter().map(|&(leaf, _)| leaf).collect();
+            hash_leaves(&leaves, height);
+        }
+        self.nodes.sort_by_key(|&(_, height)| height);
+        for group in self.nodes.chunk_by(|a, b| a.1 == b.1) {
+            let height = group[0].1;
+            let nodes: Vec<&Node<T>> = group.iter().map(|&(node, _)| node).collect();
+            hash_nodes(&nodes, height);
+        }
+    }
+}
+
+/// Splits `items`, subtrees of `width` bottom-level nodes each, into groups
+/// and runs `f` on each, on rayon when there are several.
+///
+/// A group is a share of the items per thread, so a block's few hundred
+/// dirty leaves still spread over every thread, but no fewer than `least`
+/// items and no more than [`GROUP_NODES`] bottom nodes.
+fn in_groups<I: Sync>(items: &[I], width: usize, least: usize, f: impl Fn(&[I]) + Sync + Send) {
+    let threads = rayon::current_num_threads();
+    let most = (GROUP_NODES / width.max(1)).max(least);
+    let per_group = items.len().div_ceil(threads).clamp(least, most);
+    if items.len() > per_group && threads > 1 {
+        items.par_chunks(per_group).for_each(f);
+    } else {
+        items.chunks(per_group).for_each(f);
+    }
+}
+
+/// Hashes leaves of height `height` together, level by level, and caches
+/// each leaf's root.
+fn hash_leaves<T: Value>(leaves: &[&Leaf<T>], height: usize) {
+    in_groups(leaves, 1 << height, MIN_LEAF_GROUP, |group| {
+        let mut bytes = Vec::new();
+        let mut jobs: Vec<Job> = group
+            .iter()
+            .map(|leaf| Job::full(leaf.chunks(&mut bytes), height))
+            .collect();
+        fold(&mut jobs, 0, height);
+        for (leaf, job) in group.iter().zip(jobs) {
+            let _ = leaf.hash.set(job.root());
+        }
+    });
+}
+
+/// Hashes inner nodes at height `height` together, level by level, keeping
+/// each node's levels for the nodes that will be rebuilt from it.
+fn hash_nodes<T: Value>(nodes: &[&Node<T>], height: usize) {
+    let below = child_height::<T>(height);
+    let span = height - below;
+    let root_of = |child: &Arc<Tree<T>>| {
+        child
+            .cached_hash()
+            .expect("a node's changed children are hashed before it")
+    };
+    in_groups(nodes, 1 << span, 1, |group| {
+        let mut jobs: Vec<Job> = group
+            .iter()
+            .map(|node| match &node.base {
+                Some(base) => {
+                    debug_assert_eq!(
+                        base.levels.len(),
+                        levels_len(node.children.len(), span),
+                        "the base describes as many children"
+                    );
+                    let mut levels = base.levels.to_vec();
+                    for &slot in &base.changed {
+                        levels[slot] = root_of(&node.children[slot]);
+                    }
+                    Job {
+                        levels,
+                        dirty: Dirty::Some(base.changed.clone()),
+                        start: 0,
+                        size: node.children.len(),
+                    }
+                }
+                None => Job::full(node.children.iter().map(root_of).collect(), span),
+            })
+            .collect();
+        fold(&mut jobs, below, span);
+        for (node, job) in group.iter().zip(jobs) {
+            let root = job.root();
+            let _ = node.levels.set(job.levels.into());
+            let _ = node.hash.set(root);
+        }
+    });
+}
+
+/// One subtree being hashed: every level of it from the bottom nodes up to
+/// its root, bottom first, each level half the one below rounded up, a
+/// missing right sibling taken as the zero subtree of its height.
+struct Job {
+    levels: Vec<Hash256>,
+    /// The nodes of the current level that changed, whose parents the next
+    /// level rehashes.
+    dirty: Dirty,
+    /// Where the current level starts in `levels`, and its size.
+    start: usize,
+    size: usize,
+}
+
+enum Dirty {
+    All,
+    /// Ascending and unique.
+    Some(Vec<usize>),
+}
+
+impl Job {
+    /// A subtree with no levels to start from: every node is new.
+    fn full(mut bottom: Vec<Hash256>, span: usize) -> Self {
+        let size = bottom.len();
+        bottom.resize(levels_len(size, span), [0; 32]);
+        Self {
+            levels: bottom,
+            dirty: Dirty::All,
+            start: 0,
+            size,
+        }
+    }
+
+    fn root(&self) -> Hash256 {
+        *self.levels.last().expect("a subtree has a root level")
+    }
+
+    /// Moves `dirty` up to the parents and appends their child pairs to
+    /// `pairs`, `zero` standing in for a missing right child.
+    fn push_pairs(&mut self, pairs: &mut Vec<Hash256>, zero: &Hash256) {
+        let (start, size) = (self.start, self.size);
+        let mut push = |parent: usize| {
+            pairs.push(self.levels[start + 2 * parent]);
+            let right = 2 * parent + 1;
+            pairs.push(if right < size {
+                self.levels[start + right]
+            } else {
+                *zero
+            });
+        };
+        match &mut self.dirty {
+            Dirty::All => (0..size.div_ceil(2)).for_each(&mut push),
+            Dirty::Some(nodes) => {
+                for node in nodes.iter_mut() {
+                    *node /= 2;
+                }
+                nodes.dedup();
+                nodes.iter().copied().for_each(push);
+            }
+        }
+    }
+
+    /// Writes the parents' hashes, taken from the front of `hashes`, into the
+    /// next level and moves up to it. Returns how many hashes it took.
+    fn take_parents(&mut self, hashes: &[Hash256]) -> usize {
+        let next = self.start + self.size;
+        let taken = match &self.dirty {
+            Dirty::All => {
+                let count = self.size.div_ceil(2);
+                self.levels[next..next + count].copy_from_slice(&hashes[..count]);
+                count
+            }
+            Dirty::Some(parents) => {
+                for (&parent, hash) in parents.iter().zip(hashes) {
+                    self.levels[next + parent] = *hash;
+                }
+                parents.len()
+            }
+        };
+        self.start = next;
+        self.size = self.size.div_ceil(2);
+        taken
+    }
+}
+
+/// Rehashes `jobs` up `span` levels from height `below`: each level's pairs
+/// from every job gathered into one call.
+fn fold(jobs: &mut [Job], below: usize, span: usize) {
+    let mut pairs = Vec::new();
+    let mut hashes = Vec::new();
+    for zero in &ZERO_HASHES[below..below + span] {
+        pairs.clear();
+        for job in jobs.iter_mut() {
+            job.push_pairs(&mut pairs, zero);
+        }
+        hashes.clear();
+        hashes.resize(pairs.len() / 2, [0; 32]);
+        hash_pairs(&pairs, &mut hashes);
+        let mut at = 0;
+        for job in jobs.iter_mut() {
+            at += job.take_parents(&hashes[at..]);
+        }
+    }
+}
+
+/// How many hashes a [`Job`] keeps for `children` bottom nodes folded up
 /// `levels` levels: each level half the one below, rounded up, down to the
 /// root.
 fn levels_len(children: usize, levels: usize) -> usize {
@@ -618,52 +846,9 @@ fn levels_len(children: usize, levels: usize) -> usize {
     total
 }
 
-/// Every level of the fold from `roots`, which sit at height `below`, up to
-/// the root at height `height`, bottom first: `roots` themselves, then each
-/// level above, with a missing right sibling taken as the zero subtree of its
-/// height. The last hash is the root.
-///
-/// Not `merkleize`: that pads with the zero hashes of chunk-level subtrees,
-/// right only for chunks, while a missing child here is a zero subtree of the
-/// children's own height, and one level up of that height plus one.
-fn fold_levels(roots: Vec<Hash256>, below: usize, height: usize) -> Vec<Hash256> {
-    debug_assert!(roots.len() <= 1 << (height - below));
-    if roots.is_empty() {
-        return vec![ZERO_HASHES[height]];
-    }
-    let mut levels = Vec::with_capacity(levels_len(roots.len(), height - below));
-    levels.extend_from_slice(&roots);
-    let mut layer = roots;
-    for zero in &ZERO_HASHES[below..height] {
-        hash_layer(&mut layer, zero);
-        levels.extend_from_slice(&layer);
-    }
-    levels
-}
-
 /// A composite element's own root, as a leaf keeps it.
 pub(crate) fn element_root<T: Value>(value: &T) -> Hash256 {
     HashTreeRoot::hash_tree_root(value, &Sha2Hasher)
-}
-
-/// The hash in `cell`, computing and storing it first if the cell is empty.
-///
-/// Uses `get` and `set` rather than `OnceLock::get_or_init`. `get_or_init`
-/// holds the cell's lock while `compute` runs, and `compute` hashes the
-/// children on rayon: a worker blocked on a cell another worker
-/// is filling may be the very worker that one's parallel hash waits on, which
-/// deadlocks. Racing workers here are safe: each may end up rehashing the
-/// whole uncached subtree below this node rather than just this one cell, and
-/// more than two workers can race on it, but every racer computes the same
-/// value, so the cost is wasted work, never a wrong hash.
-fn cached(cell: &OnceLock<Hash256>, compute: impl FnOnce() -> Hash256) -> Hash256 {
-    if let Some(hash) = cell.get() {
-        return *hash;
-    }
-    let hash = compute();
-    // A racing worker may have stored the same value first.
-    let _ = cell.set(hash);
-    hash
 }
 
 #[cfg(test)]

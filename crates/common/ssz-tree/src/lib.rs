@@ -25,6 +25,11 @@
 //! binary levels, so a node rebuilt from it rehashes only the paths of the
 //! children it replaced, not all of its levels.
 //!
+//! A bottom inner node and its unhashed leaves are hashed together, one
+//! binary level at a time, each level's pairs from every leaf in one SHA-256
+//! call, wide enough for multi-message kernels; above them, changed subtrees
+//! are hashed in parallel. See `Tree::hash`.
+//!
 //! The result is shaped much like a B+-tree over indices: page-sized nodes
 //! with a high fan-out, and every element in the leaves. Unlike one, it has no
 //! keys to search and never splits or rebalances. An index's bits pick the
