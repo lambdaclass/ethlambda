@@ -180,9 +180,10 @@ pub struct BuilderProposals {
 ///
 /// `stop` resolves with the name of what asked the client to stop, a signal
 /// in the binary. It is first polled once startup is done, when the duties
-/// start, and not before: a future that starts listening for signals when it
-/// is first polled leaves one sent during startup its default action, as the
-/// node does until it has started. Once it resolves the client starts no
+/// start, and not before, and a caller may read that first poll as the start
+/// of the duties: the binary ends the process at once on a signal that comes
+/// before it, since nothing is signed yet. A client that stops before then
+/// drops `stop` unpolled. Once it resolves the client starts no
 /// other slot, lets the work in flight finish, and returns `Ok(())` (see
 /// [`run_until_stopped`]). Every other way the client stops is an `Err`.
 pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static str>) -> Result<()> {
@@ -728,6 +729,12 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
         }
     };
 
+    // `stop` is first polled in here, which the binary reads as the start of
+    // the duties (see this function's doc). The keymanager is already
+    // serving, so keep this call right after its spawn, with no await
+    // between: until here a signal ends the process at once, and could cut
+    // an import between saving its keys and registering them, leaving keys
+    // the next start refuses.
     let stopped = run_until_stopped(
         duties,
         &protection,

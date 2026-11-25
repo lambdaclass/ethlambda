@@ -13,9 +13,10 @@
 //! long checkpoint sync until startup finished, since nothing in startup gives
 //! up on a signal.
 //!
-//! The validator client follows the same rule: it listens from when its duties
-//! start (`validator::run`), not while it decrypts its keystores and first
-//! reaches its beacon node.
+//! The validator client listens from the top of `validator::run` instead, and
+//! a signal before its duties start ends it at once, from a task of its own
+//! (`validator::listen_for_stop`). It can: nothing is signed before the first
+//! duty, so there is nothing to drain.
 
 #[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};

@@ -844,11 +844,19 @@ flight finish:
   waited for.
 
 It then logs `Shutdown complete` and exits 0. Three more signals end it at
-once, with exit code 1. A signal during startup, while the keystores are
-decrypted and the beacon node is first asked for the chain, keeps its default
-action, as the node's do until it has started: it ends the process at once, or,
-in a container, where the client is PID 1, it is ignored until Docker kills
-the container.
+once, with exit code 1.
+
+Both signals are listened for from the moment the client starts. One sent
+during startup, while the keystores are decrypted and the beacon node is
+first asked for the chain, logs `Shutdown signal received before the duties
+started` and ends the process at once with exit code 0: no duty has run, so
+nothing is signed and there is nothing to wait for. That holds in a
+container too, where the client is PID 1 and a signal with no handler is
+ignored.
+
+A signal sent while the client stops on an error (an unusable
+slashing-protection record, a doppelganger) does not cut its keymanager wait
+short: it is logged, and three more end the process with exit code 1.
 
 systemd's defaults need no change: `KillSignal` is SIGTERM, and `TimeoutStopSec`
 (90 s) covers both waits. `docker stop` sends SIGTERM and waits 10 s, enough for

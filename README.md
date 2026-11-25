@@ -380,10 +380,10 @@ default `KillSignal`, and the default `TimeoutStopSec` (90 s) covers both
 waits. `docker stop` sends SIGTERM to the client, which is the image's PID 1,
 and its default 10 s covers the slot; with `--enable-keymanager`, pass
 `--stop-timeout 70` so an import in flight is not cut short. A signal during
-startup, while the keystores are decrypted, ends the process at once, or in a
-container is ignored until Docker kills it. v1.0.0 handles neither signal at
-any point: outside a container either one ends it at once, and inside one
-`docker stop` waits out its timeout and kills it. See
+startup, while the keystores are decrypted, ends the process at once with exit
+code 0, in a container too, since nothing is signed yet. v1.0.0 handles
+neither signal at any point: outside a container either one ends it at once,
+and inside one `docker stop` waits out its timeout and kills it. See
 [`docs/cli.md`](./docs/cli.md#stopping) for what a stop waits for.
 
 ### Running in a devnet
