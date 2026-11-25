@@ -910,15 +910,6 @@ contributions only.
   never the block.
 - Messages from earlier slots over the same root are not packed.
 
-## The validator client signs a sync committee message at the deadline only
-
-`validator.md` ("Prepare sync committee message") has a member sign as soon as
-it sees the block for the slot, or at the sync-message deadline, whichever
-comes first. The validator client signs once, at the deadline
-(`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
-reads, and refuses to when that root is optimistic
-(`specs/bellatrix/optimistic-sync.md`).
-
 ## The validator client's builder proposals
 
 With `--builder-proposals` the validator client registers its validators with

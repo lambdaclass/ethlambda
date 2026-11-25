@@ -618,12 +618,13 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 
             // The rest of the way to the first of the slot's remaining duties:
             // the attester offset, or the sync committee offset when the network
-            // puts it earlier, or the slot's block when a beacon node reports it
-            // first. Zero if the refresh or the proposal above already ran past
-            // it, in which case the duty is late rather than skipped. Each
-            // branch of `serve_slot_duties` waits for its own trigger.
+            // puts it earlier, or the slot's block (or its payload) when a
+            // beacon node reports it first. Zero if the refresh or the proposal
+            // above already ran past it, in which case the duty is late rather
+            // than skipped. Each branch of `serve_slot_duties` waits for its
+            // own trigger.
             let first_duty = clock.until_first_slot_duty(slot, SystemTime::now());
-            triggers.head_within(slot, first_duty).await;
+            triggers.report_within(slot, first_duty).await;
 
             // Attesting and aggregating both start from these, so a key
             // doppelganger protection still withholds does neither; its sync

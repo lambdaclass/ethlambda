@@ -452,7 +452,8 @@ static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
 /// the vote), confirmed by the node's own data. `deadline` is the clock's
 /// offset with no such event before it, which is every slot with the event
 /// stream off or down. `mismatch` is an event the node's data did not bear
-/// out, so the duty waited for its deadline after all: a rise there points
+/// out (or had not answered by the deadline), so the duty waited for its
+/// deadline after all: a rise there points
 /// at beacon nodes that disagree with each other, or a vote whose payload was
 /// announced but not seen present.
 static DUTY_TRIGGERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {

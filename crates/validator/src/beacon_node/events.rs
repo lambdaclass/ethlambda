@@ -458,17 +458,21 @@ fn transport(base_url: &str, err: &reqwest::Error) -> Error {
 }
 
 /// The start of a refused subscription's body, as one line, for the error.
-/// Read a piece at a time and only up to [`ERROR_BODY_LIMIT`], so a node
-/// answering with an endless body cannot hold the reconnect on it.
+/// Read a piece at a time, only up to [`ERROR_BODY_LIMIT`], and within one
+/// [`CONNECT_TIMEOUT`] for the whole read rather than one per piece, so a node
+/// answering with an endless or trickled body cannot hold the reconnect on it.
 async fn body_excerpt(mut response: reqwest::Response) -> String {
     let mut bytes = Vec::new();
-    while bytes.len() < ERROR_BODY_LIMIT {
-        let Ok(Ok(Some(chunk))) = tokio::time::timeout(CONNECT_TIMEOUT, response.chunk()).await
-        else {
-            break;
-        };
-        bytes.extend_from_slice(&chunk[..chunk.len().min(ERROR_BODY_LIMIT - bytes.len())]);
-    }
+    let read = async {
+        while bytes.len() < ERROR_BODY_LIMIT {
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            bytes.extend_from_slice(&chunk[..chunk.len().min(ERROR_BODY_LIMIT - bytes.len())]);
+        }
+    };
+    // Whatever arrived by then is the excerpt.
+    let _ = tokio::time::timeout(CONNECT_TIMEOUT, read).await;
     ethlambda_types::text::one_line(&String::from_utf8_lossy(&bytes), ERROR_BODY_LIMIT)
 }
 
