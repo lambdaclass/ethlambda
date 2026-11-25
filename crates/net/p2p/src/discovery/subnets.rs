@@ -24,8 +24,10 @@
 //!
 //! Lighthouse does the same with sigp/discv5's `find_node_predicate`, whose
 //! semantics ethrex's `find_nodes` copies: a match counts only once its node has
-//! answered the query, so dead records stay out. The predicate is
-//! Lighthouse's too: everything admission checks, plus at least one wanted
+//! answered the query, so dead records stay out of the walk's answer. The cached
+//! step, `records_matching`, makes no such check: it hands over records
+//! discovery already holds without asking their nodes anything. The predicate
+//! is Lighthouse's too: everything admission checks, plus at least one wanted
 //! `attnets` bit.
 //!
 //! [`rank_candidates`]: super::admission::rank_candidates
@@ -504,8 +506,11 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_is_wanted_while_the_dial_loop_cannot_dial() {
-        // An unset handle: the task it starts finds discovery not running,
-        // which is all this test needs, since it reads only what is published.
+        // An unset handle, which the spawned task never gets to use:
+        // `#[tokio::test]` runs on a current-thread runtime and this test
+        // never awaits, so the task is not polled once before the drop at the
+        // end aborts it. That is all this test needs, since it reads only what
+        // `update` publishes.
         let hunt = SubnetHunt::spawn(DiscoveryHandle::new(), filter(), HashSet::from([1, 4]));
 
         hunt.update(&HashMap::new(), &HashMap::new(), true);
