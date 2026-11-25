@@ -160,35 +160,6 @@ pub fn case_config(case: &Case) -> Config {
 /// is one line.
 pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Gloas;
 
-/// The gloas containers that are, or hold, an `ExecutionPayload`.
-///
-/// On this branch the payload carries one more field than the specification's
-/// (`dependency_witnesses`), so none of the four decodes a fixture's bytes or
-/// reproduces its root. A case that reads one is reported as ignored rather
-/// than run: the `ssz_static` cases of these four handlers, and every
-/// fork-choice or gossip case [`reads_payload_envelope`] is true for.
-pub const PAYLOAD_CONTAINERS: &[&str] = &[
-    "ExecutionPayload",
-    "ExecutionPayloadEnvelope",
-    "SignedExecutionPayloadEnvelope",
-    "NewPayloadRequest",
-];
-
-/// Whether `case` hands its runner a `SignedExecutionPayloadEnvelope` to
-/// decode, which this branch cannot do: see [`PAYLOAD_CONTAINERS`].
-///
-/// The fork-choice and gossip formats write each envelope a case uses to its
-/// own `execution_payload_envelope_<root>.ssz_snappy`, so the file names
-/// answer this without parsing the case, at the time the test list is built,
-/// which is when a test has to be marked ignored.
-pub fn reads_payload_envelope(case: &Case) -> bool {
-    read_dir_sorted(&case.path).iter().any(|entry| {
-        let name = entry.file_name();
-        name.to_string_lossy()
-            .starts_with("execution_payload_envelope_")
-    })
-}
-
 /// The root of the extracted fixture tree.
 ///
 /// Panics rather than skipping when the fixtures are absent. A spec suite that

@@ -170,7 +170,7 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
         // client accepts as well-formed.
         block_access_list: vec![0xc0u8].try_into().expect("fits"),
         slot_number: 77,
-        dependency_witnesses: vec![gloas::DependencyWitness::from(vec![0xaa, 0xbb])].into(),
+        dependency_witnesses: Some(vec![gloas::DependencyWitness::from(vec![0xaa, 0xbb])].into()),
     };
     let status = client(endpoint)
         .new_payload_v5(

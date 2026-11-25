@@ -865,16 +865,6 @@ ignored runs. The ignored cases are deliberate exclusions:
   and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
-- On this branch, every gloas case that decodes an `ExecutionPayload` or a
-  container holding one: the `ssz_static` cases of `ExecutionPayload`,
-  `ExecutionPayloadEnvelope`, `SignedExecutionPayloadEnvelope` and
-  `NewPayloadRequest` (`PAYLOAD_CONTAINERS`), and the `fork_choice` and
-  `networking/gossip_*` cases that use an envelope (`reads_payload_envelope`).
-  That is 117 cases on mainnet and 590 on minimal, plus the 38 chain-actor
-  tests in `ethlambda-blockchain` that decode a fixture envelope. The payload
-  carries one more field here than the specification's, so the fixtures match
-  neither its encoding nor its root: see
-  [spec_deviations.md](./spec_deviations.md#the-gloas-execution-payload-carries-dependency-witnesses).
 
 ## Accounting for every fork directory
 

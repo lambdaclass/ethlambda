@@ -143,9 +143,11 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// unchanged.
 ///
 /// `dependencyWitnesses` comes last and is not in the specification's
-/// `ExecutionPayloadV4`: an array of `DATA`, written even when empty, so the
-/// execution client always reads the list its block header commits to rather
-/// than having to pick a meaning for an absent key.
+/// `ExecutionPayloadV4`: an array of `DATA`, written exactly when the payload
+/// has the field, and then even when the list is empty, so that the execution
+/// client reads the list its block header commits to. A payload without the
+/// field, from before `HEZE_FORK_EPOCH`, is written as the specification's
+/// object, with no such key.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 
 impl Serialize for ExecutionPayloadV4<'_> {
@@ -153,7 +155,12 @@ impl Serialize for ExecutionPayloadV4<'_> {
         use serde::ser::SerializeStruct as _;
 
         let payload = self.0;
-        let mut out = serializer.serialize_struct("ExecutionPayloadV4", 20)?;
+        let members = if payload.dependency_witnesses.is_some() {
+            20
+        } else {
+            19
+        };
+        let mut out = serializer.serialize_struct("ExecutionPayloadV4", members)?;
         out.serialize_field("parentHash", &data(&payload.parent_hash.0))?;
         out.serialize_field("feeRecipient", &data(&payload.fee_recipient.0))?;
         out.serialize_field("stateRoot", &data(&payload.state_root.0))?;
@@ -184,12 +191,13 @@ impl Serialize for ExecutionPayloadV4<'_> {
         out.serialize_field("blockAccessList", &data(payload.block_access_list.as_ref()))?;
         out.serialize_field("slotNumber", &quantity(payload.slot_number))?;
 
-        let dependency_witnesses: Vec<String> = payload
-            .dependency_witnesses
-            .iter()
-            .map(|witness| data(witness.as_ref()))
-            .collect();
-        out.serialize_field("dependencyWitnesses", &dependency_witnesses)?;
+        if let Some(dependency_witnesses) = &payload.dependency_witnesses {
+            let dependency_witnesses: Vec<String> = dependency_witnesses
+                .iter()
+                .map(|witness| data(witness.as_ref()))
+                .collect();
+            out.serialize_field("dependencyWitnesses", &dependency_witnesses)?;
+        }
         out.end()
     }
 }
@@ -527,7 +535,15 @@ mod tests {
             dependency_witnesses: Default::default(),
         };
 
-        // No witnesses is an empty array, never an absent key.
+        // A payload without the field is the specification's object.
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        let object = json.as_object().expect("a JSON object");
+        assert!(!object.contains_key("dependencyWitnesses"));
+        assert_eq!(object.len(), 19);
+
+        // A payload with the field and no witnesses writes an empty array,
+        // never an absent key.
+        payload.dependency_witnesses = Some(Default::default());
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
         assert_eq!(json["dependencyWitnesses"], serde_json::json!([]));
         assert_eq!(json.as_object().expect("a JSON object").len(), 20);
@@ -543,9 +559,13 @@ mod tests {
         for byte in [0xc1u8, 0x80] {
             payload.block_access_list.push(byte);
         }
-        for witness in [vec![0x01u8, 0x02], vec![0xff]] {
-            payload.dependency_witnesses.push(witness.into());
-        }
+        payload.dependency_witnesses = Some(
+            vec![
+                gloas::DependencyWitness::from(vec![0x01u8, 0x02]),
+                gloas::DependencyWitness::from(vec![0xff]),
+            ]
+            .into(),
+        );
 
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
 

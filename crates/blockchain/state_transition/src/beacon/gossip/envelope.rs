@@ -23,9 +23,11 @@
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
-//! - [`cheap_checks`] rejects a payload whose `dependency_witnesses` holds an
-//!   item of any length but [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The
-//!   specification's payload has no such list, so it has no rule for it.
+//! - [`cheap_checks`] rejects a payload that has the `dependency_witnesses`
+//!   field before `HEZE_FORK_EPOCH` or lacks it from that epoch on, and one
+//!   whose list holds an item of any length but
+//!   [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The specification's payload has no such
+//!   list, so it has no rule for it.
 
 use std::num::NonZeroUsize;
 
@@ -40,6 +42,7 @@ use super::{
 use crate::beacon::containers::gloas::BuilderIndex;
 use crate::beacon::containers::{SignedBeaconBlock, gloas};
 use crate::beacon::fork_choice::Store;
+use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
@@ -109,13 +112,21 @@ pub fn cheap_checks(
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
+    // [REJECT] The payload has the dependency witnesses field exactly when
+    // its slot is at or after `HEZE_FORK_EPOCH`. The payload names its own
+    // slot, so this needs no block either.
+    let witnesses = &message.payload.dependency_witnesses;
+    let payload_epoch = compute_epoch_at_slot(message.payload.slot_number);
+    if witnesses.is_some() != store.config().carries_dependency_witnesses(payload_epoch) {
+        return Err(Outcome::Reject(RejectReason::DependencyWitnessesField));
+    }
     // [REJECT] Every dependency witness is exactly one leanSPHINCS signature
     // long. No block can make a witness of another length valid, so, like the
     // limits above, this runs before anything can be queued, and before the
     // execution client is asked to verify the signatures.
-    let witnesses = &message.payload.dependency_witnesses;
     if witnesses
         .iter()
+        .flatten()
         .any(|witness| witness.len() != LEAN_SPHINCS_SIGNATURE_SIZE)
     {
         return Err(Outcome::Reject(RejectReason::DependencyWitnessSize));
@@ -313,9 +324,71 @@ mod tests {
         );
     }
 
+    /// `store(0)` with payloads carrying dependency witnesses from genesis.
+    fn store_with_dependency_witnesses() -> Store {
+        let mut store = store(0);
+        let mut config = (*store.config()).clone();
+        config.heze_fork_epoch = 0;
+        store.replace_config(config);
+        store
+    }
+
+    #[test]
+    fn a_payload_with_the_dependency_witnesses_field_is_rejected_before_its_epoch() {
+        // `store(0)` schedules no epoch for the field, so no payload has it.
+        let store = store(0);
+        let mut envelope = envelope(5, 0);
+        envelope.message.payload.dependency_witnesses = Some(Default::default());
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &envelope),
+            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+        );
+        // The block is unknown, which would queue a well-formed envelope.
+        assert_eq!(
+            validate(&seen_envelopes(), &store, &envelope),
+            Outcome::Reject(RejectReason::DependencyWitnessesField)
+        );
+    }
+
+    #[test]
+    fn a_payload_without_the_dependency_witnesses_field_is_rejected_from_its_epoch() {
+        let store = store_with_dependency_witnesses();
+        let envelope = envelope(5, 0);
+        assert_eq!(envelope.message.payload.dependency_witnesses, None);
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &envelope),
+            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+        );
+    }
+
+    #[test]
+    fn the_dependency_witnesses_field_is_judged_by_the_payloads_own_slot() {
+        let mut store = store(0);
+        let mut config = (*store.config()).clone();
+        config.heze_fork_epoch = 1;
+        store.replace_config(config);
+        let first_slot_with_the_field = preset::slots_per_epoch();
+
+        let mut before = envelope(first_slot_with_the_field - 1, 0);
+        assert_eq!(cheap_checks(&seen_envelopes(), &store, &before), Ok(()));
+        before.message.payload.dependency_witnesses = Some(Default::default());
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &before),
+            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+        );
+
+        let mut from = envelope(first_slot_with_the_field, 0);
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &from),
+            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+        );
+        from.message.payload.dependency_witnesses = Some(Default::default());
+        assert_eq!(cheap_checks(&seen_envelopes(), &store, &from), Ok(()));
+    }
+
     #[test]
     fn a_dependency_witness_of_the_wrong_size_is_rejected_before_any_block_lookup() {
-        let store = store(0);
+        let store = store_with_dependency_witnesses();
         let well_sized = gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]);
         for wrong_size in [
             0,
@@ -326,7 +399,7 @@ mod tests {
             // does not vouch for the list.
             let mut envelope = envelope(5, 0);
             envelope.message.payload.dependency_witnesses =
-                vec![well_sized.clone(), vec![0u8; wrong_size].into()].into();
+                Some(vec![well_sized.clone(), vec![0u8; wrong_size].into()].into());
             assert_eq!(
                 cheap_checks(&seen_envelopes(), &store, &envelope),
                 Err(Outcome::Reject(RejectReason::DependencyWitnessSize)),
@@ -342,10 +415,11 @@ mod tests {
 
     #[test]
     fn dependency_witnesses_of_the_signature_size_pass_the_cheap_checks() {
-        let store = store(0);
+        let store = store_with_dependency_witnesses();
         let mut envelope = envelope(5, 0);
-        envelope.message.payload.dependency_witnesses =
-            vec![gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]); 2].into();
+        envelope.message.payload.dependency_witnesses = Some(
+            vec![gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]); 2].into(),
+        );
         assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope),

@@ -480,23 +480,23 @@ pub struct ExecutionRequests {
 ///
 /// Bellatrix's fields through `block_hash`, unchanged; `transactions` and
 /// `withdrawals` become progressive (EIP-7688); `block_access_list`
-/// (EIP-7928) and `slot_number` (EIP-8061) are appended, and after them
-/// `dependency_witnesses`, which the specification's container does not
-/// have (see the field). Not `#[derive(Default)]`: `logs_bloom` is an
-/// [`SszVector`], which, like every earlier fork's payload, has no
-/// meaningful empty value.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-#[ssz(progressive_container)]
+/// (EIP-7928) and `slot_number` (EIP-8061) are appended. Those nineteen
+/// fields are the specification's container. From
+/// [`Config::heze_fork_epoch`](crate::beacon::config::Config::heze_fork_epoch)
+/// on, a payload has a twentieth, `dependency_witnesses`, which the
+/// specification's container does not have (see the field).
+///
+/// A payload is therefore one of two containers, and which one is a property
+/// of the value: `dependency_witnesses` is `None` in the first and `Some` in
+/// the second. Its SSZ encoding, decoding and hash tree root are written out
+/// below rather than derived, because a derived container has a fixed set of
+/// fields. Whether a payload of a given slot may be the one or the other is
+/// not decided here: see
+/// [`Config::carries_dependency_witnesses`](crate::beacon::config::Config::carries_dependency_witnesses).
+///
+/// Not `#[derive(Default)]`: `logs_bloom` is an [`SszVector`], which, like
+/// every earlier fork's payload, has no meaningful empty value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionPayload {
     pub parent_hash: ExecutionBlockHash,
     pub fee_recipient: ExecutionAddress,
@@ -540,15 +540,282 @@ pub struct ExecutionPayload {
     /// never reads their contents: it takes them from `engine_getPayloadV6`,
     /// carries them in the envelope, and hands them to `engine_newPayloadV5`.
     ///
-    /// Not a field of the specification's `ExecutionPayload`, so a payload's
-    /// encoding and root differ from the specification's. It is the last
-    /// field because a progressive container can only grow at its end
-    /// (EIP-7495): every field before it keeps its generalized index.
+    /// `None` is a payload from before
+    /// [`Config::heze_fork_epoch`](crate::beacon::config::Config::heze_fork_epoch):
+    /// the specification's container, with no such field. `Some` is a payload
+    /// from that epoch on, whose container has the field even when the list
+    /// is empty, so `Some` of an empty list and `None` encode and hash
+    /// differently. It is the last field because a progressive container can
+    /// only grow at its end (EIP-7495): every field before it keeps its
+    /// generalized index.
     ///
-    /// `#[serde(default)]` so JSON written without the field still reads, as
-    /// a payload with no witnesses.
-    #[serde(default, with = "crate::beacon::serde_helpers::ssz_hex_seq")]
-    pub dependency_witnesses: DependencyWitnesses,
+    /// In JSON a payload without the field has no such key.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::beacon::serde_helpers::optional_ssz_hex_seq"
+    )]
+    pub dependency_witnesses: Option<DependencyWitnesses>,
+}
+
+/// A payload holds dependency witnesses and belongs to a slot whose payloads
+/// do not have the field, so no container can hold it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the payload holds dependency witnesses before the epoch payloads carry them from")]
+pub struct DependencyWitnessesTooEarly;
+
+impl ExecutionPayload {
+    /// The number of fields of the container without `dependency_witnesses`.
+    const FIELDS_BEFORE_DEPENDENCY_WITNESSES: usize = 19;
+
+    /// This payload as the container its slot calls for: the one with
+    /// `dependency_witnesses` when `carries_witnesses`, the specification's
+    /// otherwise.
+    ///
+    /// For a payload read from an execution client, which says whether the
+    /// block has a witness list by sending or leaving out a JSON key. The two
+    /// sides must agree on the epoch the list starts at, and this is where
+    /// the consensus side has the say. A payload that should have the field
+    /// and came without one gets the empty list. A payload that should not
+    /// have it loses an empty list. A list that holds witnesses cannot be
+    /// dropped, because the execution block commits to it, so that payload is
+    /// refused.
+    pub fn with_dependency_witnesses_field(
+        mut self,
+        carries_witnesses: bool,
+    ) -> Result<Self, DependencyWitnessesTooEarly> {
+        self.dependency_witnesses = match (self.dependency_witnesses.take(), carries_witnesses) {
+            (witnesses, true) => Some(witnesses.unwrap_or_default()),
+            (Some(witnesses), false) if !witnesses.is_empty() => {
+                return Err(DependencyWitnessesTooEarly);
+            }
+            (_, false) => None,
+        };
+        Ok(self)
+    }
+
+    /// The length of the container's fixed part: every fixed-size field, and
+    /// one offset for each variable-size one. `carries_witnesses` says
+    /// whether `dependency_witnesses`, a variable-size field, is one of them.
+    fn fixed_part_len(carries_witnesses: bool) -> usize {
+        fn fixed<T: libssz::SszEncode>() -> usize {
+            T::fixed_size()
+        }
+        const OFFSET: usize = libssz::BYTES_PER_LENGTH_OFFSET;
+
+        let without_witnesses = fixed::<ExecutionBlockHash>() // parent_hash
+            + fixed::<ExecutionAddress>() // fee_recipient
+            + fixed::<Bytes32>() // state_root
+            + fixed::<Bytes32>() // receipts_root
+            + fixed::<LogsBloom>() // logs_bloom
+            + fixed::<Bytes32>() // prev_randao
+            + fixed::<u64>() // block_number
+            + fixed::<u64>() // gas_limit
+            + fixed::<u64>() // gas_used
+            + fixed::<u64>() // timestamp
+            + OFFSET // extra_data
+            + fixed::<Uint256>() // base_fee_per_gas
+            + fixed::<ExecutionBlockHash>() // block_hash
+            + OFFSET // transactions
+            + OFFSET // withdrawals
+            + fixed::<u64>() // blob_gas_used
+            + fixed::<u64>() // excess_blob_gas
+            + OFFSET // block_access_list
+            + fixed::<u64>(); // slot_number
+        if carries_witnesses {
+            without_witnesses + OFFSET
+        } else {
+            without_witnesses
+        }
+    }
+
+    /// Decodes `bytes` as the container with or without
+    /// `dependency_witnesses`, as `carries_witnesses` says.
+    fn decode_container(
+        bytes: &[u8],
+        carries_witnesses: bool,
+    ) -> Result<Self, libssz::DecodeError> {
+        let mut decoder =
+            libssz::ContainerDecoder::new(bytes, Self::fixed_part_len(carries_witnesses))?;
+
+        // The fixed part, in field order: a fixed-size field's value, or a
+        // variable-size field's offset.
+        let parent_hash = decoder.decode_fixed()?;
+        let fee_recipient = decoder.decode_fixed()?;
+        let state_root = decoder.decode_fixed()?;
+        let receipts_root = decoder.decode_fixed()?;
+        let logs_bloom = decoder.decode_fixed()?;
+        let prev_randao = decoder.decode_fixed()?;
+        let block_number = decoder.decode_fixed()?;
+        let gas_limit = decoder.decode_fixed()?;
+        let gas_used = decoder.decode_fixed()?;
+        let timestamp = decoder.decode_fixed()?;
+        decoder.read_variable_offset()?; // extra_data
+        let base_fee_per_gas = decoder.decode_fixed()?;
+        let block_hash = decoder.decode_fixed()?;
+        decoder.read_variable_offset()?; // transactions
+        decoder.read_variable_offset()?; // withdrawals
+        let blob_gas_used = decoder.decode_fixed()?;
+        let excess_blob_gas = decoder.decode_fixed()?;
+        decoder.read_variable_offset()?; // block_access_list
+        let slot_number = decoder.decode_fixed()?;
+        if carries_witnesses {
+            decoder.read_variable_offset()?; // dependency_witnesses
+        }
+
+        // The variable part, in the order the offsets were read.
+        let extra_data = decoder.decode_variable()?;
+        let transactions = decoder.decode_variable()?;
+        let withdrawals = decoder.decode_variable()?;
+        let block_access_list = decoder.decode_variable()?;
+        let dependency_witnesses = if carries_witnesses {
+            Some(decoder.decode_variable()?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            parent_hash,
+            fee_recipient,
+            state_root,
+            receipts_root,
+            logs_bloom,
+            prev_randao,
+            block_number,
+            gas_limit,
+            gas_used,
+            timestamp,
+            extra_data,
+            base_fee_per_gas,
+            block_hash,
+            transactions,
+            withdrawals,
+            blob_gas_used,
+            excess_blob_gas,
+            block_access_list,
+            slot_number,
+            dependency_witnesses,
+        })
+    }
+}
+
+impl libssz::SszEncode for ExecutionPayload {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        Self::fixed_part_len(self.dependency_witnesses.is_some())
+            + self.extra_data.encoded_len()
+            + self.transactions.encoded_len()
+            + self.withdrawals.encoded_len()
+            + self.block_access_list.encoded_len()
+            + self
+                .dependency_witnesses
+                .as_ref()
+                .map_or(0, libssz::SszEncode::encoded_len)
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let fixed_part_len = Self::fixed_part_len(self.dependency_witnesses.is_some());
+        let mut encoder =
+            libssz::ContainerEncoder::with_capacity(buf, fixed_part_len, self.encoded_len());
+        encoder.append_fixed(&self.parent_hash);
+        encoder.append_fixed(&self.fee_recipient);
+        encoder.append_fixed(&self.state_root);
+        encoder.append_fixed(&self.receipts_root);
+        encoder.append_fixed(&self.logs_bloom);
+        encoder.append_fixed(&self.prev_randao);
+        encoder.append_fixed(&self.block_number);
+        encoder.append_fixed(&self.gas_limit);
+        encoder.append_fixed(&self.gas_used);
+        encoder.append_fixed(&self.timestamp);
+        encoder.append_variable(&self.extra_data);
+        encoder.append_fixed(&self.base_fee_per_gas);
+        encoder.append_fixed(&self.block_hash);
+        encoder.append_variable(&self.transactions);
+        encoder.append_variable(&self.withdrawals);
+        encoder.append_fixed(&self.blob_gas_used);
+        encoder.append_fixed(&self.excess_blob_gas);
+        encoder.append_variable(&self.block_access_list);
+        encoder.append_fixed(&self.slot_number);
+        if let Some(dependency_witnesses) = &self.dependency_witnesses {
+            encoder.append_variable(dependency_witnesses);
+        }
+        encoder.finalize();
+    }
+}
+
+impl libssz::SszDecode for ExecutionPayload {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    /// The bytes say which of the two containers they encode. A container's
+    /// first offset is the length of its fixed part, and the fixed part is
+    /// one offset longer when `dependency_witnesses` is a field. So the bytes
+    /// are read as the container without it, and as the one with it when
+    /// their first offset is that longer length.
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        match Self::decode_container(bytes, false) {
+            Err(libssz::DecodeError::InvalidFirstOffset { got, .. })
+                if got == Self::fixed_part_len(true) =>
+            {
+                Self::decode_container(bytes, true)
+            }
+            decoded => decoded,
+        }
+    }
+}
+
+impl libssz_merkle::HashTreeRoot for ExecutionPayload {
+    /// A progressive container's root (EIP-7495): the progressive
+    /// merkleization of its fields' roots, mixed in with which fields are
+    /// active. Every field of either container is active, so the second
+    /// value is one bit per field: nineteen bits without
+    /// `dependency_witnesses`, twenty with it.
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        let mut field_roots = vec![
+            self.parent_hash.hash_tree_root(hasher),
+            self.fee_recipient.hash_tree_root(hasher),
+            self.state_root.hash_tree_root(hasher),
+            self.receipts_root.hash_tree_root(hasher),
+            self.logs_bloom.hash_tree_root(hasher),
+            self.prev_randao.hash_tree_root(hasher),
+            self.block_number.hash_tree_root(hasher),
+            self.gas_limit.hash_tree_root(hasher),
+            self.gas_used.hash_tree_root(hasher),
+            self.timestamp.hash_tree_root(hasher),
+            self.extra_data.hash_tree_root(hasher),
+            self.base_fee_per_gas.hash_tree_root(hasher),
+            self.block_hash.hash_tree_root(hasher),
+            self.transactions.hash_tree_root(hasher),
+            self.withdrawals.hash_tree_root(hasher),
+            self.blob_gas_used.hash_tree_root(hasher),
+            self.excess_blob_gas.hash_tree_root(hasher),
+            self.block_access_list.hash_tree_root(hasher),
+            self.slot_number.hash_tree_root(hasher),
+        ];
+        debug_assert_eq!(field_roots.len(), Self::FIELDS_BEFORE_DEPENDENCY_WITNESSES);
+        if let Some(dependency_witnesses) = &self.dependency_witnesses {
+            field_roots.push(dependency_witnesses.hash_tree_root(hasher));
+        }
+
+        let mut active_fields = [0u8; 32];
+        for field in 0..field_roots.len() {
+            active_fields[field / 8] |= 1 << (field % 8);
+        }
+        let root = libssz_merkle::merkleize_progressive(hasher, &field_roots);
+        libssz_merkle::hash_nodes(hasher, &root, &active_fields)
+    }
 }
 
 /// A builder-signed reveal of the payload it bid for: the payload itself,
@@ -1238,6 +1505,289 @@ mod tests {
             slot_number: 0,
             dependency_witnesses: Default::default(),
         }
+    }
+
+    /// The specification's gloas `ExecutionPayload`, with the derived SSZ
+    /// implementations [`ExecutionPayload`]'s hand-written ones must agree
+    /// with when it has no `dependency_witnesses`.
+    #[derive(Debug, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
+    #[ssz(progressive_container)]
+    struct PayloadWithoutWitnesses {
+        parent_hash: ExecutionBlockHash,
+        fee_recipient: ExecutionAddress,
+        state_root: Bytes32,
+        receipts_root: Bytes32,
+        logs_bloom: LogsBloom,
+        prev_randao: Bytes32,
+        block_number: u64,
+        gas_limit: u64,
+        gas_used: u64,
+        timestamp: u64,
+        extra_data: ExtraData,
+        base_fee_per_gas: Uint256,
+        block_hash: ExecutionBlockHash,
+        transactions: Transactions,
+        withdrawals: Withdrawals,
+        blob_gas_used: u64,
+        excess_blob_gas: u64,
+        block_access_list: BlockAccessList,
+        slot_number: u64,
+    }
+
+    /// The same container with `dependency_witnesses` appended, which
+    /// [`ExecutionPayload`] must agree with when it has the field.
+    #[derive(Debug, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
+    #[ssz(progressive_container)]
+    struct PayloadWithWitnesses {
+        parent_hash: ExecutionBlockHash,
+        fee_recipient: ExecutionAddress,
+        state_root: Bytes32,
+        receipts_root: Bytes32,
+        logs_bloom: LogsBloom,
+        prev_randao: Bytes32,
+        block_number: u64,
+        gas_limit: u64,
+        gas_used: u64,
+        timestamp: u64,
+        extra_data: ExtraData,
+        base_fee_per_gas: Uint256,
+        block_hash: ExecutionBlockHash,
+        transactions: Transactions,
+        withdrawals: Withdrawals,
+        blob_gas_used: u64,
+        excess_blob_gas: u64,
+        block_access_list: BlockAccessList,
+        slot_number: u64,
+        dependency_witnesses: DependencyWitnesses,
+    }
+
+    /// A payload whose every field holds a value of its own, so a field
+    /// encoded or hashed out of place shows.
+    fn distinct_execution_payload() -> ExecutionPayload {
+        let mut logs_bloom = vec![0u8; preset::BYTES_PER_LOGS_BLOOM];
+        logs_bloom[3] = 0x5a;
+        ExecutionPayload {
+            parent_hash: ExecutionBlockHash::repeat_byte(1),
+            fee_recipient: ExecutionAddress::repeat_byte(2),
+            state_root: Bytes32::repeat_byte(3),
+            receipts_root: Bytes32::repeat_byte(4),
+            logs_bloom: LogsBloom::try_from(logs_bloom).expect("an exact-length bloom"),
+            prev_randao: Bytes32::repeat_byte(5),
+            block_number: 6,
+            gas_limit: 7,
+            gas_used: 8,
+            timestamp: 9,
+            extra_data: vec![0x0a, 0x0b].try_into().expect("fits"),
+            base_fee_per_gas: zero_execution_payload().base_fee_per_gas,
+            block_hash: ExecutionBlockHash::repeat_byte(12),
+            transactions: vec![
+                Transaction::from(vec![0x02, 0xab]),
+                Transaction::from(vec![0x06]),
+            ]
+            .into(),
+            withdrawals: vec![Withdrawal {
+                index: 13,
+                validator_index: 14,
+                address: ExecutionAddress::repeat_byte(15),
+                amount: 16,
+            }]
+            .into(),
+            blob_gas_used: 17,
+            excess_blob_gas: 18,
+            block_access_list: vec![0xc1, 0x80].into(),
+            slot_number: 19,
+            dependency_witnesses: None,
+        }
+    }
+
+    fn two_witnesses() -> DependencyWitnesses {
+        vec![
+            DependencyWitness::from(vec![0xaa; 7_740]),
+            DependencyWitness::from(vec![0xbb; 7_740]),
+        ]
+        .into()
+    }
+
+    fn without_witnesses(payload: &ExecutionPayload) -> PayloadWithoutWitnesses {
+        let payload = payload.clone();
+        PayloadWithoutWitnesses {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: payload.logs_bloom,
+            prev_randao: payload.prev_randao,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data,
+            base_fee_per_gas: payload.base_fee_per_gas,
+            block_hash: payload.block_hash,
+            transactions: payload.transactions,
+            withdrawals: payload.withdrawals,
+            blob_gas_used: payload.blob_gas_used,
+            excess_blob_gas: payload.excess_blob_gas,
+            block_access_list: payload.block_access_list,
+            slot_number: payload.slot_number,
+        }
+    }
+
+    fn with_witnesses(payload: &ExecutionPayload) -> PayloadWithWitnesses {
+        let payload = payload.clone();
+        PayloadWithWitnesses {
+            parent_hash: payload.parent_hash,
+            fee_recipient: payload.fee_recipient,
+            state_root: payload.state_root,
+            receipts_root: payload.receipts_root,
+            logs_bloom: payload.logs_bloom,
+            prev_randao: payload.prev_randao,
+            block_number: payload.block_number,
+            gas_limit: payload.gas_limit,
+            gas_used: payload.gas_used,
+            timestamp: payload.timestamp,
+            extra_data: payload.extra_data,
+            base_fee_per_gas: payload.base_fee_per_gas,
+            block_hash: payload.block_hash,
+            transactions: payload.transactions,
+            withdrawals: payload.withdrawals,
+            blob_gas_used: payload.blob_gas_used,
+            excess_blob_gas: payload.excess_blob_gas,
+            block_access_list: payload.block_access_list,
+            slot_number: payload.slot_number,
+            dependency_witnesses: payload
+                .dependency_witnesses
+                .expect("the payload has the field"),
+        }
+    }
+
+    #[test]
+    fn a_payload_without_dependency_witnesses_is_the_specifications_container() {
+        let payload = distinct_execution_payload();
+        let reference = without_witnesses(&payload);
+
+        assert_eq!(payload.to_ssz(), reference.to_ssz());
+        assert_eq!(payload.encoded_len(), reference.to_ssz().len());
+        assert_eq!(payload.hash_tree_root(), reference.hash_tree_root());
+        assert_eq!(
+            ExecutionPayload::from_ssz_bytes(&reference.to_ssz()),
+            Ok(payload)
+        );
+    }
+
+    #[test]
+    fn a_payload_with_dependency_witnesses_is_the_container_with_the_field_appended() {
+        for witnesses in [DependencyWitnesses::default(), two_witnesses()] {
+            let mut payload = distinct_execution_payload();
+            payload.dependency_witnesses = Some(witnesses);
+            let reference = with_witnesses(&payload);
+
+            assert_eq!(payload.to_ssz(), reference.to_ssz());
+            assert_eq!(payload.encoded_len(), reference.to_ssz().len());
+            assert_eq!(payload.hash_tree_root(), reference.hash_tree_root());
+            assert_eq!(
+                ExecutionPayload::from_ssz_bytes(&reference.to_ssz()),
+                Ok(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_dependency_witnesses_list_is_not_the_same_payload_as_no_field() {
+        let without = distinct_execution_payload();
+        let mut with_empty = without.clone();
+        with_empty.dependency_witnesses = Some(Default::default());
+
+        assert_ne!(without.to_ssz(), with_empty.to_ssz());
+        assert_ne!(without.hash_tree_root(), with_empty.hash_tree_root());
+        // The bytes alone say which of the two they are.
+        assert_eq!(
+            ExecutionPayload::from_ssz_bytes(&without.to_ssz()),
+            Ok(without)
+        );
+        assert_eq!(
+            ExecutionPayload::from_ssz_bytes(&with_empty.to_ssz()),
+            Ok(with_empty)
+        );
+    }
+
+    #[test]
+    fn a_payload_keeps_its_container_inside_an_envelope() {
+        for witnesses in [
+            None,
+            Some(DependencyWitnesses::default()),
+            Some(two_witnesses()),
+        ] {
+            let mut payload = distinct_execution_payload();
+            payload.dependency_witnesses = witnesses;
+            let envelope = ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 1,
+                beacon_block_root: Bytes32::repeat_byte(2),
+                parent_beacon_block_root: Bytes32::repeat_byte(3),
+            };
+            assert_eq!(
+                ExecutionPayloadEnvelope::from_ssz_bytes(&envelope.to_ssz()),
+                Ok(envelope)
+            );
+        }
+    }
+
+    #[test]
+    fn payload_bytes_with_a_first_offset_of_neither_container_do_not_decode() {
+        let mut bytes = distinct_execution_payload().to_ssz();
+        // The first offset is `extra_data`'s, after the ten fixed-size fields
+        // before it: four 32-byte values, the address, the bloom and four
+        // `u64`s. Two bytes more than the container without the field is the
+        // fixed part of neither.
+        let first_offset = 4 * 32 + 20 + preset::BYTES_PER_LOGS_BLOOM + 4 * 8;
+        let wrong = (ExecutionPayload::fixed_part_len(false) + 2) as u32;
+        bytes[first_offset..first_offset + 4].copy_from_slice(&wrong.to_le_bytes());
+        assert!(matches!(
+            ExecutionPayload::from_ssz_bytes(&bytes),
+            Err(libssz::DecodeError::InvalidFirstOffset { .. })
+        ));
+        assert!(ExecutionPayload::from_ssz_bytes(&bytes[..100]).is_err());
+    }
+
+    #[test]
+    fn a_payload_is_made_the_container_its_slot_calls_for() {
+        let without = distinct_execution_payload();
+        let mut with_empty = without.clone();
+        with_empty.dependency_witnesses = Some(Default::default());
+        let mut with_two = without.clone();
+        with_two.dependency_witnesses = Some(two_witnesses());
+
+        // A slot whose payloads have the field: a payload without one gets
+        // the empty list, and a list is kept as it is.
+        assert_eq!(
+            without.clone().with_dependency_witnesses_field(true),
+            Ok(with_empty.clone())
+        );
+        assert_eq!(
+            with_empty.clone().with_dependency_witnesses_field(true),
+            Ok(with_empty.clone())
+        );
+        assert_eq!(
+            with_two.clone().with_dependency_witnesses_field(true),
+            Ok(with_two.clone())
+        );
+
+        // A slot whose payloads do not: an empty list is dropped, and a list
+        // that holds witnesses has no container to go in.
+        assert_eq!(
+            without.clone().with_dependency_witnesses_field(false),
+            Ok(without.clone())
+        );
+        assert_eq!(
+            with_empty.with_dependency_witnesses_field(false),
+            Ok(without)
+        );
+        assert_eq!(
+            with_two.with_dependency_witnesses_field(false),
+            Err(DependencyWitnessesTooEarly)
+        );
     }
 
     /// A minimal but complete gloas state, every field present at an

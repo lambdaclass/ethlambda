@@ -821,10 +821,27 @@ async fn build_payload(
         ));
     };
     tokio::time::sleep(payload_build_window(&store.config())).await;
-    engine.get_payload_v6(payload_id).await.map_err(|err| {
+    let mut built = engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
-    })
+    })?;
+    // The execution client says whether its block has a witness list by
+    // sending or leaving out a key. Which container the payload must be is
+    // this side's to say, from the payload's own slot.
+    let payload = built.execution_payload;
+    let slot = payload.slot_number;
+    let carries_witnesses = store
+        .config()
+        .carries_dependency_witnesses(compute_epoch_at_slot(slot));
+    built.execution_payload = payload
+        .with_dependency_witnesses_field(carries_witnesses)
+        .map_err(|err| {
+            warn!(%err, slot, "The execution client built a payload this slot cannot carry");
+            ApiError::ServiceUnavailable(
+                "the execution client built a payload with dependency witnesses too early",
+            )
+        })?;
+    Ok(built)
 }
 
 /// The pure half: the pooled operations and the built payload into a block and

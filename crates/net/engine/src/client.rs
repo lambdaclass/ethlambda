@@ -260,7 +260,8 @@ impl EngineClient {
     ///
     /// The parameters are the same four as V4's, with the payload as
     /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`, and
-    /// `dependencyWitnesses` after them). The response is V4's. An execution
+    /// `dependencyWitnesses` after them when the payload has the field). The
+    /// response is V4's. An execution
     /// client answers `-38005` when the payload's timestamp is not
     /// Amsterdam's, which surfaces as [`EngineError::Rpc`] and is not retried.
     pub async fn new_payload_v5(

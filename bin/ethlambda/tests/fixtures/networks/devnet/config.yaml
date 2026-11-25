@@ -205,9 +205,10 @@ BLOB_SCHEDULE:
 
 # Keys a kurtosis-generated config carries that mainnet's does not. GLOAS_* and
 # PAYLOAD_DUE_BPS are claimed by `Config` now; GAS_LIMIT_SCHEDULE,
-# HEZE_FORK_VERSION, HEZE_FORK_EPOCH, and INCLUSION_LIST_DUE_BPS are still
-# deliberately present: this build cannot process heze, so they must land in
-# the ignored-key warning rather than in Config.
+# HEZE_FORK_VERSION, and INCLUSION_LIST_DUE_BPS are still deliberately
+# present: this build cannot process heze, so they must land in the
+# ignored-key warning rather than in Config. HEZE_FORK_EPOCH is claimed, as
+# the epoch payloads carry dependency witnesses from.
 MAX_REQUEST_PAYLOADS: 128
 CONSOLIDATION_CHURN_LIMIT_QUOTIENT: 65536
 GAS_LIMIT_SCHEDULE: []

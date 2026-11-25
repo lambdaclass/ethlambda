@@ -492,6 +492,54 @@ pub mod ssz_hex_seq {
     }
 }
 
+/// [`ssz_hex_seq`] for a sequence a value may not have at all.
+///
+/// Pair it with `#[serde(default, skip_serializing_if = "Option::is_none")]`:
+/// `None` then writes no key, and a missing key reads as `None`, as does
+/// `null`. An empty array is a sequence that is there and holds nothing, which
+/// is `Some`.
+pub mod optional_ssz_hex_seq {
+    pub fn serialize<'a, S, C, T>(values: &'a Option<C>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        &'a C: IntoIterator<Item = T>,
+        <&'a C as IntoIterator>::IntoIter: ExactSizeIterator,
+        T: std::ops::Deref,
+        T::Target: libssz::SszEncode,
+    {
+        match values {
+            Some(values) => super::ssz_hex_seq::serialize(values, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<Option<C>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: libssz::SszDecode,
+    {
+        /// A sequence that is there, read through [`super::ssz_hex_seq`].
+        struct Present<C, T>(C, std::marker::PhantomData<T>);
+
+        impl<'de, C, T> serde::Deserialize<'de> for Present<C, T>
+        where
+            C: TryFrom<Vec<T>>,
+            C::Error: std::fmt::Debug,
+            T: libssz::SszDecode,
+        {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                super::ssz_hex_seq::deserialize(deserializer)
+                    .map(|values| Present(values, std::marker::PhantomData))
+            }
+        }
+
+        let present = <Option<Present<C, T>> as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(present.map(|present| present.0))
+    }
+}
+
 /// A sequence of values that serialize themselves, from a foreign collection.
 ///
 /// `SszList` and `SszVector` come from `libssz-types`, which has no serde

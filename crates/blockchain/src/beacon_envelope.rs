@@ -1251,10 +1251,6 @@ pub(crate) mod tests {
             SignedBeaconBlock::from_ssz(ForkName::Gloas, &bytes).expect("block decodes")
         }
 
-        /// A fixture envelope. The fixtures encode the specification's
-        /// payload, which lacks the `dependency_witnesses` field the payload
-        /// has on this branch, so none of them decodes: every test that
-        /// reaches this is ignored.
         fn envelope(&self, root_hex: &str) -> gloas::SignedExecutionPayloadEnvelope {
             let bytes = self.bytes(&format!("execution_payload_envelope_0x{root_hex}"));
             gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes).expect("envelope decodes")
@@ -1315,7 +1311,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_ahead_of_its_block_is_held_then_applied_when_the_block_imports() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1359,7 +1358,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_block_on_a_full_parent_waits_for_the_parents_envelope_then_imports() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -1390,7 +1392,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_that_fails_verification_is_dropped_and_its_child_stays_held() {
         let case = Case::new(
             "on_execution_payload_envelope",
@@ -1422,7 +1427,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_for_an_already_verified_payload_is_ignored() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1461,7 +1469,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_stored_column_queues_only_an_envelope_that_waits_for_columns() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1494,7 +1505,10 @@ pub(crate) mod tests {
     /// copy with the honest payload and a bad signature, arriving first, must
     /// not take the root's one slot from the honest envelope.
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_bad_signature_copy_does_not_take_the_parking_slot() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1527,7 +1541,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn unmatched_envelopes_are_capped_per_slot_and_per_root() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1636,7 +1653,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn finality_evicts_all_three_queues() {
         // The finalized slot is fixed at init, so the queues are filled
         // directly around it.
@@ -1688,7 +1708,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_forged_envelope_for_a_root_does_not_evict_the_honest_one() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -1722,7 +1745,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn the_finalized_blocks_own_envelope_survives_eviction() {
         // Finalized at slot 10, so the finalized root is the zero anchor of
         // `beacon_store`.
@@ -1895,7 +1921,10 @@ pub(crate) mod tests {
     /// cap is for roots nobody has vouched for, so none of these may count
     /// against it.
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn envelopes_for_stored_blocks_are_kept_outside_the_per_slot_cap() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -1935,7 +1964,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_that_contradicts_the_stored_bid_is_dropped() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -1949,7 +1981,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_held_for_a_stored_block_goes_with_the_block() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -1966,7 +2001,10 @@ pub(crate) mod tests {
     /// ahead of its parent, then the parent, then the parent's envelope, and
     /// the clock is not ticked in between.
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn catch_up_imports_the_chain_without_a_tick() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(24);
@@ -2001,7 +2039,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_held_envelope_for_the_parent_suppresses_the_immediate_ask() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -2020,7 +2061,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn awaiting_import_keeps_the_lowest_slots_when_over_its_cap() {
         let mut queues = EnvelopeQueues::default();
         let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
@@ -2070,7 +2114,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn a_parent_whose_envelope_is_already_held_is_not_asked_for() {
         let (mut server, p2p) =
             crate::tests::beacon_server_recording(beacon_store(GENESIS_TIME, 0));
@@ -2091,7 +2138,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn an_unmatched_envelope_ages_out_after_the_ttl() {
         // The store clock reads slot 10.
         let mut server = beacon_server(crate::tests::beacon_store_at_slot_10());
@@ -2115,7 +2165,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn the_unmatched_queue_is_bounded_across_slots_by_the_ttl() {
         // Fill every slot the TTL keeps to the per-slot cap and per-root cap,
         // then read off the most the queue can hold.
@@ -2344,7 +2397,10 @@ pub(crate) mod tests {
     /// The actor's import of an envelope is what publishes `execution_payload`,
     /// and `execution_payload_available` right after it.
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_imported_envelope_emits_execution_payload_then_available() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -2393,7 +2449,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_valid_verdict_applies_the_envelope_and_records_valid() {
         let (client, mock) =
             mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
@@ -2427,7 +2486,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_syncing_verdict_applies_the_envelope_as_not_validated() {
         let (client, _mock) =
             mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
@@ -2455,7 +2517,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_verdict_leaves_no_full_node_and_drops_the_full_child() {
         // A non-null `latestValidHash`: the payload executed and failed.
         let (client, mock) = mock_engine(
@@ -2500,7 +2565,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn no_verdict_does_not_apply_the_envelope() {
         // Port 1 has nothing listening, so every attempt is refused at once.
         let client = EngineClient::new("http://127.0.0.1:1".to_string(), JwtSecret::new([0u8; 32]))
@@ -2577,7 +2645,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn the_forkchoice_hashes_follow_the_head_node_and_the_checkpoints_bids() {
         let (server, _mock, hash) = full_head_server("VALID", "SYNCING").await;
         let parent = server
@@ -2639,7 +2710,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_gloas_head_sends_forkchoice_v4_with_the_custody_columns() {
         let (mut server, mock, hash) = full_head_server("VALID", "SYNCING").await;
         server.custody_columns = vec![0, 9];
@@ -2660,7 +2734,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_valid_forkchoice_response_promotes_optimistic_payloads() {
         let (mut server, mock, _hash) = full_head_server("SYNCING", "SYNCING").await;
         assert_eq!(
@@ -2686,7 +2763,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_forkchoice_response_unverifies_the_payload_and_keeps_the_block() {
         let (mut server, _mock, _hash) = full_head_server("SYNCING", "INVALID").await;
 
@@ -2702,7 +2782,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_forkchoice_response_removes_a_child_built_on_the_full_payload() {
         let (mut server, _mock, hash) = full_head_server("SYNCING", "INVALID").await;
         // A child whose bid names the parent's payload as its own parent: the
@@ -2746,7 +2829,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn the_engine_is_not_asked_about_an_envelope_that_fails_consensus_checks() {
         let (client, mock) =
             mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
@@ -2767,7 +2853,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_block_hash_rejects_only_that_envelope() {
         let (client, mock) = mock_engine(
             status_json("INVALID_BLOCK_HASH", None),
@@ -2800,7 +2889,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_engine_error_holds_the_envelope_and_asks_again_once_a_slot() {
         let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;
@@ -2907,7 +2999,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_latest_valid_hash_does_not_reach_a_payload_the_block_skipped() {
         let (mut server, [q, p, r], [hq, _hp, _hr]) = skipped_payload_chain();
 
@@ -2954,7 +3049,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn validation_does_not_promote_a_payload_the_block_skipped() {
         let (mut server, [q, p, r], _hashes) = skipped_payload_chain();
 
@@ -2976,7 +3074,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_payload_takes_its_full_child_and_spares_the_empty_one() {
         let (mut server, [q, p, r], [_hq, hp, _hr]) = skipped_payload_chain();
         // Two children of p: `full` names p's payload as its parent's, `empty`
@@ -3017,7 +3118,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_restored_payload_is_seeded_with_a_verdict_a_valid_answer_can_promote() {
         let (mut server, [q, p, r], _hashes) = skipped_payload_chain();
         // A restart empties the status map; the verified set is on disk.
@@ -3048,7 +3152,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_invalid_verdict_with_a_null_latest_valid_hash_rejects_only_that_envelope() {
         // How ethrex reports a payload whose contents do not hash to its block
         // hash: INVALID, `latestValidHash` null.
@@ -3076,7 +3183,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the fixture envelope does not decode: the payload carries an extra field on this branch"]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_down_engine_is_probed_once_per_redrive_however_many_envelopes_wait() {
         let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
         let mut server = server_with_held_child(client).await;

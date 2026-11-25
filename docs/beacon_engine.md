@@ -43,8 +43,9 @@ Two method families a full client would have are deliberately absent:
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
-  `slotNumber`, and on this branch `dependencyWitnesses`: see
-  [Dependency witnesses](#dependency-witnesses)) from gloas on. The handshake
+  `slotNumber`, and on this branch `dependencyWitnesses` from
+  `HEZE_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
+  gloas on. The handshake
   warns when a gloas network's execution client does not advertise
   `engine_getPayloadV6`.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
@@ -322,36 +323,51 @@ dropped.
 This branch pairs with an execution client whose blocks carry *dependency
 witnesses*: post-quantum signatures (leanSPHINCS, 7,740 bytes each) that sit in
 the block outside its transactions, and that the execution block header commits
-to with a field of its own. They travel in the payload, so `ExecutionPayloadV4`
-has one more member here than the specification gives it:
+to with a field of its own. Execution blocks have that list from the upgrade
+whose consensus side is heze, so `HEZE_FORK_EPOCH` is the epoch a payload
+carries it from. From that epoch `ExecutionPayloadV4` has one more member here
+than the specification gives it; before it, the object is the specification's:
 
 | Method | Direction | `dependencyWitnesses` |
 |---|---|---|
-| `engine_getPayloadV6` | read | An array of `DATA`, one string per witness. An absent key, or `null`, is an empty list. An element that is not `0x`-prefixed hex fails the whole answer, like any other malformed field |
-| `engine_newPayloadV5` | written | An array of `DATA`, the payload's last member. Always present: `[]` when there are none |
+| `engine_getPayloadV6` | read | An array of `DATA`, one string per witness. An element that is not `0x`-prefixed hex fails the whole answer, like any other malformed field. What an absent key or `null` means depends on the payload's slot: see below |
+| `engine_newPayloadV5` | written | An array of `DATA`, the payload's last member, when the payload has the field: `[]` when the list is empty. No such key when the payload does not have the field |
 
 ```json
 "dependencyWitnesses": ["0x<15480 hex digits>", "0x<15480 hex digits>"]
 ```
 
 Between the two calls the list is `dependency_witnesses`, the last field of the
-gloas `ExecutionPayload` container, so the builder's signature covers it and it
-is gossiped, served and stored with the envelope, like the transactions. The
-Beacon API's JSON names it `dependency_witnesses`, an array of hex strings,
-and reads a payload without the key as one with no witnesses.
+gloas `ExecutionPayload` container from `HEZE_FORK_EPOCH` on, so the builder's
+signature covers it and it is gossiped, served and stored with the envelope,
+like the transactions. Before that epoch the container has no such field. In
+the code the field is an `Option`: `None` is the container without it, `Some`
+the container with it, and `Some` of an empty list is not `None`. The Beacon
+API's JSON names it `dependency_witnesses`, an array of hex strings, and
+leaves the key out of a payload that does not have the field.
+
+The execution client and this node must agree on the epoch. On the proposal
+path the node settles it from the payload's own slot
+(`ExecutionPayload::with_dependency_witnesses_field`): from the epoch on, an
+answer without the key becomes the empty list; before it, an empty list is
+dropped, and an answer that holds witnesses is refused, because the execution
+block commits to them and the payload cannot carry them.
 
 The follower never rebuilds the execution header or its hash, so the header's
 commitment needs nothing on this side: `engine_newPayloadV5` hands the list to
 the execution client, which checks it against the header and verifies every
-signature. What the follower judges is each witness's length alone. An envelope
-with a witness that is not exactly 7,740 bytes long is rejected by the
-envelope's gossip rule (`gossip::envelope::cheap_checks`,
-`LEAN_SPHINCS_SIGNATURE_SIZE`), which gossiped and fetched envelopes both go
-through before one can be parked or the engine asked.
+signature. What the follower judges is which container the payload is and
+each witness's length. An envelope whose payload has the field before
+`HEZE_FORK_EPOCH`, or lacks it from that epoch on, is rejected by the
+envelope's gossip rule (`gossip::envelope::cheap_checks`) and by
+`verify_execution_payload_envelope`. So is one with a witness that is not
+exactly 7,740 bytes long (`LEAN_SPHINCS_SIGNATURE_SIZE`), by the gossip rule,
+which gossiped and fetched envelopes both go through before one can be parked
+or the engine asked.
 
-The field changes the encoding and the root of every gloas payload, which is a
-departure from the specification:
-see [spec_deviations.md](./spec_deviations.md#the-gloas-execution-payload-carries-dependency-witnesses).
+The field changes the encoding and the root of every payload from
+`HEZE_FORK_EPOCH` on, which is a departure from the specification:
+see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-dependency-witnesses-from-the-heze-epoch).
 
 ## Blobs from the execution client
 

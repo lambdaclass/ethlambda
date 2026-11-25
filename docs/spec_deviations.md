@@ -800,33 +800,45 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
-## The gloas execution payload carries dependency witnesses
+## The execution payload carries dependency witnesses from the heze epoch
 
 - **The specification:** gloas's `ExecutionPayload` ends at `slot_number`, and
-  `ExecutionPayloadV4` at `slotNumber`.
-- **ethlambda, on this branch:** the container has one more field after
+  `ExecutionPayloadV4` at `slotNumber`. Heze is a fork of its own, with a fork
+  version, and its payload is gloas's.
+- **ethlambda, on this branch:** before `HEZE_FORK_EPOCH` the payload is the
+  specification's. From that epoch on the container has one more field after
   `slot_number`, `dependency_witnesses`, a progressive list of progressive byte
   lists (the shape of `transactions`), and `ExecutionPayloadV4` one more member,
-  `dependencyWitnesses`. See
+  `dependencyWitnesses`. The field is there even when the list is empty. See
   [beacon_engine.md](./beacon_engine.md#dependency-witnesses) for the wire
-  shape in each direction.
+  shape in each direction. Nothing else happens at that epoch: this build does
+  not process heze, so the node stays on gloas, with gloas's fork version,
+  fork digest and rules, and `HEZE_FORK_VERSION` is still an ignored key.
 - **Why:** the execution blocks of the network this branch runs on carry
-  post-quantum signatures outside their transactions, and the consensus layer
-  is what moves an execution block from its builder to every other node's
-  execution client. The field is the last one because a progressive container
-  (EIP-7495) can only grow at its end.
-- **Consequence:** `ExecutionPayload`, `ExecutionPayloadEnvelope`,
-  `SignedExecutionPayloadEnvelope` and `NewPayloadRequest` encode and
-  merkleize differently from the specification's, with or without witnesses
-  in the list. The envelope topic, the envelope req/resp protocols, the Beacon
-  API's envelope bodies and stored envelopes are therefore compatible only
-  among nodes that have the field. Blocks, bids and states are unchanged: a
-  block commits to its payload through the bid's `block_hash`, and no state
-  field holds a payload. The spec-test cases that decode or hash one of the
-  four containers are reported as ignored.
-- **One rule of its own:** the envelope's gossip rule rejects a witness that is
-  not exactly `LEAN_SPHINCS_SIGNATURE_SIZE` (7,740) bytes long. The signatures
-  themselves are verified by the execution client.
+  post-quantum signatures outside their transactions from the upgrade whose
+  consensus side is heze, and the consensus layer is what moves an execution
+  block from its builder to every other node's execution client. The field is
+  the last one because a progressive container (EIP-7495) can only grow at its
+  end.
+- **Consequence:** from `HEZE_FORK_EPOCH` on, `ExecutionPayload`,
+  `ExecutionPayloadEnvelope`, `SignedExecutionPayloadEnvelope` and
+  `NewPayloadRequest` encode and merkleize differently from the
+  specification's, with or without witnesses in the list. The envelope topic,
+  the envelope req/resp protocols, the Beacon API's envelope bodies and stored
+  envelopes of those epochs are therefore compatible only among nodes that
+  have the field, and a node that follows the real heze is not one of them.
+  Blocks, bids and states are unchanged: a block commits to its payload
+  through the bid's `block_hash`, and no state field holds a payload. Before
+  that epoch, and on every network that does not schedule it, the four
+  containers are the specification's, so the spec-test cases that decode or
+  hash one of them run.
+- **Two rules of its own:** a payload must have the field exactly from
+  `HEZE_FORK_EPOCH` on, which the envelope's gossip rule and
+  `verify_execution_payload_envelope` both check, since nothing else an
+  envelope is checked against tells the two containers apart. And the
+  envelope's gossip rule rejects a witness that is not exactly
+  `LEAN_SPHINCS_SIGNATURE_SIZE` (7,740) bytes long. The signatures themselves
+  are verified by the execution client.
 
 ## Columns built from the execution client's blobs are verified
 

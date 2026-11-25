@@ -89,16 +89,6 @@ pub fn trials() -> Vec<Trial> {
             continue;
         }
 
-        // The payload carries an extra field on this branch, so the fixtures
-        // of the containers holding one match neither its encoding nor its
-        // root: see `PAYLOAD_CONTAINERS`. Only gloas's payload changed, so
-        // the same handlers still run for every earlier fork.
-        if case.fork == ForkName::Gloas && super::PAYLOAD_CONTAINERS.contains(&handler.as_str()) {
-            let name = format!("ssz_static/{}", case.id());
-            trials.push(Trial::test(name, || Ok(())).with_ignored_flag(true));
-            continue;
-        }
-
         trials.push(super::case_trial("ssz_static", case, move |case| {
             let fork = case.fork;
 

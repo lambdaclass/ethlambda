@@ -2030,6 +2030,11 @@ fn first_config_difference(
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
+        // Not a fork of this node's: the epoch payloads carry dependency
+        // witnesses from. Compared below under the fork schedule's rule,
+        // since a payload validated before it and one validated after it are
+        // different containers.
+        heze_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -2183,6 +2188,18 @@ fn first_config_difference(
         return Some(format!(
             "{field}: directory has {stored}, config file says {supplied}, \
              and this directory has processed through epoch {processed_through}"
+        ));
+    }
+
+    // May be scheduled or moved while it lies ahead of everything processed
+    // under both values, as a fork's epoch may.
+    if persisted.heze_fork_epoch != supplied.heze_fork_epoch
+        && persisted.heze_fork_epoch.min(supplied.heze_fork_epoch) <= processed_through
+    {
+        return Some(format!(
+            "heze_fork_epoch: directory has {}, config file says {}, \
+             and this directory has processed through epoch {processed_through}",
+            persisted.heze_fork_epoch, supplied.heze_fork_epoch
         ));
     }
 

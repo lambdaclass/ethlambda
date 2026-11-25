@@ -249,7 +249,6 @@ mod tests {
         let parsed = ConfigFile::parse(DEVNET).unwrap();
         for key in [
             "HEZE_FORK_VERSION",
-            "HEZE_FORK_EPOCH",
             "GAS_LIMIT_SCHEDULE",
             "INCLUSION_LIST_DUE_BPS",
         ] {
@@ -258,6 +257,18 @@ mod tests {
                 "{key} not reported"
             );
         }
+    }
+
+    #[test]
+    fn the_heze_epoch_is_claimed_although_heze_is_not_processed() {
+        // The one heze key with a reader: the epoch payloads carry dependency
+        // witnesses from. The devnet file leaves it unscheduled.
+        let parsed = ConfigFile::parse(DEVNET).unwrap();
+        assert!(!parsed.ignored.contains(&"HEZE_FORK_EPOCH".to_string()));
+        assert_eq!(
+            parsed.config.heze_fork_epoch,
+            ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH
+        );
     }
 
     #[test]

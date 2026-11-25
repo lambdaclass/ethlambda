@@ -1150,14 +1150,9 @@ pub fn trials() -> Vec<Trial> {
     let mut trials = vec![super::discovery_trial("fork_choice", cases.len())];
 
     for (_handler, case) in cases {
-        // The payload carries an extra field on this branch, so a fixture's
-        // envelope does not decode: a case with an `execution_payload` step
-        // is ignored rather than run. See `PAYLOAD_CONTAINERS`.
-        let ignored = !case.in_scope() || super::reads_payload_envelope(&case);
-        let trial = super::case_trial("fork_choice", case, |case| {
+        trials.push(super::case_trial("fork_choice", case, |case| {
             run_case(case, &super::case_config(case))
-        });
-        trials.push(trial.with_ignored_flag(ignored));
+        }));
     }
 
     trials

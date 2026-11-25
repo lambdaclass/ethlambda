@@ -199,8 +199,11 @@ struct ExecutionPayloadJson {
     #[serde(default)]
     slot_number: Option<String>,
     /// Not in the specification's `ExecutionPayloadV4`. An execution client
-    /// whose blocks have no dependency witnesses may leave the key out, which
-    /// reads as an empty list.
+    /// sends it for a block that has a witness list, empty or not, and leaves
+    /// the key out for a block that has none. A missing key and `null` both
+    /// read as a payload without the field. Whether that is the right
+    /// container for the payload's slot is the caller's to settle: see
+    /// `ExecutionPayload::with_dependency_witnesses_field`.
     #[serde(default)]
     dependency_witnesses: Option<Vec<String>>,
 }
@@ -295,10 +298,15 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             .ok_or_else(|| decode("ExecutionPayloadV4 carries no slotNumber"))?;
         let dependency_witnesses = payload
             .dependency_witnesses
-            .iter()
-            .flatten()
-            .map(|witness| parse_data(witness).map(gloas::DependencyWitness::from))
-            .collect::<Result<Vec<_>, _>>()?;
+            .as_ref()
+            .map(|witnesses| {
+                witnesses
+                    .iter()
+                    .map(|witness| parse_data(witness).map(gloas::DependencyWitness::from))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .map(gloas::DependencyWitnesses::from);
 
         let execution_payload = gloas::ExecutionPayload {
             parent_hash: H256(parse_fixed(&payload.parent_hash)?),
@@ -322,7 +330,7 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             excess_blob_gas: parse_quantity(&payload.excess_blob_gas)?,
             block_access_list: parse_data(block_access_list)?.into(),
             slot_number: parse_quantity(slot_number)?,
-            dependency_witnesses: dependency_witnesses.into(),
+            dependency_witnesses,
         };
 
         Ok(BuiltGloasPayload {
@@ -552,7 +560,7 @@ mod tests {
         assert_eq!(payload.transactions.len(), 1);
         assert_eq!(payload.withdrawals[0].amount, 3);
         // `v6_json` has no `dependencyWitnesses` key.
-        assert!(payload.dependency_witnesses.is_empty());
+        assert_eq!(payload.dependency_witnesses, None);
         assert_eq!(uint256(&built.block_value), "0x1bc16d674ec80000");
         assert_eq!(built.blobs_bundle.commitments.len(), 1);
         assert_eq!(built.blobs_bundle.proofs.len(), 2);
@@ -615,9 +623,13 @@ mod tests {
         let response: GetPayloadV6Response = serde_json::from_value(json.clone()).unwrap();
         let built = BuiltGloasPayload::try_from(response).unwrap();
         let payload = &built.execution_payload;
-        assert_eq!(payload.dependency_witnesses.len(), 2);
-        assert_eq!(payload.dependency_witnesses[0].as_ref(), &[0xab; 7740]);
-        assert_eq!(payload.dependency_witnesses[1].as_ref(), &[0xcd; 7740]);
+        let read = payload
+            .dependency_witnesses
+            .as_ref()
+            .expect("the key is there");
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].as_ref(), &[0xab; 7740]);
+        assert_eq!(read[1].as_ref(), &[0xcd; 7740]);
 
         // What `engine_newPayloadV5` is sent is what `engine_getPayloadV6`
         // answered, key for key.
@@ -637,7 +649,19 @@ mod tests {
         json["executionPayload"]["dependencyWitnesses"] = serde_json::Value::Null;
         let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
         let built = BuiltGloasPayload::try_from(response).unwrap();
-        assert!(built.execution_payload.dependency_witnesses.is_empty());
+        assert_eq!(built.execution_payload.dependency_witnesses, None);
+    }
+
+    #[test]
+    fn an_empty_dependency_witnesses_array_reads_as_an_empty_list() {
+        let mut json = v6_json();
+        json["executionPayload"]["dependencyWitnesses"] = serde_json::json!([]);
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        assert_eq!(
+            built.execution_payload.dependency_witnesses,
+            Some(Default::default())
+        );
     }
 
     #[test]

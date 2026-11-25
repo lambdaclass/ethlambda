@@ -260,7 +260,7 @@ fn gloas_payload() -> gloas::ExecutionPayload {
         excess_blob_gas: payload.excess_blob_gas,
         block_access_list: vec![0xca, 0xfe].into(),
         slot_number: 33,
-        dependency_witnesses: vec![gloas::DependencyWitness::from(vec![0xbe, 0xef])].into(),
+        dependency_witnesses: Some(vec![gloas::DependencyWitness::from(vec![0xbe, 0xef])].into()),
     }
 }
 
@@ -411,7 +411,32 @@ fn a_gloas_payload_without_dependency_witnesses_in_its_json_has_none() {
     let mut json = serde_json::to_value(gloas_payload()).unwrap();
     json.as_object_mut().unwrap().remove("dependency_witnesses");
     let payload: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
-    assert!(payload.dependency_witnesses.is_empty());
+    assert_eq!(payload.dependency_witnesses, None);
+}
+
+#[test]
+fn a_gloas_payload_without_the_dependency_witnesses_field_writes_no_such_key() {
+    let mut payload = gloas_payload();
+    payload.dependency_witnesses = None;
+    let json = serde_json::to_value(&payload).unwrap();
+    assert!(
+        !json
+            .as_object()
+            .unwrap()
+            .contains_key("dependency_witnesses")
+    );
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
+}
+
+#[test]
+fn a_gloas_payload_with_an_empty_dependency_witnesses_list_keeps_the_field_in_json() {
+    let mut payload = gloas_payload();
+    payload.dependency_witnesses = Some(Default::default());
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["dependency_witnesses"], serde_json::json!([]));
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
 }
 
 #[test]
