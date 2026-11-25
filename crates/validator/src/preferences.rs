@@ -16,8 +16,8 @@
 //! gossip rule compares it with the node's own shuffling dependent root. Fulu's
 //! proposer lookahead fixes an epoch's proposers one epoch earlier than v1's
 //! definition says, so only v2's `dependent_root` is the one a preference must
-//! carry. The duty loop keeps its own v1 schedule; this service fetches v2 for
-//! itself.
+//! carry. The duty loop keeps its own proposer schedule (v2 too from the epoch
+//! after fulu's, v1 before); this service fetches v2 for itself.
 //!
 //! # The signing domain
 //!
