@@ -239,11 +239,12 @@ impl ProposerSettings {
     /// `--gas-limit` from `schedule` (the network's `GAS_LIMIT_SCHEDULE`), at
     /// the epoch each reader names.
     ///
-    /// Set once, when the beacon node's `/eth/v1/config/spec` is in, which is
-    /// after these settings are built and before anything that signs reads
-    /// them. It leaves [`Self::generation`] alone: that counts override
-    /// writes, and the full registration send each epoch compares every gas
-    /// limit it signs anyway.
+    /// Set when the beacon node's `/eth/v1/config/spec` is in, which is after
+    /// these settings are built and before anything that signs reads them,
+    /// and again whenever the chain check takes another schedule from the
+    /// nodes (`chain_check::hand_over_gas_limit_schedule`). It leaves
+    /// [`Self::generation`] alone: that counts override writes, and the full
+    /// registration send each epoch compares every gas limit it signs anyway.
     pub fn set_gas_limit_schedule(&self, schedule: GasLimitSchedule) {
         self.inner
             .write()

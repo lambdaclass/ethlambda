@@ -437,6 +437,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         genesis,
         clock.clone(),
         context.clone(),
+        settings.clone(),
         shutdown.clone(),
     ));
     let mut keymanager = None;

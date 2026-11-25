@@ -424,8 +424,11 @@ a node reporting it unscheduled may only be the one not upgraded yet, while the
 upgraded one is restarting. A fork the network cancels therefore needs a
 restart. A node that stops answering loses its say after three slots, so it cannot
 hold a fork at an epoch the network has postponed (unless the postponement comes in
-the fork's last three slots); the duty offsets are still read from the first node
-through a round it misses. A merge that would put a fork before the one it follows
+the fork's last three slots); the duty offsets and the gas limit schedule are still
+read from the first node through a round it misses. Those two are taken from the
+first node alone, since they identify no chain: a schedule it starts serving after
+startup (a Lighthouse node shows `GAS_LIMIT_SCHEDULE` only once gloas is scheduled)
+becomes the default gas limit from the next round on. A merge that would put a fork before the one it follows
 is refused whole and warned about. A fork that is already active is never moved: a
 node that reports another epoch or version for it is on another chain.
 The client does not need a restart for a fork the network schedules after it

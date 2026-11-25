@@ -955,7 +955,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
   carry, which the node's own gloas payload is built toward; without it, the
   one the beacon node's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch,
-  else 60M.
+  else 60M (the chain check re-reads the schedule from the first usable node, like the
+  duty offsets, and hands it to `ProposerSettings`).
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
