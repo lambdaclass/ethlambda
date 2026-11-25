@@ -20,12 +20,32 @@ COPY --from=planner /app/recipe.json recipe.json
 # cached deps are compiled with default flags and cargo reuses them.
 COPY .cargo/ .cargo/
 
+# leanVM's PQ prover is compiled once more per CPU tier (AVX-512, GFNI and
+# VPCLMULQDQ on x86-64, SHA3 on arm64), and picks the fastest one the host has
+# at run time: one image for every host, as the other clients' leanVM builds
+# are. A tier only gets its instructions when rustc is wrapped by leanVM's own
+# `scripts/tier-rustc`, which adds a tier's target features to that tier's
+# crates and leaves every other crate as asked, so the node itself keeps the
+# portable baseline in `.cargo/config.toml`. Fetched at the pinned revision
+# (`leanvm-revision`, which a test holds equal to the workspace's `rev`), so
+# the wrapper is the one the prover's sources were written against. Set before
+# `cargo chef cook`, which is what compiles the tiers. A build without the
+# `leanvm-cpu-tiers` feature has no tier crates, and the wrapper changes
+# nothing in it.
+COPY leanvm-revision leanvm-revision
+RUN rev="$(tr -d '[:space:]' < leanvm-revision)" \
+    && test -n "$rev" \
+    && curl -fsSL "https://raw.githubusercontent.com/leanEthereum/leanVM/${rev}/scripts/tier-rustc" \
+        -o /usr/local/bin/leanvm-tier-rustc \
+    && chmod +x /usr/local/bin/leanvm-tier-rustc
+ENV RUSTC_WRAPPER=/usr/local/bin/leanvm-tier-rustc
+
 # Build profile, release by default
 ARG BUILD_PROFILE=release
 ENV BUILD_PROFILE=$BUILD_PROFILE
 
-# Extra Cargo features
-ARG FEATURES=""
+# Cargo features. `leanvm-cpu-tiers` by default: see the wrapper above.
+ARG FEATURES="leanvm-cpu-tiers"
 ENV FEATURES=$FEATURES
 
 # Disable default features (e.g. for `shadow-integration`, which must drop the

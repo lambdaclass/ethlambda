@@ -17,6 +17,9 @@ jemalloc = ["dep:tikv-jemallocator"]
 # The quinn-udp UDP fallback is a Cargo `[patch]` (which cannot be feature-gated),
 # injected at build time by `shadow/build.sh` / `make shadow-build`.
 shadow-integration = ["ethlambda-crypto/shadow-integration"]
+# The PQ prover's CPU tiers: see `ethlambda-crypto`'s feature of the same
+# name. The Dockerfile builds with it, and with the wrapper it needs.
+leanvm-cpu-tiers = ["ethlambda-crypto/leanvm-cpu-tiers"]
 
 [dependencies]
 ethlambda-blockchain.workspace = true
