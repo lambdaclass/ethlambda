@@ -118,9 +118,12 @@ const MIN_TOKEN_LEN: usize = 16;
 /// trailing space strips to `Some("")`, and empty matched empty.
 ///
 /// It was reachable without anyone doing anything unusual:
-/// [`secure_fs::write_private`] opens with `truncate(true)` and then writes,
+/// [`secure_fs::write_private`] opened with `truncate(true)` and then wrote,
 /// so a first boot that failed between those two steps left a zero-byte file
-/// that every later boot accepted.
+/// that every later boot accepted. On unix it now replaces the file by
+/// rename, so a first boot cut partway leaves no token file and the next one
+/// generates a token. The refusal stays for a file written any other way: by
+/// hand, or off unix, where the write still truncates in place.
 ///
 /// Refusing is the right failure here rather than regenerating: a token file
 /// that exists but is unusable means something went wrong that an operator
@@ -328,12 +331,31 @@ mod token_tests {
         assert_eq!(generated, reloaded);
     }
 
+    /// A first boot cut between creating the token's temporary file and
+    /// renaming it into place leaves that temporary behind and no token file.
+    /// The next boot generates a token rather than reading the leftover, and
+    /// clears it.
+    #[test]
+    fn a_token_write_cut_partway_leaves_a_token_to_generate_not_a_short_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let leftover = dir.path().join(format!("{API_TOKEN_FILE}.tmp"));
+        std::fs::write(&leftover, "").expect("writes the leftover");
+
+        let generated = load_or_create_token(dir.path()).expect("generates a token");
+
+        assert!(generated.len() >= MIN_TOKEN_LEN);
+        assert!(!leftover.exists(), "the leftover is cleared");
+        let reloaded = load_or_create_token(dir.path()).expect("reads it back");
+        assert_eq!(generated, reloaded);
+    }
+
     /// The authentication bypass this check exists for.
     ///
-    /// `secure_fs::write_private` truncates before it writes, so a first boot
-    /// that dies between those steps leaves a zero-byte file. Accepting it
-    /// produced an empty expected token, and `ct_eq` matches two empty slices,
-    /// so `Authorization: Bearer ` with a trailing space authenticated.
+    /// `secure_fs::write_private` used to truncate before it wrote, so a
+    /// first boot that died between those steps left a zero-byte file, as it
+    /// still can off unix. Accepting it produced an empty expected token, and
+    /// `ct_eq` matches two empty slices, so `Authorization: Bearer ` with a
+    /// trailing space authenticated.
     #[test]
     fn an_empty_token_file_is_refused_rather_than_accepted() {
         let dir = tempfile::tempdir().expect("temp dir");

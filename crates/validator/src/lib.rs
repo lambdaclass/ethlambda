@@ -683,8 +683,10 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
             // epoch it covers a lookahead and a refresh that both failed.
             // After the slot's duties and bounded by the slot's end, so it
             // never delays a duty. Only once this epoch's refresh got through:
-            // until then the refresh itself runs again every slot.
-            if last_epoch == Some(epoch) {
+            // until then the refresh itself runs again every slot. Not once
+            // the client is stopping: the schedule is for slots it will not
+            // serve, and the retry could use up the stop's wait for nothing.
+            if last_epoch == Some(epoch) && !shutdown.is_cancelled() {
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 retry_missing_ptc(&mut duties, epoch, budget, &context).await;
             }

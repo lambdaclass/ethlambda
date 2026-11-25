@@ -388,12 +388,12 @@ impl Handoff {
             signal = &mut signal => return Some(signal),
         }
         let signal = signal.await;
-        if stop.send(signal).is_err() {
+        let _ = stop.send(signal).inspect_err(|_| {
             info!(
                 signal,
                 "Shutdown signal received while the client is already stopping"
-            );
-        }
+            )
+        });
         None
     }
 }
