@@ -954,7 +954,28 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded. `--enable-doppelganger-protection` (`crate::doppelganger`,
+  unguarded. The client checks every beacon node against the chain it runs on
+  (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
+  the first node that answers at startup (startup waits, retrying every 2 s,
+  while none does), and a node whose genesis, preset, slot
+  duration or any active fork's epoch and version differs is skipped by every call
+  until a later check finds it compatible again. A background task re-asks
+  every node every slot, judging and merging each answer as it arrives, at the
+  epoch read then, so a hung node holds back only its own.
+  Every round follows a fork the compatible nodes newly
+  schedule, merged from what each usable node last served
+  (`FallbackBeaconNode::served_configs`; only nodes that answered one of their last
+  `MISSES_BEFORE_SAY_IS_LOST` (3) checks have a say, so one timeout cannot hand the
+  schedule to another node: an unscheduled fork is taken only when all of them schedule
+  it alike, a scheduled one moves only when every one scheduling it agrees, and
+  is never unscheduled; only a fork still in the future may change), into the
+  `SharedConfig` the slot clock and signing
+  domains read, logging the change at `warn`. `Delivery::Everywhere` means every
+  usable node; `BeaconNodeApi::readmissions` tells the preferences service, and
+  the duty loop (subnet and sync subscriptions, builder registrations), to
+  resend when a skipped node is let back in. The spec parser requires the slot duration and every altair
+  to fulu epoch and version rather than defaulting them to mainnet.
+  `--enable-doppelganger-protection` (`crate::doppelganger`,
   Lighthouse's rule) withholds a key's attestations, blocks, RANDAO reveals and
   aggregates from its registration epoch `E` (startup or keymanager import)
   until `/eth/v1/validator/liveness` shows `E + 1` clean at the last slot of
