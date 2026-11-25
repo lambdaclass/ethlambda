@@ -33,6 +33,10 @@ serde_json = "1"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
+[features]
+# The tree hashing with Prysm's `hashtree` kernels, as Silver does.
+hashtree = ["ethlambda-ssz-tree/hashtree"]
+
 # The node ships with this profile; a separate workspace does not inherit it.
 [profile.release]
 opt-level = 3

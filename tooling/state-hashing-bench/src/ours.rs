@@ -1,19 +1,20 @@
 //! ethlambda's tree, `ethlambda-ssz-tree`, driven the way the node's state
 //! transition drives it.
 //!
-//! The lists are the state's own types, update buffers included (a `VecMap`
-//! for balances and participation, a `BTreeMap` for validators and
+//! The lists are the state's own types, update buffers included (a
+//! `SparseMap` for balances and participation, a `BTreeMap` for validators and
 //! inactivity scores). Writes are buffered and folded in by `apply_updates`,
-//! as block processing and fulu's epoch pass (`single_pass::write_back`) do,
-//! except where they cover a large share of a list (the epoch's balance
-//! rewrite): those go through the write cursor (`iter_cow`, the API
-//! `try_update_balances` uses). At that density the two cost the same,
-//! measured at 49.8 ms (buffer) against 50.0 ms (cursor) per epoch on an M3
-//! Pro, so the choice does not tilt the comparison. Participation rotates with
-//! `mem::take` plus `List::repeat`, as `process_participation_flag_updates`
+//! as block processing does, except where they cover a large share of a list:
+//! the epoch's balance rewrite goes through the write cursor (`iter_cow`), as
+//! fulu's epoch pass (`single_pass::write_back`) does. Participation rotates
+//! with `mem::take` plus `List::repeat`, as `process_participation_flag_updates`
 //! does. Each list's time is its clone, its writes and its root.
+//!
+//! `Ours` is generic over how the two participation lists are kept: the
+//! state's own tree (`EpochParticipation`), or a [`FlatList`], every Merkle
+//! level kept flat as Silver keeps its lists.
 
-use ethlambda_ssz_tree::{Length, ListOf, UpdateMap, Value};
+use ethlambda_ssz_tree::{FlatList, Length, ListOf, UpdateMap, Value};
 use ethlambda_types::beacon::containers::{
     Balances, EpochParticipation, InactivityScores, Validators,
 };
@@ -23,28 +24,102 @@ use crate::format::{Root, Roots};
 use crate::trace::{Initial, Step, Writes};
 use crate::{Candidate, ListTimes, timed};
 
+/// How the participation lists are kept.
+pub trait Participation: Clone + Send + Sync + 'static {
+    fn build(values: Vec<u8>) -> (Self, Root);
+    /// Next epoch's previous participation: `current`, grown to `len` with
+    /// the epoch's new validators.
+    fn rotated(current: &Self, len: usize) -> Self;
+    /// Next epoch's current participation: `len` zeros.
+    fn zeros(len: usize) -> Self;
+    fn write_and_commit(self, writes: &Writes<u8>) -> (Self, Root);
+}
+
+impl Participation for EpochParticipation {
+    fn build(values: Vec<u8>) -> (Self, Root) {
+        let list = Self::try_from(values).expect("under the limit");
+        let root = root(&list);
+        (list, root)
+    }
+
+    fn rotated(current: &Self, len: usize) -> Self {
+        let mut list = current.clone();
+        while list.len() < len {
+            list.push(0).expect("under the limit");
+        }
+        list
+    }
+
+    fn zeros(len: usize) -> Self {
+        Self::repeat(0, len).expect("under the limit")
+    }
+
+    fn write_and_commit(mut self, writes: &Writes<u8>) -> (Self, Root) {
+        write(&mut self, writes);
+        commit(self)
+    }
+}
+
+/// The participation flags in a [`FlatList`], with the state's bound.
+pub type FlatParticipation = FlatList<u8, { 1 << 40 }>;
+
+impl Participation for FlatParticipation {
+    fn build(values: Vec<u8>) -> (Self, Root) {
+        let mut list = Self::try_from(values).expect("under the limit");
+        let root = list.commit();
+        (list, root)
+    }
+
+    fn rotated(current: &Self, len: usize) -> Self {
+        let mut list = current.clone();
+        while list.len() < len {
+            list.push(0).expect("under the limit");
+        }
+        list
+    }
+
+    fn zeros(len: usize) -> Self {
+        Self::zeros(len).expect("under the limit")
+    }
+
+    /// Writes go straight into the pages: a flat list has no buffer.
+    fn write_and_commit(mut self, writes: &Writes<u8>) -> (Self, Root) {
+        let len = self.len();
+        for (&index, &value) in writes.indices.iter().zip(&writes.values) {
+            let index = index as usize;
+            if index < len {
+                self.set(index, value);
+            } else {
+                self.push(value).expect("under the limit");
+            }
+        }
+        let root = self.commit();
+        (self, root)
+    }
+}
+
 #[derive(Clone)]
-pub struct Ours {
+pub struct Ours<P = EpochParticipation> {
     validators: Validators,
     balances: Balances,
-    previous: EpochParticipation,
-    current: EpochParticipation,
+    previous: P,
+    current: P,
     inactivity: InactivityScores,
     roots: Roots,
 }
 
-impl Candidate for Ours {
+impl<P: Participation> Candidate for Ours<P> {
     fn build(initial: Initial) -> Self {
         let validators = Validators::try_from(initial.validators).expect("under the limit");
         let balances = Balances::try_from(initial.balances).expect("under the limit");
-        let previous = EpochParticipation::try_from(initial.previous).expect("under the limit");
-        let current = EpochParticipation::try_from(initial.current).expect("under the limit");
+        let (previous, previous_root) = P::build(initial.previous);
+        let (current, current_root) = P::build(initial.current);
         let inactivity = InactivityScores::try_from(initial.inactivity).expect("under the limit");
         let roots = Roots {
             validators: root(&validators),
             balances: root(&balances),
-            previous_participation: root(&previous),
-            current_participation: root(&current),
+            previous_participation: previous_root,
+            current_participation: current_root,
             inactivity_scores: root(&inactivity),
         };
         Self {
@@ -69,28 +144,20 @@ impl Candidate for Ours {
             commit(list)
         });
         let (previous, previous_root) = timed(&mut times[2], || {
-            let mut list = match step.rotation {
+            let list = match step.rotation {
                 // The node's rotation moves current into previous, after the
                 // epoch's new validators were appended to it.
-                Some(len) => {
-                    let mut list = self.current.clone();
-                    while list.len() < len {
-                        list.push(0).expect("under the limit");
-                    }
-                    list
-                }
+                Some(len) => P::rotated(&self.current, len),
                 None => self.previous.clone(),
             };
-            write(&mut list, &step.previous);
-            commit(list)
+            list.write_and_commit(&step.previous)
         });
         let (current, current_root) = timed(&mut times[3], || {
-            let mut list = match step.rotation {
-                Some(len) => EpochParticipation::repeat(0, len).expect("under the limit"),
+            let list = match step.rotation {
+                Some(len) => P::zeros(len),
                 None => self.current.clone(),
             };
-            write(&mut list, &step.current);
-            commit(list)
+            list.write_and_commit(&step.current)
         });
         let (inactivity, inactivity_root) = timed(&mut times[4], || {
             let mut list = self.inactivity.clone();
@@ -150,9 +217,9 @@ fn write<T: Value, L: Length, U: UpdateMap<T>>(list: &mut ListOf<T, L, U>, write
 /// The writes below the old length go in descending index order. The trace
 /// holds them sorted, but the node's arrive unsorted (sync committee members
 /// and attesters in committee order), so its first few already reach near the
-/// end of the list and a `VecMap` buffer grows to full size about once.
-/// Ascending order would regrow and copy it every time the highest index
-/// written doubled, a cost the node does not pay.
+/// end of the list. That matters to a dense `VecMap` buffer, which ascending
+/// order would regrow every time the highest index written doubled, a cost the
+/// node does not pay.
 fn buffered<T: Value, L: Length, U: UpdateMap<T>>(list: &mut ListOf<T, L, U>, writes: &Writes<T>) {
     let len = list.len();
     let split = writes

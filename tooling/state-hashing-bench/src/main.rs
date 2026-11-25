@@ -50,15 +50,18 @@ struct Args {
     /// Also write every summary and per-step time to this JSON file.
     #[arg(long)]
     json: Option<PathBuf>,
-    /// Run one library only, for a quicker loop while working on it.
-    #[arg(long, value_enum)]
-    only: Option<Library>,
+    /// Run only these candidates (comma-separated), for a quicker loop
+    /// while working on one.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    only: Vec<Library>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Library {
     Silver,
     Ours,
+    /// Ours with the participation lists in a `FlatList`.
+    Flat,
 }
 
 /// Time per list, in [`LIST_NAMES`] order.
@@ -198,7 +201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         1 => "1 thread".to_string(),
         n => format!("{n} threads"),
     };
-    let runs = |library| args.only.is_none_or(|only| only == library);
+    let runs = |library| args.only.is_empty() || args.only.contains(&library);
     let mut runners = Vec::new();
     if runs(Library::Silver) {
         runners.push(Runner::new::<silver::Silver>(
@@ -210,6 +213,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         for &n in &threads {
             runners.push(Runner::new::<ours::Ours>(
                 format!("ethlambda-ssz-tree, {}", label(n)),
+                n,
+            )?);
+        }
+    }
+    if runs(Library::Flat) {
+        type Flat = ours::Ours<ours::FlatParticipation>;
+        for &n in &threads {
+            runners.push(Runner::new::<Flat>(
+                format!("ethlambda-ssz-tree, flat participation, {}", label(n)),
                 n,
             )?);
         }
