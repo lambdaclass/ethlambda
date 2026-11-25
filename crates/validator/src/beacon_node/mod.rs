@@ -467,9 +467,11 @@ pub trait BeaconNodeApi: Send + Sync {
     /// definition (one epoch later) is not.
     ///
     /// The fallback fails over quietly here: when every node fails it logs
-    /// nothing of its own, since its one caller, the preferences service,
-    /// reports the failure itself, once per epoch. A new caller that needs
-    /// the failure seen must log it.
+    /// nothing of its own, since both callers report the failure themselves:
+    /// the preferences service once per epoch, and the duty loop, whose
+    /// proposer schedule comes from here from fulu (see
+    /// `duties::ProposerDutiesVersion`), at each fetch. A new caller that
+    /// needs the failure seen must log it.
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
     /// Produce the attestation data for `slot`, which is in `fork`.
