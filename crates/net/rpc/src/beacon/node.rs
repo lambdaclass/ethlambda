@@ -107,8 +107,11 @@ async fn get_version(version: &'static str) -> Response {
 /// devnet orchestrator wiring bootnodes, say) dials it.
 ///
 /// The addresses are only as good as `--discovery.advertise-ip`: without it the
-/// node does not know the address peers reach it on, so the lists are empty and
-/// the ENR carries no IP.
+/// node does not know the address peers reach it on, so the lists are empty.
+/// The ENR is read live, so it can still gain a usable IP without the flag: it
+/// starts with no usable one (the `0.0.0.0` discovery binds), and discv5's IP
+/// voting re-signs it with the external address once peers agree on one. The
+/// lists stay empty even then.
 ///
 /// `metadata` is the `MetaData` peers get over req/resp, read at request time.
 /// Its `seq_number` versions that `MetaData` alone, so it is not the ENR's

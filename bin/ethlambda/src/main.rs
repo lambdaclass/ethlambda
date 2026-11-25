@@ -137,7 +137,9 @@ fn main() -> eyre::Result<()> {
 /// serves, read live, and the multiaddrs peers reach this node on. The
 /// addresses need the node's externally reachable IP, which only
 /// `--discovery.advertise-ip` supplies (a node bound to `0.0.0.0` does not know
-/// it), so without the flag they are left empty rather than guessed.
+/// it), so without the flag they are left empty rather than guessed. They stay
+/// empty even once discv5's IP voting has written an external address into the
+/// ENR: the record is read live, these lists are built once, here.
 fn beacon_identity(
     enr: ethlambda_rpc::EnrSource,
     advertise_ip: Option<IpAddr>,
@@ -839,6 +841,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         payload_attestation_pool.clone(),
         builder_market.clone(),
         sync_committee_pool.clone(),
+        Some(Arc::new(events.clone())),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;

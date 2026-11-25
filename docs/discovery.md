@@ -158,7 +158,11 @@ knows an address and a public key and nothing about `quic`, `tcp` or `attnets`;
 the dial loop looks the node id back up in what the filter filed to recover the
 multiaddrs and the subnets. A node discovery offers that we never read an admissible record
 for is skipped, which is what happens to a bootnode still known only as a bare
-endpoint.
+endpoint. What the filter files is capped at 10,000 nodes, the bound of ethrex's own
+connection pool, and like that pool it evicts the oldest entry to make room rather
+than turning new ones away: nodes that leave mainnet are never forgotten otherwise,
+and a full map that refused newcomers would have the dial loop skip every node
+discovery offered it from then on.
 
 A peer's dial list carries every address it advertises, `quic` and `tcp` both,
 in one dial attempt, `quic` first. libp2p walks that list `dial_concurrency_factor`
@@ -175,9 +179,20 @@ natively and reaches none of that code, so the cheaper transport is now asked fo
 first instead of merely offered. A lean peer advertises `quic` alone and is
 unaffected either way.
 
-Admitted peers are ranked by how many attestation subnets they advertise that no
-currently connected peer covers, so discovery preferentially fills gaps in subnet
-coverage. A peer advertising no `attnets` is ranked last but never dropped.
+Admitted peers are ranked to fill this node's gaps first, by three counts compared
+in order:
+
+1. **Custody.** How many undersupplied columns the peer's `cgc` puts it in
+   custody of: columns this node samples that fewer than `MAX_FETCH_RETRIES`
+   (10, the by-root retry ladder's rounds) connected peers custody. Always zero
+   on lean, which samples nothing, and for a record with no `cgc`.
+2. **Wanted subnets.** How many of the subnets the [subnet hunt](#hunting-for-subnet-peers)
+   is looking for the peer advertises.
+3. **Uncovered subnets.** How many attestation subnets the peer advertises that no
+   currently connected peer covers.
+
+A peer scoring zero on all three, such as one whose record carries neither `cgc`
+nor `attnets`, is ranked last but never dropped.
 
 Dialing stops once `--discovery.target-peers` peers are connected, and resumes if
 that count drops. The same number also paces discovery itself: every connection
@@ -235,11 +250,17 @@ ethrex's predicate queries (Lighthouse does the same with sigp/discv5's
   `attnets` of peers dialed from discovery, so an inbound peer covers nothing
   here, as in ranking.
 - **What matches.** A record that passes admission and sets at least one short
-  subnet's `attnets` bit. A match counts only once its node has answered the
-  walk, so dead records stay out.
+  subnet's `attnets` bit. A match the walk finds counts only once its node has
+  answered the walk, so dead records stay out of that step. The first step has
+  no such check: it hands over records discovery already holds without asking
+  their nodes anything, so a cached match may be a node that has gone, and the
+  dial is what finds out.
 - **How it runs.** One hunt at a time, off the P2P actor: first the matches
   discovery already holds, then a walk of up to 10 s for the rest, at most 6
-  peers per hunt, then a 30 s pause. Nothing is hunted while the dial loop has
+  peers per hunt, then a 30 s pause. A hunt that handed nothing over and never
+  reached the network (its walk failed, or saw no node at all) is retried after
+  5 s instead: that is a hunt run before any bootnode has answered, since
+  discovery starts out knowing them only as bare endpoints. Nothing is hunted while the dial loop has
   no budget to dial a find. A peer a hunt handed over is left out of hunts for
   10 minutes, since discovery keeps offering a mainnet peer that connected and
   said goodbye.

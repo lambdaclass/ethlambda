@@ -375,10 +375,14 @@ pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bo
         let opts = DialOpts::peer_id(candidate.peer_id)
             .addresses(candidate.addrs)
             .build();
-        // The candidate has already been popped and marked tried in the peer
-        // table, so this is the only chance to record its subnets: whatever
-        // happens here, it will not be offered again. Which makes the refusal
-        // the swarm gives back decide whether recording them is right.
+        // The candidate has already been popped, so this is the only chance to
+        // record its subnets for this draw: whatever happens here, the dial
+        // loop does not see it again unless it is offered anew. A contact-poll
+        // draw was marked tried in ethrex's contact table on the way out, so
+        // discovery holds it back until it has offered every other node in its
+        // pool; a subnet-hunt find was not, and a later hunt may hand it over
+        // again once `REOFFER_AFTER` has passed. Either way, the refusal the
+        // swarm gives back is what decides whether recording them is right.
         match server.swarm_handle.dial_outcome(opts).await {
             // Nothing in flight and nothing coming, so `forget_discovered_peer`
             // would never run: recording the subnets here would leave

@@ -24,8 +24,10 @@
 //!
 //! Lighthouse does the same with sigp/discv5's `find_node_predicate`, whose
 //! semantics ethrex's `find_nodes` copies: a match counts only once its node has
-//! answered the query, so dead records stay out. The predicate is
-//! Lighthouse's too: everything admission checks, plus at least one wanted
+//! answered the query, so dead records stay out of the walk's answer. The cached
+//! step, `records_matching`, makes no such check: it hands over records
+//! discovery already holds without asking their nodes anything. The predicate
+//! is Lighthouse's too: everything admission checks, plus at least one wanted
 //! `attnets` bit.
 //!
 //! [`rank_candidates`]: super::admission::rank_candidates
@@ -38,6 +40,7 @@ use ethrex_p2p::discovery::DiscoveryHandle;
 use ethrex_p2p::types::NodeRecord;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::admission::{DiscoveredPeer, LeanFilter};
@@ -69,9 +72,21 @@ const HUNT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Long enough for the last hunt's dials to become connections, so the next
 /// one counts them instead of hunting for peers already on their way; a dial
 /// that times out takes ten seconds by itself. On a small network that has no
-/// more peers on a subnet to give, this is also the rate a hunt that finds
-/// nothing is repeated at.
+/// more peers on a subnet to give, this is also the rate a hunt whose walk saw
+/// the network and matched nothing is repeated at. A hunt that never reached
+/// the network waits [`HUNT_RETRY`] instead (see [`pause_after`]).
 const HUNT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Pause after a hunt that handed over nothing and never reached the network:
+/// its walk could not run, or ran and saw no node at all.
+///
+/// That is a hunt run before the network has answered: the first one starts
+/// while discovery knows its bootnodes only as bare endpoints, with no record
+/// to match, and its walk sees nothing until one of them replies (or none
+/// answers at all). Such a hunt leaves no dials in flight for
+/// [`HUNT_INTERVAL`] to wait out, so waiting it would only leave the
+/// subscribed subnets unhunted for longer.
+const HUNT_RETRY: Duration = Duration::from_secs(5);
 
 /// How long a peer the hunt handed over stays out of later hunts.
 ///
@@ -94,14 +109,17 @@ pub(crate) struct SubnetHunt {
     wanted: watch::Sender<BTreeSet<u64>>,
     /// Peers the hunt found, already through admission.
     found: mpsc::UnboundedReceiver<DiscoveredPeer>,
+    /// The hunt task, aborted when this value is dropped.
+    task: JoinHandle<()>,
 }
 
 impl SubnetHunt {
     /// Start the hunt task, idle until [`Self::update`] publishes a subnet.
     /// Must be called from inside a tokio runtime.
     ///
-    /// The task ends once this value is dropped, at the end of the hunt it is
-    /// in, which is when the `P2PServer` holding it goes away.
+    /// The task is aborted when this value is dropped, which is when the
+    /// `P2PServer` holding it goes away, wherever the task is: idle, asleep
+    /// between hunts, or in the middle of one.
     pub(crate) fn spawn(
         handle: DiscoveryHandle,
         filter: LeanFilter,
@@ -109,11 +127,12 @@ impl SubnetHunt {
     ) -> Self {
         let (wanted, wanted_rx) = watch::channel(BTreeSet::new());
         let (found_tx, found) = mpsc::unbounded_channel();
-        tokio::spawn(hunt(handle, filter, wanted_rx, found_tx));
+        let task = tokio::spawn(hunt(handle, filter, wanted_rx, found_tx));
         Self {
             subscribed,
             wanted,
             found,
+            task,
         }
     }
 
@@ -158,6 +177,21 @@ impl SubnetHunt {
     }
 }
 
+impl Drop for SubnetHunt {
+    /// Stop the task rather than wait for it to notice that `wanted` closed.
+    ///
+    /// It would not notice in time: `watch::Receiver::wait_for` tests the
+    /// current value before it reports the sender gone, so a task asleep
+    /// between hunts would wake to whatever was last wanted and, if that was
+    /// anything, run one more whole hunt for nobody, a network walk of up to
+    /// [`HUNT_QUERY_TIMEOUT`] included. Aborting drops whatever the task is
+    /// awaiting, and a dropped `find_nodes` future is how discovery is told to
+    /// abandon its query, so a walk under way ends cleanly too.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// The subscribed subnets fewer than [`TARGET_SUBNET_PEERS`] connected peers
 /// advertise.
 ///
@@ -187,7 +221,8 @@ fn short_subnets(
         .collect()
 }
 
-/// The hunt task: one hunt per [`HUNT_INTERVAL`] while anything is wanted.
+/// The hunt task: one hunt per [`HUNT_INTERVAL`] while anything is wanted,
+/// sooner while discovery has not reached the network yet ([`pause_after`]).
 ///
 /// A hunt first offers the matches discovery already holds, which costs no
 /// network round trip, and walks the network only for what that left short.
@@ -200,7 +235,10 @@ async fn hunt(
 ) {
     let mut offered: HashMap<H256, Instant> = HashMap::new();
     loop {
-        // An error is the dial loop's sender going away, which is shutdown.
+        // An error is the dial loop's sender gone with nothing wanted. The
+        // `SubnetHunt` that held it has aborted this task on its way out, and
+        // the abort is what normally ends it; this only ends a poll already
+        // under way when the abort landed.
         let Ok(subnets) = wanted
             .wait_for(|wanted| !wanted.is_empty())
             .await
@@ -214,7 +252,7 @@ async fn hunt(
         let cached = handle.records_matching(predicate).await;
         let mut handed = offer(&filter, cached, MAX_HUNT_RESULTS, &mut offered, &found);
 
-        if handed < MAX_HUNT_RESULTS {
+        let walk = if handed < MAX_HUNT_RESULTS {
             // Rebuilt, so the walk does not count the peers just offered.
             let predicate = hunt_predicate(&filter, &subnets, &offered);
             match handle
@@ -239,11 +277,17 @@ async fn hunt(
                         "Subnet hunt finished"
                     );
                     handed += walked;
+                    Walk::Ran {
+                        nodes_seen: result.nodes_seen,
+                    }
                 }
                 // Not running is shutdown or a discovery that failed to start,
                 // and a refusal is a full query slot: either way, the next hunt
-                // asks again.
-                Err(err) => debug!(?subnets, cached = handed, %err, "Subnet hunt could not walk"),
+                // asks again, and soon if this one handed nothing over.
+                Err(err) => {
+                    debug!(?subnets, cached = handed, %err, "Subnet hunt could not walk");
+                    Walk::Failed
+                }
             }
         } else {
             debug!(
@@ -251,12 +295,41 @@ async fn hunt(
                 cached = handed,
                 "Subnet hunt satisfied from known records"
             );
-        }
+            Walk::Skipped
+        };
         if found.is_closed() {
             return;
         }
         crate::metrics::inc_subnet_hunt_peers(handed as u64);
-        tokio::time::sleep(HUNT_INTERVAL).await;
+        tokio::time::sleep(pause_after(handed, walk)).await;
+    }
+}
+
+/// How a hunt's network walk went, for [`pause_after`].
+#[derive(Debug, Clone, Copy)]
+enum Walk {
+    /// Not needed: what discovery already held filled the hunt.
+    Skipped,
+    /// Ran to an answer, having seen this many distinct nodes' records.
+    Ran { nodes_seen: usize },
+    /// Could not run.
+    Failed,
+}
+
+/// How long to wait after a hunt that handed `handed` peers over and whose
+/// walk went as `walk`.
+///
+/// [`HUNT_INTERVAL`] whenever there is something to wait for: finds being
+/// dialed, which the next hunt should count as connections, or a network that
+/// answered and had nothing more to give. [`HUNT_RETRY`] when there is neither,
+/// a hunt that handed nothing over and never reached the network, which is
+/// what a hunt run before any node has answered discovery looks like.
+fn pause_after(handed: usize, walk: Walk) -> Duration {
+    match walk {
+        Walk::Skipped => HUNT_INTERVAL,
+        _ if handed > 0 => HUNT_INTERVAL,
+        Walk::Ran { nodes_seen } if nodes_seen > 0 => HUNT_INTERVAL,
+        Walk::Ran { .. } | Walk::Failed => HUNT_RETRY,
     }
 }
 
@@ -407,10 +480,38 @@ mod tests {
         assert_eq!(handed.len(), 3);
     }
 
+    #[test]
+    fn a_hunt_that_never_reached_the_network_is_retried_soon() {
+        // A hunt run before any bootnode has answered: nothing cached matched,
+        // the walk saw no node, and nothing is being dialed that the full
+        // interval would wait for.
+        assert_eq!(pause_after(0, Walk::Ran { nodes_seen: 0 }), HUNT_RETRY);
+        assert_eq!(pause_after(0, Walk::Failed), HUNT_RETRY);
+    }
+
+    #[test]
+    fn a_hunt_with_dials_in_flight_or_a_network_that_answered_waits_the_interval() {
+        assert_eq!(
+            pause_after(0, Walk::Ran { nodes_seen: 40 }),
+            HUNT_INTERVAL,
+            "the network answered and had no match: asking again at once finds none either"
+        );
+        assert_eq!(
+            pause_after(2, Walk::Failed),
+            HUNT_INTERVAL,
+            "cached finds are being dialed, and the next hunt should count them"
+        );
+        assert_eq!(pause_after(2, Walk::Ran { nodes_seen: 0 }), HUNT_INTERVAL);
+        assert_eq!(pause_after(MAX_HUNT_RESULTS, Walk::Skipped), HUNT_INTERVAL);
+    }
+
     #[tokio::test]
     async fn nothing_is_wanted_while_the_dial_loop_cannot_dial() {
-        // An unset handle: the task it starts finds discovery not running,
-        // which is all this test needs, since it reads only what is published.
+        // An unset handle, which the spawned task never gets to use:
+        // `#[tokio::test]` runs on a current-thread runtime and this test
+        // never awaits, so the task is not polled once before the drop at the
+        // end aborts it. That is all this test needs, since it reads only what
+        // `update` publishes.
         let hunt = SubnetHunt::spawn(DiscoveryHandle::new(), filter(), HashSet::from([1, 4]));
 
         hunt.update(&HashMap::new(), &HashMap::new(), true);

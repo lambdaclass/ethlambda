@@ -19,7 +19,7 @@
 //! and the dial loop looks the node id back up there and ranks what it got
 //! ([`rank_candidates`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ethrex_common::H256;
@@ -27,7 +27,7 @@ use ethrex_p2p::peer_filter::PeerFilter;
 use ethrex_p2p::types::NodeRecord;
 use libp2p::{Multiaddr, PeerId};
 use libssz::SszDecode;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::beacon::constants;
@@ -40,14 +40,27 @@ use super::enr::{
 use super::node_id::node_id_from_public_key;
 use crate::dial_addrs;
 
-/// Dial targets held at once, past which a new one is dropped.
+/// Dial targets held at once, past which the oldest is evicted to make room for
+/// a new one.
 ///
-/// Only records that pass admission land here, so on any real network the map
-/// is the size of the lean population and never approaches this. The cap is for
-/// the case where that population is manufactured: minting ENRs costs a
-/// signature, and an unbounded map would grow with however many an adversary
-/// cares to gossip. Matching ethrex's own connection-pool bound keeps our
-/// memory in the same order as the table that feeds us.
+/// Only records that pass admission land here, but on beacon mainnet that is
+/// still on the order of ten thousand nodes, and node ids churn. A node that
+/// leaves the network never publishes the higher-`seq` record that would
+/// [`DialTargets::forget`] it, so departed nodes pile up for the life of the
+/// process and the map reaches this cap; the subnet hunt gets it there sooner,
+/// since every record a predicate query sees goes through the filter too. Once
+/// full, refusing new entries would drop every later admission, and the dial
+/// loop would silently skip each node discovery offers it afterwards. Evicting
+/// first-in-first-out keeps the newest admissions instead, the same policy and
+/// the same bound as ethrex's own connection pool, which feeds us.
+///
+/// Eviction has a cost too: discovery re-runs the filter only on a node it has
+/// no contact for or on a higher-`seq` record, so a live node evicted here
+/// while discovery still holds its contact is not filed again until it
+/// republishes, and the dial loop skips it until then like any node it has no
+/// target for. The cap itself is for a manufactured population: minting ENRs
+/// costs a signature, and an unbounded map would grow with however many an
+/// adversary cares to gossip.
 const MAX_DIAL_TARGETS: usize = 10_000;
 
 /// A peer that passed admission and is ready to dial.
@@ -79,9 +92,9 @@ pub(crate) struct DiscoveredPeer {
 /// What the filter admitted, keyed by the node id discovery will name it with.
 ///
 /// Written inside the discovery actor as ENRs arrive, read by the dial loop in
-/// the P2P actor, hence the lock. Every critical section is one map operation on
-/// data already in hand, so nothing is held across an `.await` and the discovery
-/// message loop is never parked on it.
+/// the P2P actor, hence the lock. Every critical section is a few collection
+/// calls on data already in hand, so nothing is held across an `.await` and the
+/// discovery message loop is never parked on it.
 ///
 /// This exists because the two halves know different things about the same peer.
 /// Discovery decides *whether* to dial, from facts it tracks itself: whether the
@@ -90,21 +103,42 @@ pub(crate) struct DiscoveredPeer {
 /// *How* to dial a lean peer lives in ENR entries discovery has no opinion
 /// about, so we keep what we read out of the record the one time we saw it.
 #[derive(Clone, Default)]
-pub(crate) struct DialTargets(Arc<Mutex<HashMap<H256, DiscoveredPeer>>>);
+pub(crate) struct DialTargets(Arc<Mutex<Targets>>);
+
+/// What [`DialTargets`] guards.
+#[derive(Default)]
+struct Targets {
+    by_id: HashMap<H256, DiscoveredPeer>,
+    /// `by_id`'s keys, each exactly once, oldest first: the order
+    /// [`MAX_DIAL_TARGETS`] evicts in.
+    order: VecDeque<H256>,
+}
 
 impl DialTargets {
     /// File a peer the filter just admitted, replacing what an earlier record
-    /// said about it.
+    /// said about it, and evict the oldest target if that takes the map past
+    /// [`MAX_DIAL_TARGETS`].
+    ///
+    /// A newer record from a node already filed replaces the target but keeps
+    /// its place in line, as ethrex's connection pool does: moving it to the
+    /// back would mean finding it in `order` first, a linear scan on every
+    /// republished record.
     fn record(&self, peer: DiscoveredPeer) {
         let mut targets = self.lock();
-        if targets.len() >= MAX_DIAL_TARGETS && !targets.contains_key(&peer.node_id) {
-            debug!(
-                node_id = %peer.node_id,
-                "Dropping dial target: already holding MAX_DIAL_TARGETS"
-            );
+        let node_id = peer.node_id;
+        if targets.by_id.insert(node_id, peer).is_some() {
             return;
         }
-        targets.insert(peer.node_id, peer);
+        targets.order.push_back(node_id);
+        if targets.order.len() > MAX_DIAL_TARGETS
+            && let Some(oldest) = targets.order.pop_front()
+        {
+            targets.by_id.remove(&oldest);
+            trace!(
+                node_id = %oldest,
+                "Evicting the oldest dial target: holding MAX_DIAL_TARGETS"
+            );
+        }
     }
 
     /// Forget a peer whose latest record no longer passes admission.
@@ -112,20 +146,30 @@ impl DialTargets {
     /// Discovery stops offering it either way, so this is about not keeping a
     /// stale multiaddr for a peer that moved off our network.
     fn forget(&self, node_id: &H256) {
-        self.lock().remove(node_id);
+        let mut targets = self.lock();
+        // Every rejected record lands here, but only one that used to pass is
+        // filed, which is rare enough to afford the linear scan of `order`.
+        // The id cannot stay there: `order` would then outnumber the map and
+        // evict before it is full, and a node filed again later would hold two
+        // places in line and be evicted at the older one.
+        if targets.by_id.remove(node_id).is_some() {
+            targets.order.retain(|id| id != node_id);
+        }
     }
 
     /// How to dial `node_id`, or `None` for a node we never saw an admissible
-    /// record for. That covers every bootnode discovery knows only as a bare
-    /// endpoint, which is why it is an ordinary answer rather than a surprise.
+    /// record for, or whose target was evicted since. That covers every
+    /// bootnode discovery knows only as a bare endpoint, which is why it is an
+    /// ordinary answer rather than a surprise.
     pub(crate) fn get(&self, node_id: &H256) -> Option<DiscoveredPeer> {
-        self.lock().get(node_id).cloned()
+        self.lock().by_id.get(node_id).cloned()
     }
 
     /// The only way the map is reached, so the reason a poisoned lock is
-    /// impossible is stated once: every critical section is a `HashMap` call
-    /// with no user code inside it, so no panic can leave the map torn.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<H256, DiscoveredPeer>> {
+    /// impossible is stated once: every critical section is a few `HashMap`
+    /// and `VecDeque` calls with no user code inside them, so no panic can
+    /// leave the two torn.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Targets> {
         self.0.lock().expect("dial targets lock is never poisoned")
     }
 }
@@ -823,6 +867,62 @@ mod tests {
 
         assert!(!policy.accepts(&record));
         assert_eq!(filed_target(&policy, &record), None);
+    }
+
+    /// A target filed under the node id `n`. Nothing below reads anything else.
+    fn numbered_target(n: u64) -> DiscoveredPeer {
+        DiscoveredPeer {
+            node_id: H256::from_low_u64_be(n),
+            ..DiscoveredPeer::for_test(vec![])
+        }
+    }
+
+    #[test]
+    fn a_full_map_makes_room_for_a_new_target() {
+        // On mainnet, nodes that left the network fill the map. Refusing what
+        // arrives after that would leave the dial loop skipping every node
+        // discovery offers it from then on.
+        let targets = DialTargets::default();
+        let max = MAX_DIAL_TARGETS as u64;
+        for n in 0..max {
+            targets.record(numbered_target(n));
+        }
+        // A newer record from a node already filed takes no second place.
+        targets.record(numbered_target(1));
+        assert_eq!(targets.lock().order.len(), MAX_DIAL_TARGETS);
+
+        targets.record(numbered_target(max));
+
+        assert!(targets.get(&H256::from_low_u64_be(max)).is_some());
+        assert!(
+            targets.get(&H256::from_low_u64_be(0)).is_none(),
+            "the oldest target makes room"
+        );
+        assert!(
+            targets.get(&H256::from_low_u64_be(1)).is_some(),
+            "a re-recorded target keeps its first place in line, so only one goes"
+        );
+        let held = targets.lock();
+        assert_eq!(held.by_id.len(), MAX_DIAL_TARGETS);
+        assert_eq!(held.order.len(), MAX_DIAL_TARGETS);
+    }
+
+    #[test]
+    fn a_forgotten_target_leaves_no_place_in_line_behind() {
+        let targets = DialTargets::default();
+        for n in 0..3 {
+            targets.record(numbered_target(n));
+        }
+
+        targets.forget(&H256::from_low_u64_be(1));
+        targets.record(numbered_target(1));
+
+        let order: Vec<H256> = targets.lock().order.iter().copied().collect();
+        assert_eq!(
+            order,
+            [0, 2, 1].map(H256::from_low_u64_be),
+            "filed again, it goes to the back once rather than holding its old place too"
+        );
     }
 
     #[test]
