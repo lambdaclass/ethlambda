@@ -548,6 +548,27 @@ ethlambda's validator client publishes (`Published a PQ block`) is canonical
 on the other clients, and their rejected-gossip counters stay empty for
 ethlambda's messages.
 
+What shows the published files in use: the genesis generator logs
+`leanXMSS keys: 0 from cache, N fetched, 0 derived`, and on a first start
+each ethlambda validator client logs `Derived the validators' PQ keys ...
+stored=0 cached=N built=0 refused=0 trees_built=0` and `Every validator's VRF
+tree is ready ... loaded=N hashed=0`, about a second each. A restart on the
+same `--validators-dir` reads both from disk instead (`stored=N`), since the
+first start writes every key's trees and VRF state there. VRF states
+published for pq-devnet-0's rule (leaves revealed, before `b5d422b2`) fail
+their check against the seed instead, and show as `loaded=0 hashed=N` after
+minutes per key: the package has to publish states for pq-devnet-1's rule.
+
+To check ethlambda alone, give two participants `cl_type: ethlambda` and
+`vc_type: ethlambda` with 16 validators each (the 32 minimum), and no other
+client. The key cache is best effort, and checking that takes a client
+without stored trees: stop one validator client, move its
+`pq_xmss_trees/` aside, and start it again with `--xmss-cache-url` pointing
+at a file that does not exist. It logs `Could not read the leanXMSS cache;
+building every key`, then `cached=0 built=16` after about 2.4 s a key spread
+across the cores, and keeps doing its duties: each client holds half the
+stake, so the chain justifies only while both attest.
+
 ## Spec fixtures
 
 No consensus-specs release ships fixtures for either fork. The pyspec on the
