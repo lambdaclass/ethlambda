@@ -557,7 +557,10 @@ the next slot's probe to answer.
   still answer `503` while it syncs, which the client reads as a node to fail
   over from. So nodes that cannot be reached never stop the duties by
   themselves, and only the probe taken for the slot counts: a late answer, or
-  one from an earlier slot, opens the check rather than holding it shut.
+  one from an earlier slot, opens the check rather than holding it shut. A
+  node whose answer is still on its way at the boundary, and that answered
+  synced the slot before, holds the check open too, so a slow synced node does
+  not lose the slot to a fast syncing one.
 - **Requests go to the nodes that passed first**, then the rest, each group
   in `--beacon-nodes` order. A blinded block still goes back to the node that
   produced it.

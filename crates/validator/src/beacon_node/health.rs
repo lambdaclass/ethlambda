@@ -21,7 +21,9 @@
 //!   while its node syncs still covers it, so nodes that cannot be reached
 //!   never stop duties on their own. Only the probe taken for the slot counts,
 //!   so a late answer, or a probe task that stopped, opens the gate rather than
-//!   holding it shut.
+//!   holding it shut. A node whose answer is still on its way at the boundary,
+//!   and that answered synced the slot before, holds the gate open too, so a
+//!   slow synced node does not lose the slot to a fast syncing one.
 //! - **Routing** ([`NodeHealth::ranked`]). The fallback asks the nodes whose
 //!   last probe passed (neither syncing nor optimistic) first, in command-line
 //!   order, then the rest, in the same order. Positions stay command-line
@@ -41,6 +43,7 @@
 //! the record, not acted on. A record older than two slots is no longer read for
 //! routing, which only ever moves a node back to plain command-line order.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -153,6 +156,9 @@ pub struct SyncVerdict {
     pub synced: usize,
     pub syncing: usize,
     pub optimistic: usize,
+    /// Nodes whose probe for the slot had not come back when it was read, and
+    /// that answered synced for the slot before. Not counted as answering.
+    pub awaited_synced: usize,
 }
 
 impl SyncVerdict {
@@ -171,9 +177,10 @@ impl SyncVerdict {
     }
 
     /// Whether duties may be signed: some node answered synced, or no node
-    /// answered at all, which leaves each duty to its endpoint's 503.
+    /// answered at all, which leaves each duty to its endpoint's 503, or a
+    /// node that was synced a slot ago has not answered yet.
     pub fn signs(&self) -> bool {
-        self.answered == 0 || self.synced > 0
+        self.answered == 0 || self.synced > 0 || self.awaited_synced > 0
     }
 }
 
@@ -184,6 +191,10 @@ impl SyncVerdict {
 /// the latter.
 pub struct NodeHealth {
     probes: RwLock<Vec<Option<Probe>>>,
+    /// Whether each node's last probe that answered reported its execution
+    /// client offline. A probe with no answer leaves it as it was, so the
+    /// change logs compare one answer with the last.
+    el_offline: Vec<AtomicBool>,
     /// How long a probe is read for routing. Unset until [`run`] starts, so a
     /// fallback that is never probed on a schedule (a test, the voluntary-exit
     /// command) reads whatever it holds.
@@ -194,6 +205,7 @@ impl NodeHealth {
     pub fn new(nodes: usize) -> Self {
         Self {
             probes: RwLock::new(vec![None; nodes]),
+            el_offline: (0..nodes).map(|_| AtomicBool::new(false)).collect(),
             read_for: OnceLock::new(),
         }
     }
@@ -255,14 +267,19 @@ impl NodeHealth {
                 Standing::Synced | Standing::Unknown => {}
             }
         }
-        let was_el_offline = previous.as_ref().is_some_and(is_el_offline);
+        // Against the last probe that answered, so a failed probe in between
+        // neither hides the execution client coming back nor repeats it going.
+        if standing == Standing::NoAnswer {
+            return;
+        }
+        let was_el_offline = self.el_offline[position].swap(el_offline, Ordering::Relaxed);
         if el_offline && !was_el_offline {
             warn!(
                 position,
                 "Beacon node reports its execution client is offline; it will go optimistic if it \
                  has not already"
             );
-        } else if was_el_offline && !el_offline && standing != Standing::NoAnswer {
+        } else if was_el_offline && !el_offline {
             info!(position, "Beacon node reports its execution client is back");
         }
     }
@@ -293,11 +310,18 @@ impl NodeHealth {
     }
 
     /// How the probes taken for `slot` split. A node whose last probe was taken
-    /// for another slot did not answer this one.
+    /// for another slot did not answer this one; one still on the slot before's
+    /// synced answer is counted apart, as awaited.
     pub fn verdict(&self, slot: Slot) -> SyncVerdict {
         let probes = self.read();
         let for_slot = probes.iter().flatten().filter(|probe| probe.slot == slot);
-        SyncVerdict::tally(for_slot.map(Probe::standing))
+        let mut verdict = SyncVerdict::tally(for_slot.map(Probe::standing));
+        verdict.awaited_synced = probes
+            .iter()
+            .flatten()
+            .filter(|probe| probe.slot + 1 == slot && probe.standing() == Standing::Synced)
+            .count();
+        verdict
     }
 
     /// The records are plain values with no invariant between them, so one a
@@ -476,6 +500,25 @@ mod tests {
         assert!(!verdict.signs());
     }
 
+    /// A synced node whose answer for the slot is still on its way holds the
+    /// slot open against a fast syncing one. Once its answer is in, or its
+    /// probe failed, the slot's own answers decide.
+    #[test]
+    fn a_synced_node_still_answering_holds_the_slot_open() {
+        let nodes = NodeHealth::new(2);
+        nodes.record(0, synced(9));
+        nodes.record(1, syncing(10));
+        let verdict = nodes.verdict(10);
+        assert_eq!((verdict.answered, verdict.awaited_synced), (1, 1));
+        assert!(verdict.signs());
+
+        nodes.record(0, down(10));
+        assert!(!nodes.verdict(10).signs(), "its probe failed");
+
+        let older = health(vec![synced(8), syncing(10)]);
+        assert!(!older.verdict(10).signs(), "synced two slots ago only");
+    }
+
     #[test]
     fn the_gate_counts_each_kind_of_answer() {
         let slot = 4;
@@ -487,6 +530,7 @@ mod tests {
                 synced: 0,
                 syncing: 1,
                 optimistic: 1,
+                awaited_synced: 0,
             }
         );
         assert!(!slot_signs(&health, slot));
@@ -554,6 +598,28 @@ mod tests {
 
         let later = health.ranked_at(taken + Duration::from_secs(60));
         assert_eq!(later, vec![(0, Standing::Unknown), (1, Standing::Unknown)]);
+    }
+
+    /// A probe with no answer leaves the execution client's last reported
+    /// state as it was, so the next answer is compared with the one before it.
+    #[test]
+    fn a_failed_probe_leaves_the_execution_clients_state() {
+        let el_offline = |slot| {
+            probe(
+                slot,
+                Ok(SyncStatus {
+                    el_offline: true,
+                    ..status(false, false)
+                }),
+            )
+        };
+        let nodes = NodeHealth::new(1);
+        let held = |nodes: &NodeHealth| nodes.el_offline[0].load(Ordering::Relaxed);
+        nodes.record(0, el_offline(3));
+        nodes.record(0, down(4));
+        assert!(held(&nodes), "no answer, nothing changed");
+        nodes.record(0, synced(5));
+        assert!(!held(&nodes));
     }
 
     /// The snapshot is every node's last probe, in command-line order, with

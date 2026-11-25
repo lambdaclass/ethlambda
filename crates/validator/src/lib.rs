@@ -435,10 +435,33 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     // boundary on its own clock: the duty loop reads it at the boundary and
     // never waits for it. Aborted once the client stops. See
     // `beacon_node::health`.
+    //
+    // It loops for the life of the client, so it ends only by panicking. The
+    // duties then go on as before the check existed (every slot signs, and
+    // requests walk the nodes in command-line order), which is logged here
+    // rather than left to pass unnoticed.
     let probes = tokio::spawn(crate::beacon_node::health::run(
         beacon_node.clone(),
         clock.clone(),
     ));
+    let stop_probes = probes.abort_handle();
+    tokio::spawn(async move {
+        let ended = probes.await;
+        if !ended
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            let reason = match ended {
+                Err(err) => err.to_string(),
+                Ok(()) => "its task returned".to_string(),
+            };
+            error!(
+                %reason,
+                "The beacon node sync probe stopped; no slot is withheld for a syncing node from \
+                 now on, until the validator client is restarted"
+            );
+        }
+    });
 
     // The check runs on its own clock, three quarters into each slot, so a
     // slow duty never delays it and a slow liveness query never delays a
@@ -728,7 +751,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     if let Some(check) = check {
         check.abort();
     }
-    probes.abort();
+    stop_probes.abort();
     Err(stopped)
 }
 
