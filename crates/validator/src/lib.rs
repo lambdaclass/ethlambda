@@ -327,7 +327,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let protection = slashing_protection::SharedProtection::new(protection);
     health.attach(
         beacon_node.health().clone(),
-        clock.slot_duration(),
+        clock.clone(),
         protection.clone(),
     );
 
@@ -570,7 +570,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                         last_epoch = Some(epoch);
                         resubscribe = moved;
                         to_register = Some(registrable);
-                        health.epoch_refreshed(refreshed_entries.len());
+                        // Through the lookahead epoch only when its fetch
+                        // went through: `refresh_around` shrugs a failed one
+                        // off, and the schedule then ends with this epoch.
+                        let covered_through = if duties.holds_attesters(epoch + 1) {
+                            epoch + 1
+                        } else {
+                            epoch
+                        };
+                        health.epoch_refreshed(refreshed_entries.len(), covered_through);
                         resolved = Arc::new(refreshed_entries);
                     }
                     // A beacon node that is down, syncing or answering badly will

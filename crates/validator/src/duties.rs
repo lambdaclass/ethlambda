@@ -314,6 +314,12 @@ impl<B: BeaconNodeApi> DutiesService<B> {
         self.sync.retain(|held, _| *held >= period);
     }
 
+    /// Whether an attester schedule is held for `epoch`, an empty one
+    /// included: a fetch that found no duties still answered.
+    pub fn holds_attesters(&self, epoch: Epoch) -> bool {
+        self.by_epoch.contains_key(&epoch)
+    }
+
     /// Whether a payload timeliness committee schedule is held for `epoch`,
     /// an empty one included: a fetch that found no duties still answered.
     pub fn holds_ptc(&self, epoch: Epoch) -> bool {

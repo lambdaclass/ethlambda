@@ -992,11 +992,12 @@ is cheap to poll.
   to finish. A failed write keeps it `false` until a later write succeeds. A
   full disk or a read-only remount under `--validators-dir` shows up here.
 - **`started`**: a duty refresh has succeeded since the process started.
-- **`schedule_current`**: the last successful duty refresh is at most two
-  epochs old, so the schedule it fetched (its own epoch and the next) still
-  covers now. A node can answer its probe synced and still fail every refresh;
-  once the schedule runs out the client has nothing to sign. `true` before the
-  first refresh.
+- **`schedule_current`**: the attester schedule the last successful duty
+  refresh left held reaches the current epoch: the refresh's own epoch, and
+  the next when its lookahead fetch went through too. A node can answer its
+  probe synced and still fail every refresh, or every lookahead; once the
+  schedule runs out the client has no attestations to make. `true` before the
+  first refresh and before genesis.
 
 `status` is one of three:
 

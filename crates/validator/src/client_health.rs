@@ -28,11 +28,12 @@
 //!   [`SharedProtection::last_write_ok`]). A failed write fails the check
 //!   until a later write succeeds.
 //! - **`started`**: a duty refresh has succeeded since the process started.
-//! - **`schedule_current`**: the last successful duty refresh is at most two
-//!   epochs old, so the schedule it fetched (its own epoch and the next) still
-//!   covers now. A node can answer its probe synced and still fail every
-//!   refresh; once the schedule runs out the client has no duties to do.
-//!   `true` before the first refresh, which `started` reports.
+//! - **`schedule_current`**: the attester schedule the last successful duty
+//!   refresh left held reaches the clock's epoch: its own epoch, and the next
+//!   when the lookahead fetch went through too. A node can answer its probe
+//!   synced and still fail every refresh, or every lookahead; once the
+//!   schedule runs out the client has no attestations to make. `true` before
+//!   the first refresh, which `started` reports, and before genesis.
 //!
 //! # Status
 //!
@@ -59,15 +60,17 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use axum::http::StatusCode;
+use ethlambda_types::beacon::primitives::Epoch;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::beacon_node::health::{NodeHealth, Probe, Standing};
 use crate::keys::ValidatorStore;
 use crate::slashing_protection::SharedProtection;
+use crate::slot_clock::SlotClock;
 
 /// What every report names as its `service`.
 pub const SERVICE: &str = "ethlambda-validator";
@@ -77,9 +80,8 @@ pub const SERVICE: &str = "ethlambda-validator";
 /// bound the fallback reads probes for when it routes.
 const PROBE_READ_SLOTS: u32 = 2;
 
-/// How many epochs a successful duty refresh's schedule covers: its own and
-/// the next.
-const SCHEDULE_EPOCHS: u64 = 2;
+/// [`ClientHealth::covered_through`] before any refresh has succeeded.
+const NOT_REFRESHED: u64 = u64::MAX;
 
 /// The state `/health` reads, shared by the metrics server, which reports it,
 /// and the duty loop, which keeps it.
@@ -93,9 +95,9 @@ pub struct ClientHealth {
     resolved: AtomicU64,
     /// A duty refresh has succeeded.
     started: AtomicBool,
-    /// When the last duty refresh succeeded, in milliseconds since the Unix
-    /// epoch: `0` before the first.
-    refreshed_at: AtomicU64,
+    /// The last epoch the attester schedule held after the last successful
+    /// refresh: [`NOT_REFRESHED`] before the first.
+    covered_through: AtomicU64,
     /// Set once the beacon nodes and the record exist, which is after the
     /// metrics server is already answering.
     attached: OnceLock<Attached>,
@@ -105,8 +107,8 @@ struct Attached {
     nodes: Arc<NodeHealth>,
     /// How old a probe may be and still be read.
     read_for: Duration,
-    /// How long a successful refresh's schedule lasts.
-    schedule_lasts: Duration,
+    /// What says which epoch it is, for the schedule check.
+    clock: SlotClock,
     protection: SharedProtection,
 }
 
@@ -121,54 +123,43 @@ impl ClientHealth {
             loaded: AtomicU64::new(loaded),
             resolved: AtomicU64::new(0),
             started: AtomicBool::new(false),
-            refreshed_at: AtomicU64::new(0),
+            covered_through: AtomicU64::new(NOT_REFRESHED),
             attached: OnceLock::new(),
         }
     }
 
     /// Read the beacon nodes' probes from `nodes`, judging a probe stale past
-    /// two of `slot_duration`, and the record's last write from `protection`.
-    /// Called once, after the preset is adopted, since an epoch's length is
-    /// read from it; a second call changes nothing.
-    pub fn attach(
-        &self,
-        nodes: Arc<NodeHealth>,
-        slot_duration: Duration,
-        protection: SharedProtection,
-    ) {
-        let schedule_slots = SCHEDULE_EPOCHS * ethlambda_types::beacon::preset::slots_per_epoch();
+    /// two of `clock`'s slots, the epoch from `clock`, and the record's last
+    /// write from `protection`. Called once, after the preset is adopted,
+    /// since an epoch's length is read from it; a second call changes nothing.
+    pub fn attach(&self, nodes: Arc<NodeHealth>, clock: SlotClock, protection: SharedProtection) {
         let _ = self.attached.set(Attached {
             nodes,
-            read_for: slot_duration * PROBE_READ_SLOTS,
-            schedule_lasts: slot_duration * u32::try_from(schedule_slots).unwrap_or(u32::MAX),
+            read_for: clock.slot_duration() * PROBE_READ_SLOTS,
+            clock,
             protection,
         });
     }
 
-    /// A duty refresh succeeded, resolving `resolved` validators to an index.
-    /// The first one is what moves the client from `starting`.
-    pub fn epoch_refreshed(&self, resolved: usize) {
-        self.epoch_refreshed_at(resolved, SystemTime::now());
-    }
-
-    fn epoch_refreshed_at(&self, resolved: usize, at: SystemTime) {
-        let millis = at
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as u64);
+    /// A duty refresh succeeded, resolving `resolved` validators to an index
+    /// and leaving the attester schedule held through `covered_through`. The
+    /// first one is what moves the client from `starting`.
+    pub fn epoch_refreshed(&self, resolved: usize, covered_through: Epoch) {
         self.resolved.store(resolved as u64, Ordering::Relaxed);
-        self.refreshed_at.store(millis.max(1), Ordering::Relaxed);
+        self.covered_through
+            .store(covered_through, Ordering::Relaxed);
         self.started.store(true, Ordering::Relaxed);
     }
 
-    /// The last successful refresh's schedule still covers `now`, or no
-    /// refresh has succeeded yet.
+    /// The attester schedule held reaches the epoch `now` is in, or no
+    /// refresh has succeeded yet, or it is before genesis.
     fn schedule_current(&self, attached: &Attached, now: SystemTime) -> bool {
-        let refreshed = self.refreshed_at.load(Ordering::Relaxed);
-        if refreshed == 0 {
-            return true;
-        }
-        let at = UNIX_EPOCH + Duration::from_millis(refreshed);
-        now.duration_since(at).unwrap_or_default() <= attached.schedule_lasts
+        let covered = self.covered_through.load(Ordering::Relaxed);
+        covered == NOT_REFRESHED
+            || attached
+                .clock
+                .slot_at(now)
+                .is_none_or(|slot| attached.clock.epoch_of(slot) <= covered)
     }
 
     /// What `/health` answers now.
@@ -385,12 +376,23 @@ mod tests {
         Arc::new(RwLock::new(store))
     }
 
+    /// Slots of [`SLOT`], with genesis a day from now. Before genesis every
+    /// schedule is current, so only the test that sets a clock past genesis
+    /// reads the schedule check.
+    fn clock() -> SlotClock {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+        SlotClock::new(now + 86_400, SLOT.as_millis() as u64, 3_333, 6_667)
+    }
+
     /// A client with `nodes` beacon nodes and `keys` keys, attached to an
     /// in-memory record, before any probe or refresh.
     fn client(nodes: usize, keys: u8) -> (ClientHealth, Arc<NodeHealth>) {
         let health = ClientHealth::new(nodes, store_of(keys));
         let probes = Arc::new(NodeHealth::new(nodes));
-        health.attach(probes.clone(), SLOT, SlashingProtection::in_memory());
+        health.attach(probes.clone(), clock(), SlashingProtection::in_memory());
         (health, probes)
     }
 
@@ -401,7 +403,7 @@ mod tests {
         let (health, probes) = client(2, 3);
         probes.record(0, synced());
         probes.record(1, down());
-        health.epoch_refreshed(2);
+        health.epoch_refreshed(2, 0);
 
         let body = serde_json::to_value(health.report()).expect("serializes");
         assert_eq!(
@@ -420,33 +422,42 @@ mod tests {
         );
     }
 
-    /// A refresh's schedule covers its own epoch and the next. Once the last
-    /// successful refresh is older than that, the client has no duties left
-    /// to do, whatever its nodes' probes say.
+    /// The schedule reaches the last epoch the refresh left held, whenever in
+    /// its epoch the refresh ran. From the epoch after, the client has no
+    /// attestations left to make, whatever its nodes' probes say; and a
+    /// refresh whose lookahead failed covers its own epoch alone.
     #[test]
-    fn a_schedule_past_two_epochs_is_unhealthy() {
-        let (health, probes) = client(1, 1);
-        let refreshed = SystemTime::now();
-        health.epoch_refreshed_at(1, refreshed);
-        let two_epochs = SLOT * (2 * ethlambda_types::beacon::preset::slots_per_epoch()) as u32;
-        // The last slot the schedule covers, with a fresh probe.
-        let last = refreshed + two_epochs - SLOT;
-        probes.record(
-            0,
-            Probe {
-                at: last,
-                ..synced()
-            },
+    fn a_schedule_that_ends_before_the_clocks_epoch_is_unhealthy() {
+        let clock = SlotClock::new(1_000_000, SLOT.as_millis() as u64, 3_333, 6_667);
+        let health = ClientHealth::new(1, store_of(1));
+        let probes = Arc::new(NodeHealth::new(1));
+        health.attach(
+            probes.clone(),
+            clock.clone(),
+            SlashingProtection::in_memory(),
         );
+        let first_slot = |epoch: Epoch| epoch * ethlambda_types::beacon::preset::slots_per_epoch();
+        // The report at `slot`'s start, with a fresh synced probe.
+        let report_at_slot = |slot| {
+            let at = clock.start_of(slot);
+            probes.record(0, Probe { at, ..synced() });
+            health.report_at(at)
+        };
 
-        let covered = health.report_at(last);
+        let epoch = 10;
+        health.epoch_refreshed(1, epoch + 1);
+        let covered = report_at_slot(first_slot(epoch + 2) - 1);
         assert_eq!(covered.status, Status::Healthy);
         assert!(covered.checks.schedule_current);
 
-        let past = health.report_at(last + SLOT * 2);
+        let past = report_at_slot(first_slot(epoch + 2));
         assert_eq!(past.status, Status::Unhealthy);
         assert!(!past.checks.schedule_current);
         assert!(past.beacon_node_available(), "the node still probes usable");
+
+        health.epoch_refreshed(1, epoch);
+        let without_lookahead = report_at_slot(first_slot(epoch + 1));
+        assert_eq!(without_lookahead.status, Status::Unhealthy);
     }
 
     /// Until the first refresh the client is `starting`, a `503`, and the
@@ -475,7 +486,7 @@ mod tests {
         let health = ClientHealth::new(1, store_of(1));
         health.attach(
             beacon_node.health().clone(),
-            SLOT,
+            clock(),
             SlashingProtection::in_memory(),
         );
 
@@ -506,8 +517,10 @@ mod tests {
         )
         .await
         .expect("the refresh passes on a synced node");
-        // What the duty loop does with a refresh that succeeded.
-        health.epoch_refreshed(refreshed.resolved.len());
+        // What the duty loop does with a refresh that succeeded: the mock
+        // answers the lookahead too, so the schedule runs through epoch 4.
+        assert!(duties.holds_attesters(4));
+        health.epoch_refreshed(refreshed.resolved.len(), 4);
 
         let report = health.report();
         assert_eq!(report.status, Status::Healthy);
@@ -542,7 +555,7 @@ mod tests {
     #[test]
     fn a_started_client_with_no_probe_is_unhealthy() {
         let (health, _probes) = client(1, 1);
-        health.epoch_refreshed(1);
+        health.epoch_refreshed(1, 0);
         let report = health.report();
         assert_eq!(report.status, Status::Unhealthy);
         assert_eq!(report.status_code(), StatusCode::SERVICE_UNAVAILABLE);
@@ -553,7 +566,7 @@ mod tests {
     #[test]
     fn no_usable_node_is_unhealthy_until_one_recovers() {
         let (health, probes) = client(3, 1);
-        health.epoch_refreshed(1);
+        health.epoch_refreshed(1, 0);
         probes.record(0, down());
         probes.record(1, syncing());
         probes.record(2, optimistic());
@@ -574,7 +587,7 @@ mod tests {
     #[test]
     fn a_stale_probe_does_not_count_as_usable() {
         let (health, probes) = client(1, 1);
-        health.epoch_refreshed(1);
+        health.epoch_refreshed(1, 0);
         let taken = SystemTime::now();
         probes.record(
             0,
@@ -597,7 +610,7 @@ mod tests {
     fn an_empty_store_reports_zero_loaded_and_stays_healthy() {
         let (health, probes) = client(1, 0);
         probes.record(0, synced());
-        health.epoch_refreshed(0);
+        health.epoch_refreshed(0, 0);
         let report = health.report();
         assert_eq!(report.status, Status::Healthy);
         assert_eq!(
@@ -648,9 +661,9 @@ mod tests {
         let protection = crate::slashing_protection::SharedProtection::new(record);
         let health = ClientHealth::new(1, store_of(1));
         let probes = Arc::new(NodeHealth::new(1));
-        health.attach(probes.clone(), SLOT, protection.clone());
+        health.attach(probes.clone(), clock(), protection.clone());
         probes.record(0, synced());
-        health.epoch_refreshed(1);
+        health.epoch_refreshed(1, 0);
         assert_eq!(health.report().status, Status::Healthy);
 
         let read_only = std::fs::Permissions::from_mode(0o500);
@@ -714,7 +727,7 @@ mod tests {
         let (health, probes) = client(1, 1);
         let health = Arc::new(health);
         let router = crate::metrics::router(health.clone());
-        health.epoch_refreshed(1);
+        health.epoch_refreshed(1, 0);
 
         for (probe, code) in [
             (down(), StatusCode::SERVICE_UNAVAILABLE),
