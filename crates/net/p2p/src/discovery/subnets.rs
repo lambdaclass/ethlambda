@@ -38,6 +38,7 @@ use ethrex_p2p::discovery::DiscoveryHandle;
 use ethrex_p2p::types::NodeRecord;
 use libp2p::PeerId;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::admission::{DiscoveredPeer, LeanFilter};
@@ -105,14 +106,17 @@ pub(crate) struct SubnetHunt {
     wanted: watch::Sender<BTreeSet<u64>>,
     /// Peers the hunt found, already through admission.
     found: mpsc::UnboundedReceiver<DiscoveredPeer>,
+    /// The hunt task, aborted when this value is dropped.
+    task: JoinHandle<()>,
 }
 
 impl SubnetHunt {
     /// Start the hunt task, idle until [`Self::update`] publishes a subnet.
     /// Must be called from inside a tokio runtime.
     ///
-    /// The task ends once this value is dropped, at the end of the hunt it is
-    /// in, which is when the `P2PServer` holding it goes away.
+    /// The task is aborted when this value is dropped, which is when the
+    /// `P2PServer` holding it goes away, wherever the task is: idle, asleep
+    /// between hunts, or in the middle of one.
     pub(crate) fn spawn(
         handle: DiscoveryHandle,
         filter: LeanFilter,
@@ -120,11 +124,12 @@ impl SubnetHunt {
     ) -> Self {
         let (wanted, wanted_rx) = watch::channel(BTreeSet::new());
         let (found_tx, found) = mpsc::unbounded_channel();
-        tokio::spawn(hunt(handle, filter, wanted_rx, found_tx));
+        let task = tokio::spawn(hunt(handle, filter, wanted_rx, found_tx));
         Self {
             subscribed,
             wanted,
             found,
+            task,
         }
     }
 
@@ -166,6 +171,21 @@ impl SubnetHunt {
             found.push(peer);
         }
         found
+    }
+}
+
+impl Drop for SubnetHunt {
+    /// Stop the task rather than wait for it to notice that `wanted` closed.
+    ///
+    /// It would not notice in time: `watch::Receiver::wait_for` tests the
+    /// current value before it reports the sender gone, so a task asleep
+    /// between hunts would wake to whatever was last wanted and, if that was
+    /// anything, run one more whole hunt for nobody, a network walk of up to
+    /// [`HUNT_QUERY_TIMEOUT`] included. Aborting drops whatever the task is
+    /// awaiting, and a dropped `find_nodes` future is how discovery is told to
+    /// abandon its query, so a walk under way ends cleanly too.
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -212,7 +232,10 @@ async fn hunt(
 ) {
     let mut offered: HashMap<H256, Instant> = HashMap::new();
     loop {
-        // An error is the dial loop's sender going away, which is shutdown.
+        // An error is the dial loop's sender gone with nothing wanted. The
+        // `SubnetHunt` that held it has aborted this task on its way out, and
+        // the abort is what normally ends it; this only ends a poll already
+        // under way when the abort landed.
         let Ok(subnets) = wanted
             .wait_for(|wanted| !wanted.is_empty())
             .await
