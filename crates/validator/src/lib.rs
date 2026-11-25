@@ -626,7 +626,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             if readmitted && last_epoch.is_some() && to_register.is_none() {
                 let registrable = resolved
                     .iter()
-                    .filter(|entry| is_registrable(&entry.status))
+                    .filter(|entry| is_registrable(entry))
                     .map(|entry| entry.pubkey);
                 to_register = Some(registrable.collect());
                 register_again = true;
