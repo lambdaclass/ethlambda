@@ -218,6 +218,30 @@ impl PqSignaturePool {
         self.proven.get(&(slot, data_root, committee)).cloned()
     }
 
+    /// Whether the aggregate this node holds for `group`'s vote already
+    /// proves every signature `group` has.
+    ///
+    /// A committee's seats are staggered, and one node can hold several of
+    /// them. Unless a vote arrived between two of their cutoffs, the later
+    /// seat collected what the earlier one proved: proving it again takes the
+    /// prover seconds, one proof at a time, for an aggregate the endpoint
+    /// would not even keep ([`Self::insert_proven`] keeps the larger one) and
+    /// that `should_broadcast_aggregate` rules out once the earlier seat has
+    /// broadcast. The held aggregate still answers the later seat's request.
+    pub fn is_proven(&self, group: &CommitteeSignatures) -> bool {
+        let key = (
+            group.data.slot,
+            group.data.hash_tree_root(),
+            group.committee_index,
+        );
+        self.proven.get(&key).is_some_and(|held| {
+            group
+                .signatures
+                .keys()
+                .all(|signer| held.attesting_indices.binary_search(signer).is_ok())
+        })
+    }
+
     /// Whether `slot`'s collection has ended.
     pub fn is_sealed(&self, slot: Slot) -> bool {
         self.sealed_slot.is_some_and(|sealed| slot <= sealed)
@@ -399,6 +423,43 @@ mod tests {
         assert!(!covered_given(&[&[0], &[1]]));
         // `0011` has neither.
         assert!(!covered_given(&[&[2, 3]]));
+    }
+
+    /// A later seat has something to prove only when it collected a vote the
+    /// held aggregate lacks.
+    #[test]
+    fn a_group_is_proven_once_the_held_aggregate_has_all_its_signers() {
+        use ethlambda_types::beacon::containers::pq::Attestation;
+        let mut pool = PqSignaturePool::default();
+        pool.subscribe(3, 3, 0, 7);
+        pool.insert(3, &vote(3, 0, 10, 1));
+        pool.insert(3, &vote(3, 0, 11, 1));
+        let collected = |pool: &PqSignaturePool| pool.collected(3, &[0]).remove(0);
+        assert!(!pool.is_proven(&collected(&pool)), "nothing held yet");
+
+        // The first seat proves the two votes it collected.
+        let group = collected(&pool);
+        pool.insert_proven(Arc::new(PooledPqAggregate {
+            attestation: Attestation {
+                aggregation_bits: Default::default(),
+                data: group.data,
+                committee_bits: Default::default(),
+            },
+            committee_index: 0,
+            attesting_indices: vec![10, 11],
+            proof: Default::default(),
+        }));
+        assert!(pool.is_proven(&collected(&pool)));
+
+        // A third vote reaches the next seat before its cutoff.
+        pool.insert(3, &vote(3, 0, 12, 1));
+        assert!(!pool.is_proven(&collected(&pool)));
+
+        // Another vote on other data is its own group, with nothing held.
+        pool.insert(3, &vote(3, 0, 13, 2));
+        let groups = pool.collected(3, &[0]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| !pool.is_proven(group)));
     }
 
     #[test]

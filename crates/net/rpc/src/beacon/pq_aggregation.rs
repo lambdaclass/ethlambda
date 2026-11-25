@@ -14,7 +14,8 @@
 //! at `position` stops collecting at `get_aggregation_cutoff_ms(position)` and
 //! broadcasts at `get_aggregate_due_ms(position)`. The task here wakes at
 //! each seat's cutoff in turn, proves what was collected for the committees
-//! one of this node's validators holds that seat in, and ends the slot's
+//! one of this node's validators holds that seat in (unless an earlier seat
+//! of this node already proved every vote collected), and ends the slot's
 //! collection after the last seat's. The endpoint then answers with what was
 //! proved, and the aggregate also goes into the pool block production packs
 //! from, since gossip never hands a node its own messages.
@@ -129,6 +130,10 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
         let state_ms = started.elapsed().as_millis() as u64;
         let mut groups = store.pq_signature_pool().collected(slot, &committees);
         let committees = groups.len();
+        // What an earlier seat of this node already proved in full is not
+        // proved again: see `PqSignaturePool::is_proven`.
+        groups.retain(|group| !store.pq_signature_pool().is_proven(group));
+        let already_proven = committees - groups.len();
         let signatures: usize = groups.iter().map(|group| group.signatures.len()).sum();
         // The larger groups first, in case not every one fits before the
         // deadline.
@@ -198,9 +203,10 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
             committees,
             signatures,
             proved,
+            already_proven,
             failed,
             late,
-            unproved = committees - proved - failed - late,
+            unproved = committees - already_proven - proved - failed - late,
             queued_ms,
             state_ms,
             prove_ms = prove_ms_total,
