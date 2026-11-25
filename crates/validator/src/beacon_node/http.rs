@@ -52,6 +52,7 @@ use crate::beacon_node::dto::{
     SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorDetailsDto, ValidatorEntryDto,
     VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
+use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
     Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
@@ -1002,29 +1003,34 @@ impl BeaconNodeApi for HttpBeaconNode {
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
-        let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
-        let syncing = response.data.is_syncing;
-        let optimistic = response.data.is_optimistic.unwrap_or(false);
+        let status = self.sync_status().await?;
 
         // Reported rather than acted on. An execution client that has just gone
         // offline leaves the node with the head it validated before that, which
         // is still a head worth attesting to; the moment that stops being true
         // the node reports it as optimistic instead.
-        if response.data.el_offline.unwrap_or(false) {
+        if status.el_offline {
             warn!(
                 url = %self.describe(),
                 "Beacon node reports its execution client is offline; it will go optimistic if it \
                  has not already"
             );
         }
-        if optimistic && !syncing {
+        if status.is_optimistic && !status.is_syncing {
             warn!(
                 url = %self.describe(),
                 "Beacon node has finished syncing but is tracking an unvalidated head; refusing \
                  to sign against it"
             );
         }
-        Ok(syncing || optimistic)
+        Ok(!status.is_synced())
+    }
+
+    /// Logs nothing: the per-slot probe asks this every slot, and its record
+    /// logs a node's status only when it changes.
+    async fn sync_status(&self) -> Result<SyncStatus> {
+        let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
+        Ok(response.data.into())
     }
 
     /// Resolves each pubkey to its validator index and current status.
@@ -2716,6 +2722,37 @@ mod tests {
             .await
             .expect("a no-op");
         assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    /// The probe's request: every field of the answer reaches the record, and
+    /// an absent `is_optimistic` or `el_offline` reads as `false`.
+    #[tokio::test]
+    async fn the_sync_status_carries_every_field_of_the_answer() {
+        let reply = br#"{"data":{"head_slot":"640","sync_distance":"12","is_syncing":true,"is_optimistic":true,"el_offline":true}}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let status = served.node.sync_status().await.expect("decodes");
+        assert_eq!(
+            status,
+            SyncStatus {
+                head_slot: Some(640),
+                sync_distance: Some(12),
+                is_syncing: true,
+                is_optimistic: true,
+                el_offline: true,
+            }
+        );
+        assert!(
+            served.seen.lock().expect("lock")[0]
+                .0
+                .ends_with("/eth/v1/node/syncing")
+        );
+
+        let reply =
+            br#"{"data":{"head_slot":"640","sync_distance":"0","is_syncing":false}}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let status = served.node.sync_status().await.expect("decodes");
+        assert!(status.is_synced());
+        assert!(!status.el_offline);
     }
 
     #[tokio::test]

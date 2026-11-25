@@ -20,6 +20,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::health::SyncStatus;
 use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
@@ -28,6 +29,7 @@ use ethlambda_types::beacon::containers::gloas;
 pub mod block_contents;
 pub mod dto;
 pub mod fallback;
+pub mod health;
 pub mod http;
 
 #[cfg(test)]
@@ -425,7 +427,19 @@ pub trait BeaconNodeApi: Send + Sync {
     /// [`crate::error::Error::BeaconNodeSyncing`]. That is a backstop, not the
     /// check: it puts correctness entirely in the node's hands for a rule the
     /// client is the one bound by.
+    ///
+    /// The duty loop does not call this. It reads the same two flags from the
+    /// probe [`health`] takes ahead of every slot, through
+    /// [`Self::sync_status`]. This answers the callers outside the loop: the
+    /// voluntary-exit command, and a node's own check before
+    /// [`Self::liveness`].
     async fn is_optimistic_or_syncing(&self) -> Result<bool>;
+
+    /// The node's `GET /eth/v1/node/syncing` answer in full: the two flags
+    /// [`Self::is_optimistic_or_syncing`] reads, `el_offline`, and the head slot
+    /// and sync distance it reports. What [`health`]'s per-slot probe asks each
+    /// node.
+    async fn sync_status(&self) -> Result<SyncStatus>;
 
     /// Resolves each pubkey to its current validator index and status, so the
     /// rest of the client can address validators by index, as the Beacon API
@@ -694,6 +708,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// # Contract: the answer is for `slot`, or this is an `Err`
     ///
     /// For the reason [`Self::attestation_data`] states.
+    ///
+    /// # Not from a node whose last probe said syncing or optimistic
+    ///
+    /// The Beacon API asks for a 503 here only while a node syncs, and the
+    /// answer carries no `execution_optimistic`, so an optimistic node may hand
+    /// out data for a block its execution client has not validated. The
+    /// fallback therefore does not ask a node whose last [`health`] probe
+    /// reported syncing or optimistic, and answers `Err(BeaconNodeSyncing)`
+    /// when that leaves no node to ask.
     async fn payload_attestation_data(
         &self,
         slot: Slot,
@@ -808,6 +831,14 @@ pub trait BeaconNodeApi: Send + Sync {
     /// execution client has not validated. Mapping it to the same error a 503
     /// gets makes failover try the next node rather than hand this one's root
     /// to the signer.
+    ///
+    /// # Not from a node whose last probe said syncing
+    ///
+    /// A syncing node that is not optimistic answers its stale head with
+    /// `execution_optimistic: false`, and the Beacon API defines no 503 for this
+    /// endpoint. The fallback therefore does not ask a node whose last
+    /// [`health`] probe reported syncing or optimistic, and answers
+    /// `Err(BeaconNodeSyncing)` when that leaves no node to ask.
     async fn head_block_root(&self) -> Result<Root>;
 
     /// Submit signed sync committee messages to the node's pool. Returns how
