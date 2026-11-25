@@ -262,6 +262,9 @@ pub struct MockBeaconNode {
     /// Every `sync_committee_selections` request that got past the
     /// configured failures, in call order.
     pub sync_selection_requests: Mutex<Vec<Vec<SyncCommitteeSelection>>>,
+    /// Leave a `sync_committee_selections` request unanswered while any
+    /// entry in it has no combined proof, as Charon does.
+    pub hold_uncombined_sync_selections: bool,
 }
 
 impl MockBeaconNode {
@@ -548,6 +551,13 @@ impl MockBeaconNode {
             .lock()
             .expect("lock")
             .insert((validator, slot, subcommittee), proof);
+        self
+    }
+
+    /// Answer `sync_committee_selections` as Charon does: never, while an
+    /// entry in the request has no combined proof.
+    pub fn holding_uncombined_sync_selections(mut self) -> Self {
+        self.hold_uncombined_sync_selections = true;
         self
     }
 
@@ -1593,16 +1603,22 @@ impl BeaconNodeApi for MockBeaconNode {
             .lock()
             .expect("lock")
             .push(selections.to_vec());
-        let combined = self.combined_sync_selections.lock().expect("lock");
-        Ok(selections
-            .iter()
-            .filter_map(|selection| {
-                let proof = combined.get(&selection.key())?;
-                Some(SyncCommitteeSelection {
-                    selection_proof: *proof,
-                    ..*selection
+        let answered: Vec<_> = {
+            let combined = self.combined_sync_selections.lock().expect("lock");
+            selections
+                .iter()
+                .filter_map(|selection| {
+                    let proof = combined.get(&selection.key())?;
+                    Some(SyncCommitteeSelection {
+                        selection_proof: *proof,
+                        ..*selection
+                    })
                 })
-            })
-            .collect())
+                .collect()
+        };
+        if self.hold_uncombined_sync_selections && answered.len() < selections.len() {
+            std::future::pending::<()>().await;
+        }
+        Ok(answered)
     }
 }

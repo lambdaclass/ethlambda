@@ -35,7 +35,11 @@
 //!   is a precaution of the same kind.
 //! - `sync_committee_selections`, for sync committee contributions: every
 //!   sync duty's subnets, at the start of each slot, read at the slot's
-//!   contribution deadline.
+//!   contribution deadline. Each seat (one subnet of one duty) goes in a
+//!   request of its own, as Lighthouse sends them, so that a seat the
+//!   middleware cannot combine in time holds back no other: Charon answers
+//!   a request only once it has combined every entry in it. A seat's
+//!   combined proof counts as soon as its own answer is in.
 //!
 //! The combined proofs are remembered in the [`SigningContext`], which with
 //! the mode on holds nothing else, and every decision reads them there:
@@ -64,7 +68,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Slot, ValidatorIndex};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
@@ -113,6 +117,20 @@ struct Partials {
     /// proof is sent again only while the schedule has not moved.
     generation: u64,
     by_duty: HashMap<(BlsPubkey, Slot), BlsSignature>,
+}
+
+/// How one seat of [`Distributed::exchange_sync`] came out.
+enum Seat {
+    /// Nothing was asked: the duty names a key this client no longer
+    /// holds, or the partial proof could not be signed.
+    NotAsked,
+    Combined,
+    /// The middleware answered without a combined proof for it.
+    Uncombined,
+    /// The request failed.
+    Refused(Error),
+    /// No answer by the contribution deadline.
+    Late,
 }
 
 impl<B: BeaconNodeApi + 'static> Distributed<B> {
@@ -202,23 +220,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             return;
         }
         let (this, store) = (self.clone(), store.clone());
-        tokio::spawn(async move {
-            let exchange = this.exchange_sync(slot, &sync_duties, &store);
-            match tokio::time::timeout(budget, exchange).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => warn!(
-                    %slot,
-                    %err,
-                    "Middleware did not combine the sync committee selection proofs; no \
-                     contribution this slot"
-                ),
-                Err(_) => warn!(
-                    %slot,
-                    "Middleware did not combine the sync committee selection proofs before the \
-                     contribution deadline; no contribution this slot"
-                ),
-            }
-        });
+        tokio::spawn(async move { this.exchange_sync(slot, &sync_duties, &store, budget).await });
     }
 
     /// The epoch's round, run when the attester schedule moved: exchange the
@@ -525,16 +527,27 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         Ok(combined)
     }
 
-    /// Sign the partial proof of every subnet of every duty in `duties` at
-    /// `slot`, send them in one `sync_committee_selections` request, and
-    /// remember the combined proofs the middleware answers. Returns how many
-    /// it answered.
+    /// Exchange the partial proof of every seat in `duties` at `slot` (one
+    /// subnet of one duty) for the combined one, each in a
+    /// `sync_committee_selections` request of its own, all at once, and
+    /// remember each combined proof as it is answered. A seat still
+    /// unanswered `budget` from now, where the proofs are read, is given up
+    /// on. Returns how many seats got a combined proof.
+    ///
+    /// One request per seat, as Lighthouse sends them. Charon answers a
+    /// request only once it has combined every entry in it, so a seat it
+    /// cannot combine in time would hold back every other seat in a request
+    /// they shared. On its own it holds back only itself. Each seat's
+    /// partial proof is signed on its own too and sent as soon as it is, so
+    /// a slow signature delays only its own seat's request.
     pub async fn exchange_sync(
         &self,
         slot: Slot,
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
-    ) -> Result<usize> {
+        budget: Duration,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + budget;
         let mut seats = Vec::new();
         for duty in duties {
             let Ok(pubkey) = parse_pubkey(&duty.pubkey) else {
@@ -544,74 +557,112 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
                 seats.push((duty.validator_index, pubkey, subnet));
             }
         }
-        // The duty budget: these are read at this slot's contribution
-        // deadline.
-        let partials = sign_all(seats.iter().map(|(_, pubkey, subnet)| {
-            (
-                *pubkey,
-                self.context
-                    .sign_sync_selection_proof(store, pubkey, slot, *subnet),
-            )
-        }))
-        .await;
+        let exchanges = seats
+            .into_iter()
+            .map(|(validator, pubkey, subnet)| async move {
+                let seat = self.exchange_seat(slot, validator, pubkey, subnet, store);
+                tokio::time::timeout_at(deadline, seat)
+                    .await
+                    .unwrap_or(Seat::Late)
+            });
 
-        let mut asked = Vec::with_capacity(seats.len());
-        let mut pubkeys: HashMap<(ValidatorIndex, Slot, u64), BlsPubkey> = HashMap::new();
-        for ((validator, pubkey, subnet), partial) in seats.into_iter().zip(partials) {
-            match partial {
-                Ok(selection_proof) => {
-                    let selection = SyncCommitteeSelection {
-                        validator_index: validator,
-                        slot,
-                        subcommittee_index: subnet,
-                        selection_proof,
-                    };
-                    pubkeys.insert(selection.key(), pubkey);
-                    asked.push(selection);
-                }
-                Err(Error::UnknownValidator(_)) => debug!(
+        let (mut combined, mut uncombined, mut late) = (0, 0, 0);
+        let mut refused = Vec::new();
+        for seat in join_all(exchanges).await {
+            match seat {
+                Seat::NotAsked => {}
+                Seat::Combined => combined += 1,
+                Seat::Uncombined => uncombined += 1,
+                Seat::Late => late += 1,
+                Seat::Refused(err) => refused.push(err),
+            }
+        }
+        if let Some(err) = refused.first() {
+            warn!(
+                %slot,
+                seats = refused.len(),
+                %err,
+                "Middleware refused the sync committee selection exchange; no contribution for \
+                 those seats this slot"
+            );
+        }
+        if uncombined + late > 0 {
+            warn!(
+                %slot,
+                combined,
+                uncombined,
+                late,
+                "Middleware left some sync committee seats without a combined selection proof; \
+                 no contribution for them this slot"
+            );
+        }
+        debug!(%slot, combined, "Exchanged sync committee selection proofs");
+        combined
+    }
+
+    /// One seat of [`Self::exchange_sync`]: sign `validator`'s partial proof
+    /// for `subnet` at `slot`, send it alone, and remember the combined proof
+    /// the middleware answers.
+    async fn exchange_seat(
+        &self,
+        slot: Slot,
+        validator: ValidatorIndex,
+        pubkey: BlsPubkey,
+        subnet: u64,
+        store: &RwLock<ValidatorStore>,
+    ) -> Seat {
+        // The duty budget, as every duty signature gets.
+        let signing = self
+            .context
+            .sign_sync_selection_proof(store, &pubkey, slot, subnet);
+        let signed = sign_all([(pubkey, signing)]).await.pop();
+        let selection_proof = match signed.expect("one result per request") {
+            Ok(proof) => proof,
+            Err(Error::UnknownValidator(_)) => {
+                debug!(
                     %slot,
                     validator,
                     "Sync duty names a key this client no longer holds; not asking the middleware"
-                ),
-                Err(err) => {
-                    warn!(
-                        %slot,
-                        validator,
-                        subnet,
-                        %err,
-                        "Could not sign the partial sync selection proof; no contribution for it"
-                    );
-                    crate::metrics::inc_signing_failures();
-                }
-            }
-        }
-        if asked.is_empty() {
-            return Ok(0);
-        }
-
-        let answers = self.beacon_node.sync_committee_selections(&asked).await?;
-        let mut combined = 0;
-        for answer in answers {
-            if let Some(pubkey) = pubkeys.get(&answer.key()) {
-                self.context.remember_combined_sync_selection_proof(
-                    *pubkey,
-                    answer.slot,
-                    answer.subcommittee_index,
-                    answer.selection_proof,
                 );
-                combined += 1;
+                return Seat::NotAsked;
             }
-        }
-        if combined < asked.len() {
-            warn!(
-                %slot,
-                asked = asked.len(),
-                combined,
-                "Middleware left some sync committee seats without a combined selection proof"
-            );
-        }
-        Ok(combined)
+            Err(err) => {
+                warn!(
+                    %slot,
+                    validator,
+                    subnet,
+                    %err,
+                    "Could not sign the partial sync selection proof; no contribution for it"
+                );
+                crate::metrics::inc_signing_failures();
+                return Seat::NotAsked;
+            }
+        };
+
+        let selection = SyncCommitteeSelection {
+            validator_index: validator,
+            slot,
+            subcommittee_index: subnet,
+            selection_proof,
+        };
+        let asked = std::slice::from_ref(&selection);
+        let answers = match self.beacon_node.sync_committee_selections(asked).await {
+            Ok(answers) => answers,
+            Err(err) => return Seat::Refused(err),
+        };
+        let Some(answer) = answers
+            .into_iter()
+            .find(|answer| answer.key() == selection.key())
+        else {
+            return Seat::Uncombined;
+        };
+        self.context.remember_combined_sync_selection_proof(
+            pubkey,
+            answer.slot,
+            answer.subcommittee_index,
+            answer.selection_proof,
+        );
+        Seat::Combined
     }
 
     /// Send the subscriptions for `duties`, reporting a failure as the duty
@@ -652,6 +703,9 @@ mod tests {
     const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     /// The first slot of epoch 100, where every test's round runs.
     const EPOCH_START: Slot = 3200;
+    /// What a sync committee exchange is given in the tests, where nothing
+    /// waits on the clock.
+    const SYNC_BUDGET: Duration = Duration::from_secs(4);
 
     fn secret() -> [u8; 32] {
         hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
@@ -1229,13 +1283,13 @@ mod tests {
         let distributed = Distributed::new(node.clone(), context.clone());
 
         let combined = distributed
-            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store)
-            .await
-            .expect("exchanges");
+            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store, SYNC_BUDGET)
+            .await;
         assert_eq!(combined, 4);
-        let asked = node.sync_selection_requests().remove(0);
-        assert_eq!(asked.len(), 4, "one entry per subnet");
-        for entry in &asked {
+        let requests = node.sync_selection_requests();
+        assert_eq!(requests.len(), 4, "one request per subnet");
+        assert!(requests.iter().all(|request| request.len() == 1));
+        for entry in requests.iter().flatten() {
             assert!(verifies(
                 &pubkey,
                 &entry.selection_proof,
@@ -1257,6 +1311,60 @@ mod tests {
         assert!(!requested.contains(&own_selects));
         let sent = node.published_contributions();
         assert_eq!(sent[0].message.selection_proof, sync_proof(true));
+    }
+
+    /// A seat the middleware cannot combine holds back no other. The mock
+    /// waits, as Charon does, until every entry in a request is combined, so
+    /// a request shared by both seats would go unanswered for both; asked on
+    /// its own, the combined seat is answered and contributes.
+    #[tokio::test]
+    async fn a_seat_the_middleware_cannot_combine_holds_back_no_other() {
+        let (store, pubkey) = store();
+        let size = sync_subcommittee_size() as u64;
+        let sync_duty = SyncDutyDto {
+            pubkey: encode_hex(&pubkey.0),
+            validator_index: 9,
+            validator_sync_committee_indices: vec![0, size],
+        };
+        let slot = EPOCH_START;
+        let root = Root::repeat_byte(4);
+        let mut node = MockBeaconNode::new()
+            .holding_uncombined_sync_selections()
+            .with_combined_sync_selection(9, slot, 0, sync_proof(true));
+        for subnet in 0..2 {
+            node = node.with_contribution(SyncCommitteeContribution {
+                slot,
+                beacon_block_root: root,
+                subcommittee_index: subnet,
+                aggregation_bits: Default::default(),
+                signature: BlsSignature([1; 96]),
+            });
+        }
+        let node = Arc::new(node);
+        let context = distributed_context();
+        let distributed = Distributed::new(node.clone(), context.clone());
+
+        // Short, since the uncombined seat waits it out.
+        let budget = Duration::from_millis(500);
+        let combined = distributed
+            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store, budget)
+            .await;
+
+        assert_eq!(combined, 1);
+        let requests = node.sync_selection_requests();
+        assert_eq!(requests.len(), 2, "one request per subnet");
+        assert!(requests.iter().all(|request| request.len() == 1));
+        let published = SyncCommitteeService::new(node.clone(), context)
+            .aggregate(slot, root, &[sync_duty], &store)
+            .await
+            .expect("aggregates");
+        assert_eq!(published, 1);
+        let requested: Vec<u64> = node
+            .contribution_requests()
+            .iter()
+            .map(|(_, subnet, _)| *subnet)
+            .collect();
+        assert_eq!(requested, vec![0]);
     }
 
     /// No answer from the middleware, no contribution, whatever the share's
@@ -1287,12 +1395,10 @@ mod tests {
         let context = distributed_context();
         let distributed = Distributed::new(node.clone(), context.clone());
 
-        assert!(
-            distributed
-                .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store)
-                .await
-                .is_err()
-        );
+        let combined = distributed
+            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store, SYNC_BUDGET)
+            .await;
+        assert_eq!(combined, 0);
         let published = SyncCommitteeService::new(node.clone(), context)
             .aggregate(slot, root, &[sync_duty], &store)
             .await

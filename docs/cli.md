@@ -693,9 +693,12 @@ the combined proofs and decides on those:
   the same combined proofs and publishes them in the `AggregateAndProof`.
 - At the start of each slot it sends the partial proof of every sync
   committee subnet its validators sit in to
-  `POST /eth/v1/validator/sync_committee_selections`, and the contribution
-  deadline acts on the answer. An answer that has not come by that deadline
-  is given up on, with a warning: the slot's contributions go without it.
+  `POST /eth/v1/validator/sync_committee_selections`, one request per
+  validator and subnet, as Lighthouse does. Charon answers a request only
+  once it has combined every entry in it, so a seat it cannot combine in time
+  holds back only its own answer. The contribution deadline acts on the
+  answers in by then. A seat whose answer has not come is given up on, with a
+  warning, and goes without a contribution that slot.
 
 A duty with no combined proof aggregates for nobody: its subscription goes
 out without the role and no aggregate or contribution is asked for. The
