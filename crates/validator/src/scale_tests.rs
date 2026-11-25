@@ -82,6 +82,10 @@ const GLOAS_EPOCH: Epoch = 500_000;
 
 const FEE_RECIPIENT: H160 = H160([0xab; 20]);
 
+/// Where the per-epoch gas limit change starts, plus the epoch, so each
+/// epoch's differs from the default and from every earlier one.
+const CHANGED_GAS_LIMIT: u64 = 40_000_000;
+
 /// EIP-2335's default scrypt parameters, which `staking-deposit-cli` and
 /// `ethstaker-deposit-cli` write: `n = 2^18`, `r = 8`, `p = 1`. One derivation
 /// takes `128 * r * n` bytes, 256 MiB.
@@ -428,6 +432,26 @@ async fn epoch_work(
         json_bytes: json.len(),
     });
 
+    // The per-slot check's slow path, which the slots below never reach:
+    // with no setting written it returns at the generation compare. A
+    // keymanager change moves the generation, and the check then walks every
+    // known key (`current_blocking`) to find the one that changed, signs it
+    // and sends it. One key's gas limit is changed per epoch, a different key
+    // each time, so each epoch signs exactly one registration.
+    let changed = keys[(epoch - START_EPOCH) as usize % keys.len()];
+    let gas_limit = CHANGED_GAS_LIMIT + epoch;
+    settings.set_gas_limit(&changed, gas_limit);
+    let started = Instant::now();
+    registration
+        .clone()
+        .register_changed(epoch, store.clone())
+        .await;
+    timings.registration_change.push(started.elapsed());
+    let sent = std::mem::take(&mut *node.registrations.lock().expect("lock"));
+    assert_eq!(sent.len(), 1, "only the changed key is registered again");
+    assert_eq!(sent[0].message.pubkey, changed);
+    assert_eq!(sent[0].message.gas_limit, gas_limit);
+
     clear(node);
     refreshed.resolved
 }
@@ -539,7 +563,9 @@ async fn slot_work(
         usize::from(!duties.attester.is_empty()) + usize::from(duties.proposer.is_some());
     assert_eq!(
         writes as usize, expected,
-        "slot {slot}: one write per block and per batch"
+        "slot {slot}: one write per block and per batch (the histogram is process-wide: run \
+         this test alone with `--exact`, not under `--include-ignored`, or other tests' \
+         record writes land in it too)"
     );
     timings.writes += writes;
     timings.write_seconds += write_seconds_after - write_seconds_before;
@@ -958,6 +984,9 @@ struct Timings {
     write_seconds: f64,
     write_per_slot: Samples,
     registration_check: Samples,
+    /// The per-slot registration check after a setting changed, once an
+    /// epoch: see [`epoch_work`].
+    registration_change: Samples,
     preparations: Samples,
 }
 
@@ -1040,6 +1069,11 @@ impl Timings {
                 timeout.as_secs() * registered.batches as u64
             );
         }
+        println!(
+            "  registration check after a change: {} (walks every key, signs and sends the one \
+             changed)",
+            self.registration_change.summary(false)
+        );
         println!("per slot");
         println!(
             "  proposal:                         {}",
@@ -1083,7 +1117,7 @@ impl Timings {
             self.duty_path.summary(false)
         );
         println!(
-            "  registration check:               {}",
+            "  registration check, no change:    {}",
             self.registration_check.summary(false)
         );
         println!(
