@@ -44,8 +44,8 @@ use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
     P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
-        CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
-        PublishBlock,
+        BlockStateReady, CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation,
+        PublishAttestation, PublishBlock,
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
@@ -1650,6 +1650,7 @@ impl P2P {
             sync_committee_pool,
             gossip_events,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
@@ -1887,6 +1888,10 @@ pub struct P2PServer {
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
 
+    /// Subnet attestations and aggregates whose verdict waits for the block
+    /// they vote for to have a post-state. See [`beacon::parked_votes`].
+    pub(crate) parked_votes: beacon::parked_votes::ParkedVotes,
+
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
     pub(crate) peer_scoring: Option<beacon::scoring::PeerScoring>,
@@ -2019,6 +2024,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn discover_peers(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
+    /// Report the first verdict of the parked votes past their deadline; see
+    /// [`beacon::parked_votes`]. Scheduled only while votes are parked.
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn sweep_parked_votes(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
     /// Apply the fork schedule at the wall-clock epoch. Sent once at startup and
@@ -2144,6 +2153,17 @@ impl P2PServer {
         gossipsub::prune_operation_pool(self);
         beacon::sync_committee::leave_expired_sync_committee_subnets(self);
         beacon::sync_committee::prune_sync_committee_pool(self);
+    }
+
+    #[send_handler]
+    async fn handle_sweep_parked_votes(
+        &mut self,
+        _msg: p2p_protocol::SweepParkedVotes,
+        ctx: &Context<Self>,
+    ) {
+        if beacon::verdict::sweep_parked_votes(self) {
+            beacon::verdict::schedule_parked_vote_sweep(ctx);
+        }
     }
 
     #[send_handler]
@@ -2356,6 +2376,12 @@ impl Handler<CheckDataColumnSidecars> for P2PServer {
                 beacon::engine_columns::publish_and_forward(self, msg.sidecars)
             }
         }
+    }
+}
+
+impl Handler<BlockStateReady> for P2PServer {
+    async fn handle(&mut self, msg: BlockStateReady, ctx: &Context<Self>) {
+        beacon::verdict::release_parked_votes(self, ctx, msg.block_root);
     }
 }
 
@@ -4143,6 +4169,7 @@ pub(crate) mod test_support {
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring: None,
         }
     }

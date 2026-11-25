@@ -3751,6 +3751,7 @@ pub(crate) mod tests {
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring: None,
         }
     }

@@ -566,6 +566,37 @@ pub(crate) fn inc_validation_permit_exhausted(pool: &str) {
         .inc();
 }
 
+static LEAN_BEACON_GOSSIP_PARKED_VOTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_parked_votes_total",
+        "Subnet attestations and aggregates whose verdict waited for their block's post-state, by what happened to them",
+        &["kind", "result"]
+    )
+    .unwrap()
+});
+
+/// Count one vote of topic `kind` through the parked-vote queue (see
+/// `beacon::parked_votes`): `parked`, `full` (refused by the cap, so it got
+/// its verdict at once), `rechecked` (checked again once its block's state was
+/// ready) or `expired` (never ready in time, so it got its first verdict).
+pub(crate) fn inc_parked_votes(kind: &str, result: &str) {
+    LEAN_BEACON_GOSSIP_PARKED_VOTES_TOTAL
+        .with_label_values(&[kind, result])
+        .inc();
+}
+
+/// Set how many votes are parked right now.
+pub(crate) fn set_parked_votes(count: usize) {
+    static LEAN_BEACON_GOSSIP_PARKED_VOTES: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_beacon_gossip_parked_votes",
+            "Subnet attestations and aggregates waiting for their block's post-state before their verdict"
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_GOSSIP_PARKED_VOTES.set(count.try_into().unwrap_or(i64::MAX));
+}
+
 /// Record how long a column check (`kind` `column_check`: one block's
 /// prechecks, or one further KZG sub-batch of its columns) or an envelope
 /// check (`envelope_check`) awaited a `column_check` permit.
