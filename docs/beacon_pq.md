@@ -418,7 +418,12 @@ A start drops the leaves of slots more than two epochs back, which nothing
 asks for again.
 
 - **Attesting**: a `SingleAttestation` signed at the target epoch's leaf,
-  published on one of PQ's 16 subnets. The client votes once a beacon node
+  published on one of PQ's 16 subnets. Each one is published as soon as its
+  signature exists (`AttestationService::publish_pq_as_signed`,
+  `pq::sign_each`), with whatever else was signed by then, not once the
+  slot's batch is signed: a key that has to build a bottom tree first takes
+  seconds, and held for it, every other key's vote would miss the
+  aggregators' cutoff too. The client votes once a beacon node
   reports a non-optimistic `head` at the slot whose block the attestation
   data names, or at the attestation deadline otherwise (`head_monitor`, as at
   every fork); it used to wait for the deadline every slot, which put its

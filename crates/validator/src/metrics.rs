@@ -559,6 +559,10 @@ pub fn inc_signing_failures() {
     SIGNING_FAILURES_TOTAL.inc();
 }
 
+pub fn inc_signing_failures_by(count: u64) {
+    SIGNING_FAILURES_TOTAL.inc_by(count);
+}
+
 pub fn inc_attestations_refused() {
     ATTESTATIONS_REFUSED_TOTAL.inc();
 }

@@ -85,7 +85,8 @@ pub const VRF_TREE_DIRECTORY: &str = "pq_vrf_trees";
 /// leanXMSS trees, one file per validator, named by its BLS public key:
 /// [`TREE_FILE_MAGIC`], the key's public key, leanVM's `cache_to_bytes` (the
 /// top tree's cached level and that of every bottom tree the key holds, at
-/// most `MAX_CACHED_BOTTOM_TREES`; about 25 KB), then an HMAC-SHA256 tag over
+/// most `DEFAULT_BOTTOM_TREE_CACHE_SIZE`, eight since leanVM bindings v0.19.0;
+/// about 46 KB), then an HMAC-SHA256 tag over
 /// all of it under a key derived from the XMSS seed ([`tree_mac_key`]), so
 /// only a file this client wrote for this seed loads. Lighthouse's and
 /// Teku's PQ branches keep the same thing the same way. Written whenever a
@@ -961,6 +962,23 @@ pub struct SignRequest {
 /// the async runtime.
 pub fn sign_batch(requests: &[SignRequest]) -> Vec<Result<XmssSignature, PqSignError>> {
     use rayon::prelude::*;
+    let checked = claim_batch(requests);
+    requests
+        .par_iter()
+        .zip(checked)
+        .map(|(request, checked)| {
+            let (key, leaf_index) = checked?;
+            Ok(sign_claimed(request, &key, leaf_index))
+        })
+        .collect()
+}
+
+/// Each request's key and leaf, with the leaf claimed for its root in the
+/// durable record: what happens before any signature of a batch exists, one
+/// write and one flush for all of it. A request whose key is unknown, whose
+/// leaf is out of range or already spent on another root is an error at its
+/// position, and claims nothing.
+fn claim_batch(requests: &[SignRequest]) -> Vec<Result<(Arc<PqKey>, u32), PqSignError>> {
     let mut checked: Vec<Result<(Arc<PqKey>, u32), PqSignError>> = requests
         .iter()
         .map(|request| {
@@ -987,14 +1005,7 @@ pub fn sign_batch(requests: &[SignRequest]) -> Vec<Result<XmssSignature, PqSignE
             *checked = Err(err);
         }
     }
-    requests
-        .par_iter()
-        .zip(checked)
-        .map(|(request, checked)| {
-            let (key, leaf_index) = checked?;
-            Ok(sign_claimed(request, &key, leaf_index))
-        })
-        .collect()
+    checked
 }
 
 /// [`sign_batch`] on tokio's blocking pool, so neither the flush nor the
@@ -1012,6 +1023,41 @@ pub async fn sign_all(requests: Vec<SignRequest>) -> Vec<Result<XmssSignature, P
                 .map(|_| Err(PqSignError::Task(reason.clone())))
                 .collect()
         })
+}
+
+/// [`sign_all`], with each signature handed over the moment it exists rather
+/// than all of them once the slowest is made: `(position in requests,
+/// signature)`, in the order they finish. The channel closes when every
+/// request was answered; one that closes short means the signing task died,
+/// and the positions never seen were not signed.
+///
+/// For a duty whose messages are worth more the earlier they are out. The
+/// keys sign in parallel, so a batch normally takes a few signatures' time,
+/// but one key that has to build a bottom tree first takes seconds, and
+/// returned together, every other key's signature would wait for it.
+pub fn sign_each(
+    requests: Vec<SignRequest>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(usize, Result<XmssSignature, PqSignError>)> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    if requests.is_empty() {
+        return receiver;
+    }
+    tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let checked = claim_batch(&requests);
+        requests
+            .par_iter()
+            .zip(checked)
+            .enumerate()
+            .for_each(|(position, (request, checked))| {
+                let signed =
+                    checked.map(|(key, leaf_index)| sign_claimed(request, &key, leaf_index));
+                // A receiver that is gone abandoned the duty, as when its
+                // slot ended: the leaf is spent either way.
+                let _ = sender.send((position, signed));
+            });
+    });
+    receiver
 }
 
 /// One [`sign_all`] signature.
@@ -1093,6 +1139,44 @@ mod tests {
         assert_eq!(slot_leaf(0, 0) >> 16, slot_leaf(4095, 7) >> 16);
         assert_ne!(slot_leaf(0, 0) >> 16, slot_leaf(4096, 0) >> 16);
         assert_ne!(attestation_leaf(0) >> 16, slot_leaf(0, 0) >> 16);
+    }
+
+    /// `sign_each` answers every request once, at its position, with the
+    /// signature the batch signer makes, and an unsignable request is an
+    /// error at its own position only.
+    #[tokio::test]
+    async fn each_signature_is_handed_over_once_at_its_position() {
+        let pubkey = BlsPubkey([41; 48]);
+        derive_and_register(pubkey, &[41; 32], 0, None);
+        let leaf = attestation_leaf(3);
+        let root = Root::from([5; 32]);
+        let known = SignRequest { pubkey, leaf, root };
+        let unknown = SignRequest {
+            pubkey: BlsPubkey([42; 48]),
+            leaf,
+            root,
+        };
+
+        let mut signed = sign_each(vec![unknown, known]);
+        let mut answers = Vec::new();
+        while let Some(answer) = signed.recv().await {
+            answers.push(answer);
+        }
+        answers.sort_by_key(|(position, _)| *position);
+
+        assert_eq!(answers.len(), 2);
+        assert!(matches!(
+            answers[0],
+            (0, Err(PqSignError::UnknownValidator))
+        ));
+        let (1, Ok(signature)) = &answers[1] else {
+            panic!("the known key signs at position 1");
+        };
+        // Signing is deterministic: the batch signer gives the same bytes.
+        let batch = sign_batch(&[known]);
+        assert_eq!(batch[0].as_ref().expect("signs").0, signature.0);
+        // No requests, no answers.
+        assert!(sign_each(Vec::new()).recv().await.is_none());
     }
 
     #[test]

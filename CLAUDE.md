@@ -911,7 +911,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `pq` branch, see `docs/beacon_pq.md`, "Running a devnet"),
   with its own validators: the validator client derives each
   validator's leanXMSS key and VRF seed from its BLS key
-  (`ethlambda_crypto::pq_keys`) and attests, aggregates (staggered by its seat
+  (`ethlambda_crypto::pq_keys`) and attests (each vote published as soon as
+  it is signed, `pq::sign_each`, not once the batch is), aggregates (staggered by its seat
   in the aggregation committee, each seat on its own; the node skips a seat's
   proof when an earlier seat of its own already proved every vote collected),
   casts PTC votes and proposes, each signature at its leaf. The VRF tree (`ethlambda_crypto::vrf`, Keccak-256 over all
