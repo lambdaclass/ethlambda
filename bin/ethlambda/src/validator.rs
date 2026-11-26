@@ -286,8 +286,14 @@ impl ValidatorOptions {
         let source = NetworkSource::resolve(&spec)
             .wrap_err_with(|| format!("failed to resolve --network {value}"))?;
         let genesis = source.genesis();
+        // A directory's `config.yaml` may omit `CONFIG_NAME`; the flag's value
+        // then names the network in logs and errors instead of nothing.
+        let name = match source.name() {
+            "" => value.clone(),
+            name => name.to_string(),
+        };
         Ok(Some(ExpectedNetwork {
-            name: source.name().to_string(),
+            name,
             chain: ChainId {
                 genesis: Genesis {
                     genesis_time: genesis.genesis_time,
