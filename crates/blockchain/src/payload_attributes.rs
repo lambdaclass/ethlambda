@@ -14,7 +14,7 @@
 //!   slot: the head, on gloas the parent payload branch (the head's payload
 //!   arriving, or the PTC's votes on it) and the proposer's signed
 //!   preferences, and the fee recipient `prepare_beacon_proposer` names
-//!   ([`AttributesKey`]). It does so only when someone is subscribed, and
+//!   ([`AttributesKey`]). It publishes only when someone is subscribed, and
 //!   only for a proposer a validator client registered through
 //!   `prepare_beacon_proposer`, unless `--always-prepare-payload` asks for
 //!   every slot. External block builders (buildoor, for one) build from this
@@ -24,14 +24,15 @@
 //! other consensus client does (lambdaclass/ethlambda#894): with an execution
 //! client configured, the actor sends `forkchoiceUpdated` with the attributes
 //! and keeps the payload id in [`PreparedPayloads`]. `produceBlockV3` and
-//! `produceBlockV4` collect that build at once when their own attributes
-//! match, so the execution client has had seconds to fill it, and otherwise
-//! start one themselves. This runs whether or not anyone is subscribed to the
-//! event.
+//! `produceBlockV4` collect that build when their own attributes match, at
+//! once when it started at least `PAYLOAD_BUILD_WINDOW` before (the execution
+//! client has then had seconds to fill it), and otherwise start one
+//! themselves. This runs for the same proposers as the event, whether or not
+//! anyone is subscribed to it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4, PayloadId};
 use ethlambda_engine::{CustodyColumns, EngineClient, ForkchoiceStateV1};
@@ -66,7 +67,7 @@ use spawned_concurrency::tasks::{Context, Handler, send_after};
 use tracing::{debug, info, warn};
 
 use crate::BlockChainServer;
-use crate::beacon_payloads::checkpoint_hash;
+use crate::beacon_payloads::{checkpoint_hash, get_safe_execution_block_hash};
 use crate::events::{
     PayloadAttributesEvent, PayloadAttributesEventData, PayloadAttributesEventV3,
     PayloadAttributesEventV4,
@@ -168,12 +169,13 @@ pub enum BuildAttributes {
 ///
 /// The chain actor fills it once it sends `forkchoiceUpdated` with the next
 /// slot's attributes. Block production takes the entry its own attributes
-/// match and collects that build with `getPayload` at once, rather than start
-/// a build at the slot. A build is named by its parent payload and its
-/// attributes, which is what the execution client derives its payload id
-/// from. The safe and finalized hashes are left out: they do not change what
-/// is built, and they can move between the two calls, at an epoch boundary
-/// for one.
+/// match and collects that build with `getPayload` (once it has had
+/// `PAYLOAD_BUILD_WINDOW` to fill, which a build started seconds ahead has),
+/// rather than start a build at the slot. A build is named by its parent
+/// payload and its attributes, which is what the execution client derives its
+/// payload id from. The safe and finalized hashes are left out: they do not
+/// change what is built, and they can move between the two calls, at an
+/// epoch boundary for one.
 #[derive(Clone, Default)]
 pub struct PreparedPayloads(Arc<Mutex<Vec<PreparedPayload>>>);
 
@@ -182,7 +184,17 @@ struct PreparedPayload {
     slot: Slot,
     parent_hash: H256,
     attributes: BuildAttributes,
-    payload_id: PayloadId,
+    build: PreparedBuild,
+}
+
+/// A build [`PreparedPayloads::take`] hands out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedBuild {
+    pub payload_id: PayloadId,
+    /// When the execution client answered the `forkchoiceUpdated` that
+    /// started the build: a build restarted moments before the slot has had
+    /// no time to fill yet.
+    pub started: Instant,
 }
 
 /// The most builds held at once. One slot has more than one only when the
@@ -212,29 +224,34 @@ impl PreparedPayloads {
             slot,
             parent_hash,
             attributes,
-            payload_id,
+            build: PreparedBuild {
+                payload_id,
+                started: Instant::now(),
+            },
         });
+        // `held` stays in insertion order (`take` keeps it), so the first is
+        // the oldest.
         if held.len() > MAX_PREPARED_PAYLOADS {
             held.remove(0);
         }
     }
 
-    /// Takes the payload id of the build started for `slot` on `parent_hash`
-    /// with exactly `attributes`. A build is taken once: an execution client
-    /// may stop building once `getPayload` has served it.
+    /// Takes the build started for `slot` on `parent_hash` with exactly
+    /// `attributes`. A build is taken once: an execution client may stop
+    /// building once `getPayload` has served it.
     pub fn take(
         &self,
         slot: Slot,
         parent_hash: H256,
         attributes: &BuildAttributes,
-    ) -> Option<PayloadId> {
+    ) -> Option<PreparedBuild> {
         let mut held = self.0.lock().expect("prepared payloads lock poisoned");
         let index = held.iter().position(|build| {
             build.slot == slot
                 && build.parent_hash == parent_hash
                 && build.attributes == *attributes
         })?;
-        Some(held.swap_remove(index).payload_id)
+        Some(held.remove(index).build)
     }
 }
 
@@ -273,13 +290,14 @@ pub fn advance_for_proposal(
 }
 
 /// The forkchoice state a payload build on `head_block_hash` is started
-/// with: safe and finalized are the checkpoint blocks' hashes, by the same
-/// rule the head's own `forkchoiceUpdated` uses, so the two calls never
-/// disagree.
+/// with: the safe and finalized hashes the head's own `forkchoiceUpdated`
+/// sends (the Fast Confirmation Rule's confirmed block and the finalized
+/// checkpoint's block, `beacon_payloads::forkchoice_plan`), so a build never
+/// moves the execution client's safe block back to the justified one.
 pub fn building_forkchoice_state(store: &Store, head_block_hash: H256) -> ForkchoiceStateV1 {
     ForkchoiceStateV1 {
         head_block_hash,
-        safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
+        safe_block_hash: get_safe_execution_block_hash(store),
         finalized_block_hash: checkpoint_hash(store, store.beacon_finalized_checkpoint().root),
     }
 }
@@ -886,9 +904,14 @@ impl BlockChainServer {
                 >= lookahead_start(self.store.config().slot_duration_ms)
         };
         // With an execution client the worker also starts the payload build,
-        // so a proposal is prepared whether or not anyone listens.
+        // so a proposal is prepared whether or not anyone listens. Only when
+        // this node prepares for some proposer, though: otherwise `wanted`
+        // below refuses every key, and a follower with no validator client
+        // would read the key on every payload attestation for nothing.
+        let builds = self.engine.is_some()
+            && (preparation.always_prepare || preparation.fee_recipients.any_prepared());
         if !may_publish(
-            self.events.has_subscribers() || self.engine.is_some(),
+            self.events.has_subscribers() || builds,
             self.sync_status.is_syncing(),
             past_lookahead,
         ) {
@@ -933,8 +956,14 @@ impl BlockChainServer {
 
     /// Ask the execution client to start building the next slot's payload,
     /// and record the build for block production to collect. Off the actor:
-    /// it only waits on the execution client. Nothing is retried on failure,
-    /// since production then starts its own build.
+    /// it only waits on the execution client. A build that fails is not
+    /// started again, since production then starts its own.
+    ///
+    /// Bounded by the proposal slot's start. Production looks for the build
+    /// then, so a later answer is of no use, and the engine client's retries
+    /// (up to three attempts at 8 s each) would otherwise re-send this update
+    /// after the head's own `forkchoiceUpdated` for the new slot, moving the
+    /// execution client's head back to this one's.
     fn start_payload_build(&self, key: AttributesKey, build: PayloadBuild) {
         let (Some(engine), Some(preparation)) = (
             self.engine.clone(),
@@ -944,7 +973,10 @@ impl BlockChainServer {
         };
         let prepared = preparation.prepared_payloads.clone();
         let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
-        tokio::spawn(start_build(engine, prepared, custody, key, build));
+        let until_slot = Duration::from_millis(self.ms_until_slot_start(key.proposal_slot));
+        tokio::spawn(start_build(
+            engine, prepared, custody, key, build, until_slot,
+        ));
     }
 }
 
@@ -954,6 +986,7 @@ async fn start_build(
     custody: Option<CustodyColumns>,
     key: AttributesKey,
     build: PayloadBuild,
+    until_slot: Duration,
 ) {
     let proposal_slot = key.proposal_slot;
     let head_root = ShortRoot(&key.head_root.0);
@@ -961,17 +994,27 @@ async fn start_build(
         forkchoice,
         attributes,
     } = build;
-    let started = match &attributes {
-        BuildAttributes::V3(attributes) => {
-            engine
-                .forkchoice_updated_with_attributes(&forkchoice, attributes)
-                .await
+    let request = async {
+        match &attributes {
+            BuildAttributes::V3(attributes) => {
+                engine
+                    .forkchoice_updated_with_attributes(&forkchoice, attributes)
+                    .await
+            }
+            BuildAttributes::V4(attributes) => {
+                engine
+                    .forkchoice_updated_v4_with_attributes(&forkchoice, attributes, custody)
+                    .await
+            }
         }
-        BuildAttributes::V4(attributes) => {
-            engine
-                .forkchoice_updated_v4_with_attributes(&forkchoice, attributes, custody)
-                .await
-        }
+    };
+    let Ok(started) = tokio::time::timeout(until_slot, request).await else {
+        warn!(
+            proposal_slot,
+            %head_root,
+            "The execution client did not start the next slot's payload build before the slot"
+        );
+        return;
     };
     match started {
         Ok((_, Some(payload_id))) => {
@@ -1025,8 +1068,9 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
                 .is_some_and(|(now, _)| now == key);
         let recheck = self.payload_attributes.finish(key, current, result.is_ok());
         match result {
-            // Only while still current, so a stale worker never moves the
-            // execution client's head back.
+            // Only while still current, so a stale worker's build never
+            // names an old head to the execution client; and
+            // `start_payload_build` stops the update at the slot's start.
             Ok(Some(NextPayload { event, build })) if current => {
                 if self.events.has_subscribers() {
                     debug!(
@@ -1645,7 +1689,9 @@ mod tests {
         assert_eq!(prepared.take(10, parent, &BuildAttributes::V3(v4.v3)), None);
 
         assert_eq!(
-            prepared.take(10, parent, &attributes(10)),
+            prepared
+                .take(10, parent, &attributes(10))
+                .map(|build| build.payload_id),
             Some(PayloadId([1; 8]))
         );
         // Once: the execution client may stop building after serving it.
@@ -1663,15 +1709,42 @@ mod tests {
         prepared.insert(10, second, attributes(10), PayloadId([2; 8]));
         prepared.insert(10, first, attributes(10), PayloadId([3; 8]));
         assert_eq!(
-            prepared.take(10, first, &attributes(10)),
+            prepared
+                .take(10, first, &attributes(10))
+                .map(|build| build.payload_id),
             Some(PayloadId([3; 8]))
         );
 
         prepared.insert(11, first, attributes(11), PayloadId([4; 8]));
         assert_eq!(prepared.take(10, second, &attributes(10)), None);
         assert_eq!(
-            prepared.take(11, first, &attributes(11)),
+            prepared
+                .take(11, first, &attributes(11))
+                .map(|build| build.payload_id),
             Some(PayloadId([4; 8]))
+        );
+    }
+
+    /// Past the cap the oldest build goes, also after a `take` from the
+    /// middle: the newest is the one production is likeliest to ask for.
+    #[test]
+    fn the_oldest_build_is_dropped_past_the_cap() {
+        let prepared = PreparedPayloads::default();
+        let parent = |n: u8| H256::repeat_byte(n);
+        for n in 1..=MAX_PREPARED_PAYLOADS as u8 {
+            prepared.insert(10, parent(n), attributes(10), PayloadId([n; 8]));
+        }
+        assert!(prepared.take(10, parent(1), &attributes(10)).is_some());
+        let newest = MAX_PREPARED_PAYLOADS as u8;
+        prepared.insert(10, parent(newest + 1), attributes(10), PayloadId([0xf0; 8]));
+        prepared.insert(10, parent(newest + 2), attributes(10), PayloadId([0xf1; 8]));
+
+        assert_eq!(prepared.take(10, parent(2), &attributes(10)), None);
+        assert_eq!(
+            prepared
+                .take(10, parent(newest), &attributes(10))
+                .map(|build| build.payload_id),
+            Some(PayloadId([newest; 8]))
         );
     }
 

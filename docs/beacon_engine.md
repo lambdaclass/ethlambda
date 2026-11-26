@@ -47,9 +47,10 @@ Two method families a full client would have are deliberately absent:
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
   execution client does not advertise `engine_getPayloadV6`. The chain actor
   sends that `forkchoiceUpdated` with attributes a third of a slot ahead, for
-  a proposer a validator client registered, and block production collects
-  the build with `getPayload` at once; see the `payload_attributes` event in
-  [`rpc.md`](rpc.md).
+  a proposer a validator client registered (every proposer with
+  `--always-prepare-payload`), with the same safe and finalized hashes as the
+  head's own update, and block production collects the build with
+  `getPayload`; see the `payload_attributes` event in [`rpc.md`](rpc.md).
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto

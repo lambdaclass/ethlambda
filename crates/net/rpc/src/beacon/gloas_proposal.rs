@@ -795,9 +795,10 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
 ///
 /// The chain actor starts the build a third of a slot ahead, and again when
 /// its inputs change ([`PreparedPayloads`]). When one of those builds has
-/// exactly these attributes it is collected at once, the execution client
-/// having filled it since. Otherwise the build starts here and is collected
-/// after [`PAYLOAD_BUILD_WINDOW`], as on fulu.
+/// exactly these attributes it is collected ([`prepared_build`]: at once, the
+/// execution client having filled it since, unless it started less than
+/// [`PAYLOAD_BUILD_WINDOW`] ago). Otherwise the build starts here and is
+/// collected after [`PAYLOAD_BUILD_WINDOW`], as on fulu.
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
@@ -811,7 +812,7 @@ async fn build_payload(
     let attributes = payload_attributes_v4(&prepared.inputs, fee_recipient);
     let slot = prepared.inputs.slot_number;
     let key = BuildAttributes::V4(attributes.clone());
-    if let Some(payload_id) = prepared_build(ahead, slot, forkchoice.head_block_hash, &key) {
+    if let Some(payload_id) = prepared_build(ahead, slot, forkchoice.head_block_hash, &key).await {
         match engine.get_payload_v6(payload_id).await {
             Ok(built) => {
                 info!(%slot, "Collected the payload build started ahead of the slot");

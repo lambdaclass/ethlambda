@@ -1240,32 +1240,39 @@ fn blinded_block(
 /// window a block carries few or none of the transactions pending
 /// (lambdaclass/ethlambda#894: 0 to 3 of 16 back to back, 48 of 48 after
 /// 500 ms). Lodestar and Nimbus wait the same on this path. A proposal the
-/// actor prepared skips it.
+/// actor prepared waits only for what is left of it since that build
+/// started, which is nothing for a build started seconds ahead.
 pub(crate) const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
 
 /// The payload id of the build the chain actor started ahead of `slot` with
-/// exactly these inputs, if it did ([`PreparedPayloads`]).
-pub(crate) fn prepared_build(
+/// exactly these inputs, if it did ([`PreparedPayloads`]), once that build
+/// has had [`PAYLOAD_BUILD_WINDOW`] to fill. A build started seconds ahead
+/// has, and is returned at once; one restarted moments before the slot (the
+/// head or an attribute changed late) is waited on for the rest of the
+/// window, as a build started here would be.
+pub(crate) async fn prepared_build(
     prepared: Option<&PreparedPayloads>,
     slot: Slot,
     parent_hash: H256,
     attributes: &BuildAttributes,
 ) -> Option<PayloadId> {
     let prepared = prepared?;
-    let payload_id = prepared.take(slot, parent_hash, attributes);
-    if payload_id.is_none() {
+    let Some(build) = prepared.take(slot, parent_hash, attributes) else {
         info!(%slot, "No payload build was started ahead for these attributes; building now");
-    }
-    payload_id
+        return None;
+    };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW.saturating_sub(build.started.elapsed())).await;
+    Some(build.payload_id)
 }
 
 /// The execution client's payload for `state`'s slot, on the head.
 ///
 /// The chain actor starts the build a third of a slot ahead, and again when
 /// its inputs change ([`PreparedPayloads`]). When one of those builds has
-/// exactly these attributes it is collected at once, the execution client
-/// having filled it since. Otherwise the build starts here and is collected
-/// after [`PAYLOAD_BUILD_WINDOW`].
+/// exactly these attributes it is collected ([`prepared_build`]: at once, the
+/// execution client having filled it since, unless it started less than
+/// [`PAYLOAD_BUILD_WINDOW`] ago). Otherwise the build starts here and is
+/// collected after [`PAYLOAD_BUILD_WINDOW`].
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
@@ -1294,7 +1301,7 @@ async fn build_payload(
     let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
     let slot = state.slot();
     let ahead = BuildAttributes::V3(attributes.clone());
-    if let Some(payload_id) = prepared_build(prepared, slot, inputs.parent_hash, &ahead) {
+    if let Some(payload_id) = prepared_build(prepared, slot, inputs.parent_hash, &ahead).await {
         match engine.get_payload(payload_id).await {
             Ok(built) => {
                 info!(%slot, "Collected the payload build started ahead of the slot");
