@@ -1152,6 +1152,69 @@ beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
 
+`GET /health` on the same port answers whether the client can do its duties:
+`200` when it can, `503` when it cannot or has not started yet, with the checks
+behind the answer.
+
+```json
+{
+  "status": "unhealthy",
+  "service": "ethlambda-validator",
+  "checks": {
+    "beacon_nodes": { "usable": 0, "configured": 2 },
+    "validators": { "loaded": 64, "resolved": 64 },
+    "slashing_protection": { "last_write_ok": true },
+    "started": true,
+    "schedule_current": true
+  }
+}
+```
+
+It reads state the client already keeps and sends no request of its own, so it
+is cheap to poll.
+
+- **`beacon_nodes`**: `usable` counts the nodes whose latest
+  [sync probe](#the-per-slot-sync-check) was answered, neither syncing nor
+  optimistic, and is at most two slots old. One usable node is enough: a client
+  with some nodes down and one usable is `healthy`, with the counts in the
+  body.
+- **`validators`**: the keys loaded, and those the last duty refresh resolved to
+  an index. Reported, never failing: a key waiting for activation has no index
+  yet, and a client started with no keys, to wait for a keymanager import, is
+  idle on purpose. A key doppelganger protection still withholds counts as
+  loaded.
+- **`slashing_protection.last_write_ok`**: the record's last write succeeded,
+  and the last access to it did not give up after waiting 3 s for another one
+  to finish. A failed write keeps it `false` until a later write succeeds. A
+  full disk or a read-only remount under `--validators-dir` shows up here.
+- **`started`**: a duty refresh has succeeded since the process started.
+- **`schedule_current`**: the attester schedule the last successful duty
+  refresh left held reaches the current epoch: the refresh's own epoch, and
+  the next when its lookahead fetch went through too. A node can answer its
+  probe synced and still fail every refresh, or every lookahead; once the
+  schedule runs out the client has no attestations to make. `true` before the
+  first refresh and before genesis. A client with no validator resolved (no
+  keys, or keys waiting for activation) holds no schedule, and a refresh
+  counts through the next epoch, so it is not caught out at each boundary.
+
+`status` is one of three:
+
+- `healthy` (`200`): started, at least one usable node, the last write went
+  through, and the schedule is current.
+- `starting` (`503`): no refresh has succeeded yet and nothing else has failed.
+  A node not probed yet does not count against a client that has not started,
+  so a normal startup reads `starting` throughout. Once started, a node with no
+  probe counts as unusable.
+- `unhealthy` (`503`): anything else.
+
+Remote signers are not checked, since that would take a request to each.
+`ethlambda_validator_healthy` carries the same answer as a series, set from the
+same report on every scrape.
+
+Point readiness checks, load balancers and uptime monitors at it, not a
+Kubernetes liveness probe: it answers `503` while every beacon node is down or
+syncing, which restarting the validator client does not fix.
+
 ## `voluntary-exit`
 
 `ethlambda voluntary-exit` signs a voluntary exit for one validator and hands

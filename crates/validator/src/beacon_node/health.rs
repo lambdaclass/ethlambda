@@ -605,7 +605,6 @@ pub fn slot_signs(health: &NodeHealth, slot: Slot) -> bool {
          signing nothing in this slot"
     );
     crate::metrics::inc_slots_skipped_syncing();
-    crate::metrics::set_beacon_node_available(false);
     false
 }
 

@@ -29,6 +29,7 @@ pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
 pub mod chain_check;
+pub mod client_health;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -296,6 +297,12 @@ where
     // The keymanager mutates this at runtime while the duty loop reads it, so
     // it is shared rather than owned outright from here on.
     let store = Arc::new(RwLock::new(store));
+    // What `/health` reports. The nodes and the record are attached once
+    // they exist; until the first refresh it answers `starting`.
+    let health = Arc::new(client_health::ClientHealth::new(
+        config.beacon_nodes.len(),
+        store.clone(),
+    ));
 
     // Bound before any beacon-node network call, deliberately: a validator
     // that cannot reach its beacon node waits for one at startup, for as long
@@ -310,8 +317,9 @@ where
             source,
         })?;
     info!(address = %config.metrics, "Metrics listening");
+    let router = metrics::router(health.clone());
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, metrics::router()).await {
+        if let Err(err) = axum::serve(listener, router).await {
             error!(%err, "Metrics server stopped");
         }
     });
@@ -375,6 +383,11 @@ where
         "Slashing protection loaded"
     );
     let protection = slashing_protection::SharedProtection::new(protection);
+    health.attach(
+        beacon_node.health().clone(),
+        clock.clone(),
+        protection.clone(),
+    );
 
     // Every key loaded is registered before anything that signs exists, in
     // the epoch the clock is in now, so this process's own activity before a
@@ -720,6 +733,9 @@ where
                     Ok(settled) => owed = settled,
                     Err(err) => return Err(err),
                 }
+                if owed.is_some() {
+                    report_refreshed(&health, &duties, epoch, resolved.len());
+                }
             }
 
             // A node the chain check let back in since the last slot was
@@ -911,6 +927,7 @@ where
                 );
                 match settled {
                     Ok(Some(owed)) => {
+                        report_refreshed(&health, &duties, epoch, resolved.len());
                         send_owed(
                             owed,
                             epoch,
@@ -1293,7 +1310,6 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
         Ok(Err(err)) => {
             error!(%slot, %err, "Failed to publish sync committee messages for this slot");
             metrics::inc_sync_committee_failures();
-            metrics::set_beacon_node_available(false);
             return;
         }
         Err(_) => {
@@ -1403,13 +1419,6 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
         Err(err) => {
             error!(%slot, %err, "Failed to publish attestations for this slot");
             metrics::inc_attestation_failures();
-            // Every error `attest` can return originates from the beacon
-            // node (a failed fetch, a bad or mismatched response, a
-            // failed submission), so a failure here is exactly the signal
-            // this gauge exists for: `refresh_epoch` only runs once an
-            // epoch and would otherwise leave it reporting stale
-            // availability for up to that long.
-            metrics::set_beacon_node_available(false);
         }
     }
 }
@@ -1447,7 +1456,6 @@ async fn payload_attest<B: BeaconNodeApi>(
         Ok(Err(err)) => {
             error!(%slot, %err, "Failed to publish payload attestations for this slot");
             metrics::inc_payload_attestation_failures();
-            metrics::set_beacon_node_available(false);
         }
         Err(_) => {
             warn!(
@@ -1645,7 +1653,6 @@ async fn ahead_of_block<B: BeaconNodeApi>(
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 warn!(%slot, %err, "Proposer duties fetch failed; asking again next slot");
-                metrics::set_beacon_node_available(false);
             }
             Err(_) => {
                 warn!(
@@ -1723,7 +1730,6 @@ fn settle_refresh(
                 "Failed to refresh duties: the beacon node is syncing or optimistic; keeping the \
                  previous schedule and proposing no block until a refresh gets through"
             );
-            metrics::set_beacon_node_available(false);
             *node_syncing = true;
             Ok(None)
         }
@@ -1733,7 +1739,6 @@ fn settle_refresh(
         // hide the cause behind a warning every slot.
         Err(err) if err.is_retryable() => {
             warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
-            metrics::set_beacon_node_available(false);
             Ok(None)
         }
         // Unreachable today: every error `refresh_epoch` can produce comes
@@ -1748,6 +1753,26 @@ fn settle_refresh(
             Err(err)
         }
     }
+}
+
+/// Tell `/health` that `epoch`'s refresh got through, resolving `resolved`
+/// validators, and how far the schedule it left reaches: through the
+/// lookahead epoch only when its fetch went through, since `refresh_around`
+/// shrugs a failed one off and the schedule then ends with this epoch. With
+/// no validator resolved there is no schedule to run out, and nothing to fetch
+/// for the next epoch either, so it stands until the next refresh.
+fn report_refreshed<B: BeaconNodeApi>(
+    health: &client_health::ClientHealth,
+    duties: &DutiesService<B>,
+    epoch: u64,
+    resolved: usize,
+) {
+    let covered_through = if resolved == 0 || duties.holds_attesters(epoch + 1) {
+        epoch + 1
+    } else {
+        epoch
+    };
+    health.epoch_refreshed(resolved, covered_through);
 }
 
 /// Send what a refresh left owing, from tasks of their own, once the slot's
@@ -1802,7 +1827,6 @@ fn spawn_subscriptions<B: BeaconNodeApi + 'static>(
         let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
         let _ = subscribed.await.inspect_err(|err| {
             warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
-            metrics::set_beacon_node_available(false);
         });
     });
 }
@@ -1941,7 +1965,6 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    metrics::set_beacon_node_available(true);
     let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
     Ok(Refreshed {
         // Taken here, after the last await, rather than from
