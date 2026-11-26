@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-384e4547.js";
+            window.path_to_searchindex_js = "searchindex-b125aab9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1215,7 +1215,9 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_remote_signer_request_duration_seconds</code></td><td>Histogram</td><td>Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer’s 64 request slots. The number to watch for a slow signer; empty when every key is local</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_failures_total</code></td><td>Counter</td><td>Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under <code>--validators-dir</code></td></tr>
-<tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset</td></tr>
+<tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit shortly after the slot’s block arrives, and no later than just past the one-third-slot duty offset, where it sits for a slot whose block came late or not at all, or with <code>--disable-event-stream</code></td></tr>
+<tr><td><code>ethlambda_validator_duty_triggers_total</code></td><td>Counter</td><td>What started each slot’s duty, once per duty per slot. <code>duty</code>: <code>attestation</code>, <code>sync_committee_message</code>, <code>payload_attestation</code>. <code>trigger</code>: <code>event</code> (a beacon node’s <code>head</code> for the slot, or its <code>execution_payload_available</code> for the vote, borne out by the node’s answer), <code>deadline</code> (no event for the slot before the offset: every slot with <code>--disable-event-stream</code> or the streams down) or <code>mismatch</code> (an event the node’s answer did not bear out, or had not answered by the offset, so the duty waited for its offset after all). A steady <code>mismatch</code> share points at beacon nodes that disagree with each other, or payloads announced and not seen present</td></tr>
+<tr><td><code>ethlambda_validator_event_streams_open</code></td><td>Gauge</td><td>Beacon node event streams open: one per node for <code>head</code>, and one more per node for <code>execution_payload_available</code> on a network that schedules gloas. A stream missing from that count costs its node’s early starts, not a duty</td></tr>
 </tbody>
 </table>
 </div>

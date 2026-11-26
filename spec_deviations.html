@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-384e4547.js";
+            window.path_to_searchindex_js = "searchindex-b125aab9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1065,13 +1065,6 @@ Every “retry without operations” fallback also drops it. That costs rewards,
 never the block.</li>
 <li>Messages from earlier slots over the same root are not packed.</li>
 </ul>
-<h2 id="the-validator-client-signs-a-sync-committee-message-at-the-deadline-only"><a class="header" href="#the-validator-client-signs-a-sync-committee-message-at-the-deadline-only">The validator client signs a sync committee message at the deadline only</a></h2>
-<p><code>validator.md</code> (“Prepare sync committee message”) has a member sign as soon as
-it sees the block for the slot, or at the sync-message deadline, whichever
-comes first. The validator client signs once, at the deadline
-(<code>SYNC_MESSAGE_DUE_BPS</code>, or its gloas variant), over the head root it then
-reads, and refuses to when that root is optimistic
-(<code>specs/bellatrix/optimistic-sync.md</code>).</p>
 <h2 id="the-validator-client-withholds-payload-timeliness-votes-over-an-optimistic-head"><a class="header" href="#the-validator-client-withholds-payload-timeliness-votes-over-an-optimistic-head">The validator client withholds payload timeliness votes over an optimistic head</a></h2>
 <ul>
 <li><strong>Specification:</strong> <code>specs/bellatrix/optimistic-sync.md</code> says an optimistic
