@@ -1,8 +1,11 @@
 //! Ordered failover across several beacon nodes.
 //!
-//! First healthy wins, in the order given on the command line. Deliberately not
-//! health-scored: Lighthouse ranks its nodes by sync distance and tie-breaks on
-//! list order, which is better, and is a refinement this does not need yet.
+//! First healthy wins. The nodes whose last sync probe passed (neither syncing
+//! nor optimistic, see [`super::health`]) are tried first, in the order given on
+//! the command line, then the rest in the same order. Deliberately no finer
+//! than passed or not: Lighthouse ranks its nodes by sync distance, optimistic
+//! status and `el_offline`, and tie-breaks on list order, which is better, and
+//! is a refinement this does not need yet.
 //!
 //! # Only nodes on this client's chain
 //!
@@ -20,7 +23,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
@@ -37,6 +41,7 @@ use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::health::{NodeHealth, Probe, Standing, SyncStatus, SyncVerdict};
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
@@ -51,6 +56,18 @@ use crate::error::{Error, Result};
 /// by the node reference and whatever else the closure captures, rather than
 /// to `Self`.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Which nodes a request may be sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Every node.
+    Every,
+    /// Every node but those whose last sync probe reported syncing or
+    /// optimistic, or got no answer, for the calls the Beacon API gives no 503
+    /// for in that state. A node with no probe to read is still asked (see
+    /// [`Standing::may_serve_ungated`]).
+    SkipUnsynced,
+}
 
 /// What an error says when every node was skipped for being on another chain
 /// (or not yet known to be on this one), so no request was made at all.
@@ -170,6 +187,9 @@ pub struct FallbackBeaconNode<B> {
     /// In the order given, which never changes: a [`Producer`] is a position
     /// in it, so a blinded block goes back to the node that produced it.
     nodes: Vec<B>,
+    /// Each node's last sync probe, by the same positions. What orders the
+    /// walk, and what the duty loop gates each slot on.
+    health: Arc<NodeHealth>,
     /// The chain check's state of each node, by position in `nodes`. Built
     /// with it and never resized, so the two always line up.
     states: Vec<NodeState>,
@@ -184,12 +204,40 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// [`Self::establish`] is what takes a node out.
     pub fn new(nodes: Vec<B>) -> Self {
         assert!(!nodes.is_empty(), "at least one beacon node is required");
+        let health = Arc::new(NodeHealth::new(nodes.len()));
         let states = nodes.iter().map(|_| NodeState::new()).collect();
         Self {
             nodes,
+            health,
             states,
             readmissions: AtomicU64::new(0),
         }
+    }
+
+    /// Each node's last sync probe. Shared, so whatever reports on the nodes
+    /// reads the records the walk is ordered by.
+    pub fn health(&self) -> &Arc<NodeHealth> {
+        &self.health
+    }
+
+    /// Ask every usable node for its sync status at once, each within
+    /// `budget`, and record each answer, or the error in its place, as it
+    /// arrives: a node that hangs holds back only its own record. `slot` is
+    /// the slot the probe is taken ahead of. See [`super::health`].
+    ///
+    /// A node on another chain (or not checked yet) is not probed: no call
+    /// goes to it, so a synced answer from it must not open the slot's gate.
+    pub async fn probe(&self, slot: Slot, budget: Duration) {
+        let health = &self.health;
+        let asks = self.usable_nodes().map(|(position, node)| async move {
+            let at = SystemTime::now();
+            let outcome = match tokio::time::timeout(budget, node.sync_status()).await {
+                Ok(answer) => answer.map_err(|err| err.to_string()),
+                Err(_) => Err(format!("no answer within {} ms", budget.as_millis())),
+            };
+            health.record(position, Probe { slot, at, outcome });
+        });
+        futures_util::future::join_all(asks).await;
     }
 
     fn is_usable(&self, position: usize) -> bool {
@@ -488,16 +536,22 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// whose usable flag is down (on another chain, or not checked yet) is
     /// skipped without a request.
     ///
+    /// The order is [`NodeHealth::ranked`]'s: the nodes whose last sync probe
+    /// passed first, then the rest, each in command-line order. With no probe
+    /// held it is the command-line order.
+    ///
     /// "Success" means the node returned `Ok`, nothing more. That is the right
     /// rule only where an `Ok` is an answer this client can act on, which is
-    /// why [`BeaconNodeApi::is_syncing`] does not use this helper: there,
-    /// `Ok(true)` is a node reporting itself unusable, and returning it from
-    /// the first node would mask every healthy node behind it.
+    /// why [`BeaconNodeApi::is_optimistic_or_syncing`] does not use this
+    /// helper: there, `Ok(true)` is a node reporting itself unusable, and
+    /// returning it from the first node would mask every healthy node behind
+    /// it.
     ///
-    /// A node that is syncing is skipped here in practice, because the calls
-    /// routed through this helper answer 503 while syncing and 503 is mapped to
-    /// an error. That is a property of those endpoints, not something this
-    /// function arranges.
+    /// A node that is syncing and still listed is skipped here in practice,
+    /// because the calls routed through this helper answer 503 while syncing
+    /// and 503 is mapped to an error. That is a property of those endpoints,
+    /// not something this function arranges; [`Self::try_each_synced`] is for
+    /// the calls where it is not.
     ///
     /// `'p` is a single, caller-inferred lifetime rather than a higher-ranked
     /// `for<'b>` one: a higher-ranked bound would force the closure's future to
@@ -521,7 +575,22 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
-        self.try_each_at_inner(what, true, call).await
+        self.try_each_at_inner(what, true, Reach::Every, call).await
+    }
+
+    /// [`Self::try_each`] without the nodes whose last sync probe reported
+    /// syncing or optimistic, or got no answer, for a call whose endpoint
+    /// answers such a node with no 503 and data this client must not sign. A
+    /// node with no probe to read is still asked. When no node is left to ask,
+    /// this is `Err(BeaconNodeSyncing)`, which the callers read as "do not
+    /// sign" rather than as a failure.
+    async fn try_each_synced<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<T>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        self.try_each_at_inner(what, true, Reach::SkipUnsynced, call)
+            .await
+            .map(|(_, value)| value)
     }
 
     /// [`Self::try_each`] without the final `warn!`, for a caller whose own
@@ -533,22 +602,37 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
-        self.try_each_at_inner(what, false, call)
+        self.try_each_at_inner(what, false, Reach::Every, call)
             .await
             .map(|(_, value)| value)
     }
 
+    /// The walk behind every `try_each`. The position returned is the node's
+    /// command-line position, whatever order it was asked in.
     async fn try_each_at_inner<'p, T, F>(
         &'p self,
         what: &'static str,
         warn_when_all_fail: bool,
+        reach: Reach,
         call: F,
     ) -> Result<(usize, T)>
     where
         F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
     {
         let mut last = None;
-        for (position, node) in self.usable_nodes() {
+        let mut asked = false;
+        for (position, standing) in self.health.ranked() {
+            let Some(node) = self.nodes.get(position) else {
+                continue;
+            };
+            if !self.is_usable(position) {
+                continue;
+            }
+            if reach == Reach::SkipUnsynced && !standing.may_serve_ungated() {
+                debug!(%what, position, ?standing, "Not asking a beacon node whose last sync probe did not answer synced");
+                continue;
+            }
+            asked = true;
             match call(node).await {
                 Ok(value) => return Ok((position, value)),
                 Err(err) => {
@@ -560,6 +644,12 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                     last = Some(err);
                 }
             }
+        }
+        // No node on this client's chain vouched, at its last probe, for being
+        // one this client may sign against: an answer, not a failure. With no
+        // node on this client's chain at all, it is the failure below.
+        if reach == Reach::SkipUnsynced && !asked && self.usable_nodes().next().is_some() {
+            return Err(Error::BeaconNodeSyncing);
         }
         let detail = self.failure_detail(last);
         if warn_when_all_fail {
@@ -717,45 +807,42 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ///
     /// Deliberately not a plain `try_each`. A node answering `true` is
     /// answering successfully, so `try_each` would return that `Ok(true)` from
-    /// the first node and never consult the rest, and the caller
-    /// (`refresh_epoch`) turns `true` into "do not refresh duties". A syncing
-    /// node at the head of the list would therefore stop duties from being
-    /// refreshed for as long as it was syncing, with a perfectly healthy node
-    /// sitting behind it unused, which is the opposite of what configuring a
-    /// second node is for.
+    /// the first node and never consult the rest, and a caller that turns
+    /// `true` into "hold off" would hold off with a perfectly healthy node
+    /// sitting behind a syncing one, which is the opposite of what configuring
+    /// a second node is for.
     ///
-    /// So: look for a node that is usable, and report `false` the moment one is
-    /// found. `true` means every reachable node said it was syncing or
-    /// optimistic, which is the only situation where the caller's decision to
-    /// hold off is right.
-    ///
-    /// A node that fails outright is skipped like any other failure, and only
-    /// if none answers at all does this surface an error.
+    /// So every node on this client's chain is asked at once, and the answers
+    /// are read by the rule the duty loop's per-slot gate reads its probe by
+    /// ([`SyncVerdict::signs`]): `false` when some node is usable, `true` when
+    /// every node that answered said it was syncing or optimistic. A node that
+    /// fails outright is left out of the count, and only if none answers at
+    /// all does this surface an error.
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
+        let selected: Vec<(usize, &B)> = self.usable_nodes().collect();
+        let answers =
+            futures_util::future::join_all(selected.iter().map(|(_, node)| node.sync_status()))
+                .await;
         let mut last = None;
-        let mut any_answered = false;
-        for (position, node) in self.usable_nodes() {
-            match node.is_optimistic_or_syncing().await {
-                Ok(false) => return Ok(false),
-                Ok(true) => {
-                    any_answered = true;
-                    debug!(
-                        position,
-                        "Beacon node is syncing or optimistic; trying the next"
-                    );
-                }
+        let mut standings = Vec::with_capacity(answers.len());
+        for ((position, _), answer) in selected.iter().zip(answers) {
+            let position = *position;
+            match answer {
+                Ok(status) => standings.push(Standing::of(&status)),
                 Err(err) => {
-                    debug!(what = "syncing", position, %err, "Beacon node request failed; trying the next");
+                    debug!(what = "syncing", position, %err, "Beacon node request failed");
                     last = Some(err);
                 }
             }
         }
 
-        if any_answered {
-            // Every node that answered said it was unusable. That is a real
-            // answer, not a failure: the caller should hold off, and saying so
-            // is more useful than an error claiming nothing could be reached.
-            return Ok(true);
+        let verdict = SyncVerdict::tally(standings);
+        if verdict.answered > 0 {
+            // Every node that answered said it was unusable, when none is
+            // synced. That is a real answer, not a failure: the caller should
+            // hold off, and saying so is more useful than an error claiming
+            // nothing could be reached.
+            return Ok(!verdict.signs());
         }
 
         let detail = self.failure_detail(last);
@@ -764,6 +851,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             %detail, "All configured beacon nodes failed; duty likely missed"
         );
         Err(Error::AllBeaconNodesFailed(detail))
+    }
+
+    /// The first node in the walk's order to answer, as for any query. The
+    /// per-slot probe asks each node itself (see [`Self::probe`]), and nothing
+    /// else calls this through the fallback.
+    async fn sync_status(&self) -> Result<SyncStatus> {
+        self.try_each("syncing", |node| node.sync_status()).await
     }
 
     async fn validator_indices(&self, pubkeys: &[BlsPubkey]) -> Result<Vec<ValidatorEntry>> {
@@ -788,8 +882,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties> {
-        // Quiet: the preferences service reports its own failure once per
-        // epoch, and no duty depends on this answer.
+        // Quiet: both callers report their own failure, the preferences
+        // service once per epoch and the duty loop at each fetch it needs.
         self.try_each_quiet("proposer_duties_v2", |node| node.proposer_duties_v2(epoch))
             .await
     }
@@ -1036,11 +1130,14 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// walk, even though another might have one. That is the right trade: PTC
     /// votes are due at three quarters of the slot, and a node that has seen
     /// nothing by then is one this client should not be voting through.
+    ///
+    /// Never from a node whose last sync probe reported syncing or optimistic:
+    /// see the trait's contract.
     async fn payload_attestation_data(
         &self,
         slot: Slot,
     ) -> Result<Option<gloas::PayloadAttestationData>> {
-        self.try_each("payload_attestation_data", |node| {
+        self.try_each_synced("payload_attestation_data", |node| {
             node.payload_attestation_data(slot)
         })
         .await
@@ -1146,9 +1243,11 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     /// An optimistic head is an error from each implementation, so a node
-    /// tracking an unvalidated head is walked past rather than signed over.
+    /// tracking an unvalidated head is walked past rather than signed over. A
+    /// node whose last sync probe reported syncing or optimistic is not asked
+    /// at all: see the trait's contract.
     async fn head_block_root(&self) -> Result<Root> {
-        self.try_each("head_block_root", |node| node.head_block_root())
+        self.try_each_synced("head_block_root", |node| node.head_block_root())
             .await
     }
 
@@ -1387,13 +1486,13 @@ mod tests {
         );
     }
 
-    /// A syncing node at the head of the list must not stop duties being
-    /// refreshed when a healthy node sits behind it.
+    /// A syncing node at the head of the list must not make the fallback
+    /// report itself unusable when a healthy node sits behind it.
     ///
-    /// `is_syncing` returning `Ok(true)` is a *successful* call, so a plain
-    /// `try_each` would return the first node's answer and never look further.
-    /// `refresh_epoch` turns `true` into "do not refresh", so the second node
-    /// would go unused for as long as the first was syncing.
+    /// `is_optimistic_or_syncing` returning `Ok(true)` is a *successful* call,
+    /// so a plain `try_each` would return the first node's answer and never
+    /// look further, and a caller holding off on `true` would leave the second
+    /// node unused for as long as the first was syncing.
     #[tokio::test]
     async fn a_syncing_first_node_does_not_mask_a_healthy_second() {
         let syncing = MockBeaconNode {
@@ -1930,6 +2029,221 @@ mod tests {
         assert!(
             !fallback.is_optimistic_or_syncing().await.expect("answers"),
             "the healthy second node must be found"
+        );
+    }
+
+    /// A node that answers every duty endpoint for slot 96, its head root
+    /// marked with `mark` so the answer names the node that gave it.
+    fn answering(mark: u8) -> MockBeaconNode {
+        use ethlambda_types::beacon::primitives::BlsSignature;
+        let root = Root::repeat_byte(mark);
+        let mut node = MockBeaconNode::new().with_attestation_data(96);
+        node.aggregate = node.attestation_data;
+        node.with_block(96, 7)
+            .with_head_root(root)
+            .with_contribution(altair::SyncCommitteeContribution {
+                slot: 96,
+                beacon_block_root: root,
+                subcommittee_index: 0,
+                aggregation_bits: Default::default(),
+                signature: BlsSignature([1; 96]),
+            })
+            .with_payload_attestation_data(gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot: 96,
+                payload_present: true,
+                blob_data_available: true,
+            })
+    }
+
+    /// The issue's second case: the first node is syncing but answers every
+    /// endpoint, as a node that does not refuse with 503 would; the second is
+    /// synced. Once a probe has said so, every duty is served by the second,
+    /// and the first is asked nothing.
+    #[tokio::test]
+    async fn every_duty_is_served_by_the_synced_node_listed_second() {
+        let syncing = MockBeaconNode {
+            syncing: true,
+            ..answering(1)
+        };
+        let fallback = FallbackBeaconNode::new(vec![syncing, answering(2)]);
+        fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("attestation data");
+        let block = fallback
+            .produce_block(&request(96, 7))
+            .await
+            .expect("a block");
+        assert_eq!(block.producer, Producer::at(1));
+        fallback
+            .publish_block(ForkName::Electra, b"body")
+            .await
+            .expect("published");
+        fallback
+            .aggregate_attestation(96, Root::ZERO, 0)
+            .await
+            .expect("an aggregate");
+        let head = fallback.head_block_root().await.expect("a head");
+        assert_eq!(head, Root::repeat_byte(2));
+        fallback
+            .sync_committee_contribution(96, 0, head)
+            .await
+            .expect("a contribution");
+        fallback
+            .payload_attestation_data(96)
+            .await
+            .expect("payload data")
+            .expect("a block");
+
+        let first = &fallback.nodes[0];
+        assert_eq!(first.attestation_data_call_count(), 0);
+        assert!(first.block_requests().is_empty());
+        assert!(first.published_blocks().is_empty());
+        assert!(first.aggregate_requests().is_empty());
+        assert!(first.contribution_requests().is_empty());
+        assert_eq!(first.payload_attestation_data_call_count(), 0);
+
+        let second = &fallback.nodes[1];
+        assert_eq!(second.attestation_data_call_count(), 1);
+        assert_eq!(second.block_requests().len(), 1);
+        assert_eq!(second.published_blocks().len(), 1);
+        assert_eq!(second.aggregate_requests().len(), 1);
+        assert_eq!(second.contribution_requests().len(), 1);
+        assert_eq!(second.payload_attestation_data_call_count(), 1);
+    }
+
+    /// The order is a preference, not a filter: a call the synced node fails
+    /// still falls through to the rest, where the 503 the Beacon API requires
+    /// of a syncing node is the backstop.
+    #[tokio::test]
+    async fn a_node_that_did_not_pass_is_still_asked_after_the_ones_that_did() {
+        let syncing = MockBeaconNode {
+            syncing: true,
+            ..answering(1)
+        };
+        let failing = answering(2).failing_call("attestation_data", "timed out");
+        let fallback = FallbackBeaconNode::new(vec![syncing, failing]);
+        fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the first node answers once the second has failed");
+        assert_eq!(fallback.nodes[0].attestation_data_call_count(), 1);
+    }
+
+    /// The walk's order is not the list's, but a blinded block still names the
+    /// node that produced it by its command-line position, and goes back there.
+    #[tokio::test]
+    async fn a_blinded_block_goes_back_to_its_producer_whatever_the_walk_order() {
+        let syncing = MockBeaconNode {
+            syncing: true,
+            ..blinded_node()
+        };
+        let fallback = FallbackBeaconNode::new(vec![syncing, blinded_node()]);
+        fallback.probe(5, std::time::Duration::from_secs(1)).await;
+
+        let produced = fallback
+            .produce_block(&blinded_request(5, 7))
+            .await
+            .expect("node 1 produces");
+        assert_eq!(produced.producer, Producer::at(1));
+        fallback
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[4])
+            .await
+            .expect("published");
+        assert!(
+            fallback.nodes[0]
+                .published_blinded
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
+        assert_eq!(
+            *fallback.nodes[1].published_blinded.lock().expect("lock"),
+            vec![(ForkName::Electra, vec![4])]
+        );
+    }
+
+    /// A head root and payload attestation data are never taken from a node
+    /// whose probe said syncing or optimistic, even when the synced node ahead
+    /// of it in the walk fails the call: no 503 would stop the answer.
+    #[tokio::test]
+    async fn an_unsynced_node_is_not_asked_for_a_head_root_or_payload_data() {
+        for unsynced in [
+            MockBeaconNode {
+                syncing: true,
+                ..answering(1)
+            },
+            MockBeaconNode {
+                optimistic: true,
+                ..answering(1)
+            },
+        ] {
+            let failing = answering(2)
+                .failing_call("head_block_root", "timed out")
+                .failing_call("payload_attestation_data", "timed out");
+            let fallback = FallbackBeaconNode::new(vec![unsynced, failing]);
+            fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+            let err = fallback.head_block_root().await.expect_err("no root");
+            assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+            let err = fallback
+                .payload_attestation_data(96)
+                .await
+                .expect_err("no data");
+            assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+            assert_eq!(fallback.nodes[0].payload_attestation_data_call_count(), 0);
+        }
+    }
+
+    /// With every node unsynced at its last probe, nobody is asked, and the
+    /// answer is the one a caller reads as "do not sign" rather than a failed
+    /// node.
+    #[tokio::test]
+    async fn every_node_unsynced_is_a_syncing_answer_without_asking() {
+        let optimistic = MockBeaconNode {
+            optimistic: true,
+            ..answering(1)
+        };
+        let fallback = FallbackBeaconNode::new(vec![optimistic]);
+        fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+        let err = fallback.head_block_root().await.expect_err("no root");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        let err = fallback
+            .payload_attestation_data(96)
+            .await
+            .expect_err("no data");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        assert_eq!(fallback.nodes[0].payload_attestation_data_call_count(), 0);
+    }
+
+    /// A node whose probe failed vouches for nothing, and nothing stops a
+    /// syncing node's stale head root, so it is not asked either. A node with
+    /// no probe at all, in a fallback no probe task runs for, still is.
+    #[tokio::test]
+    async fn a_node_that_did_not_answer_its_probe_is_not_asked_for_a_head_root() {
+        let unanswered = answering(3).failing_call("is_syncing", "down");
+        let fallback = FallbackBeaconNode::new(vec![unanswered]);
+        fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+        let err = fallback.head_block_root().await.expect_err("no root");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        let err = fallback
+            .payload_attestation_data(96)
+            .await
+            .expect_err("no data");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        assert_eq!(fallback.nodes[0].payload_attestation_data_call_count(), 0);
+
+        let never_probed = FallbackBeaconNode::new(vec![answering(3)]);
+        assert_eq!(
+            never_probed.head_block_root().await.expect("a root"),
+            Root::repeat_byte(3)
         );
     }
 

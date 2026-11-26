@@ -110,6 +110,7 @@ use ethlambda_types::beacon::primitives::{
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::beacon_node::block_contents::{GloasPayload, Producer, signed_envelope_ssz};
@@ -212,6 +213,10 @@ pub struct ProposalService<B> {
     /// block may rightly pay instead of the current one. `None` compares
     /// against the current one alone.
     preferences: Option<Arc<PreferencesService<B>>>,
+    /// Where a signed blinded block's publish runs, so a shutdown can wait
+    /// for it. The service's own tracker unless [`Self::with_tasks`] gives it
+    /// the client's.
+    tasks: TaskTracker,
 }
 
 impl<B: BeaconNodeApi + 'static> ProposalService<B> {
@@ -231,6 +236,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             builder_min_bid: 0,
             clock: None,
             preferences: None,
+            tasks: TaskTracker::new(),
         }
     }
 
@@ -255,6 +261,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// not. Without it no delay is taken.
     pub fn with_clock(mut self, clock: SlotClock) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Run each signed blinded block's publish on `tasks`, which the client
+    /// closes and waits for when a shutdown signal stops it, so the publish
+    /// is not dropped with the process (see [`Self::publish_blinded`]).
+    pub fn with_tasks(mut self, tasks: TaskTracker) -> Self {
+        self.tasks = tasks;
         self
     }
 
@@ -717,7 +731,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     ///
     /// The request runs on a spawned task, so neither the deadline nor a
     /// dropped proposal cancels it: the beacon node may wait up to 5 s on the
-    /// relay, and the block may already be out. The task logs and counts the
+    /// relay, and the block may already be out. The task is spawned on the
+    /// service's [`TaskTracker`], so a shutdown signal waits for it as well
+    /// (see [`Self::with_tasks`]). The task logs and counts the
     /// node's answer ([`blinded_outcome`]) and hands the outcome back over a
     /// channel. Whoever holds it then does the rest: the duty loop when this
     /// returns it in time, and the task itself when this has stopped waiting
@@ -753,7 +769,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let beacon_node = self.beacon_node.clone();
         let slot_start = self.clock.as_ref().map(|clock| clock.start_of(slot));
         let (handoff, mut outcome) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let bytes = body.len();
             let answer = beacon_node
                 .publish_blinded_block(producer, fork, &body)
@@ -1489,6 +1505,49 @@ mod tests {
             .expect_err("the slot is signed");
         assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
         assert_eq!(node.block_requests().len(), 1);
+    }
+
+    /// A blinded publish that outlives its proposal runs on the tracker the
+    /// client gave the service, so a shutdown that closes the tracker and
+    /// waits for it holds on until the node has answered.
+    #[tokio::test]
+    async fn a_blinded_publish_still_going_is_on_the_clients_tracker() {
+        let (store, pubkey) = store();
+        let relay_answers = Arc::new(tokio::sync::Semaphore::new(0));
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block()
+                .with_blinded_publish_gate(relay_answers.clone()),
+        );
+        let tasks = TaskTracker::new();
+        let service = builder_service(node.clone(), None).with_tasks(tasks.clone());
+
+        // Past the deadline the same way as the test above.
+        let at_the_node = node.blinded_publish_entered.clone();
+        let this_duty = duty(&pubkey, 7, slot());
+        let hour = std::time::Duration::from_secs(3600);
+        let proposal = service.propose_by(slot(), &this_duty, &store, Instant::now() + hour);
+        tokio::pin!(proposal);
+        tokio::select! {
+            outcome = &mut proposal => {
+                panic!("the node is still waiting on the relay, yet the proposal ended: {outcome:?}")
+            }
+            () = at_the_node.notified() => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(hour * 2).await;
+        let outcome = proposal.await.expect("signed, so not an error");
+        tokio::time::resume();
+        assert_eq!(outcome, Proposed::Blinded(BlindedOutcome::StillPublishing));
+
+        tasks.close();
+        assert_eq!(tasks.len(), 1, "the publish is the client's to wait for");
+        relay_answers.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .expect("the wait ends once the node answers");
+        assert_eq!(node.published_blinded.lock().expect("lock").len(), 1);
     }
 
     /// The duty loop's entry point, with the deadline far off: a full block
