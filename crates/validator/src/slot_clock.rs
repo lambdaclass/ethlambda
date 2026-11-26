@@ -90,6 +90,11 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
+    /// Whether `slot` is a PQ slot.
+    pub fn is_pq(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Pq
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -620,6 +625,22 @@ mod tests {
         assert_eq!(slot, 0);
         assert_eq!(delay, Duration::from_secs(30));
         assert_eq!(now + delay, clock.start_of(0));
+    }
+
+    /// A PQ slot is one from the PQ fork epoch on, and gloas too.
+    #[test]
+    fn pq_starts_at_its_fork_epoch() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Eip8483, 0)
+            .with_fork_epoch(ForkName::Pq, 2);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let first_pq = 2 * slots_per_epoch();
+        assert!(!clock.is_pq(first_pq - 1));
+        assert!(clock.is_pq(first_pq));
+        assert!(clock.is_gloas(first_pq));
+        let without_pq = SlotClock::from_config(GENESIS, &Config::mainnet());
+        assert!(!without_pq.is_pq(first_pq));
     }
 
     /// Slots before the gloas epoch keep the pre-gloas offsets and slots from

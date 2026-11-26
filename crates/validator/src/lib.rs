@@ -1079,6 +1079,17 @@ async fn run_until_stopped(
 /// one after another, so the committee vote, which the payload can start
 /// before the aggregation is due, is not held behind it. Each is bounded by
 /// the end of the slot.
+///
+/// # From PQ the committee vote waits for the slot's attestations
+///
+/// A leanXMSS signature costs about 0.3 s of a core (see `pq::sign_batch`),
+/// and the slot's attestations and committee votes, twenty and fifteen of
+/// them on a devnet host, used to sign at once on the same cores, so both
+/// finished together. The attestations are due a quarter into the slot and
+/// the votes three quarters in, so at PQ the vote starts only once the
+/// attestations are out (or their duty gave up), and the attestations have
+/// the cores to themselves. Not the aggregation: that comes later in the
+/// slot, and its own wait would hold the vote for nothing.
 #[allow(clippy::too_many_arguments)]
 async fn serve_slot_duties<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
@@ -1093,6 +1104,9 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
+    // Dropped unsent when the attestation part ends without signing (no
+    // duties, or abandoned), which releases the vote just the same.
+    let (attested, attestations_out) = tokio::sync::oneshot::channel::<()>();
     let attest = async {
         if !slot_duties.is_empty() {
             attest_and_aggregate(
@@ -1103,12 +1117,16 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
                 slot,
                 slot_duties,
                 store,
+                attested,
             )
             .await;
         }
     };
     let vote = async {
         if clock.is_gloas(slot) && !committee.is_empty() {
+            if clock.is_pq(slot) {
+                let _ = attestations_out.await;
+            }
             payload_attest(payload_attestation, triggers, clock, slot, committee, store).await;
         }
     };
@@ -1190,6 +1208,10 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
 ///
 /// Split out of the loop so the loop can go on to the payload committee duty
 /// whether or not this client has an attester duty in the slot.
+///
+/// `attested` is told once the attestations are out, or the duty failed or
+/// gave up, before the aggregation's wait.
+#[allow(clippy::too_many_arguments)]
 async fn attest_and_aggregate<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
@@ -1198,6 +1220,7 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
     store: &RwLock<ValidatorStore>,
+    attested: tokio::sync::oneshot::Sender<()>,
 ) {
     // Bound the slot's work by what is left of the slot.
     //
@@ -1219,9 +1242,11 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
         clock.until_attestation(slot, now),
         clock.remaining_in(slot, now),
     );
-    let attested = triggers.attest(attestation, slot, wait, slot_duties, store);
-    let attempt = tokio::time::timeout(budget, attested);
-    match attempt.await.unwrap_or_else(|_| {
+    let attempt = tokio::time::timeout(
+        budget,
+        triggers.attest(attestation, slot, wait, slot_duties, store),
+    );
+    let outcome = attempt.await.unwrap_or_else(|_| {
         warn!(
             %slot,
             budget_ms = budget.as_millis() as u64,
@@ -1229,7 +1254,11 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
         );
         metrics::inc_attestation_deadline_missed();
         Err(Error::AttestationDeadline { slot })
-    }) {
+    });
+    // A committee vote waiting for the cores (see `serve_slot_duties`) may go
+    // now; nobody waiting is fine.
+    let _ = attested.send(());
+    match outcome {
         // `attest` scopes its own read guard away from every await (see
         // its doc comment), so passing the shared `store` straight
         // through here holds nothing across this call.
