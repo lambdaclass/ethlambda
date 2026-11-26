@@ -79,6 +79,7 @@ subtle = "2.6"
 libc = "0.2"
 
 [dev-dependencies]
+ephyra.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

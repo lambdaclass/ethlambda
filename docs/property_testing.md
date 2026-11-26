@@ -21,9 +21,20 @@ of 10,000 passing inputs each, unless a property sets its own.
 | `crates/net/p2p/src/req_resp/encoding_properties.rs` | req/resp length prefix (`encode_varint`/`decode_varint`) and snappy framing (`write_payload`/`decode_payload`) | round trip; a protobuf varint model in `u128`; on corrupted streams, no panic and nothing accepted beyond its declared length or `MAX_PAYLOAD_SIZE` |
 | `crates/blockchain/state_transition/tests/justification_properties.rs` | `slot_is_justifiable_after`, `justified_slots_ops` | leanSpec's `Slot.is_justifiable_after` rule for rule; the relative-indexed bitlist against a set of absolute slots over random extend / justify / finalize sequences |
 | `crates/common/types/tests/u256_properties.rs` | beacon `U256`'s hand-written `Ord`, decimal `Display`/`from_dec_str`, JSON | the value as two `u128` halves; `u128`'s own formatting where the value fits |
+| `crates/validator/tests/slashing_protection_properties.rs` | the validator client's slashing protection (`src/slashing_protection/`): the real on-disk record, over random sequences of proposals, attestation batches, `check_block`, restarts, export-then-import into a fresh directory, imported histories and registrations | **safety**, from the consensus specs' slashing conditions: nothing approved is a double proposal, double vote or surround with anything the key signed here or in an imported history; **exactness**, from the documented EIP-3076 minimal rule: a watermark model gives every verdict, refusal reason included |
 
 The p2p properties live inside the crate (`#[cfg(test)]` module) because the
 codec is `pub(crate)`. The others are integration tests over public APIs.
+
+The slashing-protection property writes its record durably on every
+approval, as production does, so a case costs a flush per signing decision
+(about 160 ms for a 40-step case on macOS). It runs 100 cases by default;
+longer hunts set `EPHYRA_BUDGET_MS`. Besides random votes, its steps include
+relative ones (an honest next vote, a surround attempt) computed from the
+key's current marks, which is what reaches the surround rule in about half
+of the cases rather than a few percent. Planting a missing surround check, or
+a write that drops the changed marks, fails it within seconds (shrunk to two
+steps and one step).
 
 ## Running
 
@@ -107,4 +118,5 @@ The ephyra docs written for this workflow are its
 | Found by | What | Status |
 |---|---|---|
 | `a_varint_is_refused_or_read_as_the_value_it_encodes` | `decode_varint` dropped the bits of a 5-byte length prefix above bit 31: `80 80 80 80 10` declares 2^32 bytes and `decode_payload` read it as an empty payload, so a prefix over `MAX_PAYLOAD_SIZE` passed the size check. Pinned by `a_length_prefix_wider_than_u32_is_refused` in `encoding.rs`. | fixed: `decode_varint` accumulates in a `u64`, reads at most 5 bytes and refuses a value past `u32::MAX` |
+| `slashing_protection_is_safe_and_exact` | Nothing: 4,294 sequences of up to 40 steps (3 seeds, 4 minutes each), about 2,400 reaching a surround refusal and 3,400 a restart, every approval safe and every verdict the model's. | clean |
 | `justifiability_matches_the_spec` | Above `delta = u64::MAX / 4`, `slot_is_justifiable_after`'s pronic test overflows and answers false where leanSpec says true. 2^62 slots past finalization, unreachable. | excluded (`REACHABLE_DELTA`) |
