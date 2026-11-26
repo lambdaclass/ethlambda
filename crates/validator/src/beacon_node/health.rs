@@ -53,8 +53,11 @@
 //! `is_syncing` and `is_optimistic`, nothing else. `sync_distance`, which is the
 //! node's own clock against its head, only orders the walk: in a stall every
 //! node is behind by about as much, so they share a tier and keep command-line
-//! order. A record older than two slots is no longer read for routing, which
-//! only ever moves a node back to plain command-line order.
+//! order. The clock check ([`crate::clock_check`]) reads `head_slot` and
+//! `sync_distance` too, after each round, to compare the node's clock with
+//! this client's, and only warns. A record older than two slots is no longer
+//! read for routing, which only ever moves a node back to plain command-line
+//! order.
 
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
@@ -64,6 +67,7 @@ use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::fallback::FallbackBeaconNode;
+use crate::clock_check::ClockWatch;
 use crate::error::{BeaconNodeFailure, Error};
 use crate::slot_clock::SlotClock;
 
@@ -132,6 +136,19 @@ pub struct Probe {
     /// The node's answer, or why there is none: an error, or no answer within
     /// the probe's budget.
     pub outcome: Result<SyncStatus, String>,
+    /// When the answer came back, and the `Date` header it carried, for the
+    /// clock check ([`crate::clock_check`]). `None` when there was no answer.
+    pub reply: Option<Reply>,
+}
+
+/// When a probe's answer came back, and what time the node's HTTP server said
+/// it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reply {
+    pub received: SystemTime,
+    /// The answer's `Date` header. `None` when it carried none, or one that is
+    /// not an IMF-fixdate.
+    pub date: Option<SystemTime>,
 }
 
 impl Probe {
@@ -614,6 +631,7 @@ pub async fn run<B: BeaconNodeApi>(beacon_node: Arc<FallbackBeaconNode<B>>, cloc
     beacon_node
         .health()
         .expire_after(clock.slot_duration() * ROUTING_SLOTS);
+    let mut clocks = ClockWatch::new(clock.clone());
     let mut last = None;
     loop {
         let (slot, wait) = next_probe(&clock, last, SystemTime::now());
@@ -624,6 +642,7 @@ pub async fn run<B: BeaconNodeApi>(beacon_node: Arc<FallbackBeaconNode<B>>, cloc
             .duration_since(SystemTime::now())
             .unwrap_or_default();
         beacon_node.probe(slot, budget).await;
+        clocks.observe(slot, &beacon_node.health().snapshot());
         last = Some(slot);
     }
 }
@@ -676,6 +695,7 @@ mod tests {
             slot,
             at: SystemTime::now(),
             outcome,
+            reply: None,
         }
     }
 

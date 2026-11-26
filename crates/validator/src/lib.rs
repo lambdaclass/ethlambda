@@ -30,6 +30,7 @@ pub mod attestation;
 pub mod beacon_node;
 pub mod chain_check;
 pub mod client_health;
+pub mod clock_check;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -623,6 +624,9 @@ where
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // Warns when the wall clock stepped since the last pass. See
+        // `clock_check::StepWatch`.
+        let mut steps = crate::clock_check::StepWatch::default();
         // Whether the last refresh attempt found the node syncing or
         // optimistic, until one gets through (see `settle_refresh`).
         let mut node_syncing = false;
@@ -634,6 +638,8 @@ where
         let mut schedule_seen = context.schedule_generation();
 
         loop {
+            steps.check(&clock, served);
+
             // One wake per slot, at the slot boundary, rather than one at the
             // attester offset.
             //

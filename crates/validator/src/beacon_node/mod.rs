@@ -5,6 +5,8 @@
 //! `reqwest` from inside the duty logic, makes the interesting behaviour
 //! (a reorg invalidating duties, a node failing mid-slot) untestable.
 
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
@@ -439,6 +441,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// and sync distance it reports. What [`health`]'s per-slot probe asks each
     /// node.
     async fn sync_status(&self) -> Result<SyncStatus>;
+
+    /// [`Self::sync_status`], with the answer's `Date` header when it carried
+    /// an IMF-fixdate: what [`health`]'s per-slot probe actually asks, so
+    /// [`crate::clock_check`] can compare this client's clock with the node's.
+    /// A node with no such header to give answers `None`, which leaves that
+    /// node to the slot comparison alone.
+    async fn sync_status_with_date(&self) -> Result<(SyncStatus, Option<SystemTime>)> {
+        Ok((self.sync_status().await?, None))
+    }
 
     /// Resolves each pubkey to its current validator index and status, so the
     /// rest of the client can address validators by index, as the Beacon API

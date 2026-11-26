@@ -7,8 +7,8 @@
 use std::sync::LazyLock;
 
 use ethlambda_metrics::{
-    Histogram, IntCounter, IntCounterVec, IntGauge, TimingGuard, register_histogram,
-    register_int_counter, register_int_counter_vec, register_int_gauge,
+    GaugeVec, Histogram, IntCounter, IntCounterVec, IntGauge, TimingGuard, register_gauge_vec,
+    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
 };
 
 use crate::head_monitor::{Duty, Fired};
@@ -492,12 +492,36 @@ static DUTY_TRIGGERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Each beacon node's clock minus this client's, labelled by the node's
+/// position in `--beacon-nodes`, from zero. See `clock_check`. Labelled by
+/// position, not URL: a URL can carry credentials.
+static BEACON_NODE_CLOCK_OFFSET_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "ethlambda_validator_beacon_node_clock_offset_seconds",
+        "A beacon node's clock minus this client's, from its Date header, else what its sync \
+         status's slots allow; positive when this client's clock is behind",
+        &["node"]
+    )
+    .unwrap()
+});
+
 /// Event streams open, one per beacon node and topic. Zero with
 /// `--disable-event-stream`.
 static EVENT_STREAMS_OPEN: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_event_streams_open",
         "Beacon node event streams open, one per node and topic"
+    )
+    .unwrap()
+});
+
+/// Steps of this client's wall clock against its monotonic one, found by the
+/// duty loop. See `clock_check::StepWatch`.
+static CLOCK_STEPS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_clock_steps_total",
+        "Steps of half a second or more of this client's wall clock, forward or back, against its \
+         monotonic clock"
     )
     .unwrap()
 });
@@ -560,6 +584,9 @@ pub fn init() {
         }
     }
     LazyLock::force(&EVENT_STREAMS_OPEN);
+    // A labelled gauge has no series until a node's first answer sets one.
+    LazyLock::force(&BEACON_NODE_CLOCK_OFFSET_SECONDS);
+    LazyLock::force(&CLOCK_STEPS_TOTAL);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -768,6 +795,24 @@ impl Drop for OpenEventStream {
 /// Record how long after a slot's start its attestations were accepted.
 pub fn observe_publication_delay(seconds: f64) {
     PUBLICATION_DELAY_SECONDS.observe(seconds);
+}
+
+/// Record what the clock check last read for the node at `position`.
+pub fn set_beacon_node_clock_offset(position: usize, seconds: f64) {
+    BEACON_NODE_CLOCK_OFFSET_SECONDS
+        .with_label_values(&[position.to_string().as_str()])
+        .set(seconds);
+}
+
+/// Drop the node at `position`'s clock offset series: it did not answer the
+/// probe the check read.
+pub fn clear_beacon_node_clock_offset(position: usize) {
+    // An error only says there was no series yet.
+    let _ = BEACON_NODE_CLOCK_OFFSET_SECONDS.remove_label_values(&[position.to_string().as_str()]);
+}
+
+pub fn inc_clock_steps() {
+    CLOCK_STEPS_TOTAL.inc();
 }
 
 /// A Prometheus endpoint for this process, and `/health`, both answered from

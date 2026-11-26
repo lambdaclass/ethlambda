@@ -349,6 +349,7 @@ mod tests {
             slot: 10,
             at: SystemTime::now(),
             outcome,
+            reply: None,
         }
     }
 

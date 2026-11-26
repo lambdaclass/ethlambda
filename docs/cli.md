@@ -676,7 +676,8 @@ the next slot's probe to answer.
   because the head looks old: during a network-wide stall every head is old,
   and clients that stop signing then keep the chain stalled. Only the node's
   own `is_syncing` and `is_optimistic` count. `sync_distance` only ranks the
-  nodes, and in a stall every node is about as far behind.
+  nodes, and in a stall every node is about as far behind. The
+  [clock checks](#clock-checks) read it and `head_slot` as well, and only warn.
 
 ### Ranking and broadcast
 
@@ -756,6 +757,47 @@ change nothing.
   with no blobs can be revealed through any of them.
 - **Signed once.** Every message is signed, and recorded by slashing
   protection, before it is sent, however many nodes it is sent to.
+
+### Clock checks
+
+Every duty is timed by this client's own clock. Ahead by more than half a
+second, an ethlambda beacon node refuses its block requests; ahead by a few
+seconds, its attestations vote for the parent; behind, every duty goes out late
+and nothing refuses it. So the client compares its clock with each beacon
+node's on every sync probe, and watches its own for steps. These checks only
+warn, since a difference does not say which clock is off. A client and a node
+on one host share a clock, so between the two only a split setup is caught.
+
+- **`Date`.** The probe answer's `Date` header, taken at the middle of the
+  second it names, less the midpoint of the round trip; answers slower than a
+  second are not used. A node is warned about once the median of its last three
+  samples is 2 s or more off, which is as fine as a one-second header can tell.
+  A sample is read for six slots, so a node that stops sending a usable `Date`
+  loses its estimate rather than keeping an old one.
+- **Slots.** A `head_slot` more than one slot past this client's wall slot
+  means this client's clock is behind, as Lighthouse checks. A node that
+  reports a nonzero `sync_distance` and is not syncing also gives its own wall
+  slot, `head_slot + sync_distance`, compared with this client's at send and at
+  receive, so a boundary crossed while the request was out does not count.
+  (Teku reports a distance of 0 whenever it is in sync, so no other distance
+  is read.) A node that sends no `Date` gets this check alone.
+- **Steps.** Each pass of the duty loop compares how far the wall clock moved
+  with how far the monotonic clock did. A step of half a second or more is
+  logged and counted on `ethlambda_validator_clock_steps_total`: back before
+  the slot served, the loop waits for the wall clock to reach the next slot
+  again; forward past the next slot, the slots stepped over are lost; within
+  those, only the next boundary moves. A loop back more than a slot late with no step (a duty
+  overran, or the process was paused) is logged too.
+
+The warnings name the node by its position in `--beacon-nodes`, from 0, and
+recur at most once an epoch while the clocks disagree.
+`ethlambda_validator_beacon_node_clock_offset_seconds` carries each node's
+offset. A warning from the slots alone shows there only the offset the slots
+prove, which can read under 2 (about 1.9 s on 12 s slots when this client is
+behind), so an alert meant to match the warnings fires lower; see
+[Metrics](./metrics.md#validator-client). A slot disagreement proving less
+than half a second, a boundary crossed inside a long round trip, is not
+warned about.
 
 ### Doppelganger protection
 
