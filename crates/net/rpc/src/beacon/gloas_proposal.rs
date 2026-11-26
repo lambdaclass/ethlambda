@@ -808,7 +808,8 @@ async fn build_payload(
     ahead: Option<&PreparedPayloads>,
 ) -> Result<BuiltGloasPayload, ApiError> {
     let fee_recipient = fee_recipient_for(fee_recipients, prepared);
-    let forkchoice = building_forkchoice_state(store, prepared.inputs.head_block_hash);
+    let forkchoice =
+        building_forkchoice_state(store, prepared.head_root, prepared.inputs.head_block_hash);
     let attributes = payload_attributes_v4(&prepared.inputs, fee_recipient);
     let slot = prepared.inputs.slot_number;
     let key = BuildAttributes::V4(attributes.clone());

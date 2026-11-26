@@ -296,16 +296,34 @@ pub fn advance_for_proposal(
     advance_to_slot(&epoch_start, slot, config)
 }
 
-/// The forkchoice state a payload build on `head_block_hash` is started
-/// with: the safe and finalized hashes the head's own `forkchoiceUpdated`
-/// sends (the Fast Confirmation Rule's confirmed block and the finalized
-/// checkpoint's block, `beacon_payloads::forkchoice_plan`), so a build never
-/// moves the execution client's safe block back to the justified one.
-pub fn building_forkchoice_state(store: &Store, head_block_hash: H256) -> ForkchoiceStateV1 {
+/// The forkchoice state a payload build on the block `head_root` is started
+/// with, `head_block_hash` being the payload the build extends: the safe and
+/// finalized hashes the head's own `forkchoiceUpdated` sends (the Fast
+/// Confirmation Rule's confirmed block and the finalized checkpoint's block,
+/// `beacon_payloads::forkchoice_plan`), so a build never moves the execution
+/// client's safe block back to the justified one.
+///
+/// The confirmed block is safe only on the chain it was checked against, the
+/// stored head's. A caller read `head_root` some time ago (production first
+/// advances the state to the slot), so when the stored head is no longer
+/// `head_root`, before or after the safe hash is read, the finalized block
+/// stands in: the execution client refuses a safe block that is not an
+/// ancestor of the head (`-38002`), and that would lose the proposal.
+pub fn building_forkchoice_state(
+    store: &Store,
+    head_root: H256,
+    head_block_hash: H256,
+) -> ForkchoiceStateV1 {
+    let finalized_block_hash = checkpoint_hash(store, store.beacon_finalized_checkpoint().root);
+    let on_build_head = || store.head().is_ok_and(|head| head == head_root);
+    let safe_block_hash = match on_build_head().then(|| get_safe_execution_block_hash(store)) {
+        Some(safe) if on_build_head() => safe,
+        _ => finalized_block_hash,
+    };
     ForkchoiceStateV1 {
         head_block_hash,
-        safe_block_hash: get_safe_execution_block_hash(store),
-        finalized_block_hash: checkpoint_hash(store, store.beacon_finalized_checkpoint().root),
+        safe_block_hash,
+        finalized_block_hash,
     }
 }
 
@@ -624,7 +642,7 @@ pub(crate) fn next_payload(
                 payload_attributes: (&attributes).into(),
             });
             let build = PayloadBuild {
-                forkchoice: building_forkchoice_state(store, inputs.parent_hash),
+                forkchoice: building_forkchoice_state(store, head_root, inputs.parent_hash),
                 attributes: BuildAttributes::V3(attributes),
             };
             (data, build)
@@ -653,7 +671,8 @@ pub(crate) fn next_payload(
                 proposal.preferences.as_ref(),
             );
             let attributes = payload_attributes_v4(&proposal.inputs, fee_recipient);
-            let forkchoice = building_forkchoice_state(store, proposal.inputs.head_block_hash);
+            let forkchoice =
+                building_forkchoice_state(store, head_root, proposal.inputs.head_block_hash);
             let data = PayloadAttributesEventData::V4(PayloadAttributesEventV4 {
                 proposer_index: proposal.proposer,
                 proposal_slot,
@@ -787,9 +806,11 @@ pub(crate) struct PayloadAttributesPublisher {
     in_flight: Option<AttributesKey>,
     /// The last key a worker failed on, and how many have.
     failed: Option<(AttributesKey, u8)>,
-    /// The task sending the last build's `forkchoiceUpdated`, aborted when a
-    /// newer build starts ([`BlockChainServer::start_payload_build`]).
-    build_task: Option<AbortHandle>,
+    /// The task sending the last build's `forkchoiceUpdated`, with the key it
+    /// was started for. Aborted as soon as the current key differs (a new
+    /// head, for one), whether or not a newer build follows
+    /// ([`BlockChainServer::start_payload_build`]).
+    build_task: Option<(AttributesKey, AbortHandle)>,
 }
 
 impl PayloadAttributesPublisher {
@@ -931,6 +952,25 @@ impl BlockChainServer {
         else {
             return;
         };
+        // A build still sending its update for other inputs (an older head,
+        // for one) is superseded whether or not a build for this key follows:
+        // its retries must not reach the execution client after the head's
+        // own update. Its build may then never have started, so its key is no
+        // longer counted as done: should the inputs return to it, it builds
+        // again.
+        if self
+            .payload_attributes
+            .build_task
+            .as_ref()
+            .is_some_and(|(building, _)| *building != key)
+            && let Some((building, task)) = self.payload_attributes.build_task.take()
+            && !task.is_finished()
+        {
+            task.abort();
+            if self.payload_attributes.published == Some(building) {
+                self.payload_attributes.published = None;
+            }
+        }
         if !self.payload_attributes.wants(key) {
             return;
         }
@@ -969,13 +1009,14 @@ impl BlockChainServer {
     /// it only waits on the execution client. A build that fails is not
     /// started again, since production then starts its own.
     ///
-    /// Bounded by the proposal slot's start, and cut short by the next build.
+    /// Bounded by the proposal slot's start, and cut short once the current
+    /// key differs from this build's (a new head, a newer build;
+    /// [`Self::maybe_prepare_payload_attributes`] checks after every import).
     /// The engine client retries a failed attempt (up to three, at 8 s each),
     /// and a retry of a superseded update could otherwise reach the execution
-    /// client after a newer build's update or after the new slot's own
-    /// `forkchoiceUpdated`, moving its head back to this one's. Production
-    /// looks for the build at the slot's start, so a later answer is of no
-    /// use either.
+    /// client after the head's own `forkchoiceUpdated` or a newer build's,
+    /// moving its head back to this one's. Production looks for the build at
+    /// the slot's start, so a later answer is of no use either.
     fn start_payload_build(&mut self, key: AttributesKey, build: PayloadBuild) {
         let (Some(engine), Some(preparation)) = (
             self.engine.clone(),
@@ -986,13 +1027,13 @@ impl BlockChainServer {
         let prepared = preparation.prepared_payloads.clone();
         let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
         let until_slot = Duration::from_millis(self.ms_until_slot_start(key.proposal_slot));
-        if let Some(previous) = self.payload_attributes.build_task.take() {
+        if let Some((_, previous)) = self.payload_attributes.build_task.take() {
             previous.abort();
         }
         let task = tokio::spawn(start_build(
             engine, prepared, custody, key, build, until_slot,
         ));
-        self.payload_attributes.build_task = Some(task.abort_handle());
+        self.payload_attributes.build_task = Some((key, task.abort_handle()));
     }
 }
 
@@ -1086,8 +1127,8 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
         match result {
             // Only while still current, so a stale worker's build never
             // names an old head to the execution client; and
-            // `start_payload_build` stops the update at the slot's start or
-            // at the next build.
+            // the update is stopped at the slot's start or once the key
+            // changes (`start_payload_build`).
             Ok(Some(NextPayload { event, build })) if current => {
                 if self.events.has_subscribers() {
                     debug!(
@@ -1654,7 +1695,7 @@ mod tests {
         assert_eq!(
             next.build,
             PayloadBuild {
-                forkchoice: building_forkchoice_state(&store, inputs.parent_hash),
+                forkchoice: building_forkchoice_state(&store, head_root, inputs.parent_hash),
                 attributes: BuildAttributes::V3(payload_attributes_v3(
                     &inputs,
                     fee_recipient,

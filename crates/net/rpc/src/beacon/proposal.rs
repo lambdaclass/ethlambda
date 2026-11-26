@@ -1297,7 +1297,7 @@ async fn build_payload(
             "No fee recipient prepared for the proposer and no --fallback-fee-recipient; using the zero address"
         ),
     }
-    let forkchoice = building_forkchoice_state(store, inputs.parent_hash);
+    let forkchoice = building_forkchoice_state(store, head_root, inputs.parent_hash);
     let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
     let slot = state.slot();
     let ahead = BuildAttributes::V3(attributes.clone());

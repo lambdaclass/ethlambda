@@ -1196,9 +1196,10 @@ How `payload_attributes` behaves:
   the build themselves and collect it half a second later: asked at once,
   geth and ethrex answer with the payload they started from, with few or none
   of the pending transactions (lambdaclass/ethlambda#894). The update carries
-  the same safe and finalized hashes as the head's own `forkchoiceUpdated`,
-  and one the execution client has not answered by the proposal slot's start
-  is abandoned.
+  the same safe and finalized hashes as the head's own `forkchoiceUpdated`
+  (the finalized block as safe too when the head moved since the build's head
+  was read), and one the execution client has not answered by the proposal
+  slot's start, or by the time its inputs change, is abandoned.
 
 Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing. A proposal
