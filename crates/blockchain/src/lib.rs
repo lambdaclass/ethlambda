@@ -3772,13 +3772,15 @@ impl BlockChainServer {
         // Before the block is moved into the store. Only the first hold asks:
         // a redelivery of a held root must not re-query the execution client.
         // Only a recent block does, checked before the signature so range
-        // sync pays for neither. Only within the ask budget (per block slot
-        // and in flight, see `beacon_blobs::AskBudget`), spent before the
-        // signature so a flood of distinct roots for one recent slot cannot
-        // buy unbounded BLS work here. Only a block whose proposer signature
-        // verifies does: the built columns go through every chain check
-        // before they leave `beacon_blobs`, but a block that already fails
-        // here is not worth an engine call and a cell computation.
+        // sync pays for neither the ask nor a second signature check (the
+        // caller's `precheck_before_waiting` already ran the first). Only
+        // within the ask budget (per block slot and in flight, see
+        // `beacon_blobs::AskBudget`), spent before the signature so a flood
+        // of distinct roots for one recent slot cannot buy unbounded BLS work
+        // here. Only a block whose proposer signature verifies does: the
+        // built columns go through every chain check before they leave
+        // `beacon_blobs`, but a block that already fails here is not worth an
+        // engine call and a cell computation.
         if let (Some(engine), Some(p2p), SignedBeaconBlock::Fulu(inner)) =
             (&self.engine, &self.p2p, &block)
             && !inner.message.body.blob_kzg_commitments.is_empty()

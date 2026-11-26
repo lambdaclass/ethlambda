@@ -128,8 +128,11 @@ pub(crate) fn recent_enough_to_ask(slot: u64, current_slot: u64) -> bool {
 /// registered validator's signature passes the precheck), an engine call, a
 /// cell computation and a parent-state advance in [`check_built`]. An honest
 /// slot has one block, two when its proposer equivocates; the rest is room for
-/// a forged copy arriving first. Once a slot's budget is spent its blocks are
-/// left to gossip and the peer asks, which is where a miss leaves them anyway.
+/// a forged one arriving first. A copy whose signature fails never reaches
+/// the hold (the import's `precheck_before_waiting` refuses it), so "forged"
+/// here means a block past the lookahead signed by a validator that is not
+/// the slot's proposer. Once a slot's budget is spent its blocks are left to
+/// gossip and the peer asks, which is where a miss leaves them anyway.
 pub(crate) const MAX_ASKS_PER_SLOT: u8 = 4;
 
 /// How many execution-client asks may be in flight at once, from the engine
