@@ -28,6 +28,7 @@ use ethlambda_types::beacon::containers::gloas;
 
 pub mod block_contents;
 pub mod dto;
+pub mod events;
 pub mod fallback;
 pub mod health;
 pub mod http;

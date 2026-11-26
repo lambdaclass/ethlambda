@@ -195,6 +195,17 @@ pub(crate) struct ValidatorOptions {
     /// `/eth/v1/validator/liveness`.
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
+
+    /// Read no beacon node's event stream: every attestation and sync
+    /// committee message waits for its offset into the slot, and every
+    /// payload timeliness committee vote for its deadline, even when the
+    /// slot's block or payload has already arrived.
+    ///
+    /// On by default, the stream lets those duties go out as soon as the
+    /// block (or the payload) does. Off is for a beacon node whose stream is
+    /// broken, or a proxy in front of it that holds events back.
+    #[arg(long, default_value = "false")]
+    pub(crate) disable_event_stream: bool,
 }
 
 impl ValidatorOptions {
@@ -337,6 +348,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, || stop.start())
         .await
@@ -482,6 +494,7 @@ mod tests {
             builder_min_bid: 0,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            disable_event_stream: false,
         }
     }
 
