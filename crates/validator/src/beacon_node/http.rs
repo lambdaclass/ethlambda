@@ -954,7 +954,7 @@ impl HttpBeaconNode {
 /// those errors are logged, and the chain check logs them at `warn`). Anything
 /// that does not parse as a URL is returned as it is: it cannot be a URL that
 /// carries credentials a request would send.
-fn without_credentials(url: &str) -> String {
+pub(crate) fn without_credentials(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
             // Neither fails on a URL that already has a user name or password.
