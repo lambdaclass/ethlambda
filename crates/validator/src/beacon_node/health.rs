@@ -333,13 +333,6 @@ impl NodeHealth {
         }
     }
 
-    /// Keep that the node at `position` had not answered a broadcast by the
-    /// time the broadcast stopped waiting for it, a moment after another node
-    /// accepted: it ranks [`Tier::Failing`] as for a request that timed out.
-    pub fn record_no_answer(&self, position: usize, what: &'static str) {
-        self.mark_failing(position, what, &"no answer while another node accepted");
-    }
-
     fn mark_failing(&self, position: usize, what: &'static str, err: &dyn std::fmt::Display) {
         let already = {
             let mut records = self.write();
@@ -989,15 +982,6 @@ mod tests {
         assert_eq!(order(&health), vec![1, 0], "still failing");
         health.record(0, synced(5));
         assert_eq!(order(&health), vec![0, 1]);
-    }
-
-    /// A broadcast that stopped waiting for a node ranks it failing, as a
-    /// timed-out request does.
-    #[test]
-    fn a_node_cut_off_by_a_broadcast_ranks_failing() {
-        let health = health(vec![synced(3), synced(3)]);
-        health.record_no_answer(0, "publish_block");
-        assert_eq!(health.tiers()[1], (0, Tier::Failing));
     }
 
     /// A request failure is read for as long as a probe is: a probe task that

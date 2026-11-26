@@ -89,6 +89,9 @@ pub struct MockBeaconNode {
     /// The method of every call made while [`Self::hang`] was set, recorded
     /// on entry.
     pub hung_calls: Mutex<Vec<&'static str>>,
+    /// When set, a node that answers every call that checks [`Self::hang`],
+    /// but this much later: slower than its peers, not hung.
+    pub slow: Option<std::time::Duration>,
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
@@ -531,6 +534,13 @@ impl MockBeaconNode {
         *self.hang.lock().expect("lock") = timeout;
     }
 
+    /// Answer every call that checks [`Self::hang`] `delay` late, as a node
+    /// that is slower than its peers but answers.
+    pub fn with_slow_answers(mut self, delay: std::time::Duration) -> Self {
+        self.slow = Some(delay);
+        self
+    }
+
     /// How many calls to `what` were made while the node hung.
     pub fn hung_calls_to(&self, what: &str) -> usize {
         self.hung_calls
@@ -544,8 +554,12 @@ impl MockBeaconNode {
     /// For a call that checks it: when the node hangs, wait out the timeout
     /// and fail as the HTTP client fails a request that got no answer. Checked
     /// by `sync_status`, `attestation_data`, `publish_block`,
-    /// `submit_attestations` and `publish_execution_payload_envelope`.
+    /// `submit_attestations` and `publish_execution_payload_envelope`, which
+    /// all also wait out [`Self::slow`] first.
     async fn stall(&self, what: &'static str) -> Result<()> {
+        if let Some(delay) = self.slow {
+            tokio::time::sleep(delay).await;
+        }
         let hang = *self.hang.lock().expect("lock");
         let Some(timeout) = hang else {
             return Ok(());

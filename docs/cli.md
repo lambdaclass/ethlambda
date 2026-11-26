@@ -721,20 +721,27 @@ change nothing.
   broadcast only when no other node took it, so a hung node does not hold
   every broadcast back by a request timeout.
 - **Half a second after the first acceptance, the rest are cut off.** A node
-  still sending by then is not waited for and is ranked failing, so a node
-  that hangs for the first time costs a broadcast half a second, not a
-  request timeout a proposal's deadline would cut short.
+  still sending by then is not waited for, so a node that hangs costs a
+  broadcast half a second, not a request timeout a proposal's deadline would
+  cut short. It is not ranked failing for it: a node that is only slower (to
+  import a block, or to take a large envelope) would otherwise be dropped
+  from every broadcast until its next probe, slot after slot. A node that
+  really hung is ranked failing once its probe gets no answer.
 - **A block reports the best answer**: imported (`200`) over broadcast but
   not imported (`202`) over refused, each node's answer logged. A blinded
   block still goes only to the node that produced it.
 - **An envelope goes to its block's producer first**, then to the other
-  nodes once the producer has answered. The producer certainly holds the
-  block the envelope reveals; a node that has not imported it yet queues or
-  drops the envelope, and waiting for the producer's answer gives each a
-  round trip longer to import it. An envelope sent without its blobs goes to
-  the producer first, with or without the flag, since only it cached them;
-  if it does not take it, the other nodes are tried in rank order, since a
-  block with no blobs can be revealed through any of them.
+  nodes once the producer has answered, or after half a second without an
+  answer. The producer certainly holds the block the envelope reveals; a
+  node that has not imported it yet queues or drops the envelope, and
+  waiting for the producer's answer gives each a round trip longer to import
+  it. The half-second bound is for a producer that holds the request open
+  (one that answered the block `202` and never imported it waits for it),
+  which would otherwise keep the envelope from every node until the
+  proposal's deadline. An envelope sent without its blobs goes to the
+  producer first, with or without the flag, since only it cached them; if it
+  does not take it, the other nodes are tried in rank order, since a block
+  with no blobs can be revealed through any of them.
 - **Signed once.** Every message is signed, and recorded by slashing
   protection, before it is sent, however many nodes it is sent to.
 
