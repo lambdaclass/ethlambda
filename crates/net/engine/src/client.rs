@@ -331,38 +331,9 @@ impl EngineClient {
         state: &ForkchoiceStateV1,
         attributes: &crate::building::PayloadAttributesV3,
     ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        self.forkchoice_updated_v3_building(state, attributes, ENGINE_MAX_ATTEMPTS)
-            .await
-    }
-
-    /// [`Self::forkchoice_updated_with_attributes`] in a single attempt at
-    /// [`ENGINE_TIMEOUT`], for a caller that must not wait out the retry
-    /// ladder: the chain actor starting the next slot's build ahead of it,
-    /// which block production replaces with its own when this one fails.
-    pub async fn forkchoice_updated_with_attributes_once(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV3,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        self.forkchoice_updated_v3_building(state, attributes, 1)
-            .await
-    }
-
-    async fn forkchoice_updated_v3_building(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV3,
-        attempts: u32,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
         let params = json!([state, attributes]);
-        let response: ForkchoiceUpdatedResponse = self
-            .call_with_attempts(
-                "engine_forkchoiceUpdatedV3",
-                params,
-                ENGINE_TIMEOUT,
-                attempts,
-            )
-            .await?;
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV3", params).await?;
         Ok((response.payload_status, response.payload_id))
     }
 
@@ -394,38 +365,9 @@ impl EngineClient {
         attributes: &crate::building::PayloadAttributesV4,
         custody_columns: Option<CustodyColumns>,
     ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        self.forkchoice_updated_v4_building(state, attributes, custody_columns, ENGINE_MAX_ATTEMPTS)
-            .await
-    }
-
-    /// [`Self::forkchoice_updated_v4_with_attributes`] in a single attempt,
-    /// for the same caller as [`Self::forkchoice_updated_with_attributes_once`].
-    pub async fn forkchoice_updated_v4_with_attributes_once(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV4,
-        custody_columns: Option<CustodyColumns>,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
-        self.forkchoice_updated_v4_building(state, attributes, custody_columns, 1)
-            .await
-    }
-
-    async fn forkchoice_updated_v4_building(
-        &self,
-        state: &ForkchoiceStateV1,
-        attributes: &crate::building::PayloadAttributesV4,
-        custody_columns: Option<CustodyColumns>,
-        attempts: u32,
-    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
         let params = json!([state, attributes, custody_columns]);
-        let response: ForkchoiceUpdatedResponse = self
-            .call_with_attempts(
-                "engine_forkchoiceUpdatedV4",
-                params,
-                ENGINE_TIMEOUT,
-                attempts,
-            )
-            .await?;
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV4", params).await?;
         Ok((response.payload_status, response.payload_id))
     }
 

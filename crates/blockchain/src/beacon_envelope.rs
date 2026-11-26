@@ -2256,11 +2256,8 @@ pub(crate) mod tests {
         new_payload: String,
         /// The `payloadStatus` object `engine_forkchoiceUpdated*` answers with.
         forkchoice: String,
-        /// The `payloadId` `engine_forkchoiceUpdated*` answers with, as the
-        /// JSON string it is on the wire; `None` answers `null`.
-        pub(crate) payload_id: Option<String>,
         /// Request bodies, in arrival order.
-        pub(crate) requests: Vec<String>,
+        requests: Vec<String>,
     }
 
     pub(crate) fn status_json(status: &str, latest_valid_hash: Option<H256>) -> String {
@@ -2280,7 +2277,6 @@ pub(crate) mod tests {
         let state = Arc::new(std::sync::Mutex::new(MockState {
             new_payload,
             forkchoice,
-            payload_id: None,
             requests: Vec::new(),
         }));
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -2328,23 +2324,19 @@ pub(crate) mod tests {
                             .to_string();
                         pending.drain(..head_end + body_len);
 
-                        let (result, payload_id) = {
+                        let result = {
                             let mut state = shared.lock().unwrap();
                             state.requests.push(body.clone());
-                            let payload_id = state
-                                .payload_id
-                                .as_ref()
-                                .map_or("null".to_string(), |id| format!("\"{id}\""));
                             if body.contains("engine_newPayload") {
-                                (state.new_payload.clone(), payload_id)
+                                state.new_payload.clone()
                             } else {
-                                (state.forkchoice.clone(), payload_id)
+                                state.forkchoice.clone()
                             }
                         };
                         let result = if body.contains("engine_newPayload") {
                             result
                         } else {
-                            format!(r#"{{"payloadStatus":{result},"payloadId":{payload_id}}}"#)
+                            format!(r#"{{"payloadStatus":{result},"payloadId":null}}"#)
                         };
                         let payload = if result == "ERROR" {
                             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"mock failure"}}"#.to_string()

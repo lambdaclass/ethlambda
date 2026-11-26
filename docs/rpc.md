@@ -1185,27 +1185,21 @@ How `payload_attributes` behaves:
   `prepare_beacon_proposer` or a builder registration, or every proposer with
   `beacon --always-prepare-payload`, which an external builder reading this
   stream (ethereum-package's buildoor) needs.
-- **The build starts here too.** With an execution client, the chain actor
-  sends `forkchoiceUpdated` for its head with these attributes as soon as
-  the computation hands them back, as other clients do at the same point,
-  and again whenever a re-check finds new inputs; until the slot, its own
-  head updates (on the tick and after imports) carry them too. Every
-  `forkchoiceUpdated` the actor sends leaves in order from one place, so the
-  execution client never hears a head fork choice has since replaced after
-  its replacement, the guarantee Lighthouse keeps with its
-  `execution_engine_forkchoice_lock` (a gloas build on the EMPTY branch of a
-  FULL head names the parent payload on purpose).
-  `produceBlockV3` and `produceBlockV4` then collect that build with
+- **The build starts here too.** With an execution client, the same
+  computation sends `forkchoiceUpdated` with these attributes, as other
+  clients do at the same point, and again whenever a re-check finds new
+  inputs. `produceBlockV3` and `produceBlockV4` then collect that build with
   `getPayload` when their own attributes match it (same slot, parent payload
   and attributes): at once, the execution client having had seconds to fill
   it, unless a late re-check restarted it less than half a second before, in
   which case they wait for the rest of that half second. Otherwise they start
   the build themselves and collect it half a second later: asked at once,
   geth and ethrex answer with the payload they started from, with few or none
-  of the pending transactions (lambdaclass/ethlambda#894). Production's own
-  `forkchoiceUpdated` goes out from the Beacon API, not the actor, so it is
-  the one update that can still reach the execution client out of order with
-  the actor's.
+  of the pending transactions (lambdaclass/ethlambda#894). The update carries
+  the same safe and finalized hashes as the head's own `forkchoiceUpdated`
+  (the finalized block as safe too when the head moved since the build's head
+  was read), and one the execution client has not answered by the proposal
+  slot's start, or by the time its inputs change, is abandoned.
 
 Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing. A proposal
