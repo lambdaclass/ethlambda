@@ -24,7 +24,7 @@
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
 //! - [`cheap_checks`] rejects a payload that has the `aggregate_proof`
-//!   field before `LSTAR_FORK_EPOCH` or lacks it from that epoch on. The
+//!   field before `ISTAR_FORK_EPOCH` or lacks it from that epoch on. The
 //!   specification's payload has no such field, so it has no rule for it.
 //!   What the field holds is not looked at, and its size bound is the
 //!   container's: a payload over it does not decode.
@@ -106,7 +106,7 @@ pub fn cheap_checks(
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
     // [REJECT] The payload has the aggregate proof field exactly when its
-    // slot is at or after `LSTAR_FORK_EPOCH`. The payload names its own slot,
+    // slot is at or after `ISTAR_FORK_EPOCH`. The payload names its own slot,
     // so this needs no block either. The proof itself is the execution
     // client's to read: nothing here parses it.
     let proof = &message.payload.aggregate_proof;
@@ -311,7 +311,7 @@ mod tests {
     fn store_with_aggregate_proofs() -> Store {
         let mut store = store(0);
         let mut config = (*store.config()).clone();
-        config.lstar_fork_epoch = 0;
+        config.istar_fork_epoch = 0;
         store.replace_config(config);
         store
     }
@@ -348,7 +348,7 @@ mod tests {
     fn the_aggregate_proof_field_is_judged_by_the_payloads_own_slot() {
         let mut store = store(0);
         let mut config = (*store.config()).clone();
-        config.lstar_fork_epoch = 1;
+        config.istar_fork_epoch = 1;
         store.replace_config(config);
         let first_slot_with_the_field = preset::slots_per_epoch();
 

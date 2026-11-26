@@ -146,7 +146,7 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// `ExecutionPayloadV4`: one `DATA`, written exactly when the payload has the
 /// field, and then even when it is empty (`0x`), so that the execution client
 /// reads the bytes its block header commits to. A payload without the field,
-/// from before `LSTAR_FORK_EPOCH`, is written as the specification's object,
+/// from before `ISTAR_FORK_EPOCH`, is written as the specification's object,
 /// with no such key.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 

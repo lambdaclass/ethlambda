@@ -800,13 +800,13 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
-## The execution payload carries an aggregate proof from the lstar epoch
+## The execution payload carries an aggregate proof from the istar epoch
 
 - **The specification:** gloas's `ExecutionPayload` ends at `slot_number`, and
   `ExecutionPayloadV4` at `slotNumber`. It names no upgrade after heze.
 - **ethlambda, on this branch:** the config reads one more key,
-  `LSTAR_FORK_EPOCH`, the epoch of the upgrade the execution layer schedules
-  as `lstarTime`. Before it the payload is the specification's. From that
+  `ISTAR_FORK_EPOCH`, the epoch of the upgrade the execution layer schedules
+  as `istarTime`. Before it the payload is the specification's. From that
   epoch on the container has one more field after `slot_number`,
   `aggregate_proof`, a `ByteList[MAX_AGGREGATE_PROOF_BYTES]` (1,048,576
   bytes), and `ExecutionPayloadV4` one more member, `aggregateProof`. The
@@ -822,7 +822,7 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   its transactions. The consensus layer is what moves an execution block from
   its builder to every other node's execution client. The field is the last
   one because a progressive container (EIP-7495) can only grow at its end.
-- **Consequence:** from `LSTAR_FORK_EPOCH` on, `ExecutionPayload`,
+- **Consequence:** from `ISTAR_FORK_EPOCH` on, `ExecutionPayload`,
   `ExecutionPayloadEnvelope`, `SignedExecutionPayloadEnvelope` and
   `NewPayloadRequest` encode and merkleize differently from the
   specification's, with or without bytes in the proof. The envelope topic,
@@ -834,7 +834,7 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   the four containers are the specification's, so the spec-test cases that
   decode or hash one of them run.
 - **One rule of its own:** a payload must have the field exactly from
-  `LSTAR_FORK_EPOCH` on, which the envelope's gossip rule and
+  `ISTAR_FORK_EPOCH` on, which the envelope's gossip rule and
   `verify_execution_payload_envelope` both check, since nothing else an
   envelope is checked against tells the two containers apart. The proof is
   opaque here: no rule reads it, and the execution client verifies it. Its

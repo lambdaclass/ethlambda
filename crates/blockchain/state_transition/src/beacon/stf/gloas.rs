@@ -753,7 +753,7 @@ pub fn verify_execution_payload_envelope(
         "verify_execution_payload_envelope: payload.slot_number == state.slot",
     )?;
     // Not in the specification, whose payload has no such field. From
-    // `LSTAR_FORK_EPOCH` on a payload is the container with
+    // `ISTAR_FORK_EPOCH` on a payload is the container with
     // `aggregate_proof`, and before it the one without. The two encode
     // and hash differently even with an empty proof, and nothing else an
     // envelope is checked against tells them apart, so the wrong one for the
@@ -761,7 +761,7 @@ pub fn verify_execution_payload_envelope(
     verify(
         payload.aggregate_proof.is_some()
             == config.carries_aggregate_proof(compute_epoch_at_slot(state.slot())),
-        "verify_execution_payload_envelope: payload.aggregate_proof is present          exactly from LSTAR_FORK_EPOCH",
+        "verify_execution_payload_envelope: payload.aggregate_proof is present          exactly from ISTAR_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,

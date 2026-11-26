@@ -620,7 +620,7 @@ fn check_envelope(
     verify(
         payload.aggregate_proof.is_some()
             == config.carries_aggregate_proof(get_current_epoch(post)),
-        "payload.aggregate_proof is present exactly from LSTAR_FORK_EPOCH",
+        "payload.aggregate_proof is present exactly from ISTAR_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,
@@ -1147,7 +1147,7 @@ mod gloas_block_production_tests {
     }
 
     #[test]
-    fn a_payload_has_an_aggregate_proof_exactly_from_the_lstar_epoch() {
+    fn a_payload_has_an_aggregate_proof_exactly_from_the_istar_epoch() {
         let state = state_to_build_on();
         let epoch = get_current_epoch(&state);
         let requests = ExecutionRequests::default();
@@ -1231,7 +1231,7 @@ mod gloas_block_production_tests {
         // Scheduled at the block's own epoch: a payload has the field, here
         // with an empty string.
         let mut from_this_epoch = config();
-        from_this_epoch.lstar_fork_epoch = epoch;
+        from_this_epoch.istar_fork_epoch = epoch;
         let produced_with = assemble(&with, &from_this_epoch).unwrap();
         assert!(assemble(&without, &from_this_epoch).is_err());
         assert!(import(&produced_with, &from_this_epoch).is_ok());
@@ -1244,7 +1244,7 @@ mod gloas_block_production_tests {
         // Scheduled for the next epoch: this block's payload does not have
         // the field yet.
         let mut from_next_epoch = config();
-        from_next_epoch.lstar_fork_epoch = epoch + 1;
+        from_next_epoch.istar_fork_epoch = epoch + 1;
         assert!(assemble(&without, &from_next_epoch).is_ok());
         assert!(assemble(&with, &from_next_epoch).is_err());
         assert!(import(&produced_without, &from_next_epoch).is_ok());

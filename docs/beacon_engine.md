@@ -43,7 +43,7 @@ Two method families a full client would have are deliberately absent:
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
-  `slotNumber`, and on this branch `aggregateProof` from `LSTAR_FORK_EPOCH`:
+  `slotNumber`, and on this branch `aggregateProof` from `ISTAR_FORK_EPOCH`:
   see [The aggregate proof](#the-aggregate-proof)) from gloas on. The
   handshake warns when a gloas network's execution client does not advertise
   `engine_getPayloadV6`.
@@ -324,8 +324,8 @@ post-quantum signatures inside them, and whose block builder, from the upgrade
 after heze, may strip those signatures from the block's transactions and prove
 them all with one *aggregate proof*. The proof sits in the block outside its
 transactions, and the execution block header commits to it with a field of its
-own. The execution layer schedules that upgrade by time (`lstarTime`); this
-side reads its epoch from one more config key, `LSTAR_FORK_EPOCH`, and that is
+own. The execution layer schedules that upgrade by time (`istarTime`); this
+side reads its epoch from one more config key, `ISTAR_FORK_EPOCH`, and that is
 the epoch a payload carries the proof from. From that epoch
 `ExecutionPayloadV4` has one more member here than the specification gives it;
 before it, the object is the specification's:
@@ -343,7 +343,7 @@ The proof is one byte string, and nothing on this side parses it. A block with
 no stripped signature has the empty string.
 
 Between the two calls the string is `aggregate_proof`, the last field of the
-gloas `ExecutionPayload` container from `LSTAR_FORK_EPOCH` on, a
+gloas `ExecutionPayload` container from `ISTAR_FORK_EPOCH` on, a
 `ByteList[MAX_AGGREGATE_PROOF_BYTES]`, so the builder's signature covers it
 and it is gossiped, served and stored with the envelope, like the
 transactions. Before that epoch the container has no such field. In the code
@@ -363,7 +363,7 @@ The follower never rebuilds the execution header or its hash, so the header's
 commitment needs nothing on this side: `engine_newPayloadV5` hands the proof
 to the execution client, which checks it against the header and verifies it.
 What the follower judges is which container the payload is, and the size
-bound. An envelope whose payload has the field before `LSTAR_FORK_EPOCH`, or
+bound. An envelope whose payload has the field before `ISTAR_FORK_EPOCH`, or
 lacks it from that epoch on, is rejected by the envelope's gossip rule
 (`gossip::envelope::cheap_checks`) and by `verify_execution_payload_envelope`.
 The bound is the container's: a payload whose proof is longer than
@@ -372,8 +372,8 @@ answer, from the Beacon API or from the execution client. The bound is below
 the 10 MiB an envelope may take on the wire, which does not change.
 
 The field changes the encoding and the root of every payload from
-`LSTAR_FORK_EPOCH` on, which is a departure from the specification:
-see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-an-aggregate-proof-from-the-lstar-epoch).
+`ISTAR_FORK_EPOCH` on, which is a departure from the specification:
+see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-an-aggregate-proof-from-the-istar-epoch).
 
 ## Blobs from the execution client
 

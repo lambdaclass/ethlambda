@@ -484,7 +484,7 @@ pub struct ExecutionRequests {
 /// `withdrawals` become progressive (EIP-7688); `block_access_list`
 /// (EIP-7928) and `slot_number` (EIP-8061) are appended. Those nineteen
 /// fields are the specification's container. From
-/// [`Config::lstar_fork_epoch`](crate::beacon::config::Config::lstar_fork_epoch)
+/// [`Config::istar_fork_epoch`](crate::beacon::config::Config::istar_fork_epoch)
 /// on, a payload has a twentieth, `aggregate_proof`, which the
 /// specification's container does not have (see the field).
 ///
@@ -546,7 +546,7 @@ pub struct ExecutionPayload {
     /// bound is all it enforces, and [`AggregateProof`] cannot hold more.
     ///
     /// `None` is a payload from before
-    /// [`Config::lstar_fork_epoch`](crate::beacon::config::Config::lstar_fork_epoch):
+    /// [`Config::istar_fork_epoch`](crate::beacon::config::Config::istar_fork_epoch):
     /// the specification's container, with no such field. `Some` is a payload
     /// from that epoch on, whose container has the field even when the
     /// string is empty, as it is for a block with no stripped signature, so
