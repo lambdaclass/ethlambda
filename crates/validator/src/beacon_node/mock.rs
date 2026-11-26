@@ -1,7 +1,7 @@
 //! A `BeaconNodeApi` that answers from values a test sets, used by the duty
 //! service tests. Compiled only under `cfg(test)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::events::{EventSource, EventStream, NodeEvent, Topic};
 use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
@@ -89,6 +90,9 @@ pub struct MockBeaconNode {
     /// The method of every call made while [`Self::hang`] was set, recorded
     /// on entry.
     pub hung_calls: Mutex<Vec<&'static str>>,
+    /// When set, a node that answers every call that checks [`Self::hang`],
+    /// but this much later: slower than its peers, not hung.
+    pub slow: Option<std::time::Duration>,
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
@@ -261,6 +265,85 @@ pub struct MockBeaconNode {
     pub liveness_delay: Option<std::time::Duration>,
     /// How long `spec` takes before it answers, as a hung node would.
     pub spec_delay: Option<std::time::Duration>,
+    /// A delay for the first call of each named method only (see
+    /// [`Self::with_first_call_delay`]).
+    pub first_call_delays: Mutex<HashMap<&'static str, std::time::Duration>>,
+    /// The event streams `subscribe` hands out, one per call, in order: the
+    /// first one for any topic asked for, or scripted for any topic (`None`).
+    /// Once none fits, a subscription fails as an unreachable node's does.
+    pub event_streams: Mutex<VecDeque<(Option<Topic>, ScriptedStream)>>,
+    /// The topics of every `subscribe` call, in call order.
+    pub event_subscriptions: Mutex<Vec<Vec<Topic>>>,
+}
+
+/// One step of a scripted event stream.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamStep {
+    /// Send nothing for this long.
+    Wait(std::time::Duration),
+    /// Deliver this event.
+    Event(NodeEvent),
+}
+
+/// What a scripted stream does once its steps run out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The node closes it.
+    Close,
+    /// It breaks, as a dropped connection does.
+    Fail,
+    /// It stays open and sends nothing more.
+    Hang,
+}
+
+/// An event stream the mock hands out: its steps, then its end.
+#[derive(Debug, Clone)]
+pub struct ScriptedStream {
+    pub steps: VecDeque<StreamStep>,
+    pub end: StreamEnd,
+}
+
+#[async_trait]
+impl EventStream for ScriptedStream {
+    async fn next_event(&mut self) -> Result<Option<NodeEvent>> {
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                StreamStep::Wait(delay) => tokio::time::sleep(delay).await,
+                StreamStep::Event(event) => return Ok(Some(event)),
+            }
+        }
+        match self.end {
+            StreamEnd::Close => Ok(None),
+            StreamEnd::Fail => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Body,
+                detail: "the event stream broke".to_string(),
+            }),
+            StreamEnd::Hang => std::future::pending().await,
+        }
+    }
+}
+
+#[async_trait]
+impl EventSource for MockBeaconNode {
+    async fn subscribe(&self, topics: &[Topic]) -> Result<Box<dyn EventStream>> {
+        self.event_subscriptions
+            .lock()
+            .expect("lock")
+            .push(topics.to_vec());
+        let mut streams = self.event_streams.lock().expect("lock");
+        let fits = streams
+            .iter()
+            .position(|(topic, _)| topic.is_none_or(|topic| topics.contains(&topic)));
+        match fits.and_then(|position| streams.remove(position)) {
+            Some((_, stream)) => Ok(Box::new(stream)),
+            None => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Connect,
+                detail: "no event stream scripted".to_string(),
+            }),
+        }
+    }
 }
 
 impl MockBeaconNode {
@@ -437,6 +520,43 @@ impl MockBeaconNode {
         self
     }
 
+    /// Answer `attestation_data` naming `root` as the head block. Over
+    /// [`Self::with_attestation_data`], which names the zero root.
+    pub fn with_attestation_block_root(mut self, root: Root) -> Self {
+        if let Some(data) = &mut self.attestation_data {
+            data.beacon_block_root = root;
+        }
+        self
+    }
+
+    /// Hand `steps`, then `end`, to the next `subscribe`, whatever its topic,
+    /// that no stream scripted before this one goes to.
+    pub fn with_event_stream(self, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(None, steps, end)
+    }
+
+    /// [`Self::with_event_stream`], for a subscription to `topic` only.
+    pub fn with_topic_stream(self, topic: Topic, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(Some(topic), steps, end)
+    }
+
+    fn script_stream(self, topic: Option<Topic>, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        let stream = ScriptedStream {
+            steps: steps.into(),
+            end,
+        };
+        self.event_streams
+            .lock()
+            .expect("lock")
+            .push_back((topic, stream));
+        self
+    }
+
+    /// The topics of every `subscribe` call, in call order.
+    pub fn event_subscriptions(&self) -> Vec<Vec<Topic>> {
+        self.event_subscriptions.lock().expect("lock").clone()
+    }
+
     /// Answer `produce_block` with a minimal well-formed electra block for
     /// `slot`, proposed by `proposer_index`.
     ///
@@ -501,6 +621,26 @@ impl MockBeaconNode {
         self
     }
 
+    /// Make the first call to `what` (`attestation_data`, `head_block_root`
+    /// or `payload_attestation_data`) take `delay` before it answers, and
+    /// every later one answer at once: an early request still out at a
+    /// duty's deadline, then the deadline's own request.
+    pub fn with_first_call_delay(self, what: &'static str, delay: std::time::Duration) -> Self {
+        self.first_call_delays
+            .lock()
+            .expect("lock")
+            .insert(what, delay);
+        self
+    }
+
+    /// Wait out the delay set for `what`'s first call, if this is it.
+    async fn delay_first_call(&self, what: &'static str) {
+        let delay = self.first_call_delays.lock().expect("lock").remove(what);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Make `produce_block` wait for a permit from `gate` before it answers.
     pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.produce_gate = Some(gate);
@@ -531,6 +671,13 @@ impl MockBeaconNode {
         *self.hang.lock().expect("lock") = timeout;
     }
 
+    /// Answer every call that checks [`Self::hang`] `delay` late, as a node
+    /// that is slower than its peers but answers.
+    pub fn with_slow_answers(mut self, delay: std::time::Duration) -> Self {
+        self.slow = Some(delay);
+        self
+    }
+
     /// How many calls to `what` were made while the node hung.
     pub fn hung_calls_to(&self, what: &str) -> usize {
         self.hung_calls
@@ -544,8 +691,12 @@ impl MockBeaconNode {
     /// For a call that checks it: when the node hangs, wait out the timeout
     /// and fail as the HTTP client fails a request that got no answer. Checked
     /// by `sync_status`, `attestation_data`, `publish_block`,
-    /// `submit_attestations` and `publish_execution_payload_envelope`.
+    /// `submit_attestations` and `publish_execution_payload_envelope`, which
+    /// all also wait out [`Self::slow`] first.
     async fn stall(&self, what: &'static str) -> Result<()> {
+        if let Some(delay) = self.slow {
+            tokio::time::sleep(delay).await;
+        }
         let hang = *self.hang.lock().expect("lock");
         let Some(timeout) = hang else {
             return Ok(());
@@ -1042,6 +1193,7 @@ impl BeaconNodeApi for MockBeaconNode {
         self.stall("attestation_data").await?;
         self.guard("attestation_data")?;
         *self.attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("attestation_data").await;
         self.attestation_data_forks.lock().expect("lock").push(fork);
         let data = self.attestation_data.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -1307,6 +1459,7 @@ impl BeaconNodeApi for MockBeaconNode {
     ) -> Result<Option<gloas::PayloadAttestationData>> {
         self.guard("payload_attestation_data")?;
         *self.payload_attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("payload_attestation_data").await;
         let Some(data) = self.payload_attestation_data else {
             return Ok(None);
         };
@@ -1464,6 +1617,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn head_block_root(&self) -> Result<Root> {
         self.guard("head_block_root")?;
+        self.delay_first_call("head_block_root").await;
         if self.head_optimistic {
             return Err(Error::BeaconNodeSyncing);
         }
