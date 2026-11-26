@@ -45,7 +45,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{
-    EventBus, FeeRecipients, SyncStatusController,
+    EventBus, FeeRecipients, PreparedPayloads, SyncStatusController,
     metrics::SyncStatus,
     payload_attributes::{
         FeeRecipientSource, GloasProposal, ProposalError, building_forkchoice_state,
@@ -130,15 +130,14 @@ const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long [`build_payload`] lets the execution client build between
 /// `forkchoiceUpdated` (which starts the build) and `getPayload` (which ends
-/// it).
+/// it), when no build was started ahead of the slot.
 ///
-/// The node asks for a payload only when its block is requested, with no
-/// payload prepared ahead of the slot. Geth answers a `getPayload` that
-/// follows the update at once with the empty payload it starts from, before
-/// its first build with transactions finishes, so without a window every
-/// self-built block carried no transactions and no blobs, whatever the
-/// mempool held. Half a second covers a devnet mempool many times over; it
-/// overlaps the attestation packing that runs beside the build.
+/// Geth answers a `getPayload` that follows the update at once with the empty
+/// payload it starts from, before its first build with transactions
+/// finishes, so without a window such a block carries no transactions and no
+/// blobs, whatever the mempool held. Half a second covers a devnet mempool
+/// many times over; it overlaps the attestation packing that runs beside the
+/// build. A proposal the chain actor prepared skips it.
 const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
 
 /// What `produceBlockV4` built for one block, kept for the envelope endpoints.
@@ -242,6 +241,7 @@ async fn post_produce_block(
     Extension(cache): Extension<PayloadCache>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
+    ahead: Option<Extension<PreparedPayloads>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -308,6 +308,7 @@ async fn post_produce_block(
         &sync_pool,
         &fee_recipients,
         &custody,
+        ahead.as_ref().map(|Extension(ahead)| ahead),
         &own_version,
         slot,
         query.randao_reveal,
@@ -471,6 +472,7 @@ async fn produce(
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
+    ahead: Option<&PreparedPayloads>,
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
@@ -493,9 +495,18 @@ async fn produce(
     let (local, el_version) = tokio::join!(
         async {
             match engine {
-                Some(engine) => {
-                    Some(build_local(store, engine, fee_recipients, custody, &prepared, slot).await)
-                }
+                Some(engine) => Some(
+                    build_local(
+                        store,
+                        engine,
+                        fee_recipients,
+                        custody,
+                        &prepared,
+                        ahead,
+                        slot,
+                    )
+                    .await,
+                ),
                 None => None,
             }
         },
@@ -733,10 +744,19 @@ async fn build_local(
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
     prepared: &Prepared,
+    ahead: Option<&PreparedPayloads>,
     slot: Slot,
 ) -> Result<LocalBuild, ApiError> {
     let fee_recipient = fee_recipient_for(fee_recipients, prepared);
-    let built = build_payload(store, engine, fee_recipient, custody, &prepared.inputs).await?;
+    let built = build_payload(
+        store,
+        engine,
+        fee_recipient,
+        custody,
+        &prepared.inputs,
+        ahead,
+    )
+    .await?;
     let bundle = &built.blobs_bundle;
     if bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len()
@@ -784,22 +804,42 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
     recipient
 }
 
-/// Ask the execution client to build on the chosen parent payload for the
-/// prepared slot, then collect what it built.
+/// The execution client's payload for the prepared slot, on the chosen parent
+/// payload.
 ///
-/// Collected straight away rather than after waiting, as the fulu path does: the
-/// execution client starts with a valid payload and improves it, so an early
-/// `getPayload` always answers, and the validator client asks at the start of
-/// the slot, when the block is due.
+/// The chain actor starts the build a third of a slot ahead, and again when
+/// its inputs change ([`PreparedPayloads`]). When one of those builds has
+/// exactly these attributes, it is collected at once: the execution client
+/// has been filling it since. Otherwise the build starts here, and is
+/// collected after [`PAYLOAD_BUILD_WINDOW`], as Lodestar and Nimbus do on
+/// that path: an execution client answers an immediate `getPayload` with
+/// whatever it built in that instant, an empty payload for geth and ethrex.
 pub(crate) async fn build_payload(
     store: &Store,
     engine: &EngineClient,
     fee_recipient: ExecutionAddress,
     custody: &NodeCustodyColumns,
     inputs: &GloasPayloadInputs,
+    prepared: Option<&PreparedPayloads>,
 ) -> Result<BuiltGloasPayload, ApiError> {
     let forkchoice = building_forkchoice_state(store, inputs.head_block_hash);
     let attributes = payload_attributes_v4(inputs, fee_recipient);
+    let slot = inputs.slot_number;
+    let ahead =
+        prepared.and_then(|prepared| prepared.take(slot, forkchoice.head_block_hash, &attributes));
+    if let Some(payload_id) = ahead {
+        match engine.get_payload_v6(payload_id).await {
+            Ok(built) => {
+                info!(%slot, "Collected the payload build started ahead of the slot");
+                return Ok(built);
+            }
+            Err(err) => {
+                warn!(%slot, %err, "Collecting the payload build started ahead failed; building now");
+            }
+        }
+    } else if prepared.is_some() {
+        info!(%slot, "No payload build was started ahead for these attributes; building now");
+    }
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
     let (status, payload_id) = engine
         .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)

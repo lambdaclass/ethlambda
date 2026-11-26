@@ -59,7 +59,7 @@ use crate::import_timing::{
 use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
-pub use payload_attributes::{FeeRecipients, PayloadPreparation};
+pub use payload_attributes::{FeeRecipients, PayloadPreparation, PreparedPayloads};
 
 pub mod aggregation;
 mod beacon_aggregates;
