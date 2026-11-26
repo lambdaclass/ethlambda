@@ -20,10 +20,27 @@ of 10,000 passing inputs each, unless a property sets its own.
 |---|---|---|
 | `crates/net/p2p/src/req_resp/encoding_properties.rs` | req/resp length prefix (`encode_varint`/`decode_varint`) and snappy framing (`write_payload`/`decode_payload`) | round trip; a protobuf varint model in `u128`; on corrupted streams, no panic and nothing accepted beyond its declared length or `MAX_PAYLOAD_SIZE` |
 | `crates/blockchain/state_transition/tests/justification_properties.rs` | `slot_is_justifiable_after`, `justified_slots_ops` | leanSpec's `Slot.is_justifiable_after` rule for rule; the relative-indexed bitlist against a set of absolute slots over random extend / justify / finalize sequences |
+| `crates/net/p2p/src/beacon/decode_properties.rs` | the beacon gossip decoders (`decode.rs`: every topic, every fork, gloas's progressive containers included), and `libssz` under them | SSZ's one-encoding-per-value: anything a decoder accepts must re-encode to the bytes received; no input may panic. Seeds are the consensus-specs `ssz_static` cases, mutated |
 | `crates/common/types/tests/u256_properties.rs` | beacon `U256`'s hand-written `Ord`, decimal `Display`/`from_dec_str`, JSON | the value as two `u128` halves; `u128`'s own formatting where the value fits |
 
-The p2p properties live inside the crate (`#[cfg(test)]` module) because the
+The p2p properties live inside the crate (`#[cfg(test)]` modules) because the
 codec is `pub(crate)`. The others are integration tests over public APIs.
+
+The gossip-decoder properties take their seeds from the consensus-specs
+fixtures, so they sit behind `ethlambda-p2p`'s `beacon-spec-tests` feature and
+report as ignored without it, like the other fixture-driven tests. `make
+test-beacon-mainnet` runs them; by hand:
+
+```bash
+make consensus-spec-tests CONSENSUS_SPEC_TESTS_CONFIGS=mainnet
+cargo test --profile release-fast -p ethlambda-p2p --lib --features beacon-spec-tests beacon::decode_properties
+```
+
+`every_fixture_decodes_through_its_gossip_decoder` checks the seeds themselves
+(every case decodes through its topic's decoder at its fork and round-trips).
+A clean run of the mutation property is meaningful because the oracle is known
+to fire: a decoder made to ignore trailing bytes fails it on the first input,
+shrunk to a single inserted byte.
 
 ## Running
 
@@ -107,4 +124,5 @@ The ephyra docs written for this workflow are its
 | Found by | What | Status |
 |---|---|---|
 | `a_varint_is_refused_or_read_as_the_value_it_encodes` | `decode_varint` dropped the bits of a 5-byte length prefix above bit 31: `80 80 80 80 10` declares 2^32 bytes and `decode_payload` read it as an empty payload, so a prefix over `MAX_PAYLOAD_SIZE` passed the size check. Pinned by `a_length_prefix_wider_than_u32_is_refused` in `encoding.rs`. | fixed: `decode_varint` accumulates in a `u64`, reads at most 5 bytes and refuses a value past `u32::MAX` |
+| `a_gossip_decoder_accepts_only_canonical_encodings` | Nothing: about 115 million mutated payloads over 3 seeds (60 s each), some 27 million of them accepted, every one re-encoding to its own bytes. | clean |
 | `justifiability_matches_the_spec` | Above `delta = u64::MAX / 4`, `slot_is_justifiable_after`'s pronic test overflows and answers false where leanSpec says true. 2^62 slots past finalization, unreachable. | excluded (`REACHABLE_DELTA`) |
