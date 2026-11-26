@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fe059486.js";
+            window.path_to_searchindex_js = "searchindex-7d4645e3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1123,8 +1123,9 @@ publish still going then, or a SIGKILL, ends it with the request.</li>
 <li><strong>Registrations stop at gloas.</strong> The client sends no <code>register_validator</code> from
 the gloas fork epoch on: the builder market works through proposer
 preferences there (see the next section), and <code>produceBlockV4</code> sends the
-configured boost factor and <code>--builder-min-bid</code> (default <code>0</code>), and no
-builders.
+configured boost factor (default <code>100</code>) and <code>--builder-min-bid</code> (default
+<code>0</code>), with or without <code>--builder-proposals</code>, and no builders
+(<code>--self-build-only</code>: <code>0</code> and <code>2^64 - 1</code>).
 Validators with no fee recipient are not registered either (the field is
 required), and only validators the beacon node resolved, pending or active,
 are signed for: the flashbots relay refuses a whole batch over an exited or
