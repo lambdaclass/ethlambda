@@ -149,7 +149,7 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// field, from before `HEZE_FORK_EPOCH`, is written as the specification's
 /// object, with no such key.
 ///
-/// From `LSTAR_FORK_EPOCH` the execution block has one proof where it had
+/// From `ISTAR_FORK_EPOCH` the execution block has one proof where it had
 /// the witness list, and so do the payload and this object:
 /// `dependencyProof`, one `DATA`, `0x` when the proof is empty, written
 /// exactly when the payload has that field.

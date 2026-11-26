@@ -754,7 +754,7 @@ pub fn verify_execution_payload_envelope(
     )?;
     // Not in the specification, whose payload has no such fields. From
     // `HEZE_FORK_EPOCH` on a payload is the container with
-    // `dependency_witnesses`, from `LSTAR_FORK_EPOCH` on the one with
+    // `dependency_witnesses`, from `ISTAR_FORK_EPOCH` on the one with
     // `dependency_proof` in its place, and before both the one with
     // neither. The three hash differently even with nothing in those
     // fields, and nothing else an envelope is checked against tells them
@@ -762,7 +762,7 @@ pub fn verify_execution_payload_envelope(
     verify(
         payload.container() == Some(config.payload_container(compute_epoch_at_slot(state.slot()))),
         "verify_execution_payload_envelope: payload is the container of its epoch, with \
-         dependency_witnesses from HEZE_FORK_EPOCH and dependency_proof from LSTAR_FORK_EPOCH",
+         dependency_witnesses from HEZE_FORK_EPOCH and dependency_proof from ISTAR_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,

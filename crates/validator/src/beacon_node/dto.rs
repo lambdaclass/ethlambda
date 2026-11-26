@@ -698,8 +698,8 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     }
     // The same for the epoch a dependency proof takes the witnesses' place
     // from.
-    if let Some(epoch) = spec_u64(value, "LSTAR_FORK_EPOCH")? {
-        config.lstar_fork_epoch = epoch;
+    if let Some(epoch) = spec_u64(value, "ISTAR_FORK_EPOCH")? {
+        config.istar_fork_epoch = epoch;
     }
 
     Ok(config)
@@ -1076,7 +1076,7 @@ mod tests {
             PayloadContainer::Specification
         );
 
-        let response = serde_json::json!({ "HEZE_FORK_EPOCH": "3", "LSTAR_FORK_EPOCH": "5" });
+        let response = serde_json::json!({ "HEZE_FORK_EPOCH": "3", "ISTAR_FORK_EPOCH": "5" });
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.payload_container(2), PayloadContainer::Specification);
         assert_eq!(config.payload_container(3), PayloadContainer::WithWitnesses);

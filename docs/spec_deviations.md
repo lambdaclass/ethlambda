@@ -839,9 +839,9 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   envelope's gossip rule rejects a witness that is not exactly
   `LEAN_SPHINCS_SIGNATURE_SIZE` (7,740) bytes long. The signatures themselves
   are verified by the execution client.
-- **From `LSTAR_FORK_EPOCH`, a dependency proof:** the config reads one more
-  key, `LSTAR_FORK_EPOCH`, the epoch of the upgrade after heze, which the
-  execution layer schedules as `lstarTime` and the specification does not
+- **From `ISTAR_FORK_EPOCH`, a dependency proof:** the config reads one more
+  key, `ISTAR_FORK_EPOCH`, the epoch of the upgrade after heze, which the
+  execution layer schedules as `istarTime` and the specification does not
   name. From that epoch the execution block has one proof where it had the
   witness list (EIP-8288), and so does the payload: `dependency_proof`, a
   `ByteList[MAX_DEPENDENCY_PROOF_BYTES]` (1,048,576 bytes), is the container's

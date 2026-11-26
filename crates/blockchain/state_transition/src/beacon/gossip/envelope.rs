@@ -26,7 +26,7 @@
 //! - [`cheap_checks`] rejects a payload that is not the container its slot
 //!   calls for: the specification's before `HEZE_FORK_EPOCH`, the one with
 //!   `dependency_witnesses` from that epoch on, and the one with
-//!   `dependency_proof` from `LSTAR_FORK_EPOCH` on. It also rejects one
+//!   `dependency_proof` from `ISTAR_FORK_EPOCH` on. It also rejects one
 //!   whose list holds an item of any length but
 //!   [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The specification's payload has
 //!   neither field, so it has no rule for them. The proof is not looked at,
@@ -118,7 +118,7 @@ pub fn cheap_checks(
     }
     // [REJECT] The payload is the container its slot calls for: it has the
     // dependency witnesses field exactly from `HEZE_FORK_EPOCH` up to
-    // `LSTAR_FORK_EPOCH`, and the dependency proof field exactly from the
+    // `ISTAR_FORK_EPOCH`, and the dependency proof field exactly from the
     // latter on. The payload names its own slot, so this needs no block
     // either. The proof itself is the execution client's to read.
     let witnesses = &message.payload.dependency_witnesses;
@@ -399,7 +399,7 @@ mod tests {
         let mut store = store(0);
         let mut config = (*store.config()).clone();
         config.heze_fork_epoch = 0;
-        config.lstar_fork_epoch = 1;
+        config.istar_fork_epoch = 1;
         store.replace_config(config);
         store
     }

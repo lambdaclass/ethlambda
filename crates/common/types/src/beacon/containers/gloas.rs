@@ -493,7 +493,7 @@ pub struct ExecutionRequests {
 /// fields are the specification's container. From
 /// [`Config::heze_fork_epoch`](crate::beacon::config::Config::heze_fork_epoch)
 /// on, a payload has a twentieth, `dependency_witnesses`, and from
-/// [`Config::lstar_fork_epoch`](crate::beacon::config::Config::lstar_fork_epoch)
+/// [`Config::istar_fork_epoch`](crate::beacon::config::Config::istar_fork_epoch)
 /// on it has `dependency_proof` instead. The specification's container has
 /// neither (see the fields).
 ///
@@ -564,7 +564,7 @@ pub struct ExecutionPayload {
     /// differently. It comes after the specification's fields because a
     /// progressive container can only grow at its end (EIP-7495): every
     /// field before it keeps its generalized index. From
-    /// [`Config::lstar_fork_epoch`](crate::beacon::config::Config::lstar_fork_epoch)
+    /// [`Config::istar_fork_epoch`](crate::beacon::config::Config::istar_fork_epoch)
     /// on it is `None` again: see `dependency_proof`.
     ///
     /// In JSON a payload without the field has no such key.
@@ -584,7 +584,7 @@ pub struct ExecutionPayload {
     /// [`DependencyProof`] cannot hold more.
     ///
     /// `None` is a payload from before
-    /// [`Config::lstar_fork_epoch`](crate::beacon::config::Config::lstar_fork_epoch).
+    /// [`Config::istar_fork_epoch`](crate::beacon::config::Config::istar_fork_epoch).
     /// `Some` is a payload from that epoch on, whose container has the field
     /// even when the string is empty, as it is for a block with no
     /// dependency.
@@ -2167,14 +2167,14 @@ mod tests {
         // and the list's bytes are read as a proof no more than before.
         let mut with_proof = without.clone();
         with_proof.dependency_proof = Some(some_proof());
-        config.lstar_fork_epoch = epoch;
+        config.istar_fork_epoch = epoch;
         assert_eq!(
             ExecutionPayload::from_ssz_by_slot(&config, &with_proof.to_ssz()),
             Ok(with_proof.clone())
         );
         assert!(ExecutionPayload::from_ssz_by_slot(&config, &without.to_ssz()).is_err());
         // Scheduled for the next epoch: this payload still has the list.
-        config.lstar_fork_epoch = epoch + 1;
+        config.istar_fork_epoch = epoch + 1;
         assert_eq!(
             ExecutionPayload::from_ssz_by_slot(&config, &with_two.to_ssz()),
             Ok(with_two)
@@ -2233,7 +2233,7 @@ mod tests {
             match container {
                 PayloadContainer::Specification => {}
                 PayloadContainer::WithWitnesses => config.heze_fork_epoch = epoch,
-                PayloadContainer::WithProof => config.lstar_fork_epoch = epoch,
+                PayloadContainer::WithProof => config.istar_fork_epoch = epoch,
             }
             assert_eq!(
                 ExecutionPayloadEnvelope::from_ssz_by_slot(&config, &envelope.to_ssz()),

@@ -45,7 +45,7 @@ Two method families a full client would have are deliberately absent:
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`, and on this branch `dependencyWitnesses` from
   `HEZE_FORK_EPOCH` and `dependencyProof` in its place from
-  `LSTAR_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
+  `ISTAR_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
   gloas on. The handshake warns when a gloas network's execution client does
   not advertise `engine_getPayloadV6`.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
@@ -354,7 +354,7 @@ sync, the Beacon API), its payload is decoded as the container
 (`from_ssz_by_slot`), and an envelope whose payload is the other container
 does not decode. The validator client decodes the envelope of a block it
 asked for as the container of that block's slot, and reads `HEZE_FORK_EPOCH`
-and `LSTAR_FORK_EPOCH` from `/eth/v1/config/spec` to know it. JSON needs none
+and `ISTAR_FORK_EPOCH` from `/eth/v1/config/spec` to know it. JSON needs none
 of this: it names each field it has.
 
 The execution client and this node must agree on the epoch. On the proposal
@@ -387,8 +387,8 @@ From the upgrade after heze, the builder of an execution block makes one
 *dependency proof* that stands for all of the block's dependency witnesses,
 and the block carries the proof and no witness list (EIP-8288). The execution
 block header commits to the proof with fields of its own. The execution layer
-schedules that upgrade by time (`lstarTime`); this side reads its epoch from
-one more config key, `LSTAR_FORK_EPOCH`, and that is the epoch a payload
+schedules that upgrade by time (`istarTime`); this side reads its epoch from
+one more config key, `ISTAR_FORK_EPOCH`, and that is the epoch a payload
 carries the proof from.
 
 | Method | Direction | `dependencyProof` |
@@ -405,7 +405,7 @@ empty string.
 
 Between the two calls the proof is `dependency_proof`, a
 `ByteList[MAX_DEPENDENCY_PROOF_BYTES]`, which takes the witness list's place
-in the `ExecutionPayload` container from `LSTAR_FORK_EPOCH` on, the way a
+in the `ExecutionPayload` container from `ISTAR_FORK_EPOCH` on, the way a
 progressive container replaces a field (EIP-7495): the list's field, the
 twentieth, becomes inactive, and the proof is the twenty-first. An inactive
 field is left out of the encoding and leaves a zero chunk in the tree, so no
@@ -420,7 +420,7 @@ On the proposal path an answer with `dependencyProof` is that container as it
 stands, and an answer with neither key, or with an empty witness list, gets
 the empty proof. An answer that holds witnesses at a slot whose payloads carry
 a proof, or a proof at a slot whose payloads do not, is refused. An envelope
-whose payload has a proof before `LSTAR_FORK_EPOCH`, lacks one from that epoch
+whose payload has a proof before `ISTAR_FORK_EPOCH`, lacks one from that epoch
 on, or has both a proof and a witness list, is rejected by the same two rules
 as above. The proof's size bound is the container's: a payload over it does
 not decode, from gossip, from a peer's answer, from the Beacon API or from the
