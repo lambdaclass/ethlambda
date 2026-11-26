@@ -259,10 +259,11 @@ impl EngineClient {
     /// a revealed execution payload envelope.
     ///
     /// The parameters are the same four as V4's, with the payload as
-    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`). The
-    /// response is V4's. An execution client answers `-38005` when the
-    /// payload's timestamp is not Amsterdam's, which surfaces as
-    /// [`EngineError::Rpc`] and is not retried.
+    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`, and
+    /// `aggregateProof` after them when the payload has the field). The
+    /// response is V4's. An execution
+    /// client answers `-38005` when the payload's timestamp is not
+    /// Amsterdam's, which surfaces as [`EngineError::Rpc`] and is not retried.
     pub async fn new_payload_v5(
         &self,
         payload: &gloas::ExecutionPayload,
@@ -370,7 +371,8 @@ impl EngineClient {
     }
 
     /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
-    /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included).
+    /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included,
+    /// and `aggregateProof` when the execution client sends it).
     ///
     /// One attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], like V5. Prysm tightens
     /// its own to 300 ms from gloas; this keeps the second until an execution

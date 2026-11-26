@@ -141,6 +141,13 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// has progressive `transactions` and `withdrawals`, a different type from
 /// deneb's, so it needs its own serializer; the wire shape of those two is
 /// unchanged.
+///
+/// `aggregateProof` comes last and is not in the specification's
+/// `ExecutionPayloadV4`: one `DATA`, written exactly when the payload has the
+/// field, and then even when it is empty (`0x`), so that the execution client
+/// reads the bytes its block header commits to. A payload without the field,
+/// from before `LSTAR_FORK_EPOCH`, is written as the specification's object,
+/// with no such key.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 
 impl Serialize for ExecutionPayloadV4<'_> {
@@ -148,7 +155,12 @@ impl Serialize for ExecutionPayloadV4<'_> {
         use serde::ser::SerializeStruct as _;
 
         let payload = self.0;
-        let mut out = serializer.serialize_struct("ExecutionPayloadV4", 19)?;
+        let members = if payload.aggregate_proof.is_some() {
+            20
+        } else {
+            19
+        };
+        let mut out = serializer.serialize_struct("ExecutionPayloadV4", members)?;
         out.serialize_field("parentHash", &data(&payload.parent_hash.0))?;
         out.serialize_field("feeRecipient", &data(&payload.fee_recipient.0))?;
         out.serialize_field("stateRoot", &data(&payload.state_root.0))?;
@@ -178,6 +190,10 @@ impl Serialize for ExecutionPayloadV4<'_> {
         out.serialize_field("excessBlobGas", &quantity(payload.excess_blob_gas))?;
         out.serialize_field("blockAccessList", &data(payload.block_access_list.as_ref()))?;
         out.serialize_field("slotNumber", &quantity(payload.slot_number))?;
+
+        if let Some(aggregate_proof) = &payload.aggregate_proof {
+            out.serialize_field("aggregateProof", &data(aggregate_proof))?;
+        }
         out.end()
     }
 }
@@ -512,7 +528,22 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 4096,
+            aggregate_proof: Default::default(),
         };
+
+        // A payload without the field is the specification's object.
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        let object = json.as_object().expect("a JSON object");
+        assert!(!object.contains_key("aggregateProof"));
+        assert_eq!(object.len(), 19);
+
+        // A payload with the field and an empty proof writes the empty
+        // `DATA`, never an absent key.
+        payload.aggregate_proof = Some(Default::default());
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        assert_eq!(json["aggregateProof"], "0x");
+        assert_eq!(json.as_object().expect("a JSON object").len(), 20);
+
         let transaction: gloas::Transaction = vec![0x02u8, 0xab].try_into().expect("fits");
         payload.transactions.push(transaction);
         payload.withdrawals.push(Withdrawal {
@@ -524,6 +555,7 @@ mod tests {
         for byte in [0xc1u8, 0x80] {
             payload.block_access_list.push(byte);
         }
+        payload.aggregate_proof = Some(vec![0x01u8, 0xff].try_into().expect("fits"));
 
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
 
@@ -552,12 +584,16 @@ mod tests {
             "excessBlobGas": "0x0",
             "blockAccessList": "0xc180",
             "slotNumber": "0x1000",
+            "aggregateProof": "0x01ff",
         });
         assert_eq!(json, expected);
 
-        // The spec's order, with the two Amsterdam fields last.
+        // The spec's order, the two Amsterdam fields at its end, then the
+        // proof after everything the specification names.
         let text = serde_json::to_string(&ExecutionPayloadV4(&payload)).expect("serializes");
-        assert!(text.ends_with(r#""blockAccessList":"0xc180","slotNumber":"0x1000"}"#));
+        assert!(text.ends_with(
+            r#""blockAccessList":"0xc180","slotNumber":"0x1000","aggregateProof":"0x01ff"}"#
+        ));
     }
 
     #[test]

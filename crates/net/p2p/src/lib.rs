@@ -3972,6 +3972,7 @@ pub(crate) mod test_support {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
+            aggregate_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

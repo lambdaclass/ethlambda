@@ -16,7 +16,11 @@
 //!   schedule) stay out for the same reason `GLOAS_*` used to: a fork version
 //!   stored here would give [`Config::fork_at_epoch`] a fork
 //!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
-//!   reported as an unknown key instead. `GAS_LIMIT_SCHEDULE` (gloas-era)
+//!   reported as an unknown key instead. `LSTAR_FORK_EPOCH`, the epoch of the
+//!   upgrade after heze, is read all the same, as [`Config::lstar_fork_epoch`]:
+//!   it schedules no fork of this build's either, and is there for the one
+//!   thing this build does at that epoch (see
+//!   [`Config::carries_aggregate_proof`]). `GAS_LIMIT_SCHEDULE` (gloas-era)
 //!   stays out too, since it is a list rather than a scalar. The rest are
 //!   heze-era data keys, not gloas's, with no reader in this build at all:
 //!   `INCLUSION_LIST_DUE_BPS`, `MAX_REQUEST_INCLUSION_LIST`,
@@ -326,6 +330,17 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub gloas_fork_epoch: Epoch,
+    /// The epoch the upgrade after heze activates at, or
+    /// [`constants::FAR_FUTURE_EPOCH`] if it is not scheduled. The execution
+    /// layer schedules the same upgrade by time, as `lstarTime`.
+    ///
+    /// This build processes neither heze nor that upgrade: the fork a state
+    /// or a signature belongs to never reads this, and there is no
+    /// `lstar_fork_version`. It is the epoch from which an execution payload
+    /// carries an aggregate proof, and nothing else: see
+    /// [`Self::carries_aggregate_proof`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub lstar_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -723,6 +738,7 @@ impl Config {
             fulu_fork_epoch: 411_392,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            lstar_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -857,6 +873,7 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            lstar_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -1054,6 +1071,18 @@ impl Config {
             .unwrap_or(ForkName::Phase0)
     }
 
+    /// Whether an execution payload of `epoch` carries an aggregate proof.
+    ///
+    /// The execution layer's blocks carry one from the upgrade after heze,
+    /// so that upgrade's epoch decides: before it a payload is the
+    /// specification's gloas container, and from it on the container has one
+    /// more field, the aggregate proof, present even when it is an empty
+    /// string. Nothing else changes at that epoch in this build, which stays
+    /// on gloas.
+    pub fn carries_aggregate_proof(&self, epoch: Epoch) -> bool {
+        self.lstar_fork_epoch != constants::FAR_FUTURE_EPOCH && self.lstar_fork_epoch <= epoch
+    }
+
     /// The `Fork.current_version` value blocks and attestations of `fork`
     /// sign under.
     pub fn fork_version(&self, fork: ForkName) -> Version {
@@ -1174,6 +1203,40 @@ mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
 
     use super::*;
+
+    #[test]
+    fn a_payload_carries_an_aggregate_proof_from_the_lstar_epoch() {
+        let mut config = Config::minimal();
+        // Not scheduled: never, the last epoch included.
+        assert_eq!(config.lstar_fork_epoch, constants::FAR_FUTURE_EPOCH);
+        assert!(!config.carries_aggregate_proof(0));
+        assert!(!config.carries_aggregate_proof(constants::FAR_FUTURE_EPOCH));
+
+        config.lstar_fork_epoch = 3;
+        assert!(!config.carries_aggregate_proof(2));
+        assert!(config.carries_aggregate_proof(3));
+        assert!(config.carries_aggregate_proof(4));
+
+        // Scheduling it moves no fork: the node stays on the fork it was on.
+        let fork_before = Config::minimal().fork_at_epoch(3);
+        assert_eq!(config.fork_at_epoch(3), fork_before);
+    }
+
+    #[test]
+    fn the_lstar_epoch_is_read_from_a_config_file_and_the_heze_epoch_is_not() {
+        // Heze schedules nothing here, so its epoch does not stand in for
+        // the later one.
+        let yaml = "HEZE_FORK_EPOCH: 1\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.lstar_fork_epoch, constants::FAR_FUTURE_EPOCH);
+        assert!(!config.carries_aggregate_proof(1));
+
+        let yaml = "HEZE_FORK_EPOCH: 1\nLSTAR_FORK_EPOCH: 2\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.lstar_fork_epoch, 2);
+        assert!(!config.carries_aggregate_proof(1));
+        assert!(config.carries_aggregate_proof(2));
+    }
 
     #[test]
     fn the_terminal_total_difficulties_match_the_config_files() {

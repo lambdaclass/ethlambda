@@ -479,6 +479,7 @@ pub(crate) mod test_support {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: slot,
+            aggregate_proof: Default::default(),
         };
         SignedExecutionPayloadEnvelope {
             message: ExecutionPayloadEnvelope {

@@ -800,6 +800,46 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
+## The execution payload carries an aggregate proof from the lstar epoch
+
+- **The specification:** gloas's `ExecutionPayload` ends at `slot_number`, and
+  `ExecutionPayloadV4` at `slotNumber`. It names no upgrade after heze.
+- **ethlambda, on this branch:** the config reads one more key,
+  `LSTAR_FORK_EPOCH`, the epoch of the upgrade the execution layer schedules
+  as `lstarTime`. Before it the payload is the specification's. From that
+  epoch on the container has one more field after `slot_number`,
+  `aggregate_proof`, a `ByteList[MAX_AGGREGATE_PROOF_BYTES]` (1,048,576
+  bytes), and `ExecutionPayloadV4` one more member, `aggregateProof`. The
+  field is there even when the string is empty. See
+  [beacon_engine.md](./beacon_engine.md#the-aggregate-proof) for the wire
+  shape in each direction. Nothing else happens at that epoch: this build
+  processes neither heze nor the upgrade after it, so the node stays on gloas,
+  with gloas's fork version, fork digest and rules, and the heze keys are
+  still ignored.
+- **Why:** from that upgrade on, the builder of an execution block of the
+  network this branch runs on may strip post-quantum signatures from the
+  block's transactions and prove them with one proof the block carries beside
+  its transactions. The consensus layer is what moves an execution block from
+  its builder to every other node's execution client. The field is the last
+  one because a progressive container (EIP-7495) can only grow at its end.
+- **Consequence:** from `LSTAR_FORK_EPOCH` on, `ExecutionPayload`,
+  `ExecutionPayloadEnvelope`, `SignedExecutionPayloadEnvelope` and
+  `NewPayloadRequest` encode and merkleize differently from the
+  specification's, with or without bytes in the proof. The envelope topic,
+  the envelope req/resp protocols, the Beacon API's envelope bodies and stored
+  envelopes of those epochs are therefore compatible only among nodes that
+  have the field. Blocks, bids and states are unchanged: a block commits to
+  its payload through the bid's `block_hash`, and no state field holds a
+  payload. Before that epoch, and on every network that does not schedule it,
+  the four containers are the specification's, so the spec-test cases that
+  decode or hash one of them run.
+- **One rule of its own:** a payload must have the field exactly from
+  `LSTAR_FORK_EPOCH` on, which the envelope's gossip rule and
+  `verify_execution_payload_envelope` both check, since nothing else an
+  envelope is checked against tells the two containers apart. The proof is
+  opaque here: no rule reads it, and the execution client verifies it. Its
+  size bound is the container's, so a payload over it does not decode.
+
 ## Columns built from the execution client's blobs are verified
 
 - **The specification:** fulu `p2p-interface.md`, "Distributed blob publishing

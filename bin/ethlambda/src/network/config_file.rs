@@ -261,6 +261,23 @@ mod tests {
     }
 
     #[test]
+    fn the_lstar_epoch_is_claimed_although_no_such_fork_is_processed() {
+        // The devnet file does not name the key, so it stays unscheduled.
+        let parsed = ConfigFile::parse(DEVNET).unwrap();
+        assert_eq!(
+            parsed.config.lstar_fork_epoch,
+            ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH
+        );
+
+        // The epoch payloads carry an aggregate proof from: a key with a
+        // reader, unlike heze's, which the file does name.
+        let parsed = ConfigFile::parse(&format!("{DEVNET}\nLSTAR_FORK_EPOCH: 7\n")).unwrap();
+        assert!(!parsed.ignored.contains(&"LSTAR_FORK_EPOCH".to_string()));
+        assert!(parsed.ignored.contains(&"HEZE_FORK_EPOCH".to_string()));
+        assert_eq!(parsed.config.lstar_fork_epoch, 7);
+    }
+
+    #[test]
     fn the_gloas_keys_are_claimed_rather_than_ignored() {
         // GLOAS_* and PAYLOAD_DUE_BPS used to be reported as ignored
         // alongside heze's; now that `Config` has fields for them, they must

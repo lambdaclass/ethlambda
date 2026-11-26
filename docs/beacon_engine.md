@@ -43,8 +43,10 @@ Two method families a full client would have are deliberately absent:
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
-  `slotNumber`) from gloas on. The handshake warns when a gloas network's
-  execution client does not advertise `engine_getPayloadV6`.
+  `slotNumber`, and on this branch `aggregateProof` from `LSTAR_FORK_EPOCH`:
+  see [The aggregate proof](#the-aggregate-proof)) from gloas on. The
+  handshake warns when a gloas network's execution client does not advertise
+  `engine_getPayloadV6`.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -314,6 +316,64 @@ only and releases the rest once that ask is answered, so an unreachable client
 costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
+
+### The aggregate proof
+
+This branch pairs with an execution client whose transactions carry
+post-quantum signatures inside them, and whose block builder, from the upgrade
+after heze, may strip those signatures from the block's transactions and prove
+them all with one *aggregate proof*. The proof sits in the block outside its
+transactions, and the execution block header commits to it with a field of its
+own. The execution layer schedules that upgrade by time (`lstarTime`); this
+side reads its epoch from one more config key, `LSTAR_FORK_EPOCH`, and that is
+the epoch a payload carries the proof from. From that epoch
+`ExecutionPayloadV4` has one more member here than the specification gives it;
+before it, the object is the specification's:
+
+| Method | Direction | `aggregateProof` |
+|---|---|---|
+| `engine_getPayloadV6` | read | One `DATA`. A string that is not `0x`-prefixed hex, or that is longer than `MAX_AGGREGATE_PROOF_BYTES` (1,048,576 bytes), fails the whole answer, like any other malformed field. What an absent key or `null` means depends on the payload's slot: see below |
+| `engine_newPayloadV5` | written | One `DATA`, the payload's last member, when the payload has the field: `0x` when it is empty. No such key when the payload does not have the field |
+
+```json
+"aggregateProof": "0x<the proof, in the prover's serialization>"
+```
+
+The proof is one byte string, and nothing on this side parses it. A block with
+no stripped signature has the empty string.
+
+Between the two calls the string is `aggregate_proof`, the last field of the
+gloas `ExecutionPayload` container from `LSTAR_FORK_EPOCH` on, a
+`ByteList[MAX_AGGREGATE_PROOF_BYTES]`, so the builder's signature covers it
+and it is gossiped, served and stored with the envelope, like the
+transactions. Before that epoch the container has no such field. In the code
+the field is an `Option`: `None` is the container without it, `Some` the
+container with it, and `Some` of an empty string is not `None`. The Beacon
+API's JSON names it `aggregate_proof`, one hex string, and leaves the key out
+of a payload that does not have the field.
+
+The execution client and this node must agree on the epoch. On the proposal
+path the node settles it from the payload's own slot
+(`ExecutionPayload::with_aggregate_proof_field`): from the epoch on, an answer
+without the key becomes the empty string; before it, an empty string is
+dropped, and an answer that holds a proof is refused, because the execution
+block commits to it and the payload cannot carry it.
+
+The follower never rebuilds the execution header or its hash, so the header's
+commitment needs nothing on this side: `engine_newPayloadV5` hands the proof
+to the execution client, which checks it against the header and verifies it.
+What the follower judges is which container the payload is, and the size
+bound. An envelope whose payload has the field before `LSTAR_FORK_EPOCH`, or
+lacks it from that epoch on, is rejected by the envelope's gossip rule
+(`gossip::envelope::cheap_checks`) and by `verify_execution_payload_envelope`.
+The bound is the container's: a payload whose proof is longer than
+`MAX_AGGREGATE_PROOF_BYTES` does not decode, from gossip, from a peer's
+answer, from the Beacon API or from the execution client. The bound is below
+the 10 MiB an envelope may take on the wire, which does not change.
+
+The field changes the encoding and the root of every payload from
+`LSTAR_FORK_EPOCH` on, which is a departure from the specification:
+see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-an-aggregate-proof-from-the-lstar-epoch).
 
 ## Blobs from the execution client
 

@@ -2030,6 +2030,11 @@ fn first_config_difference(
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
+        // Not a fork of this node's: the epoch payloads carry an aggregate
+        // proof from. Compared below under the fork schedule's rule, since a
+        // payload validated before it and one validated after it are
+        // different containers.
+        lstar_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -2183,6 +2188,18 @@ fn first_config_difference(
         return Some(format!(
             "{field}: directory has {stored}, config file says {supplied}, \
              and this directory has processed through epoch {processed_through}"
+        ));
+    }
+
+    // May be scheduled or moved while it lies ahead of everything processed
+    // under both values, as a fork's epoch may.
+    if persisted.lstar_fork_epoch != supplied.lstar_fork_epoch
+        && persisted.lstar_fork_epoch.min(supplied.lstar_fork_epoch) <= processed_through
+    {
+        return Some(format!(
+            "lstar_fork_epoch: directory has {}, config file says {}, \
+             and this directory has processed through epoch {processed_through}",
+            persisted.lstar_fork_epoch, supplied.lstar_fork_epoch
         ));
     }
 
@@ -4249,6 +4266,7 @@ mod anchor_envelope_root_tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
+            aggregate_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

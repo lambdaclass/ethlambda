@@ -618,6 +618,11 @@ fn check_envelope(
         "payload.slot_number == state.slot",
     )?;
     verify(
+        payload.aggregate_proof.is_some()
+            == config.carries_aggregate_proof(get_current_epoch(post)),
+        "payload.aggregate_proof is present exactly from LSTAR_FORK_EPOCH",
+    )?;
+    verify(
         payload.parent_hash == inner.latest_block_hash,
         "payload.parent_hash == state.latest_block_hash",
     )?;
@@ -719,6 +724,7 @@ pub mod test_support {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: inputs.slot_number,
+            aggregate_proof: Default::default(),
         }
     }
 
@@ -1138,6 +1144,110 @@ mod gloas_block_production_tests {
             BlockProcessingOptions::default(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_payload_has_an_aggregate_proof_exactly_from_the_lstar_epoch() {
+        let state = state_to_build_on();
+        let epoch = get_current_epoch(&state);
+        let requests = ExecutionRequests::default();
+        let inputs = gloas_payload_inputs(
+            &state,
+            true,
+            &requests,
+            &config(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        let without = payload_for(&inputs);
+        assert_eq!(without.aggregate_proof, None);
+        let with = without.clone().with_aggregate_proof_field(true).unwrap();
+
+        let assemble = |payload: &ExecutionPayload, config: &Config| {
+            assemble_gloas_block(
+                &state,
+                GloasBlockInputs {
+                    sync_aggregate: empty_sync_aggregate(),
+                    randao_reveal: randao_reveal(&state),
+                    graffiti: Bytes32::ZERO,
+                    attestations: Vec::new(),
+                    payload_attestations: Vec::new(),
+                    parent_execution_requests: requests.clone(),
+                    execution_payload: payload.clone(),
+                    blob_kzg_commitments: Vec::new(),
+                    execution_requests: ExecutionRequests::default(),
+                },
+                config,
+                &PubkeyIndexCache::default(),
+                BlockProcessingOptions::default(),
+            )
+        };
+        // What a peer importing the block and its envelope checks.
+        let import = |produced: &GloasProduced, config: &Config| {
+            let GloasProduced { block, envelope } = produced;
+            let signed = gloas::SignedBeaconBlock {
+                message: block.clone(),
+                signature: {
+                    let domain = get_domain(&state, constants::DOMAIN_BEACON_PROPOSER, None);
+                    sign_for(
+                        block.proposer_index as usize,
+                        compute_signing_root(block.hash_tree_root(), domain),
+                    )
+                },
+            };
+            let wrapped = ethlambda_types::beacon::containers::SignedBeaconBlock::Gloas(signed);
+            let mut post = state.clone();
+            stf::block::process_block(
+                &mut post,
+                &wrapped,
+                config,
+                &ExecutionEngine::valid(),
+                OwnedBlockCaches::default().caches(),
+                BlockProcessingOptions::default(),
+            )
+            .unwrap();
+            let domain = get_domain(&post, constants::DOMAIN_BEACON_BUILDER, None);
+            let signed_envelope = gloas::SignedExecutionPayloadEnvelope {
+                message: envelope.clone(),
+                signature: sign_for(
+                    block.proposer_index as usize,
+                    compute_signing_root(envelope.hash_tree_root(), domain),
+                ),
+            };
+            stf::gloas::verify_execution_payload_envelope(
+                &post,
+                &signed_envelope,
+                config,
+                &ExecutionEngine::valid(),
+            )
+        };
+
+        // No epoch scheduled: a payload is the specification's container.
+        let unscheduled = config();
+        let produced_without = assemble(&without, &unscheduled).unwrap();
+        assert!(assemble(&with, &unscheduled).is_err());
+        assert!(import(&produced_without, &unscheduled).is_ok());
+
+        // Scheduled at the block's own epoch: a payload has the field, here
+        // with an empty string.
+        let mut from_this_epoch = config();
+        from_this_epoch.lstar_fork_epoch = epoch;
+        let produced_with = assemble(&with, &from_this_epoch).unwrap();
+        assert!(assemble(&without, &from_this_epoch).is_err());
+        assert!(import(&produced_with, &from_this_epoch).is_ok());
+
+        // A node importing under the other schedule refuses each envelope,
+        // although block, bid and execution block hash are the same.
+        assert!(import(&produced_with, &unscheduled).is_err());
+        assert!(import(&produced_without, &from_this_epoch).is_err());
+
+        // Scheduled for the next epoch: this block's payload does not have
+        // the field yet.
+        let mut from_next_epoch = config();
+        from_next_epoch.lstar_fork_epoch = epoch + 1;
+        assert!(assemble(&without, &from_next_epoch).is_ok());
+        assert!(assemble(&with, &from_next_epoch).is_err());
+        assert!(import(&produced_without, &from_next_epoch).is_ok());
     }
 
     #[test]

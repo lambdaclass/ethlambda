@@ -170,6 +170,7 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
         // client accepts as well-formed.
         block_access_list: vec![0xc0u8].try_into().expect("fits"),
         slot_number: 77,
+        aggregate_proof: Some(vec![0xaa, 0xbb].try_into().expect("fits")),
     };
     let status = client(endpoint)
         .new_payload_v5(
@@ -191,6 +192,7 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
     assert_eq!(params.len(), 4);
     assert_eq!(params[0]["slotNumber"], "0x4d");
     assert_eq!(params[0]["blockAccessList"], "0xc0");
+    assert_eq!(params[0]["aggregateProof"], "0xaabb");
     assert_eq!(params[1][0], format!("0x{}", "01".repeat(32)));
     assert_eq!(params[2], format!("0x{}", "02".repeat(32)));
     assert_eq!(params[3][0], "0x00aa");

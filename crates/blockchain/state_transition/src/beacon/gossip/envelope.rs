@@ -23,6 +23,11 @@
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
+//! - [`cheap_checks`] rejects a payload that has the `aggregate_proof`
+//!   field before `LSTAR_FORK_EPOCH` or lacks it from that epoch on. The
+//!   specification's payload has no such field, so it has no rule for it.
+//!   What the field holds is not looked at, and its size bound is the
+//!   container's: a payload over it does not decode.
 
 use std::num::NonZeroUsize;
 
@@ -37,6 +42,7 @@ use super::{
 use crate::beacon::containers::gloas::BuilderIndex;
 use crate::beacon::containers::{SignedBeaconBlock, gloas};
 use crate::beacon::fork_choice::Store;
+use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
@@ -98,6 +104,15 @@ pub fn cheap_checks(
     }
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
+    }
+    // [REJECT] The payload has the aggregate proof field exactly when its
+    // slot is at or after `LSTAR_FORK_EPOCH`. The payload names its own slot,
+    // so this needs no block either. The proof itself is the execution
+    // client's to read: nothing here parses it.
+    let proof = &message.payload.aggregate_proof;
+    let payload_epoch = compute_epoch_at_slot(message.payload.slot_number);
+    if proof.is_some() != store.config().carries_aggregate_proof(payload_epoch) {
+        return Err(Outcome::Reject(RejectReason::AggregateProofField));
     }
     Ok(())
 }
@@ -249,6 +264,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: slot,
+            aggregate_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {
@@ -289,6 +305,85 @@ mod tests {
             validate(&seen_envelopes(), &store, &envelope),
             Outcome::Reject(RejectReason::OperationLimit)
         );
+    }
+
+    /// `store(0)` with payloads carrying an aggregate proof from genesis.
+    fn store_with_aggregate_proofs() -> Store {
+        let mut store = store(0);
+        let mut config = (*store.config()).clone();
+        config.lstar_fork_epoch = 0;
+        store.replace_config(config);
+        store
+    }
+
+    #[test]
+    fn a_payload_with_the_aggregate_proof_field_is_rejected_before_its_epoch() {
+        // `store(0)` schedules no epoch for the field, so no payload has it.
+        let store = store(0);
+        let mut envelope = envelope(5, 0);
+        envelope.message.payload.aggregate_proof = Some(Default::default());
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &envelope),
+            Err(Outcome::Reject(RejectReason::AggregateProofField)),
+        );
+        // The block is unknown, which would queue a well-formed envelope.
+        assert_eq!(
+            validate(&seen_envelopes(), &store, &envelope),
+            Outcome::Reject(RejectReason::AggregateProofField)
+        );
+    }
+
+    #[test]
+    fn a_payload_without_the_aggregate_proof_field_is_rejected_from_its_epoch() {
+        let store = store_with_aggregate_proofs();
+        let envelope = envelope(5, 0);
+        assert_eq!(envelope.message.payload.aggregate_proof, None);
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &envelope),
+            Err(Outcome::Reject(RejectReason::AggregateProofField)),
+        );
+    }
+
+    #[test]
+    fn the_aggregate_proof_field_is_judged_by_the_payloads_own_slot() {
+        let mut store = store(0);
+        let mut config = (*store.config()).clone();
+        config.lstar_fork_epoch = 1;
+        store.replace_config(config);
+        let first_slot_with_the_field = preset::slots_per_epoch();
+
+        let mut before = envelope(first_slot_with_the_field - 1, 0);
+        assert_eq!(cheap_checks(&seen_envelopes(), &store, &before), Ok(()));
+        before.message.payload.aggregate_proof = Some(Default::default());
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &before),
+            Err(Outcome::Reject(RejectReason::AggregateProofField)),
+        );
+
+        let mut from = envelope(first_slot_with_the_field, 0);
+        assert_eq!(
+            cheap_checks(&seen_envelopes(), &store, &from),
+            Err(Outcome::Reject(RejectReason::AggregateProofField)),
+        );
+        from.message.payload.aggregate_proof = Some(Default::default());
+        assert_eq!(cheap_checks(&seen_envelopes(), &store, &from), Ok(()));
+    }
+
+    #[test]
+    fn an_aggregate_proof_is_not_parsed_by_the_cheap_checks() {
+        let store = store_with_aggregate_proofs();
+        // Nothing a prover would write: bytes within the bound pass whatever
+        // they are.
+        for proof in [vec![], vec![0xff], vec![0x00; 7_741]] {
+            let mut envelope = envelope(5, 0);
+            envelope.message.payload.aggregate_proof =
+                Some(proof.try_into().expect("within the bound"));
+            assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
+            assert_eq!(
+                validate(&seen_envelopes(), &store, &envelope),
+                Outcome::Queue(QueueReason::BlockUnknown)
+            );
+        }
     }
 
     #[test]

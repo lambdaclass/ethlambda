@@ -340,6 +340,9 @@ pub enum RejectReason {
     ExecutionRequestsRootMismatch,
     /// A gloas envelope's payload carries more withdrawals than its limit.
     TooManyWithdrawals,
+    /// A gloas envelope's payload has the aggregate proof field before
+    /// the epoch payloads carry it from, or lacks it from that epoch on.
+    AggregateProofField,
     /// A payload attestation's slot lies before the gloas fork.
     PreGloasSlot,
     /// A payload attestation's validator is not in its slot's payload
@@ -401,6 +404,7 @@ impl RejectReason {
             Self::BlockHashMismatch => "block_hash_mismatch",
             Self::ExecutionRequestsRootMismatch => "execution_requests_root_mismatch",
             Self::TooManyWithdrawals => "too_many_withdrawals",
+            Self::AggregateProofField => "aggregate_proof_field",
             Self::PreGloasSlot => "pre_gloas_slot",
             Self::NotInPtc => "not_in_ptc",
             Self::InvalidOperation => "invalid_operation",

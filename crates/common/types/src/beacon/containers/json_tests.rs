@@ -260,6 +260,7 @@ fn gloas_payload() -> gloas::ExecutionPayload {
         excess_blob_gas: payload.excess_blob_gas,
         block_access_list: vec![0xca, 0xfe].into(),
         slot_number: 33,
+        aggregate_proof: Some(vec![0xbe, 0xef].try_into().unwrap()),
     }
 }
 
@@ -397,6 +398,50 @@ fn a_gloas_envelope_round_trips_through_json() {
         },
         signature: signature(4),
     });
+}
+
+#[test]
+fn a_gloas_payload_writes_its_aggregate_proof_as_one_hex_string() {
+    let json = serde_json::to_value(gloas_payload()).unwrap();
+    assert_eq!(json["aggregate_proof"], "0xbeef");
+}
+
+#[test]
+fn a_gloas_payload_without_an_aggregate_proof_in_its_json_has_none() {
+    let mut json = serde_json::to_value(gloas_payload()).unwrap();
+    json.as_object_mut().unwrap().remove("aggregate_proof");
+    let payload: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(payload.aggregate_proof, None);
+}
+
+#[test]
+fn a_gloas_payload_without_the_aggregate_proof_field_writes_no_such_key() {
+    let mut payload = gloas_payload();
+    payload.aggregate_proof = None;
+    let json = serde_json::to_value(&payload).unwrap();
+    assert!(!json.as_object().unwrap().contains_key("aggregate_proof"));
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
+}
+
+#[test]
+fn a_gloas_payload_with_an_empty_aggregate_proof_keeps_the_field_in_json() {
+    let mut payload = gloas_payload();
+    payload.aggregate_proof = Some(Default::default());
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["aggregate_proof"], "0x");
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
+}
+
+#[test]
+fn an_aggregate_proof_over_the_bound_is_refused_in_json() {
+    let mut json = serde_json::to_value(gloas_payload()).unwrap();
+    json["aggregate_proof"] = format!("0x{}", "00".repeat(gloas::MAX_AGGREGATE_PROOF_BYTES)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json.clone()).is_ok());
+    json["aggregate_proof"] =
+        format!("0x{}", "00".repeat(gloas::MAX_AGGREGATE_PROOF_BYTES + 1)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json).is_err());
 }
 
 #[test]

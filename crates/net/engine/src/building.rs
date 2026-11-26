@@ -198,6 +198,14 @@ struct ExecutionPayloadJson {
     /// `ExecutionPayloadV4` only (Amsterdam).
     #[serde(default)]
     slot_number: Option<String>,
+    /// Not in the specification's `ExecutionPayloadV4`. An execution client
+    /// sends it for a block that has an aggregate proof, an empty string or
+    /// not, and leaves the key out for a block that has none. A missing key
+    /// and `null` both read as a payload without the field. Whether that is
+    /// the right container for the payload's slot is the caller's to settle:
+    /// see `ExecutionPayload::with_aggregate_proof_field`.
+    #[serde(default)]
+    aggregate_proof: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +296,17 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             .slot_number
             .as_deref()
             .ok_or_else(|| decode("ExecutionPayloadV4 carries no slotNumber"))?;
+        // The bytes are not looked into. Their length is: the container
+        // cannot hold more than the bound, and an execution client must not
+        // build a block that exceeds it.
+        let aggregate_proof = payload
+            .aggregate_proof
+            .as_deref()
+            .map(|proof| {
+                gloas::AggregateProof::try_from(parse_data(proof)?)
+                    .map_err(|_| decode("aggregateProof exceeds MAX_AGGREGATE_PROOF_BYTES"))
+            })
+            .transpose()?;
 
         let execution_payload = gloas::ExecutionPayload {
             parent_hash: H256(parse_fixed(&payload.parent_hash)?),
@@ -311,6 +330,7 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             excess_blob_gas: parse_quantity(&payload.excess_blob_gas)?,
             block_access_list: parse_data(block_access_list)?.into(),
             slot_number: parse_quantity(slot_number)?,
+            aggregate_proof,
         };
 
         Ok(BuiltGloasPayload {
@@ -539,6 +559,8 @@ mod tests {
         assert_eq!(payload.block_hash, H256([0x55; 32]));
         assert_eq!(payload.transactions.len(), 1);
         assert_eq!(payload.withdrawals[0].amount, 3);
+        // `v6_json` has no `aggregateProof` key.
+        assert_eq!(payload.aggregate_proof, None);
         assert_eq!(uint256(&built.block_value), "0x1bc16d674ec80000");
         assert_eq!(built.blobs_bundle.commitments.len(), 1);
         assert_eq!(built.blobs_bundle.proofs.len(), 2);
@@ -583,6 +605,85 @@ mod tests {
         let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
         assert!(matches!(
             BuiltGloasPayload::try_from(response),
+            Err(EngineError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn an_aggregate_proof_survives_get_payload_then_new_payload() {
+        use crate::types::ExecutionPayloadV4;
+
+        // Bytes of no meaning here: none of them is read.
+        let proof = format!("0x{}", "ab".repeat(7740));
+        let mut json = v6_json();
+        json["executionPayload"]["aggregateProof"] = proof.into();
+
+        let response: GetPayloadV6Response = serde_json::from_value(json.clone()).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        let payload = &built.execution_payload;
+        let read = payload.aggregate_proof.as_ref().expect("the key is there");
+        assert_eq!(&read[..], &[0xab; 7740]);
+
+        // What `engine_newPayloadV5` is sent is what `engine_getPayloadV6`
+        // answered, key for key.
+        let sent = serde_json::to_value(ExecutionPayloadV4(payload)).unwrap();
+        assert_eq!(sent, json["executionPayload"]);
+
+        // And the sent form reads back as the same container.
+        json["executionPayload"] = sent;
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let reread = BuiltGloasPayload::try_from(response).unwrap();
+        assert_eq!(&reread.execution_payload, payload);
+    }
+
+    #[test]
+    fn a_null_aggregate_proof_reads_as_none() {
+        let mut json = v6_json();
+        json["executionPayload"]["aggregateProof"] = serde_json::Value::Null;
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        assert_eq!(built.execution_payload.aggregate_proof, None);
+    }
+
+    #[test]
+    fn an_empty_aggregate_proof_reads_as_an_empty_string() {
+        let mut json = v6_json();
+        json["executionPayload"]["aggregateProof"] = "0x".into();
+        let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+        let built = BuiltGloasPayload::try_from(response).unwrap();
+        assert_eq!(
+            built.execution_payload.aggregate_proof,
+            Some(Default::default())
+        );
+    }
+
+    #[test]
+    fn a_malformed_aggregate_proof_is_a_decode_error() {
+        for malformed in ["0xzz", "abcd", "0xabc"] {
+            let mut json = v6_json();
+            json["executionPayload"]["aggregateProof"] = malformed.into();
+            let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+            assert!(
+                matches!(
+                    BuiltGloasPayload::try_from(response),
+                    Err(EngineError::Decode(_))
+                ),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aggregate_proof_over_the_bound_is_a_decode_error() {
+        let of_len = |bytes: usize| {
+            let mut json = v6_json();
+            json["executionPayload"]["aggregateProof"] = format!("0x{}", "00".repeat(bytes)).into();
+            let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+            BuiltGloasPayload::try_from(response)
+        };
+        assert!(of_len(gloas::MAX_AGGREGATE_PROOF_BYTES).is_ok());
+        assert!(matches!(
+            of_len(gloas::MAX_AGGREGATE_PROOF_BYTES + 1),
             Err(EngineError::Decode(_))
         ));
     }

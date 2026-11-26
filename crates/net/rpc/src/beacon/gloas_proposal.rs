@@ -807,10 +807,27 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
-    engine.get_payload_v6(payload_id).await.map_err(|err| {
+    let mut built = engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
-    })
+    })?;
+    // The execution client says whether its block has an aggregate proof by
+    // sending or leaving out a key. Which container the payload must be is
+    // this side's to say, from the payload's own slot.
+    let payload = built.execution_payload;
+    let slot = payload.slot_number;
+    let carries_proof = store
+        .config()
+        .carries_aggregate_proof(compute_epoch_at_slot(slot));
+    built.execution_payload = payload
+        .with_aggregate_proof_field(carries_proof)
+        .map_err(|err| {
+            warn!(%err, slot, "The execution client built a payload this slot cannot carry");
+            ApiError::ServiceUnavailable(
+                "the execution client built a payload with an aggregate proof too early",
+            )
+        })?;
+    Ok(built)
 }
 
 /// The pure half: the pooled operations and the built payload into a block and
