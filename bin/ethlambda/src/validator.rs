@@ -126,35 +126,36 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) web3signer_url: Option<String>,
 
-    /// Propose builder blocks: register each validator with the beacon node's
-    /// builder and accept a blinded block when the builder's bid wins. Requires
-    /// a beacon node started with a builder (ethlambda: `--builder`). The
-    /// registrations and blinded blocks are fulu and earlier only. From gloas
-    /// the builder market works through proposer preferences, which are
-    /// published with or without this flag; there it only sets the boost
-    /// factor that weighs p2p bids in `produceBlockV4`. Without it the factor
-    /// is 0, the local payload unless it cannot be built: a node whose
-    /// execution client fails at the slot may still build on a p2p bid, and
-    /// that block is signed.
+    /// Propose builder blocks before gloas: register each validator with the
+    /// beacon node's builder and accept a blinded block when the builder's bid
+    /// wins. Requires a beacon node started with a builder (ethlambda:
+    /// `--builder`). The registrations and blinded blocks are fulu and earlier
+    /// only. From gloas the builder market works through proposer
+    /// preferences and p2p bids, and those compete with the local payload
+    /// with or without this flag (see `--builder-boost-factor`).
     #[arg(long, default_value = "false")]
     pub(crate) builder_proposals: bool,
 
     /// How a builder's bid is weighed against the local payload: the local
     /// payload wins iff `local >= factor * bid / 100`. 100 compares them as
     /// they are; 0 prefers the local payload unless it cannot be built.
+    ///
+    /// From gloas it weighs the pooled p2p bids in `produceBlockV4`, with or
+    /// without `--builder-proposals`. Before gloas it is sent only with
+    /// `--builder-proposals`; without it the factor is 0.
     #[arg(
         long,
         default_value = "100",
-        requires = "builder_proposals",
-        conflicts_with = "prefer_builder_proposals"
+        conflicts_with_all = ["prefer_builder_proposals", "self_build_only"]
     )]
     pub(crate) builder_boost_factor: u64,
 
     /// Take the builder's block whenever there is a valid bid: this client
     /// sends `builder_boost_factor = u64::MAX`. The beacon node still keeps
     /// its local payload when its execution client sets
-    /// `shouldOverrideBuilder`.
-    #[arg(long, default_value = "false", requires = "builder_proposals")]
+    /// `shouldOverrideBuilder`. From gloas with or without
+    /// `--builder-proposals`; before gloas only with it.
+    #[arg(long, default_value = "false", conflicts_with = "self_build_only")]
     pub(crate) prefer_builder_proposals: bool,
 
     /// The smallest builder bid, in gwei, a gloas block may be built on: the
@@ -165,11 +166,24 @@ pub(crate) struct ValidatorOptions {
     /// matters most with `--prefer-builder-proposals`, which otherwise takes
     /// a 1-gwei bid over the local payload. `0` sets no floor.
     ///
-    /// Taken with or without `--builder-proposals`: without it, a node whose
-    /// execution client fails at the slot may still build on a pooled bid,
-    /// and this is the floor that bid must clear.
-    #[arg(long, default_value_t = 0)]
+    /// Taken with or without `--builder-proposals`, as the boost factor is.
+    #[arg(long, default_value_t = 0, conflicts_with = "self_build_only")]
     pub(crate) builder_min_bid: u64,
+
+    /// Never sign a block built on a builder's payload. From gloas each block
+    /// request asks for no bid (factor 0, `min_bid` `2^64 - 1`), and a block
+    /// whose bid names a builder anyway is refused before slashing protection
+    /// records the slot. When the beacon node cannot build the payload
+    /// itself, the slot is missed rather than built on a bid. Lodestar's
+    /// `executiononly`.
+    ///
+    /// Before gloas nothing changes: a builder's payload comes only as a
+    /// blinded block, which this client refuses without
+    /// `--builder-proposals`. Conflicts with every flag that lets a builder
+    /// in: `--builder-proposals`, the factor, the preference and
+    /// `--builder-min-bid`.
+    #[arg(long, default_value = "false", conflicts_with = "builder_proposals")]
+    pub(crate) self_build_only: bool,
 
     /// Register every loaded key that has no slashing-protection record,
     /// instead of refusing to start.
@@ -251,17 +265,25 @@ impl ValidatorOptions {
 
     /// The builder configuration these flags describe, or `None` when builder
     /// proposals are off.
+    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
+        self.builder_proposals.then_some(BuilderProposals {
+            boost_factor: self.boost_factor(),
+        })
+    }
+
+    /// The boost factor these flags describe: `u64::MAX` with
+    /// `--prefer-builder-proposals`, `--builder-boost-factor` otherwise (100
+    /// unless given). Before gloas it is sent only with builder proposals;
+    /// from gloas, with or without them.
     ///
     /// `--prefer-builder-proposals` wins over the factor by construction:
     /// clap refuses the two together, so at most one is ever set.
-    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
-        self.builder_proposals.then_some(BuilderProposals {
-            boost_factor: if self.prefer_builder_proposals {
-                u64::MAX
-            } else {
-                self.builder_boost_factor
-            },
-        })
+    pub(crate) fn boost_factor(&self) -> u64 {
+        if self.prefer_builder_proposals {
+            u64::MAX
+        } else {
+            self.builder_boost_factor
+        }
     }
 
     /// Reject a port clash before anything binds, the way the node's own
@@ -331,6 +353,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
+    let gloas_boost_factor = options.boost_factor();
     let config = ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
@@ -346,6 +369,8 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         gas_limit: options.gas_limit,
         builder,
         builder_min_bid: options.builder_min_bid,
+        gloas_boost_factor,
+        self_build_only: options.self_build_only,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
         event_stream: !options.disable_event_stream,
@@ -492,6 +517,7 @@ mod tests {
             builder_boost_factor: 100,
             prefer_builder_proposals: false,
             builder_min_bid: 0,
+            self_build_only: false,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
             disable_event_stream: false,
@@ -638,17 +664,57 @@ mod tests {
         );
     }
 
+    /// From gloas, with no builder flag at all, p2p bids compete at par: a
+    /// factor of 100 and no floor, as Lighthouse, Teku and Nimbus send.
     #[test]
-    fn the_factor_and_the_preference_need_builder_proposals() {
-        parse(&["--builder-boost-factor", "250"])
-            .expect_err("a factor with builder proposals off is a mistake");
-        parse(&["--prefer-builder-proposals"])
-            .expect_err("a preference with builder proposals off is a mistake");
+    fn by_default_gloas_bids_compete_at_par() {
+        let options = parse(&[]).expect("parses");
+        assert_eq!(options.boost_factor(), 100);
+        assert_eq!(options.builder_min_bid, 0);
+        assert!(!options.self_build_only);
+        assert_eq!(options.builder(), None);
+    }
+
+    /// The factor and the preference no longer need builder proposals: from
+    /// gloas they weigh p2p bids without them. Builder proposals stay off.
+    #[test]
+    fn the_factor_and_the_preference_apply_at_gloas_without_builder_proposals() {
+        let options = parse(&["--builder-boost-factor", "250"]).expect("parses");
+        assert_eq!(options.boost_factor(), 250);
+        assert_eq!(options.builder(), None);
+        let options = parse(&["--prefer-builder-proposals"]).expect("parses");
+        assert_eq!(options.boost_factor(), u64::MAX);
+        assert_eq!(options.builder(), None);
+    }
+
+    #[test]
+    fn self_build_only_is_off_by_default_and_taken_alone() {
+        assert!(!parse(&[]).expect("parses").self_build_only);
+        assert!(
+            parse(&["--self-build-only"])
+                .expect("parses")
+                .self_build_only
+        );
+    }
+
+    /// A self-build-only client takes no builder's payload, so every flag
+    /// that would let one in is refused beside it.
+    #[test]
+    fn self_build_only_conflicts_with_every_flag_that_lets_a_builder_in() {
+        for flags in [
+            &["--builder-proposals"][..],
+            &["--builder-boost-factor", "0"],
+            &["--prefer-builder-proposals"],
+            &["--builder-min-bid", "1"],
+        ] {
+            let line: Vec<&str> = flags.iter().copied().chain(["--self-build-only"]).collect();
+            parse(&line).expect_err("the two say different things");
+        }
     }
 
     /// The floor travels with either way of weighing bids, in gwei as given,
-    /// and without builder proposals too: a node whose local build fails may
-    /// still build on a pooled bid, which the floor then applies to.
+    /// and without builder proposals too: from gloas pooled bids compete
+    /// without them, and the floor applies to those bids.
     #[test]
     fn a_min_bid_is_taken_with_or_without_builder_proposals() {
         let options =
