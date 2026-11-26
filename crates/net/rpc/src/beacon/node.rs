@@ -112,7 +112,9 @@ async fn get_version(version: &'static str) -> Response {
 ///
 /// `metadata` is the `MetaData` peers get over req/resp, read at request time.
 /// Its `seq_number` versions that `MetaData` alone, so it is not the ENR's
-/// `seq`: the p2p specification counts the two separately.
+/// `seq`: the p2p specification counts the two separately. Its
+/// `custody_group_count` is `MetaData` v3's, which validator custody may have
+/// raised past the ENR's `cgc` since startup.
 async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) -> Response {
     let identity = identity.unwrap_or_default();
     let metadata = match identity.metadata {
@@ -122,12 +124,15 @@ async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) 
                 "seq_number": metadata.seq_number.to_string(),
                 "attnets": format!("0x{}", hex::encode(&metadata.attnets)),
                 "syncnets": format!("0x{}", hex::encode(&metadata.syncnets)),
+                "custody_group_count": metadata.custody_group_count.to_string(),
             })
         }
+        // No p2p layer: nothing is advertised, so nothing is custodied.
         None => serde_json::json!({
             "seq_number": "0",
             "attnets": "0x0000000000000000",
             "syncnets": "0x00",
+            "custody_group_count": "0",
         }),
     };
     crate::json_response(serde_json::json!({
@@ -454,6 +459,7 @@ mod tests {
             seq_number: 3,
             attnets: vec![0x00, 0x10, 0, 0, 0, 0, 0, 0x01],
             syncnets: vec![0x04],
+            custody_group_count: 8,
         });
         let request = Request::builder()
             .uri("/eth/v1/node/identity")
@@ -463,6 +469,7 @@ mod tests {
         assert_eq!(json["data"]["metadata"]["seq_number"], "3");
         assert_eq!(json["data"]["metadata"]["attnets"], "0x0010000000000001");
         assert_eq!(json["data"]["metadata"]["syncnets"], "0x04");
+        assert_eq!(json["data"]["metadata"]["custody_group_count"], "8");
     }
 
     fn peer(

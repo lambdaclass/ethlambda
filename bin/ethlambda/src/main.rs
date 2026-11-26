@@ -300,6 +300,9 @@ enum ChainActor {
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
+        /// This start's custody set, recorded in the data directory just
+        /// before the chain actor spawns (see `StartupCustody::record`).
+        custody_record: ethlambda_storage::CustodyRecord,
     },
 }
 
@@ -561,6 +564,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
+    // The validators a validator client names to the Beacon API, read by the
+    // p2p layer's validator custody once an epoch. Beacon only; a lean node
+    // never fills it.
+    let attached_validators = ethlambda_network_api::AttachedValidators::default();
+
     // The one place the two chains diverge. Everything above is shared setup;
     // everything below is shared startup and, in `wait_for_shutdown`, shared
     // teardown.
@@ -724,7 +732,22 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // the same computation, so the two cannot disagree about this
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
-            let params = beacon::wire_params(&source, node_id, mainnet.custody_group_count)?;
+
+            // The anchored beacon store. `P2PServer` holds it for the lean
+            // handlers, and the two beacon block handlers read it too: it is
+            // what `beacon_blocks_by_{range,root}/2` are answered from.
+            //
+            // Opened before the wire parameters are derived because the
+            // custody count comes partly from it: the highest count the
+            // attached validators have required, recorded by an earlier run.
+            let store =
+                fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
+                    .await
+                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+            let custody = beacon::startup_custody(&store, mainnet.custody_group_count);
+
+            let params =
+                beacon::wire_params(&source, node_id, custody, attached_validators.clone())?;
 
             // Cloned ahead of the move into `WireConfig::Beacon` below: the
             // chain actor needs its own copy to gate fulu import on, the same
@@ -737,14 +760,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // to, and both readings come from this one computation.
             let attestation_subnets: HashSet<u64> =
                 params.wire.attestation_subnets.iter().copied().collect();
-
-            // The anchored beacon store. `P2PServer` holds it for the lean
-            // handlers, and the two beacon block handlers read it too: it is
-            // what `beacon_blocks_by_{range,root}/2` are answered from.
-            let store =
-                fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
-                    .await
-                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
             let engine = match &execution {
                 None => {
@@ -787,7 +802,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     attestation_committee_count:
                         ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
                     fork_id: params.fork_id,
-                    custody_group_count: Some(mainnet.custody_group_count),
+                    // The count the custody set was computed for, which
+                    // `MetaData` v3 also starts at. The record keeps it until
+                    // a restart: a runtime raise reaches `MetaData` only.
+                    custody_group_count: Some(custody.group_count),
                 },
                 store,
                 node_names: HashMap::new(),
@@ -801,6 +819,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .safe_slots_to_import_optimistically,
                     always_prepare_payload: mainnet.always_prepare_payload,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
+                    custody_record: custody.record(),
                 },
             }
         }
@@ -967,6 +986,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     builder_market: rpc_builder_market,
                     sync_committee_pool: sync_committee_pool.clone(),
                     fee_recipients: rpc_fee_recipients,
+                    attached_validators,
                     prepared_payloads: rpc_prepared_payloads,
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
@@ -1006,8 +1026,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             safe_slots_to_import_optimistically,
             always_prepare_payload,
             anchor_envelope_urls,
+            custody_record,
         } => {
             check_custody_set(&custody_columns)?;
+            // The last fallible step is behind us and the chain actor, the
+            // only importer of blocks and columns, starts next: from here on
+            // this start holds its custody set, so the next start compares
+            // against it. A start that failed earlier recorded nothing, so
+            // it cannot move the next one's `earliest_available_slot`.
+            setup.store.set_custody_record(custody_record);
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
                 .filter(|_| !anchor_envelope_urls.is_empty())
                 .map(|root| (anchor_envelope_urls, root));
@@ -2136,7 +2163,11 @@ fn first_config_difference(
         deposit_contract_address: _,
 
         // PeerDAS custody: describes what this node samples/custodies, an
-        // operator/wire choice, not a state-transition rule.
+        // operator/wire choice, not a state-transition rule. Validator
+        // custody reads `balance_per_additional_custody_group` and
+        // `validator_custody_requirement` off the running config, so a changed
+        // value applies to the next requirement it computes; the count already
+        // recorded in the directory stands either way, since it never falls.
         balance_per_additional_custody_group: _,
         custody_requirement: _,
         number_of_custody_groups: _,

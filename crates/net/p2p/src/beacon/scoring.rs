@@ -1331,6 +1331,9 @@ mod tests {
                     genesis_time: config.genesis_time,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    custody_since_slot: 0,
+                    attached_validators: Default::default(),
                     attestation_subnets: Vec::new(),
                 })),
             })
@@ -1434,6 +1437,9 @@ mod tests {
                 genesis_time: 1_606_824_023,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: vec![3],
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: vec![5],
             },
         ))))
