@@ -90,9 +90,9 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
-    /// Whether `slot` is a PQ slot, where every duty signs with leanXMSS.
+    /// Whether `slot` is a PQ slot.
     pub fn is_pq(&self, slot: Slot) -> bool {
-        self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Pq
+        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Pq
     }
 
     /// The slot containing `now`, or `None` before genesis.
