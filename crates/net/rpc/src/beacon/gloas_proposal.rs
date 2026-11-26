@@ -45,7 +45,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{
-    EventBus, FeeRecipients, SyncStatusController,
+    BuildAttributes, EventBus, FeeRecipients, PreparedPayloads, SyncStatusController,
     metrics::SyncStatus,
     payload_attributes::{
         FeeRecipientSource, GloasProposal, ProposalError, building_forkchoice_state,
@@ -108,7 +108,8 @@ use crate::beacon::{
     emit_accepted,
     graffiti::{self, OwnVersion},
     proposal::{
-        Blobs, CellKzgProofs, decimal, randao_verification, refuse_future_slot, require_gloas_slot,
+        Blobs, CellKzgProofs, PAYLOAD_BUILD_WINDOW, decimal, prepared_build, randao_verification,
+        refuse_future_slot, require_gloas_slot,
     },
     validator::head,
 };
@@ -228,6 +229,7 @@ async fn post_produce_block(
     Extension(cache): Extension<PayloadCache>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
+    ahead: Option<Extension<PreparedPayloads>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -294,6 +296,7 @@ async fn post_produce_block(
         &sync_pool,
         &fee_recipients,
         &custody,
+        ahead.as_ref().map(|Extension(ahead)| ahead),
         &own_version,
         slot,
         query.randao_reveal,
@@ -457,6 +460,7 @@ async fn produce(
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
+    ahead: Option<&PreparedPayloads>,
     own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
@@ -479,9 +483,18 @@ async fn produce(
     let (local, el_version) = tokio::join!(
         async {
             match engine {
-                Some(engine) => {
-                    Some(build_local(store, engine, fee_recipients, custody, &prepared, slot).await)
-                }
+                Some(engine) => Some(
+                    build_local(
+                        store,
+                        engine,
+                        fee_recipients,
+                        custody,
+                        &prepared,
+                        ahead,
+                        slot,
+                    )
+                    .await,
+                ),
                 None => None,
             }
         },
@@ -719,9 +732,10 @@ async fn build_local(
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
     prepared: &Prepared,
+    ahead: Option<&PreparedPayloads>,
     slot: Slot,
 ) -> Result<LocalBuild, ApiError> {
-    let built = build_payload(store, engine, fee_recipients, custody, prepared).await?;
+    let built = build_payload(store, engine, fee_recipients, custody, prepared, ahead).await?;
     let bundle = &built.blobs_bundle;
     if bundle.commitments.len() != bundle.blobs.len()
         || bundle.proofs.len()
@@ -776,23 +790,38 @@ fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> Exe
     recipient
 }
 
-/// Ask the execution client to build on the chosen parent payload for the
-/// prepared slot, then collect what it built.
+/// The execution client's payload for the prepared slot, on the chosen parent
+/// payload.
 ///
-/// Collected straight away rather than after waiting, as the fulu path does: the
-/// execution client starts with a valid payload and improves it, so an early
-/// `getPayload` always answers, and the validator client asks at the start of
-/// the slot, when the block is due.
+/// The chain actor starts the build a third of a slot ahead, and again when
+/// its inputs change ([`PreparedPayloads`]). When one of those builds has
+/// exactly these attributes it is collected at once, the execution client
+/// having filled it since. Otherwise the build starts here and is collected
+/// after [`PAYLOAD_BUILD_WINDOW`], as on fulu.
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
     prepared: &Prepared,
+    ahead: Option<&PreparedPayloads>,
 ) -> Result<BuiltGloasPayload, ApiError> {
     let fee_recipient = fee_recipient_for(fee_recipients, prepared);
     let forkchoice = building_forkchoice_state(store, prepared.inputs.head_block_hash);
     let attributes = payload_attributes_v4(&prepared.inputs, fee_recipient);
+    let slot = prepared.inputs.slot_number;
+    let key = BuildAttributes::V4(attributes.clone());
+    if let Some(payload_id) = prepared_build(ahead, slot, forkchoice.head_block_hash, &key) {
+        match engine.get_payload_v6(payload_id).await {
+            Ok(built) => {
+                info!(%slot, "Collected the payload build started ahead of the slot");
+                return Ok(built);
+            }
+            Err(err) => {
+                warn!(%slot, %err, "Collecting the payload build started ahead failed; building now");
+            }
+        }
+    }
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
     let (status, payload_id) = engine
         .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
@@ -807,6 +836,7 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW).await;
     engine.get_payload_v6(payload_id).await.map_err(|err| {
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")

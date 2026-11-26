@@ -27,7 +27,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{
-    SyncStatusController,
+    BuildAttributes, PreparedPayloads, SyncStatusController,
     metrics::SyncStatus,
     payload_attributes::{
         FeeRecipientSource, advance_for_proposal, building_forkchoice_state, payload_attributes_v3,
@@ -35,7 +35,7 @@ use ethlambda_blockchain::{
 };
 use ethlambda_engine::{
     EngineClient,
-    building::BuiltPayload,
+    building::{BuiltPayload, PayloadId},
     types::{ClientVersionV1, uint256},
 };
 use ethlambda_network_api::RpcToP2PRef;
@@ -534,6 +534,7 @@ async fn get_block(
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
     builder: Option<Extension<Arc<Builder>>>,
+    prepared: Option<Extension<PreparedPayloads>>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -577,6 +578,7 @@ async fn get_block(
         &engine,
         &sync_pool,
         &fee_recipients,
+        prepared.as_ref().map(|Extension(prepared)| prepared),
         &own_version,
         builder.as_ref().map(|Extension(builder)| builder.as_ref()),
         query.builder_boost_factor.unwrap_or(DEFAULT_BOOST_FACTOR),
@@ -697,6 +699,7 @@ async fn produce(
     engine: &EngineClient,
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
+    prepared: Option<&PreparedPayloads>,
     own_version: &ClientVersionV1,
     builder: Option<&Builder>,
     boost_factor: u64,
@@ -740,7 +743,15 @@ async fn produce(
     // at most the version's own timeout. The builder's bid is asked alongside
     // as well, bounded by its own header timeout, and checked as soon as it
     // arrives, so a valid one can bound the wait for the local payload.
-    let local = build_payload(store, engine, fee_recipients, &state, head_root, proposer);
+    let local = build_payload(
+        store,
+        engine,
+        fee_recipients,
+        prepared,
+        &state,
+        head_root,
+        proposer,
+    );
     let bid = async {
         let request = request.as_ref()?;
         let bid = fetch_bid(request, slot).await?;
@@ -1218,18 +1229,48 @@ fn blinded_block(
     }
 }
 
-/// Ask the execution client to build on the head for `state`'s slot, then
-/// collect what it built.
+/// How long block production lets the execution client build between
+/// `forkchoiceUpdated` (which starts the build) and `getPayload` (which ends
+/// it), for a proposal the chain actor did not start a build for ahead of the
+/// slot.
 ///
-/// Collected straight away rather than after waiting: the execution client
-/// starts with a valid (possibly empty) payload and improves it, so an early
-/// `getPayload` always answers, with less time for transactions to arrive. The
-/// validator client asks at the start of the slot, which is when the block is
-/// due.
+/// An execution client answers a `getPayload` that follows the update at once
+/// with whatever it built in that instant: geth and ethrex start from an
+/// empty payload and add transactions as they execute them, so without a
+/// window a block carries few or none of the transactions pending
+/// (lambdaclass/ethlambda#894: 0 to 3 of 16 back to back, 48 of 48 after
+/// 500 ms). Lodestar and Nimbus wait the same on this path. A proposal the
+/// actor prepared skips it.
+pub(crate) const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
+
+/// The payload id of the build the chain actor started ahead of `slot` with
+/// exactly these inputs, if it did ([`PreparedPayloads`]).
+pub(crate) fn prepared_build(
+    prepared: Option<&PreparedPayloads>,
+    slot: Slot,
+    parent_hash: H256,
+    attributes: &BuildAttributes,
+) -> Option<PayloadId> {
+    let prepared = prepared?;
+    let payload_id = prepared.take(slot, parent_hash, attributes);
+    if payload_id.is_none() {
+        info!(%slot, "No payload build was started ahead for these attributes; building now");
+    }
+    payload_id
+}
+
+/// The execution client's payload for `state`'s slot, on the head.
+///
+/// The chain actor starts the build a third of a slot ahead, and again when
+/// its inputs change ([`PreparedPayloads`]). When one of those builds has
+/// exactly these attributes it is collected at once, the execution client
+/// having filled it since. Otherwise the build starts here and is collected
+/// after [`PAYLOAD_BUILD_WINDOW`].
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
+    prepared: Option<&PreparedPayloads>,
     state: &BeaconState,
     head_root: H256,
     proposer: u64,
@@ -1251,6 +1292,19 @@ async fn build_payload(
     }
     let forkchoice = building_forkchoice_state(store, inputs.parent_hash);
     let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
+    let slot = state.slot();
+    let ahead = BuildAttributes::V3(attributes.clone());
+    if let Some(payload_id) = prepared_build(prepared, slot, inputs.parent_hash, &ahead) {
+        match engine.get_payload(payload_id).await {
+            Ok(built) => {
+                info!(%slot, "Collected the payload build started ahead of the slot");
+                return Ok(built);
+            }
+            Err(err) => {
+                warn!(%slot, %err, "Collecting the payload build started ahead failed; building now");
+            }
+        }
+    }
     let (status, payload_id) = engine
         .forkchoice_updated_with_attributes(&forkchoice, &attributes)
         .await
@@ -1264,6 +1318,7 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW).await;
     engine.get_payload(payload_id).await.map_err(|err| {
         warn!(%err, "getPayload failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")

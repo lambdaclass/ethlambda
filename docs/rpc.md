@@ -1185,13 +1185,20 @@ How `payload_attributes` behaves:
   `prepare_beacon_proposer` or a builder registration, or every proposer with
   `beacon --always-prepare-payload`, which an external builder reading this
   stream (ethereum-package's buildoor) needs.
-- **Nothing reaches the execution client early.** Other clients send a
-  `forkchoiceUpdated` with these attributes at the same point, so the payload
-  is already building when `produceBlock` arrives; this node still starts the
-  build at `produceBlock`.
+- **The build starts here too.** With an execution client, the same
+  computation sends `forkchoiceUpdated` with these attributes, as other
+  clients do at the same point, and again whenever a re-check finds new
+  inputs. `produceBlockV3` and `produceBlockV4` then collect that build with
+  `getPayload` at once when their own attributes match it (same slot, parent
+  payload and attributes), so the execution client has had seconds to fill
+  it. Otherwise they start the build themselves and collect it half a second
+  later: asked at once, geth and ethrex answer with the payload they started
+  from, with few or none of the pending transactions
+  (lambdaclass/ethlambda#894).
 
 Event payloads are built only while at least one client is connected, whatever
-topics that client asked for; with none, the stream costs nothing.
+topics that client asked for; with none, the stream costs nothing. A proposal
+on a node with an execution client is computed either way, for its build.
 
 ## Metrics & Debug Server (`:5054`)
 
