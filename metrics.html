@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-31582dfb.js";
+            window.path_to_searchindex_js = "searchindex-d189a536.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1175,7 +1175,7 @@ and absent is not the same as zero.</p>
 <tr><th>Metric</th><th>Type</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>ethlambda_validator_validators_loaded</code></td><td>Gauge</td><td>Validator keys loaded from the keystores</td></tr>
+<tr><td><code>ethlambda_validator_validators_loaded</code></td><td>Gauge</td><td>Validator keys this client holds, local and remote, the count <code>/health</code> reports as <code>validators.loaded</code>. Set at startup and again on every scrape, so keys imported or deleted through the keymanager API show up</td></tr>
 <tr><td><code>ethlambda_validator_validators_resolved</code></td><td>Gauge</td><td>Loaded keys that have an index on chain, out of <code>validators_loaded</code>. A persistent gap means validators are deposited but not yet activated</td></tr>
 <tr><td><code>ethlambda_validator_duties_held</code></td><td>Gauge</td><td>Attester duties currently scheduled</td></tr>
 <tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
@@ -1210,7 +1210,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_blinded_blocks_unconfirmed_total</code></td><td>Counter</td><td>Blinded blocks the beacon node did not confirm (a 5xx other than 503, or no answer once connected), which the relay may still have published. Not retried, since a second block for the slot would be an equivocation</td></tr>
 <tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
 <tr><td><code>ethlambda_validator_slots_skipped_syncing_total</code></td><td>Counter</td><td>Slots in which nothing was signed because every beacon node that answered the slot’s sync probe (<code>/eth/v1/node/syncing</code>, a sixth of a slot before the boundary) reported syncing or optimistic. Should read zero once the nodes are synced; a steady climb is a node that stays syncing or on an optimistic head, usually because its execution client is behind. Nodes that did not answer are not counted against the slot, so this stays flat while every node is down. See <a href="./cli.html#the-per-slot-sync-check">The per-slot sync check</a></td></tr>
-<tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation. 0 after a slot the sync check withheld, until the next refresh succeeds</td></tr>
+<tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when at least one configured beacon node answered its latest sync probe neither syncing nor optimistic, and that probe is at most two slots old. 0 before the first probe answers, and while every node is down, syncing or optimistic, which includes every slot the sync check withholds. Set on every scrape from the per-node probe records <code>/health</code> reads, so it follows the nodes rather than the last duty: a failed attestation no longer sets it to 0, and a node that comes back sets it to 1 within a slot, without waiting for the next epoch’s refresh</td></tr>
+<tr><td><code>ethlambda_validator_healthy</code></td><td>Gauge</td><td>1 when <code>/health</code> answers <code>200</code>, 0 when it answers <code>503</code>: the client has run a duty refresh whose attester schedule reaches the current epoch, at least one beacon node is usable, and the last slashing-protection write went through. Set on every scrape from the same report <code>/health</code> answers with, so an alert on it and a probe of the endpoint cannot disagree. 0 while the client is starting. See <a href="./cli.html#metrics">Metrics</a> for the checks</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time a duty waited for its batch of signatures. With local keys that is the signing itself. With keys in a remote signer it is the batch’s slowest answer, round trip and verification included, and at most the 2 s signing budget, so a sample in the top bucket means a signer that did not answer in time</td></tr>
 <tr><td><code>ethlambda_validator_remote_signer_request_duration_seconds</code></td><td>Histogram</td><td>Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer’s 64 request slots. The number to watch for a slow signer; empty when every key is local</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>

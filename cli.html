@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-31582dfb.js";
+            window.path_to_searchindex_js = "searchindex-d189a536.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1280,6 +1280,64 @@ flight is not cut short.</p>
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 “attestations stopped”. See <a href="./metrics.html#validator-client">Metrics</a>.</p>
+<p><code>GET /health</code> on the same port answers whether the client can do its duties:
+<code>200</code> when it can, <code>503</code> when it cannot or has not started yet, with the checks
+behind the answer.</p>
+<pre><code class="language-json">{
+  "status": "unhealthy",
+  "service": "ethlambda-validator",
+  "checks": {
+    "beacon_nodes": { "usable": 0, "configured": 2 },
+    "validators": { "loaded": 64, "resolved": 64 },
+    "slashing_protection": { "last_write_ok": true },
+    "started": true,
+    "schedule_current": true
+  }
+}
+</code></pre>
+<p>It reads state the client already keeps and sends no request of its own, so it
+is cheap to poll.</p>
+<ul>
+<li><strong><code>beacon_nodes</code></strong>: <code>usable</code> counts the nodes whose latest
+<a href="#the-per-slot-sync-check">sync probe</a> was answered, neither syncing nor
+optimistic, and is at most two slots old. One usable node is enough: a client
+with some nodes down and one usable is <code>healthy</code>, with the counts in the
+body.</li>
+<li><strong><code>validators</code></strong>: the keys loaded, and those the last duty refresh resolved to
+an index. Reported, never failing: a key waiting for activation has no index
+yet, and a client started with no keys, to wait for a keymanager import, is
+idle on purpose. A key doppelganger protection still withholds counts as
+loaded.</li>
+<li><strong><code>slashing_protection.last_write_ok</code></strong>: the record’s last write succeeded,
+and the last access to it did not give up after waiting 3 s for another one
+to finish. A failed write keeps it <code>false</code> until a later write succeeds. A
+full disk or a read-only remount under <code>--validators-dir</code> shows up here.</li>
+<li><strong><code>started</code></strong>: a duty refresh has succeeded since the process started.</li>
+<li><strong><code>schedule_current</code></strong>: the attester schedule the last successful duty
+refresh left held reaches the current epoch: the refresh’s own epoch, and
+the next when its lookahead fetch went through too. A node can answer its
+probe synced and still fail every refresh, or every lookahead; once the
+schedule runs out the client has no attestations to make. <code>true</code> before the
+first refresh and before genesis. A client with no validator resolved (no
+keys, or keys waiting for activation) holds no schedule, and a refresh
+counts through the next epoch, so it is not caught out at each boundary.</li>
+</ul>
+<p><code>status</code> is one of three:</p>
+<ul>
+<li><code>healthy</code> (<code>200</code>): started, at least one usable node, the last write went
+through, and the schedule is current.</li>
+<li><code>starting</code> (<code>503</code>): no refresh has succeeded yet and nothing else has failed.
+A node not probed yet does not count against a client that has not started,
+so a normal startup reads <code>starting</code> throughout. Once started, a node with no
+probe counts as unusable.</li>
+<li><code>unhealthy</code> (<code>503</code>): anything else.</li>
+</ul>
+<p>Remote signers are not checked, since that would take a request to each.
+<code>ethlambda_validator_healthy</code> carries the same answer as a series, set from the
+same report on every scrape.</p>
+<p>Point readiness checks, load balancers and uptime monitors at it, not a
+Kubernetes liveness probe: it answers <code>503</code> while every beacon node is down or
+syncing, which restarting the validator client does not fix.</p>
 <h2 id="voluntary-exit"><a class="header" href="#voluntary-exit"><code>voluntary-exit</code></a></h2>
 <p><code>ethlambda voluntary-exit</code> signs a voluntary exit for one validator and hands
 it to a beacon node, which validates it against its head and gossips it. It is
