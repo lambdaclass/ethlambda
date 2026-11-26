@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b125aab9.js";
+            window.path_to_searchindex_js = "searchindex-fe059486.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1345,13 +1345,30 @@ fulu or later.</li>
 <code>prepare_beacon_proposer</code> or a builder registration, or every proposer with
 <code>beacon --always-prepare-payload</code>, which an external builder reading this
 stream (ethereum-package’s buildoor) needs.</li>
-<li><strong>Nothing reaches the execution client early.</strong> Other clients send a
-<code>forkchoiceUpdated</code> with these attributes at the same point, so the payload
-is already building when <code>produceBlock</code> arrives; this node still starts the
-build at <code>produceBlock</code>.</li>
+<li><strong>The build starts here too.</strong> With an execution client, the same
+computation sends <code>forkchoiceUpdated</code> with these attributes, as other
+clients do at the same point, and again whenever a re-check finds new
+inputs. <code>produceBlockV3</code> and <code>produceBlockV4</code> then collect that build with
+<code>getPayload</code> when their own attributes match it (same slot, parent payload
+and attributes): at once, the execution client having had seconds to fill
+it, unless a late re-check restarted it less than half a second before, in
+which case they wait for the rest of that half second. Otherwise they start
+the build themselves and collect it half a second later: asked at once,
+geth and ethrex answer with the payload they started from, with few or none
+of the pending transactions (lambdaclass/ethlambda#894). The update carries
+the same safe and finalized hashes as the head’s own <code>forkchoiceUpdated</code>
+(the finalized block as safe too when the head moved since the build’s head
+was read), and one the execution client has not answered by the proposal
+slot’s start, or by the time its inputs change, is abandoned.</li>
 </ul>
 <p>Event payloads are built only while at least one client is connected, whatever
-topics that client asked for; with none, the stream costs nothing.</p>
+topics that client asked for; with none, the stream costs nothing. A proposal
+on a node with an execution client is computed either way, for its build, as
+long as some validator client registered a proposer here (or
+<code>--always-prepare-payload</code> is set). Its event is then kept, and a client that
+subscribes later in the window gets it at the next re-check, as it would
+from a node that computes only for subscribers; each set of inputs’ event
+is sent once.</p>
 <h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
 <div class="table-wrapper">
 <table>

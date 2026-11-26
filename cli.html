@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b125aab9.js";
+            window.path_to_searchindex_js = "searchindex-fe059486.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -315,7 +315,7 @@ from a normal build.</p>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
-<tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). Lighthouse’s flag of the same name</td></tr>
+<tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). With <code>--execution-endpoint</code> it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer’s signed preferences on gloas, else <code>--fallback-fee-recipient</code>, else the zero address. Lighthouse’s flag of the same name</td></tr>
 <tr><td><code>--fallback-fee-recipient</code></td><td>none</td><td>Execution address (20 bytes of hex, <code>0x</code> optional) a locally built payload pays when no validator client named a fee recipient for the proposer through <code>prepare_beacon_proposer</code> or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: <code>payload_attributes</code> events still need <code>prepare_beacon_proposer</code> or <code>--always-prepare-payload</code>. Lighthouse’s beacon-node <code>--suggested-fee-recipient</code></td></tr>
 <tr><td><code>--builder</code></td><td>none</td><td>Base URL of a builder API endpoint, normally MEV-Boost (e.g. <code>http://127.0.0.1:18550</code>). Without it every block is built locally</td></tr>
 <tr><td><code>--builder-header-timeout</code></td><td><code>1000</code></td><td>Milliseconds block production waits for the builder’s bid; also sent to the builder as <code>X-Timeout-Ms</code>. Requires <code>--builder</code></td></tr>

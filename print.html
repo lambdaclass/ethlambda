@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b125aab9.js";
+            window.path_to_searchindex_js = "searchindex-fe059486.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -3852,16 +3852,23 @@ Osaka-current fork choice notification is cancun’s V3. Amsterdam’s pair (new
 used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.</p>
 <p>Two method families a full client would have are deliberately absent:</p>
 <ul>
-<li><strong><code>engine_getPayload*</code> outside the gloas path.</strong> The follower itself never
-asks an execution client to start building a block, so its own
-<code>forkchoiceUpdated</code> calls carry <code>null</code> payload attributes. Block production for
-a validator client (<code>produceBlockV3</code> for fulu, <code>produceBlockV4</code> for gloas) does:
+<li><strong><code>engine_getPayload*</code> outside block production.</strong> The follower asks an
+execution client to build only for a proposal of a validator client it
+serves (for every slot’s proposer with <code>--always-prepare-payload</code>), so the
+<code>forkchoiceUpdated</code> calls that follow its head carry <code>null</code> payload
+attributes. Block production for a validator client
+(<code>produceBlockV3</code> for fulu, <code>produceBlockV4</code> for gloas) does:
 <code>forkchoiceUpdatedV3</code> with <code>PayloadAttributesV3</code> then <code>engine_getPayloadV5</code>
 before gloas, and <code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code> (V3’s fields
 plus <code>slotNumber</code> and <code>targetGasLimit</code>, the parent bid’s gas limit) then
 <code>engine_getPayloadV6</code> (<code>ExecutionPayloadV4</code>, with <code>blockAccessList</code> and
 <code>slotNumber</code>) from gloas on. The handshake warns when a gloas network’s
-execution client does not advertise <code>engine_getPayloadV6</code>.</li>
+execution client does not advertise <code>engine_getPayloadV6</code>. The chain actor
+sends that <code>forkchoiceUpdated</code> with attributes a third of a slot ahead, for
+a proposer a validator client registered (every proposer with
+<code>--always-prepare-payload</code>), with the same safe and finalized hashes as the
+head’s own update, and block production collects the build with
+<code>getPayload</code>; see the <code>payload_attributes</code> event in <a href="#http-api-1"><code>rpc.md</code></a>.</li>
 <li><strong><code>engine_getPayloadBodies*</code>.</strong> Nothing consumes them.</li>
 </ul>
 <p>Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -4486,7 +4493,7 @@ from a normal build.</p>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
-<tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). Lighthouse’s flag of the same name</td></tr>
+<tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). With <code>--execution-endpoint</code> it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer’s signed preferences on gloas, else <code>--fallback-fee-recipient</code>, else the zero address. Lighthouse’s flag of the same name</td></tr>
 <tr><td><code>--fallback-fee-recipient</code></td><td>none</td><td>Execution address (20 bytes of hex, <code>0x</code> optional) a locally built payload pays when no validator client named a fee recipient for the proposer through <code>prepare_beacon_proposer</code> or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: <code>payload_attributes</code> events still need <code>prepare_beacon_proposer</code> or <code>--always-prepare-payload</code>. Lighthouse’s beacon-node <code>--suggested-fee-recipient</code></td></tr>
 <tr><td><code>--builder</code></td><td>none</td><td>Base URL of a builder API endpoint, normally MEV-Boost (e.g. <code>http://127.0.0.1:18550</code>). Without it every block is built locally</td></tr>
 <tr><td><code>--builder-header-timeout</code></td><td><code>1000</code></td><td>Milliseconds block production waits for the builder’s bid; also sent to the builder as <code>X-Timeout-Ms</code>. Requires <code>--builder</code></td></tr>
@@ -6654,13 +6661,30 @@ fulu or later.</li>
 <code>prepare_beacon_proposer</code> or a builder registration, or every proposer with
 <code>beacon --always-prepare-payload</code>, which an external builder reading this
 stream (ethereum-package’s buildoor) needs.</li>
-<li><strong>Nothing reaches the execution client early.</strong> Other clients send a
-<code>forkchoiceUpdated</code> with these attributes at the same point, so the payload
-is already building when <code>produceBlock</code> arrives; this node still starts the
-build at <code>produceBlock</code>.</li>
+<li><strong>The build starts here too.</strong> With an execution client, the same
+computation sends <code>forkchoiceUpdated</code> with these attributes, as other
+clients do at the same point, and again whenever a re-check finds new
+inputs. <code>produceBlockV3</code> and <code>produceBlockV4</code> then collect that build with
+<code>getPayload</code> when their own attributes match it (same slot, parent payload
+and attributes): at once, the execution client having had seconds to fill
+it, unless a late re-check restarted it less than half a second before, in
+which case they wait for the rest of that half second. Otherwise they start
+the build themselves and collect it half a second later: asked at once,
+geth and ethrex answer with the payload they started from, with few or none
+of the pending transactions (lambdaclass/ethlambda#894). The update carries
+the same safe and finalized hashes as the head’s own <code>forkchoiceUpdated</code>
+(the finalized block as safe too when the head moved since the build’s head
+was read), and one the execution client has not answered by the proposal
+slot’s start, or by the time its inputs change, is abandoned.</li>
 </ul>
 <p>Event payloads are built only while at least one client is connected, whatever
-topics that client asked for; with none, the stream costs nothing.</p>
+topics that client asked for; with none, the stream costs nothing. A proposal
+on a node with an execution client is computed either way, for its build, as
+long as some validator client registered a proposer here (or
+<code>--always-prepare-payload</code> is set). Its event is then kept, and a client that
+subscribes later in the window gets it at the next re-check, as it would
+from a node that computes only for subscribers; each set of inputs’ event
+is sent once.</p>
 <h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
 <div class="table-wrapper">
 <table>

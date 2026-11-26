@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b125aab9.js";
+            window.path_to_searchindex_js = "searchindex-fe059486.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -216,16 +216,23 @@ Osaka-current fork choice notification is cancun’s V3. Amsterdam’s pair (new
 used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.</p>
 <p>Two method families a full client would have are deliberately absent:</p>
 <ul>
-<li><strong><code>engine_getPayload*</code> outside the gloas path.</strong> The follower itself never
-asks an execution client to start building a block, so its own
-<code>forkchoiceUpdated</code> calls carry <code>null</code> payload attributes. Block production for
-a validator client (<code>produceBlockV3</code> for fulu, <code>produceBlockV4</code> for gloas) does:
+<li><strong><code>engine_getPayload*</code> outside block production.</strong> The follower asks an
+execution client to build only for a proposal of a validator client it
+serves (for every slot’s proposer with <code>--always-prepare-payload</code>), so the
+<code>forkchoiceUpdated</code> calls that follow its head carry <code>null</code> payload
+attributes. Block production for a validator client
+(<code>produceBlockV3</code> for fulu, <code>produceBlockV4</code> for gloas) does:
 <code>forkchoiceUpdatedV3</code> with <code>PayloadAttributesV3</code> then <code>engine_getPayloadV5</code>
 before gloas, and <code>forkchoiceUpdatedV4</code> with <code>PayloadAttributesV4</code> (V3’s fields
 plus <code>slotNumber</code> and <code>targetGasLimit</code>, the parent bid’s gas limit) then
 <code>engine_getPayloadV6</code> (<code>ExecutionPayloadV4</code>, with <code>blockAccessList</code> and
 <code>slotNumber</code>) from gloas on. The handshake warns when a gloas network’s
-execution client does not advertise <code>engine_getPayloadV6</code>.</li>
+execution client does not advertise <code>engine_getPayloadV6</code>. The chain actor
+sends that <code>forkchoiceUpdated</code> with attributes a third of a slot ahead, for
+a proposer a validator client registered (every proposer with
+<code>--always-prepare-payload</code>), with the same safe and finalized hashes as the
+head’s own update, and block production collects the build with
+<code>getPayload</code>; see the <code>payload_attributes</code> event in <a href="rpc.html"><code>rpc.md</code></a>.</li>
 <li><strong><code>engine_getPayloadBodies*</code>.</strong> Nothing consumes them.</li>
 </ul>
 <p>Blocks before electra are not asked about at all. This node checkpoint-syncs onto
