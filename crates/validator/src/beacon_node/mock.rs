@@ -254,6 +254,9 @@ pub struct MockBeaconNode {
     pub liveness_delay: Option<std::time::Duration>,
     /// How long `spec` takes before it answers, as a hung node would.
     pub spec_delay: Option<std::time::Duration>,
+    /// A delay for the first call of each named method only (see
+    /// [`Self::with_first_call_delay`]).
+    pub first_call_delays: Mutex<HashMap<&'static str, std::time::Duration>>,
     /// The event streams `subscribe` hands out, one per call, in order: the
     /// first one for any topic asked for, or scripted for any topic (`None`).
     /// Once none fits, a subscription fails as an unreachable node's does.
@@ -605,6 +608,26 @@ impl MockBeaconNode {
     pub fn with_preparation_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.preparation_gate = Some(gate);
         self
+    }
+
+    /// Make the first call to `what` (`attestation_data`, `head_block_root`
+    /// or `payload_attestation_data`) take `delay` before it answers, and
+    /// every later one answer at once: an early request still out at a
+    /// duty's deadline, then the deadline's own request.
+    pub fn with_first_call_delay(self, what: &'static str, delay: std::time::Duration) -> Self {
+        self.first_call_delays
+            .lock()
+            .expect("lock")
+            .insert(what, delay);
+        self
+    }
+
+    /// Wait out the delay set for `what`'s first call, if this is it.
+    async fn delay_first_call(&self, what: &'static str) {
+        let delay = self.first_call_delays.lock().expect("lock").remove(what);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Make `produce_block` wait for a permit from `gate` before it answers.
@@ -1106,6 +1129,7 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         self.guard("attestation_data")?;
         *self.attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("attestation_data").await;
         self.attestation_data_forks.lock().expect("lock").push(fork);
         let data = self.attestation_data.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -1369,6 +1393,7 @@ impl BeaconNodeApi for MockBeaconNode {
     ) -> Result<Option<gloas::PayloadAttestationData>> {
         self.guard("payload_attestation_data")?;
         *self.payload_attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("payload_attestation_data").await;
         let Some(data) = self.payload_attestation_data else {
             return Ok(None);
         };
@@ -1525,6 +1550,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn head_block_root(&self) -> Result<Root> {
         self.guard("head_block_root")?;
+        self.delay_first_call("head_block_root").await;
         if self.head_optimistic {
             return Err(Error::BeaconNodeSyncing);
         }

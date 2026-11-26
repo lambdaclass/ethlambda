@@ -1251,6 +1251,64 @@ mod tests {
         assert_eq!(node.submitted_sync_messages().len(), 1);
     }
 
+    /// How long a node's first answer takes in the tests below: past the
+    /// deadline, so the early request is still out when the deadline comes.
+    const HUNG: Duration = Duration::from_secs(10);
+
+    /// The early request a head event started is still out at the deadline:
+    /// it is dropped there, and the deadline attempt attests once, on time,
+    /// rather than waiting for the hung answer or signing twice.
+    #[tokio::test(start_paused = true)]
+    async fn attestation_data_still_out_at_the_deadline_attests_once_then() {
+        let node = Arc::new(
+            attesting(block())
+                .with_first_call_delay("attestation_data", HUNG)
+                .with_event_stream(vec![after(1_000), head(SLOT, block())], StreamEnd::Hang),
+        );
+        let (_monitor, triggers) = read_streams(std::slice::from_ref(&node), false);
+
+        let (fired, attested, took) = attest(&triggers, &node).await;
+        assert_eq!(fired, Fired::Mismatch);
+        assert_eq!(attested.published, 1);
+        assert!(took >= WAIT, "attested {took:?} in, before the deadline");
+        assert!(
+            took < WAIT + Duration::from_secs(1),
+            "attested {took:?} in: the hung request held the deadline attempt back"
+        );
+
+        tokio::time::sleep(HUNG).await;
+        assert_eq!(
+            node.attestation_data_call_count(),
+            2,
+            "early, then deadline"
+        );
+        assert_eq!(node.submitted().len(), 1);
+    }
+
+    /// Likewise for the head root a sync committee message signs.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_root_still_out_at_the_deadline_signs_once_then() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_head_root(block())
+                .with_first_call_delay("head_block_root", HUNG)
+                .with_event_stream(vec![after(1_000), head(SLOT, block())], StreamEnd::Hang),
+        );
+        let (_monitor, triggers) = read_streams(std::slice::from_ref(&node), false);
+
+        let (fired, signed, took) = sign_sync(&triggers, &node).await;
+        assert_eq!(fired, Fired::Mismatch);
+        assert_eq!(signed, Some(block()));
+        assert!(took >= WAIT, "signed {took:?} in, before the deadline");
+        assert!(
+            took < WAIT + Duration::from_secs(1),
+            "signed {took:?} in: the hung request held the deadline attempt back"
+        );
+
+        tokio::time::sleep(HUNG).await;
+        assert_eq!(node.submitted_sync_messages().len(), 1);
+    }
+
     // Payload timeliness committee votes.
 
     const GLOAS_EPOCH: u64 = 10;
@@ -1304,6 +1362,39 @@ mod tests {
         assert_eq!(voted, 1);
         assert!(took < WAIT);
         assert_eq!(node.payload_attestation_data_call_count(), 1);
+    }
+
+    /// Likewise for the payload attestation data a committee vote signs.
+    #[tokio::test(start_paused = true)]
+    async fn payload_data_still_out_at_the_deadline_votes_once_then() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_payload_attestation_data(payload_data(true, true))
+                .with_first_call_delay("payload_attestation_data", HUNG)
+                .with_topic_stream(
+                    Topic::ExecutionPayloadAvailable,
+                    vec![after(1_000), payload(gloas_slot(), block())],
+                    StreamEnd::Hang,
+                ),
+        );
+        let (_monitor, triggers) = read_streams(std::slice::from_ref(&node), true);
+
+        let (fired, voted, took) = vote(&triggers, &node).await;
+        assert_eq!(fired, Fired::Mismatch);
+        assert_eq!(voted, 1);
+        assert!(took >= WAIT, "voted {took:?} in, before the deadline");
+        assert!(
+            took < WAIT + Duration::from_secs(1),
+            "voted {took:?} in: the hung request held the deadline attempt back"
+        );
+
+        tokio::time::sleep(HUNG).await;
+        assert_eq!(
+            node.payload_attestation_data_call_count(),
+            2,
+            "early, then deadline"
+        );
+        assert_eq!(node.submitted_payload_attestations().len(), 1);
     }
 
     /// The slot's block, as head, is not its payload: the vote waits.

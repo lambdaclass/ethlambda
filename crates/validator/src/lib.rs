@@ -3346,6 +3346,139 @@ mod tests {
         assert_eq!(node.submitted_payload_attestations().len(), 1);
     }
 
+    /// With live triggers, each of a gloas slot's duties signs once, and the
+    /// payload vote, started by its payload event, does not wait behind the
+    /// slot's attestation: here that one's early request hangs until its
+    /// deadline, and the vote is out before it.
+    #[tokio::test]
+    async fn with_live_triggers_each_duty_signs_once_and_the_vote_does_not_wait() {
+        use crate::beacon_node::events::{
+            EventSource, HeadEvent, NodeEvent, PayloadAvailableEvent, Topic,
+        };
+        use crate::beacon_node::mock::{MockBeaconNode, StreamEnd, StreamStep};
+        use crate::head_monitor::HeadMonitor;
+        use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
+        use std::time::Duration;
+
+        let mut config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
+        config.slot_duration_ms = 1_000;
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch");
+        let genesis = now.as_secs() - 100;
+        let clock = SlotClock::from_config(genesis, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+        // When the slot starts, from now: its events are scripted from there.
+        let slot_start = Duration::from_secs(genesis + slot) - now;
+        let at = |millis: u64| StreamStep::Wait(slot_start + Duration::from_millis(millis));
+
+        let (store, pubkeys) = crate::test_support::store_with_keys(1);
+        let store = RwLock::new(store);
+        let pubkey = crate::beacon_node::dto::encode_hex(&pubkeys[0].0);
+        let block = Root::repeat_byte(5);
+
+        let head = NodeEvent::Head(HeadEvent {
+            slot,
+            block,
+            execution_optimistic: false,
+        });
+        let payload = NodeEvent::PayloadAvailable(PayloadAvailableEvent {
+            slot,
+            block_root: block,
+        });
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(slot)
+                .with_attestation_block_root(block)
+                // The early attestation request hangs past its deadline.
+                .with_first_call_delay("attestation_data", Duration::from_secs(10))
+                .with_head_root(block)
+                .with_payload_attestation_data(PayloadAttestationData {
+                    beacon_block_root: block,
+                    slot,
+                    payload_present: true,
+                    blob_data_available: true,
+                })
+                .with_topic_stream(
+                    Topic::Head,
+                    vec![at(30), StreamStep::Event(head)],
+                    StreamEnd::Hang,
+                )
+                .with_topic_stream(
+                    Topic::ExecutionPayloadAvailable,
+                    vec![at(60), StreamStep::Event(payload)],
+                    StreamEnd::Hang,
+                ),
+        );
+        let sources = vec![("mock".to_string(), node.clone() as Arc<dyn EventSource>)];
+        let (_monitor, triggers) = HeadMonitor::spawn(sources, || true);
+
+        let attester = [crate::beacon_node::dto::AttesterDutyDto {
+            pubkey: pubkey.clone(),
+            validator_index: 3,
+            committee_index: 0,
+            committee_length: 128,
+            committees_at_slot: 1,
+            validator_committee_index: 0,
+            slot,
+        }];
+        let committee = [crate::beacon_node::dto::PtcDutyDto {
+            pubkey: pubkey.clone(),
+            validator_index: 3,
+            slot,
+        }];
+        let sync = [crate::beacon_node::dto::SyncDutyDto {
+            pubkey,
+            validator_index: 3,
+            validator_sync_committee_indices: vec![0],
+        }];
+
+        let attestation = AttestationService::new(
+            node.clone(),
+            context.clone(),
+            slashing_protection::SlashingProtection::in_memory(),
+        );
+        let aggregation = AggregationService::new(node.clone(), context.clone());
+        let payload_attestation = PayloadAttestationService::new(node.clone(), context.clone());
+        let sync_committee = SyncCommitteeService::new(node.clone(), context.clone());
+        let serve = serve_slot_duties(
+            &attestation,
+            &aggregation,
+            &payload_attestation,
+            &sync_committee,
+            &triggers,
+            &clock,
+            slot,
+            &attester,
+            &committee,
+            &sync,
+            &store,
+        );
+        // How many attestations were out when the vote went out.
+        let watch = async {
+            while node.submitted_payload_attestations().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            node.submitted().len()
+        };
+        let ((), attested_before_the_vote) = tokio::join!(serve, watch);
+
+        assert_eq!(
+            attested_before_the_vote, 0,
+            "the vote waited for the attestation"
+        );
+        assert_eq!(node.submitted().len(), 1, "one attestation");
+        assert_eq!(
+            node.attestation_data_call_count(),
+            2,
+            "early, then deadline"
+        );
+        assert_eq!(node.submitted_sync_messages().len(), 1, "one sync message");
+        assert_eq!(node.submitted_payload_attestations().len(), 1, "one vote");
+    }
+
     fn altair_context() -> SigningContext {
         SigningContext::new(
             ethlambda_types::beacon::config::Config::mainnet()
