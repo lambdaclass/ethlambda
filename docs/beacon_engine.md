@@ -37,8 +37,9 @@ Two method families a full client would have are deliberately absent:
 
 - **`engine_getPayload*` outside block production.** The follower asks an
   execution client to build only for a proposal of a validator client it
-  serves, so the `forkchoiceUpdated` calls that follow its head carry `null`
-  payload attributes. Block production for a validator client
+  serves (for every slot's proposer with `--always-prepare-payload`), so the
+  `forkchoiceUpdated` calls that follow its head carry `null` payload
+  attributes. Block production for a validator client
   (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
   `forkchoiceUpdatedV3` with `PayloadAttributesV3` then `engine_getPayloadV5`
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields

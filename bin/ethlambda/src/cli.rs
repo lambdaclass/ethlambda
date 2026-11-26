@@ -383,9 +383,10 @@ pub(crate) struct MainnetOptions {
     /// proposer. Lighthouse's `--always-prepare-payload`. With
     /// `--execution-endpoint`, it also has the execution client start a
     /// payload build for every slot, a third of a slot ahead, whether or not
-    /// anything is subscribed to `/eth/v1/events`, paying the
-    /// `--fallback-fee-recipient` (or the zero address) for a proposer no
-    /// validator client registered.
+    /// anything is subscribed to `/eth/v1/events`. For a proposer no
+    /// validator client registered, that build pays the fee recipient of the
+    /// proposer's signed preferences on gloas, else `--fallback-fee-recipient`,
+    /// else the zero address.
     #[arg(long)]
     pub(crate) always_prepare_payload: bool,
 

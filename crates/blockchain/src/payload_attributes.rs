@@ -64,6 +64,7 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use ethlambda_types::primitives::H256;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler, send_after};
+use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 use crate::BlockChainServer;
@@ -205,7 +206,9 @@ const MAX_PREPARED_PAYLOADS: usize = 8;
 impl PreparedPayloads {
     /// Records the build the execution client started for `slot`, on the
     /// payload `parent_hash`, with `attributes`. Drops the builds for earlier
-    /// slots, and an older build with the same inputs.
+    /// slots, and an older build with the same inputs. When that older build
+    /// has the same payload id, the execution client kept building it rather
+    /// than starting over, so its start time stays.
     pub fn insert(
         &self,
         slot: Slot,
@@ -214,11 +217,15 @@ impl PreparedPayloads {
         payload_id: PayloadId,
     ) {
         let mut held = self.0.lock().expect("prepared payloads lock poisoned");
+        let mut started = Instant::now();
         held.retain(|build| {
-            build.slot >= slot
-                && !(build.slot == slot
-                    && build.parent_hash == parent_hash
-                    && build.attributes == attributes)
+            let same_inputs = build.slot == slot
+                && build.parent_hash == parent_hash
+                && build.attributes == attributes;
+            if same_inputs && build.build.payload_id == payload_id {
+                started = build.build.started;
+            }
+            build.slot >= slot && !same_inputs
         });
         held.push(PreparedPayload {
             slot,
@@ -226,7 +233,7 @@ impl PreparedPayloads {
             attributes,
             build: PreparedBuild {
                 payload_id,
-                started: Instant::now(),
+                started,
             },
         });
         // `held` stays in insertion order (`take` keeps it), so the first is
@@ -780,6 +787,9 @@ pub(crate) struct PayloadAttributesPublisher {
     in_flight: Option<AttributesKey>,
     /// The last key a worker failed on, and how many have.
     failed: Option<(AttributesKey, u8)>,
+    /// The task sending the last build's `forkchoiceUpdated`, aborted when a
+    /// newer build starts ([`BlockChainServer::start_payload_build`]).
+    build_task: Option<AbortHandle>,
 }
 
 impl PayloadAttributesPublisher {
@@ -959,12 +969,14 @@ impl BlockChainServer {
     /// it only waits on the execution client. A build that fails is not
     /// started again, since production then starts its own.
     ///
-    /// Bounded by the proposal slot's start. Production looks for the build
-    /// then, so a later answer is of no use, and the engine client's retries
-    /// (up to three attempts at 8 s each) would otherwise re-send this update
-    /// after the head's own `forkchoiceUpdated` for the new slot, moving the
-    /// execution client's head back to this one's.
-    fn start_payload_build(&self, key: AttributesKey, build: PayloadBuild) {
+    /// Bounded by the proposal slot's start, and cut short by the next build.
+    /// The engine client retries a failed attempt (up to three, at 8 s each),
+    /// and a retry of a superseded update could otherwise reach the execution
+    /// client after a newer build's update or after the new slot's own
+    /// `forkchoiceUpdated`, moving its head back to this one's. Production
+    /// looks for the build at the slot's start, so a later answer is of no
+    /// use either.
+    fn start_payload_build(&mut self, key: AttributesKey, build: PayloadBuild) {
         let (Some(engine), Some(preparation)) = (
             self.engine.clone(),
             self.payload_attributes.preparation.as_ref(),
@@ -974,9 +986,13 @@ impl BlockChainServer {
         let prepared = preparation.prepared_payloads.clone();
         let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
         let until_slot = Duration::from_millis(self.ms_until_slot_start(key.proposal_slot));
-        tokio::spawn(start_build(
+        if let Some(previous) = self.payload_attributes.build_task.take() {
+            previous.abort();
+        }
+        let task = tokio::spawn(start_build(
             engine, prepared, custody, key, build, until_slot,
         ));
+        self.payload_attributes.build_task = Some(task.abort_handle());
     }
 }
 
@@ -1070,7 +1086,8 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
         match result {
             // Only while still current, so a stale worker's build never
             // names an old head to the execution client; and
-            // `start_payload_build` stops the update at the slot's start.
+            // `start_payload_build` stops the update at the slot's start or
+            // at the next build.
             Ok(Some(NextPayload { event, build })) if current => {
                 if self.events.has_subscribers() {
                     debug!(
@@ -1746,6 +1763,27 @@ mod tests {
                 .map(|build| build.payload_id),
             Some(PayloadId([newest; 8]))
         );
+    }
+
+    /// The same inputs answered with the same payload id are the build the
+    /// execution client kept running, so production does not wait on it
+    /// again; a new payload id is a build started over.
+    #[test]
+    fn a_repeated_build_keeps_its_start_time() {
+        let prepared = PreparedPayloads::default();
+        let parent = H256::repeat_byte(9);
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let between = Instant::now();
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let kept = prepared.take(10, parent, &attributes(10)).unwrap();
+        assert!(kept.started <= between);
+
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let between = Instant::now();
+        prepared.insert(10, parent, attributes(10), PayloadId([2; 8]));
+        let restarted = prepared.take(10, parent, &attributes(10)).unwrap();
+        assert_eq!(restarted.payload_id, PayloadId([2; 8]));
+        assert!(restarted.started >= between);
     }
 
     #[test]
