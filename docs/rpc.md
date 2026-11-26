@@ -999,6 +999,12 @@ gloas's `MAX_*_SIZE` preset keys, which bound gossip message sizes the node does
 not run on. Domain types and withdrawal prefixes are `0x`-prefixed hex;
 `VERSIONED_HASH_VERSION_KZG` is a decimal, as lighthouse reports it.
 `GENESIS_TIME` is absent: `/eth/v1/beacon/genesis` reports it.
+`GAS_LIMIT_SCHEDULE` (gloas, EIP-8261) is a list of `{"EPOCH", "GAS_LIMIT"}`
+entries with quoted values, ascending by epoch, as `BLOB_SCHEDULE` is and as
+lighthouse reports it, and `[]` on a network that schedules nothing (lighthouse
+leaves the key out while gloas is unscheduled). Validator clients, this one's
+included, take their default gas limit from it. The data directory does not
+store it: it is read from the network's `config.yaml` at every start.
 
 The configuration keys come from the `Config` the data directory was
 initialized with. Some of them (the custody and subnet counts, the

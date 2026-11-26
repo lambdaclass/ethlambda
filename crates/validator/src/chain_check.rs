@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::config::{Config, GasLimitSchedule};
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::slots_per_epoch;
@@ -33,6 +33,7 @@ use tracing::warn;
 use crate::beacon_node::dto::{encode_hex, fork_epoch_key, fork_version_key};
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, Genesis};
+use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
 
@@ -54,6 +55,16 @@ fn epoch_text(epoch: Epoch) -> String {
 
 fn version_text(version: Version) -> String {
     encode_hex(&version)
+}
+
+/// `[epoch: gas limit, ...]`, for a change line.
+fn gas_limit_schedule_text(schedule: &GasLimitSchedule) -> String {
+    let entries: Vec<String> = schedule
+        .entries()
+        .iter()
+        .map(|entry| format!("{}: {}", entry.epoch, entry.gas_limit))
+        .collect();
+    format!("[{}]", entries.join(", "))
 }
 
 /// Whether every fork in `config` comes at or after the one before it. An
@@ -277,10 +288,11 @@ const OFFSETS: [Offset; 10] = [
 /// disagreement. `Config::fork_at_epoch` would otherwise answer a fork for
 /// the epochs in between that matches no real one.
 ///
-/// The duty offsets are taken from the first of `nodes`, say or not, because
-/// an upgraded node may start serving the gloas offsets and they identify no
-/// chain. The caller passes what each node last served, so the first node
-/// stays the first through a round it does not answer.
+/// The duty offsets and `GAS_LIMIT_SCHEDULE` are taken from the first of
+/// `nodes`, say or not, because an upgraded node may start serving the gloas
+/// offsets or a gas limit schedule, and they identify no chain. The caller
+/// passes what each node last served, so the first node stays the first
+/// through a round it does not answer.
 ///
 /// Everything else (genesis, slot duration, past forks) stays as it is.
 pub fn merge_schedule(
@@ -403,6 +415,18 @@ pub fn merge_schedule(
                 set(&mut config, get(first));
             }
         }
+        // The gas limit schedule too, for the same reason: it only names a
+        // default gas limit and identifies no chain. A node may start serving
+        // it later (Lighthouse leaves the key out while gloas is
+        // unscheduled), and [`run`] hands it to the proposer settings.
+        if first.gas_limit_schedule != config.gas_limit_schedule {
+            changes.push(format!(
+                "GAS_LIMIT_SCHEDULE {} -> {}",
+                gas_limit_schedule_text(&config.gas_limit_schedule),
+                gas_limit_schedule_text(&first.gas_limit_schedule)
+            ));
+            config.gas_limit_schedule = first.gas_limit_schedule.clone();
+        }
     }
 
     ScheduleMerge {
@@ -512,13 +536,20 @@ pub fn follow_schedule(
 /// the price of that.
 ///
 /// Disagreements are warned about once per epoch, at the epoch's first round.
+///
+/// `settings` get the gas limit schedule each round leaves the client's
+/// configuration with ([`hand_over_gas_limit_schedule`]): they name the
+/// default gas limit from it, and hold their own copy of it.
 pub async fn run<B: BeaconNodeApi>(
     nodes: Arc<FallbackBeaconNode<B>>,
     genesis: Genesis,
     clock: SlotClock,
     context: Arc<SigningContext>,
+    settings: Arc<ProposerSettings>,
     shutdown: CancellationToken,
 ) {
+    // What startup handed the settings: the configuration's own.
+    let mut handed_over = context.config().gas_limit_schedule.clone();
     let mut warned_epoch = None;
     let epoch_now = || clock.now().map_or(0, |slot| clock.epoch_of(slot));
     loop {
@@ -540,6 +571,29 @@ pub async fn run<B: BeaconNodeApi>(
             () = shutdown.cancelled() => return,
             () = check_once(&nodes, genesis, &context, epoch_now, warn_disagreements) => {}
         }
+        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
+    }
+}
+
+/// Give `settings` the gas limit schedule the client's configuration carries
+/// now, when it is not `handed_over` (the one they were last given), and
+/// remember it.
+///
+/// Proposer preferences, builder registrations and the keymanager's
+/// `gas_limit` read the default gas limit from the settings, so a schedule
+/// the check took from the nodes after startup reaches them from the next
+/// read on. The settings' generation does not move, as for the startup
+/// schedule (see `ProposerSettings::set_gas_limit_schedule`).
+pub fn hand_over_gas_limit_schedule(
+    context: &SigningContext,
+    settings: &ProposerSettings,
+    handed_over: &mut GasLimitSchedule,
+) {
+    let config = context.config();
+    let current = &config.gas_limit_schedule;
+    if current != handed_over {
+        settings.set_gas_limit_schedule(current.clone());
+        *handed_over = current.clone();
     }
 }
 
@@ -805,6 +859,73 @@ mod tests {
         let merge = merge(&current, &[(0, upgraded), (1, Config::mainnet())], NOW);
         assert_eq!(merge.config.attestation_due_bps_gloas, 2_000);
         assert_eq!(merge.changes.len(), 1, "got {:?}", merge.changes);
+    }
+
+    fn with_gas_limit_schedule(epoch: Epoch, gas_limit: u64) -> Config {
+        let mut config = Config::mainnet();
+        config.gas_limit_schedule =
+            vec![ethlambda_types::beacon::config::GasLimitScheduleEntry { epoch, gas_limit }]
+                .into();
+        config
+    }
+
+    /// A gas limit schedule the first node starts serving after startup (a
+    /// Lighthouse node shows the key only once gloas is scheduled) is taken,
+    /// as the duty offsets are, and so is one it changes; the other nodes'
+    /// do not count.
+    #[test]
+    fn the_gas_limit_schedule_follows_the_first_node() {
+        let current = Config::mainnet();
+        let served = with_gas_limit_schedule(NOW + 10, 200_000_000);
+        let taken = merge(&current, &[(0, served.clone()), (1, current.clone())], NOW);
+        assert_eq!(taken.config.gas_limit_schedule, served.gas_limit_schedule);
+        assert_eq!(
+            taken.changes,
+            [format!(
+                "GAS_LIMIT_SCHEDULE [] -> [{}: 200000000]",
+                NOW + 10
+            )]
+        );
+
+        let second_only = merge(&current, &[(0, current.clone()), (1, served.clone())], NOW);
+        assert!(second_only.config.gas_limit_schedule.is_empty());
+        assert!(
+            second_only.changes.is_empty(),
+            "got {:?}",
+            second_only.changes
+        );
+
+        let changed = with_gas_limit_schedule(NOW + 20, 300_000_000);
+        let moved = merge(&served, &[(0, changed.clone())], NOW);
+        assert_eq!(moved.config.gas_limit_schedule, changed.gas_limit_schedule);
+    }
+
+    /// A schedule the check swapped into the configuration reaches the
+    /// proposer settings once, and the settings name the default gas limit
+    /// from it.
+    #[test]
+    fn a_followed_gas_limit_schedule_reaches_the_proposer_settings() {
+        let (context, _) = context_and_clock();
+        let settings =
+            ProposerSettings::new(ethlambda_types::beacon::primitives::Bytes32::ZERO, None);
+        let key = ethlambda_types::beacon::primitives::BlsPubkey([1; 48]);
+        let mut handed_over = context.config().gas_limit_schedule.clone();
+
+        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
+        assert_eq!(
+            settings.gas_limit(&key, NOW + 10),
+            crate::proposer_settings::DEFAULT_GAS_LIMIT
+        );
+
+        let scheduled = with_gas_limit_schedule(NOW + 10, 200_000_000);
+        context.replace_config(scheduled.clone());
+        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
+        assert_eq!(handed_over, scheduled.gas_limit_schedule);
+        assert_eq!(
+            settings.gas_limit(&key, NOW + 9),
+            crate::proposer_settings::DEFAULT_GAS_LIMIT
+        );
+        assert_eq!(settings.gas_limit(&key, NOW + 10), 200_000_000);
     }
 
     /// The only node that scheduled the fork is out of the merge (restarting

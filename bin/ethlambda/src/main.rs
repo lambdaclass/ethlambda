@@ -2154,6 +2154,12 @@ fn first_config_difference(
         max_request_blob_sidecars_electra: _,
         max_request_data_column_sidecars: _,
         min_epochs_for_block_requests: _,
+
+        // Advisory, a validator client's default gas limit: the specification
+        // says it adds no validity rule. It is also not stored, so `persisted`
+        // always holds an empty one; the caller's `replace_config` installs
+        // the file's.
+        gas_limit_schedule: _,
     } = persisted;
 
     compare!(preset_base);
@@ -2381,7 +2387,9 @@ async fn fetch_initial_beacon_state(
             // contradict, so the config file wins: the node runs on the
             // persisted config, and keeping the stored one would leave it on
             // the old fork schedule. `replace_config` needs the only handle
-            // to the cached config, hence the `drop`.
+            // to the cached config, hence the `drop`. It is also what puts
+            // the file's `GAS_LIMIT_SCHEDULE` back, which the stored row does
+            // not carry: a non-empty one always differs from the stored one.
             let config_changed = *persisted != config;
             drop(persisted);
             if config_changed {
@@ -3542,6 +3550,57 @@ validators:
             fulu_fork_epoch,
             "the new schedule must be persisted, not only served"
         );
+    }
+
+    /// `GAS_LIMIT_SCHEDULE` is not in the stored config row, so it has to
+    /// come back from the config file on every start: the fresh store keeps
+    /// the one it was bootstrapped with, and a resume installs the file's.
+    #[tokio::test]
+    async fn the_gas_limit_schedule_survives_a_resume_without_being_stored() {
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = beacon::mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // The devnet's file carries an empty schedule; give the loaded config
+        // one, as a file that schedules a gas limit would.
+        let entry = GasLimitScheduleEntry {
+            epoch: 100,
+            gas_limit: 200_000_000,
+        };
+        let load = || {
+            let mut loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+            loaded.config.gas_limit_schedule = vec![entry].into();
+            network::NetworkSource::Loaded(Box::new(loaded))
+        };
+
+        let Ok(fresh) = fetch_initial_beacon_state(&[], backend.clone(), &load()).await else {
+            panic!("first run anchors");
+        };
+        assert_eq!(fresh.config().gas_limit_schedule.entries(), [entry]);
+        drop(fresh);
+
+        let stored = Store::from_db_state(backend.clone())
+            .expect("reopen")
+            .expect("populated directory");
+        assert!(
+            stored.config().gas_limit_schedule.is_empty(),
+            "the stored row carries no schedule"
+        );
+        drop(stored);
+
+        let Ok(resumed) = fetch_initial_beacon_state(&[], backend, &load()).await else {
+            panic!("an unchanged config resumes");
+        };
+        assert_eq!(resumed.config().gas_limit_schedule.entries(), [entry]);
     }
 
     /// `churn_limit_quotient` is one of the state-transition fields the

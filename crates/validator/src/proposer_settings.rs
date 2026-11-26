@@ -1,7 +1,10 @@
 //! What each validator proposes with: its fee recipient, graffiti and gas limit.
 //!
 //! Every validator starts on the process-wide defaults from the command line.
-//! The keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
+//! The gas limit's default without `--gas-limit` depends on the epoch: the
+//! network's `GAS_LIMIT_SCHEDULE`, read off the beacon node, names one per
+//! epoch, and [`DEFAULT_GAS_LIMIT`] covers every epoch it does not. The
+//! keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
 //! override them per key, and `DELETE` puts a key back on the defaults.
 //!
 //! Graffiti has one source more, `--graffiti-file`, read before every
@@ -48,7 +51,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H160, H256};
+use ethlambda_types::beacon::config::GasLimitSchedule;
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, H160, H256,
+};
 use tracing::{debug, info, warn};
 
 use crate::graffiti_file::{GraffitiFile, GraffitiFileError, GraffitiTable};
@@ -84,16 +90,16 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
     String::from_utf8_lossy(&graffiti.0[..GRAFFITI_BYTES - padding]).into_owned()
 }
 
-/// The gas limit a validator with no override reports, unless `--gas-limit`
-/// names another.
+/// The gas limit of last resort: what a validator with no override reports
+/// when `--gas-limit` was not given and the network's `GAS_LIMIT_SCHEDULE`
+/// schedules nothing for the epoch (the beacon node does not serve the key,
+/// the schedule is empty, or its first entry is still ahead).
 ///
-/// Lighthouse's and Nimbus's default (Lighthouse's when the network config
-/// names no gas limit schedule, which this client does not read). Builder
-/// registrations carry it as the gas limit the builder should target, from
-/// gloas the proposer preferences carry it as the target the node's own
-/// payload is built toward too, and the keymanager API serves it as the
-/// specification requires. A network whose gas limit is elsewhere needs
-/// `--gas-limit`, or every proposal pulls its limit toward this one.
+/// Lighthouse's and Nimbus's default, and what Lighthouse falls back to when
+/// its schedule names none. Builder registrations carry the resulting gas
+/// limit as the one the builder should target, from gloas the proposer
+/// preferences carry it as the target the node's own payload is built toward
+/// too, and the keymanager API serves it as the specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// `text` as a fee recipient: `0x` and forty hex digits, the keymanager
@@ -164,8 +170,30 @@ pub enum SettingChange {
 struct Inner {
     default_fee_recipient: Option<ExecutionAddress>,
     default_graffiti: Option<Bytes32>,
-    default_gas_limit: u64,
+    /// `--gas-limit`, or `None` when it was not given.
+    default_gas_limit: Option<u64>,
+    /// The network's `GAS_LIMIT_SCHEDULE`, from the beacon node's
+    /// `/eth/v1/config/spec`; empty until it is fetched, or when the node does
+    /// not serve the key.
+    gas_limit_schedule: GasLimitSchedule,
     overrides: HashMap<BlsPubkey, Overrides>,
+}
+
+impl Inner {
+    /// The gas limit at `epoch` of a validator with no override of its own:
+    /// `--gas-limit`, else the one the schedule names for `epoch`, else
+    /// [`DEFAULT_GAS_LIMIT`]. Lighthouse's order.
+    fn default_gas_limit(&self, epoch: Epoch) -> u64 {
+        self.default_gas_limit
+            .or_else(|| self.gas_limit_schedule.gas_limit_at(epoch))
+            .unwrap_or(DEFAULT_GAS_LIMIT)
+    }
+
+    /// `pubkey`'s gas limit at `epoch`: its override, else the default.
+    fn gas_limit(&self, pubkey: &BlsPubkey, epoch: Epoch) -> u64 {
+        let overridden = self.overrides.get(pubkey).and_then(|o| o.gas_limit);
+        overridden.unwrap_or_else(|| self.default_gas_limit(epoch))
+    }
 }
 
 /// The defaults and every per-key override, shared by the duty loop and the
@@ -206,7 +234,8 @@ impl ProposerSettings {
             inner: RwLock::new(Inner {
                 default_fee_recipient: fee_recipient,
                 default_graffiti: graffiti.into(),
-                default_gas_limit: DEFAULT_GAS_LIMIT,
+                default_gas_limit: None,
+                gas_limit_schedule: GasLimitSchedule::default(),
                 overrides: HashMap::new(),
             }),
             generation: AtomicU64::new(0),
@@ -223,14 +252,32 @@ impl ProposerSettings {
         self
     }
 
-    /// These settings with `gas_limit` as the gas limit of every validator
-    /// with no override of its own, in place of [`DEFAULT_GAS_LIMIT`].
-    pub fn with_default_gas_limit(mut self, gas_limit: u64) -> Self {
+    /// These settings with `gas_limit` (`--gas-limit`) as the gas limit of
+    /// every validator with no override of its own, at every epoch, in place
+    /// of the schedule's and [`DEFAULT_GAS_LIMIT`]. `None` leaves those two.
+    pub fn with_default_gas_limit(mut self, gas_limit: Option<u64>) -> Self {
         self.inner
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .default_gas_limit = gas_limit;
         self
+    }
+
+    /// Take the gas limit of a validator with neither an override nor
+    /// `--gas-limit` from `schedule` (the network's `GAS_LIMIT_SCHEDULE`), at
+    /// the epoch each reader names.
+    ///
+    /// Set when the beacon node's `/eth/v1/config/spec` is in, which is after
+    /// these settings are built and before anything that signs reads them,
+    /// and again whenever the chain check takes another schedule from the
+    /// nodes (`chain_check::hand_over_gas_limit_schedule`). It leaves
+    /// [`Self::generation`] alone: that counts override writes, and the full
+    /// registration send each epoch compares every gas limit it signs anyway.
+    pub fn set_gas_limit_schedule(&self, schedule: GasLimitSchedule) {
+        self.inner
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gas_limit_schedule = schedule;
     }
 
     /// A counter that moves whenever a write or delete changes a fee
@@ -272,26 +319,29 @@ impl ProposerSettings {
         })
     }
 
-    /// `pubkey`'s fee recipient and gas limit read together, under one lock, or
-    /// `None` when it has no fee recipient.
+    /// `pubkey`'s fee recipient and its gas limit at `epoch` read together,
+    /// under one lock, or `None` when it has no fee recipient.
     ///
     /// For a signed message that carries both (a builder registration, proposer
     /// preferences): two separate reads could straddle a keymanager write and
     /// pair an old address with a new gas limit, a combination the operator
     /// never configured, which the builder then keeps.
+    ///
+    /// `epoch` picks the schedule's entry when neither an override nor
+    /// `--gas-limit` names a gas limit: a preference's proposal epoch, a
+    /// registration's current one.
     pub fn fee_recipient_and_gas_limit(
         &self,
         pubkey: &BlsPubkey,
+        epoch: Epoch,
     ) -> Option<(ExecutionAddress, u64)> {
         self.read(|inner| {
-            let overrides = inner.overrides.get(pubkey);
-            let fee_recipient = overrides
+            let fee_recipient = inner
+                .overrides
+                .get(pubkey)
                 .and_then(|o| o.fee_recipient)
                 .or(inner.default_fee_recipient)?;
-            let gas_limit = overrides
-                .and_then(|o| o.gas_limit)
-                .unwrap_or(inner.default_gas_limit);
-            Some((fee_recipient, gas_limit))
+            Some((fee_recipient, inner.gas_limit(pubkey, epoch)))
         })
     }
 
@@ -381,12 +431,11 @@ impl ProposerSettings {
         .ok()
     }
 
-    /// The gas limit `pubkey` reports.
-    pub fn gas_limit(&self, pubkey: &BlsPubkey) -> u64 {
-        self.read(|inner| {
-            let overridden = inner.overrides.get(pubkey).and_then(|o| o.gas_limit);
-            overridden.unwrap_or(inner.default_gas_limit)
-        })
+    /// The gas limit `pubkey` targets at `epoch`: its override, else
+    /// `--gas-limit`, else the schedule's for `epoch`, else
+    /// [`DEFAULT_GAS_LIMIT`].
+    pub fn gas_limit(&self, pubkey: &BlsPubkey, epoch: Epoch) -> u64 {
+        self.read(|inner| inner.gas_limit(pubkey, epoch))
     }
 
     /// Every override `pubkey` holds, defaults left as `None`.
@@ -455,6 +504,7 @@ impl ProposerSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::config::GasLimitScheduleEntry;
     use ethlambda_types::beacon::primitives::H160;
 
     fn key(byte: u8) -> BlsPubkey {
@@ -470,7 +520,7 @@ mod tests {
         let settings = settings();
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
-        assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
     }
 
     #[test]
@@ -482,11 +532,11 @@ mod tests {
 
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
         assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x22)));
-        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 0), 30_000_000);
 
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(2)), Some(Bytes32::repeat_byte(0x11)));
-        assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(2), 0), DEFAULT_GAS_LIMIT);
     }
 
     /// `--gas-limit` replaces the default every key without an override gets,
@@ -494,18 +544,87 @@ mod tests {
     /// clearing it falls back to the configured default, not the built-in one.
     #[test]
     fn a_configured_default_gas_limit_replaces_the_built_in_one() {
-        let settings = settings().with_default_gas_limit(200_000_000);
-        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        let settings = settings().with_default_gas_limit(Some(200_000_000));
+        assert_eq!(settings.gas_limit(&key(1), 0), 200_000_000);
         assert_eq!(
-            settings.fee_recipient_and_gas_limit(&key(1)),
+            settings.fee_recipient_and_gas_limit(&key(1), 0),
             Some((H160([0xaa; 20]), 200_000_000))
         );
 
         settings.set_gas_limit(&key(1), 30_000_000);
-        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
-        assert_eq!(settings.gas_limit(&key(2)), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 0), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(2), 0), 200_000_000);
         settings.clear_gas_limit(&key(1));
-        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 0), 200_000_000);
+    }
+
+    /// Two entries, at epochs 100 and 200.
+    fn schedule() -> GasLimitSchedule {
+        vec![
+            GasLimitScheduleEntry {
+                epoch: 100,
+                gas_limit: 200_000_000,
+            },
+            GasLimitScheduleEntry {
+                epoch: 200,
+                gas_limit: 300_000_000,
+            },
+        ]
+        .into()
+    }
+
+    /// Without `--gas-limit`, the schedule names the default per epoch, and
+    /// [`DEFAULT_GAS_LIMIT`] covers the epochs before its first entry.
+    #[test]
+    fn the_schedule_names_the_default_at_each_epoch() {
+        let settings = settings();
+        settings.set_gas_limit_schedule(schedule());
+
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 99), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 100), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 199), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 200), 300_000_000);
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1), 150),
+            Some((H160([0xaa; 20]), 200_000_000))
+        );
+    }
+
+    /// A node that does not serve `GAS_LIMIT_SCHEDULE` leaves the schedule
+    /// empty, and every epoch gets [`DEFAULT_GAS_LIMIT`].
+    #[test]
+    fn without_a_schedule_every_epoch_gets_the_built_in_default() {
+        let settings = settings();
+        settings.set_gas_limit_schedule(GasLimitSchedule::default());
+        for epoch in [0, 100, Epoch::MAX] {
+            assert_eq!(settings.gas_limit(&key(1), epoch), DEFAULT_GAS_LIMIT);
+        }
+    }
+
+    /// The order: a key's own override, then `--gas-limit`, then the
+    /// schedule, then [`DEFAULT_GAS_LIMIT`].
+    #[test]
+    fn an_override_and_the_flag_both_win_over_the_schedule() {
+        let flagged = settings().with_default_gas_limit(Some(45_000_000));
+        flagged.set_gas_limit_schedule(schedule());
+        assert_eq!(flagged.gas_limit(&key(1), 0), 45_000_000);
+        assert_eq!(flagged.gas_limit(&key(1), 150), 45_000_000);
+        flagged.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(flagged.gas_limit(&key(1), 150), 30_000_000);
+        assert_eq!(
+            flagged.fee_recipient_and_gas_limit(&key(1), 150),
+            Some((H160([0xaa; 20]), 30_000_000))
+        );
+
+        let scheduled = settings().with_default_gas_limit(None);
+        scheduled.set_gas_limit_schedule(schedule());
+        scheduled.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(scheduled.gas_limit(&key(1), 150), 30_000_000);
+        assert_eq!(scheduled.gas_limit(&key(2), 150), 200_000_000);
+        // Clearing the override puts the key back on the schedule.
+        scheduled.clear_gas_limit(&key(1));
+        assert_eq!(scheduled.gas_limit(&key(1), 150), 200_000_000);
     }
 
     /// The pair a signed registration or preference carries agrees with the
@@ -513,19 +632,19 @@ mod tests {
     #[test]
     fn the_fee_recipient_and_gas_limit_read_together_match_the_single_reads() {
         let settings = ProposerSettings::new(Bytes32::ZERO, None);
-        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1), 0), None);
 
         settings.set_gas_limit(&key(1), 30_000_000);
-        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1), 0), None);
         settings.set_fee_recipient(&key(1), H160([0xbb; 20]));
         assert_eq!(
-            settings.fee_recipient_and_gas_limit(&key(1)),
+            settings.fee_recipient_and_gas_limit(&key(1), 0),
             Some((H160([0xbb; 20]), 30_000_000))
         );
 
         let defaults = self::settings();
         assert_eq!(
-            defaults.fee_recipient_and_gas_limit(&key(2)),
+            defaults.fee_recipient_and_gas_limit(&key(2), 0),
             Some((H160([0xaa; 20]), DEFAULT_GAS_LIMIT))
         );
     }
@@ -562,7 +681,7 @@ mod tests {
         settings.forget(&key(1));
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
         assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
-        assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
     }
 
     #[test]
@@ -597,7 +716,7 @@ mod tests {
         );
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
         assert_eq!(
-            settings.gas_limit(&key(1)),
+            settings.gas_limit(&key(1), 0),
             DEFAULT_GAS_LIMIT,
             "an override the seed does not carry is gone"
         );
