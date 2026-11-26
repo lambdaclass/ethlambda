@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-7d4645e3.js";
+            window.path_to_searchindex_js = "searchindex-31582dfb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -628,7 +628,8 @@ slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p
 <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client’s chain is asked <code>/eth/v1/node/syncing</code> once a slot; the ones that answered synced and not optimistic are tried first, in list order, then the rest in list order. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see <a href="#several-beacon-nodes-the-chain-check">the chain check</a> and <a href="#the-per-slot-sync-check">The per-slot sync check</a></td></tr>
+<tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client’s chain is asked <code>/eth/v1/node/syncing</code> once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see <a href="#several-beacon-nodes-the-chain-check">the chain check</a>, <a href="#the-per-slot-sync-check">The per-slot sync check</a> and <a href="#ranking-and-broadcast">Ranking and broadcast</a></td></tr>
+<tr><td><code>--broadcast</code></td><td>none</td><td>Signed messages to send to every beacon node on this client’s chain at once instead of the first that accepts them, comma-separated: <code>attestations</code> (attestations, aggregates, payload attestations), <code>blocks</code> (blocks and envelopes, never a blinded block), <code>sync-committee</code> (messages and contributions). <code>subscriptions</code> and <code>none</code> are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See <a href="#ranking-and-broadcast">Ranking and broadcast</a></td></tr>
 <tr><td><code>--validators-dir</code></td><td>required</td><td>Directory holding the EIP-2335 keystores and <code>validator_definitions.yml</code>, which also lists the keys a remote signer holds (see <a href="#remote-signing-web3signer">Remote signing</a>). Without that file, keystores in the Lighthouse layout (<code>&lt;0xpubkey&gt;/voting-keystore.json</code>, password in <code>--secrets-dir/&lt;0xpubkey&gt;</code>) are discovered and the file is written</td></tr>
 <tr><td><code>--secrets-dir</code></td><td>required</td><td>Directory holding one password file per keystore, named after the validator’s public key</td></tr>
 <tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
@@ -827,9 +828,9 @@ one from an earlier slot, opens the check rather than holding it shut. A
 node whose answer is still on its way at the boundary, and that answered
 synced the slot before, holds the check open too, so a slow synced node does
 not lose the slot to a fast syncing one.</li>
-<li><strong>Requests go to the nodes that passed first</strong>, then the rest, each group
-in <code>--beacon-nodes</code> order. A blinded block still goes back to the node that
-produced it.</li>
+<li><strong>Requests go to the best-ranked node first</strong>: see
+<a href="#ranking-and-broadcast">Ranking and broadcast</a>. A blinded block still goes
+back to the node that produced it.</li>
 <li><strong>The head root and the payload attestation data are never asked of a node
 whose last probe said syncing or optimistic, or got no answer</strong>, even after
 the nodes that passed have failed the request. Neither endpoint has a <code>503</code>
@@ -838,16 +839,91 @@ hands out payload data for a block its execution client has not validated.
 So here, unlike for the slot’s check, a node that did not answer is not
 given the benefit of the doubt. With no node left to ask, the sync committee
 message and the payload vote are not signed.</li>
-<li><strong><code>el_offline</code> is logged, not acted on</strong>: a node whose execution client has
-just gone offline still has the head it validated before, and reports itself
-optimistic once that stops being true. A node’s change of state (synced,
-syncing, optimistic, no answer, <code>el_offline</code>) is logged once, when it
-changes.</li>
-<li><strong>There is no clock-based rule.</strong> The client never skips duties because the
-head looks old by its own clock: during a network-wide stall every head is
-old, and clients that stop signing then keep the chain stalled. Only the
-node’s own <code>is_syncing</code> and <code>is_optimistic</code> count. <code>head_slot</code> and
-<code>sync_distance</code> are recorded, not acted on.</li>
+<li><strong><code>el_offline</code> ranks a node lower and stops nothing</strong>: a node whose
+execution client has just gone offline still has the head it validated
+before, and reports itself optimistic once that stops being true. A node’s
+change of state (synced, syncing, optimistic, no answer, <code>el_offline</code>,
+behind by its sync distance) is logged once, when it changes.</li>
+<li><strong>There is no clock-based rule for signing.</strong> The client never skips duties
+because the head looks old: during a network-wide stall every head is old,
+and clients that stop signing then keep the chain stalled. Only the node’s
+own <code>is_syncing</code> and <code>is_optimistic</code> count. <code>sync_distance</code> only ranks the
+nodes, and in a stall every node is about as far behind.</li>
+</ul>
+<h3 id="ranking-and-broadcast"><a class="header" href="#ranking-and-broadcast">Ranking and broadcast</a></h3>
+<p>With several <code>--beacon-nodes</code>, every request walks the nodes in rank order
+and takes the first answer. The rank comes from each node’s last sync probe,
+best first, as Lighthouse ranks its nodes:</p>
+<ol>
+<li>synced and validated: not syncing, not optimistic, execution client
+online, and at most 8 slots behind by its own <code>sync_distance</code>
+(Lighthouse’s tolerance);</li>
+<li>synced but optimistic, or with its execution client offline;</li>
+<li>syncing, or more than 8 slots behind;</li>
+<li>not probed yet;</li>
+<li>failing: it did not answer its last probe, or since then did not answer a
+request.</li>
+</ol>
+<p>Inside a tier, a node that reports syncing goes last, and an optimistic one
+or one with its execution client offline after the rest. That only reorders
+tier 3, which a stalled network fills with every node, so a synced node is
+still asked ahead of a syncing one there. <code>--beacon-nodes</code> order breaks ties,
+so a single healthy node, or several equally healthy ones, are asked exactly
+as listed. Lighthouse’s finer tiers (16 and 64 slots behind) are not kept:
+they only reorder nodes that are all behind, which in practice means a stalled
+network, where every node is behind by about as much.</p>
+<p>A request that times out, or whose connection cannot be made, ranks its node
+failing at once, until a probe sent after it answers. So a node that takes requests
+and never answers costs one request timeout (8 s) and then nothing until it
+answers again, rather than a timeout on every request: an attestation duty
+used to wait out the whole timeout on a hung first node every slot, which
+left the second node no time. An answer with an error status (a <code>404</code> from a
+node with nothing to aggregate, a <code>503</code> from a syncing one) is an answer and
+changes no rank. A probe more than two slots old is not read, which only
+matters if the probe task stops, and puts every node back in list order.</p>
+<p>Every node here means every node on this client’s chain: a node the
+<a href="#several-beacon-nodes-the-chain-check">chain check</a> found on another chain,
+or has not checked yet, is never probed, asked or sent a broadcast, whatever
+its rank, and an envelope whose producer left the chain goes to the others.</p>
+<p><code>--broadcast</code> sends signed messages to every node at once rather than to the
+first that accepts them, so they reach the network through every node’s gossip
+mesh: <code>attestations</code> (attestations, aggregates, payload attestations),
+<code>blocks</code> (blocks and envelopes) and <code>sync-committee</code> (messages and
+contributions), comma-separated. None by default, as in Lighthouse, so the
+client behaves as before unless asked. Subscriptions, fee recipient
+preparations, builder registrations and proposer preferences always go to
+every node; <code>subscriptions</code> and <code>none</code> are accepted for compatibility and
+change nothing.</p>
+<ul>
+<li><strong>One accepting node is success.</strong> A message one node took is on the
+network. A node that refused is logged.</li>
+<li><strong>Failing nodes are sent it last.</strong> A node ranked failing is sent a
+broadcast only when no other node took it, so a hung node does not hold
+every broadcast back by a request timeout.</li>
+<li><strong>Half a second after the first acceptance, the rest are cut off.</strong> A node
+still sending by then is not waited for, so a node that hangs costs a
+broadcast half a second, not a request timeout a proposal’s deadline would
+cut short. It is not ranked failing for it: a node that is only slower (to
+import a block, or to take a large envelope) would otherwise be dropped
+from every broadcast until its next probe, slot after slot. A node that
+really hung is ranked failing once its probe gets no answer.</li>
+<li><strong>A block reports the best answer</strong>: imported (<code>200</code>) over broadcast but
+not imported (<code>202</code>) over refused, each node’s answer logged. A blinded
+block still goes only to the node that produced it.</li>
+<li><strong>An envelope goes to its block’s producer first</strong>, then to the other
+nodes once the producer has answered, or after half a second without an
+answer. The producer certainly holds the block the envelope reveals; a
+node that has not imported it yet queues or drops the envelope, and
+waiting for the producer’s answer gives each a round trip longer to import
+it. The half-second bound is for a producer that holds the request open
+(one that answered the block <code>202</code> and never imported it waits for it),
+which would otherwise keep the envelope from every node until the
+proposal’s deadline. An envelope sent without its blobs goes to the
+producer first, with or without the flag, since only it cached them; if it
+does not take it, the other nodes are tried in rank order, since a block
+with no blobs can be revealed through any of them.</li>
+<li><strong>Signed once.</strong> Every message is signed, and recorded by slashing
+protection, before it is sent, however many nodes it is sent to.</li>
 </ul>
 <h3 id="doppelganger-protection"><a class="header" href="#doppelganger-protection">Doppelganger protection</a></h3>
 <p>Off unless <code>--enable-doppelganger-protection</code> is passed. A doppelganger is a
