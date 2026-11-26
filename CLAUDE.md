@@ -1116,7 +1116,10 @@ GENESIS_VALIDATORS:
 ### Property Tests (ephyra)
 Properties checked against reference models with [ephyra](https://github.com/datadog-labs/ephyra)
 (a dev-dependency, run by plain `cargo test`): the req/resp varint and snappy framing
-(`p2p/src/req_resp/encoding_properties.rs`), 3SF-mini justifiability and the
+(`p2p/src/req_resp/encoding_properties.rs`), the beacon gossip decoders against SSZ's
+one-encoding-per-value, seeded from the `ssz_static` fixtures and so behind `ethlambda-p2p`'s
+`beacon-spec-tests` feature (`p2p/src/beacon/decode_properties.rs`, run by
+`make test-beacon-mainnet`), 3SF-mini justifiability and the
 `justified_slots` window (`state_transition/tests/justification_properties.rs`), and
 `U256` (`types/tests/u256_properties.rs`). A failure prints `EPHYRA_REPLAY=seed:iteration`
 and is remembered in `<crate>/.ephyra/regressions/` (committed, replayed first). Long runs

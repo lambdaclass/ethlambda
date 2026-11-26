@@ -124,6 +124,15 @@ test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chai
 # in seconds.
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
 	BEACON_SPEC_PRESET=mainnet $(BEACON_SPEC_TEST) --lib
+	$(BEACON_P2P_TEST)
+
+# The gossip-decoder property tests (`ethlambda-p2p`'s `beacon::decode_properties`,
+# ephyra) seed from the mainnet `ssz_static` cases, so they run here and are
+# `ignore`d elsewhere. An invocation of its own rather than a third package in
+# `BEACON_SPEC_TEST`: that would put libp2p into the minimal job's build too,
+# which reads the shared cache but never saves it. This job saves it, so the
+# p2p build is cached with the rest.
+BEACON_P2P_TEST=cargo test --locked -p ethlambda-p2p --lib --profile release-fast --features beacon-spec-tests beacon::decode_properties
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	BEACON_SPEC_PRESET=minimal $(BEACON_SPEC_TEST)

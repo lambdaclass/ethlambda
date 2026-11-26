@@ -16,6 +16,8 @@
 pub mod builder_market;
 pub mod column_checks;
 pub mod decode;
+#[cfg(test)]
+mod decode_properties;
 pub mod encoding;
 pub mod engine_columns;
 pub mod envelope_checks;
