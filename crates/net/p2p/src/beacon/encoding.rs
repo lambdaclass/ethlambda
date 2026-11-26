@@ -482,6 +482,7 @@ pub(crate) mod test_support {
             block_access_list: Default::default(),
             slot_number: slot,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         SignedExecutionPayloadEnvelope {
             message: ExecutionPayloadEnvelope {

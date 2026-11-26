@@ -815,6 +815,7 @@ pub(crate) mod test_utils {
             block_access_list: Default::default(),
             slot_number: slot,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

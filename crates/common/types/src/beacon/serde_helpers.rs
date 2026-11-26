@@ -540,6 +540,44 @@ pub mod optional_ssz_hex_seq {
     }
 }
 
+/// [`ssz_hex`] for a value that may not be there at all, as
+/// [`optional_ssz_hex_seq`] is for a sequence.
+///
+/// Pair it with `#[serde(default, skip_serializing_if = "Option::is_none")]`:
+/// `None` then writes no key, and a missing key reads as `None`, as does
+/// `null`. The hex of an empty encoding, `"0x"`, is a value that is there and
+/// holds nothing, which is `Some`.
+pub mod optional_ssz_hex {
+    pub fn serialize<S, T>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        T: libssz::SszEncode,
+    {
+        match value {
+            Some(value) => super::ssz_hex::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: libssz::SszDecode,
+    {
+        /// A value that is there, read through [`super::ssz_hex`].
+        struct Present<T>(T);
+
+        impl<'de, T: libssz::SszDecode> serde::Deserialize<'de> for Present<T> {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                super::ssz_hex::deserialize(deserializer).map(Present)
+            }
+        }
+
+        let present = <Option<Present<T>> as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(present.map(|present| present.0))
+    }
+}
+
 /// A sequence of values that serialize themselves, from a foreign collection.
 ///
 /// `SszList` and `SszVector` come from `libssz-types`, which has no serde

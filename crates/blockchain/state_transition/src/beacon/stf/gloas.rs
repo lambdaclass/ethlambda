@@ -752,16 +752,17 @@ pub fn verify_execution_payload_envelope(
         payload.slot_number == state.slot(),
         "verify_execution_payload_envelope: payload.slot_number == state.slot",
     )?;
-    // Not in the specification, whose payload has no such field. From
+    // Not in the specification, whose payload has no such fields. From
     // `HEZE_FORK_EPOCH` on a payload is the container with
-    // `dependency_witnesses`, and before it the one without. The two encode
-    // and hash differently even with no witnesses, and nothing else an
-    // envelope is checked against tells them apart, so the wrong one for the
-    // slot is refused here.
+    // `dependency_witnesses`, from `LSTAR_FORK_EPOCH` on the one with
+    // `dependency_proof` in its place, and before both the one with
+    // neither. The three hash differently even with nothing in those
+    // fields, and nothing else an envelope is checked against tells them
+    // apart, so the wrong one for the slot is refused here.
     verify(
-        payload.dependency_witnesses.is_some()
-            == config.carries_dependency_witnesses(compute_epoch_at_slot(state.slot())),
-        "verify_execution_payload_envelope: payload.dependency_witnesses is present          exactly from HEZE_FORK_EPOCH",
+        payload.container() == Some(config.payload_container(compute_epoch_at_slot(state.slot()))),
+        "verify_execution_payload_envelope: payload is the container of its epoch, with \
+         dependency_witnesses from HEZE_FORK_EPOCH and dependency_proof from LSTAR_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,
@@ -2152,6 +2153,7 @@ mod tests {
             block_access_list: Default::default(),
             slot_number: 0,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         }
     }
 
@@ -2256,6 +2258,7 @@ mod tests {
             block_access_list: Default::default(),
             slot_number: slot,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
 
         let mut message = gloas::ExecutionPayloadEnvelope {

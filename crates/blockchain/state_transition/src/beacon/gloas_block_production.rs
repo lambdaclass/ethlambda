@@ -618,9 +618,9 @@ fn check_envelope(
         "payload.slot_number == state.slot",
     )?;
     verify(
-        payload.dependency_witnesses.is_some()
-            == config.carries_dependency_witnesses(get_current_epoch(post)),
-        "payload.dependency_witnesses is present exactly from HEZE_FORK_EPOCH",
+        payload.container() == Some(config.payload_container(get_current_epoch(post))),
+        "payload is the container of its epoch, with dependency_witnesses from \
+         HEZE_FORK_EPOCH and dependency_proof from LSTAR_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,
@@ -725,6 +725,7 @@ pub mod test_support {
             block_access_list: Default::default(),
             slot_number: inputs.slot_number,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         }
     }
 
@@ -816,6 +817,7 @@ mod gloas_block_production_tests {
     use super::test_support::*;
     use super::*;
     use crate::beacon::block_production::empty_sync_aggregate;
+    use crate::beacon::containers::gloas::PayloadContainer;
     use crate::beacon::helpers::accessors::{get_block_root_at_slot, get_domain};
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::sign_for;
@@ -1163,7 +1165,11 @@ mod gloas_block_production_tests {
         assert_eq!(without.dependency_witnesses, None);
         let with = without
             .clone()
-            .with_dependency_witnesses_field(true)
+            .into_container(PayloadContainer::WithWitnesses)
+            .unwrap();
+        let with_proof = without
+            .clone()
+            .into_container(PayloadContainer::WithProof)
             .unwrap();
 
         let assemble = |payload: &ExecutionPayload, config: &Config| {
@@ -1251,6 +1257,25 @@ mod gloas_block_production_tests {
         assert!(assemble(&without, &from_next_epoch).is_ok());
         assert!(assemble(&with, &from_next_epoch).is_err());
         assert!(import(&produced_without, &from_next_epoch).is_ok());
+
+        // The proof scheduled at the block's own epoch: a payload has it,
+        // here empty, and the witness list is no longer a payload's.
+        let mut proof_from_this_epoch = from_this_epoch.clone();
+        proof_from_this_epoch.lstar_fork_epoch = epoch;
+        let produced_with_proof = assemble(&with_proof, &proof_from_this_epoch).unwrap();
+        assert!(assemble(&with, &proof_from_this_epoch).is_err());
+        assert!(assemble(&without, &proof_from_this_epoch).is_err());
+        assert!(import(&produced_with_proof, &proof_from_this_epoch).is_ok());
+        assert!(import(&produced_with, &proof_from_this_epoch).is_err());
+        assert!(import(&produced_with_proof, &from_this_epoch).is_err());
+
+        // The proof scheduled for the next epoch: this block's payload still
+        // has the witness list.
+        let mut proof_from_next_epoch = from_this_epoch.clone();
+        proof_from_next_epoch.lstar_fork_epoch = epoch + 1;
+        assert!(assemble(&with, &proof_from_next_epoch).is_ok());
+        assert!(assemble(&with_proof, &proof_from_next_epoch).is_err());
+        assert!(import(&produced_with, &proof_from_next_epoch).is_ok());
     }
 
     #[test]

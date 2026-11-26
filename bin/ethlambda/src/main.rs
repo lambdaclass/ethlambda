@@ -2038,6 +2038,9 @@ fn first_config_difference(
         // since a payload validated before it and one validated after it are
         // different containers.
         heze_fork_epoch: _,
+        // The same for the epoch a dependency proof takes the witnesses'
+        // place from.
+        lstar_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -2203,6 +2206,16 @@ fn first_config_difference(
             "heze_fork_epoch: directory has {}, config file says {}, \
              and this directory has processed through epoch {processed_through}",
             persisted.heze_fork_epoch, supplied.heze_fork_epoch
+        ));
+    }
+
+    if persisted.lstar_fork_epoch != supplied.lstar_fork_epoch
+        && persisted.lstar_fork_epoch.min(supplied.lstar_fork_epoch) <= processed_through
+    {
+        return Some(format!(
+            "lstar_fork_epoch: directory has {}, config file says {}, \
+             and this directory has processed through epoch {processed_through}",
+            persisted.lstar_fork_epoch, supplied.lstar_fork_epoch
         ));
     }
 
@@ -4329,6 +4342,7 @@ mod anchor_envelope_root_tests {
             block_access_list: Default::default(),
             slot_number: 0,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

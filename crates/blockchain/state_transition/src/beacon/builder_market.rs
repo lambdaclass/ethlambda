@@ -372,6 +372,7 @@ pub mod test_support {
             block_access_list: Default::default(),
             slot_number: 0,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         let builder_exits: Vec<_> = exits
             .into_iter()

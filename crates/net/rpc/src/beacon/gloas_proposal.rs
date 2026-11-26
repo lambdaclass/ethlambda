@@ -851,22 +851,22 @@ async fn build_payload(
         warn!(%err, "getPayloadV6 failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
     })?;
-    // The execution client says whether its block has a witness list by
-    // sending or leaving out a key. Which container the payload must be is
-    // this side's to say, from the payload's own slot.
+    // The execution client says whether its block has a witness list or a
+    // dependency proof by the key it sends, or by sending neither. Which
+    // container the payload must be is this side's to say, from the
+    // payload's own slot.
     let payload = built.execution_payload;
     let slot = payload.slot_number;
-    let carries_witnesses = store
+    let container = store
         .config()
-        .carries_dependency_witnesses(compute_epoch_at_slot(slot));
-    built.execution_payload = payload
-        .with_dependency_witnesses_field(carries_witnesses)
-        .map_err(|err| {
-            warn!(%err, slot, "The execution client built a payload this slot cannot carry");
-            ApiError::ServiceUnavailable(
-                "the execution client built a payload with dependency witnesses too early",
-            )
-        })?;
+        .payload_container(compute_epoch_at_slot(slot));
+    built.execution_payload = payload.into_container(container).map_err(|err| {
+        warn!(%err, slot, "The execution client built a payload this slot cannot carry");
+        ApiError::ServiceUnavailable(
+            "the execution client built a payload with dependency witnesses or a dependency \
+             proof its slot has no place for",
+        )
+    })?;
     Ok(built)
 }
 

@@ -696,6 +696,11 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     if let Some(epoch) = spec_u64(value, "HEZE_FORK_EPOCH")? {
         config.heze_fork_epoch = epoch;
     }
+    // The same for the epoch a dependency proof takes the witnesses' place
+    // from.
+    if let Some(epoch) = spec_u64(value, "LSTAR_FORK_EPOCH")? {
+        config.lstar_fork_epoch = epoch;
+    }
 
     Ok(config)
 }
@@ -1056,6 +1061,26 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Electra), 364_032);
         // Untouched by the response, so still the mainnet default.
         assert_eq!(config.min_genesis_time, Config::mainnet().min_genesis_time);
+    }
+
+    /// Neither is a fork of this client's, so the fork loop does not read
+    /// them, and an envelope's payload is decoded as the container they give
+    /// its slot.
+    #[test]
+    fn the_epochs_that_say_a_payloads_container_are_read_from_the_response() {
+        use ethlambda_types::beacon::containers::gloas::PayloadContainer;
+
+        let unscheduled = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(
+            unscheduled.payload_container(9),
+            PayloadContainer::Specification
+        );
+
+        let response = serde_json::json!({ "HEZE_FORK_EPOCH": "3", "LSTAR_FORK_EPOCH": "5" });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.payload_container(2), PayloadContainer::Specification);
+        assert_eq!(config.payload_container(3), PayloadContainer::WithWitnesses);
+        assert_eq!(config.payload_container(5), PayloadContainer::WithProof);
     }
 
     /// The key the specification actually ships now. Reading only the old one

@@ -18,8 +18,10 @@
 //!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
 //!   reported as an unknown key instead. `HEZE_FORK_EPOCH` is the exception:
 //!   it is read as [`Config::heze_fork_epoch`], for the one thing this build
-//!   does at that epoch (see [`Config::carries_dependency_witnesses`]), and
-//!   schedules no fork of its own. `GAS_LIMIT_SCHEDULE` (gloas-era)
+//!   does at that epoch (see [`Config::payload_container`]), and schedules
+//!   no fork of its own. So is `LSTAR_FORK_EPOCH`, the epoch of the upgrade
+//!   after heze, read as [`Config::lstar_fork_epoch`] for the same one
+//!   thing. `GAS_LIMIT_SCHEDULE` (gloas-era)
 //!   stays out too, since it is a list rather than a scalar. The rest are
 //!   heze-era data keys, not gloas's, with no reader in this build at all:
 //!   `INCLUSION_LIST_DUE_BPS`, `MAX_REQUEST_INCLUSION_LIST`,
@@ -337,9 +339,20 @@ pub struct Config {
     /// belongs to never reads this, and there is no `heze_fork_version`. It
     /// is the epoch from which an execution payload carries dependency
     /// witnesses, and nothing else: see
-    /// [`Self::carries_dependency_witnesses`].
+    /// [`Self::payload_container`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub heze_fork_epoch: Epoch,
+    /// The epoch the upgrade after heze activates at, or
+    /// [`constants::FAR_FUTURE_EPOCH`] if it is not scheduled. The execution
+    /// layer schedules the same upgrade by time, as `lstarTime`.
+    ///
+    /// Like [`Self::heze_fork_epoch`], not a fork of this build's: there is
+    /// no `lstar_fork_version`, and the fork a state or a signature belongs
+    /// to never reads this. It is the epoch from which an execution payload
+    /// carries a dependency proof where it carried dependency witnesses, and
+    /// nothing else: see [`Self::payload_container`].
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub lstar_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -738,6 +751,7 @@ impl Config {
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            lstar_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -873,6 +887,7 @@ impl Config {
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            lstar_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -1070,23 +1085,26 @@ impl Config {
             .unwrap_or(ForkName::Phase0)
     }
 
-    /// Whether an execution payload of `epoch` carries dependency witnesses.
+    /// Which container an execution payload of `epoch` is, which is what a
+    /// payload's decoder is told.
     ///
-    /// The execution layer's blocks carry them from the upgrade whose
-    /// consensus side is heze, so its epoch decides: before it a payload is
-    /// the specification's gloas container, and from it on the container has
-    /// one more field, the witness list, present even when it is empty.
-    /// Nothing else changes at that epoch in this build, which stays on
-    /// gloas.
-    pub fn carries_dependency_witnesses(&self, epoch: Epoch) -> bool {
-        self.heze_fork_epoch != constants::FAR_FUTURE_EPOCH && self.heze_fork_epoch <= epoch
-    }
-
-    /// Which container an execution payload of `epoch` is: the one with
-    /// dependency witnesses where [`Self::carries_dependency_witnesses`], the
-    /// specification's before. What a payload's decoder is told.
+    /// The execution layer's blocks carry dependency witnesses from the
+    /// upgrade whose consensus side is heze, and one dependency proof in
+    /// their place from the upgrade after it. So those two epochs decide:
+    /// before heze's a payload is the specification's gloas container, from
+    /// it on the container has one more field, the witness list, and from
+    /// the later one it has the proof where it had the list. The field is
+    /// present even when it is empty. Nothing else changes at either epoch
+    /// in this build, which stays on gloas.
+    ///
+    /// The later epoch decides alone once it is reached, whether or not
+    /// heze's is scheduled before it.
     pub fn payload_container(&self, epoch: Epoch) -> PayloadContainer {
-        if self.carries_dependency_witnesses(epoch) {
+        let reached =
+            |fork_epoch: Epoch| fork_epoch != constants::FAR_FUTURE_EPOCH && fork_epoch <= epoch;
+        if reached(self.lstar_fork_epoch) {
+            PayloadContainer::WithProof
+        } else if reached(self.heze_fork_epoch) {
             PayloadContainer::WithWitnesses
         } else {
             PayloadContainer::Specification
@@ -1216,16 +1234,21 @@ mod tests {
 
     #[test]
     fn a_payload_carries_dependency_witnesses_from_the_heze_epoch() {
+        use PayloadContainer::{Specification, WithWitnesses};
+
         let mut config = Config::minimal();
         // Not scheduled: never, the last epoch included.
         assert_eq!(config.heze_fork_epoch, constants::FAR_FUTURE_EPOCH);
-        assert!(!config.carries_dependency_witnesses(0));
-        assert!(!config.carries_dependency_witnesses(constants::FAR_FUTURE_EPOCH));
+        assert_eq!(config.payload_container(0), Specification);
+        assert_eq!(
+            config.payload_container(constants::FAR_FUTURE_EPOCH),
+            Specification
+        );
 
         config.heze_fork_epoch = 3;
-        assert!(!config.carries_dependency_witnesses(2));
-        assert!(config.carries_dependency_witnesses(3));
-        assert!(config.carries_dependency_witnesses(4));
+        assert_eq!(config.payload_container(2), Specification);
+        assert_eq!(config.payload_container(3), WithWitnesses);
+        assert_eq!(config.payload_container(4), WithWitnesses);
 
         // Scheduling it moves no fork: the node stays on the fork it was on.
         let fork_before = Config::minimal().fork_at_epoch(3);
@@ -1233,11 +1256,46 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_carries_a_dependency_proof_from_the_lstar_epoch() {
+        use PayloadContainer::{Specification, WithProof, WithWitnesses};
+
+        let mut config = Config::minimal();
+        assert_eq!(config.lstar_fork_epoch, constants::FAR_FUTURE_EPOCH);
+        config.heze_fork_epoch = 3;
+        config.lstar_fork_epoch = 5;
+        assert_eq!(config.payload_container(2), Specification);
+        assert_eq!(config.payload_container(4), WithWitnesses);
+        assert_eq!(config.payload_container(5), WithProof);
+        assert_eq!(config.payload_container(6), WithProof);
+
+        // Both at one epoch: the witness list is never a payload's.
+        config.heze_fork_epoch = 5;
+        assert_eq!(config.payload_container(4), Specification);
+        assert_eq!(config.payload_container(5), WithProof);
+
+        // The later epoch without the earlier one needs nothing of it.
+        config.heze_fork_epoch = constants::FAR_FUTURE_EPOCH;
+        assert_eq!(config.payload_container(4), Specification);
+        assert_eq!(config.payload_container(5), WithProof);
+
+        // Scheduling it moves no fork either.
+        let fork_before = Config::minimal().fork_at_epoch(5);
+        assert_eq!(config.fork_at_epoch(5), fork_before);
+    }
+
+    #[test]
     fn the_heze_epoch_is_read_from_a_config_file_and_its_version_is_not() {
         let yaml = "HEZE_FORK_VERSION: 0x90000038\nHEZE_FORK_EPOCH: 1\n";
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.heze_fork_epoch, 1);
-        assert!(config.carries_dependency_witnesses(1));
+        assert_eq!(config.payload_container(1), PayloadContainer::WithWitnesses);
+        assert_eq!(config.lstar_fork_epoch, constants::FAR_FUTURE_EPOCH);
+
+        let yaml = "HEZE_FORK_EPOCH: 1\nLSTAR_FORK_EPOCH: 2\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.lstar_fork_epoch, 2);
+        assert_eq!(config.payload_container(1), PayloadContainer::WithWitnesses);
+        assert_eq!(config.payload_container(2), PayloadContainer::WithProof);
     }
 
     #[test]

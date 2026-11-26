@@ -446,6 +446,7 @@ mod tests {
             block_access_list: Default::default(),
             slot_number: 5,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         containers::gloas::SignedExecutionPayloadEnvelope {
             message: containers::gloas::ExecutionPayloadEnvelope {

@@ -148,6 +148,11 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// client reads the list its block header commits to. A payload without the
 /// field, from before `HEZE_FORK_EPOCH`, is written as the specification's
 /// object, with no such key.
+///
+/// From `LSTAR_FORK_EPOCH` the execution block has one proof where it had
+/// the witness list, and so do the payload and this object:
+/// `dependencyProof`, one `DATA`, `0x` when the proof is empty, written
+/// exactly when the payload has that field.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 
 impl Serialize for ExecutionPayloadV4<'_> {
@@ -155,11 +160,9 @@ impl Serialize for ExecutionPayloadV4<'_> {
         use serde::ser::SerializeStruct as _;
 
         let payload = self.0;
-        let members = if payload.dependency_witnesses.is_some() {
-            20
-        } else {
-            19
-        };
+        let members = 19
+            + usize::from(payload.dependency_witnesses.is_some())
+            + usize::from(payload.dependency_proof.is_some());
         let mut out = serializer.serialize_struct("ExecutionPayloadV4", members)?;
         out.serialize_field("parentHash", &data(&payload.parent_hash.0))?;
         out.serialize_field("feeRecipient", &data(&payload.fee_recipient.0))?;
@@ -197,6 +200,9 @@ impl Serialize for ExecutionPayloadV4<'_> {
                 .map(|witness| data(witness.as_ref()))
                 .collect();
             out.serialize_field("dependencyWitnesses", &dependency_witnesses)?;
+        }
+        if let Some(dependency_proof) = &payload.dependency_proof {
+            out.serialize_field("dependencyProof", &data(dependency_proof))?;
         }
         out.end()
     }
@@ -533,6 +539,7 @@ mod tests {
             block_access_list: Default::default(),
             slot_number: 4096,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
 
         // A payload without the field is the specification's object.
@@ -604,6 +611,25 @@ mod tests {
         assert!(text.ends_with(
             r#""blockAccessList":"0xc180","slotNumber":"0x1000","dependencyWitnesses":["0x0102","0xff"]}"#
         ));
+
+        // A payload with a proof writes the proof in the same place, and no
+        // witness list, which it does not have.
+        payload.dependency_witnesses = None;
+        payload.dependency_proof = Some(vec![0x01u8, 0xff].try_into().expect("fits"));
+        let mut expected = expected;
+        let object = expected.as_object_mut().expect("a JSON object");
+        object.remove("dependencyWitnesses");
+        object.insert("dependencyProof".to_string(), "0x01ff".into());
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        assert_eq!(json, expected);
+        assert_eq!(json.as_object().expect("a JSON object").len(), 20);
+        let text = serde_json::to_string(&ExecutionPayloadV4(&payload)).expect("serializes");
+        assert!(text.ends_with(r#""slotNumber":"0x1000","dependencyProof":"0x01ff"}"#));
+
+        // An empty proof is the empty `DATA`, never an absent key.
+        payload.dependency_proof = Some(Default::default());
+        let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
+        assert_eq!(json["dependencyProof"], "0x");
     }
 
     #[test]

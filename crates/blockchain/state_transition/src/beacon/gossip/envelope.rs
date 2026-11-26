@@ -23,11 +23,15 @@
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
-//! - [`cheap_checks`] rejects a payload that has the `dependency_witnesses`
-//!   field before `HEZE_FORK_EPOCH` or lacks it from that epoch on, and one
+//! - [`cheap_checks`] rejects a payload that is not the container its slot
+//!   calls for: the specification's before `HEZE_FORK_EPOCH`, the one with
+//!   `dependency_witnesses` from that epoch on, and the one with
+//!   `dependency_proof` from `LSTAR_FORK_EPOCH` on. It also rejects one
 //!   whose list holds an item of any length but
-//!   [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The specification's payload has no such
-//!   list, so it has no rule for it.
+//!   [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The specification's payload has
+//!   neither field, so it has no rule for them. The proof is not looked at,
+//!   and its size bound is the container's: a payload over it does not
+//!   decode.
 
 use std::num::NonZeroUsize;
 
@@ -112,13 +116,15 @@ pub fn cheap_checks(
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
-    // [REJECT] The payload has the dependency witnesses field exactly when
-    // its slot is at or after `HEZE_FORK_EPOCH`. The payload names its own
-    // slot, so this needs no block either.
+    // [REJECT] The payload is the container its slot calls for: it has the
+    // dependency witnesses field exactly from `HEZE_FORK_EPOCH` up to
+    // `LSTAR_FORK_EPOCH`, and the dependency proof field exactly from the
+    // latter on. The payload names its own slot, so this needs no block
+    // either. The proof itself is the execution client's to read.
     let witnesses = &message.payload.dependency_witnesses;
     let payload_epoch = compute_epoch_at_slot(message.payload.slot_number);
-    if witnesses.is_some() != store.config().carries_dependency_witnesses(payload_epoch) {
-        return Err(Outcome::Reject(RejectReason::DependencyWitnessesField));
+    if message.payload.container() != Some(store.config().payload_container(payload_epoch)) {
+        return Err(Outcome::Reject(RejectReason::PayloadContainer));
     }
     // [REJECT] Every dependency witness is exactly one leanSPHINCS signature
     // long. No block can make a witness of another length valid, so, like the
@@ -282,6 +288,7 @@ mod tests {
             block_access_list: Default::default(),
             slot_number: slot,
             dependency_witnesses: Default::default(),
+            dependency_proof: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {
@@ -341,12 +348,12 @@ mod tests {
         envelope.message.payload.dependency_witnesses = Some(Default::default());
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &envelope),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::PayloadContainer)),
         );
         // The block is unknown, which would queue a well-formed envelope.
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope),
-            Outcome::Reject(RejectReason::DependencyWitnessesField)
+            Outcome::Reject(RejectReason::PayloadContainer)
         );
     }
 
@@ -357,7 +364,7 @@ mod tests {
         assert_eq!(envelope.message.payload.dependency_witnesses, None);
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &envelope),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::PayloadContainer)),
         );
     }
 
@@ -374,16 +381,89 @@ mod tests {
         before.message.payload.dependency_witnesses = Some(Default::default());
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &before),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::PayloadContainer)),
         );
 
         let mut from = envelope(first_slot_with_the_field, 0);
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &from),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::PayloadContainer)),
         );
         from.message.payload.dependency_witnesses = Some(Default::default());
         assert_eq!(cheap_checks(&seen_envelopes(), &store, &from), Ok(()));
+    }
+
+    /// `store(0)` with payloads carrying dependency witnesses from genesis
+    /// and a dependency proof from epoch 1.
+    fn store_with_a_dependency_proof_from_epoch_one() -> Store {
+        let mut store = store(0);
+        let mut config = (*store.config()).clone();
+        config.heze_fork_epoch = 0;
+        config.lstar_fork_epoch = 1;
+        store.replace_config(config);
+        store
+    }
+
+    #[test]
+    fn a_payload_is_the_container_with_the_proof_exactly_from_its_epoch() {
+        let store = store_with_a_dependency_proof_from_epoch_one();
+        let first_slot_with_the_proof = preset::slots_per_epoch();
+        let with_proof = |slot| {
+            let mut envelope = envelope(slot, 0);
+            envelope.message.payload.dependency_proof = Some(Default::default());
+            envelope
+        };
+        let with_witnesses = |slot| {
+            let mut envelope = envelope(slot, 0);
+            envelope.message.payload.dependency_witnesses = Some(Default::default());
+            envelope
+        };
+        let checked = |envelope| cheap_checks(&seen_envelopes(), &store, &envelope);
+        let wrong_container = Err(Outcome::Reject(RejectReason::PayloadContainer));
+
+        // Before the epoch: the witness list, and no proof.
+        let before = first_slot_with_the_proof - 1;
+        assert_eq!(checked(with_witnesses(before)), Ok(()));
+        assert_eq!(checked(with_proof(before)), wrong_container);
+
+        // From it on: the proof, and neither of the earlier containers.
+        let from = first_slot_with_the_proof;
+        assert_eq!(checked(with_proof(from)), Ok(()));
+        assert_eq!(checked(with_witnesses(from)), wrong_container);
+        assert_eq!(checked(envelope(from, 0)), wrong_container);
+    }
+
+    #[test]
+    fn a_payload_with_both_witnesses_and_a_proof_is_rejected() {
+        let store = store_with_a_dependency_proof_from_epoch_one();
+        let wrong_container = Err(Outcome::Reject(RejectReason::PayloadContainer));
+        // At a slot of either epoch: no container has both fields.
+        for slot in [0, preset::slots_per_epoch()] {
+            let mut envelope = envelope(slot, 0);
+            envelope.message.payload.dependency_witnesses = Some(Default::default());
+            envelope.message.payload.dependency_proof = Some(Default::default());
+            assert_eq!(
+                cheap_checks(&seen_envelopes(), &store, &envelope),
+                wrong_container
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_proof_is_not_parsed_by_the_cheap_checks() {
+        let store = store_with_a_dependency_proof_from_epoch_one();
+        // Nothing a prover would write: bytes within the bound pass whatever
+        // they are.
+        for proof in [vec![], vec![0xff], vec![0x00; 7_741]] {
+            let mut envelope = envelope(preset::slots_per_epoch(), 0);
+            envelope.message.payload.dependency_proof =
+                Some(proof.try_into().expect("within the bound"));
+            assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
+            assert_eq!(
+                validate(&seen_envelopes(), &store, &envelope),
+                Outcome::Queue(QueueReason::BlockUnknown)
+            );
+        }
     }
 
     #[test]

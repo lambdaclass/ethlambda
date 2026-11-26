@@ -261,6 +261,7 @@ fn gloas_payload() -> gloas::ExecutionPayload {
         block_access_list: vec![0xca, 0xfe].into(),
         slot_number: 33,
         dependency_witnesses: Some(vec![gloas::DependencyWitness::from(vec![0xbe, 0xef])].into()),
+        dependency_proof: Default::default(),
     }
 }
 
@@ -437,6 +438,48 @@ fn a_gloas_payload_with_an_empty_dependency_witnesses_list_keeps_the_field_in_js
     assert_eq!(json["dependency_witnesses"], serde_json::json!([]));
     let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
     assert_eq!(reread, payload);
+}
+
+#[test]
+fn a_gloas_payload_with_a_dependency_proof_round_trips_through_json() {
+    // The fixture payload has witnesses and no proof, so its JSON has no
+    // such key.
+    let json = serde_json::to_value(gloas_payload()).unwrap();
+    assert!(!json.as_object().unwrap().contains_key("dependency_proof"));
+
+    // The container with a proof: the proof as one hex string, and no
+    // witness list.
+    let mut payload = gloas_payload();
+    payload.dependency_witnesses = None;
+    payload.dependency_proof = Some(vec![0xbe, 0xef].try_into().unwrap());
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["dependency_proof"], "0xbeef");
+    assert!(
+        !json
+            .as_object()
+            .unwrap()
+            .contains_key("dependency_witnesses")
+    );
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
+
+    // An empty proof keeps its key.
+    payload.dependency_proof = Some(Default::default());
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["dependency_proof"], "0x");
+    let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(reread, payload);
+}
+
+#[test]
+fn a_dependency_proof_over_the_bound_is_refused_in_json() {
+    let mut json = serde_json::to_value(gloas_payload()).unwrap();
+    json["dependency_proof"] =
+        format!("0x{}", "00".repeat(gloas::MAX_DEPENDENCY_PROOF_BYTES)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json.clone()).is_ok());
+    json["dependency_proof"] =
+        format!("0x{}", "00".repeat(gloas::MAX_DEPENDENCY_PROOF_BYTES + 1)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json).is_err());
 }
 
 #[test]

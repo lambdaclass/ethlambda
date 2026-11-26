@@ -171,6 +171,7 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
         block_access_list: vec![0xc0u8].try_into().expect("fits"),
         slot_number: 77,
         dependency_witnesses: Some(vec![gloas::DependencyWitness::from(vec![0xaa, 0xbb])].into()),
+        dependency_proof: Default::default(),
     };
     let status = client(endpoint)
         .new_payload_v5(

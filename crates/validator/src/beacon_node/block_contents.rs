@@ -876,6 +876,7 @@ pub fn empty_gloas_envelope_for(
         block_access_list: Default::default(),
         slot_number: 0,
         dependency_witnesses: Default::default(),
+        dependency_proof: Default::default(),
     };
     gloas::ExecutionPayloadEnvelope {
         payload,

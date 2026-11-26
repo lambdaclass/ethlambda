@@ -44,10 +44,10 @@ Two method families a full client would have are deliberately absent:
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`, and on this branch `dependencyWitnesses` from
-  `HEZE_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
-  gloas on. The handshake
-  warns when a gloas network's execution client does not advertise
-  `engine_getPayloadV6`.
+  `HEZE_FORK_EPOCH` and `dependencyProof` in its place from
+  `LSTAR_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
+  gloas on. The handshake warns when a gloas network's execution client does
+  not advertise `engine_getPayloadV6`.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -346,7 +346,7 @@ the container with it, and `Some` of an empty list is not `None`. The Beacon
 API's JSON names it `dependency_witnesses`, an array of hex strings, and
 leaves the key out of a payload that does not have the field.
 
-SSZ carries no tag for which of the two containers a payload is, so a decoder
+SSZ carries no tag for which of its containers a payload is, so a decoder
 is told, as it is told a block's fork. Wherever an envelope arrives as bytes
 with nothing to say its epoch (gossip, a peer's answer, storage, checkpoint
 sync, the Beacon API), its payload is decoded as the container
@@ -354,12 +354,12 @@ sync, the Beacon API), its payload is decoded as the container
 (`from_ssz_by_slot`), and an envelope whose payload is the other container
 does not decode. The validator client decodes the envelope of a block it
 asked for as the container of that block's slot, and reads `HEZE_FORK_EPOCH`
-from `/eth/v1/config/spec` to know it. JSON needs none of this: it names each
-field it has.
+and `LSTAR_FORK_EPOCH` from `/eth/v1/config/spec` to know it. JSON needs none
+of this: it names each field it has.
 
 The execution client and this node must agree on the epoch. On the proposal
 path the node settles it from the payload's own slot
-(`ExecutionPayload::with_dependency_witnesses_field`): from the epoch on, an
+(`ExecutionPayload::into_container`): from the epoch on, an
 answer without the key becomes the empty list; before it, an empty list is
 dropped, and an answer that holds witnesses is refused, because the execution
 block commits to them and the payload cannot carry them.
@@ -368,8 +368,9 @@ The follower never rebuilds the execution header or its hash, so the header's
 commitment needs nothing on this side: `engine_newPayloadV5` hands the list to
 the execution client, which checks it against the header and verifies every
 signature. What the follower judges is which container the payload is and
-each witness's length. An envelope whose payload has the field before
-`HEZE_FORK_EPOCH`, or lacks it from that epoch on, is rejected by the
+each witness's length. An envelope whose payload is not the container its
+slot calls for (`Config::payload_container`), for one by having the field
+before `HEZE_FORK_EPOCH` or lacking it from that epoch on, is rejected by the
 envelope's gossip rule (`gossip::envelope::cheap_checks`) and by
 `verify_execution_payload_envelope`. So is one with a witness that is not
 exactly 7,740 bytes long (`LEAN_SPHINCS_SIGNATURE_SIZE`), by the gossip rule,
@@ -379,6 +380,52 @@ or the engine asked.
 The field changes the encoding and the root of every payload from
 `HEZE_FORK_EPOCH` on, which is a departure from the specification:
 see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-dependency-witnesses-from-the-heze-epoch).
+
+#### The dependency proof
+
+From the upgrade after heze, the builder of an execution block makes one
+*dependency proof* that stands for all of the block's dependency witnesses,
+and the block carries the proof and no witness list (EIP-8288). The execution
+block header commits to the proof with fields of its own. The execution layer
+schedules that upgrade by time (`lstarTime`); this side reads its epoch from
+one more config key, `LSTAR_FORK_EPOCH`, and that is the epoch a payload
+carries the proof from.
+
+| Method | Direction | `dependencyProof` |
+|---|---|---|
+| `engine_getPayloadV6` | read | One `DATA`. A string that is not `0x`-prefixed hex, or that is longer than `MAX_DEPENDENCY_PROOF_BYTES` (1,048,576 bytes), fails the whole answer. An absent key or `null` is settled from the payload's slot, as for the witnesses |
+| `engine_newPayloadV5` | written | One `DATA`, the payload's last member, when the payload has the field: `0x` when it is empty. The payload has no `dependencyWitnesses` then |
+
+```json
+"dependencyProof": "0x<the proof, in the prover's serialization>"
+```
+
+Nothing on this side parses the proof. A block with no dependency has the
+empty string.
+
+Between the two calls the proof is `dependency_proof`, a
+`ByteList[MAX_DEPENDENCY_PROOF_BYTES]`, which takes the witness list's place
+in the `ExecutionPayload` container from `LSTAR_FORK_EPOCH` on, the way a
+progressive container replaces a field (EIP-7495): the list's field, the
+twentieth, becomes inactive, and the proof is the twenty-first. An inactive
+field is left out of the encoding and leaves a zero chunk in the tree, so no
+field changes its generalized index. A payload is therefore one of three
+containers. The one with the proof encodes to as many fields as the one with
+the witness list, so their bytes do not say which they are, which is why a
+payload is decoded as the container of its slot, as above. The Beacon API's
+JSON has `dependency_proof`, one hex string, and no `dependency_witnesses`
+then.
+
+On the proposal path an answer with `dependencyProof` is that container as it
+stands, and an answer with neither key, or with an empty witness list, gets
+the empty proof. An answer that holds witnesses at a slot whose payloads carry
+a proof, or a proof at a slot whose payloads do not, is refused. An envelope
+whose payload has a proof before `LSTAR_FORK_EPOCH`, lacks one from that epoch
+on, or has both a proof and a witness list, is rejected by the same two rules
+as above. The proof's size bound is the container's: a payload over it does
+not decode, from gossip, from a peer's answer, from the Beacon API or from the
+execution client. The bound is below the 10 MiB an envelope may take on the
+wire, which does not change.
 
 ## Blobs from the execution client
 
