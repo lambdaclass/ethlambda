@@ -32,6 +32,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::beacon_node::dto::{parse_root, quoted_u64};
+use crate::beacon_node::http::without_credentials;
 use crate::error::{BeaconNodeFailure, Error, Result};
 
 /// How long establishing the connection may take: the bound
@@ -309,7 +310,11 @@ pub trait EventStream: Send {
 
 /// An [`EventSource`] reading one beacon node's `GET /eth/v1/events`.
 pub struct HttpEventSource {
+    /// What requests go to, any `user:password@` included.
     base_url: String,
+    /// `base_url` without its credentials: what logs and errors name the node
+    /// by, as `HttpBeaconNode` does (see `without_credentials`).
+    name: String,
     /// Its own client, not `HttpBeaconNode`'s: that one's total timeout runs
     /// until a body is finished, and a stream's never is. This one bounds the
     /// connection alone, and [`IDLE_TIMEOUT`] the silence on it.
@@ -321,15 +326,22 @@ impl HttpEventSource {
     /// `HttpBeaconNode::new` strips one.
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        let name = without_credentials(&base_url);
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
-            .map_err(|err| transport(&base_url, &err))?;
-        Ok(Self { base_url, client })
+            .map_err(|err| transport(&name, &err))?;
+        Ok(Self {
+            base_url,
+            name,
+            client,
+        })
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// The node's base URL without any credentials it carries, for a log
+    /// line or an error.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -354,14 +366,14 @@ impl EventSource for HttpEventSource {
         let response = tokio::time::timeout(RESPONSE_TIMEOUT, request)
             .await
             .map_err(|_| Error::BeaconNode {
-                url: self.base_url.clone(),
+                url: self.name.clone(),
                 failure: BeaconNodeFailure::Timeout,
                 detail: format!(
                     "the event stream was not answered within {} s",
                     RESPONSE_TIMEOUT.as_secs()
                 ),
             })?
-            .map_err(|err| transport(&self.base_url, &err))?;
+            .map_err(|err| transport(&self.name, &err))?;
         let status = response.status();
         if status != StatusCode::OK {
             return Err(Error::BeaconNodeStatus {
@@ -370,7 +382,7 @@ impl EventSource for HttpEventSource {
             });
         }
         Ok(Box::new(HttpEventStream {
-            base_url: self.base_url.clone(),
+            name: self.name.clone(),
             response,
             parser: SseParser::default(),
             decoded: VecDeque::new(),
@@ -380,7 +392,8 @@ impl EventSource for HttpEventSource {
 
 /// A stream [`HttpEventSource`] opened.
 struct HttpEventStream {
-    base_url: String,
+    /// The node's URL without its credentials (see [`HttpEventSource::name`]).
+    name: String,
     response: reqwest::Response,
     parser: SseParser,
     /// Events a body piece completed and `next_event` has not handed out.
@@ -397,7 +410,7 @@ impl EventStream for HttpEventStream {
             let chunk = match tokio::time::timeout(IDLE_TIMEOUT, self.response.chunk()).await {
                 Err(_) => {
                     return Err(Error::BeaconNode {
-                        url: self.base_url.clone(),
+                        url: self.name.clone(),
                         failure: BeaconNodeFailure::Timeout,
                         detail: format!(
                             "the event stream sent nothing for {} s",
@@ -405,14 +418,14 @@ impl EventStream for HttpEventStream {
                         ),
                     });
                 }
-                Ok(Err(err)) => return Err(transport(&self.base_url, &err)),
+                Ok(Err(err)) => return Err(transport(&self.name, &err)),
                 Ok(Ok(None)) => return Ok(None),
                 Ok(Ok(Some(chunk))) => chunk,
             };
             let frames = self.parser.push(&chunk).map_err(|FrameTooLong| {
                 Error::Decode(format!(
                     "an event on {}'s stream runs past {MAX_FRAME_BYTES} bytes",
-                    self.base_url
+                    self.name
                 ))
             })?;
             for frame in frames {
@@ -421,7 +434,7 @@ impl EventStream for HttpEventStream {
                     // One bad event is skipped, not the stream: the next
                     // slot's may well be fine, and the duty has its deadline.
                     Some(Err(err)) => warn!(
-                        node = %self.base_url,
+                        node = %self.name,
                         event = %frame.event,
                         %err,
                         "Skipping a malformed event from the beacon node"
@@ -448,10 +461,13 @@ pub fn is_idle_timeout(err: &Error) -> bool {
     )
 }
 
-/// A `reqwest` failure as this crate's beacon-node error.
-fn transport(base_url: &str, err: &reqwest::Error) -> Error {
+/// A `reqwest` failure as this crate's beacon-node error. `name` is the
+/// node's URL without its credentials ([`HttpEventSource::name`]); reqwest's
+/// own text carries none either, since it moves a URL's `user:password@` into
+/// the `Authorization` header before sending.
+fn transport(name: &str, err: &reqwest::Error) -> Error {
     Error::BeaconNode {
-        url: base_url.to_string(),
+        url: name.to_string(),
         failure: BeaconNodeFailure::classify(err),
         detail: err.to_string(),
     }
@@ -827,5 +843,28 @@ mod tests {
             Err(other) => panic!("expected the node's status, got {other:?}"),
             Ok(_) => panic!("expected the node's status, got a stream"),
         }
+    }
+
+    /// A node URL with credentials names the node without them, in logs and
+    /// in errors alike: a connection the node refuses reports the URL, and
+    /// that error is logged.
+    #[tokio::test]
+    async fn credentials_stay_out_of_the_name_and_errors() {
+        // Bound and dropped, so nothing listens there and the connect fails.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("binds")
+            .local_addr()
+            .expect("has an address")
+            .port();
+        let source =
+            HttpEventSource::new(format!("http://user:secret@127.0.0.1:{port}/")).expect("builds");
+        assert_eq!(source.name(), format!("http://127.0.0.1:{port}"));
+
+        let Err(err) = source.subscribe(&[Topic::Head]).await else {
+            panic!("nothing listens, so the subscription fails");
+        };
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("secret"), "leaked: {shown}");
+        assert!(!shown.contains("user:"), "leaked: {shown}");
     }
 }

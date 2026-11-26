@@ -219,7 +219,7 @@ pub fn start(
         .iter()
         .map(|url| {
             let source = HttpEventSource::new(url)?;
-            let name = source.base_url().to_string();
+            let name = source.name().to_string();
             Ok((name, Arc::new(source) as Arc<dyn EventSource>))
         })
         .collect::<Result<Vec<_>>>()?;
