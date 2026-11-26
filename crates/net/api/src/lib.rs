@@ -516,6 +516,23 @@ impl MetaDataController {
     }
 }
 
+/// This node's ENR and the addresses it advertises, as the Beacon API's
+/// `/eth/v1/node/identity` reports them.
+///
+/// All three come from one read of the record discovery serves, so they
+/// always describe the same record, even while IP voting re-signs it. Strings
+/// rather than ENR or libp2p types, so this crate stays free of both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvertisedRecord {
+    /// The record, `enr:`-prefixed. Empty when there is none.
+    pub enr: String,
+    /// The libp2p multiaddrs a peer reading the record dials, QUIC first,
+    /// each ending in `/p2p/<peer id>`.
+    pub p2p_addresses: Vec<String>,
+    /// The record's discv5 multiaddr, likewise.
+    pub discovery_addresses: Vec<String>,
+}
+
 /// Which side opened a peer's first connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerDirection {

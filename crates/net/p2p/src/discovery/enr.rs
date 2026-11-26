@@ -23,12 +23,16 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ethlambda_network_api::AdvertisedRecord;
 use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
 use ethrex_p2p::utils::{node_id, public_key_from_signing_key};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use libssz::SszEncode;
 use secp256k1::SecretKey;
+use tracing::warn;
 
 use super::DiscoveryError;
+use crate::dial_addrs;
 
 pub(crate) const QUIC_ENR_KEY: &[u8] = b"quic";
 pub(crate) const ETH2_ENR_KEY: &[u8] = b"eth2";
@@ -301,6 +305,47 @@ pub(crate) fn read_quic_port(record: &NodeRecord) -> Option<u16> {
 /// answer. Same answer as [`read_quic_port`] gives for `quic`.
 pub(crate) fn read_tcp_port(pairs: &NodeRecordPairs) -> Option<u16> {
     pairs.tcp_port.and_then(dialable_port)
+}
+
+/// `record` as the Beacon API's `/eth/v1/node/identity` reports it: the
+/// record, and the addresses a peer reading it would reach this node on.
+///
+/// The libp2p addresses are the ones a peer's dial would try, read the way
+/// [`admission`](super::admission) reads a peer's record, so the endpoint
+/// lists exactly what our ENR offers. An unspecified IP, the `0.0.0.0` a
+/// record carries until `--discovery.advertise-ip` or IP voting supplies one,
+/// names no host to reach, so both lists stay empty then.
+pub(crate) fn advertised_record(record: &NodeRecord) -> AdvertisedRecord {
+    let enr = record
+        .enr_url()
+        .inspect_err(|err| warn!(%err, "Could not encode the local ENR"))
+        .unwrap_or_default();
+    let pairs = record.pairs();
+    let ip = read_ip(pairs).filter(|ip| !ip.is_unspecified());
+    let public_key = read_public_key(pairs);
+    let (Some(ip), Some(public_key)) = (ip, public_key) else {
+        return AdvertisedRecord {
+            enr,
+            ..Default::default()
+        };
+    };
+    let peer_id = PeerId::from_public_key(&libp2p::identity::PublicKey::from(public_key));
+
+    let p2p_addresses = dial_addrs(ip, read_quic_port(record), read_tcp_port(pairs), peer_id);
+    let discovery_addresses = pairs.udp_port.and_then(dialable_port).map(|port| {
+        Multiaddr::empty()
+            .with(ip.into())
+            .with(Protocol::Udp(port))
+            .with(Protocol::P2p(peer_id))
+    });
+    AdvertisedRecord {
+        enr,
+        p2p_addresses: p2p_addresses.iter().map(ToString::to_string).collect(),
+        discovery_addresses: discovery_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +622,101 @@ mod tests {
         assert_eq!(read_tcp_port(&pairs), None, "explicit zero");
         pairs.tcp_port = Some(9001);
         assert_eq!(read_tcp_port(&pairs), Some(9001));
+    }
+
+    /// The peer id the swarm runs under with `signer` as its node key, derived
+    /// the way `build_swarm` derives it.
+    fn swarm_peer_id(signer: &secp256k1::SecretKey) -> PeerId {
+        let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(signer.secret_bytes())
+            .expect("a valid key");
+        let keypair = libp2p::identity::secp256k1::Keypair::from(secret);
+        libp2p::identity::Keypair::from(keypair)
+            .public()
+            .to_peer_id()
+    }
+
+    fn record_at(signer: secp256k1::SecretKey, ip: IpAddr) -> NodeRecord {
+        build_local_enr(&LocalEnrParams {
+            signer,
+            ip,
+            discovery_port: 9000,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        })
+        .expect("ENR builds")
+    }
+
+    #[test]
+    fn the_advertised_addresses_are_the_ones_a_peer_dials() {
+        // The strings `/eth/v1/node/identity` reported when it built them from
+        // `--discovery.advertise-ip`, QUIC first as this node dials.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let peer_id = swarm_peer_id(&signer);
+        let record = record_at(signer, "203.0.113.7".parse().unwrap());
+
+        let advertised = advertised_record(&record);
+
+        assert_eq!(advertised.enr, record.enr_url().unwrap());
+        assert_eq!(
+            advertised.p2p_addresses,
+            vec![
+                format!("/ip4/203.0.113.7/udp/9001/quic-v1/p2p/{peer_id}"),
+                format!("/ip4/203.0.113.7/tcp/9001/p2p/{peer_id}"),
+            ]
+        );
+        assert_eq!(
+            advertised.discovery_addresses,
+            vec![format!("/ip4/203.0.113.7/udp/9000/p2p/{peer_id}")]
+        );
+    }
+
+    #[test]
+    fn an_ipv6_record_advertises_ipv6_addresses() {
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let peer_id = swarm_peer_id(&signer);
+        let record = record_at(signer, "2001:db8::7".parse().unwrap());
+
+        let advertised = advertised_record(&record);
+
+        assert_eq!(
+            advertised.p2p_addresses[0],
+            format!("/ip6/2001:db8::7/udp/9001/quic-v1/p2p/{peer_id}")
+        );
+        assert_eq!(
+            advertised.discovery_addresses,
+            vec![format!("/ip6/2001:db8::7/udp/9000/p2p/{peer_id}")]
+        );
+    }
+
+    #[test]
+    fn the_advertised_addresses_follow_the_records_ip() {
+        // Without `--discovery.advertise-ip` the record starts at `0.0.0.0`,
+        // which names no host: no address, though the record itself is still
+        // reported. IP voting then re-signs it with the external address, and
+        // the addresses, built from the record on each read, carry that one.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let peer_id = swarm_peer_id(&signer);
+        let mut record = record_at(signer, IpAddr::from(Ipv4Addr::UNSPECIFIED));
+
+        let unresolved = advertised_record(&record);
+        assert!(unresolved.enr.starts_with("enr:"));
+        assert!(unresolved.p2p_addresses.is_empty());
+        assert!(unresolved.discovery_addresses.is_empty());
+
+        record
+            .edit(&signer, |pairs| {
+                pairs.ip = Some(Ipv4Addr::new(198, 51, 100, 4))
+            })
+            .unwrap();
+        let resolved = advertised_record(&record);
+        assert_eq!(
+            resolved.discovery_addresses,
+            vec![format!("/ip4/198.51.100.4/udp/9000/p2p/{peer_id}")]
+        );
+        assert_eq!(resolved.p2p_addresses.len(), 2);
     }
 
     #[test]

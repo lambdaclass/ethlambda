@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_network_api::{AdvertisedRecord, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
     builder_market::SharedBuilderMarket, payload_attestation_pool::SharedPayloadAttestationPool,
     sync_committee_pool::SharedSyncCommitteePool,
@@ -252,12 +252,9 @@ pub struct CustodyColumns(pub Vec<u64>);
 /// How peers reach this node, as `/eth/v1/node/identity` reports it.
 #[derive(Debug, Clone, Default)]
 pub struct BeaconIdentity {
-    /// The node's ENR, `enr:`-prefixed, read when the endpoint is asked.
-    pub enr: EnrSource,
-    /// libp2p multiaddrs the node listens on, each ending in `/p2p/<peer id>`.
-    pub p2p_addresses: Vec<String>,
-    /// discv5 multiaddrs, likewise.
-    pub discovery_addresses: Vec<String>,
+    /// The node's ENR and the multiaddrs it advertises, read when the
+    /// endpoint is asked.
+    pub record: RecordSource,
     /// The `MetaData` the p2p layer answers peers with, read per request
     /// since its sequence number and `syncnets` change at runtime. `None`
     /// without a beacon p2p layer, which leaves `metadata` all-zero.
@@ -268,37 +265,40 @@ pub struct BeaconIdentity {
     pub peers: Option<ethlambda_network_api::PeerTableController>,
 }
 
-/// Where `/eth/v1/node/identity` reads the node's ENR from.
+/// Where `/eth/v1/node/identity` reads the node's ENR, and the addresses it
+/// advertises, from.
 ///
-/// A reader rather than a string because the record changes after startup:
+/// A reader rather than a value because the record changes after startup:
 /// discv5's IP voting re-signs it with a new address and a higher `seq`, and a
-/// copy taken at startup would go on reporting a record peers no longer get.
-/// The default reads nothing, which the endpoint reports as an empty ENR, the
-/// answer for a node that publishes none.
+/// copy taken at startup would go on reporting a record, and addresses, peers
+/// no longer get. The default reads nothing, which the endpoint reports as an
+/// empty ENR and no addresses, the answer for a node that publishes no record.
 #[derive(Clone, Default)]
-pub struct EnrSource(Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>);
+pub struct RecordSource(Option<Arc<dyn Fn() -> AdvertisedRecord + Send + Sync>>);
 
-impl EnrSource {
-    pub fn new(read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+impl RecordSource {
+    pub fn new(read: impl Fn() -> AdvertisedRecord + Send + Sync + 'static) -> Self {
         Self(Some(Arc::new(read)))
     }
 
-    /// The ENR right now, or an empty string when there is none to read.
-    pub fn current(&self) -> String {
-        self.0.as_ref().and_then(|read| read()).unwrap_or_default()
+    /// The record right now, or an empty one when there is none to read.
+    pub fn current(&self) -> AdvertisedRecord {
+        self.0.as_ref().map(|read| read()).unwrap_or_default()
     }
 }
 
-/// A fixed ENR, for a record that never changes.
-impl From<String> for EnrSource {
-    fn from(enr: String) -> Self {
-        Self::new(move || Some(enr.clone()))
+/// A fixed record, for one that never changes.
+impl From<AdvertisedRecord> for RecordSource {
+    fn from(record: AdvertisedRecord) -> Self {
+        Self::new(move || record.clone())
     }
 }
 
-impl std::fmt::Debug for EnrSource {
+impl std::fmt::Debug for RecordSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("EnrSource").field(&self.current()).finish()
+        f.debug_tuple("RecordSource")
+            .field(&self.current())
+            .finish()
     }
 }
 

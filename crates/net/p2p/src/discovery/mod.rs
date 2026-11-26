@@ -336,6 +336,12 @@ impl LocalEnr {
             .inspect_err(|err| warn!(%err, "Could not encode the local ENR"))
             .ok()
     }
+
+    /// The served record and the addresses it advertises, from one snapshot
+    /// of it (see [`enr::advertised_record`]).
+    pub fn advertised(&self) -> ethlambda_network_api::AdvertisedRecord {
+        enr::advertised_record(&self.0.load().record)
+    }
 }
 
 /// The write side of [`LocalEnr`]: edits the record discovery serves.
@@ -375,8 +381,8 @@ impl LocalEnrWriter {
         // The edit runs again on a newer record whenever IP voting swaps one in
         // first, so it must come out the same every time: it only replaces the
         // one entry, from bytes computed once above.
-        let edited = self.local_node.edit_record(&self.signer, |pairs| {
-            let stored = pairs.set_extra(ETH2_ENR_KEY, eth2.clone());
+        let edited = self.local_node.edit_record(&self.signer, |entries| {
+            let stored = entries.set_extra(ETH2_ENR_KEY, eth2.clone());
             debug_assert!(stored, "eth2 is outside the ENR dictionary");
         });
         let fork_digest = hex::encode(fork_id.fork_digest);

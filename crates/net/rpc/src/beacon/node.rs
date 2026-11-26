@@ -106,12 +106,12 @@ async fn get_version(version: &'static str) -> Response {
 /// multiaddrs it listens on, which is how a peer that reads this endpoint (a
 /// devnet orchestrator wiring bootnodes, say) dials it.
 ///
-/// The addresses are only as good as `--discovery.advertise-ip`: without it the
-/// node does not know the address peers reach it on, so the lists are empty.
-/// The ENR is read live, so it can still gain a usable IP without the flag: it
-/// starts with no usable one (the `0.0.0.0` discovery binds), and discv5's IP
-/// voting re-signs it with the external address once peers agree on one. The
-/// lists stay empty even then.
+/// The ENR and the addresses are read live, from one read of the record discv5
+/// serves, so they always agree. The addresses are the ones that record
+/// advertises: with `--discovery.advertise-ip` that IP from the start. Without
+/// it the record starts with no usable IP (the `0.0.0.0` discovery binds) and
+/// the lists are empty, until discv5's IP voting re-signs the record with the
+/// external address once peers agree on one; the lists then carry that.
 ///
 /// `metadata` is the `MetaData` peers get over req/resp, read at request time.
 /// Its `seq_number` versions that `MetaData` alone, so it is not the ENR's
@@ -133,12 +133,13 @@ async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) 
             "syncnets": "0x00",
         }),
     };
+    let record = identity.record.current();
     crate::json_response(serde_json::json!({
         "data": {
             "peer_id": peer_id,
-            "enr": identity.enr.current(),
-            "p2p_addresses": identity.p2p_addresses,
-            "discovery_addresses": identity.discovery_addresses,
+            "enr": record.enr,
+            "p2p_addresses": record.p2p_addresses,
+            "discovery_addresses": record.discovery_addresses,
             "metadata": metadata,
         }
     }))
@@ -412,10 +413,13 @@ mod tests {
     #[tokio::test]
     async fn identity_reports_the_enr_and_listen_addresses() {
         let fixture = beacon_fixture(ANCHOR_SLOT);
-        let identity = crate::BeaconIdentity {
-            enr: "enr:-abc".to_string().into(),
+        let record = ethlambda_network_api::AdvertisedRecord {
+            enr: "enr:-abc".to_string(),
             p2p_addresses: vec!["/ip4/10.0.0.1/tcp/9001/p2p/test-peer".to_string()],
             discovery_addresses: vec!["/ip4/10.0.0.1/udp/9000/p2p/test-peer".to_string()],
+        };
+        let identity = crate::BeaconIdentity {
+            record: record.into(),
             metadata: None,
             peers: None,
         };
@@ -435,6 +439,52 @@ mod tests {
         assert_eq!(
             json["data"]["discovery_addresses"][0],
             "/ip4/10.0.0.1/udp/9000/p2p/test-peer"
+        );
+    }
+
+    /// The record is read on each request, so once IP voting moves the address
+    /// the next answer carries it, in the ENR and the addresses alike.
+    #[tokio::test]
+    async fn identity_reads_the_record_on_each_request() {
+        use ethlambda_network_api::AdvertisedRecord;
+        let served = std::sync::Arc::new(std::sync::Mutex::new(AdvertisedRecord {
+            enr: "enr:-unresolved".to_string(),
+            ..Default::default()
+        }));
+        let reader = std::sync::Arc::clone(&served);
+        let identity = crate::BeaconIdentity {
+            record: crate::RecordSource::new(move || reader.lock().unwrap().clone()),
+            ..Default::default()
+        };
+        let app = routes("ethlambda/test", "test-peer".into())
+            .with_state(beacon_fixture(ANCHOR_SLOT).store)
+            .layer(Extension(identity));
+        let ask = || {
+            let request = Request::builder()
+                .uri("/eth/v1/node/identity")
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+
+        let json = body_json(ask().await.unwrap()).await;
+        assert_eq!(json["data"]["enr"], "enr:-unresolved");
+        assert_eq!(json["data"]["p2p_addresses"], serde_json::json!([]));
+
+        *served.lock().unwrap() = AdvertisedRecord {
+            enr: "enr:-resolved".to_string(),
+            p2p_addresses: vec!["/ip4/198.51.100.4/tcp/9001/p2p/test-peer".to_string()],
+            discovery_addresses: vec!["/ip4/198.51.100.4/udp/9000/p2p/test-peer".to_string()],
+        };
+        let json = body_json(ask().await.unwrap()).await;
+        assert_eq!(json["data"]["enr"], "enr:-resolved");
+        assert_eq!(
+            json["data"]["p2p_addresses"][0],
+            "/ip4/198.51.100.4/tcp/9001/p2p/test-peer"
+        );
+        assert_eq!(
+            json["data"]["discovery_addresses"][0],
+            "/ip4/198.51.100.4/udp/9000/p2p/test-peer"
         );
     }
 

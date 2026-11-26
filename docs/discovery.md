@@ -98,7 +98,9 @@ compare-and-swap. Nothing takes a lock.
 
 `/eth/v1/node/identity` therefore reports the record discovery serves *now*, not
 the one logged at startup, so what the Beacon API reports and what peers get over
-discv5 are the same bytes after IP voting and after a boundary alike.
+discv5 are the same bytes after IP voting and after a boundary alike. The
+endpoint's multiaddrs are built from that same read, the way a peer reading the
+record would dial it, so they follow IP voting too.
 
 An edit is re-signed with `seq` bumped once, and discovery advertises the new
 `seq` in its next PING or PONG, which is what sends peers back for the record. If

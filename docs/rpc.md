@@ -1017,12 +1017,13 @@ slot a checkpoint-syncing peer asks for right after reading the finalized
 state. A slot the store holds nothing at is still a `404`.
 
 `/eth/v1/node/identity` reports the peer id, the ENR discv5 serves at the moment
-of the request, and the node's QUIC, TCP and discv5 multiaddrs. The ENR is read
-from discovery's own copy, so once discv5's IP voting re-signs it with the
-external address, the endpoint reports that record rather than the startup one.
-The multiaddrs need `--discovery.advertise-ip`, since a node bound to `0.0.0.0`
-does not know the address peers reach it on; without the flag they are empty,
-and the ENR carries no usable IP until IP voting supplies one. `metadata` is the
+of the request, and the QUIC, TCP and discv5 multiaddrs that ENR advertises, all
+from one read of discovery's own copy. Once discv5's IP voting re-signs the
+record with the external address, the endpoint reports that record and its
+addresses rather than the startup ones. With `--discovery.advertise-ip` the
+record carries that address from the start. Without it, a node bound to
+`0.0.0.0` does not know the address peers reach it on: the ENR carries no usable
+IP and the multiaddrs are empty until IP voting supplies one. `metadata` is the
 `MetaData` the node answers peers with over req/resp, read at request time, so
 `syncnets` and `seq_number` follow the sync committee subnets a validator client
 asks for. That `seq_number` versions `MetaData` alone: the p2p specification
