@@ -142,12 +142,12 @@ impl Serialize for ExecutionPayloadV3<'_> {
 /// deneb's, so it needs its own serializer; the wire shape of those two is
 /// unchanged.
 ///
-/// `dependencyWitnesses` comes last and is not in the specification's
-/// `ExecutionPayloadV4`: an array of `DATA`, written exactly when the payload
-/// has the field, and then even when the list is empty, so that the execution
-/// client reads the list its block header commits to. A payload without the
-/// field, from before `HEZE_FORK_EPOCH`, is written as the specification's
-/// object, with no such key.
+/// `claimWitnesses` comes last and is not in the specification's
+/// `ExecutionPayloadV4`: one `DATA`, written exactly when the payload has the
+/// field, and then even when it is empty (`0x`), so that the execution client
+/// reads the bytes its block header commits to. A payload without the field,
+/// from before `HEZE_FORK_EPOCH`, is written as the specification's object,
+/// with no such key.
 pub struct ExecutionPayloadV4<'a>(pub &'a gloas::ExecutionPayload);
 
 impl Serialize for ExecutionPayloadV4<'_> {
@@ -155,7 +155,7 @@ impl Serialize for ExecutionPayloadV4<'_> {
         use serde::ser::SerializeStruct as _;
 
         let payload = self.0;
-        let members = if payload.dependency_witnesses.is_some() {
+        let members = if payload.claim_witnesses.is_some() {
             20
         } else {
             19
@@ -191,12 +191,8 @@ impl Serialize for ExecutionPayloadV4<'_> {
         out.serialize_field("blockAccessList", &data(payload.block_access_list.as_ref()))?;
         out.serialize_field("slotNumber", &quantity(payload.slot_number))?;
 
-        if let Some(dependency_witnesses) = &payload.dependency_witnesses {
-            let dependency_witnesses: Vec<String> = dependency_witnesses
-                .iter()
-                .map(|witness| data(witness.as_ref()))
-                .collect();
-            out.serialize_field("dependencyWitnesses", &dependency_witnesses)?;
+        if let Some(claim_witnesses) = &payload.claim_witnesses {
+            out.serialize_field("claimWitnesses", &data(claim_witnesses))?;
         }
         out.end()
     }
@@ -532,20 +528,20 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 4096,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         };
 
         // A payload without the field is the specification's object.
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
         let object = json.as_object().expect("a JSON object");
-        assert!(!object.contains_key("dependencyWitnesses"));
+        assert!(!object.contains_key("claimWitnesses"));
         assert_eq!(object.len(), 19);
 
-        // A payload with the field and no witnesses writes an empty array,
-        // never an absent key.
-        payload.dependency_witnesses = Some(Default::default());
+        // A payload with the field and no witnesses writes the empty
+        // `DATA`, never an absent key.
+        payload.claim_witnesses = Some(Default::default());
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
-        assert_eq!(json["dependencyWitnesses"], serde_json::json!([]));
+        assert_eq!(json["claimWitnesses"], "0x");
         assert_eq!(json.as_object().expect("a JSON object").len(), 20);
 
         let transaction: gloas::Transaction = vec![0x02u8, 0xab].try_into().expect("fits");
@@ -559,13 +555,7 @@ mod tests {
         for byte in [0xc1u8, 0x80] {
             payload.block_access_list.push(byte);
         }
-        payload.dependency_witnesses = Some(
-            vec![
-                gloas::DependencyWitness::from(vec![0x01u8, 0x02]),
-                gloas::DependencyWitness::from(vec![0xff]),
-            ]
-            .into(),
-        );
+        payload.claim_witnesses = Some(vec![0x00u8, 0x01, 0xff].try_into().expect("fits"));
 
         let json = serde_json::to_value(ExecutionPayloadV4(&payload)).expect("serializes");
 
@@ -594,7 +584,7 @@ mod tests {
             "excessBlobGas": "0x0",
             "blockAccessList": "0xc180",
             "slotNumber": "0x1000",
-            "dependencyWitnesses": ["0x0102", "0xff"],
+            "claimWitnesses": "0x0001ff",
         });
         assert_eq!(json, expected);
 
@@ -602,7 +592,7 @@ mod tests {
         // witnesses after everything the specification names.
         let text = serde_json::to_string(&ExecutionPayloadV4(&payload)).expect("serializes");
         assert!(text.ends_with(
-            r#""blockAccessList":"0xc180","slotNumber":"0x1000","dependencyWitnesses":["0x0102","0xff"]}"#
+            r#""blockAccessList":"0xc180","slotNumber":"0x1000","claimWitnesses":"0x0001ff"}"#
         ));
     }
 

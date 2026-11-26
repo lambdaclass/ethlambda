@@ -260,7 +260,7 @@ fn gloas_payload() -> gloas::ExecutionPayload {
         excess_blob_gas: payload.excess_blob_gas,
         block_access_list: vec![0xca, 0xfe].into(),
         slot_number: 33,
-        dependency_witnesses: Some(vec![gloas::DependencyWitness::from(vec![0xbe, 0xef])].into()),
+        claim_witnesses: Some(vec![0x00, 0xbe, 0xef].try_into().unwrap()),
     }
 }
 
@@ -401,42 +401,47 @@ fn a_gloas_envelope_round_trips_through_json() {
 }
 
 #[test]
-fn a_gloas_payload_writes_its_dependency_witnesses_as_hex_strings() {
+fn a_gloas_payload_writes_its_claim_witnesses_as_one_hex_string() {
     let json = serde_json::to_value(gloas_payload()).unwrap();
-    assert_eq!(json["dependency_witnesses"], serde_json::json!(["0xbeef"]));
+    assert_eq!(json["claim_witnesses"], "0x00beef");
 }
 
 #[test]
-fn a_gloas_payload_without_dependency_witnesses_in_its_json_has_none() {
+fn a_gloas_payload_without_claim_witnesses_in_its_json_has_none() {
     let mut json = serde_json::to_value(gloas_payload()).unwrap();
-    json.as_object_mut().unwrap().remove("dependency_witnesses");
+    json.as_object_mut().unwrap().remove("claim_witnesses");
     let payload: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
-    assert_eq!(payload.dependency_witnesses, None);
+    assert_eq!(payload.claim_witnesses, None);
 }
 
 #[test]
-fn a_gloas_payload_without_the_dependency_witnesses_field_writes_no_such_key() {
+fn a_gloas_payload_without_the_claim_witnesses_field_writes_no_such_key() {
     let mut payload = gloas_payload();
-    payload.dependency_witnesses = None;
+    payload.claim_witnesses = None;
     let json = serde_json::to_value(&payload).unwrap();
-    assert!(
-        !json
-            .as_object()
-            .unwrap()
-            .contains_key("dependency_witnesses")
-    );
+    assert!(!json.as_object().unwrap().contains_key("claim_witnesses"));
     let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
     assert_eq!(reread, payload);
 }
 
 #[test]
-fn a_gloas_payload_with_an_empty_dependency_witnesses_list_keeps_the_field_in_json() {
+fn a_gloas_payload_with_empty_claim_witnesses_keeps_the_field_in_json() {
     let mut payload = gloas_payload();
-    payload.dependency_witnesses = Some(Default::default());
+    payload.claim_witnesses = Some(Default::default());
     let json = serde_json::to_value(&payload).unwrap();
-    assert_eq!(json["dependency_witnesses"], serde_json::json!([]));
+    assert_eq!(json["claim_witnesses"], "0x");
     let reread: gloas::ExecutionPayload = serde_json::from_value(json).unwrap();
     assert_eq!(reread, payload);
+}
+
+#[test]
+fn claim_witnesses_over_the_bound_are_refused_in_json() {
+    let mut json = serde_json::to_value(gloas_payload()).unwrap();
+    json["claim_witnesses"] = format!("0x{}", "00".repeat(gloas::MAX_BLOCK_WITNESS_BYTES)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json.clone()).is_ok());
+    json["claim_witnesses"] =
+        format!("0x{}", "00".repeat(gloas::MAX_BLOCK_WITNESS_BYTES + 1)).into();
+    assert!(serde_json::from_value::<gloas::ExecutionPayload>(json).is_err());
 }
 
 #[test]

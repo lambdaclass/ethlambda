@@ -2030,7 +2030,7 @@ fn first_config_difference(
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
-        // Not a fork of this node's: the epoch payloads carry dependency
+        // Not a fork of this node's: the epoch payloads carry claim
         // witnesses from. Compared below under the fork schedule's rule,
         // since a payload validated before it and one validated after it are
         // different containers.
@@ -4325,7 +4325,7 @@ mod anchor_envelope_root_tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

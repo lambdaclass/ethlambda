@@ -18,7 +18,7 @@
 //!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
 //!   reported as an unknown key instead. `HEZE_FORK_EPOCH` is the exception:
 //!   it is read as [`Config::heze_fork_epoch`], for the one thing this build
-//!   does at that epoch (see [`Config::carries_dependency_witnesses`]), and
+//!   does at that epoch (see [`Config::carries_claim_witnesses`]), and
 //!   schedules no fork of its own. `GAS_LIMIT_SCHEDULE` (gloas-era)
 //!   stays out too, since it is a list rather than a scalar. The rest are
 //!   heze-era data keys, not gloas's, with no reader in this build at all:
@@ -334,9 +334,9 @@ pub struct Config {
     ///
     /// This build does not process heze: the fork a state or a signature
     /// belongs to never reads this, and there is no `heze_fork_version`. It
-    /// is the epoch from which an execution payload carries dependency
+    /// is the epoch from which an execution payload carries claim
     /// witnesses, and nothing else: see
-    /// [`Self::carries_dependency_witnesses`].
+    /// [`Self::carries_claim_witnesses`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub heze_fork_epoch: Epoch,
 
@@ -1069,15 +1069,15 @@ impl Config {
             .unwrap_or(ForkName::Phase0)
     }
 
-    /// Whether an execution payload of `epoch` carries dependency witnesses.
+    /// Whether an execution payload of `epoch` carries claim witnesses.
     ///
     /// The execution layer's blocks carry them from the upgrade whose
     /// consensus side is heze, so its epoch decides: before it a payload is
     /// the specification's gloas container, and from it on the container has
-    /// one more field, the witness list, present even when it is empty.
-    /// Nothing else changes at that epoch in this build, which stays on
-    /// gloas.
-    pub fn carries_dependency_witnesses(&self, epoch: Epoch) -> bool {
+    /// one more field, the claim witnesses, present even when they are an
+    /// empty string. Nothing else changes at that epoch in this build, which
+    /// stays on gloas.
+    pub fn carries_claim_witnesses(&self, epoch: Epoch) -> bool {
         self.heze_fork_epoch != constants::FAR_FUTURE_EPOCH && self.heze_fork_epoch <= epoch
     }
 
@@ -1203,17 +1203,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_payload_carries_dependency_witnesses_from_the_heze_epoch() {
+    fn a_payload_carries_claim_witnesses_from_the_heze_epoch() {
         let mut config = Config::minimal();
         // Not scheduled: never, the last epoch included.
         assert_eq!(config.heze_fork_epoch, constants::FAR_FUTURE_EPOCH);
-        assert!(!config.carries_dependency_witnesses(0));
-        assert!(!config.carries_dependency_witnesses(constants::FAR_FUTURE_EPOCH));
+        assert!(!config.carries_claim_witnesses(0));
+        assert!(!config.carries_claim_witnesses(constants::FAR_FUTURE_EPOCH));
 
         config.heze_fork_epoch = 3;
-        assert!(!config.carries_dependency_witnesses(2));
-        assert!(config.carries_dependency_witnesses(3));
-        assert!(config.carries_dependency_witnesses(4));
+        assert!(!config.carries_claim_witnesses(2));
+        assert!(config.carries_claim_witnesses(3));
+        assert!(config.carries_claim_witnesses(4));
 
         // Scheduling it moves no fork: the node stays on the fork it was on.
         let fork_before = Config::minimal().fork_at_epoch(3);
@@ -1225,7 +1225,7 @@ mod tests {
         let yaml = "HEZE_FORK_VERSION: 0x90000038\nHEZE_FORK_EPOCH: 1\n";
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.heze_fork_epoch, 1);
-        assert!(config.carries_dependency_witnesses(1));
+        assert!(config.carries_claim_witnesses(1));
     }
 
     #[test]

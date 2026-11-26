@@ -754,14 +754,14 @@ pub fn verify_execution_payload_envelope(
     )?;
     // Not in the specification, whose payload has no such field. From
     // `HEZE_FORK_EPOCH` on a payload is the container with
-    // `dependency_witnesses`, and before it the one without. The two encode
+    // `claim_witnesses`, and before it the one without. The two encode
     // and hash differently even with no witnesses, and nothing else an
     // envelope is checked against tells them apart, so the wrong one for the
     // slot is refused here.
     verify(
-        payload.dependency_witnesses.is_some()
-            == config.carries_dependency_witnesses(compute_epoch_at_slot(state.slot())),
-        "verify_execution_payload_envelope: payload.dependency_witnesses is present          exactly from HEZE_FORK_EPOCH",
+        payload.claim_witnesses.is_some()
+            == config.carries_claim_witnesses(compute_epoch_at_slot(state.slot())),
+        "verify_execution_payload_envelope: payload.claim_witnesses is present          exactly from HEZE_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,
@@ -2151,7 +2151,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         }
     }
 
@@ -2255,7 +2255,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: slot,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         };
 
         let mut message = gloas::ExecutionPayloadEnvelope {

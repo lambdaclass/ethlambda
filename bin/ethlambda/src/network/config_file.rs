@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn the_heze_epoch_is_claimed_although_heze_is_not_processed() {
-        // The one heze key with a reader: the epoch payloads carry dependency
+        // The one heze key with a reader: the epoch payloads carry claim
         // witnesses from. The devnet file leaves it unscheduled.
         let parsed = ConfigFile::parse(DEVNET).unwrap();
         assert!(!parsed.ignored.contains(&"HEZE_FORK_EPOCH".to_string()));

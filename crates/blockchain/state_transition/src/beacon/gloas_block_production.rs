@@ -618,9 +618,9 @@ fn check_envelope(
         "payload.slot_number == state.slot",
     )?;
     verify(
-        payload.dependency_witnesses.is_some()
-            == config.carries_dependency_witnesses(get_current_epoch(post)),
-        "payload.dependency_witnesses is present exactly from HEZE_FORK_EPOCH",
+        payload.claim_witnesses.is_some()
+            == config.carries_claim_witnesses(get_current_epoch(post)),
+        "payload.claim_witnesses is present exactly from HEZE_FORK_EPOCH",
     )?;
     verify(
         payload.parent_hash == inner.latest_block_hash,
@@ -724,7 +724,7 @@ pub mod test_support {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: inputs.slot_number,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         }
     }
 
@@ -1147,7 +1147,7 @@ mod gloas_block_production_tests {
     }
 
     #[test]
-    fn a_payload_has_dependency_witnesses_exactly_from_the_heze_epoch() {
+    fn a_payload_has_claim_witnesses_exactly_from_the_heze_epoch() {
         let state = state_to_build_on();
         let epoch = get_current_epoch(&state);
         let requests = ExecutionRequests::default();
@@ -1160,11 +1160,8 @@ mod gloas_block_production_tests {
         )
         .unwrap();
         let without = payload_for(&inputs);
-        assert_eq!(without.dependency_witnesses, None);
-        let with = without
-            .clone()
-            .with_dependency_witnesses_field(true)
-            .unwrap();
+        assert_eq!(without.claim_witnesses, None);
+        let with = without.clone().with_claim_witnesses_field(true).unwrap();
 
         let assemble = |payload: &ExecutionPayload, config: &Config| {
             assemble_gloas_block(
@@ -1232,7 +1229,7 @@ mod gloas_block_production_tests {
         assert!(import(&produced_without, &unscheduled).is_ok());
 
         // Scheduled at the block's own epoch: a payload has the field, here
-        // with an empty list.
+        // with an empty string.
         let mut from_this_epoch = config();
         from_this_epoch.heze_fork_epoch = epoch;
         let produced_with = assemble(&with, &from_this_epoch).unwrap();

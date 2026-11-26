@@ -43,8 +43,8 @@ Two method families a full client would have are deliberately absent:
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
-  `slotNumber`, and on this branch `dependencyWitnesses` from
-  `HEZE_FORK_EPOCH`: see [Dependency witnesses](#dependency-witnesses)) from
+  `slotNumber`, and on this branch `claimWitnesses` from
+  `HEZE_FORK_EPOCH`: see [Claim witnesses](#claim-witnesses)) from
   gloas on. The handshake
   warns when a gloas network's execution client does not advertise
   `engine_getPayloadV6`.
@@ -318,56 +318,63 @@ costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
 
-### Dependency witnesses
+### Claim witnesses
 
-This branch pairs with an execution client whose blocks carry *dependency
-witnesses*: post-quantum signatures (leanSPHINCS, 7,740 bytes each) that sit in
-the block outside its transactions, and that the execution block header commits
-to with a field of its own. Execution blocks have that list from the upgrade
-whose consensus side is heze, so `HEZE_FORK_EPOCH` is the epoch a payload
-carries it from. From that epoch `ExecutionPayloadV4` has one more member here
-than the specification gives it; before it, the object is the specification's:
+This branch pairs with an execution client whose transactions declare *claims*
+(a signature or a proof that some verifier accepts) without carrying the bytes
+that satisfy them. Those bytes, the *claim witnesses*, sit in the block outside
+its transactions, and the execution block header commits to them with a field
+of its own. Execution blocks have them from the upgrade whose consensus side is
+heze, so `HEZE_FORK_EPOCH` is the epoch a payload carries them from. From that
+epoch `ExecutionPayloadV4` has one more member here than the specification
+gives it; before it, the object is the specification's:
 
-| Method | Direction | `dependencyWitnesses` |
+| Method | Direction | `claimWitnesses` |
 |---|---|---|
-| `engine_getPayloadV6` | read | An array of `DATA`, one string per witness. An element that is not `0x`-prefixed hex fails the whole answer, like any other malformed field. What an absent key or `null` means depends on the payload's slot: see below |
-| `engine_newPayloadV5` | written | An array of `DATA`, the payload's last member, when the payload has the field: `[]` when the list is empty. No such key when the payload does not have the field |
+| `engine_getPayloadV6` | read | One `DATA`. A string that is not `0x`-prefixed hex, or that is longer than `MAX_BLOCK_WITNESS_BYTES` (2,097,152 bytes), fails the whole answer, like any other malformed field. What an absent key or `null` means depends on the payload's slot: see below |
+| `engine_newPayloadV5` | written | One `DATA`, the payload's last member, when the payload has the field: `0x` when it is empty. No such key when the payload does not have the field |
 
 ```json
-"dependencyWitnesses": ["0x<15480 hex digits>", "0x<15480 hex digits>"]
+"claimWitnesses": "0x00<the witnesses, in the execution layer's encoding>"
 ```
 
-Between the two calls the list is `dependency_witnesses`, the last field of the
-gloas `ExecutionPayload` container from `HEZE_FORK_EPOCH` on, so the builder's
-signature covers it and it is gossiped, served and stored with the envelope,
-like the transactions. Before that epoch the container has no such field. In
-the code the field is an `Option`: `None` is the container without it, `Some`
-the container with it, and `Some` of an empty list is not `None`. The Beacon
-API's JSON names it `dependency_witnesses`, an array of hex strings, and
-leaves the key out of a payload that does not have the field.
+The witnesses are one byte string, and nothing on this side parses it: its
+first byte is a version and the rest is in an encoding the execution layer
+defines, which a later version byte may change without this node noticing. A
+block with no claim to satisfy has the empty string.
+
+Between the two calls the string is `claim_witnesses`, the last field of the
+gloas `ExecutionPayload` container from `HEZE_FORK_EPOCH` on, a
+`ByteList[MAX_BLOCK_WITNESS_BYTES]`, so the builder's signature covers it and
+it is gossiped, served and stored with the envelope, like the transactions.
+Before that epoch the container has no such field. In the code the field is an
+`Option`: `None` is the container without it, `Some` the container with it,
+and `Some` of an empty string is not `None`. The Beacon API's JSON names it
+`claim_witnesses`, one hex string, and leaves the key out of a payload that
+does not have the field.
 
 The execution client and this node must agree on the epoch. On the proposal
 path the node settles it from the payload's own slot
-(`ExecutionPayload::with_dependency_witnesses_field`): from the epoch on, an
-answer without the key becomes the empty list; before it, an empty list is
+(`ExecutionPayload::with_claim_witnesses_field`): from the epoch on, an
+answer without the key becomes the empty string; before it, an empty string is
 dropped, and an answer that holds witnesses is refused, because the execution
 block commits to them and the payload cannot carry them.
 
 The follower never rebuilds the execution header or its hash, so the header's
-commitment needs nothing on this side: `engine_newPayloadV5` hands the list to
-the execution client, which checks it against the header and verifies every
-signature. What the follower judges is which container the payload is and
-each witness's length. An envelope whose payload has the field before
-`HEZE_FORK_EPOCH`, or lacks it from that epoch on, is rejected by the
-envelope's gossip rule (`gossip::envelope::cheap_checks`) and by
-`verify_execution_payload_envelope`. So is one with a witness that is not
-exactly 7,740 bytes long (`LEAN_SPHINCS_SIGNATURE_SIZE`), by the gossip rule,
-which gossiped and fetched envelopes both go through before one can be parked
-or the engine asked.
+commitment needs nothing on this side: `engine_newPayloadV5` hands the string
+to the execution client, which checks it against the header and verifies every
+witness. What the follower judges is which container the payload is, and the
+size bound. An envelope whose payload has the field before `HEZE_FORK_EPOCH`,
+or lacks it from that epoch on, is rejected by the envelope's gossip rule
+(`gossip::envelope::cheap_checks`) and by `verify_execution_payload_envelope`.
+The bound is the container's: a payload whose witnesses are longer than
+`MAX_BLOCK_WITNESS_BYTES` does not decode, from gossip, from a peer's answer,
+from the Beacon API or from the execution client. The bound is below the
+10 MiB an envelope may take on the wire, which does not change.
 
 The field changes the encoding and the root of every payload from
 `HEZE_FORK_EPOCH` on, which is a departure from the specification:
-see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-dependency-witnesses-from-the-heze-epoch).
+see [spec_deviations.md](./spec_deviations.md#the-execution-payload-carries-claim-witnesses-from-the-heze-epoch).
 
 ## Blobs from the execution client
 

@@ -445,7 +445,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 5,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         };
         containers::gloas::SignedExecutionPayloadEnvelope {
             message: containers::gloas::ExecutionPayloadEnvelope {

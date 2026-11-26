@@ -23,11 +23,11 @@
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
 //!   not parked waiting for its block.
-//! - [`cheap_checks`] rejects a payload that has the `dependency_witnesses`
-//!   field before `HEZE_FORK_EPOCH` or lacks it from that epoch on, and one
-//!   whose list holds an item of any length but
-//!   [`LEAN_SPHINCS_SIGNATURE_SIZE`]. The specification's payload has no such
-//!   list, so it has no rule for it.
+//! - [`cheap_checks`] rejects a payload that has the `claim_witnesses`
+//!   field before `HEZE_FORK_EPOCH` or lacks it from that epoch on. The
+//!   specification's payload has no such field, so it has no rule for it.
+//!   What the field holds is not looked at, and its size bound is the
+//!   container's: a payload over it does not decode.
 
 use std::num::NonZeroUsize;
 
@@ -47,13 +47,6 @@ use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
 use crate::beacon::stf::gloas::verify_execution_payload_envelope_signature;
-
-/// The length in bytes of a leanSPHINCS signature, which is what each of a
-/// payload's dependency witnesses is.
-///
-/// Only the length is judged here: the execution client verifies the
-/// signatures themselves when it is asked about the payload.
-pub const LEAN_SPHINCS_SIGNATURE_SIZE: usize = 7_740;
 
 /// The first valid envelope per `(block root, builder index)`: the
 /// specification's `seen.execution_payload_envelopes`.
@@ -112,24 +105,14 @@ pub fn cheap_checks(
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
-    // [REJECT] The payload has the dependency witnesses field exactly when
-    // its slot is at or after `HEZE_FORK_EPOCH`. The payload names its own
-    // slot, so this needs no block either.
-    let witnesses = &message.payload.dependency_witnesses;
+    // [REJECT] The payload has the claim witnesses field exactly when its
+    // slot is at or after `HEZE_FORK_EPOCH`. The payload names its own slot,
+    // so this needs no block either. The witnesses themselves are the
+    // execution client's to read: nothing here parses them.
+    let witnesses = &message.payload.claim_witnesses;
     let payload_epoch = compute_epoch_at_slot(message.payload.slot_number);
-    if witnesses.is_some() != store.config().carries_dependency_witnesses(payload_epoch) {
-        return Err(Outcome::Reject(RejectReason::DependencyWitnessesField));
-    }
-    // [REJECT] Every dependency witness is exactly one leanSPHINCS signature
-    // long. No block can make a witness of another length valid, so, like the
-    // limits above, this runs before anything can be queued, and before the
-    // execution client is asked to verify the signatures.
-    if witnesses
-        .iter()
-        .flatten()
-        .any(|witness| witness.len() != LEAN_SPHINCS_SIGNATURE_SIZE)
-    {
-        return Err(Outcome::Reject(RejectReason::DependencyWitnessSize));
+    if witnesses.is_some() != store.config().carries_claim_witnesses(payload_epoch) {
+        return Err(Outcome::Reject(RejectReason::ClaimWitnessesField));
     }
     Ok(())
 }
@@ -281,7 +264,7 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: slot,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {
@@ -324,8 +307,8 @@ mod tests {
         );
     }
 
-    /// `store(0)` with payloads carrying dependency witnesses from genesis.
-    fn store_with_dependency_witnesses() -> Store {
+    /// `store(0)` with payloads carrying claim witnesses from genesis.
+    fn store_with_claim_witnesses() -> Store {
         let mut store = store(0);
         let mut config = (*store.config()).clone();
         config.heze_fork_epoch = 0;
@@ -334,35 +317,35 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_with_the_dependency_witnesses_field_is_rejected_before_its_epoch() {
+    fn a_payload_with_the_claim_witnesses_field_is_rejected_before_its_epoch() {
         // `store(0)` schedules no epoch for the field, so no payload has it.
         let store = store(0);
         let mut envelope = envelope(5, 0);
-        envelope.message.payload.dependency_witnesses = Some(Default::default());
+        envelope.message.payload.claim_witnesses = Some(Default::default());
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &envelope),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::ClaimWitnessesField)),
         );
         // The block is unknown, which would queue a well-formed envelope.
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope),
-            Outcome::Reject(RejectReason::DependencyWitnessesField)
+            Outcome::Reject(RejectReason::ClaimWitnessesField)
         );
     }
 
     #[test]
-    fn a_payload_without_the_dependency_witnesses_field_is_rejected_from_its_epoch() {
-        let store = store_with_dependency_witnesses();
+    fn a_payload_without_the_claim_witnesses_field_is_rejected_from_its_epoch() {
+        let store = store_with_claim_witnesses();
         let envelope = envelope(5, 0);
-        assert_eq!(envelope.message.payload.dependency_witnesses, None);
+        assert_eq!(envelope.message.payload.claim_witnesses, None);
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &envelope),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::ClaimWitnessesField)),
         );
     }
 
     #[test]
-    fn the_dependency_witnesses_field_is_judged_by_the_payloads_own_slot() {
+    fn the_claim_witnesses_field_is_judged_by_the_payloads_own_slot() {
         let mut store = store(0);
         let mut config = (*store.config()).clone();
         config.heze_fork_epoch = 1;
@@ -371,60 +354,36 @@ mod tests {
 
         let mut before = envelope(first_slot_with_the_field - 1, 0);
         assert_eq!(cheap_checks(&seen_envelopes(), &store, &before), Ok(()));
-        before.message.payload.dependency_witnesses = Some(Default::default());
+        before.message.payload.claim_witnesses = Some(Default::default());
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &before),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::ClaimWitnessesField)),
         );
 
         let mut from = envelope(first_slot_with_the_field, 0);
         assert_eq!(
             cheap_checks(&seen_envelopes(), &store, &from),
-            Err(Outcome::Reject(RejectReason::DependencyWitnessesField)),
+            Err(Outcome::Reject(RejectReason::ClaimWitnessesField)),
         );
-        from.message.payload.dependency_witnesses = Some(Default::default());
+        from.message.payload.claim_witnesses = Some(Default::default());
         assert_eq!(cheap_checks(&seen_envelopes(), &store, &from), Ok(()));
     }
 
     #[test]
-    fn a_dependency_witness_of_the_wrong_size_is_rejected_before_any_block_lookup() {
-        let store = store_with_dependency_witnesses();
-        let well_sized = gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]);
-        for wrong_size in [
-            0,
-            LEAN_SPHINCS_SIGNATURE_SIZE - 1,
-            LEAN_SPHINCS_SIGNATURE_SIZE + 1,
-        ] {
-            // The wrong-sized witness is the second of two, so one good item
-            // does not vouch for the list.
+    fn claim_witnesses_are_not_parsed_by_the_cheap_checks() {
+        let store = store_with_claim_witnesses();
+        // No version byte the execution layer knows, and no structure after
+        // it: bytes within the bound pass whatever they are.
+        for witnesses in [vec![], vec![0xff], vec![0x00; 7_741]] {
             let mut envelope = envelope(5, 0);
-            envelope.message.payload.dependency_witnesses =
-                Some(vec![well_sized.clone(), vec![0u8; wrong_size].into()].into());
-            assert_eq!(
-                cheap_checks(&seen_envelopes(), &store, &envelope),
-                Err(Outcome::Reject(RejectReason::DependencyWitnessSize)),
-                "a witness of {wrong_size} bytes"
-            );
-            // The block is unknown, which would queue a well-formed envelope.
+            envelope.message.payload.claim_witnesses =
+                Some(witnesses.try_into().expect("within the bound"));
+            assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
             assert_eq!(
                 validate(&seen_envelopes(), &store, &envelope),
-                Outcome::Reject(RejectReason::DependencyWitnessSize)
+                Outcome::Queue(QueueReason::BlockUnknown)
             );
         }
-    }
-
-    #[test]
-    fn dependency_witnesses_of_the_signature_size_pass_the_cheap_checks() {
-        let store = store_with_dependency_witnesses();
-        let mut envelope = envelope(5, 0);
-        envelope.message.payload.dependency_witnesses = Some(
-            vec![gloas::DependencyWitness::from(vec![0u8; LEAN_SPHINCS_SIGNATURE_SIZE]); 2].into(),
-        );
-        assert_eq!(cheap_checks(&seen_envelopes(), &store, &envelope), Ok(()));
-        assert_eq!(
-            validate(&seen_envelopes(), &store, &envelope),
-            Outcome::Queue(QueueReason::BlockUnknown)
-        );
     }
 
     #[test]

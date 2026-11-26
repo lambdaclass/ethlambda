@@ -813,7 +813,7 @@ pub fn empty_gloas_envelope_for(
         excess_blob_gas: 0,
         block_access_list: Default::default(),
         slot_number: 0,
-        dependency_witnesses: Default::default(),
+        claim_witnesses: Default::default(),
     };
     gloas::ExecutionPayloadEnvelope {
         payload,

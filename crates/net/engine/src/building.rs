@@ -199,13 +199,13 @@ struct ExecutionPayloadJson {
     #[serde(default)]
     slot_number: Option<String>,
     /// Not in the specification's `ExecutionPayloadV4`. An execution client
-    /// sends it for a block that has a witness list, empty or not, and leaves
-    /// the key out for a block that has none. A missing key and `null` both
-    /// read as a payload without the field. Whether that is the right
-    /// container for the payload's slot is the caller's to settle: see
-    /// `ExecutionPayload::with_dependency_witnesses_field`.
+    /// sends it for a block that has claim witnesses, an empty string or
+    /// not, and leaves the key out for a block that has none. A missing key
+    /// and `null` both read as a payload without the field. Whether that is
+    /// the right container for the payload's slot is the caller's to settle:
+    /// see `ExecutionPayload::with_claim_witnesses_field`.
     #[serde(default)]
-    dependency_witnesses: Option<Vec<String>>,
+    claim_witnesses: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,17 +296,17 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             .slot_number
             .as_deref()
             .ok_or_else(|| decode("ExecutionPayloadV4 carries no slotNumber"))?;
-        let dependency_witnesses = payload
-            .dependency_witnesses
-            .as_ref()
+        // The bytes are not looked into. Their length is: the container
+        // cannot hold more than the bound, and an execution client must not
+        // build a block that exceeds it.
+        let claim_witnesses = payload
+            .claim_witnesses
+            .as_deref()
             .map(|witnesses| {
-                witnesses
-                    .iter()
-                    .map(|witness| parse_data(witness).map(gloas::DependencyWitness::from))
-                    .collect::<Result<Vec<_>, _>>()
+                gloas::ClaimWitnesses::try_from(parse_data(witnesses)?)
+                    .map_err(|_| decode("claimWitnesses exceeds MAX_BLOCK_WITNESS_BYTES"))
             })
-            .transpose()?
-            .map(gloas::DependencyWitnesses::from);
+            .transpose()?;
 
         let execution_payload = gloas::ExecutionPayload {
             parent_hash: H256(parse_fixed(&payload.parent_hash)?),
@@ -330,7 +330,7 @@ impl TryFrom<GetPayloadV6Response> for BuiltGloasPayload {
             excess_blob_gas: parse_quantity(&payload.excess_blob_gas)?,
             block_access_list: parse_data(block_access_list)?.into(),
             slot_number: parse_quantity(slot_number)?,
-            dependency_witnesses,
+            claim_witnesses,
         };
 
         Ok(BuiltGloasPayload {
@@ -559,8 +559,8 @@ mod tests {
         assert_eq!(payload.block_hash, H256([0x55; 32]));
         assert_eq!(payload.transactions.len(), 1);
         assert_eq!(payload.withdrawals[0].amount, 3);
-        // `v6_json` has no `dependencyWitnesses` key.
-        assert_eq!(payload.dependency_witnesses, None);
+        // `v6_json` has no `claimWitnesses` key.
+        assert_eq!(payload.claim_witnesses, None);
         assert_eq!(uint256(&built.block_value), "0x1bc16d674ec80000");
         assert_eq!(built.blobs_bundle.commitments.len(), 1);
         assert_eq!(built.blobs_bundle.proofs.len(), 2);
@@ -610,26 +610,21 @@ mod tests {
     }
 
     #[test]
-    fn dependency_witnesses_survive_get_payload_then_new_payload() {
+    fn claim_witnesses_survive_get_payload_then_new_payload() {
         use crate::types::ExecutionPayloadV4;
 
-        let witnesses = [
-            format!("0x{}", "ab".repeat(7740)),
-            format!("0x{}", "cd".repeat(7740)),
-        ];
+        // A version byte and bytes after it, none of which is read here.
+        let witnesses = format!("0x00{}", "ab".repeat(7740));
         let mut json = v6_json();
-        json["executionPayload"]["dependencyWitnesses"] = serde_json::json!(witnesses);
+        json["executionPayload"]["claimWitnesses"] = witnesses.into();
 
         let response: GetPayloadV6Response = serde_json::from_value(json.clone()).unwrap();
         let built = BuiltGloasPayload::try_from(response).unwrap();
         let payload = &built.execution_payload;
-        let read = payload
-            .dependency_witnesses
-            .as_ref()
-            .expect("the key is there");
-        assert_eq!(read.len(), 2);
-        assert_eq!(read[0].as_ref(), &[0xab; 7740]);
-        assert_eq!(read[1].as_ref(), &[0xcd; 7740]);
+        let read = payload.claim_witnesses.as_ref().expect("the key is there");
+        assert_eq!(read.len(), 1 + 7740);
+        assert_eq!(read[0], 0x00);
+        assert_eq!(&read[1..], &[0xab; 7740]);
 
         // What `engine_newPayloadV5` is sent is what `engine_getPayloadV6`
         // answered, key for key.
@@ -644,32 +639,31 @@ mod tests {
     }
 
     #[test]
-    fn null_dependency_witnesses_read_as_none() {
+    fn null_claim_witnesses_read_as_none() {
         let mut json = v6_json();
-        json["executionPayload"]["dependencyWitnesses"] = serde_json::Value::Null;
+        json["executionPayload"]["claimWitnesses"] = serde_json::Value::Null;
         let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
         let built = BuiltGloasPayload::try_from(response).unwrap();
-        assert_eq!(built.execution_payload.dependency_witnesses, None);
+        assert_eq!(built.execution_payload.claim_witnesses, None);
     }
 
     #[test]
-    fn an_empty_dependency_witnesses_array_reads_as_an_empty_list() {
+    fn empty_claim_witnesses_read_as_an_empty_string() {
         let mut json = v6_json();
-        json["executionPayload"]["dependencyWitnesses"] = serde_json::json!([]);
+        json["executionPayload"]["claimWitnesses"] = "0x".into();
         let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
         let built = BuiltGloasPayload::try_from(response).unwrap();
         assert_eq!(
-            built.execution_payload.dependency_witnesses,
+            built.execution_payload.claim_witnesses,
             Some(Default::default())
         );
     }
 
     #[test]
-    fn a_malformed_dependency_witness_is_a_decode_error() {
+    fn malformed_claim_witnesses_are_a_decode_error() {
         for malformed in ["0xzz", "abcd", "0xabc"] {
             let mut json = v6_json();
-            json["executionPayload"]["dependencyWitnesses"] =
-                serde_json::json!(["0xabcd", malformed]);
+            json["executionPayload"]["claimWitnesses"] = malformed.into();
             let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
             assert!(
                 matches!(
@@ -679,6 +673,21 @@ mod tests {
                 "{malformed}"
             );
         }
+    }
+
+    #[test]
+    fn claim_witnesses_over_the_bound_are_a_decode_error() {
+        let of_len = |bytes: usize| {
+            let mut json = v6_json();
+            json["executionPayload"]["claimWitnesses"] = format!("0x{}", "00".repeat(bytes)).into();
+            let response: GetPayloadV6Response = serde_json::from_value(json).unwrap();
+            BuiltGloasPayload::try_from(response)
+        };
+        assert!(of_len(gloas::MAX_BLOCK_WITNESS_BYTES).is_ok());
+        assert!(matches!(
+            of_len(gloas::MAX_BLOCK_WITNESS_BYTES + 1),
+            Err(EngineError::Decode(_))
+        ));
     }
 
     #[test]

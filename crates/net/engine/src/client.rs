@@ -260,7 +260,7 @@ impl EngineClient {
     ///
     /// The parameters are the same four as V4's, with the payload as
     /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`, and
-    /// `dependencyWitnesses` after them when the payload has the field). The
+    /// `claimWitnesses` after them when the payload has the field). The
     /// response is V4's. An execution
     /// client answers `-38005` when the payload's timestamp is not
     /// Amsterdam's, which surfaces as [`EngineError::Rpc`] and is not retried.
@@ -372,7 +372,7 @@ impl EngineClient {
 
     /// `engine_getPayloadV6`: [`Self::get_payload`] for Amsterdam, answering
     /// with `ExecutionPayloadV4` (`blockAccessList` and `slotNumber` included,
-    /// and `dependencyWitnesses` when the execution client sends it).
+    /// and `claimWitnesses` when the execution client sends it).
     ///
     /// One attempt at [`ENGINE_GET_PAYLOAD_TIMEOUT`], like V5. Prysm tightens
     /// its own to 300 ms from gloas; this keeps the second until an execution

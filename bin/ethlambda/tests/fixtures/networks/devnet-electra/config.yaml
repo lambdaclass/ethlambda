@@ -213,7 +213,7 @@ BLOB_SCHEDULE:
 # and heze entries are deliberately present: this build cannot process either
 # fork, so they must land in the ignored-key warning rather than in Config.
 # HEZE_FORK_EPOCH is the exception: Config claims it, as the epoch payloads
-# carry dependency witnesses from.
+# carry claim witnesses from.
 MAX_REQUEST_PAYLOADS: 128
 CONSOLIDATION_CHURN_LIMIT_QUOTIENT: 65536
 GAS_LIMIT_SCHEDULE: []

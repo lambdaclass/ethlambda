@@ -47,7 +47,7 @@
 //! entirely, and `PartialDataColumnGroupID` gains `slot`.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{ProgressiveBitlist, ProgressiveList};
+use libssz_types::{ProgressiveBitlist, ProgressiveList, SszList};
 
 use super::altair::{SyncAggregate, SyncCommittee};
 use super::bellatrix::{ExtraData, LogsBloom};
@@ -111,11 +111,13 @@ pub type Transactions = ProgressiveList<Transaction>;
 pub type Withdrawals = ProgressiveList<Withdrawal>;
 /// The serialized block access list of an [`ExecutionPayload`] (EIP-7928).
 pub type BlockAccessList = ProgressiveList<u8>;
-/// One dependency witness of an [`ExecutionPayload`]: a byte string only the
-/// execution layer interprets, like a [`Transaction`].
-pub type DependencyWitness = ProgressiveList<u8>;
-/// The dependency witnesses in an [`ExecutionPayload`].
-pub type DependencyWitnesses = ProgressiveList<DependencyWitness>;
+/// The most bytes the claim witnesses of an [`ExecutionPayload`] may take:
+/// the execution layer's `MAX_BLOCK_WITNESS_BYTES`, 2 MiB.
+pub const MAX_BLOCK_WITNESS_BYTES: usize = 2_097_152;
+/// The claim witnesses of an [`ExecutionPayload`]: one byte string only the
+/// execution layer interprets. The bound is the type's own, so a longer
+/// string neither decodes nor converts into one.
+pub type ClaimWitnesses = SszList<u8, { MAX_BLOCK_WITNESS_BYTES }>;
 /// Execution-layer-triggered deposit requests.
 pub type DepositRequests = ProgressiveList<DepositRequest>;
 /// Execution-layer-triggered withdrawal requests.
@@ -483,16 +485,16 @@ pub struct ExecutionRequests {
 /// (EIP-7928) and `slot_number` (EIP-8061) are appended. Those nineteen
 /// fields are the specification's container. From
 /// [`Config::heze_fork_epoch`](crate::beacon::config::Config::heze_fork_epoch)
-/// on, a payload has a twentieth, `dependency_witnesses`, which the
+/// on, a payload has a twentieth, `claim_witnesses`, which the
 /// specification's container does not have (see the field).
 ///
 /// A payload is therefore one of two containers, and which one is a property
-/// of the value: `dependency_witnesses` is `None` in the first and `Some` in
+/// of the value: `claim_witnesses` is `None` in the first and `Some` in
 /// the second. Its SSZ encoding, decoding and hash tree root are written out
 /// below rather than derived, because a derived container has a fixed set of
 /// fields. Whether a payload of a given slot may be the one or the other is
 /// not decided here: see
-/// [`Config::carries_dependency_witnesses`](crate::beacon::config::Config::carries_dependency_witnesses).
+/// [`Config::carries_claim_witnesses`](crate::beacon::config::Config::carries_claim_witnesses).
 ///
 /// Not `#[derive(Default)]`: `logs_bloom` is an [`SszVector`], which, like
 /// every earlier fork's payload, has no meaningful empty value.
@@ -534,60 +536,63 @@ pub struct ExecutionPayload {
     /// slot, since a payload can be revealed a slot late).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot_number: u64,
-    /// The execution block's dependency witnesses: post-quantum signatures
-    /// the block carries outside its transactions, which the execution
-    /// client verifies and the execution block header commits to. Consensus
-    /// never reads their contents: it takes them from `engine_getPayloadV6`,
-    /// carries them in the envelope, and hands them to `engine_newPayloadV5`.
+    /// The execution block's claim witnesses: the signatures and proofs that
+    /// satisfy the claims its transactions declare, which the block holds
+    /// outside the transactions and the execution block header commits to.
+    /// They are one byte string in an encoding of the execution layer's own,
+    /// which consensus never parses or verifies: it takes the string from
+    /// `engine_getPayloadV6`, carries it in the envelope, and hands it to
+    /// `engine_newPayloadV5`. The size bound is all it enforces, and
+    /// [`ClaimWitnesses`] cannot hold more.
     ///
     /// `None` is a payload from before
     /// [`Config::heze_fork_epoch`](crate::beacon::config::Config::heze_fork_epoch):
     /// the specification's container, with no such field. `Some` is a payload
-    /// from that epoch on, whose container has the field even when the list
-    /// is empty, so `Some` of an empty list and `None` encode and hash
-    /// differently. It is the last field because a progressive container can
-    /// only grow at its end (EIP-7495): every field before it keeps its
-    /// generalized index.
+    /// from that epoch on, whose container has the field even when the
+    /// string is empty, as it is for a block with no claim to satisfy, so
+    /// `Some` of an empty string and `None` encode and hash differently. It
+    /// is the last field because a progressive container can only grow at
+    /// its end (EIP-7495): every field before it keeps its generalized index.
     ///
     /// In JSON a payload without the field has no such key.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "crate::beacon::serde_helpers::optional_ssz_hex_seq"
+        with = "crate::beacon::serde_helpers::optional_ssz_hex"
     )]
-    pub dependency_witnesses: Option<DependencyWitnesses>,
+    pub claim_witnesses: Option<ClaimWitnesses>,
 }
 
-/// A payload holds dependency witnesses and belongs to a slot whose payloads
-/// do not have the field, so no container can hold it.
+/// A payload holds claim witnesses and belongs to a slot whose payloads do
+/// not have the field, so no container can hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the payload holds dependency witnesses before the epoch payloads carry them from")]
-pub struct DependencyWitnessesTooEarly;
+#[error("the payload holds claim witnesses before the epoch payloads carry them from")]
+pub struct ClaimWitnessesTooEarly;
 
 impl ExecutionPayload {
-    /// The number of fields of the container without `dependency_witnesses`.
-    const FIELDS_BEFORE_DEPENDENCY_WITNESSES: usize = 19;
+    /// The number of fields of the container without `claim_witnesses`.
+    const FIELDS_BEFORE_CLAIM_WITNESSES: usize = 19;
 
     /// This payload as the container its slot calls for: the one with
-    /// `dependency_witnesses` when `carries_witnesses`, the specification's
+    /// `claim_witnesses` when `carries_witnesses`, the specification's
     /// otherwise.
     ///
     /// For a payload read from an execution client, which says whether the
-    /// block has a witness list by sending or leaving out a JSON key. The two
-    /// sides must agree on the epoch the list starts at, and this is where
+    /// block has claim witnesses by sending or leaving out a JSON key. The
+    /// two sides must agree on the epoch they start at, and this is where
     /// the consensus side has the say. A payload that should have the field
-    /// and came without one gets the empty list. A payload that should not
-    /// have it loses an empty list. A list that holds witnesses cannot be
-    /// dropped, because the execution block commits to it, so that payload is
-    /// refused.
-    pub fn with_dependency_witnesses_field(
+    /// and came without one gets the empty string. A payload that should not
+    /// have it loses an empty string. A string that holds witnesses cannot
+    /// be dropped, because the execution block commits to it, so that
+    /// payload is refused.
+    pub fn with_claim_witnesses_field(
         mut self,
         carries_witnesses: bool,
-    ) -> Result<Self, DependencyWitnessesTooEarly> {
-        self.dependency_witnesses = match (self.dependency_witnesses.take(), carries_witnesses) {
+    ) -> Result<Self, ClaimWitnessesTooEarly> {
+        self.claim_witnesses = match (self.claim_witnesses.take(), carries_witnesses) {
             (witnesses, true) => Some(witnesses.unwrap_or_default()),
             (Some(witnesses), false) if !witnesses.is_empty() => {
-                return Err(DependencyWitnessesTooEarly);
+                return Err(ClaimWitnessesTooEarly);
             }
             (_, false) => None,
         };
@@ -596,7 +601,7 @@ impl ExecutionPayload {
 
     /// The length of the container's fixed part: every fixed-size field, and
     /// one offset for each variable-size one. `carries_witnesses` says
-    /// whether `dependency_witnesses`, a variable-size field, is one of them.
+    /// whether `claim_witnesses`, a variable-size field, is one of them.
     fn fixed_part_len(carries_witnesses: bool) -> usize {
         fn fixed<T: libssz::SszEncode>() -> usize {
             T::fixed_size()
@@ -630,7 +635,7 @@ impl ExecutionPayload {
     }
 
     /// Decodes `bytes` as the container with or without
-    /// `dependency_witnesses`, as `carries_witnesses` says.
+    /// `claim_witnesses`, as `carries_witnesses` says.
     fn decode_container(
         bytes: &[u8],
         carries_witnesses: bool,
@@ -660,7 +665,7 @@ impl ExecutionPayload {
         decoder.read_variable_offset()?; // block_access_list
         let slot_number = decoder.decode_fixed()?;
         if carries_witnesses {
-            decoder.read_variable_offset()?; // dependency_witnesses
+            decoder.read_variable_offset()?; // claim_witnesses
         }
 
         // The variable part, in the order the offsets were read.
@@ -668,7 +673,7 @@ impl ExecutionPayload {
         let transactions = decoder.decode_variable()?;
         let withdrawals = decoder.decode_variable()?;
         let block_access_list = decoder.decode_variable()?;
-        let dependency_witnesses = if carries_witnesses {
+        let claim_witnesses = if carries_witnesses {
             Some(decoder.decode_variable()?)
         } else {
             None
@@ -694,7 +699,7 @@ impl ExecutionPayload {
             excess_blob_gas,
             block_access_list,
             slot_number,
-            dependency_witnesses,
+            claim_witnesses,
         })
     }
 }
@@ -709,19 +714,19 @@ impl libssz::SszEncode for ExecutionPayload {
     }
 
     fn encoded_len(&self) -> usize {
-        Self::fixed_part_len(self.dependency_witnesses.is_some())
+        Self::fixed_part_len(self.claim_witnesses.is_some())
             + self.extra_data.encoded_len()
             + self.transactions.encoded_len()
             + self.withdrawals.encoded_len()
             + self.block_access_list.encoded_len()
             + self
-                .dependency_witnesses
+                .claim_witnesses
                 .as_ref()
                 .map_or(0, libssz::SszEncode::encoded_len)
     }
 
     fn ssz_append(&self, buf: &mut Vec<u8>) {
-        let fixed_part_len = Self::fixed_part_len(self.dependency_witnesses.is_some());
+        let fixed_part_len = Self::fixed_part_len(self.claim_witnesses.is_some());
         let mut encoder =
             libssz::ContainerEncoder::with_capacity(buf, fixed_part_len, self.encoded_len());
         encoder.append_fixed(&self.parent_hash);
@@ -743,8 +748,8 @@ impl libssz::SszEncode for ExecutionPayload {
         encoder.append_fixed(&self.excess_blob_gas);
         encoder.append_variable(&self.block_access_list);
         encoder.append_fixed(&self.slot_number);
-        if let Some(dependency_witnesses) = &self.dependency_witnesses {
-            encoder.append_variable(dependency_witnesses);
+        if let Some(claim_witnesses) = &self.claim_witnesses {
+            encoder.append_variable(claim_witnesses);
         }
         encoder.finalize();
     }
@@ -761,7 +766,7 @@ impl libssz::SszDecode for ExecutionPayload {
 
     /// The bytes say which of the two containers they encode. A container's
     /// first offset is the length of its fixed part, and the fixed part is
-    /// one offset longer when `dependency_witnesses` is a field. So the bytes
+    /// one offset longer when `claim_witnesses` is a field. So the bytes
     /// are read as the container without it, and as the one with it when
     /// their first offset is that longer length.
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
@@ -781,7 +786,7 @@ impl libssz_merkle::HashTreeRoot for ExecutionPayload {
     /// merkleization of its fields' roots, mixed in with which fields are
     /// active. Every field of either container is active, so the second
     /// value is one bit per field: nineteen bits without
-    /// `dependency_witnesses`, twenty with it.
+    /// `claim_witnesses`, twenty with it.
     fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
         let mut field_roots = vec![
             self.parent_hash.hash_tree_root(hasher),
@@ -804,9 +809,9 @@ impl libssz_merkle::HashTreeRoot for ExecutionPayload {
             self.block_access_list.hash_tree_root(hasher),
             self.slot_number.hash_tree_root(hasher),
         ];
-        debug_assert_eq!(field_roots.len(), Self::FIELDS_BEFORE_DEPENDENCY_WITNESSES);
-        if let Some(dependency_witnesses) = &self.dependency_witnesses {
-            field_roots.push(dependency_witnesses.hash_tree_root(hasher));
+        debug_assert_eq!(field_roots.len(), Self::FIELDS_BEFORE_CLAIM_WITNESSES);
+        if let Some(claim_witnesses) = &self.claim_witnesses {
+            field_roots.push(claim_witnesses.hash_tree_root(hasher));
         }
 
         let mut active_fields = [0u8; 32];
@@ -1503,13 +1508,13 @@ mod tests {
             excess_blob_gas: 0,
             block_access_list: Default::default(),
             slot_number: 0,
-            dependency_witnesses: Default::default(),
+            claim_witnesses: Default::default(),
         }
     }
 
     /// The specification's gloas `ExecutionPayload`, with the derived SSZ
     /// implementations [`ExecutionPayload`]'s hand-written ones must agree
-    /// with when it has no `dependency_witnesses`.
+    /// with when it has no `claim_witnesses`.
     #[derive(Debug, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
     #[ssz(progressive_container)]
     struct PayloadWithoutWitnesses {
@@ -1534,7 +1539,7 @@ mod tests {
         slot_number: u64,
     }
 
-    /// The same container with `dependency_witnesses` appended, which
+    /// The same container with `claim_witnesses` appended, which
     /// [`ExecutionPayload`] must agree with when it has the field.
     #[derive(Debug, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
     #[ssz(progressive_container)]
@@ -1558,7 +1563,7 @@ mod tests {
         excess_blob_gas: u64,
         block_access_list: BlockAccessList,
         slot_number: u64,
-        dependency_witnesses: DependencyWitnesses,
+        claim_witnesses: ClaimWitnesses,
     }
 
     /// A payload whose every field holds a value of its own, so a field
@@ -1596,16 +1601,16 @@ mod tests {
             excess_blob_gas: 18,
             block_access_list: vec![0xc1, 0x80].into(),
             slot_number: 19,
-            dependency_witnesses: None,
+            claim_witnesses: None,
         }
     }
 
-    fn two_witnesses() -> DependencyWitnesses {
-        vec![
-            DependencyWitness::from(vec![0xaa; 7_740]),
-            DependencyWitness::from(vec![0xbb; 7_740]),
-        ]
-        .into()
+    /// Claim witnesses of a block that has some: a version byte and bytes
+    /// after it, which nothing here reads.
+    fn some_witnesses() -> ClaimWitnesses {
+        let mut bytes = vec![0x00];
+        bytes.extend([0xaa; 7_740]);
+        bytes.try_into().expect("within the bound")
     }
 
     fn without_witnesses(payload: &ExecutionPayload) -> PayloadWithoutWitnesses {
@@ -1655,14 +1660,12 @@ mod tests {
             excess_blob_gas: payload.excess_blob_gas,
             block_access_list: payload.block_access_list,
             slot_number: payload.slot_number,
-            dependency_witnesses: payload
-                .dependency_witnesses
-                .expect("the payload has the field"),
+            claim_witnesses: payload.claim_witnesses.expect("the payload has the field"),
         }
     }
 
     #[test]
-    fn a_payload_without_dependency_witnesses_is_the_specifications_container() {
+    fn a_payload_without_claim_witnesses_is_the_specifications_container() {
         let payload = distinct_execution_payload();
         let reference = without_witnesses(&payload);
 
@@ -1676,10 +1679,10 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_with_dependency_witnesses_is_the_container_with_the_field_appended() {
-        for witnesses in [DependencyWitnesses::default(), two_witnesses()] {
+    fn a_payload_with_claim_witnesses_is_the_container_with_the_field_appended() {
+        for witnesses in [ClaimWitnesses::default(), some_witnesses()] {
             let mut payload = distinct_execution_payload();
-            payload.dependency_witnesses = Some(witnesses);
+            payload.claim_witnesses = Some(witnesses);
             let reference = with_witnesses(&payload);
 
             assert_eq!(payload.to_ssz(), reference.to_ssz());
@@ -1693,10 +1696,10 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_dependency_witnesses_list_is_not_the_same_payload_as_no_field() {
+    fn empty_claim_witnesses_are_not_the_same_payload_as_no_field() {
         let without = distinct_execution_payload();
         let mut with_empty = without.clone();
-        with_empty.dependency_witnesses = Some(Default::default());
+        with_empty.claim_witnesses = Some(Default::default());
 
         assert_ne!(without.to_ssz(), with_empty.to_ssz());
         assert_ne!(without.hash_tree_root(), with_empty.hash_tree_root());
@@ -1715,11 +1718,11 @@ mod tests {
     fn a_payload_keeps_its_container_inside_an_envelope() {
         for witnesses in [
             None,
-            Some(DependencyWitnesses::default()),
-            Some(two_witnesses()),
+            Some(ClaimWitnesses::default()),
+            Some(some_witnesses()),
         ] {
             let mut payload = distinct_execution_payload();
-            payload.dependency_witnesses = witnesses;
+            payload.claim_witnesses = witnesses;
             let envelope = ExecutionPayloadEnvelope {
                 payload,
                 execution_requests: Default::default(),
@@ -1755,39 +1758,53 @@ mod tests {
     fn a_payload_is_made_the_container_its_slot_calls_for() {
         let without = distinct_execution_payload();
         let mut with_empty = without.clone();
-        with_empty.dependency_witnesses = Some(Default::default());
-        let mut with_two = without.clone();
-        with_two.dependency_witnesses = Some(two_witnesses());
+        with_empty.claim_witnesses = Some(Default::default());
+        let mut with_some = without.clone();
+        with_some.claim_witnesses = Some(some_witnesses());
 
         // A slot whose payloads have the field: a payload without one gets
-        // the empty list, and a list is kept as it is.
+        // the empty string, and a string is kept as it is.
         assert_eq!(
-            without.clone().with_dependency_witnesses_field(true),
+            without.clone().with_claim_witnesses_field(true),
             Ok(with_empty.clone())
         );
         assert_eq!(
-            with_empty.clone().with_dependency_witnesses_field(true),
+            with_empty.clone().with_claim_witnesses_field(true),
             Ok(with_empty.clone())
         );
         assert_eq!(
-            with_two.clone().with_dependency_witnesses_field(true),
-            Ok(with_two.clone())
+            with_some.clone().with_claim_witnesses_field(true),
+            Ok(with_some.clone())
         );
 
-        // A slot whose payloads do not: an empty list is dropped, and a list
+        // A slot whose payloads do not: an empty string is dropped, and one
         // that holds witnesses has no container to go in.
         assert_eq!(
-            without.clone().with_dependency_witnesses_field(false),
+            without.clone().with_claim_witnesses_field(false),
             Ok(without.clone())
         );
+        assert_eq!(with_empty.with_claim_witnesses_field(false), Ok(without));
         assert_eq!(
-            with_empty.with_dependency_witnesses_field(false),
-            Ok(without)
+            with_some.with_claim_witnesses_field(false),
+            Err(ClaimWitnessesTooEarly)
         );
-        assert_eq!(
-            with_two.with_dependency_witnesses_field(false),
-            Err(DependencyWitnessesTooEarly)
-        );
+    }
+
+    #[test]
+    fn claim_witnesses_longer_than_the_bound_do_not_decode() {
+        // Exactly the bound converts, and survives the payload's encoding.
+        let at_the_bound = vec![0x5a; MAX_BLOCK_WITNESS_BYTES];
+        let mut payload = distinct_execution_payload();
+        payload.claim_witnesses = Some(at_the_bound.try_into().expect("exactly the bound"));
+        let mut bytes = payload.to_ssz();
+        assert_eq!(ExecutionPayload::from_ssz_bytes(&bytes), Ok(payload));
+
+        // The witnesses are the container's last variable-size field, so
+        // they run to the end of the bytes: one byte more is a string one
+        // byte over the bound.
+        bytes.push(0x5a);
+        assert!(ExecutionPayload::from_ssz_bytes(&bytes).is_err());
+        assert!(ClaimWitnesses::try_from(vec![0u8; MAX_BLOCK_WITNESS_BYTES + 1]).is_err());
     }
 
     /// A minimal but complete gloas state, every field present at an
