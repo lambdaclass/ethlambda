@@ -401,7 +401,7 @@ where
 
     // Every node's stream, read until `run` returns and `_monitor` with it.
     let (_monitor, triggers) =
-        head_monitor::start(&config.beacon_nodes, &context.config(), config.event_stream)?;
+        head_monitor::start(&config.beacon_nodes, &context, config.event_stream)?;
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =

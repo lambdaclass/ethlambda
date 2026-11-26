@@ -29,7 +29,8 @@
 //!   It is also the event that says whether the head is optimistic.
 //!   Lighthouse, Teku, Prysm, Lodestar and Vouch wake on `head` as well.
 //! - **Payload timeliness committee vote:** an `execution_payload_available`
-//!   event for the slot, read only when the network schedules gloas. Never
+//!   event for the slot, read once the network schedules gloas, at startup or
+//!   later (see [`HeadMonitor::spawn`]). Never
 //!   the `head`: the block alone is not what the vote is about. On an
 //!   ethlambda node the event follows the envelope's import, which waits for
 //!   the payload to verify and for every sampled column of its blobs, so it
@@ -94,7 +95,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ethlambda_types::ShortRoot;
-use ethlambda_types::beacon::config::Config;
+
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::primitives::{Root, Slot};
 use tokio::sync::{RwLock, watch};
@@ -110,6 +111,7 @@ use crate::error::Result;
 use crate::keys::ValidatorStore;
 use crate::metrics;
 use crate::payload_attestation::PayloadAttestationService;
+use crate::signing::SigningContext;
 use crate::sync_committee::SyncCommitteeService;
 
 /// The first wait before a stream is opened again.
@@ -199,13 +201,15 @@ impl Drop for HeadMonitor {
 
 /// Read every beacon node's event stream, or none with `enabled` off.
 ///
-/// `config` is the chain's, from the node's `/eth/v1/config/spec`: a network
-/// that schedules gloas also gets the `execution_payload_available` streams.
+/// `context` holds the chain's fork schedule, which the chain check keeps
+/// current (see `chain_check`): a network that schedules gloas also gets the
+/// `execution_payload_available` streams, opened when gloas first shows in
+/// the schedule, at startup or later (see [`HeadMonitor::spawn`]).
 /// The monitor, when there is one, must be kept for as long as the triggers
 /// are used; the triggers outlive it safely, as deadlines alone.
 pub fn start(
     beacon_nodes: &[String],
-    config: &Config,
+    context: &Arc<SigningContext>,
     enabled: bool,
 ) -> Result<(Option<HeadMonitor>, DutyTriggers)> {
     if !enabled {
@@ -223,26 +227,37 @@ pub fn start(
             Ok((name, Arc::new(source) as Arc<dyn EventSource>))
         })
         .collect::<Result<Vec<_>>>()?;
-    let payloads = config.gloas_fork_epoch != FAR_FUTURE_EPOCH;
-    let (monitor, triggers) = HeadMonitor::spawn(sources, payloads);
+    let context = context.clone();
+    let gloas_scheduled = move || context.config().gloas_fork_epoch != FAR_FUTURE_EPOCH;
+    let (monitor, triggers) = HeadMonitor::spawn(sources, gloas_scheduled);
     Ok((Some(monitor), triggers))
 }
 
 impl HeadMonitor {
-    /// One reader for each source's `head` stream, and with `payloads` one
-    /// for its `execution_payload_available` stream as well.
+    /// One reader for each source's `head` stream, and once
+    /// `gloas_scheduled` answers yes, one for its
+    /// `execution_payload_available` stream as well.
     ///
     /// A connection per topic rather than one for both: a node that refuses
     /// the gloas topic (one that predates it) then costs the payload trigger
     /// alone, not the head's.
+    ///
+    /// The payload readers start at once when gloas is scheduled already.
+    /// Otherwise a task asks `gloas_scheduled` again every
+    /// [`SCHEDULE_CHECK_INTERVAL`] and starts them when it first says yes:
+    /// the chain check can schedule gloas after startup, and a client that
+    /// read the schedule only then would vote every payload at its deadline
+    /// until a restart. A fork is never unscheduled, so they are never
+    /// stopped. Until they start, the payload trigger waits for the deadline,
+    /// as it would with no event.
     pub fn spawn(
         sources: Vec<(String, Arc<dyn EventSource>)>,
-        payloads: bool,
+        gloas_scheduled: impl Fn() -> bool + Send + 'static,
     ) -> (Self, DutyTriggers) {
         let (heads, head_reports) = watch::channel(vec![None; sources.len()]);
         let (payloads_seen, payload_reports) = watch::channel(vec![None; sources.len()]);
         let mut readers = Vec::new();
-        for (position, (name, source)) in sources.into_iter().enumerate() {
+        for (position, (name, source)) in sources.iter().enumerate() {
             let reader = follow(
                 name.clone(),
                 source.clone(),
@@ -251,17 +266,70 @@ impl HeadMonitor {
                 position,
             );
             readers.push(tokio::spawn(reader));
-            if payloads {
-                let topic = Topic::ExecutionPayloadAvailable;
-                let reader = follow(name, source, topic, payloads_seen.clone(), position);
-                readers.push(tokio::spawn(reader));
-            }
+        }
+        if gloas_scheduled() {
+            readers.extend(payload_readers(&sources, &payloads_seen));
+        } else {
+            // Holds the sender until the readers start, so the triggers do not
+            // take the payload channel as one whose readers are all gone.
+            readers.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SCHEDULE_CHECK_INTERVAL).await;
+                    if gloas_scheduled() {
+                        break;
+                    }
+                }
+                info!("Gloas is now scheduled; reading the beacon nodes' payload event streams");
+                // Kept in this task, so aborting it, which dropping the
+                // monitor does, aborts them too.
+                let started = PayloadReaders(payload_readers(&sources, &payloads_seen));
+                std::future::pending::<()>().await;
+                drop(started);
+            }));
         }
         let triggers = DutyTriggers {
             heads: Some(head_reports),
-            payloads: payloads.then_some(payload_reports),
+            payloads: Some(payload_reports),
         };
         (Self { readers }, triggers)
+    }
+}
+
+/// How often [`HeadMonitor::spawn`] asks whether gloas is scheduled yet,
+/// until it is: once a mainnet slot, as often as the chain check that moves
+/// the schedule runs.
+const SCHEDULE_CHECK_INTERVAL: Duration = Duration::from_secs(12);
+
+/// One reader for each source's `execution_payload_available` stream.
+fn payload_readers(
+    sources: &[(String, Arc<dyn EventSource>)],
+    reports: &watch::Sender<Reports>,
+) -> Vec<JoinHandle<()>> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(position, (name, source))| {
+            let topic = Topic::ExecutionPayloadAvailable;
+            let reader = follow(
+                name.clone(),
+                source.clone(),
+                topic,
+                reports.clone(),
+                position,
+            );
+            tokio::spawn(reader)
+        })
+        .collect()
+}
+
+/// Readers started from inside a task, aborted when it is.
+struct PayloadReaders(Vec<JoinHandle<()>>);
+
+impl Drop for PayloadReaders {
+    fn drop(&mut self) {
+        for reader in &self.0 {
+            reader.abort();
+        }
     }
 }
 
@@ -741,6 +809,7 @@ mod tests {
     use crate::signing::SigningContext;
     use crate::slashing_protection::SlashingProtection;
     use crate::test_support::store_with_keys;
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::slots_per_epoch;
@@ -792,7 +861,7 @@ mod tests {
             .iter()
             .map(|node| ("mock".to_string(), node.clone() as Arc<dyn EventSource>))
             .collect();
-        HeadMonitor::spawn(sources, payloads)
+        HeadMonitor::spawn(sources, move || payloads)
     }
 
     fn key() -> (RwLock<ValidatorStore>, BlsPubkey) {
@@ -1289,6 +1358,46 @@ mod tests {
             assert_eq!(sent.len(), 1);
             assert_eq!(sent[0].data, payload_data(present, blobs));
         }
+    }
+
+    /// Gloas scheduled after startup, as the chain check can schedule it,
+    /// opens the payload streams then, not only after a restart. Dropping the
+    /// monitor stops the readers started that way too.
+    #[tokio::test(start_paused = true)]
+    async fn the_payload_topic_is_read_once_gloas_is_scheduled_later() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let payload_asks = |node: &MockBeaconNode| {
+            node.event_subscriptions()
+                .iter()
+                .filter(|topics| topics.as_slice() == [Topic::ExecutionPayloadAvailable])
+                .count()
+        };
+        let node = Arc::new(MockBeaconNode::new());
+        let scheduled = Arc::new(AtomicBool::new(false));
+        let sources = vec![("mock".to_string(), node.clone() as Arc<dyn EventSource>)];
+        let flag = scheduled.clone();
+        let (monitor, _) = HeadMonitor::spawn(sources, move || flag.load(Ordering::SeqCst));
+
+        tokio::time::sleep(SCHEDULE_CHECK_INTERVAL * 3).await;
+        assert_eq!(payload_asks(&node), 0, "no gloas, no payload stream");
+
+        scheduled.store(true, Ordering::SeqCst);
+        tokio::time::sleep(SCHEDULE_CHECK_INTERVAL + Duration::from_millis(10)).await;
+        assert!(
+            payload_asks(&node) > 0,
+            "gloas scheduled, so its stream is asked for"
+        );
+
+        drop(monitor);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let after_drop = payload_asks(&node);
+        tokio::time::sleep(RECONNECT_MAX * 3).await;
+        assert_eq!(
+            payload_asks(&node),
+            after_drop,
+            "the started readers stop with the monitor"
+        );
     }
 
     /// Without gloas scheduled only `head` is asked for; with it, each topic

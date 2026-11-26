@@ -757,7 +757,9 @@ sign once it has the slot's block or once the offset has passed, whichever comes
 first, a sync committee member likewise, and a payload timeliness committee
 member as soon as it has seen the payload and its blob data. So the client reads
 every beacon node's `GET /eth/v1/events`, one connection per topic: `head`, and
-on a network that schedules gloas `execution_payload_available` as well.
+on a network that schedules gloas `execution_payload_available` as well, opened
+when gloas first shows in the fork schedule, at startup or once the chain check
+picks it up later.
 
 - A `head` for the current slot, not `execution_optimistic`, starts the slot's
   attestation and sync committee message.
