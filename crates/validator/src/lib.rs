@@ -43,6 +43,8 @@ pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
 pub mod registration;
+#[cfg(test)]
+mod scale_tests;
 pub mod secure_fs;
 pub mod shared_config;
 pub mod signing;
@@ -97,6 +99,7 @@ use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, 
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::aggregation::AggregationService;
@@ -189,8 +192,25 @@ pub struct BuilderProposals {
     pub boost_factor: u64,
 }
 
-/// Run the validator client until the process is stopped.
-pub async fn run(config: ValidatorConfig) -> Result<()> {
+/// Run the validator client until the future `stop` returns resolves, or
+/// until something stops it with an error.
+///
+/// `stop` is called once, when startup is done: after the keystores are
+/// decrypted and the slashing-protection record is open, and before the
+/// keymanager serves its first request or any duty runs. A caller may read
+/// that call as the end of startup: the binary ends the process at once on a
+/// signal that comes before it, since nothing is signed and no keymanager
+/// request is in flight yet. A client that stops before then drops `stop`
+/// uncalled.
+///
+/// The future it returns resolves with the name of what asked the client to
+/// stop, a signal in the binary. Once it does the client starts no other
+/// slot, lets the work in flight finish, and returns `Ok(())` (see
+/// [`run_until_stopped`]). Every other way the client stops is an `Err`.
+pub async fn run<S>(config: ValidatorConfig, stop: impl FnOnce() -> S) -> Result<()>
+where
+    S: Future<Output = &'static str>,
+{
     metrics::init();
 
     // Said at startup, where an operator reads it: an operator
@@ -397,6 +417,9 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             .with_clock(clock.clone()),
     );
 
+    // The detached tasks a shutdown signal waits for: a signed blinded
+    // block's publish. See `run_until_stopped`.
+    let tasks = TaskTracker::new();
     let proposal = ProposalService::new(
         beacon_node.clone(),
         context.clone(),
@@ -406,7 +429,8 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     )
     .with_clock(clock.clone())
     .with_builder_min_bid(config.builder_min_bid)
-    .with_preferences(preferences.clone());
+    .with_preferences(preferences.clone())
+    .with_tasks(tasks.clone());
     // The proposer preparations' per-slot re-send. The epoch's own send is
     // `refresh_epoch`'s.
     let preparations = Arc::new(Preparations::new(beacon_node.clone(), settings.clone()));
@@ -431,9 +455,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         );
     }
 
-    // Cancelled when the duty loop below ends, whatever ended it: the
-    // keymanager server then stops accepting requests and finishes the ones
-    // in flight, and `run` waits for it before returning.
+    // Startup is done: nothing is signed yet, and the keymanager is not
+    // serving. From here a signal stops the client by draining rather than
+    // ending the process (see this function's doc), so this comes before the
+    // keymanager can take a request that ending the process would cut, such
+    // as an import between saving its keys and registering them. A signal
+    // that arrives before `run_until_stopped` first polls the future is held
+    // for it.
+    let stop = stop();
+
+    // Cancelled when the client stops, whatever stopped it: the keymanager
+    // server then stops accepting requests and finishes the ones in flight,
+    // and `run` waits for it before returning. On a shutdown signal it is
+    // cancelled first, and the duty loop then starts no other slot.
     let shutdown = CancellationToken::new();
     // The per-node chain check and the schedule follower, on a task of their
     // own so a node that hangs until its timeout never delays a duty. Its
@@ -531,9 +565,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         ))
     });
 
-    // The duty loop, as a future that ends only with the error that stopped
-    // it. Not awaited here: `run_until_stopped` races it against the
-    // slashing-protection record becoming unusable.
+    // The duty loop, as a future that ends with the error that stopped it, or
+    // with `Ok` between two slots once `shutdown` is cancelled. Not awaited
+    // here: `run_until_stopped` races it against the slashing-protection
+    // record becoming unusable and against `stop`.
     let duty_loop = async {
         let mut last_epoch: Option<u64> = None;
         // The slot whose duties were last attempted, so an overrunning slot does
@@ -565,7 +600,15 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // Waking at the boundary and sleeping further in reaches both. The
             // epoch refresh no longer stands between the two (see below).
             let (slot, delay) = clock.next_slot_to_serve(served, SystemTime::now());
-            tokio::time::sleep(delay).await;
+            // The one place a shutdown is taken: between slots, so a slot
+            // that has started runs to its end, which `run_until_stopped`
+            // bounds. Biased, since a slot that overran leaves no delay
+            // before the next one, and that one must not start either.
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                () = tokio::time::sleep(delay) => {}
+            }
             served = Some(slot);
 
             let epoch = clock.epoch_of(slot);
@@ -642,7 +685,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 );
                 match settled {
                     Ok(settled) => owed = settled,
-                    Err(err) => return err,
+                    Err(err) => return Err(err),
                 }
             }
 
@@ -773,6 +816,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // in front of them, and bounded by the end of the slot so a slow
             // node holds the loop for one slot at most. A refresh cut off there
             // is retried at the next slot, as a failed one is.
+            //
+            // Cut off too once the client is stopping: the schedule is for
+            // slots it will not serve, and the refresh could use up the stop's
+            // wait for nothing (see `run_until_stopped`), while the slot's own
+            // duties beside it run to their end.
             let refresh = async {
                 if !defer_refresh {
                     return None;
@@ -788,7 +836,11 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     &context,
                     budget,
                 );
-                Some(refreshed.await)
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => None,
+                    outcome = refreshed => Some(outcome),
+                }
             };
             let slot_work = async {
                 // The rest of the way to the first of the slot's remaining
@@ -837,7 +889,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                         );
                     }
                     Ok(None) => {}
-                    Err(err) => return err,
+                    Err(err) => return Err(err),
                 }
             }
 
@@ -865,8 +917,10 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             // delays none of them, and after the sends above, so a slow node
             // cannot hold them to the slot's end either. Not on a slot whose
             // refresh was due: that refresh compared every root itself, or
-            // failed and runs again.
-            if !refresh_due {
+            // failed and runs again. Not once the client is stopping: the
+            // schedule is for slots it will not serve, and the refetch could
+            // use up the stop's wait for nothing.
+            if !refresh_due && !shutdown.is_cancelled() {
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 if follow_dependent_roots(&mut duties, epoch, budget, &context.config()).await {
                     metrics::set_duties_held(duties.all().len() as u64);
@@ -899,7 +953,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                     .iter()
                     .map(|sighting| sighting.index)
                     .collect();
-                Error::DoppelgangerDetected { validators }
+                Err(Error::DoppelgangerDetected { validators })
             }
             ended = check => {
                 let reason = match ended {
@@ -908,34 +962,49 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
                 };
                 let err = Error::DoppelgangerCheckStopped { reason };
                 error!(%err, "Stopping so the validator client can be restarted");
-                err
+                Err(err)
             }
         }
     };
     // The chain check's task ending stops them for the same reason. It runs
-    // until `shutdown`, which is cancelled only once the duties have stopped,
-    // so it ends before that only by panicking. Left running without it, the
-    // duties would go on with every node it took out still out, none let
-    // back in, and no later fork followed, so the client would stop signing
-    // valid messages at the next fork with nothing to say why.
+    // until `shutdown`, so it ends before that only by panicking. Left
+    // running without it, the duties would go on with every node it took out
+    // still out, none let back in, and no later fork followed, so the client
+    // would stop signing valid messages at the next fork with nothing to say
+    // why. A shutdown signal cancels `shutdown` before the duties have
+    // stopped, and the check returning then is that stop, not a failure: the
+    // slot in flight still runs to its end (see `run_until_stopped`).
+    let chain_check_ended = async {
+        let ended = (&mut chain_check).await;
+        if ended.is_ok() && shutdown.is_cancelled() {
+            return std::future::pending().await;
+        }
+        let reason = match ended {
+            Err(err) => err.to_string(),
+            Ok(()) => "its task returned".to_string(),
+        };
+        let err = Error::ChainCheckStopped { reason };
+        error!(%err, "Stopping so the validator client can be restarted");
+        Err(err)
+    };
     let duties = async {
         tokio::select! {
             biased;
-            err = doppelganger_watch => err,
-            ended = &mut chain_check => {
-                let reason = match ended {
-                    Err(err) => err.to_string(),
-                    Ok(()) => "its task returned".to_string(),
-                };
-                let err = Error::ChainCheckStopped { reason };
-                error!(%err, "Stopping so the validator client can be restarted");
-                err
-            }
-            err = duty_loop => err,
+            stopped = doppelganger_watch => stopped,
+            stopped = chain_check_ended => stopped,
+            stopped = duty_loop => stopped,
         }
     };
 
-    let stopped = run_until_stopped(duties, &protection, shutdown, keymanager).await;
+    let stopped = run_until_stopped(
+        duties,
+        &protection,
+        stop,
+        shutdown.clone(),
+        keymanager,
+        &tasks,
+    )
+    .await;
     // Whatever stopped the client, the check and the probe stop with it rather
     // than polling the beacon node for a runtime that outlives `run`.
     if let Some(check) = check {
@@ -943,7 +1012,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     }
     stop_probes.abort();
     chain_check.abort();
-    Err(stopped)
+    stopped
 }
 
 /// Whether doppelganger protection lets the validator a duty names act on
@@ -991,9 +1060,38 @@ fn withhold_uncleared(
 /// one that never ends must not keep a stopped client from being restarted.
 const KEYMANAGER_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run `duties` until they stop on their own or the slashing-protection
-/// record becomes unusable, then let the keymanager finish, and say why the
-/// client stopped.
+/// How long a shutdown signal lets the work in flight run before the client
+/// stops without it: the slot that has started, and a signed blinded block's
+/// publish.
+///
+/// Every duty in a slot is bounded by the slot's end, and a blinded publish by
+/// the HTTP client's 8 s request timeout, but a 12 s slot outlasts the 10 s
+/// `docker stop` waits before it kills the container, and an epoch refresh is
+/// bounded by neither. 8 s is what Prysm's validator client waits. On a 12 s
+/// slot it covers the proposal, which must be out by the attester offset, and
+/// the slot's attestations, and cuts at most the duties due two thirds of the
+/// way in or later: aggregates, sync committee contributions and the payload
+/// timeliness vote. On a shorter slot the slot ends first. Cutting any duty is
+/// as safe as abandoning it at its own deadline: a block or attestation is
+/// recorded before it is signed, and the rest is not slashable.
+const DUTY_DRAIN: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Run `duties` until they stop on their own, the slashing-protection record
+/// becomes unusable or `stop` resolves, then let the keymanager finish, and
+/// say why the client stopped: `Ok(())` when `stop` stopped it, the error
+/// otherwise.
+///
+/// # Stopping on a signal
+///
+/// `stop` resolving cancels `shutdown`, so the duty loop starts no other slot
+/// and the keymanager takes no new request. The slot that has started runs
+/// on, its proposal, gloas envelope and attestations with it, and so does the
+/// publish of a signed blinded block on `tasks`. Dropping either would lose
+/// what is signed and not yet out, and the restarted client cannot sign it
+/// again, since the record already holds it. Both get until [`DUTY_DRAIN`]
+/// after the signal, and the keymanager is then drained as below. Duties that
+/// end in an error meanwhile (a doppelganger seen, say) stop the client with
+/// that error.
 ///
 /// # Stopping on an unusable record
 ///
@@ -1015,13 +1113,19 @@ const KEYMANAGER_DRAIN: std::time::Duration = std::time::Duration::from_secs(60)
 /// for: on a poisoned record the import's registration fails, and it takes
 /// its keys off disk again before it answers.
 async fn run_until_stopped(
-    duties: impl Future<Output = Error>,
+    duties: impl Future<Output = Result<()>>,
     protection: &slashing_protection::SharedProtection,
+    stop: impl Future<Output = &'static str>,
     shutdown: CancellationToken,
     keymanager: Option<JoinHandle<()>>,
-) -> Error {
+    tasks: &TaskTracker,
+) -> Result<()> {
+    // Boxed rather than pinned in place, so the duties can be dropped once
+    // the race is decided, whichever arm won, rather than held through the
+    // keymanager's drain.
+    let mut duties = Box::pin(duties);
     let stopped = tokio::select! {
-        err = duties => err,
+        stopped = &mut duties => stopped,
         () = protection.unusable() => {
             let err = Error::SlashingProtectionUnusable {
                 reason: "an access panicked while holding the record, so no attestation or \
@@ -1029,9 +1133,31 @@ async fn run_until_stopped(
                     .to_string(),
             };
             error!(%err, "Stopping so the validator client can be restarted");
-            err
+            Err(err)
+        }
+        signal = stop => {
+            info!(signal, "Shutdown signal received, finishing the duties in flight");
+            shutdown.cancel();
+            tasks.close();
+            let deadline = tokio::time::Instant::now() + DUTY_DRAIN;
+            let finished = tokio::time::timeout_at(deadline, &mut duties).await;
+            let finished = finished.inspect_err(|_| {
+                warn!(
+                    waited_s = DUTY_DRAIN.as_secs(),
+                    "The slot in flight is still running; stopping without it"
+                )
+            });
+            let published = tokio::time::timeout_at(deadline, tasks.wait()).await;
+            let _ = published.inspect_err(|_| {
+                warn!(
+                    waited_s = DUTY_DRAIN.as_secs(),
+                    "A blinded block's publish is still in flight; stopping without it"
+                )
+            });
+            finished.unwrap_or(Ok(()))
         }
     };
+    drop(duties);
 
     shutdown.cancel();
     if let Some(keymanager) = keymanager {
@@ -1046,7 +1172,7 @@ async fn run_until_stopped(
             ),
         }
     }
-    stopped
+    stopped.inspect(|()| info!("Shutdown complete"))
 }
 
 /// Everything a slot owes after its proposal: attest and aggregate, the
@@ -3434,18 +3560,81 @@ mod tests {
         let stopped = run_until_stopped(
             std::future::pending(),
             &protection,
+            std::future::pending(),
             shutdown.clone(),
             Some(keymanager),
+            &TaskTracker::new(),
         )
         .await;
         assert!(
-            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
-            "got {stopped}"
+            matches!(stopped, Err(Error::SlashingProtectionUnusable { .. })),
+            "got {stopped:?}"
         );
         assert!(shutdown.is_cancelled(), "the keymanager was told to stop");
         assert!(
             finished.load(std::sync::atomic::Ordering::Acquire),
             "its request in flight finishes before the client stops"
+        );
+    }
+
+    /// The duties an unusable record stops are dropped where they stand, and
+    /// are gone by the time the keymanager is told to stop, rather than held
+    /// suspended through its drain.
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_record_drops_the_duties_before_the_keymanager_drains() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Sets its flag when the future holding it is dropped.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        slashing_protection::blocking(&protection, |_| -> Result<()> {
+            panic!("a bug in the record")
+        })
+        .await
+        .expect_err("the access panicked");
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let duties = {
+            let guard = DropFlag(dropped.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<Result<()>>().await
+            }
+        };
+        let shutdown = CancellationToken::new();
+        let gone_when_told = Arc::new(AtomicBool::new(false));
+        let keymanager = tokio::spawn({
+            let (shutdown, dropped, gone_when_told) =
+                (shutdown.clone(), dropped.clone(), gone_when_told.clone());
+            async move {
+                shutdown.cancelled().await;
+                let gone = dropped.load(Ordering::Acquire);
+                gone_when_told.store(gone, Ordering::Release);
+            }
+        });
+
+        let stopped = run_until_stopped(
+            duties,
+            &protection,
+            std::future::pending(),
+            shutdown,
+            Some(keymanager),
+            &TaskTracker::new(),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Err(Error::SlashingProtectionUnusable { .. })),
+            "got {stopped:?}"
+        );
+        assert!(
+            gone_when_told.load(Ordering::Acquire),
+            "the duties were dropped before the keymanager was told to stop"
         );
     }
 
@@ -3459,13 +3648,18 @@ mod tests {
             keymanager_finishing_in(&shutdown, std::time::Duration::from_secs(5));
 
         let stopped = run_until_stopped(
-            async { Error::BeaconNodeSyncing },
+            async { Err(Error::BeaconNodeSyncing) },
             &protection,
+            std::future::pending(),
             shutdown,
             Some(keymanager),
+            &TaskTracker::new(),
         )
         .await;
-        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert!(
+            matches!(stopped, Err(Error::BeaconNodeSyncing)),
+            "got {stopped:?}"
+        );
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -3478,14 +3672,141 @@ mod tests {
 
         let before = tokio::time::Instant::now();
         let stopped = run_until_stopped(
-            async { Error::BeaconNodeSyncing },
+            async { Err(Error::BeaconNodeSyncing) },
             &protection,
+            std::future::pending(),
             CancellationToken::new(),
             Some(keymanager),
+            &TaskTracker::new(),
         )
         .await;
-        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert!(
+            matches!(stopped, Err(Error::BeaconNodeSyncing)),
+            "got {stopped:?}"
+        );
         assert_eq!(before.elapsed(), KEYMANAGER_DRAIN);
+    }
+
+    /// Stands in for the duty loop with a slot in flight: told to stop, it
+    /// takes `work` to finish the slot and then returns between slots, and
+    /// the flag says when it has.
+    fn duties_finishing_in(
+        shutdown: &CancellationToken,
+        work: std::time::Duration,
+    ) -> (
+        impl Future<Output = Result<()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let duties = {
+            let shutdown = shutdown.clone();
+            let finished = finished.clone();
+            async move {
+                shutdown.cancelled().await;
+                tokio::time::sleep(work).await;
+                finished.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        };
+        (duties, finished)
+    }
+
+    /// A shutdown signal is a clean stop: the duty loop and the keymanager
+    /// are told to stop, and the client returns `Ok` only once the slot in
+    /// flight, a blinded block's publish and the keymanager's request have
+    /// all finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_stops_the_client_once_the_work_in_flight_has_finished() {
+        let secs = std::time::Duration::from_secs;
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let (keymanager, keymanager_finished) = keymanager_finishing_in(&shutdown, secs(2));
+        let (duties, slot_finished) = duties_finishing_in(&shutdown, secs(3));
+        let tasks = TaskTracker::new();
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tasks.spawn({
+            let published = published.clone();
+            async move {
+                tokio::time::sleep(secs(6)).await;
+                published.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        let signal = async {
+            tokio::time::sleep(secs(1)).await;
+            "SIGTERM"
+        };
+
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            duties,
+            &protection,
+            signal,
+            shutdown.clone(),
+            Some(keymanager),
+            &tasks,
+        )
+        .await;
+        assert!(stopped.is_ok(), "a signal is a clean stop, got {stopped:?}");
+        assert!(shutdown.is_cancelled(), "the duty loop was told to stop");
+        let acquire = std::sync::atomic::Ordering::Acquire;
+        assert!(slot_finished.load(acquire), "the slot in flight finished");
+        assert!(published.load(acquire), "the blinded publish finished");
+        assert!(keymanager_finished.load(acquire), "the request finished");
+        // The publish ends last, 6 s in, which is 5 s after the signal and
+        // within the drain.
+        assert_eq!(before.elapsed(), secs(6));
+    }
+
+    /// Work in flight that never finishes does not keep a signalled client
+    /// from stopping: the slot and the publish share `DUTY_DRAIN` from the
+    /// signal, and the stop is still clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_stops_the_client_at_the_drain_deadline_whatever_is_left() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let tasks = TaskTracker::new();
+        tasks.spawn(std::future::pending::<()>());
+
+        let before = tokio::time::Instant::now();
+        let stopped = run_until_stopped(
+            std::future::pending(),
+            &protection,
+            async { "SIGINT" },
+            CancellationToken::new(),
+            None,
+            &tasks,
+        )
+        .await;
+        assert!(stopped.is_ok(), "got {stopped:?}");
+        assert_eq!(before.elapsed(), DUTY_DRAIN);
+    }
+
+    /// Duties that end in an error while the slot in flight finishes stop the
+    /// client with that error rather than a clean stop.
+    #[tokio::test(start_paused = true)]
+    async fn an_error_while_the_slot_finishes_is_still_an_error() {
+        let protection = slashing_protection::SlashingProtection::in_memory();
+        let shutdown = CancellationToken::new();
+        let duties = {
+            let shutdown = shutdown.clone();
+            async move {
+                shutdown.cancelled().await;
+                Err(Error::BeaconNodeSyncing)
+            }
+        };
+
+        let stopped = run_until_stopped(
+            duties,
+            &protection,
+            async { "SIGTERM" },
+            shutdown,
+            None,
+            &TaskTracker::new(),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Err(Error::BeaconNodeSyncing)),
+            "got {stopped:?}"
+        );
     }
 
     fn attester_duty(
@@ -3549,13 +3870,18 @@ mod tests {
         let protection = slashing_protection::SlashingProtection::in_memory();
         let before = tokio::time::Instant::now();
         let stopped = run_until_stopped(
-            async { Error::BeaconNodeSyncing },
+            async { Err(Error::BeaconNodeSyncing) },
             &protection,
+            std::future::pending(),
             CancellationToken::new(),
             None,
+            &TaskTracker::new(),
         )
         .await;
-        assert!(matches!(stopped, Error::BeaconNodeSyncing), "got {stopped}");
+        assert!(
+            matches!(stopped, Err(Error::BeaconNodeSyncing)),
+            "got {stopped:?}"
+        );
         assert_eq!(before.elapsed(), std::time::Duration::ZERO);
     }
 }

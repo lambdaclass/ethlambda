@@ -90,7 +90,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// because an ethlambda node forwards the registrations to its relay and waits
 /// up to 10 s for the answer before replying; a client that gave up at 8 s
 /// would report a failure for a registration the node went on to install.
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How much of a failed answer's body is read. Enough for a pool submission's
 /// 400, which lists each refused entry and is parsed for them.
