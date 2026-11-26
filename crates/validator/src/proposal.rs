@@ -125,6 +125,7 @@ use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produced_block};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::performance::{CHECK_DELAY_SLOTS, Duty, Outcome, Performance, check_proposal_at};
 use crate::preferences::PreferencesService;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
@@ -241,6 +242,9 @@ pub struct ProposalService<B> {
     /// for it. The service's own tracker unless [`Self::with_tasks`] gives it
     /// the client's.
     tasks: TaskTracker,
+    /// Where each proposal's outcome is counted, and its block's later check.
+    /// `None` counts and checks nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi + 'static> ProposalService<B> {
@@ -263,7 +267,57 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             clock: None,
             preferences: None,
             tasks: TaskTracker::new(),
+            performance: None,
         }
+    }
+
+    /// Count each proposal's outcome per validator in `performance`, and,
+    /// with the clock, check [`CHECK_DELAY_SLOTS`] slots on whether each
+    /// block handed to a node is the canonical one at its slot.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
+    }
+
+    fn record(&self, slot: Slot, validator: u64, outcome: Outcome) {
+        if let Some(performance) = &self.performance {
+            performance.record(Duty::Proposal, slot, validator, outcome);
+        }
+    }
+
+    /// Spawn the check of whether `block_root` is still the canonical block
+    /// at `slot` once [`CHECK_DELAY_SLOTS`] more slots have started. Off the
+    /// duty loop, so a slow node never delays a duty. Without the clock there
+    /// is no knowing when that is, and nothing is checked.
+    fn check_later(&self, slot: Slot, validator: u64, block_root: Root) {
+        if let Some(check) = self.later_check(slot, validator, block_root) {
+            check();
+        }
+    }
+
+    /// [`Self::check_later`], for a task that outlives the call to start
+    /// once it knows the block may be out. `None` when nothing is checked.
+    fn later_check(
+        &self,
+        slot: Slot,
+        validator: u64,
+        block_root: Root,
+    ) -> Option<impl FnOnce() + Send + 'static> {
+        let (Some(performance), Some(clock)) = (&self.performance, &self.clock) else {
+            return None;
+        };
+        let at = clock.start_of(slot + CHECK_DELAY_SLOTS);
+        let (beacon_node, performance) = (self.beacon_node.clone(), performance.clone());
+        Some(move || {
+            tokio::spawn(check_proposal_at(
+                beacon_node,
+                performance,
+                slot,
+                validator,
+                block_root,
+                at,
+            ));
+        })
     }
 
     /// Send `min_bid` (gwei) with every gloas block request, so the node
@@ -473,29 +527,46 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         store: &RwLock<ValidatorStore>,
         deadline: Option<Instant>,
     ) -> Result<Proposed> {
+        let validator = duty.validator_index;
         // Nothing awaits between signing and the end of `produce_and_sign`,
         // and a completed future is never discarded at the deadline, so a
         // signed block always reaches the publish step below. A deadline
         // before the signature can leave the slot recorded in slashing
         // protection with nothing signed: the slot is forgone, never signed
         // twice.
-        let signed = before(deadline, slot, self.produce_and_sign(slot, duty, store)).await?;
-        let validator = duty.validator_index;
-        if signed.blinded {
-            return self
-                .publish_blinded(
-                    slot,
-                    validator,
-                    signed.producer,
-                    signed.fork,
-                    signed.body,
-                    deadline,
-                )
-                .await;
-        }
-        self.publish_full(slot, validator, store, signed, deadline)
+        let signed = before(deadline, slot, self.produce_and_sign(slot, duty, store))
             .await
-            .map(Proposed::Full)
+            .inspect_err(|_| self.record(slot, validator, Outcome::Failed))?;
+        let block_root = signed.block_root;
+        let proposed = if signed.blinded {
+            self.publish_blinded(
+                slot,
+                validator,
+                block_root,
+                signed.producer,
+                signed.fork,
+                signed.body,
+                deadline,
+            )
+            .await
+        } else {
+            self.publish_full(slot, validator, store, signed, deadline)
+                .await
+                .map(Proposed::Full)
+        };
+        // A published block is counted where the node accepts it, beside
+        // `blocks_proposed_total`. Here: a failure, and the check of any block
+        // that may be out, an unconfirmed blinded one included. A blinded
+        // block still publishing is checked by its publish task once the node
+        // has answered, and only if it did not refuse the block; a full block
+        // whose publish ran past the deadline, by `publish_full`.
+        proposed
+            .inspect(|proposed| {
+                if !matches!(proposed, Proposed::Blinded(BlindedOutcome::StillPublishing)) {
+                    self.check_later(slot, validator, block_root)
+                }
+            })
+            .inspect_err(|_| self.record(slot, validator, Outcome::Failed))
     }
 
     /// Everything up to and including the block signature: the slashing
@@ -720,8 +791,16 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             ..
         } = signed;
         let publish = self.publish(fork, &body, slot, validator);
-        let published = before(deadline, slot, publish).await?;
+        let published = before(deadline, slot, publish).await.inspect_err(|err| {
+            // Cut while the request was in flight: the node may still import
+            // the block, so it is checked like one that is out. A refusal is
+            // not.
+            if matches!(err, Error::ProposalDeadline { .. }) {
+                self.check_later(slot, validator, block_root);
+            }
+        })?;
         crate::metrics::inc_blocks_proposed();
+        self.record(slot, validator, Outcome::Published);
         // Taken here, not by the caller, which hears back only once a gloas
         // envelope has gone out (or been cut) too.
         self.observe_publication_delay(slot);
@@ -852,32 +931,44 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// (a 4xx, a 503, a connection never made; see
     /// [`BeaconNodeApi::publish_blinded_block`]) is an error, a failed
     /// proposal.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_blinded(
         &self,
         slot: Slot,
         validator: u64,
+        block_root: Root,
         producer: Producer,
         fork: ForkName,
         body: Vec<u8>,
         deadline: Option<Instant>,
     ) -> Result<Proposed> {
         let beacon_node = self.beacon_node.clone();
+        let performance = self.performance.clone();
         let slot_start = self.clock.as_ref().map(|clock| clock.start_of(slot));
+        // Started by the task when nobody waits for its outcome any more,
+        // since the proposal then returned `StillPublishing` and started no
+        // check of its own.
+        let check = self.later_check(slot, validator, block_root);
         let (handoff, mut outcome) = tokio::sync::oneshot::channel();
         self.tasks.spawn(async move {
             let bytes = body.len();
             let answer = beacon_node
                 .publish_blinded_block(producer, fork, &body)
                 .await;
-            let outcome = blinded_outcome(slot, validator, bytes, answer);
+            let outcome = blinded_outcome(slot, validator, bytes, answer, performance.as_deref());
             // Taken at the answer, whoever ends up holding the outcome.
             if let (Ok(BlindedOutcome::Published(_)), Some(start)) = (&outcome, slot_start) {
                 observe_publication_delay_since(start);
             }
             // Fails once the receiving side has stopped waiting, which hands
-            // the outcome back here to report.
+            // the outcome back here to report, and the block to check unless
+            // the node refused it.
             if let Err(outcome) = handoff.send(outcome) {
-                report_unawaited(slot, validator, outcome);
+                let may_be_out = outcome.is_ok();
+                report_unawaited(slot, validator, outcome, performance.as_deref());
+                if may_be_out && let Some(check) = check {
+                    check();
+                }
             }
         });
 
@@ -963,6 +1054,7 @@ fn blinded_outcome(
     validator: u64,
     bytes: usize,
     answer: Result<Published>,
+    performance: Option<&Performance>,
 ) -> Result<BlindedOutcome> {
     match answer {
         Ok(published) => {
@@ -991,6 +1083,9 @@ fn blinded_outcome(
             }
             crate::metrics::inc_blocks_proposed();
             crate::metrics::inc_blinded_blocks_proposed();
+            if let Some(performance) = performance {
+                performance.record(Duty::Proposal, slot, validator, Outcome::Published);
+            }
             Ok(BlindedOutcome::Published(published))
         }
         Err(err @ Error::BlindedUnconfirmed { .. }) => {
@@ -1019,7 +1114,12 @@ fn observe_publication_delay_since(slot_start: SystemTime) {
 /// What the duty loop does with a blinded outcome it receives in time, done by
 /// the publish task when nobody is waiting for it any more (past the deadline,
 /// or a dropped proposal): a refusal counted as a failed proposal.
-fn report_unawaited(slot: Slot, validator: u64, outcome: Result<BlindedOutcome>) {
+fn report_unawaited(
+    slot: Slot,
+    validator: u64,
+    outcome: Result<BlindedOutcome>,
+    performance: Option<&Performance>,
+) {
     match outcome {
         // Logged and counted, and an accepted block's delay taken, by the
         // task already; the task never answers `StillPublishing`.
@@ -1036,6 +1136,9 @@ fn report_unawaited(slot: Slot, validator: u64, outcome: Result<BlindedOutcome>)
                 "The beacon node refused the blinded block, after the proposal stopped waiting"
             );
             crate::metrics::inc_block_proposal_failures();
+            if let Some(performance) = performance {
+                performance.record(Duty::Proposal, slot, validator, Outcome::Failed);
+            }
         }
     }
 }

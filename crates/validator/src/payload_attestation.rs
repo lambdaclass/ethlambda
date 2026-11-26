@@ -60,6 +60,7 @@ use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{PtcDutyDto, parse_pubkey};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::performance::{Batch, Duty, Performance};
 use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept. Far more than the one slot a duty
@@ -74,6 +75,8 @@ pub struct PayloadAttestationService<B> {
     /// A `std::sync::Mutex` for the reason the attestation service's guard is:
     /// the critical section is a lookup and an insert with no await inside it.
     done: std::sync::Mutex<HashSet<(ValidatorIndex, Slot)>>,
+    /// Where each member's vote outcome is counted. `None` counts nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi> PayloadAttestationService<B> {
@@ -82,7 +85,14 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             beacon_node,
             context,
             done: std::sync::Mutex::new(HashSet::new()),
+            performance: None,
         }
+    }
+
+    /// Count each vote's outcome per validator in `performance`.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
     }
 
     /// Sign and submit this client's committee votes for `slot`.
@@ -110,16 +120,31 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         let data = match self.data(slot).await {
             Ok(Some(data)) => data,
             Ok(None) => {
+                // Not a failure: there is nothing to vote on, so nothing is
+                // counted.
                 info!(%slot, "No block known for this slot; not voting on its payload");
                 return Ok(0);
             }
             // Every node's last sync probe said syncing or optimistic, so none
-            // was asked: see "Optimistic heads" above.
+            // was asked: see "Optimistic heads" above. Not a failure either:
+            // nothing may be signed over such a head.
             Err(Error::BeaconNodeSyncing) => {
                 warn!(%slot, "Every beacon node is syncing or on an optimistic head; not voting on this slot's payload");
                 return Ok(0);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // `attest_with`'s count never starts, so the pending votes
+                // are counted failed here, as an early `?` there counts them.
+                drop(Batch::new(
+                    self.performance.as_ref(),
+                    Duty::PayloadAttestation,
+                    slot,
+                    self.pending(slot, duties)
+                        .iter()
+                        .map(|duty| duty.validator_index),
+                ));
+                return Err(err);
+            }
         };
         self.attest_with(slot, duties, store, data).await
     }
@@ -153,6 +178,14 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         if pending.is_empty() {
             return Ok(0);
         }
+        // Each pending vote counts once, published or failed, however this
+        // call ends: an early `?` or the duty loop's deadline counts it failed.
+        let mut outcomes = Batch::new(
+            self.performance.as_ref(),
+            Duty::PayloadAttestation,
+            slot,
+            pending.iter().map(|duty| duty.validator_index),
+        );
 
         // Checked again here, having already been checked by the
         // implementation (see `BeaconNodeApi::payload_attestation_data`), for
@@ -210,6 +243,8 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             .beacon_node
             .submit_payload_attestations(&messages)
             .await?;
+        let sent: Vec<_> = messages.iter().map(|m| m.validator_index).collect();
+        outcomes.submitted(&sent, published);
         if published < submitted {
             warn!(
                 %slot,

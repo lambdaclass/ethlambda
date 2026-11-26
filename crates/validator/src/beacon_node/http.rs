@@ -1626,6 +1626,30 @@ impl BeaconNodeApi for HttpBeaconNode {
         parse_root(&response.data.root)
     }
 
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
+        // A 404 is this endpoint's "no block at that slot", per the
+        // specification.
+        let path = format!("/eth/v1/beacon/headers/{slot}");
+        let response: Option<crate::beacon_node::dto::BlockHeaderResponse> =
+            self.get_optional(&path, StatusCode::NOT_FOUND).await?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        let answered = response.data.header.message.slot;
+        // A node may answer an empty slot with the last block before it
+        // rather than a 404. Either way the slot holds no block. A block from
+        // a later slot answers another question.
+        if answered < slot {
+            return Ok(None);
+        }
+        if answered > slot {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for the block at slot {slot}, node answered with one at slot {answered}"
+            )));
+        }
+        parse_root(&response.data.root).map(Some)
+    }
+
     /// The same partial-success reading as attestations: see
     /// [`Self::handle_pool_submission`].
     async fn submit_sync_committee_messages(
@@ -2655,6 +2679,67 @@ mod tests {
         // The two examples are independent, so the bundle's commitments are
         // not the block's; it carries one per blob all the same.
         assert_eq!(bundle.blobs_bundle.commitments.len(), blobs.len());
+    }
+
+    /// The header endpoint's answer, in the shape the specification gives
+    /// it, read for its root. A 404, or a header for an earlier slot, is no
+    /// block at the slot; a header for a later one is an answer to another
+    /// question.
+    #[tokio::test]
+    async fn a_canonical_block_root_is_read_off_the_header_at_the_slot() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let header = |slot: u64| {
+            serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": {
+                    "root": root,
+                    "canonical": true,
+                    "header": {
+                        "message": {
+                            "slot": slot.to_string(),
+                            "proposer_index": "7",
+                            "parent_root": format!("0x{}", "00".repeat(32)),
+                            "state_root": format!("0x{}", "00".repeat(32)),
+                            "body_root": format!("0x{}", "00".repeat(32)),
+                        },
+                        "signature": format!("0x{}", "00".repeat(96)),
+                    },
+                },
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let json = vec![("content-type", "application/json")];
+
+        let served = serve(200, json.clone(), header(41)).await;
+        let answer = served.node.canonical_block_root(41).await.expect("answers");
+        assert_eq!(answer, Some(Root::from([0xab; 32])));
+        assert_eq!(
+            served.seen.lock().expect("lock")[0].0,
+            "/eth/v1/beacon/headers/41"
+        );
+
+        let served = serve(404, json.clone(), br#"{"code":404}"#.to_vec()).await;
+        assert_eq!(
+            served.node.canonical_block_root(41).await.expect("answers"),
+            None
+        );
+
+        let served = serve(200, json.clone(), header(40)).await;
+        assert_eq!(
+            served.node.canonical_block_root(41).await.expect("answers"),
+            None,
+            "the block before an empty slot"
+        );
+
+        let served = serve(200, json, header(42)).await;
+        let err = served
+            .node
+            .canonical_block_root(41)
+            .await
+            .expect_err("a header for a later slot");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
     }
 
     #[tokio::test]

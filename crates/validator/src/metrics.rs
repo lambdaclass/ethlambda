@@ -577,6 +577,8 @@ pub fn init() {
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
+    // The per-validator series, which live with what records them.
+    crate::performance::init();
     // A labelled series exists only once a label pair is touched.
     for duty in Duty::ALL {
         for fired in Fired::ALL {
