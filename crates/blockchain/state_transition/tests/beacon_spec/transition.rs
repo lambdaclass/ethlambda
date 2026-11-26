@@ -74,7 +74,7 @@ use ethlambda_state_transition::beacon::primitives::Epoch;
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect};
+use super::{Case, collect, preset};
 
 /// One case's `meta.yaml`.
 ///
@@ -176,7 +176,7 @@ fn apply_blocks(
 
 pub fn trials() -> Vec<Trial> {
     let config = Arc::new(Config::active());
-    let cases = collect(PRESET, "transition", "core");
+    let cases = collect(preset(), "transition", "core");
     let mut trials = vec![super::discovery_trial("transition", cases.len())];
 
     for case in cases {

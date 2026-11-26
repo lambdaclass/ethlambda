@@ -22,6 +22,12 @@
 //! over an optimistic head, so [`BeaconNodeApi::head_block_root`] fails with
 //! `BeaconNodeSyncing` for one, and nothing is signed.
 //!
+//! A node that is syncing but not optimistic answers its stale head with
+//! `execution_optimistic: false`, and the Beacon API has no 503 for it. The
+//! fallback therefore does not ask a node whose last sync probe reported
+//! syncing or optimistic for the head (see [`crate::beacon_node::health`]):
+//! with every node in that state, the fetch answers `BeaconNodeSyncing` too.
+//!
 //! # Duplicates
 //!
 //! Not slashable. The slot is recorded per validator at signing time only so a
@@ -34,8 +40,8 @@ use ethlambda_types::beacon::constants::{
     SYNC_COMMITTEE_SUBNET_COUNT, TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE,
 };
 use ethlambda_types::beacon::containers::altair::{
-    ContributionAndProof, SYNC_SUBCOMMITTEE_SIZE, SignedContributionAndProof,
-    SyncCommitteeContribution, SyncCommitteeMessage,
+    ContributionAndProof, SignedContributionAndProof, SyncCommitteeContribution,
+    SyncCommitteeMessage, sync_subcommittee_size,
 };
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root, Slot, ValidatorIndex};
 use sha2::{Digest, Sha256};
@@ -55,7 +61,8 @@ const HISTORY_SLOTS: u64 = 64;
 /// the selection proof's SHA-256, little-endian, divide evenly by
 /// `max(1, SYNC_SUBCOMMITTEE_SIZE / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE)`.
 pub fn is_sync_committee_aggregator(selection_proof: &BlsSignature) -> bool {
-    let modulo = (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+    let modulo =
+        (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
     let digest = Sha256::digest(selection_proof.0);
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest[..8]);
@@ -68,7 +75,7 @@ pub fn subnets_of(duty: &SyncDutyDto) -> BTreeSet<u64> {
     duty.validator_sync_committee_indices
         .iter()
         .filter_map(|seat| {
-            let subnet = seat / SYNC_SUBCOMMITTEE_SIZE as u64;
+            let subnet = seat / sync_subcommittee_size() as u64;
             if subnet < SYNC_COMMITTEE_SUBNET_COUNT as u64 {
                 Some(subnet)
             } else {
@@ -388,7 +395,7 @@ mod tests {
     /// A signature hashing to a multiple of the modulus, or to a non-multiple.
     fn found(selected: bool) -> BlsSignature {
         let modulo =
-            (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+            (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
         for seed in 0u32..100_000 {
             let mut bytes = [0u8; 96];
             bytes[..4].copy_from_slice(&seed.to_le_bytes());
@@ -411,7 +418,7 @@ mod tests {
     #[test]
     fn seats_map_to_subnets_and_stray_ones_are_dropped() {
         let (_, pubkey) = store();
-        let size = SYNC_SUBCOMMITTEE_SIZE as u64;
+        let size = sync_subcommittee_size() as u64;
         let subnets = subnets_of(&duty(
             &pubkey,
             1,
@@ -508,7 +515,7 @@ mod tests {
     }
 
     fn all_subnet_duty(pubkey: &BlsPubkey) -> SyncDutyDto {
-        let size = SYNC_SUBCOMMITTEE_SIZE as u64;
+        let size = sync_subcommittee_size() as u64;
         duty(pubkey, 9, vec![0, size, 2 * size, 3 * size])
     }
 

@@ -453,7 +453,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let fee_recipient = self.settings.fee_recipient(&pubkey);
         let request = BlockRequest {
             slot,
-            fork: self.context.config.fork_at_epoch(epoch),
+            fork: self.context.config().fork_at_epoch(epoch),
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti,
@@ -494,12 +494,13 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         //
         // The two are separate facts. The block was decoded, and will be
         // published, under the fork the node named in its response header. The
-        // signing domain comes from this client's own fork schedule, fetched
-        // from `/config/spec` at startup. They normally agree because they came
-        // from the same place; when they do not, one of them is wrong about
+        // signing domain comes from this client's own fork schedule, taken
+        // from `/config/spec` at startup and kept current by the chain check
+        // (see `chain_check`). They normally agree because they came from the
+        // same place; when they do not, one of them is wrong about
         // where a fork boundary sits, and signing anyway produces a block that
         // is rejected for a reason nothing in the logs would explain.
-        let expected = self.context.config.fork_at_epoch(epoch);
+        let expected = self.context.config().fork_at_epoch(epoch);
         if produced.fork != expected {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a {} block for slot {slot}, but this client's fork schedule puts \
@@ -1031,8 +1032,8 @@ mod tests {
     /// so it would be refused, which is the behaviour these tests want
     /// everywhere except the one that asserts it.
     fn slot() -> Slot {
-        use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
-        Config::mainnet().electra_fork_epoch * SLOTS_PER_EPOCH + 96
+        use ethlambda_types::beacon::preset::slots_per_epoch;
+        Config::mainnet().electra_fork_epoch * slots_per_epoch() + 96
     }
 
     #[tokio::test]
@@ -1880,7 +1881,7 @@ mod gloas_tests {
     use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::gloas;
-    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::BlsPubkey;
     use libssz::SszDecode as _;
 
@@ -1908,7 +1909,7 @@ mod gloas_tests {
     }
 
     fn slot() -> Slot {
-        GLOAS_EPOCH * SLOTS_PER_EPOCH + 5
+        GLOAS_EPOCH * slots_per_epoch() + 5
     }
 
     fn duty(pubkey: &BlsPubkey) -> ProposerDutyDto {

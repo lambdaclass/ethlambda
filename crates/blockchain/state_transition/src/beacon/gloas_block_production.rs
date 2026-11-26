@@ -422,7 +422,7 @@ pub fn assemble_gloas_block_on_bid(
         pubkey_indices,
         ..scratch.caches()
     };
-    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
+    stf::gloas::process_block_and_verify(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -553,7 +553,7 @@ pub fn assemble_gloas_block(
         pubkey_indices,
         ..scratch.caches()
     };
-    stf::gloas::process_block(&mut post, &block, config, caches, options)?;
+    stf::gloas::process_block_and_verify(&mut post, &block, config, caches, options)?;
     block.state_root = post.hash_tree_root();
 
     let envelope = ExecutionPayloadEnvelope {
@@ -685,7 +685,7 @@ pub mod test_support {
         };
         // The window entry `get_ptc` reads for a slot of the state's own epoch.
         let window_index =
-            (preset::SLOTS_PER_EPOCH + inner.slot % preset::SLOTS_PER_EPOCH) as usize;
+            (preset::slots_per_epoch() + inner.slot % preset::slots_per_epoch()) as usize;
         inner.ptc_window[window_index] = ptc;
         state
     }
@@ -769,7 +769,7 @@ pub mod test_support {
     /// The state after `block` is applied to `state`, as the chain stores it.
     pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             block,
             &config(),
@@ -854,7 +854,7 @@ mod gloas_block_production_tests {
         let domain = get_domain(
             state,
             constants::DOMAIN_SYNC_COMMITTEE,
-            Some(previous_slot / preset::SLOTS_PER_EPOCH),
+            Some(previous_slot / preset::slots_per_epoch()),
         );
         let signing_root = compute_signing_root(root, domain);
         let (committee, _) = state.sync_committees().unwrap();
@@ -1055,6 +1055,7 @@ mod gloas_block_production_tests {
         let state = state_to_build_on();
         let skip = BlockProcessingOptions {
             randao: RandaoVerification::Skip,
+            ..Default::default()
         };
         let produce_with = |options| {
             let requests = ExecutionRequests::default();
@@ -1094,7 +1095,7 @@ mod gloas_block_production_tests {
 
         // Importing it with the same option lands on the state root it names.
         let mut post = state.clone();
-        stf::gloas::process_block(
+        stf::gloas::process_block_and_verify(
             &mut post,
             &produced.block,
             &config(),
@@ -1206,7 +1207,7 @@ mod gloas_block_production_tests {
             .filter(|(_, validator)| **validator == first || **validator == second)
             .map(|(position, _)| position)
             .collect();
-        let set: Vec<usize> = (0..preset::PTC_SIZE)
+        let set: Vec<usize> = (0..preset::ptc_size())
             .filter(|&position| aggregate.aggregation_bits.get(position).unwrap_or(false))
             .collect();
         assert_eq!(set, expected_bits);

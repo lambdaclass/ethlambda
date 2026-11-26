@@ -42,7 +42,7 @@ use ethlambda_state_transition::beacon::primitives::{Bytes32, HashTreeRoot as _}
 use libssz::SszDecode as _;
 use libtest_mimic::Trial;
 
-use super::{PRESET, collect};
+use super::{collect, preset};
 
 #[derive(serde::Deserialize)]
 struct Proof {
@@ -62,7 +62,7 @@ fn bytes32(hex_string: &str) -> Bytes32 {
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases: Vec<_> = collect(PRESET, "merkle_proof", "single_merkle_proof")
+    let cases: Vec<_> = collect(preset(), "merkle_proof", "single_merkle_proof")
         .into_iter()
         .filter(|case| case.name.contains("blob_kzg_commitments_"))
         .collect();

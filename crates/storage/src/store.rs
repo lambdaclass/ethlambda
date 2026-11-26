@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -14,6 +15,7 @@ use crate::liveness::ObservedLiveness;
 use crate::pools::{AttestationPool, OperationPool};
 use crate::proto_array::{ProtoArray, ProtoArrayError, RebuildReason, WeightRules};
 use crate::pubkey_index_cache::PubkeyIndexCache;
+use crate::target_balance_cache::TargetBalanceCache;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -31,10 +33,10 @@ use ethlambda_types::{
         },
         fork::ForkName,
         fork_choice::{
-            BlockPayloadLink, ForkChoiceNode, JustifiedBalances, LatestMessage, PayloadStatus,
-            PayloadStatusEnum, PayloadStatusV1, PowBlock,
+            BlockPayloadLink, FastConfirmationVariables, ForkChoiceNode, JustifiedBalances,
+            LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1, PowBlock,
         },
-        preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
+        preset::{Preset, ptc_size, slots_per_epoch},
         primitives::ExecutionBlockHash,
     },
     block::{
@@ -139,18 +141,18 @@ const KEY_DB_VERSION: &[u8] = b"db_version";
 /// [`Chain::selector`] byte, not SSZ: it predates being able to decode
 /// anything else in the directory.
 const KEY_CHAIN: &[u8] = b"chain";
-/// Key for which SSZ preset the build that wrote this directory used. Its
-/// value is a single [`Preset::selector`] byte, raw for the same reason
-/// [`KEY_CHAIN`] is, and more sharply: the preset is what *decides* the shape
-/// of the containers in `States`, so it has to be readable before anything in
-/// the directory is decoded, including by a build that would decode them into
-/// the wrong shape.
+/// Key for which SSZ preset the process that wrote this directory ran
+/// ([`Preset::active`]). Its value is a single [`Preset::selector`] byte, raw
+/// for the same reason [`KEY_CHAIN`] is, and more sharply: the preset is what
+/// *decides* the shape of the containers in `States`, so it has to be readable
+/// before anything in the directory is decoded, including by a process that
+/// would decode them into the wrong shape.
 ///
 /// Written beside [`KEY_CONFIG`] by both bootstrap paths and checked by
-/// [`Store::from_db_state`]. Unlike [`KEY_DB_VERSION`], a mismatch here is not
-/// something this build could fix by migrating: the other preset's states are
-/// a different protocol's states (see this crate's `preset` module), so the
-/// only answer is to refuse.
+/// [`Store::from_db_state`] against the preset the network selected. Unlike
+/// [`KEY_DB_VERSION`], a mismatch here is not something this build could fix
+/// by migrating: the other preset's states are a different protocol's states
+/// (see `ethlambda_types::beacon::preset`), so the only answer is to refuse.
 const KEY_PRESET: &[u8] = b"preset";
 /// Key for the beacon store's unrealized justified checkpoint.
 ///
@@ -171,6 +173,16 @@ const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
 /// [`KEY_LATEST_FINALIZED`] is seeded to the anchor too, but moves with the
 /// chain, so after the first finalization nothing else on disk can answer this.
 const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
+/// The root the Fast Confirmation Rule last reported as confirmed, the one
+/// piece of its state worth keeping across a restart. Its value has type
+/// [`H256`] and it's SSZ-encoded; absent means no run has confirmed anything
+/// yet.
+///
+/// Read once per process, by [`Store::fast_confirmation_restart_root`], for the
+/// specification's `get_restart_resilient_confirmed_root`; rewritten whenever
+/// a run reports a different root. Adding it did not bump [`DB_VERSION`]: an
+/// older directory simply has no row.
+const KEY_BEACON_FAST_CONFIRMED_ROOT: &[u8] = b"beacon_fast_confirmed_root";
 /// The exclusive upper bound of every slot [`Store::prune_finalized_states`]
 /// has already deleted from `States` and `StateDiffs`, which is also the start
 /// of the next range it will delete. Its value has type [`u64`] and it's
@@ -254,6 +266,15 @@ impl Chain {
 /// (e.g. a block's `parent_state` right after import). A miss falls back to a
 /// snapshot read or a diff-chain reconstruction.
 const STATE_CACHE_CAPACITY: usize = 32;
+
+/// The marker for an unset slot: [`Store::network_head`] with no peer
+/// reporting, and [`Store::judged_head_slot`] before the chain actor's first
+/// judgment. No slot reaches it.
+///
+/// No report can be this slot: P2P drops a head more than a slot past the
+/// wall clock. `Relaxed` is enough on both sides, since the value is the
+/// whole message: nothing else is published with it.
+const UNSET_SLOT: u64 = u64::MAX;
 
 /// Keep block proofs for at least this many slots below the tip, even once
 /// finalized. Proofs older than this window are pruned only when the window
@@ -780,6 +801,19 @@ impl JustifiedBalancesCache {
     }
 }
 
+/// Where [`BeaconScratch::fast_confirmation_restart_root`] stands.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartRoot {
+    /// Not asked for yet: the previous process's persisted root, if any, is
+    /// still to be read.
+    #[default]
+    Unread,
+    /// A root the rule may restore.
+    Held(H256),
+    /// Nothing to restore: none was persisted, or the held one was dropped.
+    Gone,
+}
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
 /// chain history: apart from the entries named below, nothing here
 /// survives a restart, and nothing else here is worth the write
@@ -859,6 +893,23 @@ pub(crate) struct BeaconScratch {
     /// from `checkpoint_states`, so nothing needs to persist it.
     pub(crate) justified_balances: JustifiedBalancesCache,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
+    /// The Fast Confirmation Rule's variables and the slot of the run that
+    /// wrote them. `None` until the first run of this process, and again after
+    /// [`Store::reset_fast_confirmation`]; the next run then starts from
+    /// `get_fast_confirmation_store`'s conservative values. Not persisted: the
+    /// variables are rebuilt within an epoch, as the specification intends for
+    /// a restarted node.
+    pub(crate) fast_confirmation: Option<(u64, FastConfirmationVariables)>,
+    /// The root the last run reported as confirmed (see
+    /// `fast_confirmation::run_fast_confirmation`), which `forkchoiceUpdated`'s
+    /// safe block reads and [`KEY_BEACON_FAST_CONFIRMED_ROOT`] persists. Not
+    /// always the variables' `confirmed_root`: while a restored root wins, it
+    /// is that one. Kept as `(slot, root)`, so the safe block's on-chain check
+    /// reads the slot without decoding the block.
+    pub(crate) fast_confirmed_root: Option<(u64, H256)>,
+    /// The root the previous process reported last, which
+    /// `get_restart_resilient_confirmed_root` may restore.
+    pub(crate) fast_confirmation_restart_root: RestartRoot,
     /// In-memory half of `Table::BeaconUnrealizedJustifications`; see this
     /// struct's own documentation for why this map, unlike its neighbours,
     /// has a persisted backing table.
@@ -1254,6 +1305,15 @@ pub struct Store {
     /// node's own API), which is why it lives on the `Store` all three share.
     /// See [`ObservedLiveness`]. Always empty on lean.
     observed_liveness: Arc<ObservedLiveness>,
+    /// The highest head slot this node's peers report in `Status` that it has
+    /// not already imported, as P2P last published it, or [`UNSET_SLOT`]
+    /// while no connected peer reports one. Written by P2P, read by the chain
+    /// actor's sync tracker; see [`Store::network_head`].
+    network_head: Arc<AtomicU64>,
+    /// The head slot as the chain actor last judged the sync gate at, or
+    /// [`UNSET_SLOT`] before its first judgment. Written by the chain
+    /// actor, read by P2P; see [`Store::judged_head_slot`].
+    judged_head_slot: Arc<AtomicU64>,
     /// The total active balance per epoch, shared the way
     /// [`Self::committee_cache`] is: by the chain actor's state transition
     /// and anything else holding a `Store` clone. See
@@ -1261,6 +1321,10 @@ pub struct Store {
     /// `beacon::helpers::accessors::ActiveBalanceCacheExt` for the
     /// state-aware half. Always empty on lean.
     active_balance_cache: Arc<ActiveBalanceCache>,
+    /// Each imported block's unslashed target balances, so the pulled-up tip
+    /// extends its parent's instead of rescanning the registry. See
+    /// [`TargetBalanceCache`]. Always empty on lean.
+    target_balance_cache: Arc<TargetBalanceCache>,
     /// Pubkey to validator index, shared like [`Self::active_balance_cache`].
     /// See [`PubkeyIndexCache`], and `ethlambda-state-transition`'s
     /// `beacon::helpers::accessors::PubkeyIndexCacheExt` for the state-aware
@@ -1390,19 +1454,19 @@ impl Store {
             }
 
             // Before the config decode below and well before any state read:
-            // the preset fixes every SSZ container bound in the directory, so
-            // a build holding the other one would not be reading the same
-            // shapes back. The version check above cannot stand in for this,
+            // the preset fixes every preset-sized container bound in the
+            // directory, so a process running the other one would not be
+            // reading the same shapes back. The version check above cannot stand in for this,
             // since both presets write the same *layout* at the same version.
             let found_preset = view
                 .read_with(Table::Metadata, KEY_PRESET, |bytes| bytes.first().copied())
                 .expect("read preset")
                 .flatten()
                 .and_then(Preset::from_selector);
-            if found_preset != Some(Preset::ACTIVE) {
+            if found_preset != Some(Preset::active()) {
                 return Err(Error::PresetMismatch {
                     found: found_preset.map(Preset::name),
-                    expected: Preset::ACTIVE.name(),
+                    expected: Preset::active().name(),
                 });
             }
 
@@ -1723,7 +1787,7 @@ impl Store {
             let metadata_entries = vec![
                 (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
                 (KEY_CHAIN.to_vec(), vec![Chain::Lean.selector()]),
-                (KEY_PRESET.to_vec(), vec![Preset::ACTIVE.selector()]),
+                (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
                 // Genesis, not zero: `KEY_TIME` is an absolute UNIX
                 // millisecond, so the value that means "the clock has not
                 // advanced past genesis" is genesis itself.
@@ -1837,7 +1901,7 @@ impl Store {
         let metadata_entries = vec![
             (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
             (KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()]),
-            (KEY_PRESET.to_vec(), vec![Preset::ACTIVE.selector()]),
+            (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
             // Genesis rather than zero, for the reason `init_store` gives.
             // `get_forkchoice_store` overwrites this immediately with the
             // anchor's own time; the seed matters only for the window before
@@ -1912,7 +1976,10 @@ impl Store {
             state_rebuilds,
             committee_cache: Arc::new(CommitteeCache::default()),
             observed_liveness: Arc::new(ObservedLiveness::default()),
+            network_head: Arc::new(AtomicU64::new(UNSET_SLOT)),
+            judged_head_slot: Arc::new(AtomicU64::new(UNSET_SLOT)),
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
+            target_balance_cache: Arc::new(TargetBalanceCache::default()),
             pubkey_index_cache: Arc::new(PubkeyIndexCache::default()),
             beacon: Default::default(),
             state_writer,
@@ -2245,6 +2312,10 @@ impl Store {
                     }
                 }
                 Chain::Beacon => {
+                    // An entry below the finalized epoch is never read again:
+                    // a block consults its parent's only within one epoch.
+                    self.target_balance_cache
+                        .prune_below(finalized.slot / slots_per_epoch());
                     // `finalized.slot` is the finalized *epoch's* start slot
                     // (`Store::beacon_checkpoint_as_stored`), which can name a
                     // slot nobody ever built a block for. Pruning to it
@@ -2715,7 +2786,7 @@ impl Store {
     fn snapshot_interval_at(&self, slot: u64) -> u64 {
         let fork = match self.chain {
             Chain::Lean => ForkName::Lean,
-            Chain::Beacon => self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH),
+            Chain::Beacon => self.config.fork_at_epoch(slot / slots_per_epoch()),
         };
         fork.snapshot_interval()
     }
@@ -2890,7 +2961,7 @@ impl Store {
     /// A stored, slot-denominated [`Checkpoint`] read as a beacon one.
     fn as_beacon_checkpoint(checkpoint: Checkpoint) -> BeaconCheckpoint {
         BeaconCheckpoint {
-            epoch: checkpoint.slot / SLOTS_PER_EPOCH,
+            epoch: checkpoint.slot / slots_per_epoch(),
             root: checkpoint.root,
         }
     }
@@ -2904,7 +2975,7 @@ impl Store {
     pub fn beacon_checkpoint_as_stored(checkpoint: BeaconCheckpoint) -> Checkpoint {
         Checkpoint {
             root: checkpoint.root,
-            slot: checkpoint.epoch * SLOTS_PER_EPOCH,
+            slot: checkpoint.epoch * slots_per_epoch(),
         }
     }
 
@@ -3409,11 +3480,64 @@ impl Store {
         &self.observed_liveness
     }
 
+    /// The highest head slot this node's peers report that it has not already
+    /// imported, or `None` while no connected peer reports one.
+    ///
+    /// The sync tracker's evidence that the network is ahead of this node. It
+    /// is a peer *claim*, not a verified block: P2P drops a head past the wall
+    /// clock and does not count a head this node already holds, and the
+    /// tracker requires the node's own head to trail the clock, so no claim
+    /// can stop a node that is current, and gives up on a lead its head does
+    /// not advance towards, so no claim can hold a stalled node for long.
+    /// Runtime-only and shared by every clone of this `Store`.
+    pub fn network_head(&self) -> Option<u64> {
+        let slot = self.network_head.load(Ordering::Relaxed);
+        (slot != UNSET_SLOT).then_some(slot)
+    }
+
+    /// Publish the peers' head; see [`Self::network_head`]. P2P is the only
+    /// writer.
+    pub fn set_network_head(&self, slot: Option<u64>) {
+        // A slot at the sentinel would read back as no report: clamp it.
+        let slot = slot.map_or(UNSET_SLOT, |slot| slot.min(UNSET_SLOT - 1));
+        self.network_head.store(slot, Ordering::Relaxed);
+    }
+
+    /// The head slot the chain actor last judged the sync gate at, which P2P
+    /// reads instead of the head itself: on beacon, reading the head decodes
+    /// the whole head block, and the chain actor has just read it anyway.
+    /// `None` before the actor's first judgment, and while a beacon head row
+    /// names a block the store holds no header for yet (see
+    /// [`Store::beacon_head`]). As old as the latest judgment, which follows
+    /// every head change on both chains (a lean tick that moved the head
+    /// judges again after it, and an import cascade judges between its blocks
+    /// once a wall-clock slot, beacon running fork choice for it). Runtime-only
+    /// and shared by every clone of this `Store`.
+    pub fn judged_head_slot(&self) -> Option<u64> {
+        let slot = self.judged_head_slot.load(Ordering::Relaxed);
+        (slot != UNSET_SLOT).then_some(slot)
+    }
+
+    /// Publish the head slot, `None` for no head; see
+    /// [`Self::judged_head_slot`]. The chain actor is the only writer.
+    pub fn set_judged_head_slot(&self, slot: Option<u64>) {
+        // A slot at the sentinel would read back as no head: clamp it.
+        let slot = slot.map_or(UNSET_SLOT, |slot| slot.min(UNSET_SLOT - 1));
+        self.judged_head_slot.store(slot, Ordering::Relaxed);
+    }
+
     /// The total-active-balance cache shared by every clone of this store.
     ///
     /// An owned `Arc` for the same reason as [`Self::committee_cache`].
     pub fn active_balance_cache(&self) -> Arc<ActiveBalanceCache> {
         Arc::clone(&self.active_balance_cache)
+    }
+
+    /// The per-block target-balance cache shared by every clone of this store.
+    ///
+    /// An owned `Arc` for the same reason as [`Self::committee_cache`].
+    pub fn target_balance_cache(&self) -> Arc<TargetBalanceCache> {
+        Arc::clone(&self.target_balance_cache)
     }
 
     /// The pubkey-index cache shared by every clone of this store.
@@ -4311,10 +4435,10 @@ impl Store {
         for root in gloas_roots {
             scratch
                 .payload_timeliness_vote
-                .insert(root, vec![None; PTC_SIZE]);
+                .insert(root, vec![None; ptc_size()]);
             scratch
                 .payload_data_availability_vote
-                .insert(root, vec![None; PTC_SIZE]);
+                .insert(root, vec![None; ptc_size()]);
         }
     }
 
@@ -4790,6 +4914,12 @@ impl Store {
 
     /// Whether `root` was imported on a `NOT_VALIDATED` answer and has not
     /// since been resolved.
+    ///
+    /// Only a pre-gloas block can be: a gloas block's import asks the
+    /// execution layer nothing, so this is `false` for every gloas root. The
+    /// `execution_optimistic` flag a response or event carries is
+    /// [`Store::is_beacon_block_optimistic`], which reads a gloas block's
+    /// payload verdicts too.
     pub fn is_beacon_optimistic(&self, root: H256) -> bool {
         self.beacon
             .lock()
@@ -4922,6 +5052,118 @@ impl Store {
             .unwrap()
             .envelope_seen_ms
             .retain(|_, (slot, _)| *slot >= finalized_slot);
+    }
+
+    // ============ Fast Confirmation Rule ============
+
+    /// The Fast Confirmation Rule's variables, or `None` before this process
+    /// has run it (or after a reset).
+    pub fn fast_confirmation(&self) -> Option<FastConfirmationVariables> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .fast_confirmation
+            .map(|(_, variables)| variables)
+    }
+
+    /// The slot of the run that wrote [`Self::fast_confirmation`]'s variables.
+    pub fn fast_confirmation_slot(&self) -> Option<u64> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .fast_confirmation
+            .map(|(slot, _)| slot)
+    }
+
+    /// The root the last run reported as confirmed, or `None` before the
+    /// first run (and after a reset).
+    ///
+    /// What `forkchoiceUpdated`'s safe block is read from: callers fall back
+    /// to the finalized root, which is where the rule's own initialization
+    /// puts `confirmed_root`.
+    pub fn fast_confirmed_root(&self) -> Option<H256> {
+        self.fast_confirmed_block().map(|(_, root)| root)
+    }
+
+    /// [`Self::fast_confirmed_root`] with its block's slot.
+    pub fn fast_confirmed_block(&self) -> Option<(u64, H256)> {
+        self.beacon.lock().unwrap().fast_confirmed_root
+    }
+
+    /// Records a run for `slot`: the rule's `variables` and the block it
+    /// reported (`confirmed_slot`, `confirmed_root`), persisting that root when
+    /// it differs from the last one.
+    pub fn set_fast_confirmation(
+        &self,
+        slot: u64,
+        variables: FastConfirmationVariables,
+        confirmed_slot: u64,
+        confirmed_root: H256,
+    ) {
+        let previous = {
+            let mut scratch = self.beacon.lock().unwrap();
+            scratch.fast_confirmation = Some((slot, variables));
+            scratch
+                .fast_confirmed_root
+                .replace((confirmed_slot, confirmed_root))
+        };
+        if previous.map(|(_, root)| root) != Some(confirmed_root) {
+            self.set_metadata(KEY_BEACON_FAST_CONFIRMED_ROOT, &confirmed_root);
+        }
+    }
+
+    /// Forgets the rule's variables and the root it reported, so the safe
+    /// block falls back to the finalized one and the next run starts from the
+    /// finalized checkpoint, as the rule's initialization does.
+    ///
+    /// For a run that cannot follow on from the previous one: a slot went by
+    /// without a run, a run failed, or the node is too far behind the clock to
+    /// run at all (its stored heads would be stale then, and may be pruned).
+    /// Each of those breaks the synchrony the rule assumes, so the root
+    /// reported before it is *not* offered to
+    /// `get_restart_resilient_confirmed_root`: the specification restores a
+    /// root only across a node restart, and only the previous process's
+    /// persisted root is that ([`Self::fast_confirmation_restart_root`]).
+    pub fn reset_fast_confirmation(&self) {
+        let mut scratch = self.beacon.lock().unwrap();
+        scratch.fast_confirmation = None;
+        scratch.fast_confirmed_root = None;
+    }
+
+    /// The root the previous process reported last, read on the first ask of
+    /// this process. Held until [`Self::drop_fast_confirmation_restart_root`].
+    ///
+    /// The specification's implementation-defined
+    /// `get_root_confirmed_before_restart`.
+    pub fn fast_confirmation_restart_root(&self) -> Option<H256> {
+        let mut scratch = self.beacon.lock().unwrap();
+        if scratch.fast_confirmation_restart_root == RestartRoot::Unread {
+            let view = self.backend.begin_read().expect("read view");
+            let persisted = view
+                .read_with(Table::Metadata, KEY_BEACON_FAST_CONFIRMED_ROOT, |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid encoding")
+                })
+                .expect("read");
+            scratch.fast_confirmation_restart_root =
+                persisted.map_or(RestartRoot::Gone, RestartRoot::Held);
+        }
+        match scratch.fast_confirmation_restart_root {
+            RestartRoot::Held(root) => Some(root),
+            RestartRoot::Unread | RestartRoot::Gone => None,
+        }
+    }
+
+    /// Lets go of the restart root, once the rule no longer needs it.
+    pub fn drop_fast_confirmation_restart_root(&self) {
+        self.beacon.lock().unwrap().fast_confirmation_restart_root = RestartRoot::Gone;
+    }
+
+    /// Every validator index observed equivocating, as one snapshot.
+    ///
+    /// For a reader that needs the whole set and would otherwise take this
+    /// store's lock once per validator through [`Store::is_equivocating`].
+    pub fn equivocating_indices(&self) -> HashSet<u64> {
+        self.beacon.lock().unwrap().equivocating_indices.clone()
     }
 
     /// Returns `root`'s unrealized justification, if this store has computed
@@ -5174,7 +5416,7 @@ impl Store {
         slot: u64,
         encoded: &[u8],
     ) -> Result<DataColumnSidecar, Error> {
-        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        let fork = self.config.fork_at_epoch(slot / slots_per_epoch());
         DataColumnSidecar::from_ssz(fork, encoded)
             .map_err(|_| Error::UndecodableDataColumn { slot, fork })
     }
@@ -5941,7 +6183,7 @@ mod tests {
             .expect("preset written at bootstrap");
         assert_eq!(
             preset.first().copied().and_then(Preset::from_selector),
-            Some(Preset::ACTIVE)
+            Some(Preset::active())
         );
     }
 
@@ -5958,7 +6200,7 @@ mod tests {
         // one that is depends on the feature this crate was compiled with, and
         // the check must hold either way round, so the value is derived rather
         // than written as a literal.
-        let other = match Preset::ACTIVE {
+        let other = match Preset::active() {
             Preset::Mainnet => Preset::Minimal,
             Preset::Minimal => Preset::Mainnet,
         };
@@ -5976,7 +6218,7 @@ mod tests {
             panic!("expected a preset mismatch, got {err}");
         };
         assert_eq!(found, Some(other.name()));
-        assert_eq!(expected, Preset::ACTIVE.name());
+        assert_eq!(expected, Preset::active().name());
     }
 
     #[test]
@@ -7396,10 +7638,10 @@ mod tests {
                 slot,
                 ..Default::default()
             },
-            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             historical_roots: Default::default(),
@@ -7408,10 +7650,10 @@ mod tests {
             eth1_deposit_index: 0,
             validators: Default::default(),
             balances: Default::default(),
-            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![H256::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_attestations: Default::default(),
@@ -7496,6 +7738,17 @@ mod tests {
 
         clone.cache_state(key, Arc::new(beacon_test_state(7)));
         assert!(store.cached_state(key).is_some());
+    }
+
+    #[test]
+    fn the_network_head_is_shared_across_store_clones() {
+        let store = Store::test_store();
+        let clone = store.clone();
+        assert_eq!(store.network_head(), None);
+        clone.set_network_head(Some(42));
+        assert_eq!(store.network_head(), Some(42));
+        clone.set_network_head(None);
+        assert_eq!(store.network_head(), None);
     }
 
     #[test]
@@ -9226,10 +9479,10 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
-        store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
-        store.insert_beacon_el_block_hash(root, SLOTS_PER_EPOCH, H256::from([9u8; 32]));
+        store.insert_verified_payload(slots_per_epoch(), &test_envelope(root));
+        store.insert_beacon_el_block_hash(root, slots_per_epoch(), H256::from([9u8; 32]));
 
         assert!(store.remove_verified_payload(&root));
         assert_eq!(store.beacon_el_block_hash(root), None);
@@ -9246,10 +9499,10 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         let envelope = test_envelope(root);
-        store.insert_verified_payload(SLOTS_PER_EPOCH, &envelope);
+        store.insert_verified_payload(slots_per_epoch(), &envelope);
         assert!(store.has_verified_payload(&root));
 
         let reopened = reopen(backend);
@@ -9269,7 +9522,7 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store.set_gloas_block_timeliness(root, [true, false]);
 
@@ -9284,7 +9537,7 @@ mod tests {
         let backend = beacon_backend_finalized_at(root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(root, beacon_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(root, beacon_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store.set_block_timeliness(root, [true, true]);
 
@@ -9300,18 +9553,18 @@ mod tests {
         let backend = beacon_backend_finalized_at(gloas_root);
         let mut store = reopen(backend.clone());
         store
-            .insert_signed_block(gloas_root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .insert_signed_block(gloas_root, gloas_test_block(slots_per_epoch(), H256::ZERO))
             .expect("insert block");
         store
             .insert_signed_block(
                 phase0_root,
-                beacon_test_block(SLOTS_PER_EPOCH + 1, gloas_root),
+                beacon_test_block(slots_per_epoch() + 1, gloas_root),
             )
             .expect("insert block");
 
         let reopened = reopen(backend);
 
-        let empty = vec![None; PTC_SIZE];
+        let empty = vec![None; ptc_size()];
         assert_eq!(
             reopened.payload_timeliness_vote(&gloas_root),
             Some(empty.clone())
@@ -9353,11 +9606,11 @@ mod tests {
         let backend = beacon_backend_finalized_at(finalized);
         let mut store = reopen(backend.clone());
         let rows = [
-            (old, SLOTS_PER_EPOCH - 3, H256::ZERO, 0xa1),
-            (finalized, SLOTS_PER_EPOCH - 2, old, 0xa2),
-            (child, SLOTS_PER_EPOCH - 1, finalized, 0xa3),
+            (old, slots_per_epoch() - 3, H256::ZERO, 0xa1),
+            (finalized, slots_per_epoch() - 2, old, 0xa2),
+            (child, slots_per_epoch() - 1, finalized, 0xa3),
             // A zero payload hash is a pre-merge shape: no entry.
-            (premerge, SLOTS_PER_EPOCH, child, 0),
+            (premerge, slots_per_epoch(), child, 0),
         ];
         for (root, slot, parent, byte) in rows {
             let hash = ExecutionBlockHash::repeat_byte(byte);
@@ -9391,9 +9644,9 @@ mod tests {
         let backend = beacon_backend_finalized_at(finalized);
         let mut store = reopen(backend.clone());
         let slots = [
-            (old, SLOTS_PER_EPOCH - 3, H256::ZERO),
-            (finalized, SLOTS_PER_EPOCH - 2, old),
-            (child, SLOTS_PER_EPOCH - 1, finalized),
+            (old, slots_per_epoch() - 3, H256::ZERO),
+            (finalized, slots_per_epoch() - 2, old),
+            (child, slots_per_epoch() - 1, finalized),
         ];
         for (root, slot, parent) in slots {
             store
@@ -9466,7 +9719,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = |epoch| LatestMessage {
             epoch,
-            slot: epoch * SLOTS_PER_EPOCH,
+            slot: epoch * slots_per_epoch(),
             root: H256::from([epoch as u8; 32]),
             payload_present: false,
         };
@@ -9493,7 +9746,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
-            slot: SLOTS_PER_EPOCH,
+            slot: slots_per_epoch(),
             root: H256::from([1u8; 32]),
             payload_present: false,
         };
@@ -9531,7 +9784,7 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 1,
-            slot: SLOTS_PER_EPOCH,
+            slot: slots_per_epoch(),
             root: H256::from([1u8; 32]),
             payload_present: false,
         };
@@ -9599,6 +9852,41 @@ mod tests {
         assert_eq!(
             store.beacon_payload_status(ExecutionBlockHash::repeat_byte(5)),
             None
+        );
+    }
+
+    /// The restart root is the persisted row, read on the first ask and held,
+    /// not taken, until it is dropped; a reset forgets the run and the root it
+    /// reported, and does not make that root a restart root.
+    #[test]
+    fn the_fast_confirmation_restart_root_is_held_until_dropped() {
+        let store = Store::test_store();
+        let variables = FastConfirmationVariables::at_finalized(BeaconCheckpoint::default());
+        let (first, second) = (H256::repeat_byte(1), H256::repeat_byte(2));
+
+        // The row an earlier process left, read on the first ask.
+        store.set_fast_confirmation(5, variables, 4, first);
+        assert_eq!(store.fast_confirmed_root(), Some(first));
+        assert_eq!(store.fast_confirmed_block(), Some((4, first)));
+        assert_eq!(store.fast_confirmation_slot(), Some(5));
+        assert_eq!(store.fast_confirmation_restart_root(), Some(first));
+        assert_eq!(store.fast_confirmation_restart_root(), Some(first), "held");
+        store.drop_fast_confirmation_restart_root();
+        assert_eq!(
+            store.fast_confirmation_restart_root(),
+            None,
+            "not read again"
+        );
+
+        store.set_fast_confirmation(6, variables, 5, second);
+        store.reset_fast_confirmation();
+        assert_eq!(store.fast_confirmation(), None);
+        assert_eq!(store.fast_confirmation_slot(), None);
+        assert_eq!(store.fast_confirmed_root(), None);
+        assert_eq!(
+            store.fast_confirmation_restart_root(),
+            None,
+            "a reset within a process restores nothing"
         );
     }
 
@@ -9930,7 +10218,7 @@ mod tests {
             root: H256::from([7u8; 32]),
         };
         let stored = Store::beacon_checkpoint_as_stored(cp);
-        assert_eq!(stored.slot, 3 * SLOTS_PER_EPOCH);
+        assert_eq!(stored.slot, 3 * slots_per_epoch());
         store
             .update_checkpoints(ForkCheckpoints::new(anchor_root, Some(stored), None))
             .expect("advance justified");
@@ -10195,7 +10483,7 @@ mod tests {
     fn a_gloas_sidecar_round_trips_through_both_column_tables() {
         let store = gloas_scheduled_store();
         let root = H256::repeat_byte(7);
-        let slot = 2 * SLOTS_PER_EPOCH + 3;
+        let slot = 2 * slots_per_epoch() + 3;
         let sidecar = gloas_sidecar_at(slot, 4, root);
 
         store.put_data_column(&sidecar).unwrap();
@@ -10222,16 +10510,16 @@ mod tests {
     #[test]
     fn a_row_decodes_as_the_fork_its_slot_names() {
         let store = gloas_scheduled_store();
-        let fulu = fulu_sidecar_at(SLOTS_PER_EPOCH, 1);
+        let fulu = fulu_sidecar_at(slots_per_epoch(), 1);
         let root = fulu.block_root();
         store.put_data_column(&fulu).unwrap();
         assert_eq!(
-            store.get_data_column(SLOTS_PER_EPOCH, &root, 1).unwrap(),
+            store.get_data_column(slots_per_epoch(), &root, 1).unwrap(),
             Some(fulu)
         );
 
         // The same bytes filed under a gloas slot are not a gloas sidecar.
-        let gloas_slot = 2 * SLOTS_PER_EPOCH;
+        let gloas_slot = 2 * slots_per_epoch();
         let encoded = fulu_sidecar_at(gloas_slot, 1).to_ssz();
         assert!(matches!(
             store.decode_data_column_sidecar(gloas_slot, &encoded),
@@ -10873,6 +11161,8 @@ mod tests {
             vec![1].into(),
             1,
             vec![1].into(),
+            Box::default(),
+            1,
         ))
     }
 

@@ -243,7 +243,7 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 { "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
 ```
 
-`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+`is_syncing` is the node's own stateful sync decision, updated each tick and after each block arrival: true while the head trails the wall clock and the head the node's peers report in `Status` is ahead of it, with hysteresis. With no peer ahead (a stalled network, or no peers, including right after startup before any peer has reported) it is false. It is also false once peers have claimed a lead for a whole stall window in all (`SyncThresholds::LEAN.stall_window`, 16 slots) while the head stayed flat, until the head next advances, and a peer that has just failed to serve a range request does not count towards the lead while it cools down. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
 
 `sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
@@ -466,9 +466,12 @@ the chain actor writes, so no request waits on the actor.
   next slot's block is asked for. Entries more than an epoch old are dropped
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
-  memory, so a restart forgets it and the node builds its own payloads for the
-  zero address until the next call. ethlambda's validator client repeats the
-  call every slot, as Lighthouse's does.
+  memory, so a restart forgets it and the node builds its own payloads for
+  `beacon --fallback-fee-recipient` (the zero address without it) until the
+  next call. ethlambda's validator client repeats the call every slot, as
+  Lighthouse's does. The fallback pays any proposer no validator client named
+  a recipient for, but does not register it: the `payload_attributes` event
+  still follows `prepare_beacon_proposer`.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
@@ -845,7 +848,15 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
   under a fulu head, is answered from a copy of the head state advanced to the
   epoch's first slot, crossing the gloas upgrade where it falls, on a blocking
   thread. A gloas epoch more than one before the head state's is a `400`.
-  `dependent_root` is defined as for attester duties. There is no `503`.
+  The gloas fork epoch is a `400` until its first slot has started by the wall
+  clock, allowing `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms), while the head is
+  still before it: its committee is computed at the fork from the effective
+  balances the last pre-gloas epoch ends with, so it can change until then
+  (Lighthouse refuses it the same way). `dependent_root` is defined as for
+  attester duties, except for the fork epoch, whose root is the block root at
+  the last slot before the fork (the genesis block's when gloas starts at
+  genesis).
+  There is no `503`.
 - **`GET /eth/v1/validator/payload_attestation_data?slot=`** answers
   `{version: "gloas", data: {beacon_block_root, slot, payload_present,
   blob_data_available}}` as JSON, or the SSZ `PayloadAttestationData` on
@@ -882,9 +893,9 @@ Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
 The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.
 
-A `cl_type: ethlambda` participant in our ethereum-package fork
-([`lambdaclass/ethereum-package`](https://github.com/lambdaclass/ethereum-package/tree/add-ethlambda),
-branch `add-ethlambda`) runs an ethlambda validator client that, by default,
+A `cl_type: ethlambda` participant in
+[`ethpandaops/ethereum-package`](https://github.com/ethpandaops/ethereum-package)
+runs an ethlambda validator client that, by default,
 talks to this node alone, so every block its validators propose is one this
 node built.
 
@@ -941,9 +952,15 @@ object that may arrive late or never, and two rules share the flag:
   the optimistic set. The block's own payload does not count, so a withheld
   payload does not make the chain look unverified.
 
-Pre-gloas responses are unchanged. One helper implements both rules
-(`shared/optimistic.rs`) and every response that carries the flag goes through
-it.
+Pre-gloas responses are unchanged. `Store::is_beacon_block_optimistic` and
+`Store::is_beacon_payload_optimistic` (`ethlambda-storage`'s
+`execution_optimistic` module) implement the two rules, and every response
+that carries the flag goes through them, as do `/eth/v1/events`'s `head`,
+`head_v2` (both emissions), `chain_reorg`, `block` and `finalized_checkpoint`,
+which take the block rule. `execution_payload` applies the envelope rule to the
+verdict its envelope was just imported on. The store's own
+optimistic set alone would read `false` for every gloas block, since a gloas
+block's import asks the execution layer nothing.
 
 ### `GET /eth/v1/config/fork_schedule`
 
@@ -961,7 +978,7 @@ with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
-One flat object holding the network's configuration, the compiled preset, and
+One flat object holding the network's configuration, the active preset's values, and
 the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.
@@ -1071,20 +1088,43 @@ these are ever sent:
 
 | Event | Payload | Emitted when |
 |-------|---------|--------------|
-| `head` | `{"slot":"10", "block":"0x…", "state":"0x…", "epoch_transition":false, "previous_duty_dependent_root":"0x…", "current_duty_dependent_root":"0x…", "execution_optimistic":false}` | The head changed, and is within 32 slots of the wall clock |
-| `block` | `{"slot":"10", "block":"0x…", "execution_optimistic":false}` | A block is imported |
+| `head` | `{"slot":"10", "block":"0x…", "state":"0x…", "epoch_transition":false, "previous_duty_dependent_root":"0x…", "current_duty_dependent_root":"0x…", "execution_optimistic":false}` | The head changed, and is within 32 slots of the wall clock. Deprecated by the specification in favour of `head_v2`, and still emitted |
+| `head_v2` | `{"version":"gloas", "data":{"slot":"10", "block":"0x…", "state":"0x…", "payload_status":"full", "epoch_transition":false, "current_epoch_dependent_root":"0x…", "next_epoch_dependent_root":"0x…", "execution_optimistic":false}}` | Right after every `head` (before gloas too, with `payload_status` `full`), and a second time for the same block when its payload status goes from empty to full. `version` is the head state's fork |
+| `block` | `{"slot":"10", "block":"0x…", "execution_optimistic":false}`; from gloas on also `"builder_index":"42", "block_hash":"0x…"` (the block's bid's), absent before | A block is imported |
 | `block_gossip` | `{"slot":"10", "block":"0x…"}` | A block passed gossip validation, or was published through `POST /eth/v2/beacon/blocks` |
 | `finalized_checkpoint` | `{"block":"0x…", "state":"0x…", "epoch":"2", "execution_optimistic":false}` | The finalized checkpoint advanced |
 | `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
 | `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
+| `single_attestation` | `{"committee_index":"1", "attester_index":"1", "data":<AttestationData>, "signature":"0x…"}` | A subnet attestation passed the `beacon_attestation_{subnet_id}` gossip rules, or was accepted by `POST /eth/v2/beacon/pool/attestations`. This is the highest-rate topic (every attestation on the node's backbone subnets). Nothing is built while no client is connected, but a client subscribed to any topic turns it on: all topics share one ring, so a client that stalls lags that much sooner |
 | `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+| `fast_confirmation` | `{"block":"0x…", "slot":"1", "current_slot":"2"}` | The Fast Confirmation Rule ran, once per slot at the slot's tick, whether or not the confirmed block changed. `block` and `slot` are the most recent confirmed block's (after a restart or a slot without a run, the restored one while it wins), `current_slot` the slot of the run. Not sent while the head is more than 32 slots behind the wall clock, nor for a slot whose tick ran past its attestation deadline (the rule is not run then) |
+| `execution_payload` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…", "execution_optimistic":false}` | The chain actor imported a gloas envelope (from gossip, req/resp or `POST /eth/v1/beacon/execution_payload_envelopes`). `execution_optimistic` is the envelope rule of "`execution_optimistic` under gloas": true when the execution client answered `SYNCING` or `ACCEPTED` |
+| `execution_payload_gossip` | `{"slot":"10", "builder_index":"42", "block_hash":"0x…", "block_root":"0x…"}` | An envelope passed the `execution_payload` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_envelopes` |
+| `execution_payload_available` | `{"slot":"10", "block_root":"0x…"}` | Right after `execution_payload` (see below) |
+| `execution_payload_bid` | `{"version":"gloas", "data":<SignedExecutionPayloadBid>}` | A bid passed the `execution_payload_bid` gossip rules, or was accepted by `POST /eth/v1/beacon/execution_payload_bids` |
+| `payload_attestation_message` | `{"version":"gloas", "data":<PayloadAttestationMessage>}` | A message passed the `payload_attestation_message` gossip rules, or was accepted by `POST /eth/v1/beacon/pool/payload_attestations` |
+| `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
+| `payload_attributes` | `{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}`; from gloas, `parent_block_number` is gone and `safe_block_hash`/`finalized_block_hash` are added | The next slot's attributes, a third of a slot before it, for a proposer registered through `prepare_beacon_proposer` (every proposer with `--always-prepare-payload`); again when an input to them changes after that point (see below) |
 
-Never emitted: `single_attestation` (subnet votes are verified and relayed but
-never reach the chain actor), the operation topics (`voluntary_exit`,
+Never emitted: the operation topics (`voluntary_exit`,
 `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
-`contribution_and_proof`: no operation pools), `payload_attributes`, the light
-client topics, `blob_sidecar`, and `head_v2` with every other gloas topic (this
-build stops at fulu).
+`contribution_and_proof`: no operation pools), the light client topics and
+`blob_sidecar`.
+
+The gloas topics and `single_attestation` are emitted by whichever part of the
+node accepted the object, since several never reach the chain actor: the actor
+publishes `execution_payload` and `execution_payload_available`; p2p publishes
+the gossip-accepted `execution_payload_gossip`, `execution_payload_bid`,
+`payload_attestation_message`, `proposer_preferences` and `single_attestation`
+(subnet attestations are relayed, never applied); and the API handlers publish
+what a validator client or builder submits.
+
+**`execution_payload_available` is not a separate moment.** The specification
+asks for it when the payload and its blobs are verified available. The chain
+actor imports an envelope only once both hold (the payload verified, and every
+sampled column of a bid with commitments stored), so `execution_payload` and
+`execution_payload_available` are emitted back to back from the same import,
+`execution_payload` first.
 
 How head and finality events behave:
 
@@ -1097,9 +1137,10 @@ How head and finality events behave:
   moving it back to an ancestor). Lighthouse reports only the `chain_reorg` for
   those; Prysm reports both, as this node does.
 - **Stale heads are not reported.** A head more than 32 slots behind the wall
-  clock (catch-up) sends no `head`; `block` events still show progress.
+  clock (catch-up) sends no `head` and no `head_v2`, nor the second `head_v2`
+  when its payload arrives; `block` events still show progress.
   `chain_reorg` and `finalized_checkpoint` are not gated.
-- **Order:** each `block` as it imports, then `chain_reorg`, `head`,
+- **Order:** each `block` as it imports, then `chain_reorg`, `head`, `head_v2`,
   `finalized_checkpoint`.
 - `epoch_transition` is whether the head's epoch is later than the previous
   head's. The dependent roots follow the specification, with the genesis block
@@ -1114,6 +1155,40 @@ too: gossip never delivers a node its own messages, so
 `POST /eth/v2/validator/aggregate_and_proofs` hands each accepted one to the
 actor after gossiping it. That is also what puts this node's own aggregates
 into its fork choice.
+
+How `payload_attributes` behaves:
+
+- **What it carries** is what `produceBlockV3`/`produceBlockV4` would send the
+  execution client for a block at `proposal_slot` on the current head, from
+  the same code: the head state advanced to the slot, the fee recipient
+  (on gloas the proposer's signed preferences first, then on every fork
+  `prepare_beacon_proposer`'s, else `--fallback-fee-recipient`, else the zero
+  address), and on gloas the parent payload fork choice selects (the head's
+  payload status, and for a head at the previous slot the PTC's votes on its
+  payload) and the preferences' gas target. `payload_attributes`
+  is the execution API's `PayloadAttributesV3` (`V4` from gloas) in
+  `snake_case` with quoted integers.
+- **When**: at two thirds of each slot (Lighthouse's default
+  `--prepare-payload-lookahead` of a third of a slot), then once more each time
+  an input to the attributes changes before the slot ends: the head; on gloas
+  the parent payload the proposal extends (the head's payload arriving, or the
+  PTC voting it late, which happens after the lookahead point) and the
+  proposer's signed preferences (from gossip or
+  `POST /eth/v1/validator/proposer_preferences`); and the fee recipient
+  `prepare_beacon_proposer` names, once something else re-checks. An event is
+  sent only while the inputs it was computed from are still current, so a
+  change while it is being computed replaces it rather than following it. A
+  computation that fails is retried at the next re-check, up to three times
+  for the same inputs. Not while the node is syncing, and only for slots at
+  fulu or later.
+- **For whom**: proposers some validator client named through
+  `prepare_beacon_proposer` or a builder registration, or every proposer with
+  `beacon --always-prepare-payload`, which an external builder reading this
+  stream (ethereum-package's buildoor) needs.
+- **Nothing reaches the execution client early.** Other clients send a
+  `forkchoiceUpdated` with these attributes at the same point, so the payload
+  is already building when `produceBlock` arrives; this node still starts the
+  build at `produceBlock`.
 
 Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing.

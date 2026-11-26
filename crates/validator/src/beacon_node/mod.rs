@@ -20,6 +20,7 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::health::SyncStatus;
 use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
@@ -28,6 +29,7 @@ use ethlambda_types::beacon::containers::gloas;
 pub mod block_contents;
 pub mod dto;
 pub mod fallback;
+pub mod health;
 pub mod http;
 
 #[cfg(test)]
@@ -241,7 +243,7 @@ pub enum Published {
     HandedToBuilder,
 }
 
-/// How many of the configured nodes took something sent to every node.
+/// How many of the nodes sent to took something sent to every node.
 ///
 /// The caller needs it when what it sends lives on each node separately and
 /// a node that missed it never hears it any other way. Proposer preferences
@@ -250,7 +252,10 @@ pub enum Published {
 /// node accepted" must not be mistaken for "every node did".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    /// Every configured node accepted. The only answer a single node gives.
+    /// Every node it was sent to accepted. The only answer a single node
+    /// gives. A fallback sends only to the nodes on this client's chain, so a
+    /// node skipped for not being on it does not hold it: see
+    /// [`BeaconNodeApi::readmissions`].
     Everywhere,
     /// At least one node accepted and at least one refused or did not answer.
     Partly,
@@ -350,6 +355,14 @@ pub struct ValidatorEntry {
     pub status: String,
 }
 
+/// Whether the node saw one validator act in the epoch asked about. See
+/// [`BeaconNodeApi::liveness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Liveness {
+    pub index: ValidatorIndex,
+    pub is_live: bool,
+}
+
 /// One validator's registry entry, as much of it as a voluntary exit needs.
 ///
 /// `status` is the Beacon API's own string (`active_ongoing`,
@@ -367,6 +380,22 @@ pub struct ValidatorDetails {
 
 #[async_trait]
 pub trait BeaconNodeApi: Send + Sync {
+    /// Who this node is, for a log line that names it: its URL for an HTTP
+    /// node, empty for an implementation with nothing to say.
+    fn describe(&self) -> String {
+        String::new()
+    }
+
+    /// A count that grows each time a node calls may go to is added back: a
+    /// fallback's node let back in by the chain check. A caller that stops
+    /// sending something once every node took it ([`Delivery::Everywhere`])
+    /// sends it again when this moves, since the node let back in was skipped
+    /// by the sends before. Constant for one node, which is every node there
+    /// is.
+    fn readmissions(&self) -> u64 {
+        0
+    }
+
     /// The chain's genesis time and validators root, needed to compute slots
     /// and signing domains before any duty can be served.
     async fn genesis(&self) -> Result<Genesis>;
@@ -395,7 +424,19 @@ pub trait BeaconNodeApi: Send + Sync {
     /// [`crate::error::Error::BeaconNodeSyncing`]. That is a backstop, not the
     /// check: it puts correctness entirely in the node's hands for a rule the
     /// client is the one bound by.
+    ///
+    /// The duty loop does not call this. It reads the same two flags from the
+    /// probe [`health`] takes ahead of every slot, through
+    /// [`Self::sync_status`]. This answers the callers outside the loop: the
+    /// voluntary-exit command, and a node's own check before
+    /// [`Self::liveness`].
     async fn is_optimistic_or_syncing(&self) -> Result<bool>;
+
+    /// The node's `GET /eth/v1/node/syncing` answer in full: the two flags
+    /// [`Self::is_optimistic_or_syncing`] reads, `el_offline`, and the head slot
+    /// and sync distance it reports. What [`health`]'s per-slot probe asks each
+    /// node.
+    async fn sync_status(&self) -> Result<SyncStatus>;
 
     /// Resolves each pubkey to its current validator index and status, so the
     /// rest of the client can address validators by index, as the Beacon API
@@ -439,20 +480,23 @@ pub trait BeaconNodeApi: Send + Sync {
     /// definition (one epoch later) is not.
     ///
     /// The fallback fails over quietly here: when every node fails it logs
-    /// nothing of its own, since its one caller, the preferences service,
-    /// reports the failure itself, once per epoch. A new caller that needs
-    /// the failure seen must log it.
+    /// nothing of its own, since both callers report the failure themselves:
+    /// the preferences service once per epoch, and the duty loop, whose
+    /// proposer schedule comes from here from fulu (see
+    /// `duties::ProposerDutiesVersion`), at each fetch. A new caller that
+    /// needs the failure seen must log it.
     async fn proposer_duties_v2(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
     /// Produce the attestation data for `slot`, which is in `fork`.
     ///
-    /// No committee index is ever a parameter here. Before gloas the query
-    /// still carries `committee_index=0`, which the specification deprecated
+    /// No committee index is ever a parameter here. The query carries
+    /// `committee_index=0` at every fork, which the specification deprecated
     /// from electra on and nodes ignore, so a caller cannot get it wrong. From
-    /// gloas it is omitted, because the answer's `index` is no longer a
-    /// committee but the payload signal (0 for a same-slot block, 1 when the
-    /// attested block's payload was seen as full), and the caller must pass it
-    /// through unchanged: it is signed.
+    /// gloas the specification says to omit it, but Lighthouse still requires
+    /// it (see `HttpBeaconNode::attestation_data_path`). From gloas the
+    /// answer's `index` is no longer a committee but the payload signal (0 for
+    /// a same-slot block, 1 when the attested block's payload was seen as
+    /// full), and the caller must pass it through unchanged: it is signed.
     ///
     /// # Contract: the answer is for `slot`, or this is an `Err`
     ///
@@ -484,9 +528,11 @@ pub trait BeaconNodeApi: Send + Sync {
     /// envelope in the answer, which saves a round trip inside the proposal's
     /// budget.
     ///
-    /// Returns the block and whatever travelled with it, decoded from SSZ.
-    /// JSON is not used here: see [`block_contents`] for why a block, alone
-    /// among everything this client handles, cannot go through the JSON path.
+    /// Returns the block and whatever travelled with it, decoded into the
+    /// typed container its root is taken from. SSZ is asked for first; before
+    /// gloas a JSON answer is decoded too, for a proxy that rewrites the
+    /// request's `Accept`. See [`block_contents`] for why either way ends in
+    /// the same container, and never in a mapping of this crate's own.
     ///
     /// # Contract: the answer is for this request, or it is an `Err`
     ///
@@ -659,6 +705,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// # Contract: the answer is for `slot`, or this is an `Err`
     ///
     /// For the reason [`Self::attestation_data`] states.
+    ///
+    /// # Not from a node whose last probe said syncing or optimistic
+    ///
+    /// The Beacon API asks for a 503 here only while a node syncs, and the
+    /// answer carries no `execution_optimistic`, so an optimistic node may hand
+    /// out data for a block its execution client has not validated. The
+    /// fallback therefore does not ask a node whose last [`health`] probe
+    /// reported syncing or optimistic, and answers `Err(BeaconNodeSyncing)`
+    /// when that leaves no node to ask.
     async fn payload_attestation_data(
         &self,
         slot: Slot,
@@ -773,6 +828,14 @@ pub trait BeaconNodeApi: Send + Sync {
     /// execution client has not validated. Mapping it to the same error a 503
     /// gets makes failover try the next node rather than hand this one's root
     /// to the signer.
+    ///
+    /// # Not from a node whose last probe said syncing
+    ///
+    /// A syncing node that is not optimistic answers its stale head with
+    /// `execution_optimistic: false`, and the Beacon API defines no 503 for this
+    /// endpoint. The fallback therefore does not ask a node whose last
+    /// [`health`] probe reported syncing or optimistic, and answers
+    /// `Err(BeaconNodeSyncing)` when that leaves no node to ask.
     async fn head_block_root(&self) -> Result<Root>;
 
     /// Submit signed sync committee messages to the node's pool. Returns how
@@ -830,6 +893,73 @@ pub trait BeaconNodeApi: Send + Sync {
     /// against its head state and gossips it. A refusal (400) surfaces as
     /// [`crate::error::Error::BeaconNodeStatus`] carrying the node's reason.
     async fn submit_voluntary_exit(&self, exit: &SignedVoluntaryExit) -> Result<()>;
+
+    /// Whether the node saw each of `indices` act in each of `epochs`:
+    /// `POST /eth/v1/validator/liveness/{epoch}` once per epoch, which
+    /// doppelganger protection reads (see [`crate::doppelganger`]). What
+    /// counts as acting is the node's own view; nodes count attestations,
+    /// aggregates and blocks, whether seen on gossip or included on chain.
+    ///
+    /// The answer holds one list per epoch, in the order `epochs` names them.
+    /// Every epoch is answered by the same node, so a caller combining them
+    /// reads one node's view rather than two nodes' halves; a failure on any
+    /// of them fails the whole call, and failover asks the next node about
+    /// all of them.
+    ///
+    /// An empty `indices` answers an empty list per epoch without asking:
+    /// some nodes refuse the request.
+    ///
+    /// # Contract: a syncing node's answer is `Err(BeaconNodeSyncing)`
+    ///
+    /// A node that has not caught up has not seen what the network did, so
+    /// its "nobody is live" would clear a key it should not. An
+    /// implementation must ask the node it is about to ask this of whether
+    /// it is syncing or optimistic (once for the whole call, not once per
+    /// epoch), and answer [`crate::error::Error::BeaconNodeSyncing`] instead
+    /// when it is, so failover moves to a node that can answer. Asking any
+    /// other node, as [`Self::is_optimistic_or_syncing`] through failover
+    /// would, says nothing about the one that answers.
+    ///
+    /// # Contract: one answer per index asked, and no other
+    ///
+    /// Checked by [`validate_liveness`] in the implementation, for each
+    /// epoch, for the reason [`Self::attestation_data`] states: a key the
+    /// answer leaves out has not been shown silent, and must not be read as
+    /// if it had.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>>;
+}
+
+/// Check that `answers` names every one of `asked` exactly once and nothing
+/// else, as the contract on [`BeaconNodeApi::liveness`] requires.
+pub fn validate_liveness(asked: &[ValidatorIndex], answers: &[Liveness]) -> Result<()> {
+    let asked: std::collections::HashSet<ValidatorIndex> = asked.iter().copied().collect();
+    let mut answered = std::collections::HashSet::with_capacity(answers.len());
+    for answer in answers {
+        if !asked.contains(&answer.index) {
+            return Err(Error::InconsistentResponse(format!(
+                "liveness answer names validator {}, which was not asked about",
+                answer.index
+            )));
+        }
+        if !answered.insert(answer.index) {
+            return Err(Error::InconsistentResponse(format!(
+                "liveness answer names validator {} twice",
+                answer.index
+            )));
+        }
+    }
+    if answered.len() != asked.len() {
+        return Err(Error::InconsistentResponse(format!(
+            "liveness answer covers {} of the {} validators asked about",
+            answered.len(),
+            asked.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Check that `contribution` is the one asked for, as the contract on
@@ -948,5 +1078,32 @@ mod tests {
     #[should_panic(expected = "lean is not a Beacon Chain fork")]
     fn the_lean_fork_is_a_bug_in_the_caller() {
         let _ = validate_attestation_data(100, ForkName::Lean, &with_index(0));
+    }
+
+    fn liveness(answers: &[(ValidatorIndex, bool)]) -> Vec<Liveness> {
+        answers
+            .iter()
+            .map(|&(index, is_live)| Liveness { index, is_live })
+            .collect()
+    }
+
+    /// Every index asked about, once each, in any order, is an answer.
+    /// Anything else is a node to fail over from, never a key to clear.
+    #[test]
+    fn a_liveness_answer_must_cover_exactly_the_indices_asked() {
+        let asked = [3, 5];
+        assert!(validate_liveness(&asked, &liveness(&[(5, false), (3, true)])).is_ok());
+        for wrong in [
+            liveness(&[(3, false)]),
+            liveness(&[(3, false), (5, false), (9, false)]),
+            liveness(&[(3, false), (3, false)]),
+            liveness(&[(3, false), (9, false)]),
+        ] {
+            let err = validate_liveness(&asked, &wrong).expect_err("not an answer");
+            assert!(
+                matches!(err, crate::error::Error::InconsistentResponse(_)),
+                "got {err}"
+            );
+        }
     }
 }

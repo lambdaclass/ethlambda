@@ -5,11 +5,14 @@
 //! Two of this crate's variants could plausibly claim a bad response, so the
 //! split is fixed here rather than decided per call site:
 //!
-//! - `BeaconNodeFailure::classify` is called **only** on a `send` failure, so
-//!   it only ever describes transport: a timeout, a refused connection, a body
-//!   that stopped arriving. That is a property of the node or the network.
+//! - `BeaconNodeFailure::classify` is called **only** on a transport failure,
+//!   a `send` or a body read, so it only ever describes transport: a timeout,
+//!   a refused connection, a body that stopped arriving. That is a property of
+//!   the node or the network.
 //! - A response that arrives whole but does not deserialise is
-//!   `Error::Decode`. That is a property of what the node said.
+//!   `Error::Decode`, and so is one refused unread for being longer than any
+//!   answer this client reads (`ANSWER_READ_LIMIT`). That is a property of
+//!   what the node said.
 //! - A response that deserialises but contradicts what was asked for is
 //!   `Error::InconsistentResponse`, raised here. It used to be raised by the
 //!   caller, which was wrong for one specific reason: `FallbackBeaconNode`
@@ -17,8 +20,11 @@
 //!   answer has already been accepted, and the next node is never tried. See
 //!   the contract on `BeaconNodeApi::attestation_data`.
 //!
-//! Keeping `classify` off the `json` path is what stops `reqwest`'s own
-//! `is_decode` from competing with `Error::Decode` for the same failure.
+//! A successful answer's body is therefore read whole first, then
+//! deserialised (`answer_bytes`, then `serde_json` or SSZ): a body that stops
+//! arriving is classified, one that arrives whole and does not deserialise is
+//! `Error::Decode`. Reading through `reqwest`'s own `json` would let its
+//! `is_decode` compete with `Error::Decode` for the same failure.
 
 use std::time::Duration;
 
@@ -40,16 +46,18 @@ use libssz::SszDecode as _;
 use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
-    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
-    ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto,
-    ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response,
-    encode_hex, parse_pubkey, parse_root,
+    CommitteeSubscriptionDto, DataResponse, DutiesResponse, ErrorMessageDto, GenesisDto,
+    IndexedErrorResponse, LivenessDto, ProduceBlockV3Response, ProposerDutyDto,
+    ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto, SingleAttestationDto,
+    SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorDetailsDto, ValidatorEntryDto,
+    VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
+use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
-    ValidatorEntry, validate_attestation_data, validate_produced_block, validate_sync_contribution,
+    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    ValidatorEntry, validate_attestation_data, validate_liveness, validate_produced_block,
+    validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -82,7 +90,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// because an ethlambda node forwards the registrations to its relay and waits
 /// up to 10 s for the answer before replying; a client that gave up at 8 s
 /// would report a failure for a registration the node went on to install.
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How much of a failed answer's body is read. Enough for a pool submission's
 /// 400, which lists each refused entry and is parsed for them.
@@ -90,6 +98,24 @@ const ERROR_BODY_READ_LIMIT: usize = 1024 * 1024;
 
 /// How much of a failed answer's body an error carries, and so a log line.
 const ERROR_TEXT_LIMIT: usize = 1024;
+
+/// The most a successful answer's body may be. A longer one is refused rather
+/// than read, so a node, or a proxy in front of it, sending an endless body
+/// cannot hold this client's memory on it: [`REQUEST_TIMEOUT`] bounds how long
+/// a body may take, not how much of it arrives in that time.
+///
+/// Far above the largest answer this client reads, a `produceBlockV3` answer
+/// in JSON. Its block fits gossip's 10 MiB `MAX_PAYLOAD_SIZE`, so it is at
+/// most about 20 MiB as hex, and each blob is about 270 KB with its cell
+/// proofs, so even that block fits here beside some 400 blobs, where blob
+/// schedules run at a few dozen. SSZ is about half the size.
+const ANSWER_READ_LIMIT: usize = 128 * 1024 * 1024;
+
+/// The most of an answer's declared `Content-Length` reserved before any of
+/// its body arrives. Enough for nearly every answer to need no regrowth; a
+/// larger one grows as its body arrives (see
+/// [`HttpBeaconNode::answer_bytes_within`]).
+const ANSWER_PREALLOCATION: usize = 4 * 1024 * 1024;
 
 /// A failed answer's body, read up to [`ERROR_BODY_READ_LIMIT`] bytes, so a
 /// node answering with an endless body cannot hold the client on it. Only
@@ -118,6 +144,14 @@ fn error_text(text: &str) -> String {
     ethlambda_types::text::one_line(text, ERROR_TEXT_LIMIT)
 }
 
+/// A JSON answer's decode error as [`error_text`] writes it. serde's message
+/// can quote the node's own text, the whole of an unexpected string among
+/// it, so it is bounded and written out like a failed answer's body before
+/// it reaches an error and the log line that prints it.
+fn decode_text(err: &serde_json::Error) -> String {
+    error_text(&err.to_string())
+}
+
 /// [`read_error_body`] as [`error_text`] shows it.
 async fn error_body(response: reqwest::Response) -> String {
     error_text(&read_error_body(response).await)
@@ -133,6 +167,35 @@ struct SszResponse {
     /// `Eth-Execution-Payload-Included`, sent by `produceBlockV4` only.
     payload_included: Option<bool>,
     body: Vec<u8>,
+}
+
+/// `produceBlockV3`'s `Accept`: SSZ preferred, JSON taken. The
+/// specification's own example. See [`HttpBeaconNode::get_block_v3`] for why
+/// JSON is named at all.
+const SSZ_OR_JSON: &str = "application/octet-stream;q=1.0,application/json;q=0.9";
+
+/// What `produceBlockV3` answered, in either encoding: the fork, whether the
+/// block is blinded, and the body, still to be decoded as the container those
+/// two select.
+struct BlockAnswer {
+    fork: ForkName,
+    blinded: bool,
+    body: BlockBody,
+}
+
+enum BlockBody {
+    Ssz(Vec<u8>),
+    /// The answer's `data`, the rest of its body already read.
+    Json(serde_json::Value),
+}
+
+/// Whether `content_type` names `media_type`, ignoring case and any
+/// parameters (`application/json; charset=utf-8` names `application/json`).
+fn is_media_type(content_type: &str, media_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|named| named.trim().eq_ignore_ascii_case(media_type))
 }
 
 /// The body `produceBlockV4` requires: the node decodes it, as the
@@ -177,7 +240,7 @@ impl HttpBeaconNode {
             .connect_timeout(connect_timeout)
             .build()
             .map_err(|err| Error::BeaconNode {
-                url: base_url.clone(),
+                url: without_credentials(&base_url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -198,7 +261,7 @@ impl HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -218,7 +281,7 @@ impl HttpBeaconNode {
             request = request.header("Eth-Consensus-Version", version);
         }
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -254,7 +317,7 @@ impl HttpBeaconNode {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -295,21 +358,23 @@ impl HttpBeaconNode {
 
     /// Fetch a body as SSZ, returning the fork the node named alongside it.
     ///
-    /// `Accept` names SSZ alone, deliberately narrower than the specification's
-    /// own example.
+    /// For what this client decodes from SSZ only: today the gloas payload
+    /// envelope. `produceBlockV3` is not fetched through here; it takes JSON
+    /// as well and goes through [`Self::get_block_v3`].
     ///
-    /// That example is `application/octet-stream;q=1.0,application/json;q=0.9`,
-    /// which says JSON is acceptable at lower preference. It is the right
-    /// header for a client that can decode both. This one cannot: there is no
-    /// JSON path for a block, so a node taking the `q=0.9` offer would be
-    /// answering correctly and losing this client the proposal on every node in
-    /// the failover list. (Aggregates do not come through here; they are
-    /// fetched as JSON, because Lighthouse sends JSON for them regardless.)
+    /// `Accept` names SSZ alone, deliberately narrower than the specification's
+    /// own example. That example, [`SSZ_OR_JSON`], says JSON is acceptable at
+    /// lower preference, which is the right header for a request whose answer
+    /// this client can decode either way. For one it can only decode from SSZ,
+    /// a node taking the `q=0.9` offer would be answering correctly and failing
+    /// the request on every node in the failover list. (Aggregates do not come
+    /// through here either; they are fetched as JSON, because Lighthouse sends
+    /// JSON for them regardless.)
     ///
     /// Naming only what can be decoded makes 406 the node's one legal way out,
-    /// and `decode_status` turns that into an ordinary error failover moves
-    /// past. The content-type check below stays as the backstop for a node that
-    /// ignores the header entirely.
+    /// and `send_for_answer` turns that into an ordinary error failover moves
+    /// past. The content-type check in [`Self::ssz_answer`] stays as the
+    /// backstop for a node that ignores the header entirely.
     ///
     /// The fork comes back from `Eth-Consensus-Version` because it cannot come
     /// from the bytes: SSZ carries no type tag. A missing or unrecognised
@@ -330,7 +395,12 @@ impl HttpBeaconNode {
 
     /// POST a JSON body and read the answer as SSZ, the way [`Self::get_ssz`]
     /// does. For `produceBlockV4`, which is a POST because it carries the
-    /// builder configuration, and answers in SSZ like its predecessor.
+    /// builder configuration.
+    ///
+    /// SSZ alone, unlike `produceBlockV3`: this client has no JSON path for a
+    /// gloas block, and has not needed one, since the proxy that made it add
+    /// one for `produceBlockV3` (blobber, see [`Self::get_block_v3`]) does not
+    /// intercept this endpoint.
     async fn post_json_for_ssz(
         &self,
         path: &str,
@@ -350,8 +420,19 @@ impl HttpBeaconNode {
     }
 
     async fn read_ssz(url: String, request: reqwest::RequestBuilder) -> Result<SszResponse> {
+        let response = Self::send_for_answer(&url, request).await?;
+        Self::ssz_answer(url, response).await
+    }
+
+    /// Send `request` and hand back the answer when it is a success. A 503 is
+    /// the node syncing; any other failure status is an error carrying the
+    /// body.
+    async fn send_for_answer(
+        url: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let response = request.send().await.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -367,21 +448,20 @@ impl HttpBeaconNode {
                 body,
             });
         }
+        Ok(response)
+    }
 
-        let header = |name: &str| -> Option<String> {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        };
+    /// A successful answer read as SSZ, with the headers that say what its
+    /// bytes are.
+    async fn ssz_answer(url: String, response: reqwest::Response) -> Result<SszResponse> {
+        let header = |name: &str| Self::header(&response, name);
 
         // A node that ignored the Accept header and sent JSON would otherwise
         // reach the SSZ decoder as bytes that happen not to parse, and be
         // reported as a malformed block rather than as the content-type
         // mismatch it is.
         if let Some(content_type) = header(reqwest::header::CONTENT_TYPE.as_str())
-            && !content_type.starts_with("application/octet-stream")
+            && !is_media_type(&content_type, "application/octet-stream")
         {
             return Err(Error::InconsistentResponse(format!(
                 "asked for SSZ, node answered with {content_type}"
@@ -394,11 +474,7 @@ impl HttpBeaconNode {
                     .to_string(),
             )
         })?;
-        let fork = ForkName::parse(&version.to_ascii_lowercase()).ok_or_else(|| {
-            Error::InconsistentResponse(format!(
-                "Eth-Consensus-Version names fork {version}, which this client does not know"
-            ))
-        })?;
+        let fork = Self::known_fork(&version, "Eth-Consensus-Version")?;
 
         // Reported, not judged. Each is sent by one endpoint only, so requiring
         // it here would break every other caller of this helper; whether its
@@ -407,17 +483,270 @@ impl HttpBeaconNode {
         let payload_included =
             Self::bool_header(header("eth-execution-payload-included"), "Included")?;
 
-        let body = response.bytes().await.map_err(|err| Error::BeaconNode {
-            url,
-            failure: BeaconNodeFailure::classify(&err),
-            detail: err.to_string(),
-        })?;
+        let body = Self::answer_bytes(url, response).await?;
         Ok(SszResponse {
             fork,
             blinded,
             payload_included,
-            body: body.to_vec(),
+            body,
         })
+    }
+
+    /// GET `produceBlockV3`, taking the answer as SSZ or as JSON.
+    ///
+    /// `Accept` is [`SSZ_OR_JSON`], where every other SSZ fetch names SSZ
+    /// alone (see [`Self::get_ssz`]). A node honouring it answers SSZ, which is
+    /// read exactly as before. JSON is named because a proxy can make it the
+    /// only answer: ethereum-package's blobber, in marioevz/blobber v1.1.0's
+    /// [`validator_proxy/proxy.go`](https://github.com/marioevz/blobber/blob/v1.1.0/validator_proxy/proxy.go)
+    /// (a file of that repository, not this one), sits between a validator
+    /// client and its node, rewrites `Accept` to `application/json` on this
+    /// endpoint and on `/eth/v2/validator/blocks/{slot}`, and relays the
+    /// node's answer, headers included, unchanged. A client taking SSZ alone
+    /// lost every proposal behind it.
+    ///
+    /// Which encoding arrived is read off `Content-Type`.
+    /// `application/octet-stream`, or no content type at all, is SSZ, as for
+    /// [`Self::get_ssz`]; `application/json` is JSON, read by
+    /// [`Self::json_block_answer`]; anything else is refused rather than
+    /// guessed at.
+    async fn get_block_v3(&self, path: &str) -> Result<BlockAnswer> {
+        let url = format!("{}{path}", self.base_url);
+        debug!(%url, "Beacon API GET (ssz or json)");
+        let request = self
+            .client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, SSZ_OR_JSON);
+        let response = Self::send_for_answer(&url, request).await?;
+
+        match Self::header(&response, reqwest::header::CONTENT_TYPE.as_str()) {
+            Some(content_type) if is_media_type(&content_type, "application/json") => {
+                Self::json_block_answer(url, response).await
+            }
+            Some(content_type) if !is_media_type(&content_type, "application/octet-stream") => {
+                Err(Error::InconsistentResponse(format!(
+                    "asked for SSZ or JSON, node answered with {content_type}"
+                )))
+            }
+            _ => {
+                let SszResponse {
+                    fork,
+                    blinded,
+                    body,
+                    ..
+                } = Self::ssz_answer(url, response).await?;
+                // Required on this endpoint, so its absence is an error rather
+                // than a default. The specification marks it required precisely
+                // because it selects which container the bytes are, and a
+                // blinded body is a different shape entirely; guessing
+                // "unblinded" would send a blinded answer to the decoder and
+                // surface it as an opaque malformed block.
+                let blinded = blinded.ok_or_else(|| {
+                    Error::InconsistentResponse(
+                        "response carries no Eth-Execution-Payload-Blinded, so whether it is a \
+                         block or a blinded block is unknown"
+                            .to_string(),
+                    )
+                })?;
+                Ok(BlockAnswer {
+                    fork,
+                    blinded,
+                    body: BlockBody::Ssz(body),
+                })
+            }
+        }
+    }
+
+    /// A successful `produceBlockV3` answer read as JSON, into the same
+    /// [`BlockAnswer`] an SSZ one gives.
+    ///
+    /// The fork comes from the body's `version`, falling back on
+    /// `Eth-Consensus-Version`, and whether the block is blinded from
+    /// `execution_payload_blinded`, falling back on
+    /// `Eth-Execution-Payload-Blinded`. The specification requires both body
+    /// fields, and both headers beside them; a header only stands in for a
+    /// field the body left out, since it says the same thing.
+    ///
+    /// When a field and its header are both present they must agree. A node
+    /// naming two forks, or calling a block both blinded and not, has not said
+    /// which container `data` is, and decoding it as either one risks signing a
+    /// root that is not the block's; as an `Err` it is one failover moves past.
+    /// When neither is present the answer is refused, as an SSZ answer missing
+    /// the header is.
+    ///
+    /// A body that is not a block answer but the specification's error
+    /// message is the error it reports (see [`Self::relayed_error`]).
+    async fn json_block_answer(url: String, response: reqwest::Response) -> Result<BlockAnswer> {
+        let header_version = Self::header(&response, "eth-consensus-version");
+        let header_blinded = Self::bool_header(
+            Self::header(&response, "eth-execution-payload-blinded"),
+            "Blinded",
+        )?;
+        let bytes = Self::answer_bytes(url, response).await?;
+        let answer: ProduceBlockV3Response = serde_json::from_slice(&bytes).map_err(|err| {
+            Self::relayed_error(&bytes).unwrap_or_else(|| {
+                Error::Decode(format!("produceBlockV3 JSON answer: {}", decode_text(&err)))
+            })
+        })?;
+
+        let fork = match (answer.version, header_version) {
+            (Some(version), Some(header)) => {
+                let fork = Self::known_fork(&version, "the answer's version")?;
+                let header_fork = Self::known_fork(&header, "Eth-Consensus-Version")?;
+                // Named by the parsed forks, not the text: both parsed, so
+                // nothing of the node's own reaches the message.
+                if header_fork != fork {
+                    return Err(Error::InconsistentResponse(format!(
+                        "the answer's version names fork {} and its \
+                         Eth-Consensus-Version fork {}",
+                        fork.as_str(),
+                        header_fork.as_str()
+                    )));
+                }
+                fork
+            }
+            (Some(version), None) => Self::known_fork(&version, "the answer's version")?,
+            (None, Some(header)) => Self::known_fork(&header, "Eth-Consensus-Version")?,
+            (None, None) => {
+                return Err(Error::InconsistentResponse(
+                    "answer names its fork in neither its version nor Eth-Consensus-Version, so \
+                     the fork its data encodes is unknown"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let blinded = match (answer.execution_payload_blinded, header_blinded) {
+            (Some(body), Some(header)) if body != header => {
+                return Err(Error::InconsistentResponse(format!(
+                    "the answer's execution_payload_blinded is {body} and its \
+                     Eth-Execution-Payload-Blinded {header}"
+                )));
+            }
+            (body, header) => body.or(header).ok_or_else(|| {
+                Error::InconsistentResponse(
+                    "answer says in neither execution_payload_blinded nor \
+                     Eth-Execution-Payload-Blinded whether it is a block or a blinded block"
+                        .to_string(),
+                )
+            })?,
+        };
+
+        Ok(BlockAnswer {
+            fork,
+            blinded,
+            body: BlockBody::Json(answer.data),
+        })
+    }
+
+    /// The error a success answer's body reports, when the body is the
+    /// specification's `ErrorMessage` with a 4xx or 5xx `code`: what
+    /// [`Self::send_for_answer`] would have returned had the status said it.
+    ///
+    /// blobber (`proxyHandler` in its
+    /// [`validator_proxy/proxy.go`](https://github.com/marioevz/blobber/blob/v1.1.0/validator_proxy/proxy.go))
+    /// relays the node's headers and body but never its status, so a node
+    /// failing `produceBlockV3` behind it answers `200 application/json` with
+    /// the failure in the body. Read as a block answer that is a missing
+    /// `data`, a malformed block rather than the node's own error, and a
+    /// syncing node would stop being reported as one.
+    fn relayed_error(bytes: &[u8]) -> Option<Error> {
+        let error: ErrorMessageDto = serde_json::from_slice(bytes).ok()?;
+        if !(400..600).contains(&error.code) {
+            return None;
+        }
+        if error.code == StatusCode::SERVICE_UNAVAILABLE.as_u16() {
+            return Some(Error::BeaconNodeSyncing);
+        }
+        Some(Error::BeaconNodeStatus {
+            status: error.code,
+            body: error_text(&String::from_utf8_lossy(bytes)),
+        })
+    }
+
+    /// The header `name`, when present and readable as text.
+    fn header(response: &reqwest::Response, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// The fork `version` names, `named_by` saying where it was read for the
+    /// error when this client does not know it.
+    ///
+    /// `version` is the node's text, a JSON body's `version` being any string
+    /// at all, so the error carries it as [`error_text`] writes it: one line,
+    /// no terminal escapes, capped. The duty loop logs that error, and a
+    /// `version` holding a line break or an ESC would otherwise forge a log
+    /// line or restyle the operator's terminal.
+    fn known_fork(version: &str, named_by: &str) -> Result<ForkName> {
+        ForkName::parse(&version.to_ascii_lowercase()).ok_or_else(|| {
+            Error::InconsistentResponse(format!(
+                "{named_by} names fork {}, which this client does not know",
+                error_text(version)
+            ))
+        })
+    }
+
+    /// A successful answer's whole body, refused once it passes
+    /// [`ANSWER_READ_LIMIT`].
+    async fn answer_bytes(url: String, response: reqwest::Response) -> Result<Vec<u8>> {
+        Self::answer_bytes_within(url, response, ANSWER_READ_LIMIT).await
+    }
+
+    /// [`Self::answer_bytes`] with `limit` in place of [`ANSWER_READ_LIMIT`],
+    /// so a test can pass the limit without sending 128 MiB.
+    ///
+    /// A `Content-Length` above `limit` is refused before any of the body is
+    /// read. Without one (a chunked answer), the body is read a chunk at a
+    /// time and refused at the chunk that would take it past `limit`, so at
+    /// most `limit` bytes are ever held. Each chunk is appended to the body
+    /// returned, and no copy of the whole is made once it is read.
+    async fn answer_bytes_within(
+        url: String,
+        mut response: reqwest::Response,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let too_large = |url: &str| {
+            Error::Decode(format!(
+                "{} answered with a body of more than {limit} bytes, more than any answer this \
+                 client reads",
+                without_credentials(url)
+            ))
+        };
+        let declared = response.content_length();
+        if declared.is_some_and(|length| length > limit as u64) {
+            return Err(too_large(&url));
+        }
+
+        // Reserved up front only up to `ANSWER_PREALLOCATION`: the declared
+        // length is the node's word, and a node declaring the limit and then
+        // sending nothing would otherwise hold that much per request until
+        // the timeout. At most `ANSWER_PREALLOCATION`, so the cast cannot
+        // truncate.
+        let reserved = declared.unwrap_or(0).min(ANSWER_PREALLOCATION as u64) as usize;
+        let mut body = Vec::with_capacity(reserved);
+        while let Some(chunk) = response.chunk().await.map_err(|err| Error::BeaconNode {
+            url: without_credentials(&url),
+            failure: BeaconNodeFailure::classify(&err),
+            detail: err.to_string(),
+        })? {
+            if chunk.len() > limit - body.len() {
+                return Err(too_large(&url));
+            }
+            // Grown by doubling, as `extend_from_slice` would, but never past
+            // `limit`: left to itself, a body just over a power of two of its
+            // first reservation would reserve nearly twice the limit.
+            let needed = body.len() + chunk.len();
+            if needed > body.capacity() {
+                let grown = body.capacity().saturating_mul(2).clamp(needed, limit);
+                body.reserve_exact(grown - body.len());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     /// A `true`/`false` header, `None` when absent, an error when it is
@@ -449,7 +778,7 @@ impl HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -503,17 +832,19 @@ impl HttpBeaconNode {
         Ok(block)
     }
 
-    /// The path for one slot's attestation data.
+    /// The path for one slot's attestation data, the same at every fork.
     ///
-    /// Gloas omits `committee_index`: the parameter is optional there, and the
-    /// answer's `index` is the payload signal rather than a committee, so
-    /// asking about committee 0 would only suggest the old meaning.
-    fn attestation_data_path(slot: Slot, fork: ForkName) -> String {
-        if fork >= ForkName::Gloas {
-            format!("/eth/v1/validator/attestation_data?slot={slot}")
-        } else {
-            format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
-        }
+    /// `committee_index=0` is sent even at gloas slots, against the Beacon
+    /// API's "for slots in Gloas and later, this parameter SHOULD be omitted".
+    /// Lighthouse (v8.3.3, and `unstable`) still declares the parameter
+    /// required and answers a query without it with a 400, which would cost
+    /// every gloas attestation against a Lighthouse node. Sending it is safe:
+    /// Lighthouse's handler produces the data for committee 0 whatever the
+    /// query names, ethlambda's own beacon node ignores the parameter, and the
+    /// answer's `index` is the payload signal whatever was asked. Omit it at
+    /// gloas once Lighthouse accepts a query without it.
+    fn attestation_data_path(slot: Slot) -> String {
+        format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0")
     }
 
     /// The query string for one aggregate.
@@ -610,15 +941,40 @@ impl HttpBeaconNode {
                 body,
             });
         }
-        response
-            .json()
-            .await
-            .map_err(|err| Error::Decode(err.to_string()))
+        // Read through `answer_bytes`, not `Response::json`, which reads the
+        // whole body with no limit (see `ANSWER_READ_LIMIT`).
+        let url = response.url().to_string();
+        let bytes = Self::answer_bytes(url, response).await?;
+        serde_json::from_slice(&bytes).map_err(|err| Error::Decode(decode_text(&err)))
+    }
+}
+
+/// `url` with its user name and password removed, for a log line or an error
+/// (every `Error::BeaconNode` built here carries its URL through this, since
+/// those errors are logged, and the chain check logs them at `warn`). Anything
+/// that does not parse as a URL is returned as it is: it cannot be a URL that
+/// carries credentials a request would send.
+fn without_credentials(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            // Neither fails on a URL that already has a user name or password.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.as_str().trim_end_matches('/').to_string()
+        }
+        _ => url.to_string(),
     }
 }
 
 #[async_trait]
 impl BeaconNodeApi for HttpBeaconNode {
+    /// The base URL without any credentials it carries
+    /// (`https://user:password@host`), since this is what the chain check logs
+    /// a node by, at `info` and `warn`.
+    fn describe(&self) -> String {
+        without_credentials(&self.base_url)
+    }
+
     /// Fetches the chain's genesis time and validators root.
     async fn genesis(&self) -> Result<Genesis> {
         let response: DataResponse<GenesisDto> = self.get("/eth/v1/beacon/genesis").await?;
@@ -637,33 +993,44 @@ impl BeaconNodeApi for HttpBeaconNode {
     /// defaults, so nothing in this client may rely on those.
     async fn spec(&self) -> Result<Config> {
         let response: DataResponse<serde_json::Value> = self.get("/eth/v1/config/spec").await?;
-        config_from_spec_response(&response.data)
+        // A body that parsed as JSON is the node's own answer, so a spec it
+        // cannot be read from is told apart from a body that is not JSON at
+        // all: startup gives up on the one and waits out the other.
+        config_from_spec_response(&response.data).map_err(|err| match err {
+            Error::Decode(detail) => Error::UnreadableSpec(detail),
+            other => other,
+        })
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
-        let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
-        let syncing = response.data.is_syncing;
-        let optimistic = response.data.is_optimistic.unwrap_or(false);
+        let status = self.sync_status().await?;
 
         // Reported rather than acted on. An execution client that has just gone
         // offline leaves the node with the head it validated before that, which
         // is still a head worth attesting to; the moment that stops being true
         // the node reports it as optimistic instead.
-        if response.data.el_offline.unwrap_or(false) {
+        if status.el_offline {
             warn!(
-                url = %self.base_url,
+                url = %self.describe(),
                 "Beacon node reports its execution client is offline; it will go optimistic if it \
                  has not already"
             );
         }
-        if optimistic && !syncing {
+        if status.is_optimistic && !status.is_syncing {
             warn!(
-                url = %self.base_url,
+                url = %self.describe(),
                 "Beacon node has finished syncing but is tracking an unvalidated head; refusing \
                  to sign against it"
             );
         }
-        Ok(syncing || optimistic)
+        Ok(!status.is_synced())
+    }
+
+    /// Logs nothing: the per-slot probe asks this every slot, and its record
+    /// logs a node's status only when it changes.
+    async fn sync_status(&self) -> Result<SyncStatus> {
+        let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
+        Ok(response.data.into())
     }
 
     /// Resolves each pubkey to its validator index and current status.
@@ -731,7 +1098,7 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         let response: DataResponse<AttestationDataDto> =
-            self.get(&Self::attestation_data_path(slot, fork)).await?;
+            self.get(&Self::attestation_data_path(slot)).await?;
         let data = AttestationData::try_from(&response.data)?;
         // Enforced here rather than at the call site so that failover works:
         // see the contract on `BeaconNodeApi::attestation_data`. An `Err` here
@@ -773,24 +1140,13 @@ impl BeaconNodeApi for HttpBeaconNode {
             encode_hex(&request.graffiti.0),
             request.builder_boost_factor.unwrap_or(0),
         );
-        let SszResponse {
+        // SSZ or JSON, the fork and blindedness settled either way; see
+        // `get_block_v3`.
+        let BlockAnswer {
             fork,
             blinded,
             body,
-            ..
-        } = self.get_ssz(&path).await?;
-        // Required on this endpoint, so its absence is an error rather than a
-        // default. The specification marks it required precisely because it
-        // selects which container the bytes are, and a blinded body is a
-        // different shape entirely; guessing "unblinded" would send a blinded
-        // answer to the decoder and surface it as an opaque malformed block.
-        let blinded = blinded.ok_or_else(|| {
-            Error::InconsistentResponse(
-                "response carries no Eth-Execution-Payload-Blinded, so whether it is a block or \
-                 a blinded block is unknown"
-                    .to_string(),
-            )
-        })?;
+        } = self.get_block_v3(&path).await?;
         if blinded && request.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a blinded block for slot {}; builder proposals are off, so this \
@@ -799,10 +1155,11 @@ impl BeaconNodeApi for HttpBeaconNode {
             )));
         }
 
-        let block = if blinded {
-            ProducedBlock::from_blinded_ssz(fork, &body)?
-        } else {
-            ProducedBlock::from_ssz(fork, &body)?
+        let block = match body {
+            BlockBody::Ssz(bytes) if blinded => ProducedBlock::from_blinded_ssz(fork, &bytes)?,
+            BlockBody::Ssz(bytes) => ProducedBlock::from_ssz(fork, &bytes)?,
+            BlockBody::Json(data) if blinded => ProducedBlock::from_blinded_json(fork, data)?,
+            BlockBody::Json(data) => ProducedBlock::from_json(fork, data)?,
         };
         // Enforced here rather than at the call site so failover works: see the
         // contract on `BeaconNodeApi::produce_block`.
@@ -817,7 +1174,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .post_ssz_body("/eth/v2/beacon/blocks", fork, body)
             .await;
         let response = sent.map_err(|err| Error::BeaconNode {
-            url: url.clone(),
+            url: without_credentials(&url),
             failure: BeaconNodeFailure::classify(&err),
             detail: err.to_string(),
         })?;
@@ -869,14 +1226,14 @@ impl BeaconNodeApi for HttpBeaconNode {
         let response = sent.map_err(|err| {
             if err.is_connect() {
                 Error::BeaconNode {
-                    url: url.clone(),
+                    url: without_credentials(&url),
                     failure: BeaconNodeFailure::classify(&err),
                     detail: err.to_string(),
                 }
             } else {
                 Error::BlindedUnconfirmed {
                     status: None,
-                    detail: format!("{url}: {err}"),
+                    detail: format!("{}: {err}", without_credentials(&url)),
                 }
             }
         })?;
@@ -892,7 +1249,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         if status.is_server_error() && status != StatusCode::SERVICE_UNAVAILABLE {
             return Err(Error::BlindedUnconfirmed {
                 status: Some(status.as_u16()),
-                detail: format!("{url} answered {status}: {body}"),
+                detail: format!("{} answered {status}: {body}", without_credentials(&url)),
             });
         }
         Err(Error::BeaconNodeStatus {
@@ -989,7 +1346,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1056,7 +1413,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1085,7 +1442,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1115,12 +1472,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         // The body is read as untyped JSON first, because the layout of `data`
         // depends on the `version` beside it.
         let response: VersionedResponse<serde_json::Value> = self.get(&path).await?;
-        let fork = ForkName::parse(&response.version.to_ascii_lowercase()).ok_or_else(|| {
-            Error::InconsistentResponse(format!(
-                "aggregate names fork {}, which this client does not know",
-                response.version
-            ))
-        })?;
+        let fork = Self::known_fork(&response.version, "the aggregate's version")?;
         // Refused by name rather than left to fail as an opaque decode error,
         // the same way a pre-electra block is (see `ProducedBlock::from_ssz`).
         // Electra widened `Attestation` with `committee_bits`, so an earlier
@@ -1142,15 +1494,18 @@ impl BeaconNodeApi for HttpBeaconNode {
                 )));
             }
             ForkName::Electra | ForkName::Fulu => {
-                let dto: AttestationDto = serde_json::from_value(response.data)
-                    .map_err(|err| Error::Decode(format!("electra aggregate: {err}")))?;
+                let dto: AttestationDto = serde_json::from_value(response.data).map_err(|err| {
+                    Error::Decode(format!("electra aggregate: {}", decode_text(&err)))
+                })?;
                 AggregateKind::Electra(Attestation::try_from(&dto)?)
             }
             // Gloas's attestation is its own container, with its own hash tree
             // root, so it is decoded as one and signed over as one.
             ForkName::Gloas => {
                 let attestation: gloas::Attestation = serde_json::from_value(response.data)
-                    .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
+                    .map_err(|err| {
+                        Error::Decode(format!("gloas aggregate: {}", decode_text(&err)))
+                    })?;
                 AggregateKind::Gloas(attestation)
             }
         };
@@ -1251,7 +1606,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             .send()
             .await
             .map_err(|err| Error::BeaconNode {
-                url: url.clone(),
+                url: without_credentials(&url),
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
@@ -1335,6 +1690,41 @@ impl BeaconNodeApi for HttpBeaconNode {
         self.post_no_content("/eth/v1/beacon/pool/voluntary_exits", exit, None)
             .await
     }
+
+    /// Asks this node whether it is syncing first, once for every epoch, per
+    /// the trait's contract: the answer that clears a key must come from a
+    /// node that has the chain, and only this node's own status says whether
+    /// this one does. The epochs are then asked about at once.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        if indices.is_empty() || epochs.is_empty() {
+            return Ok(vec![Vec::new(); epochs.len()]);
+        }
+        if self.is_optimistic_or_syncing().await? {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        let body: Vec<String> = indices.iter().map(ValidatorIndex::to_string).collect();
+        let body = &body;
+        let queries = epochs.iter().map(|epoch| async move {
+            let response: DataResponse<Vec<LivenessDto>> = self
+                .post(&format!("/eth/v1/validator/liveness/{epoch}"), body, None)
+                .await?;
+            let answers: Vec<Liveness> = response
+                .data
+                .into_iter()
+                .map(|entry| Liveness {
+                    index: entry.index,
+                    is_live: entry.is_live,
+                })
+                .collect();
+            validate_liveness(indices, &answers)?;
+            Ok(answers)
+        });
+        futures_util::future::try_join_all(queries).await
+    }
 }
 
 #[cfg(test)]
@@ -1345,6 +1735,20 @@ mod tests {
     fn new_trims_a_trailing_slash_from_the_base_url() {
         let node = HttpBeaconNode::new("http://x/").expect("builds");
         assert_eq!(node.base_url(), "http://x");
+    }
+
+    /// The chain check logs a node by `describe`, and the errors its requests
+    /// fail with, so a password in its URL must reach neither.
+    #[test]
+    fn a_node_is_described_without_its_credentials() {
+        let node = HttpBeaconNode::new("https://user:secret@node.example:5052").expect("builds");
+        assert_eq!(node.describe(), "https://node.example:5052");
+        let plain = HttpBeaconNode::new("http://127.0.0.1:5052").expect("builds");
+        assert_eq!(plain.describe(), "http://127.0.0.1:5052");
+        assert_eq!(
+            without_credentials("https://user:secret@node.example:5052/eth/v1/beacon/genesis"),
+            "https://node.example:5052/eth/v1/beacon/genesis"
+        );
     }
 
     /// An `IndexedErrorMessage` naming fewer failures than the batch size is
@@ -1440,8 +1844,6 @@ mod tests {
         }
     }
 
-    /// Before gloas the query still names committee 0, exactly as it always
-    /// has; from gloas it is omitted.
     #[test]
     fn the_sync_contribution_query_carries_all_three_parameters_without_whitespace() {
         let path = HttpBeaconNode::sync_contribution_path(7, 2, Root::repeat_byte(0xab));
@@ -1456,16 +1858,22 @@ mod tests {
         assert!(!path.contains(' '));
     }
 
-    #[test]
-    fn the_committee_index_is_omitted_from_gloas_on() {
-        assert_eq!(
-            HttpBeaconNode::attestation_data_path(96, ForkName::Fulu),
-            "/eth/v1/validator/attestation_data?slot=96&committee_index=0"
-        );
-        assert_eq!(
-            HttpBeaconNode::attestation_data_path(96, ForkName::Gloas),
-            "/eth/v1/validator/attestation_data?slot=96"
-        );
+    /// The query names committee 0 at every fork, gloas included, where the
+    /// Beacon API says to omit it: Lighthouse answers a query without it with
+    /// a 400. Driven through `attestation_data` rather than the path function,
+    /// so the fork the caller passes is part of what is checked.
+    #[tokio::test]
+    async fn the_committee_index_is_sent_at_every_fork() {
+        for fork in [ForkName::Fulu, ForkName::Gloas] {
+            let served = serve(500, vec![], vec![]).await;
+            let _ = served.node.attestation_data(96, fork).await;
+            let seen = served.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1, "one request at {fork:?}");
+            assert_eq!(
+                seen[0].0, "/eth/v1/validator/attestation_data?slot=96&committee_index=0",
+                "at {fork:?}"
+            );
+        }
     }
 
     /// The body `produceBlockV4` requires: no builders, the boost factor
@@ -1503,6 +1911,10 @@ mod tests {
             let seen = served.seen.lock().expect("lock");
             assert_eq!(seen.len(), 1);
             assert!(seen[0].0.contains("/eth/v4/validator/blocks/5"));
+            assert_eq!(
+                seen[0].2["accept"], "application/octet-stream",
+                "gloas stays SSZ-only"
+            );
             let body: serde_json::Value = serde_json::from_slice(&seen[0].1).expect("json body");
             assert_eq!(body["builder_boost_factor"], expected_factor);
             assert_eq!(body["min_bid"], expected_min_bid);
@@ -1632,6 +2044,496 @@ mod tests {
         assert_eq!(produced.proposer_index(), 7);
     }
 
+    /// SSZ first, JSON at lower preference: the specification's own example,
+    /// so a proxy rewriting it to JSON (blobber) still gets an answer decoded.
+    #[tokio::test]
+    async fn a_block_request_asks_for_ssz_first_and_json_second() {
+        let served = serve(500, vec![], vec![]).await;
+        let _ = served.node.produce_block(&block_request(None)).await;
+        let seen = served.seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].2["accept"],
+            "application/octet-stream;q=1.0,application/json;q=0.9"
+        );
+    }
+
+    /// The headers a node sends beside a JSON `produceBlockV3` answer.
+    fn json_headers(
+        version: &'static str,
+        blinded: &'static str,
+    ) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("content-type", "application/json; charset=utf-8"),
+            ("eth-consensus-version", version),
+            ("eth-execution-payload-blinded", blinded),
+        ]
+    }
+
+    /// A JSON `produceBlockV3` answer around `data`, its body naming the fork
+    /// and blindedness only when given them.
+    fn json_answer(
+        version: Option<&str>,
+        blinded: Option<bool>,
+        data: serde_json::Value,
+    ) -> Vec<u8> {
+        let mut answer = serde_json::json!({
+            "execution_payload_value": "42",
+            "consensus_block_value": "0",
+            "data": data,
+        });
+        if let Some(version) = version {
+            answer["version"] = version.into();
+        }
+        if let Some(blinded) = blinded {
+            answer["execution_payload_blinded"] = blinded.into();
+        }
+        serde_json::to_vec(&answer).expect("serialises")
+    }
+
+    /// `empty_block_for(5, 7)`'s contents at `fork` (electra or fulu) with one
+    /// blob, as a JSON answer's `data` and as SSZ. The block in `data` is
+    /// written by its container's own serde, the one an ethlambda beacon node
+    /// serves it with; the proofs and blobs as the hex strings the Beacon API
+    /// specifies.
+    fn block_contents_at(fork: ForkName) -> (serde_json::Value, Vec<u8>) {
+        use crate::beacon_node::block_contents::{
+            BlockContents, FuluBlockContents, empty_blob, empty_block_for,
+        };
+        use ethlambda_types::beacon::preset;
+        use ethlambda_types::beacon::primitives::KzgProof;
+        use libssz::SszEncode as _;
+
+        let block = empty_block_for(5, 7);
+        let proofs = if fork == ForkName::Fulu {
+            preset::CELLS_PER_EXT_BLOB
+        } else {
+            1
+        };
+        let data = serde_json::json!({
+            "block": serde_json::to_value(&block).expect("serialises"),
+            "kzg_proofs": vec![encode_hex(&[3u8; 48]); proofs],
+            "blobs": [encode_hex(&vec![0u8; preset::BYTES_PER_BLOB])],
+        });
+        let kzg_proofs = vec![KzgProof([3; 48]); proofs];
+        let blobs = vec![empty_blob()];
+        let ssz = if fork == ForkName::Fulu {
+            FuluBlockContents {
+                block,
+                kzg_proofs: kzg_proofs.try_into().expect("in bounds"),
+                blobs: blobs.try_into().expect("in bounds"),
+            }
+            .to_ssz()
+        } else {
+            BlockContents {
+                block,
+                kzg_proofs: kzg_proofs.try_into().expect("in bounds"),
+                blobs: blobs.try_into().expect("in bounds"),
+            }
+            .to_ssz()
+        };
+        (data, ssz)
+    }
+
+    /// The property the JSON path exists to keep: the block decoded from a
+    /// JSON answer is the one its SSZ would give, root included, at every fork
+    /// `produceBlockV3` serves this client.
+    #[tokio::test]
+    async fn a_json_answer_decodes_into_the_block_its_ssz_would() {
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+
+        for fork in [ForkName::Electra, ForkName::Fulu] {
+            let (data, ssz) = block_contents_at(fork);
+            let version = fork.as_str();
+            let reply = json_answer(Some(version), Some(false), data);
+            let served = serve(200, json_headers(version, "false"), reply).await;
+            let request = BlockRequest {
+                fork,
+                ..block_request(None)
+            };
+            let produced = served.node.produce_block(&request).await.expect("decodes");
+
+            let expected = ProducedBlock::from_ssz(fork, &ssz).expect("the SSZ decodes");
+            assert_eq!(produced, expected, "{version}");
+            assert_eq!(produced.blob_count(), 1, "{version}");
+            assert_eq!(
+                produced.block_root(),
+                crate::beacon_node::block_contents::empty_block_for(5, 7).hash_tree_root(),
+                "{version}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blinded_json_answer_decodes_as_blinded_with_builder_proposals() {
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        use libssz::SszEncode as _;
+
+        let full = crate::beacon_node::block_contents::empty_block_for(5, 7);
+        let blinded = BlindedBeaconBlock::from(full.clone());
+        let data = serde_json::to_value(&blinded).expect("serialises");
+        let reply = json_answer(Some("fulu"), Some(true), data);
+        let served = serve(200, json_headers("fulu", "true"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&block_request(Some(100)))
+            .await
+            .expect("decodes");
+
+        assert!(produced.is_blinded());
+        let expected = ProducedBlock::from_blinded_ssz(ForkName::Fulu, &blinded.to_ssz())
+            .expect("the SSZ decodes");
+        assert_eq!(produced, expected);
+        assert_eq!(produced.block_root(), full.hash_tree_root());
+    }
+
+    #[tokio::test]
+    async fn a_blinded_json_answer_is_refused_without_builder_proposals() {
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+
+        let blinded =
+            BlindedBeaconBlock::from(crate::beacon_node::block_contents::empty_block_for(5, 7));
+        let data = serde_json::to_value(&blinded).expect("serialises");
+        let reply = json_answer(Some("fulu"), Some(true), data);
+        let served = serve(200, json_headers("fulu", "true"), reply).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("a blinded block cannot be published here");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    /// A header stands in for a body field that is missing, since it says the
+    /// same thing.
+    #[tokio::test]
+    async fn a_json_answer_missing_its_version_and_blindedness_falls_back_on_the_headers() {
+        let (data, ssz) = block_contents_at(ForkName::Fulu);
+        let reply = json_answer(None, None, data);
+        let served = serve(200, json_headers("fulu", "false"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect("decodes");
+        let expected = ProducedBlock::from_ssz(ForkName::Fulu, &ssz).expect("the SSZ decodes");
+        assert_eq!(produced, expected);
+    }
+
+    /// A body and a header that disagree have not said which container `data`
+    /// is: refused, whichever of the two facts they disagree on.
+    #[tokio::test]
+    async fn a_json_answer_whose_body_and_headers_disagree_is_refused() {
+        let cases = [
+            // The fork: a fulu body under an electra header.
+            (Some("fulu"), Some(false), "electra", "false"),
+            // Blindedness: an unblinded body under a blinded header.
+            (Some("fulu"), Some(false), "fulu", "true"),
+        ];
+        for (version, blinded, header_version, header_blinded) in cases {
+            let (data, _) = block_contents_at(ForkName::Fulu);
+            let reply = json_answer(version, blinded, data);
+            let headers = json_headers(header_version, header_blinded);
+            let served = serve(200, headers, reply).await;
+            let err = served
+                .node
+                .produce_block(&block_request(Some(100)))
+                .await
+                .expect_err("contradicts itself");
+            assert!(
+                matches!(err, Error::InconsistentResponse(_)),
+                "{header_version}/{header_blinded}: got {err:?}"
+            );
+        }
+    }
+
+    /// Neither the body nor a header names the fork: not a default to guess
+    /// at, as on the SSZ path.
+    #[tokio::test]
+    async fn a_json_answer_naming_no_fork_is_refused() {
+        let (data, _) = block_contents_at(ForkName::Fulu);
+        let reply = json_answer(None, Some(false), data);
+        let headers = vec![("content-type", "application/json")];
+        let served = serve(200, headers, reply).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the fork is unknown");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    /// A JSON answer's `version` is whatever string the node sent. One this
+    /// client does not know reaches the error, and the duty loop's log line,
+    /// written out: no line break to forge a log line with, no ESC to restyle
+    /// the operator's terminal.
+    #[tokio::test]
+    async fn an_unknown_fork_in_a_json_answer_reaches_the_error_written_out() {
+        let (data, _) = block_contents_at(ForkName::Fulu);
+        let reply = json_answer(Some("fulu\nINFO forged \u{1b}[2J"), Some(false), data);
+        let headers = vec![("content-type", "application/json")];
+        let served = serve(200, headers, reply).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the fork is unknown");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(!text.contains('\n') && !text.contains('\u{1b}'), "{text}");
+        assert!(text.contains("fulu\\nINFO forged \\u{1b}[2J"), "{text}");
+    }
+
+    /// The same for an aggregate's `version`, the other JSON body naming a
+    /// fork.
+    #[tokio::test]
+    async fn an_unknown_fork_in_an_aggregate_reaches_the_error_written_out() {
+        let reply = serde_json::json!({ "version": "electra\r\n\u{1b}[31m", "data": {} });
+        let reply = serde_json::to_vec(&reply).expect("serialises");
+        let headers = vec![("content-type", "application/json")];
+        let served = serve(200, headers, reply).await;
+        let err = served
+            .node
+            .aggregate_attestation(5, Root::ZERO, 0)
+            .await
+            .expect_err("the fork is unknown");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(!text.contains(['\r', '\n', '\u{1b}']), "{text}");
+        assert!(text.contains("electra\\r\\n\\u{1b}[31m"), "{text}");
+    }
+
+    /// serde's message for a JSON answer that does not decode quotes the
+    /// node's text, the whole of an unexpected string. It reaches the error
+    /// bounded and written out, however long the string.
+    #[tokio::test]
+    async fn a_json_answer_that_does_not_decode_reaches_the_error_bounded() {
+        let quoted = format!("{}\n\u{1b}[2J", "x".repeat(4 * ERROR_TEXT_LIMIT));
+        let reply = serde_json::json!({ "data": { "is_syncing": quoted } });
+        let reply = serde_json::to_vec(&reply).expect("serialises");
+        let headers = vec![("content-type", "application/json")];
+        let served = serve(200, headers, reply).await;
+        let err = served
+            .node
+            .is_optimistic_or_syncing()
+            .await
+            .expect_err("a string is not a bool");
+        let Error::Decode(text) = err else {
+            panic!("got {err:?}");
+        };
+        assert!(text.len() <= ERROR_TEXT_LIMIT, "{} bytes", text.len());
+        assert!(text.ends_with("..."), "{text}");
+        assert!(!text.contains(['\n', '\u{1b}']), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_block_answer_neither_ssz_nor_json_is_refused() {
+        let headers = vec![
+            ("content-type", "text/plain"),
+            ("eth-consensus-version", "fulu"),
+            ("eth-execution-payload-blinded", "false"),
+        ];
+        let served = serve(200, headers, b"a block".to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("neither encoding asked for");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    /// blobber relays a failed `produceBlockV3` under a 200: the error message
+    /// in the body is the error, as its status would have been, and a 503 in
+    /// it is still the node syncing.
+    #[tokio::test]
+    async fn an_error_message_relayed_under_a_success_is_the_error_it_reports() {
+        let headers = || vec![("content-type", "application/json")];
+        let syncing = br#"{"code":503,"message":"Beacon node is currently syncing"}"#;
+        let served = serve(200, headers(), syncing.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the node failed");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+
+        let failed = br#"{"code":500,"message":"Failed to produce block"}"#;
+        let served = serve(200, headers(), failed.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("the node failed");
+        let Error::BeaconNodeStatus { status, body } = err else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(status, 500);
+        assert!(body.contains("Failed to produce block"), "{body}");
+
+        // A `code` that is not a failure is no error message; the answer is
+        // a malformed block answer, as before.
+        let not_an_error = br#"{"code":200,"message":"ok"}"#;
+        let served = serve(200, headers(), not_an_error.to_vec()).await;
+        let err = served
+            .node
+            .produce_block(&block_request(None))
+            .await
+            .expect_err("no block");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// A builder-specs example vendored in `ethlambda-types` (see that
+    /// directory's README): JSON and SSZ for one object, written by neither
+    /// this client nor an ethlambda node.
+    macro_rules! builder_specs_example {
+        ($path:literal) => {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../common/types/tests/fixtures/builder_specs/",
+                $path
+            ))
+        };
+    }
+
+    /// The object an example `.json` holds under OpenAPI's `value` wrapper.
+    fn example_value(json: &[u8]) -> serde_json::Value {
+        let mut document: serde_json::Value = serde_json::from_slice(json).expect("json");
+        document["value"].take()
+    }
+
+    /// The fulu blinded block example, decoded from its SSZ, and its
+    /// `message` as JSON.
+    fn blinded_block_example() -> (
+        ethlambda_types::beacon::builder::BlindedBeaconBlock,
+        serde_json::Value,
+    ) {
+        use ethlambda_types::beacon::builder::SignedBlindedBeaconBlock;
+        use libssz::SszDecode as _;
+
+        let ssz = builder_specs_example!("fulu/signed_blinded_beacon_block.ssz");
+        let signed = SignedBlindedBeaconBlock::from_ssz_bytes(ssz).expect("the SSZ decodes");
+        let json = builder_specs_example!("fulu/signed_blinded_beacon_block.json");
+        let message = example_value(json)["message"].take();
+        (signed.message, message)
+    }
+
+    /// builder-specs' `ExecutionPayloadAndBlobsBundle` at fulu, for decoding
+    /// its example's SSZ. A module of its own because the SSZ derive names a
+    /// bare `Result`, which `use super::*` would make this crate's.
+    mod the_bundle {
+        use crate::beacon_node::block_contents::{Blobs, CellKzgProofs};
+        use ethlambda_types::beacon::containers::deneb::{ExecutionPayload, KzgCommitments};
+
+        /// `BlobsBundle` at fulu: one proof per cell.
+        #[derive(libssz_derive::SszDecode)]
+        pub struct BlobsBundle {
+            pub commitments: KzgCommitments,
+            pub proofs: CellKzgProofs,
+            pub blobs: Blobs,
+        }
+
+        #[derive(libssz_derive::SszDecode)]
+        pub struct ExecutionPayloadAndBlobsBundle {
+            pub execution_payload: ExecutionPayload,
+            pub blobs_bundle: BlobsBundle,
+        }
+    }
+
+    /// A request the example block answers: its own slot and proposer.
+    fn request_for(
+        block: &ethlambda_types::beacon::builder::BlindedBeaconBlock,
+        factor: Option<u64>,
+    ) -> BlockRequest {
+        BlockRequest {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            ..block_request(factor)
+        }
+    }
+
+    /// The JSON path checked against JSON this repository did not write: the
+    /// builder-specs blinded block, every list in its body populated, decodes
+    /// as a blinded `produceBlockV3` answer into the block its SSZ gives.
+    #[tokio::test]
+    async fn the_builder_specs_blinded_block_decodes_from_json_as_from_ssz() {
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+        use libssz::SszEncode as _;
+
+        let (expected, data) = blinded_block_example();
+        let reply = json_answer(Some("fulu"), Some(true), data);
+        let served = serve(200, json_headers("fulu", "true"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&request_for(&expected, Some(100)))
+            .await
+            .expect("decodes");
+
+        let from_ssz = ProducedBlock::from_blinded_ssz(ForkName::Fulu, &expected.to_ssz())
+            .expect("the SSZ decodes");
+        assert_eq!(produced, from_ssz);
+        assert_eq!(produced.block_root(), expected.hash_tree_root());
+    }
+
+    /// `the_builder_specs_blinded_block_decodes_from_json_as_from_ssz` for a
+    /// full fulu block: the example block around the builder-specs
+    /// payload, with that example's cell proofs and blob. Each part is held to
+    /// its own example's SSZ: everything but the payload to the blinded
+    /// block's, the payload and blob material to the bundle's.
+    #[tokio::test]
+    async fn the_builder_specs_full_block_decodes_from_json_as_from_ssz() {
+        use crate::beacon_node::block_contents::Contents;
+        use ethlambda_types::beacon::builder::BlindedBeaconBlock;
+        use libssz::SszDecode as _;
+        use the_bundle::ExecutionPayloadAndBlobsBundle;
+
+        let (blinded, mut block) = blinded_block_example();
+        let ssz = builder_specs_example!("fulu/execution_payload_and_blobs_bundle.ssz");
+        let bundle = ExecutionPayloadAndBlobsBundle::from_ssz_bytes(ssz).expect("the SSZ decodes");
+        let json = builder_specs_example!("fulu/execution_payload_and_blobs_bundle.json");
+        let mut bundle_json = example_value(json)["data"].take();
+
+        let body = block["body"].as_object_mut().expect("a body");
+        body.remove("execution_payload_header")
+            .expect("a blinded body");
+        body.insert(
+            "execution_payload".to_string(),
+            bundle_json["execution_payload"].take(),
+        );
+        let data = serde_json::json!({
+            "block": block,
+            "kzg_proofs": bundle_json["blobs_bundle"]["proofs"].take(),
+            "blobs": bundle_json["blobs_bundle"]["blobs"].take(),
+        });
+        let reply = json_answer(Some("fulu"), Some(false), data);
+        let served = serve(200, json_headers("fulu", "false"), reply).await;
+        let produced = served
+            .node
+            .produce_block(&request_for(&blinded, None))
+            .await
+            .expect("decodes");
+
+        let Contents::WithCellProofs {
+            block,
+            kzg_proofs,
+            blobs,
+        } = produced.contents
+        else {
+            panic!("a fulu block with cell proofs, got {:?}", produced.contents);
+        };
+        let header = blinded.body.execution_payload_header.clone();
+        assert_eq!(
+            BlindedBeaconBlock::from_parts(block.clone(), header),
+            blinded
+        );
+        assert_eq!(block.body.execution_payload, bundle.execution_payload);
+        assert_eq!(kzg_proofs, bundle.blobs_bundle.proofs);
+        assert_eq!(blobs, bundle.blobs_bundle.blobs);
+        // The two examples are independent, so the bundle's commitments are
+        // not the block's; it carries one per blob all the same.
+        assert_eq!(bundle.blobs_bundle.commitments.len(), blobs.len());
+    }
+
     #[tokio::test]
     async fn registrations_are_posted_as_json_that_round_trips() {
         use ethlambda_types::beacon::builder::{
@@ -1699,6 +2601,63 @@ mod tests {
         assert_eq!(body, format!("{}...", &written[..kept]));
     }
 
+    /// A node answering 200 with `chunks`, streamed one at a time, so the
+    /// answer is chunked and says no `Content-Length`. Its URL.
+    async fn serve_streamed(chunks: Vec<Vec<u8>>) -> String {
+        let handler = move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream =
+                    futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+                axum::body::Body::from_stream(stream)
+            }
+        };
+        let app = axum::Router::new().fallback(handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{address}/")
+    }
+
+    /// The answer at `url`, read as [`HttpBeaconNode::answer_bytes`] reads one
+    /// with `limit` for its limit, and whether it said its length up front.
+    async fn answer_within(url: &str, limit: usize) -> (bool, Result<Vec<u8>>) {
+        let response = Client::new().get(url).send().await.expect("answers");
+        let declared = response.content_length().is_some();
+        let read = HttpBeaconNode::answer_bytes_within(url.to_string(), response, limit).await;
+        (declared, read)
+    }
+
+    /// A successful answer is read up to the limit and refused past it,
+    /// whether it says its length up front or not, so no node can make this
+    /// client hold more than the limit.
+    #[tokio::test]
+    async fn an_answer_past_the_read_limit_is_refused() {
+        const LIMIT: usize = 4096;
+
+        // `Content-Length` says it: refused before the body is read.
+        let served = serve(200, vec![], vec![7; LIMIT + 1]).await;
+        let (declared, read) = answer_within(served.node.base_url(), LIMIT).await;
+        assert!(declared);
+        let err = read.expect_err("over the limit");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+        let served = serve(200, vec![], vec![7; LIMIT]).await;
+        let (_, read) = answer_within(served.node.base_url(), LIMIT).await;
+        assert_eq!(read.expect("at the limit"), vec![7; LIMIT]);
+
+        // Chunked: refused at the chunk that would pass the limit.
+        let url = serve_streamed(vec![vec![7; LIMIT / 2]; 3]).await;
+        let (declared, read) = answer_within(&url, LIMIT).await;
+        assert!(!declared);
+        let err = read.expect_err("over the limit");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+        let url = serve_streamed(vec![vec![7; LIMIT / 2]; 2]).await;
+        let (_, read) = answer_within(&url, LIMIT).await;
+        assert_eq!(read.expect("at the limit"), vec![7; LIMIT]);
+    }
+
     /// The cap applies to the written-out text and never splits a character
     /// or an escape: a body of escapes keeps whole ones, then the marker.
     #[test]
@@ -1762,6 +2721,37 @@ mod tests {
             .await
             .expect("a no-op");
         assert!(served.seen.lock().expect("lock").is_empty());
+    }
+
+    /// The probe's request: every field of the answer reaches the record, and
+    /// an absent `is_optimistic` or `el_offline` reads as `false`.
+    #[tokio::test]
+    async fn the_sync_status_carries_every_field_of_the_answer() {
+        let reply = br#"{"data":{"head_slot":"640","sync_distance":"12","is_syncing":true,"is_optimistic":true,"el_offline":true}}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let status = served.node.sync_status().await.expect("decodes");
+        assert_eq!(
+            status,
+            SyncStatus {
+                head_slot: Some(640),
+                sync_distance: Some(12),
+                is_syncing: true,
+                is_optimistic: true,
+                el_offline: true,
+            }
+        );
+        assert!(
+            served.seen.lock().expect("lock")[0]
+                .0
+                .ends_with("/eth/v1/node/syncing")
+        );
+
+        let reply =
+            br#"{"data":{"head_slot":"640","sync_distance":"0","is_syncing":false}}"#.to_vec();
+        let served = serve(200, vec![("content-type", "application/json")], reply).await;
+        let status = served.node.sync_status().await.expect("decodes");
+        assert!(status.is_synced());
+        assert!(!status.el_offline);
     }
 
     #[tokio::test]
@@ -1907,5 +2897,133 @@ mod tests {
             None
         );
         HttpBeaconNode::bool_header(Some("yes".into()), "Included").expect_err("not a boolean");
+    }
+
+    /// Every liveness request a [`serve_liveness`] node received, as (path,
+    /// JSON body).
+    type LivenessSeen = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A node that answers `/eth/v1/node/syncing` with `is_syncing` and every
+    /// liveness request with `reply`, recording what it was asked.
+    async fn serve_liveness(
+        is_syncing: bool,
+        reply: serde_json::Value,
+    ) -> (HttpBeaconNode, LivenessSeen) {
+        use axum::extract::{Json, State};
+        use axum::http::Uri;
+        use axum::routing::{get, post};
+
+        let seen: LivenessSeen = Default::default();
+        let syncing = serde_json::json!({
+            "data": { "head_slot": "1", "sync_distance": "0", "is_syncing": is_syncing,
+                      "is_optimistic": false, "el_offline": false }
+        });
+        let app = axum::Router::new()
+            .route(
+                "/eth/v1/node/syncing",
+                get(move || async move { Json(syncing) }),
+            )
+            .route(
+                "/eth/v1/validator/liveness/{epoch}",
+                post(
+                    |State((seen, reply)): State<(LivenessSeen, serde_json::Value)>,
+                     uri: Uri,
+                     Json(body): Json<serde_json::Value>| async move {
+                        seen.lock()
+                            .expect("lock")
+                            .push((uri.path().to_string(), body));
+                        Json(reply)
+                    },
+                ),
+            )
+            .with_state((seen.clone(), reply));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let node = HttpBeaconNode::new(format!("http://{address}")).expect("builds");
+        (node, seen)
+    }
+
+    /// The wire shape both ways: the epoch in the path, the indices a JSON
+    /// array of quoted integers, and the answer's quoted `index` read back.
+    #[tokio::test]
+    async fn liveness_posts_quoted_indices_and_reads_quoted_ones_back() {
+        let reply = serde_json::json!({ "data": [
+            { "index": "7", "is_live": true },
+            { "index": "3", "is_live": false },
+        ]});
+        let (node, seen) = serve_liveness(false, reply).await;
+        let answers = node.liveness(&[12], &[3, 7]).await.expect("answers");
+        assert_eq!(
+            answers,
+            vec![vec![
+                Liveness {
+                    index: 7,
+                    is_live: true
+                },
+                Liveness {
+                    index: 3,
+                    is_live: false
+                },
+            ]]
+        );
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/eth/v1/validator/liveness/12");
+        assert_eq!(seen[0].1, serde_json::json!(["3", "7"]));
+    }
+
+    /// One request per epoch, each answer kept in the order the epochs
+    /// were named.
+    #[tokio::test]
+    async fn liveness_asks_about_each_epoch() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, seen) = serve_liveness(false, reply).await;
+        let answers = node.liveness(&[11, 12], &[3]).await.expect("answers");
+        assert_eq!(answers.len(), 2);
+        let mut paths: Vec<String> = seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/eth/v1/validator/liveness/11".to_string(),
+                "/eth/v1/validator/liveness/12".to_string(),
+            ]
+        );
+    }
+
+    /// A syncing node is not asked: its "nobody is live" would clear keys
+    /// it has not watched the network for.
+    #[tokio::test]
+    async fn a_syncing_node_is_not_asked_about_liveness() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, seen) = serve_liveness(true, reply).await;
+        let err = node.liveness(&[12], &[3]).await.expect_err("syncing");
+        assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// An answer that leaves an index out is one to fail over from.
+    #[tokio::test]
+    async fn a_liveness_answer_missing_an_index_is_refused() {
+        let reply = serde_json::json!({ "data": [{ "index": "3", "is_live": false }] });
+        let (node, _) = serve_liveness(false, reply).await;
+        let err = node.liveness(&[12], &[3, 7]).await.expect_err("incomplete");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn no_liveness_request_is_sent_for_no_indices() {
+        let (node, seen) = serve_liveness(false, serde_json::json!({ "data": [] })).await;
+        let answers = node.liveness(&[12], &[]).await.expect("empty");
+        assert_eq!(answers, vec![Vec::new()]);
+        assert!(seen.lock().expect("lock").is_empty());
     }
 }

@@ -87,8 +87,12 @@ gated in `syncing`. Head advancing is the baseline "alive" signal.
 ```promql
 # head is climbing (slots/sec; ~0.25 healthy)
 deriv(lean_head_slot{network="$NET"}[5m]) > 0
-# head lag behind wall-clock; must stay small. The sync gate trips and
-# suppresses duties once lag > SYNC_LAG_THRESHOLD (currently 4).
+# head lag behind wall-clock; must stay small. ethlambda's sync gate reads
+# `syncing` (and suppresses duties) only while this lag is > 4 AND a peer's
+# Status head is more than 1 slot ahead (SyncThresholds::LEAN,
+# crates/net/api/src/sync.rs). Lag alone proves nothing about duties: with no
+# peer ahead, or once peers' lead has left the head flat for 16 slots (the
+# stall window), the node reads `synced` and keeps attesting on its stale head.
 lean_current_slot{network="$NET"} - lean_head_slot{network="$NET"}
 # sync state: 2=synced (healthy), 1=syncing, 0=idle
 lean_node_sync_status{network="$NET", status="synced"} == 1
@@ -99,8 +103,13 @@ rate(lean_state_transition_block_processing_time_seconds_count{network="$NET"}[5
 **Log:** `"Block imported successfully"` (one per imported block).
 
 **Red flags:** head flat while `lean_current_slot` climbs → `head_lag` grows past
-4 → `lean_node_sync_status{status="syncing"}==1`, which **suppresses attest +
-propose** (log `"Skipping attestations while syncing"`). Repeated
+4. If a peer reports a head ahead, `lean_node_sync_status{status="syncing"}==1`
+**suppresses attest + propose** (log `"Skipping attestations while syncing"`);
+after 16 slots of that with the head still flat the node logs `"Peers report a
+head this node is not reaching; treating the network as stalled"` and resumes
+duties on its stale head. With no peer ahead (cut off, or the whole devnet
+stalled) it stays `synced` at any lag, so judge duties by the SYNC state, not
+by the lag. Repeated
 `"Block parent missing, storing as pending"` / `"Requested missing block from
 network"` → it is missing ancestors and back-filling.
 

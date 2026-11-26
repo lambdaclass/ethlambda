@@ -151,7 +151,7 @@ pub fn upgrade_to_altair(
     let placeholder_sync_committee = altair::SyncCommittee {
         pubkeys: altair::SyncCommitteePubkeys::try_from(vec![
             BlsPubkey::default();
-            preset::SYNC_COMMITTEE_SIZE
+            preset::sync_committee_size()
         ])?,
         aggregate_pubkey: BlsPubkey::default(),
     };
@@ -172,8 +172,8 @@ pub fn upgrade_to_altair(
         balances: pre.balances.clone(),
         randao_mixes: pre.randao_mixes.clone(),
         slashings: pre.slashings.clone(),
-        previous_epoch_participation: EpochParticipation::try_from(vec![0u8; validator_count])?,
-        current_epoch_participation: EpochParticipation::try_from(vec![0u8; validator_count])?,
+        previous_epoch_participation: EpochParticipation::repeat(0, validator_count)?,
+        current_epoch_participation: EpochParticipation::repeat(0, validator_count)?,
         justification_bits: pre.justification_bits.clone(),
         previous_justified_checkpoint: pre.previous_justified_checkpoint,
         current_justified_checkpoint: pre.current_justified_checkpoint,
@@ -827,7 +827,7 @@ pub fn upgrade_to_fulu(pre: &BeaconState, config: &Config) -> Result<BeaconState
 /// `initialize_ptc_window` can run) need before a real committee exists to
 /// fill that slot.
 fn empty_ptc() -> gloas::PayloadTimelinessCommittee {
-    vec![0 as ValidatorIndex; preset::PTC_SIZE]
+    vec![0 as ValidatorIndex; preset::ptc_size()]
         .try_into()
         .expect("built at exactly PTC_SIZE")
 }
@@ -852,7 +852,7 @@ fn empty_ptc() -> gloas::PayloadTimelinessCommittee {
 /// it is asked about, so computing that shuffle once and reusing it is what
 /// keeps filling the whole window affordable.
 fn initialize_ptc_window(state: &BeaconState) -> Result<gloas::PayloadTimelinessCommitteeWindow> {
-    let mut window = vec![empty_ptc(); preset::SLOTS_PER_EPOCH as usize];
+    let mut window = vec![empty_ptc(); preset::slots_per_epoch() as usize];
 
     let committees = CommitteeCache::default();
     let current_epoch = get_current_epoch(state);
@@ -863,7 +863,7 @@ fn initialize_ptc_window(state: &BeaconState) -> Result<gloas::PayloadTimeliness
                 "initialize_ptc_window: current_epoch + offset",
             ))?;
         let start_slot = compute_start_slot_at_epoch(epoch);
-        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+        for slot_offset in 0..preset::slots_per_epoch() {
             let slot = start_slot
                 .checked_add(slot_offset)
                 .ok_or(Error::ArithmeticOverflow(
@@ -1020,7 +1020,7 @@ fn onboard_builders_from_pending_deposits(
     // and taking ownership here is what lets the loop body hold `state`
     // mutably (`add_builder_to_registry`, the balance top-up) without a
     // lingering borrow of one of its own fields.
-    for deposit in std::mem::take(&mut state.pending_deposits) {
+    for deposit in std::mem::take(&mut state.pending_deposits).to_vec() {
         if validator_pubkeys.contains(&deposit.pubkey) {
             requeue(&mut pending_deposits, &mut pending_index, deposit);
             continue;
@@ -1147,7 +1147,7 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
 
     // Every slot starts "available"; see this function's own doc.
     let mut execution_payload_availability = gloas::ExecutionPayloadAvailability::new();
-    for index in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+    for index in 0..preset::slots_per_historical_root() {
         execution_payload_availability
             .set(index, true)
             .expect("index is in [0, SLOTS_PER_HISTORICAL_ROOT)");
@@ -1157,7 +1157,7 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
     // exists as a full `BeaconState`; see this function's own doc for why
     // that has to wait.
     let placeholder_ptc_window: gloas::PayloadTimelinessCommitteeWindow =
-        vec![empty_ptc(); preset::PTC_WINDOW_LENGTH]
+        vec![empty_ptc(); preset::ptc_window_length()]
             .try_into()
             .expect("built at exactly PTC_WINDOW_LENGTH");
 
@@ -1219,7 +1219,7 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
         // [New in Gloas:EIP7732]
         builder_pending_payments: vec![
             gloas::BuilderPendingPayment::default();
-            preset::BUILDER_PENDING_PAYMENTS_LENGTH
+            preset::builder_pending_payments_length()
         ]
         .try_into()
         .expect("built at exactly BUILDER_PENDING_PAYMENTS_LENGTH"),

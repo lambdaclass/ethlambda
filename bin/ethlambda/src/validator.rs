@@ -19,9 +19,11 @@ const ADDRESS_BYTES: usize = 20;
 pub(crate) struct ValidatorOptions {
     /// Base URL(s) of the beacon node's HTTP API (e.g. http://localhost:5052).
     ///
-    /// Several may be supplied, comma-separated or by repeating the flag. They
-    /// are tried in order and the first that answers is used, so the order is
-    /// a preference, not a load-balancing policy.
+    /// Several may be supplied, comma-separated or by repeating the flag. Each
+    /// is asked whether it is syncing once a slot; the ones that are not are
+    /// tried first, then the rest, each in the order given, and the first that
+    /// answers is used, so the order is a preference, not a load-balancing
+    /// policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
 
@@ -43,6 +45,17 @@ pub(crate) struct ValidatorOptions {
     /// Port for the keymanager API. Only bound with `--enable-keymanager`.
     #[arg(long, default_value = "5062")]
     pub(crate) keymanager_port: u16,
+
+    /// File holding the keymanager API's bearer token, read in place of
+    /// `api-token.txt` in `--validators-dir`. Only read with
+    /// `--enable-keymanager`; set without it, startup warns.
+    ///
+    /// Never written or created: a missing file, or one holding fewer than 16
+    /// characters once trimmed or a character an `Authorization` header
+    /// cannot carry (anything but visible ASCII, spaces and tabs), stops the
+    /// client at startup rather than being replaced with a generated token.
+    #[arg(long)]
+    pub(crate) keymanager_token_file: Option<PathBuf>,
 
     /// Port for the Prometheus metrics server.
     #[arg(long, default_value = "5064")]
@@ -166,6 +179,18 @@ pub(crate) struct ValidatorOptions {
     /// one; remove it once the keys are registered.
     #[arg(long, default_value = "false")]
     pub(crate) init_slashing_protection: bool,
+
+    /// Doppelganger protection: sign no attestation or block for a validator
+    /// until the beacon node has seen it stay silent for a full epoch, and
+    /// stop if it sees one of them act meanwhile, since that is another
+    /// client running the same key.
+    ///
+    /// Applies at every start and to every key the keymanager API imports.
+    /// The price is two to three epochs of missed attestations each time; at
+    /// genesis keys sign at once. Needs a beacon node serving
+    /// `/eth/v1/validator/liveness`.
+    #[arg(long, default_value = "false")]
+    pub(crate) enable_doppelganger_protection: bool,
 }
 
 impl ValidatorOptions {
@@ -265,11 +290,13 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         keymanager: options
             .enable_keymanager
             .then(|| std::net::SocketAddr::new(options.http_address, options.keymanager_port)),
+        keymanager_token_file: options.keymanager_token_file,
         web3signer_url: options.web3signer_url,
         gas_limit: options.gas_limit,
         builder,
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
+        doppelganger_protection: options.enable_doppelganger_protection,
     })
     .await
     .map_err(Into::into)
@@ -286,6 +313,7 @@ mod tests {
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
             keymanager_port: 5062,
+            keymanager_token_file: None,
             metrics_port: 5064,
             graffiti: graffiti.to_string(),
             suggested_fee_recipient: None,
@@ -297,6 +325,7 @@ mod tests {
             prefer_builder_proposals: false,
             builder_min_bid: 0,
             init_slashing_protection: false,
+            enable_doppelganger_protection: false,
         }
     }
 
@@ -337,9 +366,37 @@ mod tests {
         parse(&["--gas-limit", "30000000"]).expect("parses alone");
     }
 
+    /// Without the flag the token stays in `--validators-dir`. With it the path
+    /// is taken as given, and, like `--keymanager-port`, accepted without
+    /// `--enable-keymanager`, which is what decides whether it is read.
+    #[test]
+    fn the_keymanager_token_file_is_optional_and_taken_as_given() {
+        assert_eq!(parse(&[]).expect("parses").keymanager_token_file, None);
+
+        let flags = [
+            "--enable-keymanager",
+            "--keymanager-token-file",
+            "/tmp/keymanager.txt",
+        ];
+        let options = parse(&flags).expect("parses");
+        let expected = PathBuf::from("/tmp/keymanager.txt");
+        assert_eq!(options.keymanager_token_file, Some(expected));
+
+        parse(&flags[1..]).expect("parses without --enable-keymanager");
+    }
+
     #[test]
     fn builder_proposals_are_off_by_default() {
         assert_eq!(parse(&[]).expect("parses").builder(), None);
+    }
+
+    /// Opt-in, as in Lighthouse and Prysm: it costs every start two to three
+    /// epochs of attestations.
+    #[test]
+    fn doppelganger_protection_is_off_unless_asked_for() {
+        assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
+        let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
+        assert!(options.enable_doppelganger_protection);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use ethlambda_types::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT;
 use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
 };
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::Epoch;
 use libp2p::gossipsub::IdentTopic;
 use libssz::SszEncode as _;
@@ -163,7 +163,7 @@ pub(crate) fn leave_expired_sync_committee_subnets(server: &mut P2PServer) {
     let Some(wire) = server.wire.beacon() else {
         return;
     };
-    let epoch = wire.wall_slot() / SLOTS_PER_EPOCH;
+    let epoch = wire.wall_slot() / slots_per_epoch();
     let unsubscribed = leave_expired(server, epoch);
     if !unsubscribed.is_empty() {
         debug!(
@@ -382,7 +382,7 @@ mod tests {
         // schedule's so the slot's digest is a held one.
         apply(
             &mut server,
-            slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH,
+            slot / ethlambda_types::beacon::preset::slots_per_epoch(),
         );
         let message = SyncCommitteeMessage {
             slot,
@@ -405,7 +405,7 @@ mod tests {
         let mut server = unconnected_beacon_server(config, 0).await;
         apply(&mut server, gloas - 20);
         // A slot past the boundary names a digest nobody holds yet.
-        let slot = (gloas + 5) * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let slot = (gloas + 5) * ethlambda_types::beacon::preset::slots_per_epoch();
         let message = SyncCommitteeMessage {
             slot,
             beacon_block_root: Root::repeat_byte(1),
@@ -424,7 +424,7 @@ mod tests {
         // schedule's so the slot's digest is a held one.
         apply(
             &mut server,
-            slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH,
+            slot / ethlambda_types::beacon::preset::slots_per_epoch(),
         );
         let signed = SignedContributionAndProof {
             message: ContributionAndProof {

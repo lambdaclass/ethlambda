@@ -13,10 +13,13 @@
 //! Being unmodified in the specification text is not the same as being
 //! callable unchanged, though. EIP-7688 makes `previous_epoch_participation`,
 //! `current_epoch_participation`, `inactivity_scores`, `pending_deposits`,
-//! and `pending_consolidations` progressive lists
-//! (`libssz_types::ProgressiveList`) on a gloas state, a different Rust type
-//! from every earlier fork's bounded `SszList`. Each step was checked against
-//! the real code rather than assumed, and falls into one of three groups:
+//! and `pending_consolidations` progressive lists on a gloas state, each a
+//! different Rust type from the same field's bounded list on every earlier
+//! fork: the two participation lists and `pending_deposits` are tree-backed
+//! `ethlambda_ssz_tree::ProgressiveList`s, `inactivity_scores` and
+//! `pending_consolidations` flat `libssz_types::ProgressiveList`s. Each step
+//! was checked against the real code rather than assumed, and falls into one
+//! of three groups:
 //!
 //! - **Registry and balance steps** ([`super::electra::process_registry_updates`],
 //!   [`super::electra::process_slashings`],
@@ -30,9 +33,10 @@
 //!   [`super::altair::process_inactivity_updates`],
 //!   [`super::altair::process_rewards_and_penalties`]) reach
 //!   `previous_epoch_participation`/`current_epoch_participation`/`inactivity_scores`
-//!   as plain slices, through [`crate::beacon::containers::BeaconState::altair_validator_lists`]
-//!   and [`crate::beacon::containers::BeaconState::inactivity_score_mut`]: both
-//!   `SszList` and `ProgressiveList` `Deref` to a plain `[T]`.
+//!   through [`crate::beacon::containers::BeaconState::altair_validator_lists`]
+//!   and [`crate::beacon::containers::BeaconState::inactivity_score_mut`],
+//!   whose `ParticipationRef` and `InactivityScoresRef` answer for either list
+//!   kind, so these call straight through too.
 //! - **[`super::electra::process_pending_consolidations`]** takes the queue
 //!   as a `Vec` and writes it back, through
 //!   [`crate::beacon::helpers::electra::PendingQueueFields::take_pending_consolidations`] and
@@ -57,8 +61,8 @@
 //!   It is unmodified in the specification,
 //!   but replaces the whole list (a new length, not an element write), which
 //!   only the fork's own concrete container type can do: electra's and
-//!   fulu's `EpochParticipation::try_from` is fallible where gloas's
-//!   `ProgressiveList::from` is not, so there is no shared return type a
+//!   fulu's `EpochParticipation::repeat` is fallible where gloas's
+//!   `ProgressiveList::repeat` is not, so there is no shared return type a
 //!   `dispatch_state_from!` body could give both.
 
 use crate::beacon::config::Config;
@@ -110,8 +114,8 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// installs a fresh, all-zero current list, gloas's own copy of
 /// [`crate::beacon::stf::epoch::altair::process_participation_flag_updates`]:
 /// identical logic, writing gloas's own progressive lists through
-/// [`gloas_state`] (an infallible `From<Vec<_>>` conversion, unlike the
-/// bounded `EpochParticipation`'s fallible `TryFrom` altair's version needs).
+/// [`gloas_state`] (an infallible `repeat`, unlike the bounded
+/// `EpochParticipation`'s fallible one altair's version needs).
 /// See this module's own doc for why that difference is what keeps this a
 /// separate copy rather than a shared, `Vec`-level function the way
 /// [`super::electra::process_pending_consolidations`] is.
@@ -120,7 +124,8 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
     let inner = gloas_state(state, "process_participation_flag_updates")?;
 
     inner.previous_epoch_participation = core::mem::take(&mut inner.current_epoch_participation);
-    inner.current_epoch_participation = vec![0; validator_count].into();
+    // `repeat` rather than a zeroed `Vec`, for the reason given in altair's.
+    inner.current_epoch_participation = gloas::EpochParticipation::repeat(0, validator_count);
 
     Ok(())
 }
@@ -170,7 +175,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
     let quorum = get_builder_payment_quorum_threshold(state)?;
     let inner = gloas_state(state, "process_builder_pending_payments")?;
-    let epoch_len = preset::SLOTS_PER_EPOCH as usize;
+    let epoch_len = preset::slots_per_epoch() as usize;
 
     for payment in &inner.builder_pending_payments[..epoch_len] {
         if payment.weight >= quorum {
@@ -207,11 +212,11 @@ pub fn process_builder_pending_payments(state: &mut BeaconState) -> Result<()> {
 pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
     let next_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
     let start_slot = compute_start_slot_at_epoch(next_epoch);
-    let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+    let slots_per_epoch = preset::slots_per_epoch() as usize;
 
     let committees = CommitteeCache::default();
     let mut new_slice = Vec::with_capacity(slots_per_epoch);
-    for offset in 0..preset::SLOTS_PER_EPOCH {
+    for offset in 0..preset::slots_per_epoch() {
         let slot = start_slot
             .checked_add(offset)
             .ok_or(Error::ArithmeticOverflow(
@@ -221,7 +226,7 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
     }
 
     let inner = gloas_state(state, "process_ptc_window")?;
-    let mut window = Vec::with_capacity(preset::PTC_WINDOW_LENGTH);
+    let mut window = Vec::with_capacity(preset::ptc_window_length());
     window.extend_from_slice(&inner.ptc_window[slots_per_epoch..]);
     window.extend(new_slice);
     inner.ptc_window = window.try_into().expect(
@@ -326,7 +331,10 @@ mod tests {
             signature: Default::default(),
             slot: constants::GENESIS_SLOT,
         };
-        gloas_inner_mut(&mut state).pending_deposits.push(deposit);
+        gloas_inner_mut(&mut state)
+            .pending_deposits
+            .push(deposit)
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -360,7 +368,8 @@ mod tests {
         };
         gloas_inner_mut(&mut state)
             .pending_deposits
-            .push(deposit.clone());
+            .push(deposit.clone())
+            .unwrap();
 
         let balance_before = state.balance(0).unwrap();
         process_pending_deposits(&mut state, &config).unwrap();
@@ -439,8 +448,8 @@ mod tests {
         };
         {
             let inner = gloas_inner_mut(&mut state);
-            inner.pending_deposits.push(first);
-            inner.pending_deposits.push(second.clone());
+            inner.pending_deposits.push(first).unwrap();
+            inner.pending_deposits.push(second.clone()).unwrap();
         }
 
         let balance_0_before = state.balance(0).unwrap();
@@ -605,7 +614,7 @@ mod tests {
     fn process_builder_pending_payments_shifts_the_second_epoch_into_the_first_and_zeroes_the_rest()
     {
         let mut state = gloas_state_with_validators(4);
-        let epoch_len = preset::SLOTS_PER_EPOCH as usize;
+        let epoch_len = preset::slots_per_epoch() as usize;
 
         {
             let inner = gloas_inner_mut(&mut state);
@@ -641,7 +650,7 @@ mod tests {
     #[test]
     fn process_proposer_lookahead_shifts_the_window_and_excludes_a_slashed_validator() {
         let mut state = gloas_state_with_validators(64);
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
 
         // Distinct values in the existing window, so a shift that dropped or
         // reordered the carried-over slice (rather than moving it down by
@@ -674,7 +683,7 @@ mod tests {
         let inner = gloas_inner(&state);
         assert_eq!(
             inner.proposer_lookahead.len(),
-            preset::PROPOSER_LOOKAHEAD_LENGTH
+            preset::proposer_lookahead_length()
         );
         assert_eq!(
             inner.proposer_lookahead[..inner.proposer_lookahead.len() - slots_per_epoch],
@@ -697,8 +706,8 @@ mod tests {
     #[test]
     fn process_ptc_window_shifts_and_fills_a_fresh_lookahead_slice() {
         let mut state = gloas_state_with_validators(64);
-        let window_len = preset::PTC_WINDOW_LENGTH;
-        let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+        let window_len = preset::ptc_window_length();
+        let slots_per_epoch = preset::slots_per_epoch() as usize;
 
         // Distinct values per window index, so a shift that scrambled order
         // (rather than moving each slice down by exactly one epoch) would be
@@ -708,7 +717,7 @@ mod tests {
         {
             let inner = gloas_inner_mut(&mut state);
             for window_index in 0..window_len {
-                inner.ptc_window[window_index] = vec![window_index as u64; preset::PTC_SIZE]
+                inner.ptc_window[window_index] = vec![window_index as u64; preset::ptc_size()]
                     .try_into()
                     .expect("built at exactly PTC_SIZE");
             }
@@ -731,7 +740,7 @@ mod tests {
         let next_epoch = epoch_before + preset::MIN_SEED_LOOKAHEAD + 1;
         let start_slot = compute_start_slot_at_epoch(next_epoch);
         let committees = CommitteeCache::default();
-        for offset in 0..preset::SLOTS_PER_EPOCH {
+        for offset in 0..preset::slots_per_epoch() {
             let slot = start_slot + offset;
             let expected = compute_ptc(&state, slot, &committees).unwrap();
             let actual = &inner.ptc_window[window_len - slots_per_epoch + offset as usize];
@@ -755,7 +764,7 @@ mod tests {
         // what turns the slice this call just filled
         // (`epoch_before + MIN_SEED_LOOKAHEAD + 1`) into the new
         // `state_epoch + MIN_SEED_LOOKAHEAD` boundary.
-        *state.slot_mut() += preset::SLOTS_PER_EPOCH;
+        *state.slot_mut() += preset::slots_per_epoch();
 
         let next_epoch = epoch_before + preset::MIN_SEED_LOOKAHEAD + 1;
         let slot = compute_start_slot_at_epoch(next_epoch);

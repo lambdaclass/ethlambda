@@ -43,7 +43,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::beacon::{
     constants::SYNC_COMMITTEE_SUBNET_COUNT,
     containers::altair::{
-        SYNC_SUBCOMMITTEE_SIZE, SignedContributionAndProof, SyncCommitteeMessage,
+        SignedContributionAndProof, SyncCommitteeMessage, sync_subcommittee_size,
     },
     preset,
     primitives::{Epoch, Root, Slot},
@@ -331,17 +331,17 @@ async fn post_sync_committee_subscriptions(
     };
     let wall_epoch: Epoch = compute_epoch_at_slot(wall_slot(&store));
     let clamp = (compute_sync_committee_period(wall_epoch) + 2)
-        .saturating_mul(preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+        .saturating_mul(preset::epochs_per_sync_committee_period());
 
     let mut until_by_subnet: BTreeMap<u64, Epoch> = BTreeMap::new();
     for subscription in subscriptions {
         let until = subscription.until_epoch.0.min(clamp);
         for Flexible(position) in subscription.sync_committee_indices {
-            if position >= preset::SYNC_COMMITTEE_SIZE as u64 {
+            if position >= preset::sync_committee_size() as u64 {
                 return ApiError::BadRequest("sync committee index is out of range")
                     .into_response();
             }
-            let subnet = position / SYNC_SUBCOMMITTEE_SIZE as u64;
+            let subnet = position / sync_subcommittee_size() as u64;
             let held = until_by_subnet.entry(subnet).or_insert(until);
             *held = (*held).max(until);
         }
@@ -408,7 +408,7 @@ mod tests {
     fn fixture() -> Fixture {
         let mut state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
         let committee = |shift: usize| SyncCommittee {
-            pubkeys: (0..preset::SYNC_COMMITTEE_SIZE)
+            pubkeys: (0..preset::sync_committee_size())
                 .map(|position| {
                     let index = (position + shift) % MEMBERS;
                     BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes())
@@ -654,7 +654,7 @@ mod tests {
             .map(|(_, position)| position)
             .collect();
         expected.sort_unstable();
-        let set: Vec<usize> = (0..SYNC_SUBCOMMITTEE_SIZE)
+        let set: Vec<usize> = (0..sync_subcommittee_size())
             .filter(|&position| contribution.aggregation_bits.get(position).unwrap())
             .collect();
         assert_eq!(set, expected);
@@ -662,7 +662,9 @@ mod tests {
         let committee = sync_committee_for_slot(&fixture.state, slot).unwrap();
         let participants: Vec<_> = set
             .iter()
-            .map(|&position| committee.pubkeys[subnet as usize * SYNC_SUBCOMMITTEE_SIZE + position])
+            .map(|&position| {
+                committee.pubkeys[subnet as usize * sync_subcommittee_size() + position]
+            })
             .collect();
         let signing_root = sync_committee_message_signing_root(
             &fixture.store.config(),
@@ -871,10 +873,10 @@ mod tests {
     #[tokio::test]
     async fn subscriptions_group_by_subnet_keep_the_latest_epoch_and_clamp_it() {
         let fixture = fixture();
-        let size = SYNC_SUBCOMMITTEE_SIZE;
+        let size = sync_subcommittee_size();
         let wall_epoch = compute_epoch_at_slot(wall_slot(&fixture.store));
         let clamp = (compute_sync_committee_period(wall_epoch) + 2)
-            * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+            * preset::epochs_per_sync_committee_period();
         let body = serde_json::json!([
             { "validator_index": "1", "sync_committee_indices": ["0", (size + 5).to_string()], "until_epoch": "100" },
             { "validator_index": "2", "sync_committee_indices": ["3"], "until_epoch": "250" },
@@ -891,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn a_subscription_past_the_committee_is_a_400_and_joins_nothing() {
         let fixture = fixture();
-        let past = preset::SYNC_COMMITTEE_SIZE;
+        let past = preset::sync_committee_size();
         let body = serde_json::json!([
             { "validator_index": "1", "sync_committee_indices": ["0", past.to_string()], "until_epoch": "100" },
         ]);

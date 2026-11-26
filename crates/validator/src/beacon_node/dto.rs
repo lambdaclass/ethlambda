@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `AttesterDuty` | pubkey, validator_index, committee_index, committee_length, committees_at_slot, validator_committee_index, slot | all seven, all used |
 //! | Genesis | genesis_time, genesis_validators_root, genesis_fork_version | the first two; the fork version comes from `/config/spec` |
-//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | is_syncing and is_optimistic gate signing; el_offline is logged |
+//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | all five: is_syncing and is_optimistic gate signing; el_offline is logged; head_slot and sync_distance are recorded, and read leniently |
 //! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey; the single-validator form also reads the activation, exit and withdrawable epochs |
 //! | `ProposerDuty` | pubkey, validator_index, slot | all three, all used |
 //! | `ProposerPreparation` | validator_index, fee_recipient | both, sent not read |
@@ -29,11 +29,13 @@
 //! design document's "Wire format" section for the evidence.
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::containers::electra::{
     AggregationBits, Attestation, CommitteeBits, SignedAggregateAndProof,
 };
 use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
 use ethlambda_types::beacon::fork::ForkName;
+use ethlambda_types::beacon::preset::Preset;
 use ethlambda_types::beacon::primitives::{
     BLS_PUBKEY_SIZE, BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, CommitteeIndex, Epoch, Root,
     Slot, ValidatorIndex, Version,
@@ -95,11 +97,38 @@ pub struct VersionedResponse<T> {
     pub data: T,
 }
 
+/// `produceBlockV3`'s JSON answer, as far as this client reads it.
+///
+/// `version` and `execution_payload_blinded` are required by the
+/// specification but optional here: each has a header saying the same thing
+/// (`Eth-Consensus-Version`, `Eth-Execution-Payload-Blinded`), which stands in
+/// when the body leaves it out. `execution_payload_value` and
+/// `consensus_block_value` are not read, as their headers are not on an SSZ
+/// answer: the node, not this client, weighs one payload against another.
+/// `data` stays untyped until the fork and blindedness say which container it
+/// is (see `ProducedBlock::from_json`).
+#[derive(Debug, Deserialize)]
+pub struct ProduceBlockV3Response {
+    pub version: Option<String>,
+    pub execution_payload_blinded: Option<bool>,
+    pub data: serde_json::Value,
+}
+
 /// A duties response additionally pins the block its schedule depends on.
 #[derive(Debug, Deserialize)]
 pub struct DutiesResponse<T> {
     pub dependent_root: String,
     pub data: T,
+}
+
+/// The beacon-APIs `ErrorMessage` schema, the body of a failed request.
+///
+/// Read only where a success status may carry it: behind a proxy that drops
+/// the node's status (see `HttpBeaconNode::relayed_error`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ErrorMessageDto {
+    pub code: u16,
+    pub message: String,
 }
 
 /// The beacon-APIs `IndexedErrorMessage` schema: a batch endpoint answers 400
@@ -153,6 +182,48 @@ pub struct SyncingDto {
     /// to; what it cannot do is validate new payloads, and it reports that
     /// through `is_optimistic` when it starts to matter.
     pub el_offline: Option<bool>,
+    /// The node's head slot. Kept in the per-slot probe's record (see
+    /// [`crate::beacon_node::health`]), never read to decide anything.
+    ///
+    /// `None` when absent or not an integer, rather than a failed decode. A
+    /// failed decode reads as a node that did not answer, which does not count
+    /// as syncing, so a node answering `is_syncing: true` beside a malformed
+    /// `head_slot` would open the gate it should hold shut.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub head_slot: Option<Slot>,
+    /// How many slots the node's head is behind its own wall clock. Kept and
+    /// read leniently, as `head_slot` is.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub sync_distance: Option<u64>,
+}
+
+impl From<SyncingDto> for crate::beacon_node::health::SyncStatus {
+    /// An absent `is_optimistic` or `el_offline` reads as `false`, for the
+    /// reasons given on the two fields.
+    fn from(dto: SyncingDto) -> Self {
+        Self {
+            head_slot: dto.head_slot,
+            sync_distance: dto.sync_distance,
+            is_syncing: dto.is_syncing,
+            is_optimistic: dto.is_optimistic.unwrap_or(false),
+            el_offline: dto.el_offline.unwrap_or(false),
+        }
+    }
+}
+
+/// A 64-bit integer, quoted as the Beacon API sends it or bare, and `None` for
+/// anything else: null, a negative or fractional number, text that is not an
+/// integer. For fields kept for the record, where a malformed value must not
+/// fail the answer around it.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text)) => text.parse().ok(),
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,19 +247,21 @@ pub struct AttestationDataDto {
 /// An electra-shaped `Attestation`, as `/eth/v2/validator/aggregate_attestation`
 /// returns it in JSON.
 ///
-/// # Why an aggregate goes through JSON when a block does not
+/// # Why an aggregate goes through JSON
 ///
 /// Because the node sends JSON whatever this client asks for. Lighthouse v8.2.2
 /// answers this endpoint with `200 application/json` to a request whose
 /// `Accept` names only SSZ, where the specification says it should answer SSZ
 /// or `406`. It is the most widely run consensus client, so a client that only
-/// takes SSZ here aggregates for nobody against it.
+/// takes SSZ here aggregates for nobody against it. (A produced block is taken
+/// as JSON too, but only when SSZ was not given; see
+/// [`super::block_contents`].)
 ///
-/// It is also cheap to get right here, unlike for a block. An `Attestation` is
-/// four fields, and the two bitfields arrive as hex of their exact SSZ
-/// encoding, so they decode through SSZ rather than through anything
-/// hand-written. The root this client later signs over is therefore computed
-/// from the same bytes the node would have sent as SSZ.
+/// It is also cheap to get right here. An `Attestation` is four fields, and
+/// the two bitfields arrive as hex of their exact SSZ encoding, so they decode
+/// through SSZ rather than through anything hand-written. The root this client
+/// later signs over is therefore computed from the same bytes the node would
+/// have sent as SSZ.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationDto {
     pub aggregation_bits: String,
@@ -290,6 +363,14 @@ pub struct ValidatorEntryDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorInnerDto {
     pub pubkey: String,
+}
+
+/// One entry of `POST /eth/v1/validator/liveness/{epoch}`'s answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LivenessDto {
+    #[serde(with = "quoted_u64")]
+    pub index: ValidatorIndex,
+    pub is_live: bool,
 }
 
 /// `GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}`: one
@@ -512,28 +593,156 @@ fn spec_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>> {
         .map_err(|err| Error::Decode(format!("config/spec: bad integer for {key}: {err}")))
 }
 
+/// The key a spec response names a fork's activation epoch under.
+pub(crate) fn fork_epoch_key(fork: ForkName) -> String {
+    format!("{}_FORK_EPOCH", fork.as_str().to_uppercase())
+}
+
+/// The key a spec response names a fork's version under. Phase0's is
+/// `GENESIS_FORK_VERSION`, since it has no fork to be named after.
+pub(crate) fn fork_version_key(fork: ForkName) -> String {
+    match fork {
+        ForkName::Phase0 => "GENESIS_FORK_VERSION".to_string(),
+        other => format!("{}_FORK_VERSION", other.as_str().to_uppercase()),
+    }
+}
+
+/// `key`, or an error naming it: for the values a client cannot guess.
+fn required<T>(value: Option<T>, key: &str) -> Result<T> {
+    value.ok_or_else(|| Error::Decode(format!("config/spec: {key} is absent")))
+}
+
+/// The preset a response names: `PRESET_BASE`, mainnet when absent, as every
+/// client treated an unnamed preset before minimal networks were followed.
+fn preset_of(value: &serde_json::Value) -> Result<Preset> {
+    let Some(field) = value.get("PRESET_BASE") else {
+        return Ok(Preset::Mainnet);
+    };
+    let name = field
+        .as_str()
+        .ok_or_else(|| Error::Decode("config/spec: PRESET_BASE is not a string".into()))?;
+    name.parse().map_err(|_| {
+        Error::Preset(format!(
+            "the node reports PRESET_BASE: {name}, which this client has no values for"
+        ))
+    })
+}
+
+/// Refuse a response whose preset keys contradict the preset it names.
+///
+/// The preset a node runs is adopted from `PRESET_BASE` (see
+/// [`crate::adopt_preset`]), and the values this crate computes with come from
+/// that preset's own table. A node that names `mainnet` and reports
+/// `SLOTS_PER_EPOCH: 8` is one whose values this client would silently ignore,
+/// so it is refused. The values are read from the named preset's literals, not
+/// from the active preset: the parser runs before the preset is adopted, and
+/// reading the active one would freeze the default.
+///
+/// Kept to this one small function, apart from the rest of the parser.
+fn check_preset(value: &serde_json::Value, preset: Preset) -> Result<()> {
+    use ethlambda_types::beacon::{constants, preset as table};
+
+    let values: [(&str, u64); 6] = match preset {
+        Preset::Mainnet => [
+            ("SLOTS_PER_EPOCH", table::mainnet::SLOTS_PER_EPOCH),
+            (
+                "EPOCHS_PER_SYNC_COMMITTEE_PERIOD",
+                table::mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+            ),
+            (
+                "SYNC_COMMITTEE_SIZE",
+                table::mainnet::SYNC_COMMITTEE_SIZE as u64,
+            ),
+            (
+                "MAX_COMMITTEES_PER_SLOT",
+                table::mainnet::MAX_COMMITTEES_PER_SLOT as u64,
+            ),
+            (
+                "TARGET_COMMITTEE_SIZE",
+                table::mainnet::TARGET_COMMITTEE_SIZE,
+            ),
+            (
+                "SYNC_COMMITTEE_SUBNET_COUNT",
+                constants::SYNC_COMMITTEE_SUBNET_COUNT as u64,
+            ),
+        ],
+        Preset::Minimal => [
+            ("SLOTS_PER_EPOCH", table::minimal::SLOTS_PER_EPOCH),
+            (
+                "EPOCHS_PER_SYNC_COMMITTEE_PERIOD",
+                table::minimal::EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+            ),
+            (
+                "SYNC_COMMITTEE_SIZE",
+                table::minimal::SYNC_COMMITTEE_SIZE as u64,
+            ),
+            (
+                "MAX_COMMITTEES_PER_SLOT",
+                table::minimal::MAX_COMMITTEES_PER_SLOT as u64,
+            ),
+            (
+                "TARGET_COMMITTEE_SIZE",
+                table::minimal::TARGET_COMMITTEE_SIZE,
+            ),
+            (
+                "SYNC_COMMITTEE_SUBNET_COUNT",
+                constants::SYNC_COMMITTEE_SUBNET_COUNT as u64,
+            ),
+        ],
+    };
+    for (key, expected) in values {
+        if let Some(node) = spec_u64(value, key)?
+            && node != expected
+        {
+            return Err(Error::Preset(format!(
+                "the node reports {key}: {node}, but PRESET_BASE: {} has {expected}",
+                preset
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build a [`Config`] from a `GET /eth/v1/config/spec` response.
 ///
-/// Starts from the mainnet defaults and overrides only what the response
+/// Starts from the configuration of the preset the node reports
+/// (`PRESET_BASE`, mainnet when absent) and overrides what the response
 /// names, because a validator client has to work against a network whose fork
-/// schedule differs while the compile-time presets, which fix SSZ list bounds,
-/// necessarily do not.
+/// schedule differs from its preset's defaults. The preset itself is adopted
+/// separately, by [`crate::adopt_preset`].
 ///
-/// Only the keys read below are overridden: the slot length, the duty
-/// offsets, `SHARD_COMMITTEE_PERIOD` and the fork schedule. Every other
-/// `Config` field is mainnet's whatever the node reports, so code in this
-/// crate that starts reading one has to read its key here first.
+/// What a client cannot guess is required, and an absent key is an error that
+/// names it rather than a quiet mainnet value: the slot duration
+/// (`SLOT_DURATION_MS`, or `SECONDS_PER_SLOT` from a node that has not moved
+/// on), `GENESIS_FORK_VERSION`, and the epoch and version of every fork from
+/// altair through fulu. A response without `FULU_FORK_EPOCH` would otherwise
+/// put fulu at mainnet's epoch on a chain that scheduled it elsewhere, and the
+/// client would sign every duty under the wrong fork version.
 ///
-/// An absent key keeps its default: a fork this network has not scheduled is
-/// normal. A key that is present but unparseable is an error, because silently
-/// falling back to a mainnet default would leave the client signing under the
-/// wrong fork version, which the network rejects without telling us why.
+/// Gloas is the one fork allowed to be absent, for a node that does not know
+/// it yet: an absent `GLOAS_FORK_EPOCH` is a fork that is not scheduled, set
+/// to `FAR_FUTURE_EPOCH` explicitly rather than inherited. A gloas epoch
+/// without its version is an error.
+///
+/// The `*_DUE_BPS` offsets and `SHARD_COMMITTEE_PERIOD` keep their defaults
+/// when absent: a node that predates the basis-point form is right with
+/// them, and they do not identify the chain. Every other `Config` field is
+/// its preset's default whatever the node reports, so code in this crate that starts
+/// reading one has to read its key here first.
+///
+/// A key that is present but unparseable is an error, because silently falling
+/// back to a mainnet default would leave the client signing under the wrong
+/// fork version, which the network rejects without telling us why. A response
+/// from a node whose preset keys contradict its own `PRESET_BASE` is
+/// [`Error::Preset`]; see [`check_preset`].
 ///
 /// Phase0 is handled outside the `ForkName::ALL` loop: its version is named
 /// `GENESIS_FORK_VERSION` rather than `PHASE0_FORK_VERSION`, and it has no
 /// `PHASE0_FORK_EPOCH` at all, since phase0's activation is always epoch 0.
 pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
-    let mut config = Config::mainnet();
+    let preset = preset_of(value)?;
+    check_preset(value, preset)?;
+    let mut config = Config::for_preset(preset);
 
     // `SLOT_DURATION_MS` first, `SECONDS_PER_SLOT` only as a fallback.
     //
@@ -558,18 +767,20 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
              they describe the same slot and disagree"
         )));
     }
-    if let Some(slot_duration_ms) = duration_ms.or_else(|| seconds.map(|s| s * 1_000)) {
-        if slot_duration_ms == 0 {
-            return Err(Error::Decode(
-                "config/spec: the slot duration is 0".to_string(),
-            ));
-        }
-        config.slot_duration_ms = slot_duration_ms;
-        // Kept in step because other code still reads it. Truncating is
-        // correct for every network that reports a whole number of seconds,
-        // and the millisecond field is what the clock actually uses.
-        config.seconds_per_slot = slot_duration_ms / 1_000;
+    let slot_duration_ms = required(
+        duration_ms.or_else(|| seconds.map(|s| s * 1_000)),
+        "SLOT_DURATION_MS (or SECONDS_PER_SLOT)",
+    )?;
+    if slot_duration_ms == 0 {
+        return Err(Error::Decode(
+            "config/spec: the slot duration is 0".to_string(),
+        ));
     }
+    config.slot_duration_ms = slot_duration_ms;
+    // Kept in step because other code still reads it. Truncating is
+    // correct for every network that reports a whole number of seconds,
+    // and the millisecond field is what the clock actually uses.
+    config.seconds_per_slot = slot_duration_ms / 1_000;
 
     // The duty offsets. Absent means the node has not moved to the
     // basis-point form yet, in which case the mainnet defaults already in
@@ -618,21 +829,37 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     if let Some(epochs) = spec_u64(value, "SHARD_COMMITTEE_PERIOD")? {
         config.shard_committee_period = epochs;
     }
-    if let Some(version) = spec_version(value, "GENESIS_FORK_VERSION")? {
-        config = config.with_fork_version(ForkName::Phase0, version);
-    }
+
+    let genesis_version = required(
+        spec_version(value, &fork_version_key(ForkName::Phase0))?,
+        "GENESIS_FORK_VERSION",
+    )?;
+    config = config.with_fork_version(ForkName::Phase0, genesis_version);
 
     for fork in ForkName::ALL {
         if fork == ForkName::Phase0 {
             continue;
         }
-        let name = fork.as_str().to_uppercase();
-        if let Some(epoch) = spec_u64(value, &format!("{name}_FORK_EPOCH"))? {
-            config = config.with_fork_epoch(fork, epoch);
+        let (epoch_key, version_key) = (fork_epoch_key(fork), fork_version_key(fork));
+        let epoch = spec_u64(value, &epoch_key)?;
+        let version = spec_version(value, &version_key)?;
+        if fork == ForkName::Gloas {
+            // The one fork a node may not know yet. Unscheduled is stated, not
+            // inherited from the defaults, so a default that changes cannot
+            // schedule a fork the node never named.
+            config = config.with_fork_epoch(fork, epoch.unwrap_or(FAR_FUTURE_EPOCH));
+            if epoch.is_some() && version.is_none() {
+                return Err(Error::Decode(format!(
+                    "config/spec: {epoch_key} is present but {version_key} is absent"
+                )));
+            }
+            if let Some(version) = version {
+                config = config.with_fork_version(fork, version);
+            }
+            continue;
         }
-        if let Some(version) = spec_version(value, &format!("{name}_FORK_VERSION"))? {
-            config = config.with_fork_version(fork, version);
-        }
+        config = config.with_fork_epoch(fork, required(epoch, &epoch_key)?);
+        config = config.with_fork_version(fork, required(version, &version_key)?);
     }
 
     Ok(config)
@@ -696,6 +923,58 @@ impl From<&AttestationData> for AttestationDataOutDto {
             },
         }
     }
+}
+
+/// The `/eth/v1/config/spec` body a node on `config`'s chain serves: every key
+/// [`config_from_spec_response`] requires, plus the preset keys it checks. The
+/// gloas pair is left out while gloas is unscheduled, as a node that does not
+/// know the fork leaves it out.
+#[cfg(test)]
+pub(crate) fn spec_json_of(config: &Config) -> serde_json::Value {
+    let mut spec = serde_json::Map::new();
+    let mut put = |key: String, value: String| {
+        spec.insert(key, serde_json::Value::String(value));
+    };
+    put("PRESET_BASE".to_string(), config.preset_base.to_string());
+    put(
+        "SLOT_DURATION_MS".to_string(),
+        config.slot_duration_ms.to_string(),
+    );
+    let slots_per_epoch = match config.preset_base.as_str().parse() {
+        Ok(Preset::Minimal) => ethlambda_types::beacon::preset::minimal::SLOTS_PER_EPOCH,
+        _ => ethlambda_types::beacon::preset::mainnet::SLOTS_PER_EPOCH,
+    };
+    put("SLOTS_PER_EPOCH".to_string(), slots_per_epoch.to_string());
+    put(
+        fork_version_key(ForkName::Phase0),
+        encode_hex(&config.fork_version(ForkName::Phase0)),
+    );
+    for fork in ForkName::ALL {
+        if fork == ForkName::Phase0 {
+            continue;
+        }
+        let epoch = config.fork_epoch(fork);
+        if fork == ForkName::Gloas && epoch == FAR_FUTURE_EPOCH {
+            continue;
+        }
+        put(fork_epoch_key(fork), epoch.to_string());
+        put(
+            fork_version_key(fork),
+            encode_hex(&config.fork_version(fork)),
+        );
+    }
+    serde_json::Value::Object(spec)
+}
+
+/// A complete mainnet spec response with `overrides` applied, for a test that
+/// changes one key of an otherwise valid response.
+#[cfg(test)]
+pub(crate) fn complete_spec(overrides: &[(&str, &str)]) -> serde_json::Value {
+    let mut spec = spec_json_of(&Config::mainnet());
+    for (key, value) in overrides {
+        spec[*key] = serde_json::Value::String((*value).to_string());
+    }
+    spec
 }
 
 #[cfg(test)]
@@ -913,12 +1192,11 @@ mod tests {
         );
     }
 
-    /// A real `GET /eth/v1/node/syncing` body, carrying all five spec fields;
-    /// only two are declared here.
+    /// A real `GET /eth/v1/node/syncing` body, carrying all five spec fields.
     const SYNCING: &str = r#"{
         "data": {
             "head_slot": "12345678",
-            "sync_distance": "0",
+            "sync_distance": "3",
             "is_syncing": false,
             "is_optimistic": true,
             "el_offline": false
@@ -926,10 +1204,36 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_syncing_ignoring_the_fields_it_does_not_declare() {
+    fn parses_every_syncing_field() {
         let response: DataResponse<SyncingDto> = serde_json::from_str(SYNCING).expect("parses");
         assert!(!response.data.is_syncing);
         assert_eq!(response.data.is_optimistic, Some(true));
+        assert_eq!(response.data.el_offline, Some(false));
+        assert_eq!(response.data.head_slot, Some(12_345_678));
+        assert_eq!(response.data.sync_distance, Some(3));
+    }
+
+    /// The head slot and sync distance are kept for the record only, so one
+    /// that is missing or malformed is `None` rather than a failed answer:
+    /// the flags beside it still count.
+    #[test]
+    fn a_missing_or_malformed_head_slot_does_not_fail_the_answer() {
+        for data in [
+            r#"{ "is_syncing": true }"#,
+            r#"{ "is_syncing": true, "head_slot": null, "sync_distance": "-1" }"#,
+            r#"{ "is_syncing": true, "head_slot": "soon", "sync_distance": 1.5 }"#,
+        ] {
+            let body = format!(r#"{{ "data": {data} }}"#);
+            let response: DataResponse<SyncingDto> = serde_json::from_str(&body).expect(data);
+            assert!(response.data.is_syncing, "{data}");
+            assert_eq!(response.data.head_slot, None, "{data}");
+            assert_eq!(response.data.sync_distance, None, "{data}");
+        }
+
+        let bare = r#"{ "data": { "is_syncing": false, "head_slot": 7, "sync_distance": 0 } }"#;
+        let response: DataResponse<SyncingDto> = serde_json::from_str(bare).expect("parses");
+        assert_eq!(response.data.head_slot, Some(7));
+        assert_eq!(response.data.sync_distance, Some(0));
     }
 
     /// A real `POST /eth/v1/beacon/states/head/validators` body, including
@@ -985,10 +1289,8 @@ mod tests {
 
     #[test]
     fn a_spec_response_overrides_only_what_it_names() {
-        let response = serde_json::json!({
-            "SECONDS_PER_SLOT": "12",
-            "ELECTRA_FORK_EPOCH": "364032",
-        });
+        let response =
+            complete_spec(&[("SECONDS_PER_SLOT", "12"), ("ELECTRA_FORK_EPOCH", "364032")]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.seconds_per_slot, 12);
         assert_eq!(config.fork_epoch(ForkName::Electra), 364_032);
@@ -1001,7 +1303,7 @@ mod tests {
     /// mainnet and wrong everywhere else.
     #[test]
     fn the_slot_duration_is_read_from_the_millisecond_key() {
-        let response = serde_json::json!({ "SLOT_DURATION_MS": "6000" });
+        let response = complete_spec(&[("SLOT_DURATION_MS", "6000")]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.slot_duration_ms, 6_000);
         assert_eq!(config.seconds_per_slot, 6, "the older field tracks it");
@@ -1010,7 +1312,8 @@ mod tests {
     /// Deployed nodes still send the removed key, so it stays as a fallback.
     #[test]
     fn a_node_still_sending_only_seconds_per_slot_is_understood() {
-        let response = serde_json::json!({ "SECONDS_PER_SLOT": "6" });
+        let mut response = complete_spec(&[("SECONDS_PER_SLOT", "6")]);
+        response.as_object_mut().unwrap().remove("SLOT_DURATION_MS");
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.slot_duration_ms, 6_000);
         assert_eq!(config.seconds_per_slot, 6);
@@ -1021,20 +1324,14 @@ mod tests {
     /// to tell which.
     #[test]
     fn a_node_contradicting_itself_about_the_slot_length_is_rejected() {
-        let response = serde_json::json!({
-            "SLOT_DURATION_MS": "12000",
-            "SECONDS_PER_SLOT": "6",
-        });
+        let response = complete_spec(&[("SLOT_DURATION_MS", "12000"), ("SECONDS_PER_SLOT", "6")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
 
     #[test]
     fn a_node_agreeing_with_itself_about_the_slot_length_is_accepted() {
-        let response = serde_json::json!({
-            "SLOT_DURATION_MS": "6000",
-            "SECONDS_PER_SLOT": "6",
-        });
+        let response = complete_spec(&[("SLOT_DURATION_MS", "6000"), ("SECONDS_PER_SLOT", "6")]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.slot_duration_ms, 6_000);
     }
@@ -1043,10 +1340,10 @@ mod tests {
     /// slot, which is what makes a fork that moves them work at all.
     #[test]
     fn the_duty_offsets_are_read_from_the_response() {
-        let response = serde_json::json!({
-            "ATTESTATION_DUE_BPS": "2500",
-            "AGGREGATE_DUE_BPS": "5000",
-        });
+        let response = complete_spec(&[
+            ("ATTESTATION_DUE_BPS", "2500"),
+            ("AGGREGATE_DUE_BPS", "5000"),
+        ]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.attestation_due_bps, 2_500);
         assert_eq!(config.aggregate_due_bps, 5_000);
@@ -1054,19 +1351,19 @@ mod tests {
 
     #[test]
     fn the_gloas_offsets_are_read_and_default_to_the_specification() {
-        let response = serde_json::json!({
-            "ATTESTATION_DUE_BPS_GLOAS": "2000",
-            "AGGREGATE_DUE_BPS_GLOAS": "4000",
-            "PAYLOAD_DUE_BPS": "5500",
-            "PAYLOAD_ATTESTATION_DUE_BPS": "8000",
-        });
+        let response = complete_spec(&[
+            ("ATTESTATION_DUE_BPS_GLOAS", "2000"),
+            ("AGGREGATE_DUE_BPS_GLOAS", "4000"),
+            ("PAYLOAD_DUE_BPS", "5500"),
+            ("PAYLOAD_ATTESTATION_DUE_BPS", "8000"),
+        ]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.attestation_due_bps_gloas, 2_000);
         assert_eq!(config.aggregate_due_bps_gloas, 4_000);
         assert_eq!(config.payload_due_bps, 5_500);
         assert_eq!(config.payload_attestation_due_bps, 8_000);
 
-        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
         assert_eq!(config.attestation_due_bps_gloas, 2_500);
         assert_eq!(config.aggregate_due_bps_gloas, 5_000);
         assert_eq!(config.payload_due_bps, 5_000);
@@ -1077,7 +1374,7 @@ mod tests {
     /// which are the right answer for every network that predates it.
     #[test]
     fn absent_duty_offsets_keep_the_defaults() {
-        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
         assert_eq!(config.attestation_due_bps, 3_333);
         assert_eq!(config.aggregate_due_bps, 6_667);
     }
@@ -1087,9 +1384,7 @@ mod tests {
         // No node ever sends PHASE0_FORK_VERSION; the spec calls it
         // GENESIS_FORK_VERSION. This is the regression the review caught: the
         // naive per-fork loop could never reach this field.
-        let response = serde_json::json!({
-            "GENESIS_FORK_VERSION": "0x01020304",
-        });
+        let response = complete_spec(&[("GENESIS_FORK_VERSION", "0x01020304")]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(
             config.fork_version(ForkName::Phase0),
@@ -1099,9 +1394,7 @@ mod tests {
 
     #[test]
     fn a_present_but_malformed_value_is_an_error_not_a_silent_default() {
-        let response = serde_json::json!({
-            "GENESIS_FORK_VERSION": "0xzz",
-        });
+        let response = complete_spec(&[("GENESIS_FORK_VERSION", "0xzz")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
@@ -1111,39 +1404,155 @@ mod tests {
         // A slot clock divides by this value; a beacon node reporting 0 is
         // not a network we cannot support, it is a response that cannot be
         // true.
-        let response = serde_json::json!({
-            "SECONDS_PER_SLOT": "0",
-        });
+        let mut response = complete_spec(&[("SECONDS_PER_SLOT", "0")]);
+        response.as_object_mut().unwrap().remove("SLOT_DURATION_MS");
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// A response without a slot duration is an error naming both keys, not a
+    /// 12-second clock inherited from mainnet.
+    #[test]
+    fn a_response_without_a_slot_duration_is_an_error() {
+        let mut response = complete_spec(&[]);
+        response.as_object_mut().unwrap().remove("SLOT_DURATION_MS");
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("SLOT_DURATION_MS") && text.contains("SECONDS_PER_SLOT"),
+            "got {text}"
+        );
+    }
+
+    /// The issue's example: a node that never names fulu's epoch must not get
+    /// mainnet's.
+    #[test]
+    fn a_response_without_fulu_fork_epoch_is_an_error() {
+        let mut response = complete_spec(&[]);
+        response.as_object_mut().unwrap().remove("FULU_FORK_EPOCH");
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+        assert!(err.to_string().contains("FULU_FORK_EPOCH"), "got {err}");
+    }
+
+    #[test]
+    fn every_required_key_is_named_when_absent() {
+        let mut required = vec!["GENESIS_FORK_VERSION".to_string()];
+        for fork in ForkName::ALL {
+            if fork != ForkName::Phase0 && fork != ForkName::Gloas {
+                required.push(fork_epoch_key(fork));
+                required.push(fork_version_key(fork));
+            }
+        }
+        for key in required {
+            let mut response = complete_spec(&[]);
+            response.as_object_mut().unwrap().remove(&key);
+            let err = config_from_spec_response(&response).expect_err("must reject");
+            assert!(matches!(err, Error::Decode(_)), "{key}: got {err:?}");
+            assert!(err.to_string().contains(&key), "{key}: got {err}");
+        }
+    }
+
+    /// An unscheduled gloas is stated, not inherited, and a node that names
+    /// the epoch must name the version.
+    #[test]
+    fn gloas_is_optional_but_its_epoch_needs_its_version() {
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
+        assert_eq!(config.fork_epoch(ForkName::Gloas), FAR_FUTURE_EPOCH);
+
+        let scheduled = complete_spec(&[
+            ("GLOAS_FORK_EPOCH", "500000"),
+            ("GLOAS_FORK_VERSION", "0x07000000"),
+        ]);
+        let config = config_from_spec_response(&scheduled).expect("builds");
+        assert_eq!(config.fork_epoch(ForkName::Gloas), 500_000);
+        assert_eq!(config.fork_version(ForkName::Gloas), [7, 0, 0, 0]);
+
+        let no_version = complete_spec(&[("GLOAS_FORK_EPOCH", "500000")]);
+        let err = config_from_spec_response(&no_version).expect_err("must reject");
+        assert!(err.to_string().contains("GLOAS_FORK_VERSION"), "got {err}");
+    }
+
+    /// A node on the minimal preset parses on its own terms: the base is that
+    /// preset's configuration, and the preset it names is what gets adopted.
+    #[test]
+    fn a_minimal_preset_response_is_read_as_minimal() {
+        let response = spec_json_of(&Config::minimal());
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.preset_base.as_str(), "minimal");
+    }
+
+    #[test]
+    fn an_unknown_preset_is_an_error() {
+        let response = complete_spec(&[("PRESET_BASE", "gnosis")]);
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Preset(_)), "got {err:?}");
+        assert!(err.to_string().contains("gnosis"), "got {err}");
+    }
+
+    /// A response whose preset keys contradict the preset it names is refused,
+    /// whichever key it is.
+    #[test]
+    fn preset_keys_contradicting_the_named_preset_are_an_error() {
+        for (key, value) in [
+            ("SLOTS_PER_EPOCH", "8"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "8"),
+            ("SYNC_COMMITTEE_SIZE", "32"),
+            ("MAX_COMMITTEES_PER_SLOT", "4"),
+            ("TARGET_COMMITTEE_SIZE", "4"),
+            ("SYNC_COMMITTEE_SUBNET_COUNT", "2"),
+        ] {
+            let response = complete_spec(&[(key, value)]);
+            let err = config_from_spec_response(&response).expect_err("must reject");
+            assert!(matches!(err, Error::Preset(_)), "{key}: got {err:?}");
+            assert!(err.to_string().contains(key), "{key}: got {err}");
+        }
+        // The same keys on a response that names minimal are the minimal ones.
+        let mut response = spec_json_of(&Config::minimal());
+        response["SLOTS_PER_EPOCH"] = serde_json::Value::String("32".into());
+        let err = config_from_spec_response(&response).expect_err("must reject");
+        assert!(matches!(err, Error::Preset(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_preset_keys_of_the_named_preset_are_accepted() {
+        let response = complete_spec(&[
+            ("SLOTS_PER_EPOCH", "32"),
+            ("EPOCHS_PER_SYNC_COMMITTEE_PERIOD", "256"),
+            ("SYNC_COMMITTEE_SIZE", "512"),
+            ("MAX_COMMITTEES_PER_SLOT", "64"),
+            ("TARGET_COMMITTEE_SIZE", "128"),
+            ("SYNC_COMMITTEE_SUBNET_COUNT", "4"),
+        ]);
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.preset_base.as_str(), "mainnet");
     }
 
     #[test]
     fn a_double_prefixed_version_is_rejected_rather_than_silently_stripped() {
         // Only one "0x" is ever stripped, matching `parse_root`'s convention;
         // a second one must fail to decode as hex rather than be swallowed.
-        let response = serde_json::json!({
-            "GENESIS_FORK_VERSION": "0x0x000102",
-        });
+        let response = complete_spec(&[("GENESIS_FORK_VERSION", "0x0x000102")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
 
     #[test]
     fn the_sync_offsets_are_read_and_default_to_the_specification() {
-        let response = serde_json::json!({
-            "SYNC_MESSAGE_DUE_BPS": "3000",
-            "CONTRIBUTION_DUE_BPS": "6000",
-            "SYNC_MESSAGE_DUE_BPS_GLOAS": "2000",
-            "CONTRIBUTION_DUE_BPS_GLOAS": "4000",
-        });
+        let response = complete_spec(&[
+            ("SYNC_MESSAGE_DUE_BPS", "3000"),
+            ("CONTRIBUTION_DUE_BPS", "6000"),
+            ("SYNC_MESSAGE_DUE_BPS_GLOAS", "2000"),
+            ("CONTRIBUTION_DUE_BPS_GLOAS", "4000"),
+        ]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.sync_message_due_bps, 3_000);
         assert_eq!(config.contribution_due_bps, 6_000);
         assert_eq!(config.sync_message_due_bps_gloas, 2_000);
         assert_eq!(config.contribution_due_bps_gloas, 4_000);
 
-        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
         assert_eq!(config.sync_message_due_bps, 3_333);
         assert_eq!(config.contribution_due_bps, 6_667);
         assert_eq!(config.sync_message_due_bps_gloas, 2_500);
@@ -1154,14 +1563,14 @@ mod tests {
     /// 256 epochs: the exit command checks eligibility against this field.
     #[test]
     fn the_shard_committee_period_is_read_and_defaults_to_mainnets() {
-        let response = serde_json::json!({ "SHARD_COMMITTEE_PERIOD": "4" });
+        let response = complete_spec(&[("SHARD_COMMITTEE_PERIOD", "4")]);
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.shard_committee_period, 4);
 
-        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
         assert_eq!(config.shard_committee_period, 256);
 
-        let response = serde_json::json!({ "SHARD_COMMITTEE_PERIOD": "soon" });
+        let response = complete_spec(&[("SHARD_COMMITTEE_PERIOD", "soon")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }

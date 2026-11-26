@@ -333,7 +333,7 @@ decodes anything else, and the two tags are raw bytes rather than SSZ for that
 reason: they have to be readable by a build that would decode the rest of the
 directory into the wrong shape. `db_version` catches a layout change this build
 knows about; `chain` catches lean rows being opened as beacon or the reverse;
-`preset` catches a `preset-minimal` build opening a mainnet directory, which
+`preset` catches a minimal-preset network reusing a mainnet directory, which
 the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.
@@ -476,11 +476,18 @@ costs nothing to supply.
 Sidecars are written on arrival, once the p2p layer has verified one (gossip
 validation for a sidecar gossip accepted, the chain checks in
 `beacon::gossip::column::chain_checks` for any other), rather than at block
-import. That ordering is what lets the availability
+import. This node's own fulu proposal's custody columns skip the p2p checks:
+the Beacon API verified them before publishing (`data_columns::verified_sidecars`). That ordering is what lets the availability
 gate read a block's columns before the block itself is allowed to import (a
 column has to exist first for the gate to find it), and what lets a restart
 keep every sidecar this node already paid a KZG batch to verify rather than
-re-fetching and re-verifying them. One consequence: a sidecar is stored for
+re-fetching and re-verifying them. The same property is what lets block import
+(and a gloas envelope's import) treat a present column as verified: the availability
+gate checks presence only and hands fork choice `DataAvailability::ColumnsVerified`,
+so the stored sidecars are not decoded and their KZG proofs are not checked a second
+time. A row damaged on disk after it was written therefore does not stop an import;
+it shows up when the by-root or by-range handler serves it, as a logged read or decode
+error, with that column left out of the answer. One consequence: a sidecar is stored for
 any block whose header, parent and proposer check out, whether or not that
 block ever actually imports — an equivocation or an orphaned fork's sidecars
 land here too, since gossip only requires a known, unfinalized parent, not a

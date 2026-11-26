@@ -63,6 +63,7 @@ pub mod epoch;
 pub mod fulu;
 pub mod gloas;
 pub mod operations;
+pub mod signatures;
 
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
@@ -75,6 +76,8 @@ use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 use crate::beacon::{bls, config::Config, constants};
+use crate::metrics::{StfPhase, observe_stf_phase, timed};
+use std::time::{Duration, Instant};
 
 /// What the execution layer would answer for a block's payload.
 ///
@@ -176,8 +179,39 @@ pub fn state_transition(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
 ) -> Result<()> {
+    state_transition_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`state_transition`] with explicit [`block::BlockProcessingOptions`], for
+/// the caller that collects the block's target-balance delta.
+#[allow(clippy::too_many_arguments)]
+pub fn state_transition_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    caches: BlockCaches<'_>,
+    options: block::BlockProcessingOptions,
+) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
-    apply_block(state, signed_block, validate_result, config, engine, caches)
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        options,
+    )
 }
 
 /// [`state_transition`] from the point where `state` is already at the block's
@@ -197,6 +231,28 @@ pub fn apply_block(
     engine: &ExecutionEngine,
     caches: BlockCaches<'_>,
 ) -> Result<()> {
+    apply_block_with_options(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        caches,
+        block::BlockProcessingOptions::default(),
+    )
+}
+
+/// [`apply_block`] with explicit [`block::BlockProcessingOptions`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_with_options(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    caches: BlockCaches<'_>,
+    options: block::BlockProcessingOptions,
+) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
     // arriving here is still the pre-fork one, which is exactly the case a fork
@@ -208,36 +264,49 @@ pub fn apply_block(
         "the block's fork matches the state's",
     )?;
 
+    // The proposer's signature on its own, before the body runs, rather than in
+    // the body's batch: a block nobody but its sender signed then costs one
+    // pairing to reject instead of a whole body's processing. Gossip checked it
+    // already (`precheck_block`), but a block fetched by request arrives here
+    // unchecked. `process_block` batches the body's own signatures and checks
+    // them before returning, so before the state root below is computed (and
+    // the ones that slash, exit, redirect or feed the RANDAO mix before they
+    // write; see `signatures`).
     if validate_result {
-        verify(
-            verify_block_signature(state, signed_block),
-            "block signature",
-        )?;
+        let signature_valid = timed(StfPhase::BlockSignature, || {
+            verify_block_signature(state, signed_block)
+        });
+        verify(signature_valid, "block signature")?;
     }
 
-    block::process_block(
-        state,
-        signed_block,
-        config,
-        engine,
-        caches,
-        block::BlockProcessingOptions::default(),
-    )?;
-    // As in `process_slot`: the post-state's root, checked below and needed
-    // again in the next slot, is then computed on the state's own nodes.
-    state.apply_pending_mutations();
+    block::process_block(state, signed_block, config, engine, caches, options)?;
 
+    // As in `process_slot`: the post-state's root, checked below and needed
+    // again in the next slot, is then computed on the state's own nodes. The
+    // flush and the hash are one phase: the flush is what makes the hash run
+    // on, and cache into, those nodes, and a caller that does not validate
+    // pays the flush alone without ever naming it, so it is not worth a series
+    // of its own.
     if validate_result {
+        let state_root_matches = timed(StfPhase::StateRoot, || {
+            state.apply_pending_mutations();
+            signed_block.state_root() == state.hash_tree_root()
+        });
         verify(
-            signed_block.state_root() == state.hash_tree_root(),
+            state_root_matches,
             "block state root matches the post-state",
         )?;
+    } else {
+        state.apply_pending_mutations();
     }
 
     Ok(())
 }
 
 /// Whether the block carries its proposer's signature.
+///
+/// Checked on its own, never batched: [`apply_block`] runs it before the body
+/// so that a block its proposer never signed costs one pairing to reject.
 pub fn verify_block_signature(
     state: &BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -261,12 +330,27 @@ pub fn verify_proposer_signature(
     block_root: Root,
     signature: &BlsSignature,
 ) -> bool {
-    let Ok(proposer) = state.validator(proposer_index) else {
-        return false;
-    };
+    proposer_signature_set(state, proposer_index, block_root, signature)
+        .is_some_and(|set| set.verify())
+}
+
+/// [`verify_proposer_signature`]'s check, resolved but not yet run. `None` is
+/// a proposer index outside the registry, or a key or signature that does not
+/// validate.
+fn proposer_signature_set(
+    state: &BeaconState,
+    proposer_index: ValidatorIndex,
+    block_root: Root,
+    signature: &BlsSignature,
+) -> Option<bls::SignatureSet> {
+    let proposer = state.validator(proposer_index).ok()?;
     let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
     let signing_root = compute_signing_root(block_root, domain);
-    bls::verify(&proposer.pubkey, signing_root, signature)
+    let proposer = bls::IndexedPubkey {
+        index: proposer_index,
+        pubkey: proposer.pubkey,
+    };
+    bls::SignatureSet::single(&proposer, signing_root, signature)
 }
 
 /// Advances the state to `slot`, running epoch processing at each boundary and
@@ -277,12 +361,22 @@ pub fn verify_proposer_signature(
 pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Result<()> {
     verify(state.slot() < slot, "target slot is after the current slot")?;
 
+    // The epoch work is timed on its own and taken out of this call's total,
+    // so the two phases add up to the call instead of the second containing
+    // the first.
+    let started = Instant::now();
+    let mut epoch_work = Duration::ZERO;
+
     while state.slot() < slot {
         process_slot(state)?;
         // Epoch processing runs on the last slot of an epoch, before the counter
         // moves into the next one.
-        if (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_EPOCH) {
+        if (state.slot() + 1).is_multiple_of(preset::slots_per_epoch()) {
+            let epoch_started = Instant::now();
             epoch::process_epoch(state, config)?;
+            let elapsed = epoch_started.elapsed();
+            observe_stf_phase(StfPhase::ProcessEpoch, elapsed);
+            epoch_work += elapsed;
         }
         *state.slot_mut() += 1;
         upgrade_at_fork_boundary(state, config)?;
@@ -295,6 +389,13 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
     // otherwise be cloned and cached with the whole epoch's writes still
     // pending.
     state.apply_pending_mutations();
+
+    // Only a call that got this far is observed: a rejected target slot or a
+    // failed epoch leaves no state worth attributing time to.
+    observe_stf_phase(
+        StfPhase::ProcessSlots,
+        started.elapsed().saturating_sub(epoch_work),
+    );
 
     Ok(())
 }
@@ -321,10 +422,10 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
 /// another's. Upgrading one fork per slot would silently leave the state a fork
 /// behind.
 fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<()> {
-    if !state.slot().is_multiple_of(preset::SLOTS_PER_EPOCH) {
+    if !state.slot().is_multiple_of(preset::slots_per_epoch()) {
         return Ok(());
     }
-    let epoch = state.slot() / preset::SLOTS_PER_EPOCH;
+    let epoch = state.slot() / preset::slots_per_epoch();
 
     while let Some(next) = state.fork_name().next() {
         if config.fork_epoch(next) != epoch {
@@ -358,7 +459,7 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
     // throwaway copy.
     state.apply_pending_mutations();
     let previous_state_root = state.compute_state_root();
-    let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+    let position = state.slot() as usize % preset::slots_per_historical_root();
     state.state_roots_mut()[position] = previous_state_root;
 
     if state.latest_block_header().state_root.is_zero() {
@@ -386,7 +487,7 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
                 .slot
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
-            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            let next_position = (next_slot % preset::slots_per_historical_root() as u64) as usize;
             inner
                 .execution_payload_availability
                 .set(next_position, false)
@@ -439,9 +540,9 @@ mod tests {
     #[test]
     fn process_slot_unsets_next_slots_payload_availability_on_gloas() {
         let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
-        let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
-        let next_position = (position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
-        let other_position = (next_position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let position = state.slot() as usize % preset::slots_per_historical_root();
+        let next_position = (position + 1) % preset::slots_per_historical_root();
+        let other_position = (next_position + 1) % preset::slots_per_historical_root();
         let BeaconState::Gloas(inner) = &mut state else {
             panic!("with_validators_at(Gloas) returns a gloas state");
         };
@@ -488,7 +589,7 @@ mod tests {
     #[test]
     fn process_slot_wraps_the_payload_availability_index_at_the_end_of_the_window() {
         let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
-        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot - 1;
+        *state.slot_mut() = preset::slots_per_historical_root() as Slot - 1;
         let BeaconState::Gloas(inner) = &mut state else {
             panic!("with_validators_at(Gloas) returns a gloas state");
         };
@@ -528,11 +629,44 @@ mod tests {
     fn process_slots_across_an_epoch_boundary_leaves_no_buffered_writes() {
         let mut state = test_state::with_validators(4);
         let config = Config::mainnet();
-        let target_slot = state.slot() + preset::SLOTS_PER_EPOCH;
+        let target_slot = state.slot() + preset::slots_per_epoch();
 
         process_slots(&mut state, target_slot, &config).unwrap();
 
         assert!(!state.has_pending_mutations());
+    }
+
+    /// The epoch work is observed once per boundary and under its own label,
+    /// and the plain slot work once per call, so the two never double count.
+    /// Which context they land in follows the thread's guard, which is what
+    /// keeps the precompute worker's `process_epoch` out of an import's.
+    #[test]
+    fn process_slots_observes_epoch_work_apart_from_slot_work() {
+        use crate::metrics::{import_context, take_observation_log};
+
+        let config = Config::mainnet();
+        let mut state = test_state::with_validators(4);
+        let two_epochs = state.slot() + 2 * preset::slots_per_epoch();
+
+        take_observation_log();
+        process_slots(&mut state, two_epochs, &config).unwrap();
+        assert_eq!(
+            take_observation_log(),
+            [
+                ("other", StfPhase::ProcessEpoch),
+                ("other", StfPhase::ProcessEpoch),
+                ("other", StfPhase::ProcessSlots),
+            ]
+        );
+
+        let _import = import_context();
+        let one_slot = state.slot() + 1;
+        process_slots(&mut state, one_slot, &config).unwrap();
+        assert_eq!(
+            take_observation_log(),
+            [("import", StfPhase::ProcessSlots)],
+            "a call that crosses no boundary runs no epoch work"
+        );
     }
 
     #[test]

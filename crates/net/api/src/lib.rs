@@ -22,6 +22,8 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
 
+pub mod sync;
+
 // --- Protocol: BlockChain -> P2P ---
 
 #[protocol]
@@ -34,18 +36,43 @@ pub trait BlockChainToP2P: Send + Sync {
     ) -> Result<(), ActorError>;
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
-    /// Run the chain checks on sidecars the chain actor had parked, now that
-    /// the block they are checked against has a post-state: their parent for a
-    /// fulu sidecar, their own block for a gloas one.
+    /// Hand sidecars the chain actor holds to the p2p layer, which decides
+    /// what they need before they are stored by where they came from; see
+    /// [`SidecarOrigin`].
     ///
-    /// The chain actor keeps a sidecar without checking it, so it hands these
-    /// back rather than judging them itself: the p2p layer runs every column
-    /// check, off both actors, and sends the ones that pass back through
-    /// [`P2PToBlockChain::new_data_column_sidecars`].
+    /// For [`SidecarOrigin::Parked`] that is the chain checks: sidecars the
+    /// chain actor had parked, now that the block they are checked against has
+    /// a post-state (their parent for a fulu sidecar, their own block for a
+    /// gloas one). The chain actor keeps a sidecar without checking it, so it
+    /// hands these back rather than judging them itself: the p2p layer runs
+    /// every column check, off both actors, and sends the ones that pass back
+    /// through [`P2PToBlockChain::new_data_column_sidecars`].
     fn check_data_column_sidecars(
         &self,
         sidecars: Vec<DataColumnSidecar>,
+        origin: SidecarOrigin,
     ) -> Result<(), ActorError>;
+}
+
+/// Where the sidecars handed to [`BlockChainToP2P::check_data_column_sidecars`]
+/// came from, which decides what the p2p layer does with them before they
+/// reach [`P2PToBlockChain::new_data_column_sidecars`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidecarOrigin {
+    /// From the network, parked by the chain actor unchecked until the block
+    /// they are judged against had a post-state: run the chain checks.
+    Parked,
+    /// Built by this node from the blobs its own execution client returned
+    /// for a held block (`engine_getBlobsV2`).
+    ///
+    /// Already checked: the chain actor runs every chain check on them, KZG
+    /// proofs included, before handing them over, though the fulu
+    /// `p2p-interface.md` lets a client skip verifying blobs from its local
+    /// execution layer. What is left is what it "MUST" do "as if the
+    /// `data_column_sidecar` had been received via gossip": publish each on
+    /// its subnet if and only if this node is subscribed to it, and record it
+    /// in the anti-equivocation (seen) cache.
+    ExecutionLayer,
 }
 
 /// What one block is missing, from the chain actor's point of view.
@@ -329,6 +356,12 @@ pub trait P2PToBlockChain: Send + Sync {
         message: PayloadAttestationMessage,
         arrival: BlockArrival,
     ) -> Result<(), ActorError>;
+    /// Signed proposer preferences for `proposal_slot` were recorded in the
+    /// shared builder market, accepted from gossip or submitted through the
+    /// Beacon API. The market holds them; this only tells the chain actor,
+    /// whose `payload_attributes` event carries the fee recipient and gas
+    /// target they name, that the next slot's attributes may have changed.
+    fn new_proposer_preferences(&self, proposal_slot: u64) -> Result<(), ActorError>;
 }
 
 /// When an aggregate reached this node, for the one metric that cannot be
@@ -695,4 +728,54 @@ pub struct InitBlockChain {
 }
 impl Message for InitBlockChain {
     type Result = ();
+}
+
+// --- Sink: P2P -> event stream ---
+
+/// A gloas gossip object that passed its topic's validation inside
+/// `ethlambda-p2p`, for the Beacon API's event stream.
+///
+/// These are the topics whose objects never reach the chain actor, which is
+/// the event bus's usual publisher: bids and proposer preferences are
+/// validated and kept in the p2p layer's `BuilderMarket`, and a payload
+/// attestation message is pooled there. Carrying only what each event shows
+/// keeps the sink free of a dependency on the blockchain crate, which owns
+/// the bus.
+#[derive(Clone, Debug)]
+pub enum GossipEvent {
+    /// An `execution_payload` envelope passed gossip validation. Only the
+    /// fields the event shows are carried, since the envelope itself holds a
+    /// whole execution payload.
+    ExecutionPayloadGossip {
+        slot: u64,
+        builder_index: u64,
+        block_hash: H256,
+        block_root: H256,
+    },
+    /// An `execution_payload_bid` passed gossip validation.
+    ExecutionPayloadBid(Box<SignedExecutionPayloadBid>),
+    /// A `payload_attestation_message` passed gossip validation.
+    PayloadAttestationMessage(PayloadAttestationMessage),
+    /// A `proposer_preferences` message passed gossip validation.
+    ProposerPreferences(Box<SignedProposerPreferences>),
+    /// A `beacon_attestation_{subnet_id}` single attestation passed gossip
+    /// validation (the `single_attestation` event). Boxed because the bus
+    /// moves the box as is into its `ChainEvent::SingleAttestation`, the
+    /// element its ring stores, which is boxed to keep that ring's slots
+    /// small.
+    SingleAttestation(Box<SingleAttestation>),
+}
+
+/// Where `ethlambda-p2p` reports [`GossipEvent`]s.
+///
+/// Implemented by the event bus in `ethlambda-blockchain`, so the p2p layer
+/// can feed `/eth/v1/events` without depending on the crate that owns it.
+/// Best-effort like the bus itself: `emit` never blocks and never fails.
+pub trait GossipEventSink: Send + Sync {
+    /// Whether anything listens. Asked before building a payload that costs
+    /// a clone, so a node nobody subscribes to pays nothing.
+    fn has_subscribers(&self) -> bool;
+
+    /// Publish `event` to every current subscriber.
+    fn emit(&self, event: GossipEvent);
 }

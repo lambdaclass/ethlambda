@@ -305,6 +305,18 @@ static AGGREGATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Slots the duty loop signed nothing in, because every beacon node that
+/// answered the slot's sync probe reported syncing or optimistic. See
+/// `beacon_node::health`.
+static SLOTS_SKIPPED_SYNCING_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_slots_skipped_syncing_total",
+        "Slots with no duty signed because every beacon node that answered the slot's sync probe \
+         was syncing or optimistic"
+    )
+    .unwrap()
+});
+
 static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_beacon_node_available",
@@ -421,6 +433,27 @@ static SYNC_DUTIES_HELD: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Keys doppelganger protection still withholds attestations and blocks for.
+/// Zero with the protection off, and once every key has passed.
+static DOPPELGANGER_DETECTING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_doppelganger_detecting",
+        "Validator keys doppelganger protection has not yet cleared to sign"
+    )
+    .unwrap()
+});
+
+/// Doppelganger checks (one a slot while a key is withheld) that got no
+/// liveness answer: a query failed, or every beacon node was syncing. Only a
+/// failure at an epoch's last slot costs anything, an epoch of signing.
+static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_doppelganger_check_failures_total",
+        "Doppelganger checks, one a slot while a key is withheld, that got no liveness answer"
+    )
+    .unwrap()
+});
+
 /// Register every series with the Prometheus registry so `/metrics` lists them
 /// at zero from startup, rather than only after whatever first touches them.
 ///
@@ -458,10 +491,13 @@ pub fn init() {
     LazyLock::force(&SYNC_CONTRIBUTIONS_PUBLISHED_TOTAL);
     LazyLock::force(&SYNC_CONTRIBUTION_FAILURES_TOTAL);
     LazyLock::force(&SYNC_DUTIES_HELD);
+    LazyLock::force(&DOPPELGANGER_DETECTING);
+    LazyLock::force(&DOPPELGANGER_CHECK_FAILURES_TOTAL);
     LazyLock::force(&BLOCK_PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&AGGREGATES_PUBLISHED_TOTAL);
     LazyLock::force(&AGGREGATION_FAILURES_TOTAL);
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
+    LazyLock::force(&SLOTS_SKIPPED_SYNCING_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
@@ -603,8 +639,20 @@ pub fn inc_fee_recipient_mismatches() {
     FEE_RECIPIENT_MISMATCHES_TOTAL.inc();
 }
 
+pub fn inc_slots_skipped_syncing() {
+    SLOTS_SKIPPED_SYNCING_TOTAL.inc();
+}
+
 pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
+}
+
+pub fn set_doppelganger_detecting(count: u64) {
+    DOPPELGANGER_DETECTING.set(count as i64);
+}
+
+pub fn inc_doppelganger_check_failures() {
+    DOPPELGANGER_CHECK_FAILURES_TOTAL.inc();
 }
 
 /// Time one duty's batch of signatures. The returned guard records to
