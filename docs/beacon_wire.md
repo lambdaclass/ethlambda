@@ -209,8 +209,11 @@ those too before it lets one wait (see
 parent whose proposer the head state does not hold: the actor parks it
 rather than refusing it, since a node catching up after downtime has a head
 older than the validators registered since, and range sync parks every block
-behind a parent still held for its columns. Data column sidecars are, either way, handed to
-the chain actor, which parks what it cannot import yet and imports the rest
+behind a parent still held for its columns. A refused copy takes nothing
+parked behind its root with it: the root does not cover the signature, so a
+validly signed copy can still follow. Data column sidecars are, either way,
+handed to the chain actor, which parks what it cannot import yet and imports
+the rest
 immediately, such as a sidecar whose slot merely falls outside its parent
 state's proposer lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the
 attesting indices gossip validation resolved. A subnet attestation never

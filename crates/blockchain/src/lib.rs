@@ -3288,9 +3288,11 @@ impl BlockChainServer {
                     %err,
                     "Refusing a block before it waits for its parent"
                 );
-                // Anything already parked on this root waits for a block that
-                // will never import.
-                self.discard_pending_subtree(block_root);
+                // Only this copy is refused. A block's root does not commit
+                // to its signature, so anything parked on this root keeps
+                // waiting for a validly signed copy, as it does after a
+                // failed import; discarding it would let any peer that
+                // answers with a garbled signature drop a parked chain.
                 return None;
             }
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
@@ -6114,6 +6116,18 @@ mod tests {
         // is unknown is enough: whatever becomes of a block, its arrival ends
         // in the head recompute.
         let mut server = syncing_server(None);
+        // The orphan's signature is checked against the head's post-state
+        // before it waits for its parent, so the head needs one. `bare_state`
+        // holds no validators, and a block by a proposer the head state
+        // cannot answer for still waits.
+        server
+            .store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        server
+            .store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
         let orphan = || bare_block(1, H256::repeat_byte(0xee));
 
         // Peers as stale as the node: a stall, synced.
@@ -6312,11 +6326,14 @@ mod tests {
     #[tokio::test]
     async fn the_arrival_is_the_block_on_block_was_called_with() {
         let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        // Keyed: the child waits for its parent and the ancestor is held for
+        // its columns, each only once its signature verifies against this
+        // state.
         store
             .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
             .expect("insert");
         store
-            .insert_state(H256::ZERO, bare_state())
+            .insert_state(H256::ZERO, keyed_bare_state())
             .expect("insert");
         store
             .set_time_ms(seconds_to_milliseconds(
@@ -6325,17 +6342,18 @@ mod tests {
             .unwrap();
         let mut server = beacon_server(store);
         server.custody_columns = CUSTODY.to_vec();
+        let config = server.store.config();
 
         // Stored as pending from an earlier session: the child's walk finds
         // it, its parent has a state, and it is queued behind the child. It is
         // then held for its columns, so no state transition is needed.
-        let first = fulu_block_with_commitments(&server.store, 2);
+        let first = signed_by_proposer(fulu_block_with_commitments(&server.store, 2), &config);
         let first_root = first.message_hash_tree_root();
         server
             .store
             .insert_pending_block(first_root, first.clone())
             .expect("insert");
-        let child = fulu_block(first_root, first.slot() + 1, 0);
+        let child = signed_by_proposer(fulu_block(first_root, first.slot() + 1, 0), &config);
         let child_root = child.message_hash_tree_root();
         let child_slot = child.slot();
 
@@ -6692,6 +6710,47 @@ mod tests {
             &beacon_store(GENESIS_TIME, 0).config(),
         );
         assert!(waits_for_its_parent(keyed_bare_state(), signed).await);
+    }
+
+    #[tokio::test]
+    async fn a_forged_copy_of_a_missing_parent_leaves_its_parked_children_waiting() {
+        // A block's root does not commit to its signature, so a copy with a
+        // bad one says nothing about the block: a peer can answer a by-root
+        // request with a real block's message and a garbled signature, and
+        // the validly signed copy can still follow. What is parked on that
+        // root has to still be there when it does.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, keyed_bare_state())
+            .expect("insert");
+        let mut server = beacon_server(store);
+        let config = server.store.config();
+
+        let forged_parent = bare_block(2, H256::repeat_byte(0x11));
+        let parent_root = forged_parent.message_hash_tree_root();
+        let child = signed_by_proposer(bare_block(3, parent_root), &config);
+        let child_root = child.message_hash_tree_root();
+
+        let mut queue = VecDeque::new();
+        for block in [child, forged_parent] {
+            let outcome = server
+                .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+                .await;
+            assert_eq!(outcome, None, "neither block has a parent state");
+        }
+
+        assert!(
+            !server.pending_block_parents.contains_key(&parent_root),
+            "the forged copy is refused"
+        );
+        assert_eq!(
+            server.pending_block_parents.get(&child_root),
+            Some(&parent_root),
+            "the child still waits for a validly signed parent"
+        );
     }
 
     // -----------------------------------------------------------------
