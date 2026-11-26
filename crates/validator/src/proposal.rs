@@ -448,9 +448,11 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// A proposal at a PQ slot: the RANDAO reveal is the proposer's VRF proof,
     /// the beacon node builds a self-built block and its envelope (ethlambda's
     /// `pq_blocks` endpoint), and both are signed with leanXMSS at the slot's
-    /// proposer and envelope leaves. The slashing protection record guards
-    /// the block's leaf (one block per slot), `crate::pq` the envelope's. An
-    /// envelope failure is logged, not the proposal's: the block is out.
+    /// proposer and envelope leaves, side by side, the block published as
+    /// soon as its own signature is done. The slashing protection record
+    /// guards the block's leaf (one block per slot), `crate::pq` the
+    /// envelope's. An envelope failure is logged, not the proposal's: the
+    /// block is out.
     async fn propose_pq(
         &self,
         slot: Slot,
@@ -497,10 +499,36 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         .await;
         refuse_unless_safe(slot, validator, "record", recorded)?;
 
+        // Both signatures start now, on their own cores: a leanXMSS signature
+        // costs about 0.3 s of a core and sometimes several times that (see
+        // `pq::sign_batch`), and the envelope's message is known as soon as
+        // the block is, so it need not wait for the block's signature or its
+        // publish. The block still goes out first, as soon as its own is done.
+        // An envelope signed for a block that then fails costs only the
+        // slot's envelope leaf, which no other message can use.
         let signing_root = self.context.block_signing_root(block_root, slot);
         let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_BEACON_PROPOSER);
-        let signature = crate::pq::sign(&pubkey, leaf, signing_root)
+        let block_signing =
+            tokio::spawn(async move { crate::pq::sign(&pubkey, leaf, signing_root).await });
+        let envelope = contents.execution_payload_envelope;
+        let domain = self.context.domain(
+            ethlambda_types::beacon::constants::DOMAIN_BEACON_BUILDER,
+            compute_epoch_at_slot(slot),
+        );
+        let envelope_root = ethlambda_types::beacon::signing::compute_signing_root(
+            envelope.hash_tree_root(),
+            domain,
+        );
+        let envelope_leaf =
+            crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE);
+        let envelope_signing =
+            tokio::spawn(
+                async move { crate::pq::sign(&pubkey, envelope_leaf, envelope_root).await },
+            );
+
+        let signature = block_signing
             .await
+            .unwrap_or_else(|err| Err(crate::pq::PqSignError::Task(err.to_string())))
             .map_err(pq_error)?;
         let signed = pq::SignedBeaconBlock {
             message: contents.block,
@@ -519,19 +547,12 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         crate::metrics::inc_blocks_proposed();
         self.observe_publication_delay(slot);
 
-        let envelope = contents.execution_payload_envelope;
-        let domain = self.context.domain(
-            ethlambda_types::beacon::constants::DOMAIN_BEACON_BUILDER,
-            compute_epoch_at_slot(slot),
-        );
-        let envelope_root = ethlambda_types::beacon::signing::compute_signing_root(
-            envelope.hash_tree_root(),
-            domain,
-        );
-        let leaf = crate::pq::slot_leaf(slot, crate::pq::LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE);
         // Logged and counted rather than propagated, as for gloas: the block
         // is out and the proposal did happen.
-        match crate::pq::sign(&pubkey, leaf, envelope_root).await {
+        let envelope_signature = envelope_signing
+            .await
+            .unwrap_or_else(|err| Err(crate::pq::PqSignError::Task(err.to_string())));
+        match envelope_signature {
             Ok(signature) => {
                 let signed = pq::SignedExecutionPayloadEnvelope {
                     message: envelope,
