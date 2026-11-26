@@ -205,7 +205,11 @@ has columns for. A real block dropped here still arrives through a child's
 by-root fetch or range sync, and the chain actor checks the signature of
 those too before it lets one wait (see
 `lean_beacon_blocks_refused_before_waiting_total` in
-[metrics.md](./metrics.md)). Data column sidecars are, either way, handed to
+[metrics.md](./metrics.md)). The one exception is a block waiting for its
+parent whose proposer the head state does not hold: the actor parks it
+rather than refusing it, since a node catching up after downtime has a head
+older than the validators registered since, and range sync parks every block
+behind a parent still held for its columns. Data column sidecars are, either way, handed to
 the chain actor, which parks what it cannot import yet and imports the rest
 immediately, such as a sidecar whose slot merely falls outside its parent
 state's proposer lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the

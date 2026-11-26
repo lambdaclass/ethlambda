@@ -3647,9 +3647,15 @@ impl BlockChainServer {
     ///
     /// Judged against the parent's post-state when it waits for its columns
     /// (every rule), and against the head's when it waits for its parent (the
-    /// signature only). A proposer the head state does not hold is refused
-    /// too: its signature cannot be checked, and a real block refused here
-    /// still arrives again through range sync once its parent has imported.
+    /// signature only). A proposer the head state does not hold is let
+    /// through to wait for its parent rather than refused: a node catching up
+    /// after downtime has a head older than the validators registered since,
+    /// and range sync parks every block behind a parent still held for its
+    /// columns, so refusing would throw away real blocks and their parked
+    /// descendants exactly when the node needs them. Only a signature the
+    /// head state shows is forged refuses such a block. Gossip validation
+    /// drops one instead (`gossip::block::queue_if_signed`), which costs a
+    /// real block only its gossip delivery.
     fn precheck_before_waiting(
         &self,
         block: &SignedBeaconBlock,
@@ -3673,7 +3679,12 @@ impl BlockChainServer {
             Wait::Parent => Reference::Recent(&reference_state),
             Wait::Columns => Reference::Parent(&reference_state),
         };
-        precheck_block(block, block_root, reference, &config).inspect_err(|err| {
+        let verdict = match (precheck_block(block, block_root, reference, &config), wait) {
+            // See the doc comment: unanswerable, not forged.
+            (Err(PrecheckError::UnknownProposer { .. }), Wait::Parent) => Ok(()),
+            (verdict, _) => verdict,
+        };
+        verdict.inspect_err(|err| {
             metrics::inc_beacon_blocks_refused_before_waiting(err.label(), wait.label())
         })
     }
@@ -6637,6 +6648,50 @@ mod tests {
             vec![dropped_root],
             "the dropped block is retried, not the imported ancestor"
         );
+    }
+
+    /// Parks `block`, whose parent the store has never seen, on a head whose
+    /// post-state is `head_state`, and says whether it was kept waiting.
+    async fn waits_for_its_parent(head_state: BeaconState, block: SignedBeaconBlock) -> bool {
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store.insert_state(H256::ZERO, head_state).expect("insert");
+        let mut server = beacon_server(store);
+
+        let block_root = block.message_hash_tree_root();
+        let mut queue = VecDeque::new();
+        let outcome = server
+            .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+            .await;
+        assert_eq!(outcome, None, "a block with no parent state never imports");
+        server.pending_block_parents.contains_key(&block_root)
+    }
+
+    #[tokio::test]
+    async fn a_block_by_a_proposer_the_head_state_lacks_still_waits_for_its_parent() {
+        // A node catching up after downtime: its head predates validators
+        // registered since, and range sync parks blocks behind a parent still
+        // held for its columns. The head state cannot check such a block's
+        // signature, which is no evidence that it is forged. `bare_state`
+        // has no validators, so proposer 0 is one it lacks.
+        let block = bare_block(2, H256::repeat_byte(0x11));
+        assert!(waits_for_its_parent(bare_state(), block).await);
+    }
+
+    #[tokio::test]
+    async fn a_block_the_head_state_shows_forged_is_refused_before_it_waits() {
+        // `keyed_bare_state` holds proposer 0's key, and an unsigned block
+        // carries no signature of that key.
+        let forged = bare_block(2, H256::repeat_byte(0x11));
+        assert!(!waits_for_its_parent(keyed_bare_state(), forged).await);
+
+        let signed = signed_by_proposer(
+            bare_block(2, H256::repeat_byte(0x11)),
+            &beacon_store(GENESIS_TIME, 0).config(),
+        );
+        assert!(waits_for_its_parent(keyed_bare_state(), signed).await);
     }
 
     // -----------------------------------------------------------------
