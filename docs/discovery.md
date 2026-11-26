@@ -89,7 +89,9 @@ the bump; only the sequence number and `ip` move.
 logged at startup. ethrex writes every record it re-signs into a shared mirror
 (`SharedLocalNode`) it was started with, and the endpoint reads through that
 (`discovery::LocalEnr`), so what the Beacon API reports and what peers get over
-discv5 are the same bytes even after IP voting.
+discv5 are the same bytes even after IP voting. The endpoint's multiaddrs are
+built from that same read, the way a peer reading the record would dial it, so
+they follow IP voting too.
 
 The other direction is not possible yet: nothing on this side can change the
 record discovery serves. ethrex's discovery protocol has no message that edits

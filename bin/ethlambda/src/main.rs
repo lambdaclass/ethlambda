@@ -133,40 +133,6 @@ fn main() -> eyre::Result<()> {
     }
 }
 
-/// What `/eth/v1/node/identity` reports beyond the peer id: the ENR discv5
-/// serves, read live, and the multiaddrs peers reach this node on. The
-/// addresses need the node's externally reachable IP, which only
-/// `--discovery.advertise-ip` supplies (a node bound to `0.0.0.0` does not know
-/// it), so without the flag they are left empty rather than guessed. They stay
-/// empty even once discv5's IP voting has written an external address into the
-/// ENR: the record is read live, these lists are built once, here.
-fn beacon_identity(
-    enr: ethlambda_rpc::EnrSource,
-    advertise_ip: Option<IpAddr>,
-    gossipsub_port: u16,
-    discovery_port: u16,
-    peer_id: &str,
-) -> ethlambda_rpc::BeaconIdentity {
-    let Some(ip) = advertise_ip else {
-        return ethlambda_rpc::BeaconIdentity {
-            enr,
-            ..Default::default()
-        };
-    };
-    let family = if ip.is_ipv4() { "ip4" } else { "ip6" };
-    ethlambda_rpc::BeaconIdentity {
-        enr,
-        // QUIC first, matching the order this node dials in.
-        p2p_addresses: vec![
-            format!("/{family}/{ip}/udp/{gossipsub_port}/quic-v1/p2p/{peer_id}"),
-            format!("/{family}/{ip}/tcp/{gossipsub_port}/p2p/{peer_id}"),
-        ],
-        discovery_addresses: vec![format!("/{family}/{ip}/udp/{discovery_port}/p2p/{peer_id}")],
-        metadata: None,
-        peers: None,
-    }
-}
-
 /// The level the node logs at when `RUST_LOG` says nothing.
 const NODE_LOG_LEVEL: &str = "info";
 
@@ -859,22 +825,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
-    // Read through discovery's own copy of the record, so the endpoint follows
-    // it when discv5's IP voting re-signs it. No ENR without discovery.
-    let rpc_enr = p2p
+    // Read through discovery's own copy of the record, so the ENR and the
+    // addresses it advertises follow it when discv5's IP voting re-signs it.
+    // No record, and no addresses, without discovery.
+    let rpc_record = p2p
         .local_enr()
-        .map(|local_enr| ethlambda_rpc::EnrSource::new(move || local_enr.current()))
+        .map(|local_enr| ethlambda_rpc::RecordSource::new(move || local_enr.advertised()))
         .unwrap_or_default();
     let rpc_identity = ethlambda_rpc::BeaconIdentity {
+        record: rpc_record,
         metadata: p2p.local_metadata(),
         peers: Some(p2p.peer_table()),
-        ..beacon_identity(
-            rpc_enr,
-            common.discovery.advertise_ip,
-            common.gossipsub_port,
-            common.discovery.port,
-            &local_peer_id,
-        )
     };
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.

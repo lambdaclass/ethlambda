@@ -327,6 +327,16 @@ impl LocalEnr {
             .inspect_err(|err| warn!(%err, "Could not encode the local ENR"))
             .ok()
     }
+
+    /// The served record and the addresses it advertises, from one read of it
+    /// (see [`enr::advertised_record`]). Nothing, as for a node that publishes
+    /// no record, if the lock is poisoned.
+    pub fn advertised(&self) -> ethlambda_network_api::AdvertisedRecord {
+        let Ok(local_node) = self.0.read() else {
+            return Default::default();
+        };
+        enr::advertised_record(&local_node.record)
+    }
 }
 
 /// Publish a new `eth2` entry in the ENR this node serves over discv5.
