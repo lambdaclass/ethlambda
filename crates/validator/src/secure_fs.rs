@@ -26,8 +26,7 @@ fn write_durably(mut file: std::fs::File, contents: impl AsRef<[u8]>) -> std::io
     file.sync_all()
 }
 
-/// Write `contents`, creating the file if it does not exist and truncating it
-/// if it does, at mode `0600` on unix.
+/// Write `contents` at mode `0600` on unix, replacing whatever is at `path`.
 ///
 /// For a file this crate is the sole, trusted writer of and is willing to
 /// overwrite outright: the API token. It is not named from
@@ -35,16 +34,14 @@ fn write_durably(mut file: std::fs::File, contents: impl AsRef<[u8]>) -> std::io
 /// [`write_private_no_symlink`] for the files that are, and
 /// [`write_private_durably`] for the ones whose loss would change what a
 /// validator signs.
+///
+/// On unix it goes through [`write_private_durably`] all the same, so a
+/// write cut partway leaves the old file or none, never a truncated one. The
+/// token is written during startup, which a shutdown signal ends at once.
+/// Off unix the file is created or truncated in place.
 #[cfg(unix)]
 pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    write_durably(file, contents)
+    write_private_durably(path, contents).map_err(|err| err.source)
 }
 
 #[cfg(not(unix))]

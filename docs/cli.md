@@ -969,6 +969,47 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
+### Stopping
+
+SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
+`Shutdown signal received`, starts no other slot, and lets the work in flight
+finish:
+
+- The slot in progress, with its proposal, gloas envelope and attestations,
+  and a signed blinded block's publish, get up to 8 s after the signal, which
+  is what Prysm's validator client waits. On a 12 s slot that covers the
+  proposal and the attestations; the aggregates, sync committee contributions
+  and payload timeliness vote due later in the slot may be cut. Cutting any of
+  it is safe: a block or attestation is recorded in slashing protection before
+  it is signed, and the rest is not slashable.
+- The keymanager API takes no new request, and one in flight gets up to 60 s
+  more, so an import is not cut between saving its keys and registering them.
+- The sends that are repeated anyway (proposer preferences, subnet
+  subscriptions, builder registrations, the fee recipient re-send) are not
+  waited for.
+
+It then logs `Shutdown complete` and exits 0. Three more signals end it at
+once, with exit code 1. Anything still running on the client's threads by
+then, such as an import the keymanager wait gave up on, gets up to 2 s more
+before the process exits; signals do nothing in those 2 s.
+
+Both signals are listened for from the moment the client starts. One sent
+during startup, while the keystores are decrypted and the beacon node is
+first asked for the chain, logs `Shutdown signal received during startup`
+and ends the process at once with exit code 0: no duty has run and the
+keymanager API has taken no request, so nothing is signed and there is
+nothing to wait for. That holds in a container too, where the client is
+PID 1 and a signal with no handler is ignored.
+
+A signal sent while the client stops on an error (an unusable
+slashing-protection record, a doppelganger) does not cut its keymanager wait
+short: it is logged, and three more end the process with exit code 1.
+
+systemd's defaults need no change: `KillSignal` is SIGTERM, and `TimeoutStopSec`
+(90 s) covers both waits. `docker stop` sends SIGTERM and waits 10 s, enough for
+the slot; with `--enable-keymanager`, pass `--stop-timeout 70` so an import in
+flight is not cut short.
+
 ### Metrics
 
 Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
