@@ -1,16 +1,22 @@
 //! `ethlambda validator`: the beacon-chain validator client.
 //!
-//! It talks to a beacon node over the standard REST Beacon API and depends on
-//! nothing else in this binary, so it runs against any conformant node.
+//! It talks to a beacon node over the standard REST Beacon API, so it runs
+//! against any conformant node. The one thing it takes from the rest of this
+//! binary is `--network`'s resolution, the same `network` module `ethlambda
+//! beacon` resolves its own `--network` with.
 
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::beacon_node::Genesis;
+use ethlambda_validator::chain_check::{ChainId, ExpectedNetwork};
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 use eyre::WrapErr as _;
+
+use crate::network::{NetworkSource, NetworkSpec};
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -26,6 +32,23 @@ pub(crate) struct ValidatorOptions {
     /// policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
+
+    /// The network every beacon node must be on: a built-in name (`mainnet`,
+    /// `sepolia`, `hoodi`, `plataberget`) or a path to a directory of
+    /// published network files, as `ethlambda beacon --network` takes.
+    ///
+    /// Optional, with no default. Without it the client runs on the chain of
+    /// the first beacon node that answers. With it, a node whose preset,
+    /// genesis, slot duration or genesis fork version differs from the
+    /// network's is never used, and startup fails when every node that
+    /// answered is on another network.
+    ///
+    /// The fork schedule still comes from the beacon nodes. One that differs
+    /// from this network's config is warned about once an epoch, never
+    /// refused, so a fork the network schedules or moves needs the beacon
+    /// nodes upgraded, not this client.
+    #[arg(long)]
+    pub(crate) network: Option<String>,
 
     /// Directory holding the EIP-2335 keystores and `validator_definitions.yml`.
     /// Without that file, keystores in the Lighthouse layout
@@ -249,6 +272,32 @@ impl ValidatorOptions {
         })
     }
 
+    /// Resolve `--network`, or `None` when it is absent.
+    ///
+    /// Must run before anything reads a preset value: resolving selects the
+    /// network's preset, as it does for `ethlambda beacon`, and the client
+    /// later refuses to start if a read froze one first
+    /// (`require_unread_preset`).
+    pub(crate) fn network(&self) -> eyre::Result<Option<ExpectedNetwork>> {
+        let Some(value) = &self.network else {
+            return Ok(None);
+        };
+        let spec = NetworkSpec::parse(value)?;
+        let source = NetworkSource::resolve(&spec)
+            .wrap_err_with(|| format!("failed to resolve --network {value}"))?;
+        let genesis = source.genesis();
+        Ok(Some(ExpectedNetwork {
+            name: source.name().to_string(),
+            chain: ChainId {
+                genesis: Genesis {
+                    genesis_time: genesis.genesis_time,
+                    genesis_validators_root: genesis.genesis_validators_root,
+                },
+                config: source.config().clone(),
+            },
+        }))
+    }
+
     /// Reject a port clash before anything binds, the way the node's own
     /// options do.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
@@ -277,6 +326,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     // with `EMFILE` once several signers are busy at once, and every
     // signature those requests were for fails with it.
     crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
+    let network = options.network()?;
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
@@ -297,6 +347,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         builder_min_bid: options.builder_min_bid,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        network,
     })
     .await
     .map_err(Into::into)
@@ -309,6 +360,7 @@ mod tests {
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
             beacon_nodes: vec!["http://localhost:5052".to_string()],
+            network: None,
             validators_dir: PathBuf::from("/tmp/validators"),
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
@@ -364,6 +416,51 @@ mod tests {
     #[test]
     fn the_gas_limit_does_not_need_builder_proposals() {
         parse(&["--gas-limit", "30000000"]).expect("parses alone");
+    }
+
+    /// Absent, the client takes its chain from the beacon nodes alone, as it
+    /// did before the flag existed.
+    #[test]
+    fn the_network_is_optional() {
+        let options = parse(&[]).expect("parses");
+        assert_eq!(options.network, None);
+        assert_eq!(options.network().expect("nothing to resolve"), None);
+
+        let options = parse(&["--network", "hoodi"]).expect("parses");
+        assert_eq!(options.network.as_deref(), Some("hoodi"));
+    }
+
+    /// A built-in network resolves to the genesis values and config the
+    /// beacon node runs it on, so the two are compared like for like.
+    #[test]
+    fn a_built_in_network_resolves_to_its_genesis_and_config() {
+        let mut options = options("");
+        options.network = Some("hoodi".to_string());
+        let network = options
+            .network()
+            .expect("hoodi resolves")
+            .expect("a network was named");
+
+        assert_eq!(network.name, "hoodi");
+        assert_eq!(network.chain.genesis.genesis_time, 1_742_213_400);
+        assert_eq!(
+            hex::encode(network.chain.genesis.genesis_validators_root.0),
+            "212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+        assert_eq!(network.chain.config.slot_duration_ms, 12_000);
+        assert_eq!(
+            network.chain.config.genesis_fork_version,
+            [0x10, 0, 0x09, 0x10]
+        );
+    }
+
+    #[test]
+    fn an_unknown_network_name_is_refused_at_startup() {
+        let mut options = options("");
+        options.network = Some("hodi".to_string());
+        let err = options.network().expect_err("no such network");
+        assert!(err.to_string().contains("unknown network"), "{err}");
     }
 
     /// Without the flag the token stays in `--validators-dir`. With it the path

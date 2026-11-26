@@ -359,6 +359,7 @@ beacon node.
 | Flag | Meaning |
 |---|---|
 | `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Each is asked whether it is syncing once a slot; the ones that said synced are tried first, then the rest, each in the order given, so the order is a preference. A slot in which every node that answered is syncing or on an optimistic head signs nothing |
+| `--network` | Optional. The network every beacon node must be on (`mainnet`, `sepolia`, `hoodi`, `plataberget`, or a network directory). A node on another network is not used; the fork schedule still comes from the beacon nodes, with a warning when it differs from the network's. Without it the client runs on the first answering node's chain |
 | `--validators-dir` | Directory of EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`) are discovered and the file is written |
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |

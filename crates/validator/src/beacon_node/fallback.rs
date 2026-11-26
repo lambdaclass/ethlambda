@@ -46,7 +46,9 @@ use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
-use crate::chain_check::{ChainId, Served, first_chain_difference};
+use crate::chain_check::{
+    ChainId, ExpectedNetwork, Served, first_chain_difference, first_identity_difference,
+};
 use crate::error::{Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
@@ -408,39 +410,76 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         &self,
         with_reference: impl FnOnce(&ChainId) -> Result<u64>,
     ) -> Result<ChainId> {
+        self.establish_on(None, with_reference).await
+    }
+
+    /// [`Self::establish`], with the chain held to the `network` the operator
+    /// named (`--network`) when there is one.
+    ///
+    /// The reference is then the first node that answers *on that network*:
+    /// no [`first_identity_difference`] from it (preset, genesis, slot
+    /// duration, genesis fork version). A node that answers on another one is
+    /// never the reference, so `with_reference` never sees its chain or
+    /// adopts its preset, and is judged against the reference like any other
+    /// node, which leaves it unusable. Its answer is as final as an
+    /// unreadable spec: when every node has answered with one or the other,
+    /// startup fails naming each, rather than waiting for a node that will
+    /// not move to another network on its own.
+    ///
+    /// The fork schedule is not held to the network's: it may differ while a
+    /// change rolls out, and is followed from the nodes as without a network
+    /// (see [`crate::chain_check::warn_if_schedule_differs`]).
+    pub async fn establish_on(
+        &self,
+        network: Option<&ExpectedNetwork>,
+        with_reference: impl FnOnce(&ChainId) -> Result<u64>,
+    ) -> Result<ChainId> {
+        // Why an answer cannot be the reference: `None` when it can.
+        let off_network = |chain: &ChainId| {
+            let network = network?;
+            first_identity_difference(&network.chain, chain)
+                .map(|difference| format!("not on {}: {difference}", network.name))
+        };
         let (reference_at, asked) = loop {
             let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
-            if let Some(reference_at) = asked.iter().position(|answer| answer.is_ok()) {
+            if let Some(reference_at) = asked.iter().position(|answer| {
+                answer
+                    .as_ref()
+                    .is_ok_and(|chain| off_network(chain).is_none())
+            }) {
                 break (reference_at, asked);
             }
             let detail = asked
                 .iter()
                 .enumerate()
-                .filter_map(|(position, answer)| {
-                    answer
-                        .as_ref()
-                        .err()
-                        .map(|err| format!("node {position}: {err}"))
+                .filter_map(|(position, answer)| match answer {
+                    Ok(chain) => off_network(chain).map(|why| format!("node {position}: {why}")),
+                    Err(err) => Some(format!("node {position}: {err}")),
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            // A node that answered with a preset this client cannot run on, or
-            // a spec it cannot read (a required key absent, say), answered:
-            // asking it again gives the same answer. Waiting is for a node
-            // that has not answered yet, and for one whose answer was not the
-            // node's at all: a body that is not JSON (`Error::Decode`), such
-            // as a proxy's maintenance page while the node boots.
-            if asked
-                .iter()
-                .all(|answer| matches!(answer, Err(Error::Preset(_) | Error::UnreadableSpec(_))))
-            {
+            // A node that answered with a preset this client cannot run on, a
+            // spec it cannot read (a required key absent, say), or a chain
+            // off the named network, answered: asking it again gives the
+            // same answer. Waiting is for a node that has not answered yet,
+            // and for one whose answer was not the node's at all: a body that
+            // is not JSON (`Error::Decode`), such as a proxy's maintenance
+            // page while the node boots. Every `Ok` here is off the network,
+            // or it would have been the reference.
+            if asked.iter().all(|answer| {
+                matches!(
+                    answer,
+                    Ok(_) | Err(Error::Preset(_) | Error::UnreadableSpec(_))
+                )
+            }) {
                 warn!(%detail, "No configured beacon node serves a chain this client can run on");
                 return Err(Error::AllBeaconNodesFailed(detail));
             }
             warn!(
                 %detail,
                 retry_in_secs = STARTUP_RETRY.as_secs(),
-                "No configured beacon node answered; waiting for one"
+                "No configured beacon node answered on a chain this client can run on; waiting \
+                 for one"
             );
             tokio::time::sleep(STARTUP_RETRY).await;
         };
