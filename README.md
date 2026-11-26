@@ -358,7 +358,7 @@ beacon node.
 
 | Flag | Meaning |
 |---|---|
-| `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in order, so the order is a preference |
+| `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Each is asked whether it is syncing once a slot; the ones that said synced are tried first, then the rest, each in the order given, so the order is a preference. A slot in which every node that answered is syncing or on an optimistic head signs nothing |
 | `--validators-dir` | Directory of EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`) are discovered and the file is written |
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
@@ -372,6 +372,20 @@ beacon node.
 Metrics are served on `--metrics-port` (default `5064`). See
 [`docs/cli.md`](./docs/cli.md#validator-flags) for the remaining flags and what
 the client does each slot.
+
+Stop the client with `Ctrl+C` or SIGTERM. Once its startup is done, either
+one stops it cleanly: it starts no other slot, gives the slot in progress and a
+blinded block's publish up to 8 s, gives a keymanager request in flight up to a
+minute more, and exits 0. Under systemd that needs no setting: SIGTERM is the
+default `KillSignal`, and the default `TimeoutStopSec` (90 s) covers both
+waits. `docker stop` sends SIGTERM to the client, which is the image's PID 1,
+and its default 10 s covers the slot; with `--enable-keymanager`, pass
+`--stop-timeout 70` so an import in flight is not cut short. A signal during
+startup, while the keystores are decrypted, ends the process at once with exit
+code 0, in a container too, since nothing is signed yet. v1.0.0 handles
+neither signal at any point: outside a container either one ends it at once,
+and inside one `docker stop` waits out its timeout and kills it. See
+[`docs/cli.md`](./docs/cli.md#stopping) for what a stop waits for.
 
 ### Running in a devnet
 

@@ -443,7 +443,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first usable node that answers serves the request (a node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check)), so the order is a preference, not load balancing |
+| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot; the ones that answered synced and not optimistic are tried first, in list order, then the rest in list order. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check) and [The per-slot sync check](#the-per-slot-sync-check) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
@@ -586,7 +586,9 @@ epoch's lookahead. When an epoch's schedule could not be fetched, the client
 asks again after each slot's duties until it has one. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
 slot, asks the node for the
 payload attestation data, signs it under the PTC domain and submits it. A `204`
-(the node knows no block for the slot) means no vote. So a gloas slot runs in
+(the node knows no block for the slot) means no vote, and so does a node whose
+last sync probe said syncing or optimistic: the data is not asked of it, so
+no vote is cast over an optimistic head. So a gloas slot runs in
 this order: propose at the boundary, attest at `ATTESTATION_DUE_BPS_GLOAS`,
 aggregate at `AGGREGATE_DUE_BPS_GLOAS`, then the committee vote. The attestation
 and the committee vote are each bounded by the end of the slot.
@@ -599,7 +601,9 @@ until the period's end, so the node joins the subnets. The next period's are
 added once its boundary is within four epochs. A member sleeps until
 `SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas), reads
 `/eth/v1/beacon/blocks/head/root`, signs it and submits one message per
-validator. It refuses to sign when the node reports the head optimistic. A
+validator. It refuses to sign when the node reports the head optimistic, and
+never reads the head from a node whose last sync probe said syncing or
+optimistic, since a syncing node answers its stale head with no flag set. A
 member selected by the selection-proof hash for a subnet then waits for
 `CONTRIBUTION_DUE_BPS` (`CONTRIBUTION_DUE_BPS_GLOAS`), fetches the node's
 contribution for that subnet and publishes it wrapped and signed. A subnet whose
@@ -610,6 +614,60 @@ slot.
 
 Voluntary exits are signed by the keymanager API's `voluntary_exit` route and
 by [`ethlambda voluntary-exit`](#voluntary-exit).
+
+### The per-slot sync check
+
+A validator must not sign against a beacon node that is syncing, whose head is
+not the network's, or one whose head is optimistic (its execution client has
+not validated the payload): the optimistic-sync specification says an
+optimistic validator must not propose, attest or take part in sync
+committees. So every slot the client asks every configured node on its chain
+(see [the chain check](#several-beacon-nodes-the-chain-check))
+`GET /eth/v1/node/syncing`, all at once, a sixth of a slot before the slot's
+boundary: 2 s on 12 s slots, as Lighthouse does. That is after the previous
+slot's last duty and leaves a healthy node time to answer, so the duty loop
+reads the answers at the boundary and never waits for one. A node gets until
+the next slot's probe to answer.
+
+- **A slot signs nothing when every node that answered is syncing or
+  optimistic**, and at least one answered: no block, attestation, aggregate,
+  sync committee message, contribution or payload timeliness vote. The epoch's
+  duty refresh, the proposer preferences poll and the builder registration
+  re-sends are skipped with the slot, and a refresh that was due runs at the
+  next slot that passes. The fee recipient re-send still goes out, since it
+  signs nothing and a node restarted while syncing must be prepared before its
+  first proposal. Each skipped slot is logged at warn and counted on
+  `ethlambda_validator_slots_skipped_syncing_total`, also by a client with no
+  keys loaded.
+- **A node that did not answer does not count as syncing.** Its duty endpoints
+  still answer `503` while it syncs, which the client reads as a node to fail
+  over from. So nodes that cannot be reached never stop the duties by
+  themselves, and only the probe taken for the slot counts: a late answer, or
+  one from an earlier slot, opens the check rather than holding it shut. A
+  node whose answer is still on its way at the boundary, and that answered
+  synced the slot before, holds the check open too, so a slow synced node does
+  not lose the slot to a fast syncing one.
+- **Requests go to the nodes that passed first**, then the rest, each group
+  in `--beacon-nodes` order. A blinded block still goes back to the node that
+  produced it.
+- **The head root and the payload attestation data are never asked of a node
+  whose last probe said syncing or optimistic, or got no answer**, even after
+  the nodes that passed have failed the request. Neither endpoint has a `503`
+  for that state: a syncing node answers its stale head, and an optimistic one
+  hands out payload data for a block its execution client has not validated.
+  So here, unlike for the slot's check, a node that did not answer is not
+  given the benefit of the doubt. With no node left to ask, the sync committee
+  message and the payload vote are not signed.
+- **`el_offline` is logged, not acted on**: a node whose execution client has
+  just gone offline still has the head it validated before, and reports itself
+  optimistic once that stops being true. A node's change of state (synced,
+  syncing, optimistic, no answer, `el_offline`) is logged once, when it
+  changes.
+- **There is no clock-based rule.** The client never skips duties because the
+  head looks old by its own clock: during a network-wide stall every head is
+  old, and clients that stop signing then keep the chain stalled. Only the
+  node's own `is_syncing` and `is_optimistic` count. `head_slot` and
+  `sync_distance` are recorded, not acted on.
 
 ### Doppelganger protection
 
@@ -914,6 +972,47 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
+
+### Stopping
+
+SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
+`Shutdown signal received`, starts no other slot, and lets the work in flight
+finish:
+
+- The slot in progress, with its proposal, gloas envelope and attestations,
+  and a signed blinded block's publish, get up to 8 s after the signal, which
+  is what Prysm's validator client waits. On a 12 s slot that covers the
+  proposal and the attestations; the aggregates, sync committee contributions
+  and payload timeliness vote due later in the slot may be cut. Cutting any of
+  it is safe: a block or attestation is recorded in slashing protection before
+  it is signed, and the rest is not slashable.
+- The keymanager API takes no new request, and one in flight gets up to 60 s
+  more, so an import is not cut between saving its keys and registering them.
+- The sends that are repeated anyway (proposer preferences, subnet
+  subscriptions, builder registrations, the fee recipient re-send) are not
+  waited for.
+
+It then logs `Shutdown complete` and exits 0. Three more signals end it at
+once, with exit code 1. Anything still running on the client's threads by
+then, such as an import the keymanager wait gave up on, gets up to 2 s more
+before the process exits; signals do nothing in those 2 s.
+
+Both signals are listened for from the moment the client starts. One sent
+during startup, while the keystores are decrypted and the beacon node is
+first asked for the chain, logs `Shutdown signal received during startup`
+and ends the process at once with exit code 0: no duty has run and the
+keymanager API has taken no request, so nothing is signed and there is
+nothing to wait for. That holds in a container too, where the client is
+PID 1 and a signal with no handler is ignored.
+
+A signal sent while the client stops on an error (an unusable
+slashing-protection record, a doppelganger) does not cut its keymanager wait
+short: it is logged, and three more end the process with exit code 1.
+
+systemd's defaults need no change: `KillSignal` is SIGTERM, and `TimeoutStopSec`
+(90 s) covers both waits. `docker stop` sends SIGTERM and waits 10 s, enough for
+the slot; with `--enable-keymanager`, pass `--stop-timeout 70` so an import in
+flight is not cut short.
 
 ### Metrics
 

@@ -13,12 +13,20 @@ pub(crate) fn store_with_keys(count: usize) -> (ValidatorStore, Vec<BlsPubkey>) 
     let mut store = ValidatorStore::new();
     let pubkeys = (0..count)
         .map(|index| {
-            let mut secret = [0u8; 32];
-            secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
-            store.insert_secret("test", &secret).expect("inserts")
+            store
+                .insert_secret("test", &small_secret(index))
+                .expect("inserts")
         })
         .collect();
     (store, pubkeys)
+}
+
+/// The secret [`store_with_keys`] gives its key `index`: `index + 1`, big
+/// endian.
+pub(crate) fn small_secret(index: usize) -> [u8; 32] {
+    let mut secret = [0u8; 32];
+    secret[24..].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+    secret
 }
 
 /// Settings with `fee_recipient` as the default one and the default graffiti.
