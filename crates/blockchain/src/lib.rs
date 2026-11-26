@@ -1,5 +1,6 @@
 use ethlambda_engine::{
-    CustodyColumns, EngineClient, EngineError, PayloadStatusV1 as EnginePayloadStatus,
+    CustodyColumns, EngineClient, EngineError, ForkchoiceStateV1,
+    PayloadStatusV1 as EnginePayloadStatus,
 };
 use ethlambda_network_api::{
     AggregateArrival, BlockAnnouncement, BlockArrival, BlockChainToP2PRef, BlockSource,
@@ -56,6 +57,7 @@ use crate::import_timing::{
     BlockImportReport, CascadeTelemetry, CascadeTimings, EngineAnswer, HeadTimings, ImportTimings,
     SpeculationOutcome,
 };
+use crate::payload_attributes::ForkchoiceSend;
 use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
@@ -3018,6 +3020,27 @@ impl BlockChainServer {
     /// by which a block imported on `SYNCING` later becomes `VALID` or is found
     /// to be `INVALID`.
     async fn notify_forkchoice_updated(&mut self) -> Option<(Instant, Instant)> {
+        self.send_forkchoice_updated(ForkchoiceSend::HeadUpdate)
+            .await
+    }
+
+    /// Every `forkchoiceUpdated` the actor sends, awaited here in turn, so
+    /// the execution client hears heads in the order fork choice chose them:
+    /// one ordered stream, as Lighthouse keeps under its
+    /// `execution_engine_forkchoice_lock`. The one head it names that is not
+    /// fork choice's own is a gloas build's on the EMPTY branch of a FULL
+    /// head (the parent payload, on purpose); block production's update,
+    /// sent from the Beacon API when it builds itself, is outside the stream.
+    ///
+    /// When the next slot's payload build is held for the current head
+    /// ([`payload_attributes`]), the update carries its attributes and the
+    /// payload id it answers goes to block production. A head update without
+    /// one sends `null` attributes; a [`ForkchoiceSend::StartBuild`] without
+    /// one sends nothing.
+    pub(crate) async fn send_forkchoice_updated(
+        &mut self,
+        send: ForkchoiceSend,
+    ) -> Option<(Instant, Instant)> {
         let client = self.engine.clone()?;
         let (_head_slot, head_root) = self.store.beacon_head()?;
 
@@ -3029,6 +3052,10 @@ impl BlockChainServer {
         let plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
         let state = plan.state;
         let gloas = plan.gloas;
+        let build = self
+            .payload_attributes
+            .build_for(head_root, self.wall_clock_slot());
+        let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
 
         // `head_root` stays valid across the await: this is a single-threaded
         // actor, so no other message is handled until this one returns. An
@@ -3039,19 +3066,89 @@ impl BlockChainServer {
         // `apply_forkchoice_verdict` recomputes the head itself rather than
         // leaving it to the next tick.
         let start = Instant::now();
-        // V4 from gloas on: it carries the custody columns the execution
-        // client must keep. The follower sends `null` attributes either way.
-        let response = if gloas {
-            let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
-            client.forkchoice_updated_v4(&state, custody).await
-        } else {
-            client.forkchoice_updated(&state).await
-        };
-        match response {
-            Ok(status) => {
-                self.apply_forkchoice_verdict(head_root, state.head_block_hash, gloas, &status)
+        let once = send == ForkchoiceSend::StartBuild;
+        match build {
+            // The head's own update, carrying the build that extends it. The
+            // attributes pick the method: V4 with gloas's, also on a fulu head
+            // at the fork.
+            Some((key, build)) if build.forkchoice.head_block_hash == state.head_block_hash => {
+                let response = payload_attributes::forkchoice_updated_with_build(
+                    &client,
+                    &state,
+                    &build.attributes,
+                    custody,
+                    once,
+                )
+                .await;
+                match response {
+                    Ok((status, payload_id)) => {
+                        self.record_build(key, &build, payload_id, &status, send);
+                        // Only a head update's: an `INVALID` verdict moves the
+                        // head, and only the head recompute that sent it
+                        // announces the move. The next head update carries
+                        // the start's verdict anyway.
+                        if send == ForkchoiceSend::HeadUpdate {
+                            self.apply_forkchoice_verdict(
+                                head_root,
+                                state.head_block_hash,
+                                gloas,
+                                &status,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(%err, ?send, "forkchoiceUpdated with payload attributes failed")
+                    }
+                }
             }
-            Err(err) => warn!(%err, "forkchoiceUpdated failed"),
+            // Gloas, building on the other branch of the head than its node
+            // names (an EMPTY build on a FULL head the PTC judged late): the
+            // build's own update, sent when it is started, with the head's
+            // safe and finalized hashes. Its verdict names a payload other
+            // than the head node's, so it is not applied; the head's own
+            // updates keep naming the head node, without the attributes, which
+            // leaves the build running.
+            Some((key, build)) if once => {
+                let build_state = ForkchoiceStateV1 {
+                    head_block_hash: build.forkchoice.head_block_hash,
+                    ..state
+                };
+                let response = payload_attributes::forkchoice_updated_with_build(
+                    &client,
+                    &build_state,
+                    &build.attributes,
+                    custody,
+                    once,
+                )
+                .await;
+                match response {
+                    Ok((status, payload_id)) => {
+                        self.record_build(key, &build, payload_id, &status, send)
+                    }
+                    Err(err) => {
+                        warn!(%err, ?send, "forkchoiceUpdated with payload attributes failed")
+                    }
+                }
+            }
+            _ if once => return None,
+            // V4 from gloas on: it carries the custody columns the execution
+            // client must keep.
+            _ => {
+                let response = if gloas {
+                    client.forkchoice_updated_v4(&state, custody).await
+                } else {
+                    client.forkchoice_updated(&state).await
+                };
+                match response {
+                    Ok(status) => self.apply_forkchoice_verdict(
+                        head_root,
+                        state.head_block_hash,
+                        gloas,
+                        &status,
+                    ),
+                    Err(err) => warn!(%err, "forkchoiceUpdated failed"),
+                }
+            }
         }
         Some((start, Instant::now()))
     }

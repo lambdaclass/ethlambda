@@ -39,7 +39,8 @@ Two method families a full client would have are deliberately absent:
   execution client to build only for a proposal of a validator client it
   serves (for every slot's proposer with `--always-prepare-payload`), so the
   `forkchoiceUpdated` calls that follow its head carry `null` payload
-  attributes. Block production for a validator client
+  attributes except in the last third of the slot before such a proposal.
+  Block production for a validator client
   (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
   `forkchoiceUpdatedV3` with `PayloadAttributesV3` then `engine_getPayloadV5`
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
@@ -47,11 +48,16 @@ Two method families a full client would have are deliberately absent:
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
   execution client does not advertise `engine_getPayloadV6`. The chain actor
-  sends that `forkchoiceUpdated` with attributes a third of a slot ahead, for
-  a proposer a validator client registered (every proposer with
-  `--always-prepare-payload`), with the same safe and finalized hashes as the
-  head's own update, and block production collects the build with
-  `getPayload`; see the `payload_attributes` event in [`rpc.md`](rpc.md).
+  starts that build a third of a slot ahead, for a proposer a validator
+  client registered (every proposer with `--always-prepare-payload`), by
+  sending its own `forkchoiceUpdated` for the head with the attributes, and
+  its later head updates before the slot carry them too, as Lighthouse's do;
+  block production collects the build with `getPayload`. See the
+  `payload_attributes` event in [`rpc.md`](rpc.md). All of the actor's
+  `forkchoiceUpdated` calls, with attributes or without, go out in order from
+  one function (`send_forkchoice_updated`), so the execution client never
+  hears a head fork choice has since replaced after its replacement (the
+  `forkchoiceUpdated` section below names the two exceptions).
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -464,6 +470,22 @@ Sent once after every head recompute, which is once per import cascade and once
 per tick, not once per block. It is sent even when nothing moved: an execution
 client doing state sync needs to keep being fed a recent head or its sync cannot
 converge.
+
+One more is sent when the next slot's payload build is prepared for a proposer
+this node serves (see the `payload_attributes` event in [`rpc.md`](rpc.md)):
+an update for the same head carrying the build's attributes, in a single
+attempt, so a stalled execution client holds the actor for at most one
+`ENGINE_TIMEOUT` (8 s) there. Until the slot, the head updates above carry the
+attributes too, through the usual retries. Every one of these goes out from
+the chain actor's `send_forkchoice_updated`, awaited in turn, so the execution
+client hears heads in the order fork choice chose them, as Lighthouse
+guarantees with its `execution_engine_forkchoice_lock`. Two exceptions: a
+gloas build on the EMPTY branch of a FULL head (the PTC judged its payload
+late) is started with the parent payload as head, on purpose, and the head
+updates after it name the FULL payload again without the attributes; and
+block production's own `forkchoiceUpdated` when it builds a payload itself is
+sent from the Beacon API, outside this stream, so it can still cross the
+actor's updates.
 
 Its three hashes come from the cached execution hash of the head, the root of
 the block the Fast Confirmation Rule last confirmed (see
