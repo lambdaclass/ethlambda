@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ed73c22b.js";
+            window.path_to_searchindex_js = "searchindex-384e4547.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1110,6 +1110,42 @@ returns the deleted keys’ records as a minimal EIP-3076 interchange, answering
 <code>not_active</code> for a key that is gone but still has a record.</p>
 <p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
 default; exposing it further means putting a TLS terminator in front.</p>
+<h3 id="stopping"><a class="header" href="#stopping">Stopping</a></h3>
+<p>SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
+<code>Shutdown signal received</code>, starts no other slot, and lets the work in flight
+finish:</p>
+<ul>
+<li>The slot in progress, with its proposal, gloas envelope and attestations,
+and a signed blinded block’s publish, get up to 8 s after the signal, which
+is what Prysm’s validator client waits. On a 12 s slot that covers the
+proposal and the attestations; the aggregates, sync committee contributions
+and payload timeliness vote due later in the slot may be cut. Cutting any of
+it is safe: a block or attestation is recorded in slashing protection before
+it is signed, and the rest is not slashable.</li>
+<li>The keymanager API takes no new request, and one in flight gets up to 60 s
+more, so an import is not cut between saving its keys and registering them.</li>
+<li>The sends that are repeated anyway (proposer preferences, subnet
+subscriptions, builder registrations, the fee recipient re-send) are not
+waited for.</li>
+</ul>
+<p>It then logs <code>Shutdown complete</code> and exits 0. Three more signals end it at
+once, with exit code 1. Anything still running on the client’s threads by
+then, such as an import the keymanager wait gave up on, gets up to 2 s more
+before the process exits; signals do nothing in those 2 s.</p>
+<p>Both signals are listened for from the moment the client starts. One sent
+during startup, while the keystores are decrypted and the beacon node is
+first asked for the chain, logs <code>Shutdown signal received during startup</code>
+and ends the process at once with exit code 0: no duty has run and the
+keymanager API has taken no request, so nothing is signed and there is
+nothing to wait for. That holds in a container too, where the client is
+PID 1 and a signal with no handler is ignored.</p>
+<p>A signal sent while the client stops on an error (an unusable
+slashing-protection record, a doppelganger) does not cut its keymanager wait
+short: it is logged, and three more end the process with exit code 1.</p>
+<p>systemd’s defaults need no change: <code>KillSignal</code> is SIGTERM, and <code>TimeoutStopSec</code>
+(90 s) covers both waits. <code>docker stop</code> sends SIGTERM and waits 10 s, enough for
+the slot; with <code>--enable-keymanager</code>, pass <code>--stop-timeout 70</code> so an import in
+flight is not cut short.</p>
 <h3 id="metrics"><a class="header" href="#metrics">Metrics</a></h3>
 <p>Served on <code>--metrics-port</code>, prefixed <code>ethlambda_validator_</code> rather than the
 <code>lean_</code> used elsewhere in this repository, since this process follows the
