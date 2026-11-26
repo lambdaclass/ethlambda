@@ -800,8 +800,18 @@ const MAX_ATTEMPTS: u8 = 3;
 pub(crate) struct PayloadAttributesPublisher {
     preparation: Option<PayloadPreparation>,
     /// The last key whose worker finished while it was current, having
-    /// published its event or found no proposer to publish it for.
+    /// started its build and published its event (or held it, with nobody
+    /// subscribed), or found no proposer to prepare for. Governs the worker,
+    /// and so the build; the event has its own record below.
     published: Option<AttributesKey>,
+    /// The event a worker computed for this key while nobody was subscribed
+    /// (with an execution client it runs for the build regardless), held for
+    /// the first re-check that finds a subscriber ([`Self::held_event`]).
+    unsent: Option<(AttributesKey, PayloadAttributesEvent)>,
+    /// The last key whose event went out, so a key's event is sent once
+    /// however many times it is computed, as when a worker runs for its build
+    /// again.
+    event_sent: Option<AttributesKey>,
     /// The key a worker is running for now. At most one runs.
     in_flight: Option<AttributesKey>,
     /// The last key a worker failed on, and how many have.
@@ -861,6 +871,52 @@ impl PayloadAttributesPublisher {
         // A key that still holds is retried on the next event that re-checks,
         // not now; one that no longer holds gives way to the current key.
         !current
+    }
+
+    /// A current worker's `event` for `key`, `listening` saying whether
+    /// anyone is subscribed. Returns it when it is to go out now: someone
+    /// listens and `key`'s event has not gone out yet. With nobody listening
+    /// it is held for [`Self::held_event`] instead, replacing any older one.
+    pub(crate) fn event_computed(
+        &mut self,
+        key: AttributesKey,
+        event: PayloadAttributesEvent,
+        listening: bool,
+    ) -> Option<PayloadAttributesEvent> {
+        if !listening {
+            self.unsent = Some((key, event));
+            return None;
+        }
+        self.unsent = None;
+        self.send_once(key, event)
+    }
+
+    /// The held event for `key`, the current key, once someone listens: what
+    /// a worker computed for the build while nobody was subscribed, and what
+    /// a node that only publishes would have computed at this re-check
+    /// instead. Taken once, and never for a key whose event already went out.
+    pub(crate) fn held_event(
+        &mut self,
+        key: AttributesKey,
+        listening: bool,
+    ) -> Option<PayloadAttributesEvent> {
+        if !listening || self.unsent.as_ref().is_none_or(|(held, _)| *held != key) {
+            return None;
+        }
+        let (_, event) = self.unsent.take()?;
+        self.send_once(key, event)
+    }
+
+    fn send_once(
+        &mut self,
+        key: AttributesKey,
+        event: PayloadAttributesEvent,
+    ) -> Option<PayloadAttributesEvent> {
+        if self.event_sent == Some(key) {
+            return None;
+        }
+        self.event_sent = Some(key);
+        Some(event)
     }
 }
 
@@ -970,6 +1026,18 @@ impl BlockChainServer {
             if self.payload_attributes.published == Some(building) {
                 self.payload_attributes.published = None;
             }
+        }
+        // A subscriber that arrived after this key's worker ran for the build
+        // (nobody listening then) gets the event now, whether or not the
+        // worker below runs.
+        let listening = self.events.has_subscribers();
+        if let Some(event) = self.payload_attributes.held_event(key, listening) {
+            debug!(
+                proposal_slot = key.proposal_slot,
+                head_root = %ShortRoot(&key.head_root.0),
+                "Publishing payload attributes computed before anyone subscribed"
+            );
+            self.events.publish_payload_attributes(event);
         }
         if !self.payload_attributes.wants(key) {
             return;
@@ -1130,7 +1198,14 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
             // the update is stopped at the slot's start or once the key
             // changes (`start_payload_build`).
             Ok(Some(NextPayload { event, build })) if current => {
-                if self.events.has_subscribers() {
+                // With nobody subscribed the event is held for the first
+                // re-check that finds a subscriber; the build starts either
+                // way.
+                let listening = self.events.has_subscribers();
+                if let Some(event) = self
+                    .payload_attributes
+                    .event_computed(key, event, listening)
+                {
                     debug!(
                         proposal_slot = key.proposal_slot,
                         head_root = %ShortRoot(&key.head_root.0),
@@ -1664,6 +1739,82 @@ mod tests {
     fn a_failure_on_a_stale_key_rechecks_at_once() {
         let mut publisher = idle_publisher();
         assert!(publisher.finish(key(10), false, false));
+    }
+
+    fn event(proposal_slot: Slot) -> PayloadAttributesEvent {
+        PayloadAttributesEvent::new(
+            ForkName::Fulu,
+            PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
+                proposer_index: 3,
+                proposal_slot,
+                parent_block_number: 9,
+                parent_block_root: H256([7; 32]),
+                parent_block_hash: H256::repeat_byte(2),
+                payload_attributes: BeaconPayloadAttributesV3 {
+                    timestamp: 12 * proposal_slot,
+                    prev_randao: H256::repeat_byte(3),
+                    suggested_fee_recipient: ExecutionAddress::repeat_byte(1),
+                    withdrawals: Vec::new(),
+                    parent_beacon_block_root: H256([7; 32]),
+                },
+            }),
+        )
+    }
+
+    /// With an execution client the worker runs for the payload build while
+    /// nobody is subscribed. A subscriber that arrives later in the window
+    /// (buildoor reconnecting, say) still gets the slot's event, from the
+    /// first re-check after it subscribed, and only once; the build is not
+    /// run again for it.
+    #[test]
+    fn an_event_computed_before_anyone_subscribed_goes_out_at_the_next_recheck() {
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(10));
+        assert!(publisher.finish(key(10), true, true));
+        assert_eq!(publisher.event_computed(key(10), event(10), false), None);
+        // The worker is done with the key: its build started.
+        assert!(!publisher.wants(key(10)));
+
+        // Still nobody listening, or the inputs moved on: nothing goes out.
+        assert_eq!(publisher.held_event(key(10), false), None);
+        let moved = AttributesKey {
+            build_on_full: Some(false),
+            ..key(10)
+        };
+        assert_eq!(publisher.held_event(moved, true), None);
+
+        // A subscriber appears: the next re-check publishes the event, once.
+        assert_eq!(publisher.held_event(key(10), true), Some(event(10)));
+        assert_eq!(publisher.held_event(key(10), true), None);
+        // A worker run again for the key (its build aborted, say) does not
+        // send it a second time.
+        assert_eq!(publisher.event_computed(key(10), event(10), true), None);
+    }
+
+    /// With a subscriber, the event goes out as soon as it is computed and is
+    /// not held; a key that comes back after another one's event went out is
+    /// published again, as a fresh computation for it would be.
+    #[test]
+    fn an_event_computed_with_a_subscriber_goes_out_at_once() {
+        let mut publisher = idle_publisher();
+        assert_eq!(
+            publisher.event_computed(key(10), event(10), true),
+            Some(event(10))
+        );
+        assert_eq!(publisher.held_event(key(10), true), None);
+
+        let other = AttributesKey {
+            build_on_full: Some(false),
+            ..key(10)
+        };
+        assert_eq!(
+            publisher.event_computed(other, event(10), true),
+            Some(event(10))
+        );
+        assert_eq!(
+            publisher.event_computed(key(10), event(10), true),
+            Some(event(10))
+        );
     }
 
     /// The build the actor starts for a fulu proposal asks for exactly what

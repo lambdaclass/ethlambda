@@ -1205,7 +1205,10 @@ Event payloads are built only while at least one client is connected, whatever
 topics that client asked for; with none, the stream costs nothing. A proposal
 on a node with an execution client is computed either way, for its build, as
 long as some validator client registered a proposer here (or
-`--always-prepare-payload` is set).
+`--always-prepare-payload` is set). Its event is then kept, and a client that
+subscribes later in the window gets it at the next re-check, as it would
+from a node that computes only for subscribers; each set of inputs' event
+is sent once.
 
 ## Metrics & Debug Server (`:5054`)
 
