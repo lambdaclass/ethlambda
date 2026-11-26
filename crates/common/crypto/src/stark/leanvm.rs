@@ -1,5 +1,5 @@
 //! Attestation proofs made and checked by leanVM in this process (bindings
-//! v0.17.0, [`LEANVM_REV`]).
+//! v0.19.0, [`LEANVM_REV`]).
 //!
 //! The PQ devnet does not run the specification's reference concatenation:
 //! its clients prove with leanVM. pq-devnet-0 did it through a separate
@@ -45,9 +45,14 @@ use crate::lean_xmss::{self, Message, PUBKEY_SIZE, SIGNATURE_SIZE};
 /// The most children one aggregate takes (leanVM's `MAX_RECURSIONS`).
 pub const MAX_CHILDREN_PER_AGGREGATE: usize = leanvm_prover::MAX_RECURSIONS;
 
+/// leanVM's own count of its STARK-breaking changes: proofs and signatures
+/// verify between two builds exactly when this is the same in both. What to
+/// compare with another client's when a proof of theirs does not verify.
+pub const PROTOCOL_VERSION: u32 = leanvm_prover::PROTOCOL_VERSION;
+
 /// The leanVM revision the workspace proves and verifies with (bindings
-/// v0.17.0). Every node of a network must run the same one.
-pub const LEANVM_REV: &str = "1e997c9927d3e7fafa2b813734f56e25d7a4da69";
+/// v0.19.0). Every node of a network must run the same one.
+pub const LEANVM_REV: &str = "351f7ae421529ce164ed747eee1f78bdeaec3e80";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -117,7 +122,8 @@ impl From<Error> for ProveError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeanVmConfig {
-    /// How many threads leanVM's prover pool runs, 0 for one per core.
+    /// How many threads leanVM's prover pool runs, 0 for one per physical
+    /// core.
     pub threads: usize,
     /// `log_inv_rate` of the proofs made, within leanVM's bounds: a higher
     /// rate gives smaller proofs that take longer to make. A proof verifies
@@ -148,7 +154,10 @@ impl LeanVmBackend {
     /// Takes about a second; call once.
     ///
     /// More threads than the machine has cores are lowered to the cores,
-    /// with a warning: leanVM would oversubscribe them.
+    /// with a warning: leanVM would oversubscribe them. Setup also picks the
+    /// prover's CPU tier (since bindings v0.18.0), so a build that leaves
+    /// some of this CPU unused says so on stderr here, not at the first
+    /// proof.
     pub fn setup(config: LeanVmConfig) -> Result<Self, Error> {
         let rate = usize::from(config.log_inv_rate);
         if !(leanvm_prover::MIN_LOG_INV_RATE..=leanvm_prover::MAX_LOG_INV_RATE).contains(&rate) {
@@ -172,6 +181,7 @@ impl LeanVmBackend {
             threads,
             log_inv_rate = config.log_inv_rate,
             leanvm_rev = LEANVM_REV,
+            protocol_version = PROTOCOL_VERSION,
             setup_ms,
             self_check_prove_ms = check.prove.as_millis() as u64,
             self_check_verify_ms = check.verify.as_millis() as u64,

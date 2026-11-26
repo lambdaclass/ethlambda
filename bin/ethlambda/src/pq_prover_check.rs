@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use ethlambda_crypto::stark::leanvm::{
-    LEANVM_REV, LeanVmBackend, LeanVmConfig, MAX_SELF_CHECK_SIGNATURES,
+    LEANVM_REV, LeanVmBackend, LeanVmConfig, MAX_SELF_CHECK_SIGNATURES, PROTOCOL_VERSION,
 };
 use ethlambda_types::beacon::config::Config;
 use eyre::WrapErr as _;
@@ -79,6 +79,7 @@ pub(crate) fn run(options: PqProverCheckOptions) -> eyre::Result<()> {
             slowest_ms,
             budget_ms,
             leanvm_rev = LEANVM_REV,
+            protocol_version = PROTOCOL_VERSION,
             "One aggregate of this size fits a seat's proving window on a 12-second slot"
         );
     } else {
@@ -87,6 +88,7 @@ pub(crate) fn run(options: PqProverCheckOptions) -> eyre::Result<()> {
             slowest_ms,
             budget_ms,
             leanvm_rev = LEANVM_REV,
+            protocol_version = PROTOCOL_VERSION,
             "One aggregate of this size does not fit a seat's proving window on a 12-second \
              slot: this host would miss its aggregates"
         );

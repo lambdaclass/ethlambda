@@ -1125,7 +1125,7 @@ Two more:
 The specification's `stark.VerifyAggregates` checks each signature at its
 statement's leaf index, and its reference implementation does (a proof is
 the signatures concatenated). The PQ devnet's clients prove with leanVM
-instead, in process from bindings v0.17.0 (`ethlambda_crypto::stark::leanvm`,
+instead, in process from bindings v0.19.0 (`ethlambda_crypto::stark::leanvm`,
 installed on any network that schedules PQ), and a leanVM proof attests only
 `(public key, message)` claims (leanEthereum/leanVM#787). So under the
 leanVM backend a proof shows each key signed the message at *some* leaf,

@@ -8,7 +8,7 @@
 //!   statement in public-key order, and verification checks each in turn. It
 //!   is what the specification's fixtures use.
 //! - **leanVM** ([`install_leanvm`]): real leanVM proofs, made and checked
-//!   in this process (bindings v0.17.0), as the PQ devnet's other clients make
+//!   in this process (bindings v0.19.0), as the PQ devnet's other clients make
 //!   them. See [`leanvm`].
 //!
 //! The two encodings are not interchangeable: a node verifies only the proofs

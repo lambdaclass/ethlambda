@@ -423,7 +423,7 @@ pub(crate) struct MainnetOptions {
     /// How many threads leanVM's in-process prover runs on, 0 for one per
     /// core. Read only on a network that schedules the PQ fork, whose
     /// attestation proofs this node makes and checks with leanVM (bindings
-    /// v0.17.0) in process.
+    /// v0.19.0) in process.
     #[arg(long, default_value_t = 0)]
     pub(crate) pq_prover_threads: usize,
 

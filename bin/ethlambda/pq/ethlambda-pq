@@ -3,9 +3,10 @@
 # <flags>`, as ethereum-package's pq branch runs it) still starts the node.
 #
 # pq-devnet-0 ran leanVM's prover as a separate `leanvm-sidecar`, which this
-# script started and supervised. leanVM bindings v0.17.0, pq-devnet-1's
-# release, removed the sidecar: the node proves in process on a network that
-# schedules the PQ fork, so this script only runs `ethlambda <flags>`.
+# script started and supervised. leanVM bindings v0.17.0 removed the sidecar:
+# the node proves in process on a network that schedules the PQ fork
+# (pq-devnet-1 runs bindings v0.19.0), so this script only runs
+# `ethlambda <flags>`.
 #
 # LEANVM_THREADS, the sidecar's thread count, is still honored: it becomes
 # `--pq-prover-threads` (0, the default: one per core). LEANVM_SIDECAR and

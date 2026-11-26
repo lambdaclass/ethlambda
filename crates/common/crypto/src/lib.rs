@@ -48,7 +48,7 @@ pub mod bls;
 /// The Beacon Chain PQ fork's leanXMSS signatures (the specification's `xmss`
 /// module), over Keccak-256. Not the XMSS of [`signature`].
 pub mod lean_xmss;
-/// leanVM's own leanXMSS (bindings v0.17.0): what a validator signs with and
+/// leanVM's own leanXMSS (bindings v0.19.0): what a validator signs with and
 /// what [`lean_xmss::verify`] runs, re-exported so a signer depends on one pin.
 pub use leanvm_lean_xmss;
 mod metrics;

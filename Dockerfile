@@ -100,7 +100,7 @@ LABEL org.opencontainers.image.version=$VERSION
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
 # pq-devnet-0's launcher name, `ethlambda-pq beacon <flags>`, kept for
-# launchers that still use it. leanVM bindings v0.17.0 proves in the node, so
+# launchers that still use it. Since bindings v0.17.0 leanVM proves in the node, so
 # there is no sidecar to start: the script only runs `ethlambda`. The leanVM
 # revision the node proves with is the one in `leanvm-revision`.
 COPY --chmod=755 bin/ethlambda/pq/ethlambda-pq /usr/local/bin/ethlambda-pq

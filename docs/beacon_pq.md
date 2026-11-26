@@ -54,7 +54,7 @@ changes.
 | Layer | Where | Status |
 | --- | --- | --- |
 | leanXMSS sign/verify | `ethlambda_crypto::lean_xmss` | KAT-pinned against consensus-specs and leanVM |
-| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs made in process (bindings v0.17.0) on a network that schedules PQ (see [Proofs](#proofs)) |
+| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs made in process (bindings v0.19.0) on a network that schedules PQ (see [Proofs](#proofs)) |
 | Containers | `ethlambda_types::beacon::containers::{eip8483, pq}` | SSZ round trips, gaps per the spec; the maximal aggregate, attester slashing and bid encode to `pq.yaml`'s size bounds |
 | Fork upgrades | `upgrade::{upgrade_to_eip8483, upgrade_to_pq}` | unit-tested |
 | Block processing | `stf::{eip8483, pq}` | unit-tested with real XMSS keys |
@@ -149,8 +149,8 @@ proofs through one of two backends, chosen once per process:
   about 436 signatures per block. The specification's fixtures use it, and so
   does any process that never installs leanVM.
 - **leanVM** (`stark::install_leanvm`, `stark::leanvm`): real leanVM proofs,
-  made and checked in this process by `lean_vm` at `1e997c99` (bindings
-  v0.17.0, `leanvm::LEANVM_REV`), the one release pq-devnet-1 runs for its
+  made and checked in this process by `lean_vm` at `351f7ae4` (bindings
+  v0.19.0, `leanvm::LEANVM_REV`), the one release pq-devnet-1 runs for its
   signer, prover and verifier. A statement list maps to leanVM claims as
   Lighthouse maps it: the sorted, deduplicated `(public key, message)` pairs,
   the empty proof for no claims, and merges folded sixteen children
@@ -480,7 +480,7 @@ asks for again.
 ethpandaops/ethereum-package's `pq` branch runs PQ-at-genesis devnets with
 ethlambda as beacon node, validator client or both. This branch targets
 pq-devnet-1 (`notes.ethereum.org/@ethpandaops/pq-devnet-1`): consensus-specs
-`pq` at `4c296784` and leanVM bindings v0.17.0, which every client must run,
+`pq` at `4c296784` and leanVM bindings v0.19.0, which every client must run,
 since proofs from another revision do not verify. The example below names
 pq-devnet-0's images for the other clients; swap in their pq-devnet-1 images
 once published (the notes list them as TBD). Build the image from the

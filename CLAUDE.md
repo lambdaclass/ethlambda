@@ -303,7 +303,7 @@ actual_slot = finalized_slot + 1 + relative_index
   consensus-specs' and leanVM's known answers), and proves many signatures at
   once through `ethlambda_crypto::stark`: the specification's reference (the
   signatures concatenated), or real leanVM proofs made in process
-  (`stark::leanvm`, leanVM `1e997c99`, bindings v0.17.0, the one release
+  (`stark::leanvm`, leanVM `351f7ae4`, bindings v0.19.0, the one release
   pq-devnet-1 runs for signer, prover and verifier; `lean_vm` with its
   experimental prover). `run_node` installs leanVM as soon
   as `--network` resolves to a network that schedules PQ, on
