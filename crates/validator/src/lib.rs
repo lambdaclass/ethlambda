@@ -180,6 +180,9 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// `--broadcast`: the signed messages sent to every beacon node rather
+    /// than the first that accepts them. See [`beacon_node::fallback`].
+    pub broadcast: beacon_node::fallback::Broadcast,
     /// Read the beacon nodes' event streams, so attestations and sync
     /// committee messages go out when the slot's block arrives and payload
     /// votes when its payload does, rather than only at their deadlines. See
@@ -318,7 +321,7 @@ where
         .iter()
         .map(HttpBeaconNode::new)
         .collect::<Result<Vec<_>>>()?;
-    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
+    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes).with_broadcast(config.broadcast));
 
     // The chain the client runs on is the first node's that answers, waiting
     // for one while none does; every other node is checked against it, and a

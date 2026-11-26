@@ -82,6 +82,17 @@ pub struct MockBeaconNode {
     pub sync_status_override: Mutex<Option<SyncStatus>>,
     /// How long `sync_status` takes before it answers, as a hung node would.
     pub sync_status_delay: Option<std::time::Duration>,
+    /// When set, a node that takes the request and never answers, as the HTTP
+    /// client sees one: each call that checks it ([`Self::stall`]) waits this
+    /// long, the request timeout, and then fails as a timeout. Settable while
+    /// a test runs, so a hung node can come back. See [`Self::set_hang`].
+    pub hang: Mutex<Option<std::time::Duration>>,
+    /// The method of every call made while [`Self::hang`] was set, recorded
+    /// on entry.
+    pub hung_calls: Mutex<Vec<&'static str>>,
+    /// When set, a node that answers every call that checks [`Self::hang`],
+    /// but this much later: slower than its peers, not hung.
+    pub slow: Option<std::time::Duration>,
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
@@ -648,6 +659,57 @@ impl MockBeaconNode {
         self
     }
 
+    /// Hang every call that checks [`Self::hang`] for `timeout`, then fail it
+    /// as a timeout, as a node that accepts the request and never answers.
+    pub fn with_hang(self, timeout: std::time::Duration) -> Self {
+        self.set_hang(Some(timeout));
+        self
+    }
+
+    /// Start or stop hanging: `None` is a node that answers again.
+    pub fn set_hang(&self, timeout: Option<std::time::Duration>) {
+        *self.hang.lock().expect("lock") = timeout;
+    }
+
+    /// Answer every call that checks [`Self::hang`] `delay` late, as a node
+    /// that is slower than its peers but answers.
+    pub fn with_slow_answers(mut self, delay: std::time::Duration) -> Self {
+        self.slow = Some(delay);
+        self
+    }
+
+    /// How many calls to `what` were made while the node hung.
+    pub fn hung_calls_to(&self, what: &str) -> usize {
+        self.hung_calls
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|called| **called == what)
+            .count()
+    }
+
+    /// For a call that checks it: when the node hangs, wait out the timeout
+    /// and fail as the HTTP client fails a request that got no answer. Checked
+    /// by `sync_status`, `attestation_data`, `publish_block`,
+    /// `submit_attestations` and `publish_execution_payload_envelope`, which
+    /// all also wait out [`Self::slow`] first.
+    async fn stall(&self, what: &'static str) -> Result<()> {
+        if let Some(delay) = self.slow {
+            tokio::time::sleep(delay).await;
+        }
+        let hang = *self.hang.lock().expect("lock");
+        let Some(timeout) = hang else {
+            return Ok(());
+        };
+        self.hung_calls.lock().expect("lock").push(what);
+        tokio::time::sleep(timeout).await;
+        Err(Error::BeaconNode {
+            url: "mock".to_string(),
+            failure: BeaconNodeFailure::Timeout,
+            detail: format!("{what}: no answer within {} ms", timeout.as_millis()),
+        })
+    }
+
     /// Report `status` from now on, whatever `syncing` and `optimistic` say:
     /// the node went optimistic, say, after a test's first probe.
     pub fn set_sync_status(&self, status: SyncStatus) {
@@ -1076,6 +1138,7 @@ impl BeaconNodeApi for MockBeaconNode {
         if let Some(delay) = self.sync_status_delay {
             tokio::time::sleep(delay).await;
         }
+        self.stall("sync_status").await?;
         self.guard("is_syncing")?;
         Ok(self.current_status())
     }
@@ -1127,6 +1190,7 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
+        self.stall("attestation_data").await?;
         self.guard("attestation_data")?;
         *self.attestation_data_calls.lock().expect("lock") += 1;
         self.delay_first_call("attestation_data").await;
@@ -1224,6 +1288,7 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
+        self.stall("publish_block").await?;
         self.guard("publish_block")?;
         self.published_blocks
             .lock()
@@ -1356,6 +1421,7 @@ impl BeaconNodeApi for MockBeaconNode {
         body: &[u8],
         blob_data_included: bool,
     ) -> Result<()> {
+        self.stall("publish_execution_payload_envelope").await?;
         self.guard("publish_execution_payload_envelope")?;
         self.envelope_publish_entered.notify_one();
         if let Some(gate) = &self.envelope_publish_gate {
@@ -1423,6 +1489,7 @@ impl BeaconNodeApi for MockBeaconNode {
         attestations: &[SingleAttestationDto],
         fork_name: &str,
     ) -> Result<usize> {
+        self.stall("submit_attestations").await?;
         self.guard("submit_attestations")?;
         self.submitted
             .lock()

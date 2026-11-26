@@ -706,6 +706,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             pubkey,
             fork,
             block_root,
+            producer,
             payload,
             builder_index,
             body,
@@ -723,8 +724,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             // Logged and counted rather than propagated. The block is out and
             // the proposal did happen; what failed is the reveal, which has its
             // own series because it is the failure that costs the payload.
-            let reveal =
-                self.publish_envelope(slot, validator, &pubkey, block_root, payload, store);
+            let reveal = self.publish_envelope(
+                slot, validator, &pubkey, block_root, producer, payload, store,
+            );
             let _ = before(deadline, slot, reveal)
                 .await
                 .inspect(|()| crate::metrics::inc_envelopes_published())
@@ -756,12 +758,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// be for this block and this self-build before it is signed: the signature
     /// covers the envelope as it stands, so one for another block would be a
     /// valid signature on the wrong payload.
+    ///
+    /// `producer` is the node that built the block, which the fallback sends
+    /// the envelope to first under `--broadcast blocks`.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_envelope(
         &self,
         slot: Slot,
         validator: u64,
         pubkey: &BlsPubkey,
         block_root: Root,
+        producer: Producer,
         payload: Option<GloasPayload>,
         store: &RwLock<ValidatorStore>,
     ) -> Result<()> {
@@ -797,8 +804,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             Some(payload) => payload.into_signed_contents_ssz(signature),
             None => signed_envelope_ssz(envelope, signature),
         };
+        // Signed once, above; under `--broadcast blocks` the same body goes to
+        // every node, the block's producer first.
         self.beacon_node
-            .publish_execution_payload_envelope(&body, included)
+            .publish_execution_payload_envelope_produced_by(producer, &body, included)
             .await?;
         info!(%slot, validator, bytes = body.len(), blob_data_included = included, "Envelope published");
         Ok(())
