@@ -53,6 +53,7 @@ mod scale_tests;
 pub mod secure_fs;
 pub mod shared_config;
 pub mod signing;
+pub mod slashed;
 pub mod slashing_protection;
 pub mod slot_clock;
 pub mod subscriptions;
@@ -96,6 +97,7 @@ pub(crate) fn require_unread_preset() -> Result<()> {
         .map_err(|err| Error::Preset(err.to_string()))
 }
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -198,6 +200,10 @@ pub struct ValidatorConfig {
     /// that combines their signatures: aggregation is decided by the
     /// combined selection proofs it returns. See [`distributed`].
     pub distributed: bool,
+    /// Stop the client when the chain reports a loaded key slashed, rather
+    /// than only dropping that key's proposer, attester and attestation
+    /// aggregation duties. See [`slashed`].
+    pub shut_down_when_slashed: bool,
     /// Read the beacon nodes' event streams, so attestations and sync
     /// committee messages go out when the slot's block arrives and payload
     /// votes when its payload does, rather than only at their deadlines. See
@@ -439,6 +445,9 @@ where
     if config.distributed {
         context = context.with_distributed();
     }
+    context = context.with_slashed(slashed::SlashedValidators::new(
+        config.shut_down_when_slashed,
+    ));
     let context = Arc::new(context);
     let distributed = config.distributed.then(|| {
         Arc::new(distributed::Distributed::new(
@@ -769,6 +778,9 @@ where
                     &mut resolved,
                     &mut node_syncing,
                 );
+                // A refresh that found a key slashed and then failed partway
+                // keeps the entries of the last full one, which predate it.
+                resolved = mark_slashed(&resolved, context.slashed());
                 match settled {
                     Ok(settled) => owed = settled,
                     Err(err) => return Err(err),
@@ -799,7 +811,7 @@ where
             let readmission = (readmitted && last_epoch.is_some() && owed.is_none()).then(|| {
                 let registrable = resolved
                     .iter()
-                    .filter(|entry| is_registrable(&entry.status))
+                    .filter(|entry| is_registrable(entry))
                     .map(|entry| entry.pubkey)
                     .collect::<Vec<_>>();
                 (registrable, sync_subscriptions_owed(&duties, epoch))
@@ -984,6 +996,8 @@ where
                     &mut resolved,
                     &mut node_syncing,
                 );
+                // As for a refresh run ahead of the block.
+                resolved = mark_slashed(&resolved, context.slashed());
                 match settled {
                     Ok(Some(owed)) => {
                         report_refreshed(&health, &duties, epoch, resolved.len());
@@ -1812,13 +1826,11 @@ fn settle_refresh(
             warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
             Ok(None)
         }
-        // Unreachable today: every error `refresh_epoch` can produce comes
-        // from a `BeaconNodeApi` call or its deadline, and every variant those
-        // raise is classified retryable (see `Error::is_retryable`). Kept
-        // rather than deleted, since it is the only thing that would stop the
-        // process if a future non-retryable failure (a local config or key
-        // problem, say) ever reached this point; do not remove it as
-        // unreachable dead code.
+        // A slashed key under `--shut-down-when-slashed`, whose reason
+        // `slashed` has already logged. Every other error `refresh_epoch` can
+        // produce comes from a `BeaconNodeApi` call or its deadline, and every
+        // variant those raise is classified retryable (see
+        // `Error::is_retryable`).
         Err(err) => {
             error!(%epoch, %err, "Cannot refresh duties; stopping");
             Err(err)
@@ -2013,6 +2025,11 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // would otherwise keep asking for validators whose keys were all deleted.
     if pubkeys.is_empty() {
         duties.set_indices(Vec::new());
+        // No key loaded is no key slashed: forgets any that keymanager
+        // deletes took out, in the duties service too, so a key imported
+        // again before the next refresh is not withheld there alone.
+        context.slashed().observe(&[])?;
+        duties.set_slashed(context.slashed().indices());
         return Ok(Refreshed::default());
     }
 
@@ -2035,6 +2052,19 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // a single log line from whenever it first happened.
     metrics::set_validators_resolved(indices.len() as u64);
     duties.set_indices(indices);
+    // Before anything is fetched or sent for the epoch, so a key found slashed
+    // has no duty, preparation or registration from here on, and
+    // `--shut-down-when-slashed` stops the client ahead of all of them. Only
+    // the keys asked for: a node that answers for more must not have this
+    // client report, or stop over, a validator it does not hold.
+    let asked: HashSet<&BlsPubkey> = pubkeys.iter().collect();
+    let held: Vec<ValidatorEntry> = entries
+        .iter()
+        .filter(|entry| asked.contains(&entry.pubkey))
+        .cloned()
+        .collect();
+    context.slashed().observe(&held)?;
+    duties.set_slashed(context.slashed().indices());
 
     // Sent here, with the epoch's duties, and then again every slot by the
     // duty loop (see `Preparations`). Ahead of a block only on the refresh the
@@ -2060,7 +2090,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
+    let registrable = entries.iter().filter(|entry| is_registrable(entry));
     Ok(Refreshed {
         // Taken here, after the last await, rather than from
         // `refresh_around`'s answer: a refresh abandoned after that answer
@@ -2090,13 +2120,15 @@ async fn prepare_proposers<B: BeaconNodeApi>(
 /// default, as `settings` names it now.
 ///
 /// A validator with neither is left out: there is nothing to tell the node,
-/// which then picks an address itself, as the startup warning says.
+/// which then picks an address itself, as the startup warning says. So is a
+/// slashed one, whose block the chain would refuse (see [`slashed`]).
 fn preparations<'a>(
     entries: impl IntoIterator<Item = &'a ValidatorEntry>,
     settings: &ProposerSettings,
 ) -> Vec<ProposerPreparationDto> {
     entries
         .into_iter()
+        .filter(|entry| !entry.slashed)
         .filter_map(|entry| {
             let fee_recipient = settings.fee_recipient(&entry.pubkey)?;
             Some(ProposerPreparationDto {
@@ -2244,9 +2276,9 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
     }
 }
 
-/// Whether a validator whose Beacon API `status` is this one is sent a builder
-/// registration: one that is pending or active, not one that exited or was
-/// withdrawn.
+/// Whether a validator is sent a builder registration: one that is pending or
+/// active, not one that exited or was withdrawn, and not one the chain reports
+/// slashed.
 ///
 /// The flashbots relay refuses a whole registration request over one key it
 /// does not know, and it knows only pending and active validators, so one
@@ -2254,8 +2286,30 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
 /// [`beacon_node::REGISTRATION_BATCH`]. Teku's validator client leaves exited
 /// keys out the same way, and Lighthouse's beacon node drops them before
 /// forwarding; a node that forwards as it gets would otherwise pass them on.
-fn is_registrable(status: &str) -> bool {
-    status.starts_with("pending") || status.starts_with("active")
+///
+/// The relay would take a slashed one, which is still active until it exits,
+/// but its block would be refused, so there is nothing to register it for
+/// (see [`slashed`]).
+fn is_registrable(entry: &ValidatorEntry) -> bool {
+    let status = entry.status.as_str();
+    !entry.slashed && (status.starts_with("pending") || status.starts_with("active"))
+}
+
+/// `resolved` with every key `slashed` holds marked slashed, or `resolved`
+/// itself when it already says so for each of them.
+fn mark_slashed(
+    resolved: &Arc<Vec<ValidatorEntry>>,
+    slashed: &slashed::SlashedValidators,
+) -> Arc<Vec<ValidatorEntry>> {
+    let found = |entry: &ValidatorEntry| !entry.slashed && slashed.contains(&entry.pubkey);
+    if !resolved.iter().any(found) {
+        return resolved.clone();
+    }
+    let marked = resolved.iter().map(|entry| ValidatorEntry {
+        slashed: entry.slashed || found(entry),
+        ..entry.clone()
+    });
+    Arc::new(marked.collect())
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -2437,11 +2491,13 @@ mod tests {
                 index: 11,
                 pubkey: pubkey(1),
                 status: "active_ongoing".to_string(),
+                slashed: false,
             },
             ValidatorEntry {
                 index: 22,
                 pubkey: pubkey(2),
                 status: "active_ongoing".to_string(),
+                slashed: false,
             },
         ];
         node
@@ -2792,8 +2848,9 @@ mod tests {
 
     /// Only pending and active validators get a builder registration: the
     /// flashbots relay refuses a whole batch over one key it does not know, and
-    /// it knows no exited or withdrawn one. Proposer preparations still go to
-    /// every resolved validator.
+    /// it knows no exited or withdrawn one. Nor does a slashed one, whose block
+    /// would be refused. Proposer preparations still go to every resolved
+    /// validator but the slashed one.
     #[tokio::test]
     async fn only_pending_and_active_validators_are_registered() {
         let mut node = node();
@@ -2802,23 +2859,28 @@ mod tests {
             index: 33,
             pubkey: pubkey(3),
             status: "pending_queued".to_string(),
+            slashed: false,
         });
         node.validators.push(ValidatorEntry {
             index: 44,
             pubkey: pubkey(4),
             status: "withdrawal_done".to_string(),
+            slashed: false,
         });
-        // Exiting and slashed are still active: the relay loads validators
-        // with `status=active,pending`, which takes in both.
+        // Exiting is still active: the relay loads validators with
+        // `status=active,pending`, which takes it in. So is slashed, but
+        // that one is left out all the same.
         node.validators.push(ValidatorEntry {
             index: 55,
             pubkey: pubkey(5),
             status: "active_exiting".to_string(),
+            slashed: false,
         });
         node.validators.push(ValidatorEntry {
             index: 66,
             pubkey: pubkey(6),
             status: "active_slashed".to_string(),
+            slashed: true,
         });
         let node = Arc::new(node);
         let mut duties = DutiesService::new(node.clone(), Vec::new());
@@ -2837,11 +2899,8 @@ mod tests {
                 .await
                 .expect("refreshes");
 
-        assert_eq!(
-            registrable,
-            vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]
-        );
-        assert_eq!(node.preparations().len(), 6);
+        assert_eq!(registrable, vec![pubkey(1), pubkey(3), pubkey(5)]);
+        assert_eq!(node.preparations().len(), 5);
     }
 
     /// With nothing resolved there is nobody to register, and an empty array

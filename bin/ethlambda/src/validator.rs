@@ -245,6 +245,19 @@ pub(crate) struct ValidatorOptions {
         conflicts_with = "enable_doppelganger_protection"
     )]
     pub(crate) distributed: bool,
+    /// Stop when the chain reports one of the loaded validators slashed, and
+    /// exit with code 3, which a supervisor should be told not to restart on
+    /// (systemd: `RestartPreventExitStatus=3`).
+    ///
+    /// Without it a slashed key is logged at error, counted in
+    /// `ethlambda_validator_validators_slashed` and given no more proposer,
+    /// attester or attestation aggregation duties (its sync committee duties
+    /// go on), while the other keys go on. A slashing usually means the setup
+    /// is broken (a key running in a second place, slashing protection
+    /// bypassed, a leaked key), and the keys that share it are next: do not
+    /// restart until the cause is found.
+    #[arg(long, default_value = "false")]
+    pub(crate) shut_down_when_slashed: bool,
     /// Read no beacon node's event stream: every attestation and sync
     /// committee message waits for its offset into the slot, and every
     /// payload timeliness committee vote for its deadline, even when the
@@ -338,6 +351,36 @@ impl ValidatorOptions {
     }
 }
 
+/// Run the client until it stops, and exit with the code its reason has, when
+/// it has one of its own.
+///
+/// Only a slashed key under `--shut-down-when-slashed` has one (see
+/// [`exit_code`]). Any other failure is returned, for `main` to report and
+/// exit with 1, as every sub-command's is.
+pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+    let stopped = run_on_own_runtime(options);
+    if let Err(err) = &stopped
+        && let Some(code) = exit_code(err)
+    {
+        // Reported as `main` would report it, since `exit` never returns to
+        // `main`. The runtime is already shut down by now.
+        eprintln!("Error: {err:?}");
+        std::process::exit(code);
+    }
+    stopped
+}
+
+/// The exit code `err` stops the process with, when it has one other than
+/// the 1 every failure exits with: [`ethlambda_validator::slashed::EXIT_CODE`]
+/// for a slashed key under `--shut-down-when-slashed`.
+fn exit_code(err: &eyre::Report) -> Option<i32> {
+    let slashed = matches!(
+        err.downcast_ref::<ethlambda_validator::Error>(),
+        Some(ethlambda_validator::Error::ValidatorSlashed { .. })
+    );
+    slashed.then_some(ethlambda_validator::slashed::EXIT_CODE)
+}
+
 /// Boot its own tokio runtime and run until the process is stopped.
 ///
 /// `main` stays synchronous, the same way it does for the `node` sub-command:
@@ -352,7 +395,7 @@ impl ValidatorOptions {
 ///
 /// The runtime is built here rather than by `#[tokio::main]` so its teardown
 /// is bounded (see [`RUNTIME_SHUTDOWN`]).
-pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+fn run_on_own_runtime(options: ValidatorOptions) -> eyre::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -376,7 +419,7 @@ pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
 /// place, and that write takes milliseconds when the disk answers.
 const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// [`run`]'s body, on the runtime it builds.
+/// [`run_on_own_runtime`]'s body, on the runtime it builds.
 async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // First, so that no point of startup leaves a signal its default action,
     // which for a container's PID 1 is to be ignored.
@@ -421,6 +464,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         doppelganger_protection: options.enable_doppelganger_protection,
         broadcast: options.broadcast.into_iter().collect(),
         distributed: options.distributed,
+        shut_down_when_slashed: options.shut_down_when_slashed,
         event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, || stop.start())
@@ -571,6 +615,7 @@ mod tests {
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
             distributed: false,
+            shut_down_when_slashed: false,
             disable_event_stream: false,
         }
     }
@@ -692,6 +737,37 @@ mod tests {
         assert!(!parse(&[]).expect("parses").distributed);
         assert!(parse(&["--distributed"]).expect("parses").distributed);
         assert!(parse(&["--distributed", "--enable-doppelganger-protection"]).is_err());
+    }
+
+    /// Opt-in, as Teku's `--shut-down-when-validator-slashed-enabled` is:
+    /// without it a slashed key stops proposing and attesting and the others
+    /// go on.
+    #[test]
+    fn stopping_when_slashed_is_off_unless_asked_for() {
+        assert!(!parse(&[]).expect("parses").shut_down_when_slashed);
+        let options = parse(&["--shut-down-when-slashed"]).expect("parses");
+        assert!(options.shut_down_when_slashed);
+    }
+
+    /// The stop `--shut-down-when-slashed` makes exits with its own code, the
+    /// one `--help` and `docs/cli.md` name, and no other failure does: a
+    /// supervisor told not to restart on it must still restart on those.
+    #[test]
+    fn a_slashed_stop_exits_with_its_own_code() {
+        use ethlambda_validator::Error;
+        use ethlambda_validator::slashed::EXIT_CODE;
+
+        assert_eq!(EXIT_CODE, 3, "--help and docs/cli.md name 3");
+        let slashed = eyre::Report::from(Error::ValidatorSlashed {
+            validators: vec![22],
+        });
+        assert_eq!(exit_code(&slashed), Some(EXIT_CODE));
+
+        let detected = eyre::Report::from(Error::DoppelgangerDetected {
+            validators: vec![22],
+        });
+        assert_eq!(exit_code(&detected), None);
+        assert_eq!(exit_code(&eyre::eyre!("any other failure")), None);
     }
 
     /// Nothing is broadcast unless asked for, as in Lighthouse; topics are

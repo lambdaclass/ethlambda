@@ -484,6 +484,7 @@ mod tests {
             index: 11,
             pubkey: BlsPubkey([1; 48]),
             status: "active_ongoing".to_string(),
+            slashed: false,
         }];
         let beacon_node = Arc::new(FallbackBeaconNode::new(vec![node]));
         let health = ClientHealth::new(1, store_of(1));

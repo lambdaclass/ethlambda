@@ -31,6 +31,12 @@
 //! either. Whether an epoch is a gloas one is the caller's to decide, since
 //! this service holds no fork schedule, and so is holding off the gloas fork
 //! epoch's until the fork, before which a node cannot know them.
+//!
+//! A validator the chain reports slashed keeps its attester and proposer
+//! duties in their maps, as fetched, and no accessor hands them out; its sync
+//! committee and payload timeliness committee duties are handed out as usual,
+//! since the chain still counts them (see [`DutiesService::set_slashed`] and
+//! [`crate::slashed`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -126,6 +132,9 @@ pub struct DutiesService<B> {
     /// with no `dependent_root` because the endpoint sends none: the committee
     /// is fixed a period ahead, so each refresh simply replaces what is held.
     sync: HashMap<u64, Vec<SyncDutyDto>>,
+    /// Validators the chain reports slashed, whose attester and proposer
+    /// duties no accessor hands out. See [`Self::set_slashed`].
+    slashed: HashSet<ValidatorIndex>,
     /// How many times `indices` has gained a validator it did not hold
     /// before. Stamped on each schedule fetched (see
     /// [`EpochDuties::indices_seen`]). A set that only shrank does not count:
@@ -160,11 +169,33 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             proposers: HashMap::new(),
             ptc: HashMap::new(),
             sync: HashMap::new(),
+            slashed: HashSet::new(),
             indices_grown: 0,
             attesters_moved: false,
             followed: HashMap::new(),
             warned_no_indices: false,
         }
+    }
+
+    /// Hand out no attester or proposer duty of the validators in `slashed`
+    /// from now on, the schedules already held included, and every duty of
+    /// any other. Their sync committee and payload timeliness committee
+    /// duties are still handed out: the chain counts a slashed member's
+    /// signature in both (see [`crate::slashed`]).
+    ///
+    /// Applied when the duties are read rather than when they are fetched:
+    /// a schedule is kept until its dependent root moves, so the one held when
+    /// a slashing is first seen (this epoch's, fetched as last epoch's
+    /// lookahead) would otherwise keep the key attesting for the rest of the
+    /// epoch. Each epoch refresh replaces the set.
+    pub fn set_slashed(&mut self, slashed: HashSet<ValidatorIndex>) {
+        self.slashed = slashed;
+    }
+
+    /// Whether `index`'s duties are handed out: not when the chain reports
+    /// its validator slashed.
+    fn serves(&self, index: ValidatorIndex) -> bool {
+        !self.slashed.contains(&index)
     }
 
     pub fn set_indices(&mut self, indices: Vec<ValidatorIndex>) {
@@ -317,6 +348,16 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             tracing::debug!(%epoch, "No proposer duties this epoch");
         } else {
             for duty in &mine {
+                if !self.serves(duty.validator_index) {
+                    warn!(
+                        slot = duty.slot,
+                        validator = duty.validator_index,
+                        %epoch,
+                        "Not proposing: the validator is slashed, and the chain refuses a block \
+                         from a slashed proposer"
+                    );
+                    continue;
+                }
                 info!(
                     slot = duty.slot,
                     validator = duty.validator_index,
@@ -542,17 +583,18 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .unwrap_or_default()
     }
 
-    /// This client's proposer duty for `slot`, if it has one.
+    /// This client's proposer duty for `slot`, if it has one and its
+    /// validator is not slashed (see [`Self::set_slashed`]).
     ///
-    /// At most one, and not because of any filtering here: a slot has exactly
-    /// one proposer, so two entries would mean the beacon node contradicted
+    /// At most one, and not because of that filter: a slot has exactly one
+    /// proposer, so two entries would mean the beacon node contradicted
     /// itself.
     pub fn proposer_at_slot(&self, slot: Slot, epoch: Epoch) -> Option<&ProposerDutyDto> {
         self.proposers
             .get(&epoch)?
             .duties
             .iter()
-            .find(|duty| duty.slot == slot)
+            .find(|duty| duty.slot == slot && self.serves(duty.validator_index))
     }
 
     /// Refresh the current epoch and the one after it, and forget anything
@@ -629,7 +671,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .map(|held| {
                 held.duties
                     .iter()
-                    .filter(|duty| duty.slot == slot)
+                    .filter(|duty| duty.slot == slot && self.serves(duty.validator_index))
                     .cloned()
                     .collect()
             })
@@ -640,7 +682,9 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     pub fn all(&self) -> Vec<AttesterDutyDto> {
         self.by_epoch
             .values()
-            .flat_map(|held| held.duties.iter().cloned())
+            .flat_map(|held| held.duties.iter())
+            .filter(|duty| self.serves(duty.validator_index))
+            .cloned()
             .collect()
     }
 }
@@ -1501,5 +1545,64 @@ mod tests {
         let mut service = DutiesService::new(node.clone(), Vec::new());
         service.refresh_ptc(12).await.expect("idles");
         assert_eq!(node.ptc_call_count(), 0);
+    }
+
+    /// The validator index of each duty, in order.
+    fn indices<T>(duties: &[T], index: impl Fn(&T) -> ValidatorIndex) -> Vec<ValidatorIndex> {
+        duties.iter().map(index).collect()
+    }
+
+    /// A validator found slashed after its schedules were fetched gets none of
+    /// the attester and proposer duties already held, the lookahead epoch's
+    /// included, and nothing is fetched again for it: a refresh whose
+    /// dependent roots have not moved keeps what it holds, so this is the case
+    /// a filter on arrival misses. Its sync committee and payload timeliness
+    /// duties go on, every other validator keeps all of its duties, and the
+    /// slashed one gets its back once the set no longer names it.
+    #[tokio::test]
+    async fn a_slashed_validators_held_attester_and_proposer_duties_are_not_handed_out() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(1), vec![duty(11, 96, 2), duty(22, 96, 3)])
+                .with_duties(4, root(2), vec![duty(11, 130, 2), duty(22, 131, 3)])
+                .with_proposers(3, root(1), vec![proposer(11, 97), proposer(22, 98)])
+                .with_ptc_duties(3, root(1), vec![ptc_duty(11, 99), ptc_duty(22, 99)])
+                .with_sync_duties(0, vec![sync_duty(11, vec![1]), sync_duty(22, vec![2])]),
+        );
+        let mut service = DutiesService::new(node.clone(), vec![11, 22]);
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("refreshes");
+        service.refresh_ptc(3).await.expect("refreshes");
+        service.refresh_sync(0).await.expect("refreshes");
+        let fetched = node.duties_call_count();
+
+        service.set_slashed(HashSet::from([22]));
+
+        let attester = |duty: &AttesterDutyDto| duty.validator_index;
+        assert_eq!(indices(&service.at_slot(96, 3), attester), [11]);
+        assert!(service.at_slot(131, 4).is_empty(), "the lookahead's too");
+        assert_eq!(indices(&service.all(), attester), [11, 11]);
+        assert_eq!(
+            service
+                .proposer_at_slot(97, 3)
+                .map(|duty| duty.validator_index),
+            Some(11)
+        );
+        assert!(service.proposer_at_slot(98, 3).is_none());
+        let ptc = |duty: &PtcDutyDto| duty.validator_index;
+        assert_eq!(indices(&service.ptc_at_slot(99, 3), ptc), [11, 22]);
+        let sync = |duty: &SyncDutyDto| duty.validator_index;
+        assert_eq!(indices(&service.sync_for_period(0), sync), [11, 22]);
+        assert_eq!(
+            node.duties_call_count(),
+            fetched,
+            "nothing is fetched again"
+        );
+
+        service.set_slashed(HashSet::new());
+        assert_eq!(indices(&service.at_slot(96, 3), attester), [11, 22]);
+        assert!(service.proposer_at_slot(98, 3).is_some());
     }
 }

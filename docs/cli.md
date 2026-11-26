@@ -468,6 +468,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 | `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
 | `--distributed` | off | Distributed validator mode, for keys that are shares behind middleware such as Obol Charon: whether a validator aggregates attestations or sync committee contributions is decided by the combined selection proofs the middleware returns. `--beacon-nodes` must point at the middleware. Refused with `--enable-doppelganger-protection`. See [Distributed validators](#distributed-validators) |
+| `--shut-down-when-slashed` | off | Stop when the chain reports a loaded validator slashed, exiting with code `3`, rather than only dropping that key's proposer, attester and aggregation duties. See [Slashed validators](#slashed-validators) |
 | `--disable-event-stream` | off | Read no beacon node's event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between `--disable-beacon-head-monitor` and `--disable-payload-available-monitor`; Prysm's nearest is `--disable-attest-timely`. For a node whose stream is broken, or a proxy in front of it that holds events back. See [Duties start on the block](#duties-start-on-the-block) |
 
 ### What it does today
@@ -915,6 +916,60 @@ against real middleware. Builder registrations (each signed with its client's
 own timestamp), gloas proposer preferences and payload envelopes, and
 voluntary exits are signed with the share as usual, and whether a middleware
 combines each of them is up to it.
+
+### Slashed validators
+
+Each epoch's refresh resolves every loaded key through
+`POST /eth/v1/beacon/states/head/validators`, and reads each one's
+`validator.slashed` (not its `status`, which stops saying so once the validator
+reaches `withdrawal_possible`). A slashing shows in the head state once a block
+includes it, so it is seen within an epoch of that block. The client does not
+subscribe to the beacon node's `proposer_slashing` or `attester_slashing`
+events yet, which would cut that to seconds.
+
+A key reported slashed:
+
+- is logged at error, with its index, pubkey and status, by the first refresh
+  that finds it, and counted in `ethlambda_validator_validators_slashed` while
+  it stays loaded;
+- gets no more proposals (the chain refuses a block from a slashed proposer),
+  attestations or attestation aggregations (its attestations earn nothing);
+- keeps its sync committee duties, contributions as a selected aggregator
+  included, and its payload timeliness committee duties, which the chain
+  still counts: a slashed sync committee member is rewarded for taking
+  part and penalised for missing, as any other, and nothing in gloas refuses
+  or ignores a slashed member's payload attestation;
+- is left out of builder registrations, fee recipient preparations and
+  proposer preferences.
+
+The other keys go on. They are the ones at risk: a slashing means the setup is
+broken (a key running in a second place, slashing protection bypassed, a
+leaked key), and whatever caused it usually applies to every key that shares
+the validators directory or the copied setup. Each refresh's answer replaces
+the last, so a key leaves the set only when it is no longer loaded or when a
+node's earlier answer was wrong.
+
+With `--shut-down-when-slashed` the first refresh that finds a slashed key
+stops the client instead, before it sends anything else for the epoch, with an
+error saying not to restart it until the cause is found. The process exits
+with code **3**, distinct from the `1` of any other failure, clap's `2` for a
+bad command line and the `101` of a panic. Every start finds the same key
+again, so tell the supervisor not to restart on it: systemd's
+`RestartPreventExitStatus=3` next to `Restart=on-failure`. Kubernetes has no
+per-code equivalent, and restarts the pod into the same stop until the key is
+removed. The flag is off by default, as Teku's
+`--shut-down-when-validator-slashed-enabled` is.
+
+With the flag on, the keymanager API is up only for the moment before the
+stop, too short to delete the slashed key through it. Once the cause is
+found, start the client without `--shut-down-when-slashed`, delete the key
+with `DELETE /eth/v1/keystores` (or `/eth/v1/remotekeys`), and turn the
+flag back on at the next restart.
+
+The answer is one beacon node's: with several `--beacon-nodes` the lookup
+takes the first that answers, and nothing confirms it against another. A node
+that wrongly reports a key slashed stops the client with the flag on, and
+costs that key an epoch of duties without it.
 
 ### Duty offsets come from the network
 
