@@ -507,7 +507,8 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
-        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone())
+            .with_clock(clock.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());

@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::keys::ValidatorStore;
 use crate::signing::{SigningContext, sign_all};
 use crate::slashing_protection::SharedProtection;
+use crate::slot_clock::SlotClock;
 
 /// What one slot's attestation duty produced.
 ///
@@ -55,6 +56,9 @@ pub struct AttestationService<B> {
     /// What every validator has signed, shared with the proposal service and
     /// the keymanager. See [`crate::slashing_protection`].
     protection: SharedProtection,
+    /// The slot clock each accepted vote's delay is measured from, when the
+    /// client gave one (see [`Self::with_clock`]).
+    clock: Option<SlotClock>,
 }
 
 impl<B: BeaconNodeApi> AttestationService<B> {
@@ -67,7 +71,15 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             beacon_node,
             context,
             protection,
+            clock: None,
         }
+    }
+
+    /// Measure each accepted vote's delay from the start of its slot
+    /// (`ethlambda_validator_attestation_vote_delay_seconds`).
+    pub fn with_clock(mut self, clock: SlotClock) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Sign and publish every duty held for `slot`.
@@ -75,7 +87,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
     /// One `attestation_data` fetch is shared by every validator attesting at
     /// this slot, and every signature goes out in one submission: the data does
     /// not depend on the validator, and the beacon node's pool endpoint takes a
-    /// list.
+    /// list. From PQ the votes go out in several submissions instead, each as
+    /// soon as it is signed, since a leanXMSS signature is far too slow to hold
+    /// the batch for (see `publish_pq_as_signed`).
     ///
     /// Returns how many attestations were published, and the data they were
     /// signed over, which this slot's aggregation duty needs.
@@ -269,6 +283,23 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             to_sign.push((duty, pubkey));
         }
 
+        // From PQ a leanXMSS signature at the target epoch's leaf, over the
+        // same signing root: the slashing protection record above already
+        // guards that leaf (one per target epoch). Those keys are derived from
+        // local keystores at startup and sign here, with no round trip, in
+        // parallel off this task, and each vote goes out as soon as it is
+        // signed rather than with the batch (see `publish_pq_as_signed`).
+        if is_pq {
+            let published = self
+                .publish_pq_as_signed(slot, &to_sign, &data, &data_dto, fork_name)
+                .await?;
+            return Ok(Attested {
+                published,
+                refused,
+                data: Some(data),
+            });
+        }
+
         // Signed concurrently rather than one after another. A local key
         // signs in microseconds either way; a remote signer costs a round
         // trip per signature, and a hundred validators behind one signer
@@ -287,35 +318,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // a signer hangs every vote in it, a local key's too, is published
         // the full budget after the attestation offset (see
         // `SIGNING_BUDGET` for what that leaves before aggregation).
-        //
-        // From PQ a leanXMSS signature at the target epoch's leaf, over the
-        // same signing root: the slashing protection record above already
-        // guards that leaf (one per target epoch). Those keys are derived from
-        // local keystores at startup, so they sign here, with no round trip,
-        // in parallel off this task (`pq::sign_all`).
-        let signatures: Vec<std::result::Result<String, String>> = {
-            let _timing = crate::metrics::time_signing();
-            if is_pq {
-                let root = self.context.attestation_signing_root(&data);
-                let leaf = crate::pq::attestation_leaf(data.target.epoch);
-                let requests = to_sign
-                    .iter()
-                    .map(|(_, pubkey)| crate::pq::SignRequest {
-                        pubkey: *pubkey,
-                        leaf,
-                        root,
-                    })
-                    .collect();
-                crate::pq::sign_all(requests)
-                    .await
-                    .into_iter()
-                    .map(|signature| {
-                        signature
-                            .map(|signature| encode_hex(&signature.0))
-                            .map_err(|err| err.to_string())
-                    })
-                    .collect()
-            } else {
+        let signatures: Vec<std::result::Result<String, String>> =
+            {
+                let _timing = crate::metrics::time_signing();
                 sign_all(to_sign.iter().map(|(_, pubkey)| {
                     (*pubkey, self.context.sign_attestation(store, pubkey, &data))
                 }))
@@ -327,8 +332,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                         .map_err(|err| err.to_string())
                 })
                 .collect()
-            }
-        };
+            };
 
         let mut attestations = Vec::with_capacity(to_sign.len());
         for ((duty, _), signature) in to_sign.iter().zip(signatures) {
@@ -372,11 +376,134 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         }
         info!(%slot, count = published, "Published attestations");
         crate::metrics::inc_attestations_published(published as u64);
+        self.observe_vote_delays(slot, published);
         Ok(Attested {
             published,
             refused,
             data: Some(data),
         })
+    }
+
+    /// Signs `to_sign`'s PQ votes over `data` and submits each as soon as it
+    /// is signed, rather than the batch once its slowest signature is done.
+    /// Returns how many the beacon node accepted.
+    ///
+    /// A leanXMSS signature costs about 0.3 s of a core and varies several
+    /// fold from one to the next (see `pq::sign_batch`), so twenty of them
+    /// keep a host's cores busy for a second or more. Published whole, every
+    /// vote waited for the slowest; published as signed, the median vote goes
+    /// out about halfway through, as other clients' do.
+    ///
+    /// A submission carries whatever was signed by the time the previous one
+    /// answered: the first vote alone, then the ones that came in meanwhile,
+    /// so a slow node costs fewer, larger requests rather than a queue of
+    /// small ones. A failed submission costs its own votes only; the slot's
+    /// error is returned only when none was accepted at all.
+    async fn publish_pq_as_signed(
+        &self,
+        slot: Slot,
+        to_sign: &[(&AttesterDutyDto, BlsPubkey)],
+        data: &AttestationData,
+        data_dto: &AttestationDataOutDto,
+        fork_name: &str,
+    ) -> Result<usize> {
+        let root = self.context.attestation_signing_root(data);
+        let leaf = crate::pq::attestation_leaf(data.target.epoch);
+        let requests = to_sign
+            .iter()
+            .map(|(_, pubkey)| crate::pq::SignRequest {
+                pubkey: *pubkey,
+                leaf,
+                root,
+            })
+            .collect();
+        // Until the last signature exists, not the last submission, so the
+        // histogram still reads as the time the duty's signing took.
+        let mut timing = Some(crate::metrics::time_signing());
+        let mut signed = crate::pq::sign_streamed(requests);
+
+        let mut ready = Vec::with_capacity(to_sign.len());
+        let mut answered = 0;
+        let mut published = 0;
+        let mut failure = None;
+        while signed.recv_many(&mut ready, to_sign.len()).await > 0 {
+            answered += ready.len();
+            if answered >= to_sign.len() {
+                timing.take();
+            }
+            let mut attestations = Vec::with_capacity(ready.len());
+            for (position, signature) in ready.drain(..) {
+                let (duty, _) = &to_sign[position];
+                match signature {
+                    Ok(signature) => attestations.push(SingleAttestationDto {
+                        committee_index: duty.committee_index,
+                        attester_index: duty.validator_index,
+                        data: data_dto.clone(),
+                        signature: encode_hex(&signature.0),
+                    }),
+                    // One validator failing must not cost the others their
+                    // attestation.
+                    Err(err) => {
+                        error!(%slot, validator = duty.validator_index, %err, "Failed to sign attestation");
+                        crate::metrics::inc_signing_failures();
+                    }
+                }
+            }
+            if attestations.is_empty() {
+                continue;
+            }
+
+            let submitted = attestations.len();
+            let pending = to_sign.len() - answered;
+            match self
+                .beacon_node
+                .submit_attestations(&attestations, fork_name)
+                .await
+            {
+                Ok(accepted) => {
+                    if accepted < submitted {
+                        warn!(
+                            %slot,
+                            published = accepted,
+                            submitted,
+                            "Some attestations in this slot's batch were rejected by the beacon node"
+                        );
+                    }
+                    info!(%slot, count = accepted, pending, "Published attestations");
+                    crate::metrics::inc_attestations_published(accepted as u64);
+                    self.observe_vote_delays(slot, accepted);
+                    published += accepted;
+                }
+                Err(err) => {
+                    warn!(%slot, count = submitted, pending, %err, "Failed to submit some of this slot's attestations");
+                    failure = Some(err);
+                }
+            }
+        }
+
+        if answered < to_sign.len() {
+            let missing = to_sign.len() - answered;
+            error!(%slot, missing, "The PQ signing task stopped before every attestation was signed");
+            for _ in 0..missing {
+                crate::metrics::inc_signing_failures();
+            }
+        }
+        match failure {
+            Some(err) if published == 0 => Err(err),
+            _ => Ok(published),
+        }
+    }
+
+    /// One delay observation per vote the node accepted just now, from the
+    /// start of `slot`, when the service has a clock.
+    fn observe_vote_delays(&self, slot: Slot, votes: usize) {
+        let Some(clock) = &self.clock else {
+            return;
+        };
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(clock.start_of(slot))
+            .unwrap_or_default();
+        crate::metrics::observe_vote_publication_delay(elapsed.as_secs_f64(), votes);
     }
 }
 
@@ -617,6 +744,7 @@ mod tests {
             beacon_node: node_again.clone(),
             context: context(),
             protection: service.protection,
+            clock: None,
         };
         let second = service
             .attest(101, &[duty(&pubkey_hex, 1337, 101, 3)], &store)
