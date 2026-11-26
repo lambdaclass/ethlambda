@@ -1175,6 +1175,17 @@ impl BlockChainServer {
                 // after the head, but before `forkchoiceUpdated`, whose safe
                 // block it decides.
                 self.recompute_beacon_head_with(true).await;
+                // Gossip reads states from the cache only, and drops a block
+                // whose parent's post-state is not there unless the head's is,
+                // to check its signature against. Without this, a head state
+                // pushed out of the cache while nothing imports (by Beacon
+                // API state reads, say) would stay out: every gossip block
+                // built on that head is dropped, so none imports to cache a
+                // newer one.
+                self.store
+                    .cache_head_state()
+                    .inspect_err(|err| warn!(%err, "Could not cache the head state"))
+                    .ok();
             }
         }
 
@@ -3849,13 +3860,13 @@ impl BlockChainServer {
     ///
     /// Needed because nothing else evicts a withheld hold. A block missing
     /// its parent needs a genuine gap in this node's own chain to end up
-    /// pending; a block held for its columns needs only a claim, since
-    /// nothing about a block's signature or contents is checked before the
-    /// gate can hold it (`data_availability_for` runs on the bare
-    /// `blob_kzg_commitments` field ahead of `fork_choice::on_block`'s own
-    /// verification). A peer can therefore name any known, unfinalized parent,
-    /// claim commitments, and simply never answer the resulting
-    /// `FetchRequest`, pinning the claimed block in this node's memory
+    /// pending; a block held for its columns needs only its proposer's
+    /// signature, since [`Self::precheck_before_waiting`] is all that is
+    /// checked before the gate can hold it (`data_availability_for` runs on
+    /// the bare `blob_kzg_commitments` field ahead of `fork_choice::on_block`'s
+    /// own verification). A proposer can therefore sign a block on any known,
+    /// unfinalized parent, claim commitments, and never publish the columns,
+    /// pinning the claimed block in this node's memory
     /// and in its `BlockHeaders`/`BlockBodies` rows (written by
     /// `hold_block_for_columns`'s `insert_pending_block`) for as long as it
     /// likes, at no cost to itself. Calling this after every tick and every
@@ -6751,6 +6762,54 @@ mod tests {
             Some(&parent_root),
             "the child still waits for a validly signed parent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_forged_copy_of_a_held_block_leaves_the_signed_one_held() {
+        // The columns-wait check runs on every delivery, not only the first
+        // hold: a copy with the held block's root and a garbled signature
+        // must not replace the stored block that the release imports.
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, keyed_bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let config = server.store.config();
+
+        let forged = fulu_block_with_commitments(&server.store, 2);
+        let signed = signed_by_proposer(forged.clone(), &config);
+        let root = signed.message_hash_tree_root();
+        assert_eq!(
+            forged.message_hash_tree_root(),
+            root,
+            "the signature is not part of the root"
+        );
+
+        server
+            .on_block(signed.clone(), ImportTimings::default())
+            .await;
+        assert!(server.blocks_awaiting_columns.contains_key(&root));
+
+        server.on_block(forged, ImportTimings::default()).await;
+        assert!(
+            server.blocks_awaiting_columns.contains_key(&root),
+            "the signed copy is still held"
+        );
+        let stored = server
+            .store
+            .get_signed_block(&root)
+            .expect("DB read should succeed")
+            .expect("the held block is stored");
+        assert_eq!(stored, signed, "the stored copy is the signed one");
     }
 
     // -----------------------------------------------------------------

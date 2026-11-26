@@ -194,9 +194,10 @@ impl Drop for AskPermit {
 /// built columns before they leave this module, and is what keeps a forged
 /// header out of p2p's seen cache and off the wire. This only saves asking the
 /// execution client, and computing cells, for a block whose signature already
-/// fails here. A block can reach its hold unverified, since range sync and
-/// by-root answers never pass gossip validation and the import checks the
-/// signature only after data availability.
+/// fails here. The chain actor's import runs the same check before any hold
+/// (`BlockChainServer::precheck_before_waiting`), so a block the node holds
+/// has passed it once already and this repeats it; it still guards a direct
+/// caller of `hold_block_for_columns`.
 ///
 /// It cannot catch everything [`check_built`] does: past the parent state's
 /// proposer lookahead, [`precheck_block`] checks the signature against the

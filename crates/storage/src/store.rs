@@ -3441,15 +3441,19 @@ impl Store {
         self.state_cache.lock().unwrap().put(key, state);
     }
 
-    /// Loads the head block's post-state into the state cache, for a store
-    /// just resumed from disk.
+    /// Loads the head block's post-state into the state cache, unless it is
+    /// there already.
     ///
     /// Beacon gossip validation reads states only through
-    /// [`Self::cached_state`], and after a resume nothing else puts the head's
-    /// there before the first import: fork choice judges a head from an
-    /// earlier epoch by its persisted unrealized justification, not its state.
-    /// Until then, a block whose parent has no post-state yet would find no
-    /// state to check its proposer signature against, and be dropped.
+    /// [`Self::cached_state`], and checks the proposer signature of a block
+    /// whose parent has no post-state yet against the head's, dropping one it
+    /// finds no state for. An import caches its own post-state, but nothing
+    /// else puts the head's there: not after a resume, before the first
+    /// import (fork choice judges a head from an earlier epoch by its
+    /// persisted unrealized justification, not its state), and not once other
+    /// state reads push it out while nothing imports. So the resume path calls
+    /// this, and so does the beacon chain actor's slot tick, where it is
+    /// usually a cache hit.
     ///
     /// A head with no state leaves the cache as it was: the resume path has
     /// already refused a directory like that before it gets here.
