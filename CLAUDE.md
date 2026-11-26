@@ -372,7 +372,18 @@ actual_slot = finalized_slot + 1 + relative_index
     Bids and preferences are validated in p2p against one shared `BuilderMarket`
     (`state_transition::beacon::builder_market`) and never reach the chain actor, except that an
     accepted preference (gossip or API) is reported to it by proposal slot alone
-    (`new_proposer_preferences`), for `payload_attributes`. Gloas has its own rules for `beacon_block`,
+    (`new_proposer_preferences`), for `payload_attributes`. The four gloas topics' own publishes
+    read gossipsub's answer back (`SwarmHandle::publish_reporting`): `info` only once a peer has
+    the message, `warn` when none was handed it. A preference gossiped to early joiners of the next
+    digest can never reach late ones (Lighthouse before v8.3.0 joins two slots ahead): gossipsub's
+    id is topic plus payload, and its duplicate cache refuses it for `seen_ttl` (two epochs). So the node holds
+    back its own preferences for the next digest's slots (`is_held_back`, gloas on, every digest
+    boundary): pooled, reported to the chain actor and answered as usual, but gossiped only
+    `PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary, by a timer the fork schedule arms
+    once the topics are joined (`release_held_proposer_preferences`). Gossip-delivered ones are
+    never held. The market remembers what is still owed a publish (held, or no peer was handed
+    it) and publishes it on the validator client's re-send (`republish_proposer_preferences`), at
+    the release and at the digest switch, while its slot is ahead. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate

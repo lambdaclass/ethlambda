@@ -1312,6 +1312,65 @@ async fn cached_preferences_resubmitted_are_a_200_without_a_publish() {
     );
 }
 
+/// The p2p actor recorded that the first publish reached no peer (nobody had
+/// joined the topic yet): the validator client's re-send is published again,
+/// as a republish (no second first-publish, so no second event or chain
+/// report). Once a publish goes out, a re-send is back to a plain 200.
+#[tokio::test]
+async fn a_cached_preference_whose_publish_owed_is_republished_on_resubmission() {
+    let world = World::new();
+    let app = world.app(None);
+    let signed = world.preferences(address(0xaa), 30_000_000);
+    let submit = || preferences_request(std::slice::from_ref(&signed), Some("gloas"));
+    assert_eq!(send(&app, submit()).await.status, StatusCode::OK);
+    world.market.record_preferences_publish(&signed, true);
+
+    let reply = send(&app, submit()).await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let republished = || {
+        world
+            .network
+            .republished_proposer_preferences
+            .lock()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(republished(), vec![signed.clone()]);
+    assert_eq!(
+        world.network.proposer_preferences.lock().unwrap().len(),
+        1,
+        "published once as new"
+    );
+
+    // The republish went out.
+    world.market.record_preferences_publish(&signed, false);
+    assert_eq!(send(&app, submit()).await.status, StatusCode::OK);
+    assert_eq!(republished().len(), 1);
+}
+
+/// Once its slot has started, preferences are of no use to anyone: a re-send
+/// is a 200 without a republish even if none of its publishes went out.
+#[tokio::test]
+async fn a_failed_preference_is_not_republished_once_its_slot_started() {
+    let world = World::proposing();
+    let signed = world.preferences(address(0xaa), 30_000_000);
+    assert!(world.market.record_preferences(signed.clone(), HEAD_SLOT));
+    world.market.record_preferences_publish(&signed, true);
+
+    let reply = send(&world.app(None), preferences_request(&[signed], None)).await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        world
+            .network
+            .republished_proposer_preferences
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn different_preferences_for_a_held_key_fail_with_their_position() {
     let world = World::new();

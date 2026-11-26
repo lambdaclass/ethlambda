@@ -71,7 +71,10 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
-and moves its discv5 admission filter. While the window is open a gossip
+and moves its discv5 admission filter, then publishes again the proposer
+preferences whose earlier publish reached no peer. From gloas on, a slot
+before each boundary, it also gossips the proposer preferences it held back
+for the new digest's slots (both under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
@@ -111,6 +114,48 @@ block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
+
+Peers join that digest when their own client decides to: this node an epoch
+ahead, as Lighthouse does since v8.3.0, but Lighthouse before it only two slots
+before the boundary, and Grandine 2.0.6 five. A message's gossipsub id
+is its topic and payload alone, and gossipsub keeps the id of every message it
+handed to a peer, or received from one, for `seen_ttl` (two epochs) and refuses
+to publish it again until then (`Duplicate`). So a preference gossiped in the
+epoch before the boundary reaches the early joiners only (other ethlambda
+nodes, say) and can never be sent to the late ones, or reaches no peer at all.
+
+The node therefore holds back its own preferences for a slot of the next
+digest (`is_held_back` in `p2p/src/beacon/builder_market.rs`), from gloas on,
+at every digest boundary (a blob-parameter-only one too). They are accepted,
+pooled in the market and reported to the chain actor as usual, and the Beacon
+API answers as it would for any other, but they are not gossiped until
+`PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary. By then every client
+has joined, and a bid for the boundary's first slot, which is gossiped during
+the slot before it, still finds them. At that moment a timer the fork schedule
+arms once the next digest's topics are joined
+(`release_held_proposer_preferences`) publishes every held one, on the new
+digest's topic. Preferences gossip delivers are never held back: gossipsub
+relays them on `Accept` as it does every other message.
+
+The market remembers, for each preference this node publishes, whether it is
+still owed a publish (`BuilderMarket::record_preferences_publish`): while it is
+held back, or after a publish no peer was handed. One still owed is published
+again while its slot is ahead: when the validator client sends it again (once
+an epoch, at the epoch's second-to-last slot, see `docs/cli.md`; a held one
+stays held), at the release, and at every fork-digest switch, when every peer
+following the fork has joined (`publish_owed_proposer_preferences`). The new
+digest's first slot has started by the switch, so its preference is past
+helping there and is left out. Only a publish that found no peer subscribed
+can be retried: it left no trace in the duplicate cache, so its retry goes
+out. One refused because every peer's queue was full did leave its id there,
+so its retry is answered as a duplicate, which ends the retries.
+
+A publish of a bid, a preference, an envelope or a payload attestation that no
+peer was handed is logged at `warn` with gossipsub's reason
+(`NoPeersSubscribedToTopic`, say), one gossipsub refuses as a duplicate at
+`debug`, and `Published ... to gossipsub` at `info` only once a peer has it.
+Every other topic's publish failures are logged by the swarm adapter, at
+`debug`.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -392,7 +437,8 @@ scored by its role:
   but its mesh, formed before the boundary, can already be past the
   deliveries' activation (one epoch for blocks and aggregates). P3 on the new
   digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
-  Lighthouse joins two slots ahead, so activation alone covers it there.
+  Lighthouse before v8.3.0 joins two slots ahead, so activation alone covers
+  it there.
 
 ## Aggregate attestations
 
