@@ -840,10 +840,14 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
             // epoch it covers a lookahead and a refresh that both failed.
             // After the slot's duties and bounded by the slot's end, so it
             // never delays a duty. Only once this epoch's refresh got through:
-            // until then the refresh itself runs again every slot.
+            // until then the refresh itself runs again every slot. The next
+            // epoch's schedule too, which the refresh leaves to this point
+            // (see `fetch_ptc_lookahead`).
             if last_epoch == Some(epoch) {
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 retry_missing_ptc(&mut duties, epoch, budget, &context).await;
+                let budget = clock.remaining_in(slot, SystemTime::now());
+                fetch_ptc_lookahead(&mut duties, epoch, budget, &context).await;
             }
         }
     };
@@ -2136,41 +2140,77 @@ fn is_registrable(status: &str) -> bool {
     status.starts_with("pending") || status.starts_with("active")
 }
 
-/// Fetch the payload timeliness committee schedule for this epoch and the next,
-/// each only if it is a gloas epoch, and the gloas fork epoch's only once it
-/// has begun.
+/// Fetch the payload timeliness committee schedule for this epoch, if it is a
+/// gloas epoch. The next epoch's, the lookahead, is fetched after the slot's
+/// duties instead ([`fetch_ptc_lookahead`]).
 ///
-/// Gated per epoch rather than once, because the fork can activate between the
-/// two. The fork epoch is no lookahead, though: its committee is computed at
-/// the fork from the effective balances the last pre-gloas epoch ends with, so
-/// a node serves it only from the fork on (beacon-APIs `ptc.yaml`; Lighthouse
-/// answers `400` before). It is fetched at the fork epoch's own first slot,
-/// with the epoch after it as the lookahead. A failed fetch is logged and
-/// shrugged off, like the proposer and lookahead ones: it must not cost this
-/// epoch's attester schedule, which is already in hand. The current epoch's is
-/// then fetched again after each slot's duties until one is held
+/// A failed fetch is logged and shrugged off, like the proposer and lookahead
+/// ones: it must not cost this epoch's attester schedule, which is already in
+/// hand. It is then fetched again after each slot's duties until one is held
 /// ([`retry_missing_ptc`]).
 async fn refresh_ptc<B: BeaconNodeApi>(
     duties: &mut DutiesService<B>,
     epoch: u64,
     context: &SigningContext,
 ) {
-    for target in [epoch, epoch + 1] {
-        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
-            continue;
+    if context.config.fork_at_epoch(epoch) >= ethlambda_types::beacon::fork::ForkName::Gloas
+        && let Err(err) = duties.refresh_ptc(epoch).await
+    {
+        warn!(
+            %epoch,
+            %err,
+            "Payload committee duties fetch failed; this client may miss its votes"
+        );
+    }
+    duties.prune_ptc_before(epoch);
+}
+
+/// Fetch the next epoch's payload timeliness committee schedule, within
+/// `budget`, when it is a gloas epoch, none is held and a node can know it.
+///
+/// # After the slot's duties, not with the epoch's refresh
+///
+/// The refresh runs at the epoch's first slot ahead of its duties, normally
+/// before the epoch's first block has arrived, so the node's head state is
+/// still in the previous epoch. A gloas state holds the committees of its own
+/// epoch, the one before and the one after (`ptc_window`), so the epoch after
+/// next is out of its reach and the node advances a copy of the head state
+/// through two epoch transitions to answer: about 2 s of a core on
+/// pq-devnet-0's 10,000 validators, which held every first slot's
+/// attestations back to 3-4 s. After the slot's duties the head has normally
+/// entered the epoch, and the node reads the answer off its state.
+///
+/// Fetched once per epoch: held, later slots ask nothing, and one that
+/// failed is asked again next slot. The gloas fork epoch's committee is not a
+/// lookahead: it is computed at the fork from the effective balances the last
+/// pre-gloas epoch ends with, so a node serves it only from the fork on
+/// (beacon-APIs `ptc.yaml`; Lighthouse answers `400` before), and it is
+/// fetched by the fork epoch's own refresh.
+async fn fetch_ptc_lookahead<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    budget: std::time::Duration,
+    context: &SigningContext,
+) {
+    let next = epoch + 1;
+    if context.config.fork_at_epoch(next) < ethlambda_types::beacon::fork::ForkName::Gloas
+        || next == context.config.gloas_fork_epoch
+        || duties.holds_ptc(next)
+    {
+        return;
+    }
+    match tokio::time::timeout(budget, duties.refresh_ptc(next)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            debug!(epoch = next, %err, "Next epoch's payload committee duties fetch failed; trying again next slot");
         }
-        if target == context.config.gloas_fork_epoch && epoch < target {
-            continue;
-        }
-        if let Err(err) = duties.refresh_ptc(target).await {
-            warn!(
-                epoch = target,
-                %err,
-                "Payload committee duties fetch failed; this client may miss its votes"
+        Err(_) => {
+            debug!(
+                epoch = next,
+                "Next epoch's payload committee duties fetch ran out of slot; trying again next slot"
             );
         }
     }
-    duties.prune_ptc_before(epoch);
 }
 
 /// Fetch this epoch's payload timeliness committee schedule again, within
@@ -2809,8 +2849,8 @@ mod tests {
     /// The committee schedule is fetched for gloas epochs only, so a chain that
     /// has not forked is never asked. The fork epoch's is not fetched as a
     /// lookahead from the last pre-gloas epoch, since a node cannot know it
-    /// before the fork, but at the fork epoch itself, with the next as the
-    /// lookahead.
+    /// before the fork, but at the fork epoch itself. The refresh asks for its
+    /// own epoch only: the lookahead waits for the slot's duties.
     #[tokio::test]
     async fn the_committee_schedule_is_fetched_for_gloas_epochs_only() {
         let node = Arc::new(
@@ -2835,11 +2875,11 @@ mod tests {
         );
         assert!(duties.ptc_at_slot(130, 4).is_empty());
 
-        // At the fork epoch, both it and the next are asked.
+        // At the fork epoch, it alone is asked.
         refresh_epoch(&node, &mut duties, &keys, 4, &settings(None), &gloas_at_4)
             .await
             .expect("refreshes");
-        assert_eq!(node.ptc_requested_epochs(), vec![4, 5]);
+        assert_eq!(node.ptc_requested_epochs(), vec![4]);
         assert_eq!(duties.ptc_at_slot(130, 4).len(), 1);
 
         // A chain with no gloas scheduled is never asked at all.
@@ -2884,6 +2924,39 @@ mod tests {
         // Before gloas there is no committee to ask about.
         retry_missing_ptc(&mut duties, 3, budget, &gloas_at_4).await;
         assert_eq!(node.ptc_requested_epochs(), vec![4, 4]);
+    }
+
+    /// The next epoch's committee is asked after the slot's duties until one
+    /// is held, and then no more. Never the gloas fork epoch's, which no node
+    /// knows before the fork, nor a pre-gloas epoch's.
+    #[tokio::test]
+    async fn the_next_epochs_committee_is_fetched_after_the_slots_duties() {
+        // No duties stored for epoch 5 yet, so the mock refuses the request.
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        duties.set_indices(vec![11]);
+        let gloas_at_4 = gloas_context(4);
+        let budget = std::time::Duration::from_secs(1);
+
+        fetch_ptc_lookahead(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![5]);
+        assert!(!duties.holds_ptc(5), "a failed fetch holds nothing");
+
+        // The node answers now: the next slot's fetch gets the schedule.
+        node.set_ptc_duties(5, Root::repeat_byte(1), vec![ptc_duty(11, 170)]);
+        fetch_ptc_lookahead(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![5, 5]);
+        assert_eq!(duties.ptc_at_slot(170, 5).len(), 1);
+
+        // Held: no further request.
+        fetch_ptc_lookahead(&mut duties, 4, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![5, 5]);
+
+        // From the last pre-gloas epoch the next is the fork epoch, whose
+        // committee is fetched by its own refresh; before that, nothing.
+        fetch_ptc_lookahead(&mut duties, 3, budget, &gloas_at_4).await;
+        fetch_ptc_lookahead(&mut duties, 2, budget, &gloas_at_4).await;
+        assert_eq!(node.ptc_requested_epochs(), vec![5, 5]);
     }
 
     /// A schedule that came back empty is still a schedule: nothing to retry.
