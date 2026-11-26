@@ -231,6 +231,20 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
 
+    /// Distributed validator mode, for keys that are shares behind
+    /// middleware such as Obol Charon: whether a validator aggregates
+    /// attestations or sync committee contributions is decided by the
+    /// combined selection proofs the middleware returns, not by this
+    /// client's own. `--beacon-nodes` must then point at the middleware.
+    ///
+    /// Refused with `--enable-doppelganger-protection`: the cluster's other
+    /// operators keep the validator live, so the check would stop this client.
+    #[arg(
+        long,
+        default_value = "false",
+        conflicts_with = "enable_doppelganger_protection"
+    )]
+    pub(crate) distributed: bool,
     /// Read no beacon node's event stream: every attestation and sync
     /// committee message waits for its offset into the slot, and every
     /// payload timeliness committee vote for its deadline, even when the
@@ -406,6 +420,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
         broadcast: options.broadcast.into_iter().collect(),
+        distributed: options.distributed,
         event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, || stop.start())
@@ -555,6 +570,7 @@ mod tests {
             self_build_only: false,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            distributed: false,
             disable_event_stream: false,
         }
     }
@@ -667,6 +683,15 @@ mod tests {
         assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
         let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
         assert!(options.enable_doppelganger_protection);
+    }
+
+    /// Opt-in, as in every other client, and refused with doppelganger
+    /// protection, which the cluster's other operators would trip.
+    #[test]
+    fn distributed_mode_is_off_unless_asked_for_and_excludes_doppelganger_protection() {
+        assert!(!parse(&[]).expect("parses").distributed);
+        assert!(parse(&["--distributed"]).expect("parses").distributed);
+        assert!(parse(&["--distributed", "--enable-doppelganger-protection"]).is_err());
     }
 
     /// Nothing is broadcast unless asked for, as in Lighthouse; topics are

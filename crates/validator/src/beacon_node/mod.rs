@@ -385,6 +385,41 @@ pub struct ValidatorDetails {
     pub withdrawable_epoch: Epoch,
 }
 
+/// One validator's attestation aggregation selection proof for one slot, the
+/// way `POST /eth/v1/validator/beacon_committee_selections` carries it both
+/// ways: this client's partial proof in the request, the middleware's
+/// combined one in the answer. See [`BeaconNodeApi::beacon_committee_selections`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeaconCommitteeSelection {
+    pub validator_index: ValidatorIndex,
+    pub slot: Slot,
+    pub selection_proof: BlsSignature,
+}
+
+impl BeaconCommitteeSelection {
+    /// What an answer is matched to its request by.
+    pub fn key(&self) -> (ValidatorIndex, Slot) {
+        (self.validator_index, self.slot)
+    }
+}
+
+/// [`BeaconCommitteeSelection`] for a sync committee contribution, which also
+/// names the subcommittee. See [`BeaconNodeApi::sync_committee_selections`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCommitteeSelection {
+    pub validator_index: ValidatorIndex,
+    pub slot: Slot,
+    pub subcommittee_index: u64,
+    pub selection_proof: BlsSignature,
+}
+
+impl SyncCommitteeSelection {
+    /// What an answer is matched to its request by.
+    pub fn key(&self) -> (ValidatorIndex, Slot, u64) {
+        (self.validator_index, self.slot, self.subcommittee_index)
+    }
+}
+
 #[async_trait]
 pub trait BeaconNodeApi: Send + Sync {
     /// Who this node is, for a log line that names it: its URL for an HTTP
@@ -968,6 +1003,66 @@ pub trait BeaconNodeApi: Send + Sync {
         epochs: &[Epoch],
         indices: &[ValidatorIndex],
     ) -> Result<Vec<Vec<Liveness>>>;
+
+    /// Exchange partial attestation aggregation selection proofs for the
+    /// combined ones: `POST /eth/v1/validator/beacon_committee_selections`.
+    ///
+    /// Served by distributed validator middleware (Obol Charon), not by a
+    /// beacon node, which may answer 501. Only `--distributed` asks it (see
+    /// [`crate::distributed`]). The middleware may hold the request until
+    /// enough of the cluster's operators sent their partial proofs for every
+    /// entry, so a request whose entries the other operators never send waits
+    /// for the request timeout.
+    ///
+    /// An empty `selections` answers an empty list without asking.
+    ///
+    /// # Contract: an answer names only entries that were asked, once each
+    ///
+    /// Checked by [`validate_selections`] in the implementation, for the
+    /// reason [`Self::attestation_data`] states. An entry left out of the
+    /// answer is not an error: that duty has no combined proof, and its
+    /// validator aggregates for nothing.
+    async fn beacon_committee_selections(
+        &self,
+        selections: &[BeaconCommitteeSelection],
+    ) -> Result<Vec<BeaconCommitteeSelection>>;
+
+    /// [`Self::beacon_committee_selections`] for sync committee
+    /// contributions: `POST /eth/v1/validator/sync_committee_selections`,
+    /// matched by validator, slot and subcommittee, under the same contract.
+    async fn sync_committee_selections(
+        &self,
+        selections: &[SyncCommitteeSelection],
+    ) -> Result<Vec<SyncCommitteeSelection>>;
+}
+
+/// Check that `answered` names only keys in `asked`, each at most once, as
+/// the contract on [`BeaconNodeApi::beacon_committee_selections`] requires.
+/// `what` names the endpoint in the error.
+pub fn validate_selections<K>(
+    what: &str,
+    asked: impl IntoIterator<Item = K>,
+    answered: impl IntoIterator<Item = K>,
+) -> Result<()>
+where
+    K: Eq + std::hash::Hash + std::fmt::Debug,
+{
+    let asked: std::collections::HashSet<K> = asked.into_iter().collect();
+    let mut seen = std::collections::HashSet::new();
+    for key in answered {
+        if !asked.contains(&key) {
+            return Err(Error::InconsistentResponse(format!(
+                "{what} answer names {key:?}, which was not asked about"
+            )));
+        }
+        if seen.contains(&key) {
+            return Err(Error::InconsistentResponse(format!(
+                "{what} answer names {key:?} twice"
+            )));
+        }
+        seen.insert(key);
+    }
+    Ok(())
 }
 
 /// Check that `answers` names every one of `asked` exactly once and nothing
@@ -1137,6 +1232,24 @@ mod tests {
             liveness(&[(3, false), (9, false)]),
         ] {
             let err = validate_liveness(&asked, &wrong).expect_err("not an answer");
+            assert!(
+                matches!(err, crate::error::Error::InconsistentResponse(_)),
+                "got {err}"
+            );
+        }
+    }
+
+    /// A selections answer may leave an entry out, which only costs that
+    /// duty its aggregation. Naming an entry that was not asked, or one
+    /// twice, is a middleware to fail over from.
+    #[test]
+    fn a_selections_answer_names_only_what_was_asked_once_each() {
+        let asked = [(3, 100), (5, 100)];
+        assert!(validate_selections("selections", asked, [(5, 100), (3, 100)]).is_ok());
+        assert!(validate_selections("selections", asked, [(3, 100)]).is_ok());
+        assert!(validate_selections("selections", asked, []).is_ok());
+        for wrong in [vec![(3, 101)], vec![(3, 100), (3, 100)]] {
+            let err = validate_selections("selections", asked, wrong).expect_err("not an answer");
             assert!(
                 matches!(err, crate::error::Error::InconsistentResponse(_)),
                 "got {err}"

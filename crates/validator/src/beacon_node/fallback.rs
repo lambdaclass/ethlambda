@@ -69,8 +69,9 @@ use crate::beacon_node::health::{
     NodeHealth, Probe, Reply, Standing, SyncStatus, SyncVerdict, Tier,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
+    AggregateAttestation, AttesterDuties, BeaconCommitteeSelection, BeaconNodeApi, BlockRequest,
+    Delivery, Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates,
+    SyncCommitteeSelection, ValidatorDetails, ValidatorEntry,
 };
 use crate::chain_check::{ChainId, Served, first_chain_difference};
 use crate::error::{Error, Result};
@@ -1906,6 +1907,30 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             }
         }
     }
+
+    /// A query: the first node that answers gives the combined proofs.
+    /// Quiet, because the caller retries every slot while the middleware
+    /// fails and reports each failure itself.
+    async fn beacon_committee_selections(
+        &self,
+        selections: &[BeaconCommitteeSelection],
+    ) -> Result<Vec<BeaconCommitteeSelection>> {
+        self.try_each_quiet("beacon_committee_selections", |node| {
+            node.beacon_committee_selections(selections)
+        })
+        .await
+    }
+
+    /// As [`Self::beacon_committee_selections`].
+    async fn sync_committee_selections(
+        &self,
+        selections: &[SyncCommitteeSelection],
+    ) -> Result<Vec<SyncCommitteeSelection>> {
+        self.try_each_quiet("sync_committee_selections", |node| {
+            node.sync_committee_selections(selections)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -2429,6 +2454,51 @@ mod tests {
             fallback.nodes[1].block_requests().is_empty(),
             "the second node must not have been asked to build a block too"
         );
+    }
+
+    /// A middleware that fails hands the exchange to the next one, and one
+    /// that answers ends it.
+    #[tokio::test]
+    async fn a_selections_exchange_fails_over_and_stops_at_the_first_answer() {
+        use ethlambda_types::beacon::primitives::BlsSignature;
+
+        let answering = || {
+            MockBeaconNode::new()
+                .with_combined_selection(7, 100, BlsSignature([2; 96]))
+                .with_combined_sync_selection(7, 100, 3, BlsSignature([2; 96]))
+        };
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("middleware down"),
+            answering(),
+            answering(),
+        ]);
+        let attester = [BeaconCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+        let sync = [SyncCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            subcommittee_index: 3,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+
+        let answers = fallback
+            .beacon_committee_selections(&attester)
+            .await
+            .expect("the second node answers");
+        assert_eq!(answers[0].selection_proof, BlsSignature([2; 96]));
+        let answers = fallback
+            .sync_committee_selections(&sync)
+            .await
+            .expect("the second node answers");
+        assert_eq!(answers[0].selection_proof, BlsSignature([2; 96]));
+
+        assert_eq!(fallback.nodes[1].selection_requests().len(), 1);
+        assert_eq!(fallback.nodes[1].sync_selection_requests().len(), 1);
+        assert!(fallback.nodes[2].selection_requests().is_empty());
+        assert!(fallback.nodes[2].sync_selection_requests().is_empty());
     }
 
     #[tokio::test]

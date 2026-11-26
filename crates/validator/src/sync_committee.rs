@@ -232,7 +232,9 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         store: &RwLock<ValidatorStore>,
     ) -> Result<usize> {
         // Every (validator, subnet) pair's selection proof, asked for at once
-        // and each within the signing budget.
+        // and each within the signing budget. With distributed mode on, the
+        // combined proofs fetched at the start of the slot instead, and a
+        // pair with none is not selected (see `crate::distributed`).
         let mut seats = Vec::new();
         for duty in duties {
             let pubkey = match parse_pubkey(&duty.pubkey) {
@@ -250,7 +252,7 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             (
                 *pubkey,
                 self.context
-                    .sign_sync_selection_proof(store, pubkey, slot, *subnet),
+                    .sync_selection_proof(store, pubkey, slot, *subnet),
             )
         }))
         .await;
@@ -258,7 +260,7 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         let mut selected: Vec<(ValidatorIndex, BlsPubkey, u64, BlsSignature)> = Vec::new();
         for ((validator, pubkey, subnet), proof) in seats.into_iter().zip(proofs) {
             match proof {
-                Ok(proof) if is_sync_committee_aggregator(&proof) => {
+                Ok(Some(proof)) if is_sync_committee_aggregator(&proof) => {
                     selected.push((validator, pubkey, subnet, proof));
                 }
                 Ok(_) => {}
