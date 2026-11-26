@@ -35,6 +35,7 @@ smallvec.workspace = true
 ethlambda-ssz-tree.workspace = true
 
 [dev-dependencies]
+ephyra.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 rand.workspace = true

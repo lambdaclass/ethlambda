@@ -1113,6 +1113,16 @@ GENESIS_VALIDATORS:
 ### Era Replay
 `ethlambda replay-era` replays real mainnet/Sepolia/Hoodi blocks from nimbus `.era` files through the beacon STF and compares the end of each era with the stored state. `.github/workflows/era_replay.yml` runs it on the published image after every push to `main` that touches the STF, types or ssz-tree. See [`docs/era_replay.md`](docs/era_replay.md).
 
+### Property Tests (ephyra)
+Properties checked against reference models with [ephyra](https://github.com/datadog-labs/ephyra)
+(a dev-dependency, run by plain `cargo test`): the req/resp varint and snappy framing
+(`p2p/src/req_resp/encoding_properties.rs`), 3SF-mini justifiability and the
+`justified_slots` window (`state_transition/tests/justification_properties.rs`), and
+`U256` (`types/tests/u256_properties.rs`). A failure prints `EPHYRA_REPLAY=seed:iteration`
+and is remembered in `<crate>/.ephyra/regressions/` (committed, replayed first). Long runs
+take `EPHYRA_BUDGET_MS`/`EPHYRA_SEED`/`EPHYRA_FAILURES` from the environment. See
+[`docs/property_testing.md`](docs/property_testing.md).
+
 ### Running Tests
 ```bash
 cargo test --workspace --profile release-fast                       # All workspace tests

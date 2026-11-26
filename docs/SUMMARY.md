@@ -34,4 +34,5 @@
 
 - [Benchmarking](./benchmarking.md)
 - [Era Replay](./era_replay.md)
+- [Property Testing (ephyra)](./property_testing.md)
 - [Spec Deviations](./spec_deviations.md)

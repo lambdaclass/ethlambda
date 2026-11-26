@@ -63,3 +63,9 @@ devnet.inventory
 # macOS Finder metadata. Added after one was committed by accident: this repo is
 # developed on macOS, and a stray one is pure noise in a diff.
 .DS_Store
+
+# ephyra property-test artifacts (coverage pages, `ephyra test` runs). The
+# remembered failures under `.ephyra/regressions/` are committed, like
+# proptest's `*.proptest-regressions`: each run replays them first.
+**/.ephyra/*
+!**/.ephyra/regressions/
