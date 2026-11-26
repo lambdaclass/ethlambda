@@ -2323,6 +2323,7 @@ dependencies = [
  "axum",
  "blst",
  "ctr",
+ "ephyra",
  "ethlambda-metrics",
  "ethlambda-types",
  "futures-util",

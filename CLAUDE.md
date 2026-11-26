@@ -1117,8 +1117,10 @@ GENESIS_VALIDATORS:
 Properties checked against reference models with [ephyra](https://github.com/datadog-labs/ephyra)
 (a dev-dependency, run by plain `cargo test`): the req/resp varint and snappy framing
 (`p2p/src/req_resp/encoding_properties.rs`), 3SF-mini justifiability and the
-`justified_slots` window (`state_transition/tests/justification_properties.rs`), and
-`U256` (`types/tests/u256_properties.rs`). A failure prints `EPHYRA_REPLAY=seed:iteration`
+`justified_slots` window (`state_transition/tests/justification_properties.rs`),
+`U256` (`types/tests/u256_properties.rs`), and the validator's slashing protection against
+the spec's slashing conditions and a watermark model, through restarts, migrations and imports
+(`validator/tests/slashing_protection_properties.rs`). A failure prints `EPHYRA_REPLAY=seed:iteration`
 and is remembered in `<crate>/.ephyra/regressions/` (committed, replayed first). Long runs
 take `EPHYRA_BUDGET_MS`/`EPHYRA_SEED`/`EPHYRA_FAILURES` from the environment. See
 [`docs/property_testing.md`](docs/property_testing.md).
