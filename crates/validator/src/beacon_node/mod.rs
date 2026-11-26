@@ -215,15 +215,16 @@ pub struct BlockRequest {
     /// Thirty-two bytes consensus never reads.
     pub graffiti: Bytes32,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
-    /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
-    /// factor and accepts one. From gloas the factor travels in
-    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
-    /// win on value; a gloas answer is never blinded.
+    /// off before gloas. `None` sends `0` and refuses a blinded answer; `Some`
+    /// sends the factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, and the proposal service
+    /// always sets it, builder proposals or not, so a pooled p2p bid can win
+    /// on value; a gloas answer is never blinded.
     pub builder_boost_factor: Option<u64>,
     /// The smallest p2p bid, in gwei, the node may take for a gloas block
     /// (`produceBlockV4`'s `min_bid`): `--builder-min-bid`, with or without
-    /// builder proposals, since a node whose local build fails may still build
-    /// on a pooled bid. Not sent before gloas, where no endpoint takes it.
+    /// builder proposals, or `u64::MAX` with `--self-build-only`. Not sent
+    /// before gloas, where no endpoint takes it.
     pub builder_min_bid: u64,
 }
 

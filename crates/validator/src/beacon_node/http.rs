@@ -203,13 +203,13 @@ fn is_media_type(content_type: &str, media_type: &str) -> bool {
 ///
 /// `builders` stays empty, since the builder API (relay or `builder_pubkeys`
 /// bids) is a later phase. The top-level `min_bid` and factor govern the pooled
-/// p2p bids. The factor is the configured `builder_boost_factor` with
-/// `--builder-proposals`, so such a bid can win on value, and `0` without it:
+/// p2p bids. The proposal service always sets a gloas request's factor
+/// (`--builder-boost-factor`, 100 unless given, with or without
+/// `--builder-proposals`), so such a bid can win on value; `None` sends `0`,
 /// the local payload unless it cannot be built, as beacon-APIs defines `0`.
-/// A node whose local build fails may then still build on a pooled bid (see
-/// `proposal.rs`'s module doc for why that block is signed). `min_bid` is
-/// `--builder-min-bid`, in gwei, the floor below which no p2p bid is taken,
-/// with or without builder proposals, so it also bounds that fallback.
+/// `min_bid` is `--builder-min-bid`, in gwei, the floor below which no p2p bid
+/// is taken. `--self-build-only` sends a factor of `0` and a `min_bid` of
+/// `u64::MAX` (see `proposal.rs`'s module doc).
 fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
@@ -1917,10 +1917,15 @@ mod tests {
     /// The body reaches the wire: a gloas production request posts it.
     #[tokio::test]
     async fn a_gloas_production_request_posts_the_factor_and_min_bid_in_its_body() {
+        let max = u64::MAX.to_string();
         let cases = [
             (None, 0, "0", "0"),
             (None, 1_000_000, "0", "1000000"),
             (Some(250), 1_000_000, "250", "1000000"),
+            // The proposal service's default at gloas.
+            (Some(100), 0, "100", "0"),
+            // `--self-build-only`.
+            (Some(0), u64::MAX, "0", max.as_str()),
         ];
         for (factor, min_bid, expected_factor, expected_min_bid) in cases {
             let served = serve(500, vec![], vec![]).await;

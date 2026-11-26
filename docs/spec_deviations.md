@@ -969,8 +969,9 @@ signature, whichever way the node answered. Three departures:
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the
-  configured boost factor and `--builder-min-bid` (default `0`), and no
-  builders.
+  configured boost factor (default `100`) and `--builder-min-bid` (default
+  `0`), with or without `--builder-proposals`, and no builders
+  (`--self-build-only`: `0` and `2^64 - 1`).
   Validators with no fee recipient are not registered either (the field is
   required), and only validators the beacon node resolved, pending or active,
   are signed for: the flashbots relay refuses a whole batch over an exited or

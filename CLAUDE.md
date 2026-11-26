@@ -952,7 +952,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
   client do), unconditionally, re-sending each kept one once an epoch (a node
   holds them in memory only), and `produceBlockV4` carries the boost factor and
-  `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
+  `--builder-min-bid` with or without `--builder-proposals` (default 100 and 0,
+  so p2p bids compete at par, as in Lighthouse, Teku and Nimbus).
+  `--self-build-only` (Lodestar's `executiononly`) sends 0 and `u64::MAX`
+  instead (`ProposalService::bid_terms`) and refuses, before slashing
+  protection records the slot, a gloas block whose bid is not
+  `BUILDER_INDEX_SELF_BUILD` (`ProposalService::produce_and_sign`).
+  `--gas-limit` sets the target gas limit the preferences
   carry, which the node's own gloas payload is built toward.
   Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
   slot before the boundary, on its own task (`beacon_node::health`, records
