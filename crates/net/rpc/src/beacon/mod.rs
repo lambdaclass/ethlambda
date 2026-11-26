@@ -152,9 +152,24 @@ impl BodyEncoding {
     where
         T: serde::de::DeserializeOwned + libssz::SszDecode,
     {
+        self.decode_with(body, T::from_ssz_bytes)
+    }
+
+    /// [`Self::decode`] for a container whose SSZ decoding takes more than
+    /// its bytes, with `ssz` to do it. A gloas envelope is one: its payload
+    /// is decoded as a container the bytes do not name, where its JSON names
+    /// each field it has.
+    pub(crate) fn decode_with<T>(
+        self,
+        body: &[u8],
+        ssz: impl FnOnce(&[u8]) -> Result<T, libssz::DecodeError>,
+    ) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         match self {
             Self::Json => serde_json::from_slice(body).ok(),
-            Self::Ssz => T::from_ssz_bytes(body).ok(),
+            Self::Ssz => ssz(body).ok(),
         }
     }
 }

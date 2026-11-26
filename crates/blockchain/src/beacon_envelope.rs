@@ -1253,7 +1253,8 @@ pub(crate) mod tests {
 
         fn envelope(&self, root_hex: &str) -> gloas::SignedExecutionPayloadEnvelope {
             let bytes = self.bytes(&format!("execution_payload_envelope_0x{root_hex}"));
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes).expect("envelope decodes")
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(&fixture_config(), &bytes)
+                .expect("envelope decodes")
         }
 
         /// A server over the case's anchor, its clock at `time` seconds.

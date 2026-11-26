@@ -459,6 +459,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             graffiti,
             builder_boost_factor: self.builder_boost_factor,
             builder_min_bid: self.builder_min_bid,
+            payload_container: self.context.config.payload_container(epoch),
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -675,8 +676,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         let envelope = match &payload {
             Some(payload) => payload.envelope.clone(),
             None => {
+                let epoch = compute_epoch_at_slot(slot);
+                let container = self.context.config.payload_container(epoch);
                 self.beacon_node
-                    .execution_payload_envelope(slot, block_root)
+                    .execution_payload_envelope(slot, block_root, container)
                     .await?
             }
         };
@@ -969,6 +972,7 @@ mod tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas::PayloadContainer;
     use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, H160, Root};
     use libssz::SszDecode as _;
 
@@ -1353,6 +1357,7 @@ mod tests {
             graffiti: Default::default(),
             builder_boost_factor: None,
             builder_min_bid: 0,
+            payload_container: PayloadContainer::Specification,
         };
         let full = full.produce_block(&request).await.expect("produces");
         assert!(ProposalService::<MockBeaconNode>::compares_fee_recipient(
@@ -1879,7 +1884,7 @@ mod gloas_tests {
     use crate::beacon_node::mock::MockBeaconNode;
     use crate::slashing_protection::SlashingProtection;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer};
     use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::BlsPubkey;
     use libssz::SszDecode as _;
@@ -1975,8 +1980,9 @@ mod gloas_tests {
         assert_eq!(envelopes.len(), 1);
         let (body, blob_data_included) = &envelopes[0];
         assert!(*blob_data_included, "the contents form carries the blobs");
-        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(body)
-            .expect("the body is the signed envelope contents");
+        let contents =
+            SignedExecutionPayloadEnvelopeContents::from_ssz(PayloadContainer::Specification, body)
+                .expect("the body is the signed envelope contents");
         let envelope = &contents.signed_execution_payload_envelope;
         assert_eq!(envelope.message.beacon_block_root, block_root);
         assert!(
@@ -2074,7 +2080,11 @@ mod gloas_tests {
             .expect("proposes");
 
         let (body, _) = node.published_envelopes().remove(0);
-        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(&body).expect("ok");
+        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz(
+            PayloadContainer::Specification,
+            &body,
+        )
+        .expect("ok");
         let envelope = contents.signed_execution_payload_envelope;
         let as_proposer = context().block_signing_root(envelope.message.hash_tree_root(), slot());
         assert!(!verifies(&pubkey, &envelope.signature.0, as_proposer));
@@ -2105,7 +2115,8 @@ mod gloas_tests {
         let (body, blob_data_included) = node.published_envelopes().remove(0);
         assert!(!blob_data_included);
         let envelope =
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&body).expect("bare envelope");
+            gloas::SignedExecutionPayloadEnvelope::from_ssz(PayloadContainer::Specification, &body)
+                .expect("bare envelope");
         assert_eq!(envelope.message.beacon_block_root, block_root);
         assert!(verifies(
             &pubkey,

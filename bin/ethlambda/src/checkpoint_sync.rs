@@ -728,6 +728,7 @@ enum EnvelopeFetchError {
 async fn fetch_envelope(
     client: &Client,
     base_url: &str,
+    config: &Config,
     anchor_root: H256,
 ) -> Result<gloas::SignedExecutionPayloadEnvelope, EnvelopeFetchError> {
     let url = format!("{base_url}{}", beacon_envelope_path(anchor_root));
@@ -740,7 +741,9 @@ async fn fetch_envelope(
         return Err(EnvelopeFetchError::Unknown);
     }
     let bytes = response.error_for_status()?.bytes().await?;
-    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+    // The peer says the envelope is gloas's and not which container its
+    // payload is, so that comes from the payload's own slot.
+    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, &bytes)
         .map_err(EnvelopeFetchError::Decode)?;
     if envelope.message.beacon_block_root != anchor_root {
         return Err(EnvelopeFetchError::WrongBlock);
@@ -759,6 +762,7 @@ async fn fetch_envelope(
 /// chain actor's job; this only transports.
 pub async fn fetch_anchor_envelope(
     urls: &[String],
+    config: &Config,
     anchor_root: H256,
 ) -> Option<gloas::SignedExecutionPayloadEnvelope> {
     let client = build_client()
@@ -766,7 +770,7 @@ pub async fn fetch_anchor_envelope(
         .ok()?;
     for url in urls {
         let base_url = trim_trailing_slash(url);
-        match fetch_envelope(&client, base_url, anchor_root).await {
+        match fetch_envelope(&client, base_url, config, anchor_root).await {
             Ok(envelope) => {
                 info!(%url, "Fetched the anchor's execution payload envelope");
                 return Some(envelope);
@@ -1449,7 +1453,7 @@ mod anchor_envelope_tests {
         let envelope = envelope_for(root);
         let (url, mut requests) = serve("200 OK", envelope.to_ssz()).await;
 
-        let fetched = fetch_anchor_envelope(&[url], root).await;
+        let fetched = fetch_anchor_envelope(&[url], &Config::mainnet(), root).await;
 
         assert_eq!(fetched, Some(envelope));
         let line = requests.recv().await.unwrap();
@@ -1469,12 +1473,12 @@ mod anchor_envelope_tests {
         let (knows, _) = serve("200 OK", envelope.to_ssz()).await;
 
         assert_eq!(
-            fetch_anchor_envelope(std::slice::from_ref(&unknown), root).await,
+            fetch_anchor_envelope(std::slice::from_ref(&unknown), &Config::mainnet(), root).await,
             None,
             "a 404 is not an envelope"
         );
         assert_eq!(
-            fetch_anchor_envelope(&[unknown, knows], root).await,
+            fetch_anchor_envelope(&[unknown, knows], &Config::mainnet(), root).await,
             Some(envelope)
         );
     }
@@ -1486,10 +1490,16 @@ mod anchor_envelope_tests {
         let (garbage, _) = serve("200 OK", vec![1, 2, 3]).await;
         let (other, _) = serve("200 OK", envelope_for(H256::from([8u8; 32])).to_ssz()).await;
 
-        assert_eq!(fetch_anchor_envelope(&[broken], root).await, None);
-        assert_eq!(fetch_anchor_envelope(&[garbage], root).await, None);
         assert_eq!(
-            fetch_anchor_envelope(&[other], root).await,
+            fetch_anchor_envelope(&[broken], &Config::mainnet(), root).await,
+            None
+        );
+        assert_eq!(
+            fetch_anchor_envelope(&[garbage], &Config::mainnet(), root).await,
+            None
+        );
+        assert_eq!(
+            fetch_anchor_envelope(&[other], &Config::mainnet(), root).await,
             None,
             "an envelope for another block must not be handed over"
         );

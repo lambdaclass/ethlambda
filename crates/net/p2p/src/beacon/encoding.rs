@@ -418,7 +418,9 @@ where
                 hex::encode(context),
             )));
         }
-        let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
+        // The chunk's context is a fork digest, which every container a
+        // payload may be shares. The payload's own slot says which it is.
+        let envelope = SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, payload)
             .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
         let slot = envelope.message.payload.slot_number;
         let expected = schedule.digest_at(slot / preset::slots_per_epoch());

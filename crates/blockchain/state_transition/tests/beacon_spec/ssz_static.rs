@@ -26,14 +26,30 @@ use libtest_mimic::Trial;
 
 use super::{Case, collect_all_handlers, preset};
 
+/// The container a fixture's execution payload is.
+const SPECIFICATION: gloas::PayloadContainer = gloas::PayloadContainer::Specification;
+
 /// Decodes a case, then checks its root and its re-encoding.
 fn check<T>(case: &Case) -> Result<(), String>
 where
     T: SszDecode + SszEncode + HashTreeRoot,
 {
+    check_with(case, T::from_ssz_bytes)
+}
+
+/// [`check`] for a container that holds an execution payload, which has no
+/// decoder of its bytes alone: `decode` is told the payload's container. A
+/// fixture's is the specification's.
+fn check_with<T>(
+    case: &Case,
+    decode: impl FnOnce(&[u8]) -> Result<T, libssz::DecodeError>,
+) -> Result<(), String>
+where
+    T: SszEncode + HashTreeRoot,
+{
     let bytes = case.ssz_bytes("serialized");
 
-    let value = T::from_ssz_bytes(&bytes).map_err(|err| format!("decode failed: {err:?}"))?;
+    let value = decode(&bytes).map_err(|err| format!("decode failed: {err:?}"))?;
 
     let expected: RootFile = case.yaml("roots");
     let expected_root: Root = parse_root(&expected.root);
@@ -315,9 +331,9 @@ pub fn trials() -> Vec<Trial> {
                 // (EIP-7928) and `slot_number` (EIP-8061). Ahead of the
                 // `>= Deneb` arm below, which would otherwise catch a gloas
                 // case first.
-                "ExecutionPayload" if fork == ForkName::Gloas => {
-                    check::<gloas::ExecutionPayload>(case)
-                }
+                "ExecutionPayload" if fork == ForkName::Gloas => check_with(case, |bytes| {
+                    gloas::ExecutionPayload::from_ssz(SPECIFICATION, bytes)
+                }),
                 "ExecutionPayload" if fork >= ForkName::Deneb => {
                     check::<deneb::ExecutionPayload>(case)
                 }
@@ -344,9 +360,9 @@ pub fn trials() -> Vec<Trial> {
                 // progressive, so the request built from them needs its own
                 // type too. Ahead of the `>= Electra` arm below, which would
                 // otherwise catch a gloas case first.
-                "NewPayloadRequest" if fork == ForkName::Gloas => {
-                    check::<gloas::NewPayloadRequest>(case)
-                }
+                "NewPayloadRequest" if fork == ForkName::Gloas => check_with(case, |bytes| {
+                    gloas::NewPayloadRequest::from_ssz(SPECIFICATION, bytes)
+                }),
                 "NewPayloadRequest" if fork >= ForkName::Electra => {
                     check::<electra::NewPayloadRequest>(case)
                 }
@@ -479,10 +495,12 @@ pub fn trials() -> Vec<Trial> {
                 "IndexedPayloadAttestation" => check::<gloas::IndexedPayloadAttestation>(case),
                 "ExecutionPayloadBid" => check::<gloas::ExecutionPayloadBid>(case),
                 "SignedExecutionPayloadBid" => check::<gloas::SignedExecutionPayloadBid>(case),
-                "ExecutionPayloadEnvelope" => check::<gloas::ExecutionPayloadEnvelope>(case),
-                "SignedExecutionPayloadEnvelope" => {
-                    check::<gloas::SignedExecutionPayloadEnvelope>(case)
-                }
+                "ExecutionPayloadEnvelope" => check_with(case, |bytes| {
+                    gloas::ExecutionPayloadEnvelope::from_ssz(SPECIFICATION, bytes)
+                }),
+                "SignedExecutionPayloadEnvelope" => check_with(case, |bytes| {
+                    gloas::SignedExecutionPayloadEnvelope::from_ssz(SPECIFICATION, bytes)
+                }),
                 "ProposerPreferences" => check::<gloas::ProposerPreferences>(case),
                 "SignedProposerPreferences" => check::<gloas::SignedProposerPreferences>(case),
 

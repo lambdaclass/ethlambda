@@ -346,6 +346,17 @@ the container with it, and `Some` of an empty list is not `None`. The Beacon
 API's JSON names it `dependency_witnesses`, an array of hex strings, and
 leaves the key out of a payload that does not have the field.
 
+SSZ carries no tag for which of the two containers a payload is, so a decoder
+is told, as it is told a block's fork. Wherever an envelope arrives as bytes
+with nothing to say its epoch (gossip, a peer's answer, storage, checkpoint
+sync, the Beacon API), its payload is decoded as the container
+`Config::payload_container` gives the payload's own slot
+(`from_ssz_by_slot`), and an envelope whose payload is the other container
+does not decode. The validator client decodes the envelope of a block it
+asked for as the container of that block's slot, and reads `HEZE_FORK_EPOCH`
+from `/eth/v1/config/spec` to know it. JSON needs none of this: it names each
+field it has.
+
 The execution client and this node must agree on the epoch. On the proposal
 path the node settles it from the payload's own slot
 (`ExecutionPayload::with_dependency_witnesses_field`): from the epoch on, an

@@ -323,8 +323,9 @@ fn deliver_payload(
     let Some(name) = &entry.payload else {
         return Ok(());
     };
-    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&case.ssz_bytes(name))
-        .map_err(|err| format!("decoding {name}: {err:?}"))?;
+    let envelope =
+        gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, &case.ssz_bytes(name))
+            .map_err(|err| format!("decoding {name}: {err:?}"))?;
     if trusted {
         fork_choice::accept_execution_payload_envelope(store, &envelope);
         return Ok(());
@@ -675,7 +676,8 @@ fn run_case(case: &Case) -> Result<(), String> {
                 outcome
             }
             "execution_payload" => {
-                let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(
+                let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(
+                    &config,
                     &case.ssz_bytes(&message.message),
                 )
                 .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
@@ -834,8 +836,8 @@ fn run_builder_market_message(
         }
         Ok(outcome)
     } else if message.message.starts_with("execution_payload_envelope_") {
-        let envelope =
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes).map_err(decode_err)?;
+        let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, &bytes)
+            .map_err(decode_err)?;
         let outcome = rules::envelope::validate(seen_envelopes, store, &envelope);
         if outcome == Outcome::Accept {
             seen_envelopes.record(

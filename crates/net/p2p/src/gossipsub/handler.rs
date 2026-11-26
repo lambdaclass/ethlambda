@@ -509,7 +509,8 @@ fn triage_attestation(
 /// Same shape as [`triage_block`].
 fn triage_envelope(server: &P2PServer, payload: &[u8]) -> Dispatch {
     const KIND: &str = beacon_topics::EXECUTION_PAYLOAD;
-    let envelope = match beacon_decode::decode_execution_payload_envelope(payload) {
+    let config = server.store.config();
+    let envelope = match beacon_decode::decode_execution_payload_envelope(&config, payload) {
         Ok(envelope) => envelope,
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");

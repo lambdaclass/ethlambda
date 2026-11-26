@@ -9,7 +9,7 @@ use ethlambda_types::beacon::builder::{BlindedBeaconBlock, SignedValidatorRegist
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer};
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::containers::shared::Checkpoint;
 use ethlambda_types::beacon::containers::shared::SignedVoluntaryExit;
@@ -1080,6 +1080,7 @@ impl BeaconNodeApi for MockBeaconNode {
         &self,
         slot: Slot,
         block_root: Root,
+        _container: PayloadContainer,
     ) -> Result<gloas::ExecutionPayloadEnvelope> {
         self.guard("execution_payload_envelope")?;
         self.envelope_requests

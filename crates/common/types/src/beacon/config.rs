@@ -53,6 +53,7 @@ use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 
 use crate::beacon::constants;
+use crate::beacon::containers::gloas::PayloadContainer;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
 use crate::beacon::preset::Preset;
@@ -1079,6 +1080,17 @@ impl Config {
     /// gloas.
     pub fn carries_dependency_witnesses(&self, epoch: Epoch) -> bool {
         self.heze_fork_epoch != constants::FAR_FUTURE_EPOCH && self.heze_fork_epoch <= epoch
+    }
+
+    /// Which container an execution payload of `epoch` is: the one with
+    /// dependency witnesses where [`Self::carries_dependency_witnesses`], the
+    /// specification's before. What a payload's decoder is told.
+    pub fn payload_container(&self, epoch: Epoch) -> PayloadContainer {
+        if self.carries_dependency_witnesses(epoch) {
+            PayloadContainer::WithWitnesses
+        } else {
+            PayloadContainer::Specification
+        }
     }
 
     /// The `Fork.current_version` value blocks and attestations of `fork`

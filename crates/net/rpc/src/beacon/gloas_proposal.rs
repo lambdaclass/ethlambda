@@ -87,7 +87,7 @@ use ethlambda_types::{
             gloas::{
                 BeaconBlock, ExecutionPayloadEnvelope, ExecutionRequests,
                 SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
-                SignedProposerPreferences,
+                SignedProposerPreferences, UndecodedField,
             },
         },
         fork::ForkName,
@@ -97,7 +97,7 @@ use ethlambda_types::{
     primitives::H256,
 };
 use libssz::SszEncode as _;
-use libssz_derive::{SszDecode, SszEncode};
+use libssz_derive::SszEncode;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -158,7 +158,7 @@ impl PayloadCache {
 
 /// Gloas's `BlockContents`, the Beacon API's envelope for a self-built block
 /// with its payload: not a consensus container, so it lives with the API.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, SszEncode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GloasBlockContents {
     pub(crate) block: BeaconBlock,
     pub(crate) execution_payload_envelope: ExecutionPayloadEnvelope,
@@ -170,13 +170,39 @@ pub(crate) struct GloasBlockContents {
 
 /// Gloas's `SignedExecutionPayloadEnvelopeContents`, what the stateless form of
 /// `publishExecutionPayloadEnvelope` receives.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, SszEncode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GloasSignedEnvelopeContents {
     pub(crate) signed_execution_payload_envelope: SignedExecutionPayloadEnvelope,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub(crate) kzg_proofs: CellKzgProofs,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub(crate) blobs: Blobs,
+}
+
+impl GloasSignedEnvelopeContents {
+    /// Decodes `bytes` as contents whose envelope's payload is the container
+    /// `config` gives its own slot.
+    ///
+    /// Written out because a derived decoder cannot tell the envelope that:
+    /// see `ExecutionPayload::from_ssz_by_slot`.
+    fn from_ssz_by_slot(config: &Config, bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        // Three variable-size fields, so the fixed part is their offsets.
+        let mut decoder =
+            libssz::ContainerDecoder::new(bytes, 3 * libssz::BYTES_PER_LENGTH_OFFSET)?;
+        for _ in 0..3 {
+            decoder.read_variable_offset()?;
+        }
+        let UndecodedField(envelope) = decoder.decode_variable()?;
+        let kzg_proofs = decoder.decode_variable()?;
+        let blobs = decoder.decode_variable()?;
+        Ok(Self {
+            signed_execution_payload_envelope: SignedExecutionPayloadEnvelope::from_ssz_by_slot(
+                config, &envelope,
+            )?,
+            kzg_proofs,
+            blobs,
+        })
+    }
 }
 
 pub(crate) fn routes() -> Router<Store> {
@@ -1087,7 +1113,10 @@ async fn post_envelope_emitting(
         }
     };
     let (signed, supplied) = if blob_data_included {
-        match encoding.decode::<GloasSignedEnvelopeContents>(body) {
+        let contents = encoding.decode_with(body, |ssz| {
+            GloasSignedEnvelopeContents::from_ssz_by_slot(&store.config(), ssz)
+        });
+        match contents {
             Some(contents) => (
                 contents.signed_execution_payload_envelope,
                 Some((
@@ -1107,7 +1136,10 @@ async fn post_envelope_emitting(
             }
         }
     } else {
-        match encoding.decode::<SignedExecutionPayloadEnvelope>(body) {
+        let signed = encoding.decode_with(body, |ssz| {
+            SignedExecutionPayloadEnvelope::from_ssz_by_slot(&store.config(), ssz)
+        });
+        match signed {
             Some(signed) => (signed, None),
             None => {
                 return ApiError::BadRequest(

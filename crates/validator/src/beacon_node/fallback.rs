@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer};
 use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -548,9 +548,10 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         &self,
         slot: Slot,
         block_root: Root,
+        container: PayloadContainer,
     ) -> Result<gloas::ExecutionPayloadEnvelope> {
         self.try_each("execution_payload_envelope", |node| {
-            node.execution_payload_envelope(slot, block_root)
+            node.execution_payload_envelope(slot, block_root, container)
         })
         .await
     }
@@ -1081,6 +1082,7 @@ mod tests {
             graffiti: Bytes32::default(),
             builder_boost_factor: None,
             builder_min_bid: 0,
+            payload_container: PayloadContainer::Specification,
         }
     }
 

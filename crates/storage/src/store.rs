@@ -4203,8 +4203,11 @@ impl Store {
                 &encode_slot_root_key(slot, root),
             )
             .expect("get");
+        // Stored as the container of its own slot under this store's config,
+        // so it is read back as that.
+        let config = self.config();
         Ok(bytes.map(|bytes| {
-            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(&config, &bytes)
                 .expect("a stored envelope decodes")
         }))
     }
@@ -4235,6 +4238,7 @@ impl Store {
             Self::lean_only("canonical_execution_payload_envelopes");
         }
         let recorded_head = self.beacon.lock().unwrap().head_node_payload_status;
+        let config = self.config();
         let view = self.backend.begin_read().expect("read view");
         let canonical_root = |slot: u64| -> Option<H256> {
             view.get(Table::BlockRoots, &encode_block_root_key(slot))
@@ -4284,7 +4288,7 @@ impl Store {
             let Some(bytes) = envelope_row(slot, &root) else {
                 continue;
             };
-            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(&config, &bytes)
                 .expect("a stored envelope decodes");
             let builds_on_it = match window.get(index + 1) {
                 // No successor: this is the head, whose envelope is part of

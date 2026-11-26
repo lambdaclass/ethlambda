@@ -108,7 +108,7 @@
 use ethlambda_types::beacon::builder::{BlindedBeaconBlock, SignedBlindedBeaconBlock};
 use ethlambda_types::beacon::containers::deneb::Blob;
 use ethlambda_types::beacon::containers::electra::{BeaconBlock, SignedBeaconBlock};
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer, UndecodedField};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{BlsSignature, KzgProof};
@@ -191,7 +191,7 @@ pub struct FuluSignedBlockContents {
 /// block, the envelope revealing the self-built payload it commits to, and the
 /// blob material that goes out with the envelope. Not a consensus container; see
 /// the module doc.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, PartialEq, SszEncode)]
 pub struct GloasBlockContents {
     pub block: gloas::BeaconBlock,
     pub execution_payload_envelope: gloas::ExecutionPayloadEnvelope,
@@ -199,13 +199,69 @@ pub struct GloasBlockContents {
     pub blobs: Blobs,
 }
 
+impl GloasBlockContents {
+    /// Decodes `bytes` as block contents whose payload is `container`.
+    ///
+    /// Written out because the envelope is decoded as its payload's
+    /// container, which a derived decoder cannot tell it: see
+    /// [`gloas::ExecutionPayload::from_ssz`].
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> std::result::Result<Self, libssz::DecodeError> {
+        // Four variable-size fields, so the fixed part is their offsets.
+        let mut decoder =
+            libssz::ContainerDecoder::new(bytes, 4 * libssz::BYTES_PER_LENGTH_OFFSET)?;
+        for _ in 0..4 {
+            decoder.read_variable_offset()?;
+        }
+        let block = decoder.decode_variable()?;
+        let UndecodedField(envelope) = decoder.decode_variable()?;
+        let kzg_proofs = decoder.decode_variable()?;
+        let blobs = decoder.decode_variable()?;
+        Ok(Self {
+            block,
+            execution_payload_envelope: gloas::ExecutionPayloadEnvelope::from_ssz(
+                container, &envelope,
+            )?,
+            kzg_proofs,
+            blobs,
+        })
+    }
+}
+
 /// `publishExecutionPayloadEnvelope`'s body for gloas when the client supplies
 /// the blobs (`Eth-Blob-Data-Included: true`).
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, PartialEq, SszEncode)]
 pub struct SignedExecutionPayloadEnvelopeContents {
     pub signed_execution_payload_envelope: gloas::SignedExecutionPayloadEnvelope,
     pub kzg_proofs: CellKzgProofs,
     pub blobs: Blobs,
+}
+
+impl SignedExecutionPayloadEnvelopeContents {
+    /// Decodes `bytes` as envelope contents whose payload is `container`,
+    /// for the reason [`GloasBlockContents::from_ssz`] gives.
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> std::result::Result<Self, libssz::DecodeError> {
+        let mut decoder =
+            libssz::ContainerDecoder::new(bytes, 3 * libssz::BYTES_PER_LENGTH_OFFSET)?;
+        for _ in 0..3 {
+            decoder.read_variable_offset()?;
+        }
+        let UndecodedField(envelope) = decoder.decode_variable()?;
+        let kzg_proofs = decoder.decode_variable()?;
+        let blobs = decoder.decode_variable()?;
+        Ok(Self {
+            signed_execution_payload_envelope: gloas::SignedExecutionPayloadEnvelope::from_ssz(
+                container, &envelope,
+            )?,
+            kzg_proofs,
+            blobs,
+        })
+    }
 }
 
 /// The envelope and blob material that came with a gloas block, kept apart from
@@ -483,15 +539,21 @@ impl ProducedBlock {
     /// Decode a gloas `produceBlockV4` body. `payload_included` is the node's
     /// `Eth-Execution-Payload-Included`, which selects between
     /// [`GloasBlockContents`] and a bare block: SSZ carries no tag, so a wrong
-    /// guess would decode garbage or fail in a way that names neither.
-    pub fn from_gloas_ssz(payload_included: bool, bytes: &[u8]) -> crate::error::Result<Self> {
+    /// guess would decode garbage or fail in a way that names neither. Nor
+    /// does it carry which container the payload is, so `container` says, as
+    /// the block's slot has it by this client's schedule.
+    pub fn from_gloas_ssz(
+        payload_included: bool,
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> crate::error::Result<Self> {
         let decode = |what: &str, err: libssz::DecodeError| {
             Error::Decode(format!(
                 "produced gloas block: {what} did not decode: {err:?}"
             ))
         };
         let (block, payload) = if payload_included {
-            let contents = GloasBlockContents::from_ssz_bytes(bytes)
+            let contents = GloasBlockContents::from_ssz(container, bytes)
                 .map_err(|err| decode("block contents", err))?;
             (
                 contents.block,
@@ -1059,7 +1121,9 @@ mod tests {
     #[test]
     fn a_gloas_block_with_its_payload_decodes_and_hands_the_payload_over() {
         let (bytes, root) = gloas_contents_bytes(u64::MAX, 3, 2);
-        let mut produced = ProducedBlock::from_gloas_ssz(true, &bytes).expect("decodes");
+        let mut produced =
+            ProducedBlock::from_gloas_ssz(true, PayloadContainer::Specification, &bytes)
+                .expect("decodes");
 
         assert_eq!(produced.fork, ForkName::Gloas);
         assert_eq!(produced.slot(), 77);
@@ -1087,7 +1151,9 @@ mod tests {
     #[test]
     fn a_bare_gloas_block_has_no_payload_to_hand_over() {
         let block = empty_gloas_block_for(78, 6, 1);
-        let mut produced = ProducedBlock::from_gloas_ssz(false, &block.to_ssz()).expect("decodes");
+        let mut produced =
+            ProducedBlock::from_gloas_ssz(false, PayloadContainer::Specification, &block.to_ssz())
+                .expect("decodes");
         assert_eq!(produced.slot(), 78);
         assert_eq!(produced.blob_count(), 0);
         assert!(produced.take_gloas_payload().is_none());
@@ -1098,8 +1164,8 @@ mod tests {
     #[test]
     fn the_included_header_selects_the_container() {
         let (bytes, _) = gloas_contents_bytes(u64::MAX, 0, 0);
-        let err =
-            ProducedBlock::from_gloas_ssz(false, &bytes).expect_err("contents are not a block");
+        let err = ProducedBlock::from_gloas_ssz(false, PayloadContainer::Specification, &bytes)
+            .expect_err("contents are not a block");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
     }
 
@@ -1120,7 +1186,9 @@ mod tests {
             .signed_execution_payload_bid
             .message
             .fee_recipient = ethlambda_types::beacon::primitives::H160([0xcd; 20]);
-        let produced = ProducedBlock::from_gloas_ssz(false, &block.to_ssz()).expect("decodes");
+        let produced =
+            ProducedBlock::from_gloas_ssz(false, PayloadContainer::Specification, &block.to_ssz())
+                .expect("decodes");
         assert_eq!(
             produced.fee_recipient(),
             ethlambda_types::beacon::primitives::H160([0xcd; 20])
@@ -1132,10 +1200,16 @@ mod tests {
     #[test]
     fn the_envelope_contents_round_trip() {
         let (bytes, root) = gloas_contents_bytes(u64::MAX, 2, 1);
-        let mut produced = ProducedBlock::from_gloas_ssz(true, &bytes).expect("decodes");
+        let mut produced =
+            ProducedBlock::from_gloas_ssz(true, PayloadContainer::Specification, &bytes)
+                .expect("decodes");
         let payload = produced.take_gloas_payload().expect("payload");
         let signed = payload.into_signed_contents_ssz(BlsSignature([8; 96]));
-        let decoded = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(&signed).expect("ok");
+        let decoded = SignedExecutionPayloadEnvelopeContents::from_ssz(
+            PayloadContainer::Specification,
+            &signed,
+        )
+        .expect("ok");
         assert_eq!(
             decoded
                 .signed_execution_payload_envelope

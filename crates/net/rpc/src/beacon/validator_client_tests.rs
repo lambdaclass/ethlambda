@@ -23,7 +23,7 @@ use ethlambda_state_transition::beacon::{bls, helpers::test_state::secret_key_fo
 use ethlambda_types::{
     beacon::{
         constants::DOMAIN_BEACON_ATTESTER,
-        containers::BeaconState,
+        containers::{BeaconState, gloas::PayloadContainer},
         fork::ForkName,
         preset,
         primitives::{BlsPubkey, BlsSignature},
@@ -588,6 +588,7 @@ async fn block_production_without_an_execution_client_is_retryable() {
         graffiti: Default::default(),
         builder_boost_factor: None,
         builder_min_bid: 0,
+        payload_container: PayloadContainer::Specification,
     };
     let err = client.produce_block(&request).await.unwrap_err();
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
@@ -830,6 +831,7 @@ async fn produce_with_pool(
         graffiti: ethlambda_types::primitives::H256(graffiti),
         builder_boost_factor: None,
         builder_min_bid: 0,
+        payload_container: PayloadContainer::Specification,
     };
     let produced = client.produce_block(&request).await.unwrap();
     assert_eq!(produced.slot(), slot);
@@ -1013,6 +1015,7 @@ async fn a_node_failing_block_production_behind_blobber_is_still_syncing() {
         graffiti: Default::default(),
         builder_boost_factor: None,
         builder_min_bid: 0,
+        payload_container: PayloadContainer::Specification,
     };
     let err = through_blobber.produce_block(&request).await.unwrap_err();
     assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
@@ -1438,6 +1441,7 @@ async fn the_validator_client_can_serve_on_the_sync_committee() {
         graffiti: Default::default(),
         builder_boost_factor: None,
         builder_min_bid: 0,
+        payload_container: PayloadContainer::Specification,
     };
     let produced = client.produce_block(&request).await.unwrap();
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
@@ -2157,6 +2161,7 @@ mod builder_flow {
                 graffiti: ethlambda_types::primitives::H256([0; 32]),
                 builder_boost_factor,
                 builder_min_bid: 0,
+                payload_container: PayloadContainer::Specification,
             };
             self.client.produce_block(&request).await.unwrap()
         }

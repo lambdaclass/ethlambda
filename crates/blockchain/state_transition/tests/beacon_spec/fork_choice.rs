@@ -605,7 +605,11 @@ fn apply_execution_step(
     }
 
     if let Some(name) = &step.execution_payload {
-        let signed_envelope: gloas::SignedExecutionPayloadEnvelope = decode(case, name)?;
+        // No decoder of the bytes alone: the payload's container is the one
+        // the case's config gives its slot.
+        let signed_envelope =
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, &case.ssz_bytes(name))
+                .map_err(|err| format!("decoding {name}: {err:?}"))?;
         // The format names no sampled columns for this step, so the evidence
         // is the empty retrieval, which reads as available.
         return expect_outcome(

@@ -27,15 +27,13 @@ use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer};
 use ethlambda_types::beacon::containers::shared::{AttestationData, SignedVoluntaryExit};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use tracing::{debug, warn};
-
-use libssz::SszDecode as _;
 
 use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
@@ -728,7 +726,8 @@ impl HttpBeaconNode {
                     .to_string(),
             )
         })?;
-        let block = ProducedBlock::from_gloas_ssz(included, &response.body)?;
+        let block =
+            ProducedBlock::from_gloas_ssz(included, request.payload_container, &response.body)?;
         // Enforced here rather than at the call site so failover works: see the
         // contract on `BeaconNodeApi::produce_block`.
         validate_produced_block(request, &block)?;
@@ -1168,6 +1167,7 @@ impl BeaconNodeApi for HttpBeaconNode {
         &self,
         slot: Slot,
         block_root: Root,
+        container: PayloadContainer,
     ) -> Result<gloas::ExecutionPayloadEnvelope> {
         let path = format!(
             "/eth/v1/validator/execution_payload_envelopes/{slot}/{}",
@@ -1180,7 +1180,7 @@ impl BeaconNodeApi for HttpBeaconNode {
                 response.fork.as_str()
             )));
         }
-        let envelope = gloas::ExecutionPayloadEnvelope::from_ssz_bytes(&response.body)
+        let envelope = gloas::ExecutionPayloadEnvelope::from_ssz(container, &response.body)
             .map_err(|err| Error::Decode(format!("execution payload envelope: {err:?}")))?;
         // The envelope is signed as it stands, so one for another block must
         // never reach the signing path. Enforced here so failover can act on it.
@@ -1840,6 +1840,7 @@ mod tests {
             graffiti: Default::default(),
             builder_boost_factor: factor,
             builder_min_bid: 0,
+            payload_container: PayloadContainer::Specification,
         }
     }
 

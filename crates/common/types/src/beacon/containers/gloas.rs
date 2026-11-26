@@ -64,12 +64,14 @@ use super::shared::{
     ProgressiveValidators, ProposerSlashing, RandaoMixes, SignedVoluntaryExit, Slashings,
     StateRoots,
 };
+use crate::beacon::config::Config;
 use crate::beacon::preset;
 use crate::beacon::preset_sized::{PresetBitvector, PresetList, PresetVector};
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ColumnIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
     Gwei, KzgCommitment, KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
 };
+use crate::beacon::signing::compute_epoch_at_slot;
 
 // ---------------------------------------------------------------------------
 // Collection aliases (EIP-7688: progressive where the spec says so)
@@ -486,13 +488,18 @@ pub struct ExecutionRequests {
 /// on, a payload has a twentieth, `dependency_witnesses`, which the
 /// specification's container does not have (see the field).
 ///
-/// A payload is therefore one of two containers, and which one is a property
-/// of the value: `dependency_witnesses` is `None` in the first and `Some` in
-/// the second. Its SSZ encoding, decoding and hash tree root are written out
-/// below rather than derived, because a derived container has a fixed set of
-/// fields. Whether a payload of a given slot may be the one or the other is
-/// not decided here: see
-/// [`Config::carries_dependency_witnesses`](crate::beacon::config::Config::carries_dependency_witnesses).
+/// A payload is therefore one of two containers ([`PayloadContainer`]), and
+/// which one is a property of the value: `dependency_witnesses` is `None` in
+/// the first and `Some` in the second. Its SSZ encoding, decoding and hash
+/// tree root are written out below rather than derived, because a derived
+/// container has a fixed set of fields. Whether a payload of a given slot may
+/// be the one or the other is not decided here: see
+/// [`Config::payload_container`].
+///
+/// There is no `SszDecode` for it, nor for a container that holds one: the
+/// bytes do not say which container they are, so a decoder is told
+/// ([`Self::from_ssz`]) or works it out from the payload's own slot
+/// ([`Self::from_ssz_by_slot`]).
 ///
 /// Not `#[derive(Default)]`: `logs_bloom` is an [`SszVector`], which, like
 /// every earlier fork's payload, has no meaningful empty value.
@@ -558,6 +565,39 @@ pub struct ExecutionPayload {
     pub dependency_witnesses: Option<DependencyWitnesses>,
 }
 
+/// Which of its two containers an [`ExecutionPayload`] is. A decoder has to
+/// be told, as it is told the fork of a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadContainer {
+    /// The specification's nineteen fields.
+    Specification,
+    /// Those, then `dependency_witnesses`.
+    WithWitnesses,
+}
+
+/// One variable-size field of a container, kept as its bytes.
+///
+/// For a container that holds an [`ExecutionPayload`], whose decoder is
+/// written out with [`libssz::ContainerDecoder`]: that decoder hands each
+/// variable-size field its bytes and nothing else, and a payload needs to be
+/// told its container too. The field is taken as this, and decoded from the
+/// bytes afterward.
+pub struct UndecodedField(pub Vec<u8>);
+
+impl libssz::SszDecode for UndecodedField {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
 /// A payload holds dependency witnesses and belongs to a slot whose payloads
 /// do not have the field, so no container can hold it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -592,6 +632,52 @@ impl ExecutionPayload {
             (_, false) => None,
         };
         Ok(self)
+    }
+
+    /// Which container this payload is.
+    pub fn container(&self) -> PayloadContainer {
+        match self.dependency_witnesses {
+            None => PayloadContainer::Specification,
+            Some(_) => PayloadContainer::WithWitnesses,
+        }
+    }
+
+    /// Decodes `bytes` as `container`.
+    ///
+    /// SSZ carries no tag for the container, so it comes from context, as a
+    /// block's fork does in
+    /// [`SignedBeaconBlock::from_ssz`](super::SignedBeaconBlock::from_ssz).
+    /// The context is the payload's epoch ([`Config::payload_container`]),
+    /// which a caller that asked for a payload of some slot knows, and which
+    /// [`Self::from_ssz_by_slot`] reads off the bytes for one that does not.
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> Result<Self, libssz::DecodeError> {
+        Self::decode_container(bytes, container == PayloadContainer::WithWitnesses)
+    }
+
+    /// Decodes `bytes` as the container `config` gives the payload's own
+    /// slot.
+    ///
+    /// For a payload that comes with nothing to say which epoch it is of:
+    /// from gossip, from a peer's answer, from storage. Both containers hold
+    /// `slot_number` at one place, the end of the specification's fixed
+    /// part, so it is read before the container is known. The slot is the
+    /// payload's word alone: holding it to the slot of the payload's block
+    /// is the envelope's rules' to do, as it was.
+    pub fn from_ssz_by_slot(config: &Config, bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        let end = Self::fixed_part_len(false);
+        let start = end - <Slot as libssz::SszEncode>::fixed_size();
+        let slot_number = bytes
+            .get(start..end)
+            .ok_or(libssz::DecodeError::InvalidByteLength {
+                expected: end,
+                got: bytes.len(),
+            })?;
+        let slot = <Slot as libssz::SszDecode>::from_ssz_bytes(slot_number)?;
+        let container = config.payload_container(compute_epoch_at_slot(slot));
+        Self::from_ssz(container, bytes)
     }
 
     /// The length of the container's fixed part: every fixed-size field, and
@@ -750,32 +836,6 @@ impl libssz::SszEncode for ExecutionPayload {
     }
 }
 
-impl libssz::SszDecode for ExecutionPayload {
-    fn is_fixed_size() -> bool {
-        false
-    }
-
-    fn fixed_size() -> usize {
-        0
-    }
-
-    /// The bytes say which of the two containers they encode. A container's
-    /// first offset is the length of its fixed part, and the fixed part is
-    /// one offset longer when `dependency_witnesses` is a field. So the bytes
-    /// are read as the container without it, and as the one with it when
-    /// their first offset is that longer length.
-    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
-        match Self::decode_container(bytes, false) {
-            Err(libssz::DecodeError::InvalidFirstOffset { got, .. })
-                if got == Self::fixed_part_len(true) =>
-            {
-                Self::decode_container(bytes, true)
-            }
-            decoded => decoded,
-        }
-    }
-}
-
 impl libssz_merkle::HashTreeRoot for ExecutionPayload {
     /// A progressive container's root (EIP-7495): the progressive
     /// merkleization of its fields' roots, mixed in with which fields are
@@ -822,15 +882,7 @@ impl libssz_merkle::HashTreeRoot for ExecutionPayload {
 /// the execution-layer-triggered requests it carries, and enough to bind it
 /// to the block whose [`ExecutionPayloadBid`] it fulfills.
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, SszEncode, HashTreeRoot,
 )]
 #[ssz(progressive_container)]
 pub struct ExecutionPayloadEnvelope {
@@ -842,20 +894,101 @@ pub struct ExecutionPayloadEnvelope {
     pub parent_beacon_block_root: Root,
 }
 
+impl ExecutionPayloadEnvelope {
+    /// Decodes `bytes` as an envelope whose payload is `container`: see
+    /// [`ExecutionPayload::from_ssz`].
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> Result<Self, libssz::DecodeError> {
+        Self::decode(bytes, |payload| {
+            ExecutionPayload::from_ssz(container, payload)
+        })
+    }
+
+    /// Decodes `bytes` as an envelope whose payload is the container
+    /// `config` gives its own slot: see
+    /// [`ExecutionPayload::from_ssz_by_slot`].
+    pub fn from_ssz_by_slot(config: &Config, bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        Self::decode(bytes, |payload| {
+            ExecutionPayload::from_ssz_by_slot(config, payload)
+        })
+    }
+
+    /// The container's decoding, with `payload` to decode its first field.
+    /// Written out because a derived decoder has no way to tell that field
+    /// its container.
+    fn decode(
+        bytes: &[u8],
+        payload: impl FnOnce(&[u8]) -> Result<ExecutionPayload, libssz::DecodeError>,
+    ) -> Result<Self, libssz::DecodeError> {
+        let fixed_part_len = 2 * libssz::BYTES_PER_LENGTH_OFFSET
+            + <BuilderIndex as libssz::SszEncode>::fixed_size()
+            + 2 * <Root as libssz::SszEncode>::fixed_size();
+        let mut decoder = libssz::ContainerDecoder::new(bytes, fixed_part_len)?;
+        decoder.read_variable_offset()?; // payload
+        decoder.read_variable_offset()?; // execution_requests
+        let builder_index = decoder.decode_fixed()?;
+        let beacon_block_root = decoder.decode_fixed()?;
+        let parent_beacon_block_root = decoder.decode_fixed()?;
+        let UndecodedField(payload_bytes) = decoder.decode_variable()?;
+        let execution_requests = decoder.decode_variable()?;
+        Ok(Self {
+            payload: payload(&payload_bytes)?,
+            execution_requests,
+            builder_index,
+            beacon_block_root,
+            parent_beacon_block_root,
+        })
+    }
+}
+
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, SszEncode, HashTreeRoot,
 )]
 pub struct SignedExecutionPayloadEnvelope {
     pub message: ExecutionPayloadEnvelope,
     pub signature: BlsSignature,
+}
+
+impl SignedExecutionPayloadEnvelope {
+    /// Decodes `bytes` as a signed envelope whose payload is `container`:
+    /// see [`ExecutionPayload::from_ssz`].
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> Result<Self, libssz::DecodeError> {
+        Self::decode(bytes, |message| {
+            ExecutionPayloadEnvelope::from_ssz(container, message)
+        })
+    }
+
+    /// Decodes `bytes` as a signed envelope whose payload is the container
+    /// `config` gives its own slot: see
+    /// [`ExecutionPayload::from_ssz_by_slot`].
+    pub fn from_ssz_by_slot(config: &Config, bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        Self::decode(bytes, |message| {
+            ExecutionPayloadEnvelope::from_ssz_by_slot(config, message)
+        })
+    }
+
+    /// The container's decoding, with `message` to decode its first field,
+    /// for the reason [`ExecutionPayloadEnvelope::decode`] gives.
+    fn decode(
+        bytes: &[u8],
+        message: impl FnOnce(&[u8]) -> Result<ExecutionPayloadEnvelope, libssz::DecodeError>,
+    ) -> Result<Self, libssz::DecodeError> {
+        let fixed_part_len =
+            libssz::BYTES_PER_LENGTH_OFFSET + <BlsSignature as libssz::SszEncode>::fixed_size();
+        let mut decoder = libssz::ContainerDecoder::new(bytes, fixed_part_len)?;
+        decoder.read_variable_offset()?; // message
+        let signature = decoder.decode_fixed()?;
+        let UndecodedField(message_bytes) = decoder.decode_variable()?;
+        Ok(Self {
+            message: message(&message_bytes)?,
+            signature,
+        })
+    }
 }
 
 /// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
@@ -865,7 +998,7 @@ pub struct SignedExecutionPayloadEnvelope {
 /// execution requests), with `execution_payload` and `execution_requests` now
 /// this module's own progressive shapes. Not `#[derive(Default)]`, for the
 /// reason [`ExecutionPayload`]'s own doc gives.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, HashTreeRoot)]
 #[ssz(progressive_container)]
 pub struct NewPayloadRequest {
     pub execution_payload: ExecutionPayload,
@@ -873,6 +1006,32 @@ pub struct NewPayloadRequest {
     pub versioned_hashes: VersionedHashes,
     pub parent_beacon_block_root: Root,
     pub execution_requests: ExecutionRequests,
+}
+
+impl NewPayloadRequest {
+    /// Decodes `bytes` as a request whose payload is `container`: see
+    /// [`ExecutionPayload::from_ssz`].
+    pub fn from_ssz(
+        container: PayloadContainer,
+        bytes: &[u8],
+    ) -> Result<Self, libssz::DecodeError> {
+        let fixed_part_len =
+            3 * libssz::BYTES_PER_LENGTH_OFFSET + <Root as libssz::SszEncode>::fixed_size();
+        let mut decoder = libssz::ContainerDecoder::new(bytes, fixed_part_len)?;
+        decoder.read_variable_offset()?; // execution_payload
+        decoder.read_variable_offset()?; // versioned_hashes
+        let parent_beacon_block_root = decoder.decode_fixed()?;
+        decoder.read_variable_offset()?; // execution_requests
+        let UndecodedField(payload_bytes) = decoder.decode_variable()?;
+        let versioned_hashes = decoder.decode_variable()?;
+        let execution_requests = decoder.decode_variable()?;
+        Ok(Self {
+            execution_payload: ExecutionPayload::from_ssz(container, &payload_bytes)?,
+            versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,8 +1828,9 @@ mod tests {
         assert_eq!(payload.to_ssz(), reference.to_ssz());
         assert_eq!(payload.encoded_len(), reference.to_ssz().len());
         assert_eq!(payload.hash_tree_root(), reference.hash_tree_root());
+        assert_eq!(payload.container(), PayloadContainer::Specification);
         assert_eq!(
-            ExecutionPayload::from_ssz_bytes(&reference.to_ssz()),
+            ExecutionPayload::from_ssz(PayloadContainer::Specification, &reference.to_ssz()),
             Ok(payload)
         );
     }
@@ -1685,8 +1845,9 @@ mod tests {
             assert_eq!(payload.to_ssz(), reference.to_ssz());
             assert_eq!(payload.encoded_len(), reference.to_ssz().len());
             assert_eq!(payload.hash_tree_root(), reference.hash_tree_root());
+            assert_eq!(payload.container(), PayloadContainer::WithWitnesses);
             assert_eq!(
-                ExecutionPayload::from_ssz_bytes(&reference.to_ssz()),
+                ExecutionPayload::from_ssz(PayloadContainer::WithWitnesses, &reference.to_ssz()),
                 Ok(payload)
             );
         }
@@ -1700,15 +1861,50 @@ mod tests {
 
         assert_ne!(without.to_ssz(), with_empty.to_ssz());
         assert_ne!(without.hash_tree_root(), with_empty.hash_tree_root());
-        // The bytes alone say which of the two they are.
+        // Each decodes as its own container and not as the other's, whose
+        // fixed part is of another length.
+        use PayloadContainer::{Specification, WithWitnesses};
+        assert!(ExecutionPayload::from_ssz(WithWitnesses, &without.to_ssz()).is_err());
+        assert!(ExecutionPayload::from_ssz(Specification, &with_empty.to_ssz()).is_err());
         assert_eq!(
-            ExecutionPayload::from_ssz_bytes(&without.to_ssz()),
+            ExecutionPayload::from_ssz(Specification, &without.to_ssz()),
             Ok(without)
         );
         assert_eq!(
-            ExecutionPayload::from_ssz_bytes(&with_empty.to_ssz()),
+            ExecutionPayload::from_ssz(WithWitnesses, &with_empty.to_ssz()),
             Ok(with_empty)
         );
+    }
+
+    #[test]
+    fn a_payload_is_decoded_as_the_container_of_its_own_slot() {
+        let without = distinct_execution_payload();
+        let mut with_two = without.clone();
+        with_two.dependency_witnesses = Some(two_witnesses());
+        let epoch = compute_epoch_at_slot(without.slot_number);
+
+        // No epoch scheduled, or one after the payload's: the specification's
+        // container, and the other's bytes do not decode.
+        let mut config = Config::minimal();
+        for heze_fork_epoch in [config.heze_fork_epoch, epoch + 1] {
+            config.heze_fork_epoch = heze_fork_epoch;
+            assert_eq!(
+                ExecutionPayload::from_ssz_by_slot(&config, &without.to_ssz()),
+                Ok(without.clone())
+            );
+            assert!(ExecutionPayload::from_ssz_by_slot(&config, &with_two.to_ssz()).is_err());
+        }
+
+        // Scheduled at the payload's epoch: the container with the list.
+        config.heze_fork_epoch = epoch;
+        assert_eq!(
+            ExecutionPayload::from_ssz_by_slot(&config, &with_two.to_ssz()),
+            Ok(with_two.clone())
+        );
+        assert!(ExecutionPayload::from_ssz_by_slot(&config, &without.to_ssz()).is_err());
+
+        // Bytes too short to hold the slot say nothing of their container.
+        assert!(ExecutionPayload::from_ssz_by_slot(&config, &with_two.to_ssz()[..100]).is_err());
     }
 
     #[test]
@@ -1727,10 +1923,78 @@ mod tests {
                 beacon_block_root: Bytes32::repeat_byte(2),
                 parent_beacon_block_root: Bytes32::repeat_byte(3),
             };
+            let container = envelope.payload.container();
             assert_eq!(
-                ExecutionPayloadEnvelope::from_ssz_bytes(&envelope.to_ssz()),
+                ExecutionPayloadEnvelope::from_ssz(container, &envelope.to_ssz()),
+                Ok(envelope.clone())
+            );
+
+            // The same through the containers that hold an envelope or a
+            // payload, each told the payload's container.
+            let signed = SignedExecutionPayloadEnvelope {
+                message: envelope.clone(),
+                signature: BlsSignature([7; 96]),
+            };
+            assert_eq!(
+                SignedExecutionPayloadEnvelope::from_ssz(container, &signed.to_ssz()),
+                Ok(signed.clone())
+            );
+            let request = NewPayloadRequest {
+                execution_payload: envelope.payload.clone(),
+                versioned_hashes: vec![Bytes32::repeat_byte(4)].try_into().unwrap(),
+                parent_beacon_block_root: Bytes32::repeat_byte(5),
+                execution_requests: Default::default(),
+            };
+            assert_eq!(
+                NewPayloadRequest::from_ssz(container, &request.to_ssz()),
+                Ok(request)
+            );
+
+            // And by the payload's own slot, from the outermost container in.
+            let mut config = Config::minimal();
+            if container == PayloadContainer::WithWitnesses {
+                config.heze_fork_epoch = compute_epoch_at_slot(envelope.payload.slot_number);
+            }
+            assert_eq!(
+                ExecutionPayloadEnvelope::from_ssz_by_slot(&config, &envelope.to_ssz()),
                 Ok(envelope)
             );
+            assert_eq!(
+                SignedExecutionPayloadEnvelope::from_ssz_by_slot(&config, &signed.to_ssz()),
+                Ok(signed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_envelope_does_not_decode() {
+        let envelope = SignedExecutionPayloadEnvelope {
+            message: ExecutionPayloadEnvelope {
+                payload: distinct_execution_payload(),
+                execution_requests: Default::default(),
+                builder_index: 1,
+                beacon_block_root: Bytes32::repeat_byte(2),
+                parent_beacon_block_root: Bytes32::repeat_byte(3),
+            },
+            signature: BlsSignature([7; 96]),
+        };
+        let container = PayloadContainer::Specification;
+        let bytes = envelope.to_ssz();
+        let decode = |bytes: &[u8]| SignedExecutionPayloadEnvelope::from_ssz(container, bytes);
+        assert_eq!(decode(&bytes), Ok(envelope));
+
+        // Cut short anywhere: inside the signed envelope's fixed part, the
+        // envelope's, or the payload's.
+        for len in [0, 50, 100, 150, bytes.len() - 1] {
+            assert!(decode(&bytes[..len]).is_err(), "{len} bytes");
+        }
+        // The signed envelope's one offset, then the envelope's two (at the
+        // start of the message, after the 4-byte offset and the 96-byte
+        // signature): none may point anywhere but where its field starts.
+        for offset_at in [0, 100, 104] {
+            let mut wrong = bytes.clone();
+            wrong[offset_at] ^= 0x01;
+            assert!(decode(&wrong).is_err(), "offset at {offset_at}");
         }
     }
 
@@ -1744,11 +2008,16 @@ mod tests {
         let first_offset = 4 * 32 + 20 + preset::BYTES_PER_LOGS_BLOOM + 4 * 8;
         let wrong = (ExecutionPayload::fixed_part_len(false) + 2) as u32;
         bytes[first_offset..first_offset + 4].copy_from_slice(&wrong.to_le_bytes());
-        assert!(matches!(
-            ExecutionPayload::from_ssz_bytes(&bytes),
-            Err(libssz::DecodeError::InvalidFirstOffset { .. })
-        ));
-        assert!(ExecutionPayload::from_ssz_bytes(&bytes[..100]).is_err());
+        for container in [
+            PayloadContainer::Specification,
+            PayloadContainer::WithWitnesses,
+        ] {
+            assert!(matches!(
+                ExecutionPayload::from_ssz(container, &bytes),
+                Err(libssz::DecodeError::InvalidFirstOffset { .. })
+            ));
+            assert!(ExecutionPayload::from_ssz(container, &bytes[..100]).is_err());
+        }
     }
 
     #[test]
@@ -1907,7 +2176,11 @@ mod tests {
             signature: Default::default(),
         };
         assert_eq!(
-            SignedExecutionPayloadEnvelope::from_ssz_bytes(&envelope.to_ssz()).unwrap(),
+            SignedExecutionPayloadEnvelope::from_ssz(
+                PayloadContainer::Specification,
+                &envelope.to_ssz()
+            )
+            .unwrap(),
             envelope
         );
     }

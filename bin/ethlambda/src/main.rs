@@ -990,7 +990,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
-    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
+    let mut anchor_envelope_fetch: Option<(Vec<String>, Arc<Config>, H256)> = None;
     let blockchain = match setup.chain {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
@@ -1003,9 +1003,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             anchor_envelope_urls,
         } => {
             check_custody_set(&custody_columns)?;
+            // The config the envelope is decoded under: its payload is the
+            // container that config gives the payload's slot.
+            let config = setup.store.config();
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
                 .filter(|_| !anchor_envelope_urls.is_empty())
-                .map(|root| (anchor_envelope_urls, root));
+                .map(|root| (anchor_envelope_urls, config, root));
             BlockChain::spawn_beacon(
                 setup.store,
                 sync_status,
@@ -1046,11 +1049,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // delay the node. The envelope goes through the same chain-actor entry a
     // gossiped one does, so the bid check, the column check and the
     // verification all apply to it.
-    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+    if let Some((urls, config, anchor_root)) = anchor_envelope_fetch {
         let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
         tokio::spawn(async move {
-            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
-            {
+            let fetched = checkpoint_sync::fetch_anchor_envelope(&urls, &config, anchor_root);
+            if let Some(envelope) = fetched.await {
                 let _ = chain
                     .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
                     .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));

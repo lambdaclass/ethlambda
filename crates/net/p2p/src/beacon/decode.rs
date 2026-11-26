@@ -223,11 +223,15 @@ pub fn decode_data_column_sidecar(
 }
 
 /// Decode an `execution_payload` payload. The topic exists from gloas on, so
-/// the container needs no fork lookup.
+/// the envelope needs no fork lookup. Its payload is one of the containers
+/// `config` has for a payload, and nothing on the topic says which: the
+/// payload's own slot does.
 pub fn decode_execution_payload_envelope(
+    config: &Config,
     bytes: &[u8],
 ) -> Result<gloas::SignedExecutionPayloadEnvelope, DecodeError> {
-    gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+    gloas::SignedExecutionPayloadEnvelope::from_ssz_by_slot(config, bytes)
+        .map_err(|_| DecodeError::Ssz)
 }
 
 /// Decode a `payload_attestation_message` payload. Gloas on, like
@@ -728,9 +732,26 @@ mod tests {
     fn an_execution_payload_envelope_round_trips() {
         let envelope = crate::test_support::envelope(5, 9);
         let bytes = envelope.to_ssz();
-        assert_eq!(decode_execution_payload_envelope(&bytes), Ok(envelope));
-        assert!(decode_execution_payload_envelope(&bytes[..bytes.len() - 1]).is_err());
-        assert!(decode_execution_payload_envelope(&[0xff; 3]).is_err());
+        let config = Config::mainnet();
+        let decode = |bytes: &[u8]| decode_execution_payload_envelope(&config, bytes);
+        assert_eq!(decode(&bytes), Ok(envelope.clone()));
+        assert!(decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode(&[0xff; 3]).is_err());
+
+        // Its payload is the container of its own slot. Under a config whose
+        // payloads carry dependency witnesses by then, these bytes are the
+        // wrong container, and the envelope with the list is the right one.
+        let mut with_witnesses = Config::mainnet();
+        with_witnesses.heze_fork_epoch = 0;
+        assert!(decode_execution_payload_envelope(&with_witnesses, &bytes).is_err());
+        let mut envelope = envelope;
+        envelope.message.payload.dependency_witnesses = Some(Default::default());
+        let bytes = envelope.to_ssz();
+        assert_eq!(
+            decode_execution_payload_envelope(&with_witnesses, &bytes),
+            Ok(envelope)
+        );
+        assert!(decode(&bytes).is_err());
     }
 
     #[test]

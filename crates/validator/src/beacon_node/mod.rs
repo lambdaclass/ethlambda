@@ -23,7 +23,7 @@ use crate::beacon_node::dto::{
 use crate::error::{BeaconNodeFailure, Error, Result};
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra;
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::gloas::{self, PayloadContainer};
 
 pub mod block_contents;
 pub mod dto;
@@ -220,6 +220,11 @@ pub struct BlockRequest {
     /// builder proposals, since a node whose local build fails may still build
     /// on a pooled bid. Not sent before gloas, where no endpoint takes it.
     pub builder_min_bid: u64,
+    /// The container the payload of a block at `slot` is, by this client's
+    /// own schedule. The envelope a gloas answer brings with a self-built
+    /// block is decoded as it, since the bytes do not say. Not read before
+    /// gloas, whose blocks hold their payload.
+    pub payload_container: PayloadContainer,
 }
 
 /// What became of a published block.
@@ -640,10 +645,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// (`Eth-Execution-Payload-Included: false`). An answer whose
     /// `beacon_block_root` is not `block_root` is an `Err`, for the reason
     /// [`validate_produced_block`] is enforced in the implementations.
+    /// `container` is the container `slot`'s payload is, which the answer is
+    /// decoded as.
     async fn execution_payload_envelope(
         &self,
         slot: Slot,
         block_root: Root,
+        container: PayloadContainer,
     ) -> Result<gloas::ExecutionPayloadEnvelope>;
 
     /// Publish a signed envelope, given its SSZ body.

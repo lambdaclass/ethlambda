@@ -690,6 +690,12 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
             config = config.with_fork_version(fork, version);
         }
     }
+    // Not a fork of this client's, so the loop above does not read it: the
+    // epoch payloads carry dependency witnesses from. It says which container
+    // an envelope's payload is, and an envelope is decoded as that.
+    if let Some(epoch) = spec_u64(value, "HEZE_FORK_EPOCH")? {
+        config.heze_fork_epoch = epoch;
+    }
 
     Ok(config)
 }
