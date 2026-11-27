@@ -191,9 +191,12 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
 selects the preset the process runs, before anything is decoded against it; a
-missing or unknown one is a hard startup error. The validator client has no
-`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
-reports. Sepolia's config schedules gloas, which this build follows, so
+missing or unknown one is a hard startup error. The validator client adopts
+the preset its beacon node's `/eth/v1/config/spec` reports. With its optional
+`--network`, resolving the network selects that network's `PRESET_BASE`
+first, and only a node reporting the same preset can be the one the client
+adopts it from (see [the chain check](#several-beacon-nodes-the-chain-check)).
+Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
