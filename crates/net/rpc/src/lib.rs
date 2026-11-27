@@ -290,6 +290,9 @@ pub struct BeaconApiHandles {
     /// `prepare_beacon_proposer` name, read once an epoch by the p2p layer's
     /// validator custody.
     pub attached_validators: ethlambda_network_api::AttachedValidators,
+    /// The payload builds the chain actor started ahead of their slots, which
+    /// block production collects instead of starting its own.
+    pub prepared_payloads: ethlambda_blockchain::PreparedPayloads,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -347,6 +350,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.custody_columns))
         .layer(Extension(handles.fee_recipients))
         .layer(Extension(handles.attached_validators))
+        .layer(Extension(handles.prepared_payloads))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))

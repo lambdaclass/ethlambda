@@ -951,10 +951,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   boundary (block published bare, then the proposer-signed envelope with
   `Eth-Blob-Data-Included: true`, both inside the proposal's attester-offset
   budget; an envelope failure is logged and counted, not a failed proposal),
-  attest at `ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`,
-  then the PTC vote at `PAYLOAD_ATTESTATION_DUE_BPS`. Sync committee duties
+  attest on the slot's block (a node's `head` event) or at `ATTESTATION_DUE_BPS_GLOAS`
+  at the latest, aggregate at `AGGREGATE_DUE_BPS_GLOAS`, and, beside those rather
+  than after them, the PTC vote on its payload (`execution_payload_available`) or at
+  `PAYLOAD_ATTESTATION_DUE_BPS` at the latest (`crate::head_monitor`; see
+  `docs/cli.md`, "Duties start on the block"). Sync committee duties
   (`SyncCommitteeService`, `crates/validator/src/sync_committee.rs`) run at every fork:
-  one message per validator over the head root at `SYNC_MESSAGE_DUE_BPS(_GLOAS)`
+  one message per validator over the head root, on the block or at
+  `SYNC_MESSAGE_DUE_BPS(_GLOAS)` at the latest
   (refused while the head is optimistic), then contributions for each selected
   (validator, subnet) pair at `CONTRIBUTION_DUE_BPS(_GLOAS)`, with subscriptions
   re-sent every epoch for the current and next period. The node pools the messages
@@ -969,13 +973,55 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   proposal epoch's fork version as consensus-specs v1.7.0-beta.4 and every other
   client do), unconditionally, re-sending each kept one once an epoch (a node
   holds them in memory only), and `produceBlockV4` carries the boost factor and
-  `--builder-min-bid`. `--gas-limit` sets the target gas limit the preferences
+  `--builder-min-bid` with or without `--builder-proposals` (default 100 and 0,
+  so p2p bids compete at par, as in Lighthouse, Teku and Nimbus).
+  `--self-build-only` (Lodestar's `executiononly`) sends 0 and `u64::MAX`
+  instead (`ProposalService::bid_terms`) and refuses, before slashing
+  protection records the slot, a gloas block whose bid is not
+  `BUILDER_INDEX_SELF_BUILD` (`ProposalService::produce_and_sign`).
+  `--gas-limit` sets the target gas limit the preferences
   carry, which the node's own gloas payload is built toward.
+  Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
+  slot before the boundary, on its own task (`beacon_node::health`, records
+  in `NodeHealth`, shared by the fallback): a slot in which every node that
+  answered is syncing or optimistic signs nothing and skips the epoch refresh,
+  only the fee recipient re-send going on (a node that did not answer does not
+  count, so the duty endpoints' 503 stays the backstop); requests walk the
+  nodes by `health::Tier` (synced; optimistic or `el_offline`; syncing or
+  `sync_distance` > 8; unprobed; failing), `--beacon-nodes` order breaking
+  ties, and a request that timed out or could not connect ranks its node
+  failing until a probe sent after it answers; and the head root and PTC data are
+  never asked of a node whose last probe said syncing or optimistic, or got
+  no answer. No rule that stops a duty reads the head's age. `--broadcast`
+  (`fallback::Broadcast`) sends attestations, blocks (envelopes producer
+  first) or sync committee messages to every node, failing-ranked nodes only
+  if none accepted.
   It keeps EIP-3076 minimal-watermark slashing protection in
   `--validators-dir/slashing_protection.json` (`crate::slashing_protection`),
   durable before every block (blinded ones included) and attestation signature;
   PTC votes have an in-memory `(validator, slot)` dedup only, and envelopes are
-  unguarded. `--enable-doppelganger-protection` (`crate::doppelganger`,
+  unguarded. The client checks every beacon node against the chain it runs on
+  (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
+  the first node that answers at startup (startup waits, retrying every 2 s,
+  while none does), and a node whose genesis, preset, slot
+  duration or any active fork's epoch and version differs is skipped by every call
+  until a later check finds it compatible again. A background task re-asks
+  every node every slot, judging and merging each answer as it arrives, at the
+  epoch read then, so a hung node holds back only its own.
+  Every round follows a fork the compatible nodes newly
+  schedule, merged from what each usable node last served
+  (`FallbackBeaconNode::served_configs`; only nodes that answered one of their last
+  `MISSES_BEFORE_SAY_IS_LOST` (3) checks have a say, so one timeout cannot hand the
+  schedule to another node: an unscheduled fork is taken only when all of them schedule
+  it alike, a scheduled one moves only when every one scheduling it agrees, and
+  is never unscheduled; only a fork still in the future may change), into the
+  `SharedConfig` the slot clock and signing
+  domains read, logging the change at `warn`. `Delivery::Everywhere` means every
+  usable node; `BeaconNodeApi::readmissions` tells the preferences service, and
+  the duty loop (subnet and sync subscriptions, builder registrations), to
+  resend when a skipped node is let back in. The spec parser requires the slot duration and every altair
+  to fulu epoch and version rather than defaulting them to mainnet.
+  `--enable-doppelganger-protection` (`crate::doppelganger`,
   Lighthouse's rule) withholds a key's attestations, blocks, RANDAO reveals and
   aggregates from its registration epoch `E` (startup or keymanager import)
   until `/eth/v1/validator/liveness` shows `E + 1` clean at the last slot of
@@ -998,7 +1044,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `MAX_CONCURRENT_REQUESTS` at a time. The epoch's subnet subscriptions, whose
   selection proofs are round trips for remote keys, are sent from a spawned
   task after the slot's proposal, not from `refresh_epoch`, with a longer
-  budget of their own (`SUBSCRIPTION_SIGNING_BUDGET`). Builder
+  budget of their own (`SUBSCRIPTION_SIGNING_BUDGET`). The epoch refresh
+  itself runs after the epoch's first block, beside that slot's duties and cut
+  off at the slot's end: from fulu the next epoch's proposers are fetched (v2)
+  with the lookahead, so `ahead_of_block` asks for nothing then, and only the
+  first slot served (no schedule held) refreshes in front of a block, uncut,
+  so a hung first node cannot keep it from failing over. A refresh that finds
+  the node syncing or optimistic stops proposals until one gets through.
+  Between refreshes, every slot from fulu re-asks v2 proposer duties for this
+  epoch and the next (`follow_dependent_roots`), whose root is the attester
+  and PTC schedules' too, and refetches those (and resubscribes) only when a
+  reorg moved it; no `head` event stream is read. Builder
   registrations and proposer preferences sign through the same path
   (`VALIDATOR_REGISTRATION`, told no fork; `PROPOSER_PREFERENCES`). A signer is known by
   `Web3Signer::normalize_url`'s rendering of its URL, which is what requests

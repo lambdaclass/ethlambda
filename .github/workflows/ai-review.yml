@@ -42,13 +42,14 @@ jobs:
         startsWith(github.event.label.name, 'ai-review') &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    uses: lambdaclass/actions/.github/workflows/pr_review_multi.yml@14aebc8085c4509bb9032e6e3ca0500210ec640b # v2
+    uses: lambdaclass/actions/.github/workflows/pr_review_multi.yml@433e036e485e0c5202479bd3c5841fa794b7fd56 # v2.1.0
     permissions:
       contents: read
       pull-requests: write
       actions: read
     with:
       command: /review
+      lane_effort: claude=high
     secrets:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
