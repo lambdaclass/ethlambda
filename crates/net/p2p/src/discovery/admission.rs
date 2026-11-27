@@ -12,12 +12,14 @@
 //! dial time, and is not offered for dialing again until it publishes a
 //! higher-`seq` record, which discovery runs through the filter afresh.
 //!
-//! So the dial loop filters nothing: every node it draws has already passed. It
-//! does not even read ENRs, because discovery hands out an
-//! [`ethrex_p2p::types::Node`], which knows nothing of `quic` or `attnets`.
-//! Instead the filter files what it admits in [`DialTargets`] as it judges it,
-//! and the dial loop looks the node id back up there and ranks what it got
-//! ([`rank_candidates`]).
+//! So every node the dial loop draws has already passed. The loop does not
+//! even read ENRs, because discovery hands out an [`ethrex_p2p::types::Node`],
+//! which knows nothing of `quic` or `attnets`. Instead the filter files what it
+//! admits in [`DialTargets`] as it judges it, and the dial loop looks the node
+//! id back up there ([`LeanFilter::dial_target_for`]) and ranks what it got
+//! ([`rank_candidates`]). The lookup judges the filed record once more: a
+//! record passed under the policy of its arrival, and a fork boundary may have
+//! moved that policy since.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -241,7 +243,10 @@ impl LeanFilter {
     ///
     /// Discovery re-judges a record only when its `seq` rises, so a peer
     /// rejected under the old policy stays rejected until it republishes;
-    /// peers cross a boundary by doing exactly that.
+    /// peers cross a boundary by doing exactly that. A peer admitted under
+    /// the old policy stays admitted in discovery's eyes just the same, which
+    /// is why the dial loop judges what it draws again
+    /// ([`Self::dial_target_for`]).
     pub(crate) fn set_fork_id(&self, fork_id: EnrForkId, also_admitted: Vec<ForkDigest>) {
         *self.policy.write().expect("admission policy lock poisoned") = Policy {
             fork_id,
@@ -249,9 +254,21 @@ impl LeanFilter {
         };
     }
 
-    /// A handle on what this filter has admitted so far, for the dial loop.
-    pub(crate) fn dial_targets(&self) -> DialTargets {
-        self.dial_targets.clone()
+    /// What to dial for `node_id`, a node discovery offered for dialing: the
+    /// target filed when its record was admitted, if the policy in force now
+    /// still admits that record.
+    ///
+    /// Discovery judges a record once, when it arrives, and again only when a
+    /// higher-`seq` one replaces it. A fork boundary therefore leaves every
+    /// record admitted under the old digest marked as passing, and discovery
+    /// goes on offering a peer that never moved off it. Judging the filed
+    /// record again is what keeps such a peer from being dialed once the old
+    /// digest has left the admitted set. It costs one [`admit`] per draw.
+    ///
+    /// `None` also for a node with nothing filed; see [`DialTargets::get`].
+    pub(crate) fn dial_target_for(&self, node_id: &H256) -> Option<DiscoveredPeer> {
+        let filed = self.dial_targets.get(node_id)?;
+        self.dial_target(&filed.record)
     }
 
     /// What to dial for `record`, or `None` if it would not be admitted.
@@ -754,7 +771,7 @@ mod tests {
     /// under that id when the filter judged the record.
     fn filed_target(policy: &LeanFilter, record: &NodeRecord) -> Option<DiscoveredPeer> {
         let key = read_public_key(record.pairs())?;
-        policy.dial_targets().get(&node_id_from_public_key(&key))
+        policy.dial_target_for(&node_id_from_public_key(&key))
     }
 
     #[test]
@@ -828,6 +845,32 @@ mod tests {
         dial_copy.set_fork_id(next, Vec::new());
         assert!(table_copy.accepts(&on_next));
         assert!(!table_copy.accepts(&on_local));
+    }
+
+    #[test]
+    fn a_peer_left_on_a_past_digest_is_not_dialed_once_the_window_closes() {
+        // Discovery judged this record when it arrived and re-judges it only
+        // on a higher `seq`, which a peer that never upgrades does not
+        // publish. So it keeps offering the peer after the boundary, and the
+        // dial loop has to turn it away itself once the old digest is no
+        // longer held.
+        let policy = filter();
+        let on_local = record_with(set_admissible_entries);
+        assert!(policy.accepts(&on_local));
+        let node_id = admit_record(&on_local).expect("admitted").node_id;
+
+        let mut next = EnrForkId::local();
+        next.fork_digest = [0xde, 0xad, 0xbe, 0xef];
+
+        // Switched, window still open: the old digest is held, so dialable.
+        policy.set_fork_id(next, vec![EnrForkId::local().fork_digest]);
+        assert!(policy.dial_target_for(&node_id).is_some());
+
+        // Window closed: still filed, since nothing re-ran the filter, but no
+        // longer dialed.
+        policy.set_fork_id(next, Vec::new());
+        assert!(policy.dial_targets.get(&node_id).is_some());
+        assert_eq!(policy.dial_target_for(&node_id), None);
     }
 
     #[test]
