@@ -145,7 +145,9 @@ const KEY_CONFIG: &[u8] = b"config";
 ///   since the key's field takes zero bytes there.
 ///
 /// So a new `Config` key gets an entry in [`CONFIG_ROWS`], a zero-width field
-/// encoding inside `Config`, and a row codec of its own.
+/// encoding inside `Config`, and a row codec of its own. Its zero-width decode
+/// must give the value `Config::lean` holds: a lean resume never fills a
+/// missing row, so a lean directory that predates the key runs on that decode.
 struct ConfigRow {
     /// The key's name in a `config.yaml`, for logs.
     name: &'static str,

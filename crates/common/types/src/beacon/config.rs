@@ -1985,8 +1985,8 @@ mod tests {
         let decoded = Config::from_ssz_bytes(&bytes).expect("valid config");
         assert!(decoded.gas_limit_schedule.is_empty());
         assert_eq!(decoded, Config::mainnet());
-        // Compared by `PartialEq`, which is what makes a resume put the
-        // file's schedule back.
+        // `PartialEq` still compares the field, so a resume that finds the
+        // stored schedule (its row's) differing from the file's rewrites it.
         assert_ne!(decoded, scheduled);
 
         assert_eq!(GasLimitSchedule::default().to_ssz(), Vec::<u8>::new());

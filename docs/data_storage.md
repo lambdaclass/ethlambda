@@ -306,6 +306,10 @@ own (`CONFIG_ROWS` in `store.rs`). An older directory just lacks the row: a
 beacon resume reports the key as missing, adds the config file's value and
 writes the row, instead of failing. An older build never reads the row. Every
 `config*` row is written in one batch, at bootstrap and by `replace_config`.
+A lean resume never rewrites `config`, so a lean directory that predates a row
+goes on lacking it and runs on the field's zero-width default; each such key's
+default must therefore be the value `Config::lean` holds, as
+`GAS_LIMIT_SCHEDULE`'s empty schedule is.
 
 #### One clock, three readings
 
@@ -350,9 +354,10 @@ migration path.
 `config` and `chain` are the odd ones out among the mutable rows: written at
 bootstrap (`init_store` for lean, `init_beacon` for beacon) and not mutated as
 the chain progresses. `chain` is never rewritten (it has a getter,
-`Store::chain`, and no setter). `config` is rewritten in one place,
-`Store::replace_config`, by a beacon resume whose config file changed values
-the directory does not contradict (see below), and that method panics unless
+`Store::chain`, and no setter). `config` (with its `config_*` rows) is
+rewritten in one place, `Store::replace_config`, by a beacon resume whose
+config file changed values the directory does not contradict (see below) or
+names a key the directory predates, and that method panics unless
 its `Store` holds the only handle to the cached copy. Because neither changes
 once a `Store` is shared, the `Store` keeps a copy of each in memory, and
 reads of them never reach the backend. Every other `Metadata` key is mutated
@@ -406,8 +411,8 @@ because a second row denominated in `slot ‖ root` would be a value that could
 drift from the first.
 
 `init_beacon` writes the two beacon-only keys plus `db_version`, `chain`,
-`preset`, `config`, `time`, `head`, `anchor_slot`, `latest_justified` and
-`latest_finalized` in one atomic batch.
+`preset`, `config` and its `config_*` rows, `time`, `head`, `anchor_slot`,
+`latest_justified` and `latest_finalized` in one atomic batch.
 
 `anchor_slot` is the odd one among these: every other row is either a format
 tag or something a later writer moves, while this one is written once at
@@ -916,7 +921,8 @@ A `Store` is created through one of four constructors in
 
 The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: the `Metadata` keys a lean directory needs (the format version
-and the chain and preset tags, time, config, head = safe_target = anchor root,
+and the chain and preset tags, time, config and its `config_*` rows, head =
+safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
 `BlockRoots` entry, the body if non-empty, a full snapshot into `States` keyed by the anchor's slot and root (the
 base of every future diff chain), and the anchor's `LiveChain` entry. `time`
@@ -935,7 +941,8 @@ one row an import does not write is the anchor's `BlockRoots` entry, which
 `index_beacon_anchor` adds right after the block (see [BlockRoots](#blockroots)).
 
 `from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
-`config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
+`config` (with whichever `config_*` rows the directory has) and `anchor_slot`
+from `Metadata`, returning `None` for an empty DB. A format
 mismatch is still fatal, failing with `Error::DbVersionMismatch` or
 `Error::PresetMismatch` rather than reading on, but `from_db_state` no longer
 judges the network or the chain, and it does not mutate anything either: it
