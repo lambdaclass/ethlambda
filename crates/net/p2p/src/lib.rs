@@ -1208,11 +1208,15 @@ const GOSSIPSUB_HEARTBEAT_MS: u64 = 700;
 /// How many heartbeats a message stays in gossipsub's message cache.
 const GOSSIPSUB_HISTORY_LENGTH: usize = 6;
 
-/// How long gossipsub holds a received message waiting for its verdict:
-/// `history_length` heartbeats. A verdict reported later finds the message
-/// gone, so an `Accept` forwards nothing and a `Reject` penalizes nobody.
+/// How long gossipsub is sure to hold a received message waiting for its
+/// verdict. A message enters the message cache's newest window and leaves
+/// when that window shifts out, `history_length` heartbeats after the first
+/// heartbeat that follows its arrival: between five and six heartbeats later,
+/// so five is what every message gets. A verdict reported after gossipsub
+/// dropped the message forwards nothing and penalizes nobody, and is counted
+/// as expired.
 pub(crate) const MESSAGE_CACHE_WINDOW: Duration =
-    Duration::from_millis(GOSSIPSUB_HEARTBEAT_MS * GOSSIPSUB_HISTORY_LENGTH as u64);
+    Duration::from_millis(GOSSIPSUB_HEARTBEAT_MS * (GOSSIPSUB_HISTORY_LENGTH as u64 - 1));
 
 /// The gossipsub parameters both wires share.
 ///

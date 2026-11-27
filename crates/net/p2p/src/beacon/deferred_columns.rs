@@ -9,15 +9,19 @@
 //! and hands it back through the chain checks ([`column_checks`]) once the
 //! block imports.
 //!
-//! Gossipsub does both for a verdict reported late, and nothing else here
-//! could. An `Accept` forwards the message gossipsub holds to the mesh, which
-//! is the re-broadcast. A `Reject` applies the invalid-message penalty to the
-//! peer the message came from and to every peer that sent a copy. Publishing
-//! the sidecar again would send nothing: gossipsub keeps a received id in its
-//! duplicate cache for the whole `seen_ttl` and refuses a publish of the same
-//! bytes as `Duplicate`. And the `Ignore` every other queued message is
-//! reported with at once removes the message from gossipsub's cache, leaving
-//! nothing for a later verdict to act on.
+//! Gossipsub is what can do either, for a verdict reported late. An `Accept`
+//! forwards the message gossipsub holds to the mesh, which is the
+//! re-broadcast. A `Reject` charges the invalid-message penalty (P4) to the
+//! peer the message came from and to every peer that sent a copy, but only on
+//! a topic with score parameters, and `data_column_sidecar_{subnet_id}` has
+//! none (see [`crate::beacon::scoring`]): until it does, the late `Reject`
+//! marks the message invalid and blames nobody, as an immediate one on a
+//! column topic already does. Publishing the sidecar again would send
+//! nothing: gossipsub keeps a received id in its duplicate cache for the whole
+//! `seen_ttl` and refuses a publish of the same bytes as `Duplicate`. And the
+//! `Ignore` every other queued message is reported with at once removes the
+//! message from gossipsub's cache, leaving nothing for a later verdict to act
+//! on.
 //!
 //! So such a sidecar's verdict is held here, with the sidecar, and reported
 //! once the chain checks decide: `Accept` when the sidecar was handed to the
@@ -27,11 +31,11 @@
 //! already handed the sidecar on or dropped it, so the verdict only tells
 //! gossipsub.
 //!
-//! The limit is gossipsub's: it holds an unvalidated message for
+//! The limit is gossipsub's: it is sure to hold an unvalidated message for
 //! [`MESSAGE_CACHE_WINDOW`] only. A verdict still held then is reported with
-//! its original `Queue`, since gossipsub has dropped the message by that
-//! time. A block that imports later still gets the column stored, but this
-//! node neither relays it nor blames its senders.
+//! its original `Queue`, since gossipsub may have dropped the message. A
+//! block that imports later still gets the column stored, but this node does
+//! not relay it.
 //!
 //! One verdict per `(block, index)`: valid sidecars of one block and index are
 //! byte-identical, so another copy queued under a different message id is
@@ -397,10 +401,9 @@ mod tests {
         );
     }
 
-    /// Each decided verdict reaches gossipsub as the specification asks:
-    /// relayed when the checks passed, held against its senders when they
-    /// refused it, and the queue's `Ignore` when it was never judged. A
-    /// parked one waits.
+    /// Each decided verdict reaches gossipsub: `Accept` (relayed) when the
+    /// checks passed, `Reject` when they refused it, and the queue's `Ignore`
+    /// when it was never judged. A parked one waits.
     #[tokio::test]
     async fn the_checks_verdict_is_what_gossipsub_hears() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;

@@ -666,7 +666,7 @@ impl Handler<GossipVerdict> for P2PServer {
         } = msg;
         let outcome = settle_message(self, &id.message_id, outcome, &object);
         // A queued gloas column's verdict waits for its deferred validation,
-        // so gossipsub can still relay it or blame its senders.
+        // so gossipsub can still relay it.
         let (id, object) = match (outcome, object) {
             (Outcome::Queue(_), Validated::Column(sidecar))
                 if matches!(*sidecar, DataColumnSidecar::Gloas(_)) =>
