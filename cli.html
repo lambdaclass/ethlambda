@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-995fa435.js";
+            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -311,7 +311,7 @@ from a normal build.</p>
 <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--custody-group-count</code></td><td><code>CUSTODY_REQUIREMENT</code> (4)</td><td>How many custody groups this node custodies, advertised as the ENR’s <code>cgc</code></td></tr>
+<tr><td><code>--custody-group-count</code></td><td><code>CUSTODY_REQUIREMENT</code> (4)</td><td>The fewest custody groups this node custodies, advertised as the ENR’s <code>cgc</code> and <code>MetaData</code>’s <code>custody_group_count</code>. Validator custody can raise it (see below)</td></tr>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
@@ -338,8 +338,32 @@ network where a <code>cgc=4</code> peer holds 4 of 128 columns is what decides w
 lookup finds a custodian at all.</p>
 <p>Changing it changes which columns this node custodies, since the custody set is
 a function of the node id <em>and</em> the count. Sidecars already on disk belong to
-the old set: nothing is corrupted, but the node advertises a set it has not
-finished filling until it backfills the difference.</p>
+the old set: nothing is corrupted, and nothing backfills the difference, so a
+start with more groups than the data directory held records the slot after the
+highest block it holds (the head’s or a side branch’s) and reports it in
+<code>Status</code> as <code>earliest_available_slot</code> (peers do not ask it for older columns of
+the new groups). The record is written only once the start is past its last
+fallible step, just before the chain actor spawns, so a start that fails
+earlier leaves it as it was.</p>
+<p><strong>Validator custody.</strong> Fulu <code>validator.md</code> has a node with validators attached
+custody one group per 32 ETH of their total effective balance, at least 8 and
+at most 128, and keep the highest count it has reached. The node learns its
+validators from the indices a validator client names to
+<code>beacon_committee_subscriptions</code> and <code>prepare_beacon_proposer</code>, and forgets a
+validator not named again for two epochs. Once an epoch it computes their
+requirement off the latest finalized state, as the specification says (not the
+head’s, since the record never falls and a branch that is later reorged out
+must not raise it), and records the highest one in the data directory. The count a start runs with is the larger of this flag and that
+record, so the flag is the operator’s own floor: raising it, or lowering it to
+no less than the record, takes effect at the next start.</p>
+<p>A running node changes only what it <em>advertises</em>, and only within what it
+already holds: <code>MetaData</code>’s <code>custody_group_count</code> rises (under a new sequence
+number) as far as the startup count’s sampling size, which at the default is
+the 8 groups one attached validator requires. A requirement past that is
+recorded and logged as a warning, and the next start custodies and advertises
+it. The ENR’s <code>cgc</code> keeps its startup value until a restart, the same
+limitation as the fork digest’s <code>eth2</code> entry (ethrex’s <code>DiscoveryServer</code>
+cannot replace the record it serves).</p>
 <p>With neither execution flag, the follower contacts no execution client and
 imports blocks without validating their payloads, which is what it did before
 those flags existed. It then answers <code>attestation_data</code>,
@@ -511,10 +535,10 @@ not chain-specific, branches once, and shares the shutdown:</p>
 <tr><td>build the aggregator, sync-status and event handles</td><td>shared</td><td>shared</td></tr>
 <tr><td>open <code>--data-dir</code>’s RocksDB backend</td><td>shared</td><td>shared</td></tr>
 <tr><td>resolve <code>--node-key</code>, else load <code>&lt;data-dir&gt;/node.key</code>, generating it on first start (after the open, so RocksDB’s lock covers the write)</td><td>shared</td><td>shared</td></tr>
-<tr><td><strong>the one <code>match</code></strong>: produce a <code>ChainSetup</code></td><td>genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets</td><td><code>beacon::wire_params</code> (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend</td></tr>
+<tr><td><strong>the one <code>match</code></strong>: produce a <code>ChainSetup</code></td><td>genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets</td><td>checkpoint sync or resume onto the same backend, then <code>beacon::startup_custody</code> (the custody count, from the flag and the directory’s recorded validator custody), then <code>beacon::wire_params</code> (genesis metadata, epoch, fork digest, custody columns)</td></tr>
 <tr><td>build the swarm, spawn P2P, start discv5</td><td>shared; discv5 only with <code>--discovery.enable</code></td><td>shared</td></tr>
 <tr><td>start the HTTP server</td><td>shared</td><td>shared</td></tr>
-<tr><td>spawn the chain actor and wire it to P2P</td><td>yes</td><td>yes: <code>BlockChain::spawn_beacon</code></td></tr>
+<tr><td>spawn the chain actor and wire it to P2P</td><td>yes</td><td>yes: record this start’s custody set in the data directory (<code>StartupCustody::record</code>), then <code>BlockChain::spawn_beacon</code></td></tr>
 <tr><td>ctrl-c or SIGTERM, stop and join the actors</td><td>shared</td><td>shared</td></tr>
 </tbody>
 </table>

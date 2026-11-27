@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-995fa435.js";
+            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -243,6 +243,18 @@ caller’s next one.</li>
 request, which costs bandwidth and CPU until the slot or epoch the caller
 named. A sync committee subscription is capped at the end of the next sync
 committee period; an attestation subnet’s is not capped.</li>
+<li><strong>How many custody groups the node holds.</strong> Both
+<code>beacon_committee_subscriptions</code> (every entry’s, an aggregator’s or not) and
+<code>prepare_beacon_proposer</code> record every validator index they name as attached
+to this node, with no check that the node runs it. Once an epoch the node raises its recorded
+custody count to what those validators’ effective balance requires
+(<a href="./beacon_wire.html#validator-custody">Validator custody</a>), and that record
+never falls, as fulu’s validator custody has it, so a caller naming
+validators the node does not run raises its custody, and the bandwidth and
+storage that go with it, for good: the advertised count at once, within the
+groups it already holds, and the rest from the next start. Only a new data
+directory forgets it. The named indices are kept in memory for two epochs
+past their last mention, however many a caller names.</li>
 <li><strong>When the node builds a block.</strong> Every
 <code>GET /eth/v3/validator/blocks/{slot}</code> and
 <code>POST /eth/v4/validator/blocks/{slot}</code> request has the execution client
@@ -469,7 +481,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/bls_to_execution_changes</code></td><td>JSON</td><td>The pool’s <code>SignedBLSToExecutionChange</code>s; POST takes an array</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet; every entry’s validator counts as attached, for validator custody</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s (JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/sync_committees</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>SyncCommitteeMessage</code>s</td></tr>
@@ -485,7 +497,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_bids</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip a builder’s <code>SignedExecutionPayloadBid</code> (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/proposer_preferences</code></td><td><em>(status only)</em></td><td>Validate, cache and gossip <code>SignedProposerPreferences</code> (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/builders</code></td><td>JSON</td><td>The gloas builder registry, filtered by id and status</td></tr>
-<tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below), and that it is attached, for validator custody</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/register_validator</code></td><td><em>(status only)</em></td><td>Forwards builder registrations of active or pending validators to <code>--builder</code>, and sets their fee recipients</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
 </tbody>
@@ -601,7 +613,12 @@ join its committee’s attestation subnet until the end of that slot, so the
 committee’s votes from other validators reach the pool too: every
 attestation this node relays has passed the <code>beacon_attestation_{subnet_id}</code>
 checks first, and the ones accepted on a joined subnet are pooled. Joined
-subnets are left once their slot has passed, and never appear in <code>attnets</code>.</p>
+subnets are left once their slot has passed, and never appear in <code>attnets</code>.
+Every entry’s validator, aggregator or not, is also recorded as attached to
+this node, as <code>prepare_beacon_proposer</code>‘s are: the p2p layer sizes its
+custody by the attached validators’ effective balance once an epoch, and
+forgets a validator not named again for two epochs (see
+<a href="./beacon_wire.html#validator-custody">Validator custody</a>).</p>
 </li>
 <li>
 <p><strong><code>aggregate_attestation</code></strong> answers from the pool: every vote held for the
@@ -1209,7 +1226,11 @@ address peers reach it on; without the flag they are empty and the ENR carries
 no IP. <code>metadata</code> is the <code>MetaData</code> the node answers peers with over req/resp,
 read at request time, so <code>syncnets</code> and <code>seq_number</code> follow the sync committee
 subnets a validator client asks for. That <code>seq_number</code> versions <code>MetaData</code>
-alone: the p2p specification counts it separately from the ENR’s <code>seq</code>.</p>
+alone: the p2p specification counts it separately from the ENR’s <code>seq</code>.
+<code>metadata.custody_group_count</code> is <code>MetaData</code> v3’s: the count the node started
+with (the ENR’s <code>cgc</code>), or higher once validator custody has raised it at
+runtime, which the ENR cannot follow until a restart (see
+<a href="./beacon_wire.html#validator-custody">Validator custody</a>).</p>
 <p><code>/eth/v1/node/peers</code>, <code>/eth/v1/node/peers/{peer_id}</code> and
 <code>/eth/v1/node/peer_count</code> read the p2p layer’s table of connected peers at
 request time. Only <strong>connected</strong> peers are tracked: a peer enters the table when

@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-995fa435.js";
+            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -450,6 +450,9 @@ different checkpoints.</p>
 <tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest finalized checkpoint</td></tr>
 <tr><td><code>beacon_unrealized_justified</code></td><td><code>Checkpoint</code></td><td>beacon</td><td>Unrealized justified checkpoint (beacon <code>Checkpoint</code>)</td></tr>
 <tr><td><code>beacon_unrealized_finalized</code></td><td><code>Checkpoint</code></td><td>beacon</td><td>Unrealized finalized checkpoint (beacon <code>Checkpoint</code>)</td></tr>
+<tr><td><code>validator_custody_count</code></td><td><code>u64</code></td><td>beacon</td><td>Highest custody group count attached validators have required; only ever raised, absent until one has (see <a href="beacon_wire.html#validator-custody">Validator custody</a>)</td></tr>
+<tr><td><code>custodied_group_count</code></td><td><code>u64</code></td><td>beacon</td><td>Custody groups whose columns the last start held (its sampling size); written with <code>custody_since_slot</code>, just before the chain actor spawns</td></tr>
+<tr><td><code>custody_since_slot</code></td><td><code>u64</code></td><td>beacon</td><td>First slot from which every column of <code>custodied_group_count</code> is held; <code>Status</code> reports it when later than the anchor</td></tr>
 </tbody>
 </table>
 </div>

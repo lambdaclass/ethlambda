@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-995fa435.js";
+            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -318,8 +318,9 @@ joined on demand, see <a href="#sync-committee-subnets">Sync committee subnets</
 <code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
 for blobs, deprecated at fulu in favor of the column matrix below.</p>
 <p><code>data_column_sidecar_{0..127}</code> is no longer in that absent list. This node
-subscribes to <code>sampling_size(CUSTODY_REQUIREMENT)</code> of them — the sampling size
-floored by <code>SAMPLES_PER_SLOT</code> above <code>CUSTODY_REQUIREMENT</code> itself — chosen by
+subscribes to <code>sampling_size(custody_group_count)</code> of them (the custody count
+it started with, see <a href="#validator-custody">Validator custody</a>, floored by
+<code>SAMPLES_PER_SLOT</code>; at the default <code>CUSTODY_REQUIREMENT</code> that is 8), chosen by
 <code>custody_columns(node_id, …)</code>, a public function of this node’s own discv5
 node id (<code>das-core.md</code>), so any peer can compute the same set without asking.
 <code>NUMBER_OF_CUSTODY_GROUPS</code> and <code>DATA_COLUMN_SIDECAR_SUBNET_COUNT</code> are equal
@@ -854,8 +855,10 @@ covering it.</p>
 this node never custodied, or a root it holds no header for, is left out of
 the answer rather than turned into an error, since the spec’s own words are
 “Clients MUST respond with at least one sidecar, if they have it.” A
-<code>data_column_sidecars_by_range/1</code> request starting before <code>Store::anchor_slot</code>
-gets <code>RESOURCE_UNAVAILABLE</code> instead of a merely-empty answer, the same
+<code>data_column_sidecars_by_range/1</code> request starting before <code>Store::anchor_slot</code>,
+or before the later slot from which a custody set grown at startup is complete
+(see Validator custody below), gets <code>RESOURCE_UNAVAILABLE</code> instead of a
+merely-empty answer, the same
 distinction the block-range handler draws and for the same reason: an empty
 window this node’s canonical chain skipped is normal, but a window below where
 this node’s chain begins cannot be served from any point onward. That floor is
@@ -1065,7 +1068,9 @@ checkpoint from <code>Store::beacon_finalized_checkpoint</code>, and
 <code>earliest_available_slot</code> from the anchor’s own slot rather than
 <code>finalized_epoch * SLOTS_PER_EPOCH</code>, since this node keeps only the unfinalized
 window above its anchor and the epoch’s first slot is not necessarily one it
-holds. Naming that slot tells a peer not to ask for anything older; naming zero
+holds. A start that custodies more groups than the data directory held moves it
+later, to the slot after that start’s head: the new groups’ columns are held
+only from there (see <a href="#validator-custody">Validator custody</a>). Naming that slot tells a peer not to ask for anything older; naming zero
 would claim genesis is in reach. There is one window where <code>beacon_head</code> answers
 <code>None</code>, between <code>init_beacon</code> seeding <code>KEY_HEAD</code> and fork choice inserting the
 block that root names, and every field but the fork digest falls back to zero
@@ -1081,7 +1086,7 @@ syncing” rather than as a conflicting chain.</p>
 <tbody>
 <tr><td><code>eth2</code></td><td>the computed <code>ENRForkID</code></td></tr>
 <tr><td><code>attnets</code></td><td>64 bits, with this node’s <code>SUBNETS_PER_NODE</code> backbone subnets set</td></tr>
-<tr><td><code>cgc</code></td><td><code>CUSTODY_REQUIREMENT</code></td></tr>
+<tr><td><code>cgc</code></td><td>the custody count the node started with: <code>--custody-group-count</code>, or the recorded validator custody count when that is higher</td></tr>
 <tr><td><code>quic</code></td><td><code>--gossipsub-port</code></td></tr>
 <tr><td><code>tcp</code></td><td><code>--gossipsub-port</code>, the same number: TCP and UDP are separate namespaces</td></tr>
 <tr><td><code>udp</code></td><td><code>--discovery.port</code></td></tr>
@@ -1098,17 +1103,60 @@ this node held no subscription at all.</li>
 <li><code>syncnets</code> names the sync committee subnets joined on a validator client’s
 request, so it is all-unset until one asks. It is advertised in MetaData
 only; the ENR has no <code>syncnets</code> entry.</li>
-<li><code>cgc</code> advertises <code>CUSTODY_REQUIREMENT</code>, the floor below which peers may
-reject a record outright, not <code>sampling_size(CUSTODY_REQUIREMENT)</code>, the
-larger number of columns this node actually custodies, stores and serves
-(see <a href="#data-column-sidecars">Data column sidecars</a>). That undersells rather
-than oversells: a request for more than <code>cgc</code>’s worth of columns still
-succeeds, since this node holds every column its own node id assigned it at
-the sampling size, not merely <code>cgc</code>’s worth.</li>
+<li><code>cgc</code> advertises the startup custody count (<code>CUSTODY_REQUIREMENT</code> by
+default), not its <code>sampling_size</code>, the number of groups this node actually
+custodies, stores and serves when that is larger (see
+<a href="#data-column-sidecars">Data column sidecars</a>). That undersells rather than
+oversells: a request for more than <code>cgc</code>’s worth of columns still succeeds,
+since this node holds every column its own node id assigned it at the
+sampling size, not merely <code>cgc</code>’s worth. <code>MetaData</code> v3’s
+<code>custody_group_count</code> starts at the same count (it used to say
+<code>CUSTODY_REQUIREMENT</code> whatever the flag was) and may rise past <code>cgc</code> at
+runtime; the record cannot follow until a restart.</li>
 </ul>
 <p>The <code>tcp</code> entry is what makes us discoverable in return: lighthouse’s discovery
 predicate requires <code>enr.tcp4().is_some() || enr.tcp6().is_some()</code> and applies it
 as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
+<h2 id="validator-custody"><a class="header" href="#validator-custody">Validator custody</a></h2>
+<p>Fulu <code>validator.md</code> (“Validator custody”) has a node with validators attached
+custody <code>get_validators_custody_requirement</code> groups: their total effective
+balance over <code>BALANCE_PER_ADDITIONAL_CUSTODY_GROUP</code> (32 ETH), at least
+<code>VALIDATOR_CUSTODY_REQUIREMENT</code> (8) and at most <code>NUMBER_OF_CUSTODY_GROUPS</code>
+(128). A node whose validators’ balance falls keeps custodying its highest
+count, across restarts too. What this node does about it, and what it does not
+yet:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Piece</th><th>Where</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td>Attached validators</td><td><code>ethlambda_network_api::AttachedValidators</code>, filled by the Beacon API</td><td>Every index named to <code>beacon_committee_subscriptions</code> (aggregator or not) and <code>prepare_beacon_proposer</code>, with the epoch it was last named in. One not named again for <code>EXPIRY_EPOCHS</code> (2) epochs stops counting, so a detached validator client stops raising custody</td></tr>
+<tr><td>Requirement</td><td><code>das::get_validators_custody_requirement</code></td><td>Off the latest finalized state’s effective balances, as the specification says, once an epoch. Not the head’s: the record never falls, so a raise read off a branch that is later reorged out would stay for good. The p2p actor (<code>beacon::validator_custody::refresh</code>) starts the run; the computation goes to a <code>spawn_blocking</code> task (<code>compute</code>), which takes the effective balances from the fork choice’s <code>JustifiedBalances</code> snapshot for the finalized checkpoint when it is cached (it keeps the last 8 epoch boundaries) and otherwise reads the state that snapshot is built from, whose rebuild would stall the actor: <code>fork_choice::checkpoint_state</code>, the checkpoint block’s post-state advanced to its epoch’s first slot, not the post-state itself, which is an epoch behind when that slot was empty and may hold other effective balances, so the count recorded for a checkpoint does not depend on what was cached; a panic there reports the run unavailable. The outcome comes back as <code>ValidatorCustodyComputed</code> (<code>finish</code>). An unreadable state retries the run at the next slot. With no attached validator in the registry there is no requirement at all, not the floor of 8: a plain follower is never raised. Indices the state does not know are skipped</td></tr>
+<tr><td>Highest count</td><td><code>Store::raise_validator_custody_count</code>, metadata key <code>validator_custody_count</code></td><td>Only ever raised. Absent in an older directory, which reads as nothing recorded; <code>DB_VERSION</code> did not change</td></tr>
+<tr><td>Startup</td><td><code>beacon::startup_custody</code> in the binary</td><td>Custodies and advertises the larger of <code>--custody-group-count</code> and the recorded count. The record is the validators’ requirement alone, so the flag stays the operator’s floor above it</td></tr>
+<tr><td>Runtime</td><td><code>beacon::validator_custody::apply</code></td><td>Raises <code>MetaData</code> v3’s <code>custody_group_count</code> (and <code>/eth/v1/node/identity</code>’s copy), under a new sequence number, up to the startup count’s <code>sampling_size</code>: groups the node already subscribes to, stores, requires for availability and serves. At the default count that is 8, all one attached validator requires. A requirement past it is recorded and warned about; the next start applies it</td></tr>
+<tr><td>History</td><td><code>ethlambda_storage::CustodyRecord</code>, metadata keys <code>custodied_group_count</code> and <code>custody_since_slot</code></td><td>Each start records how many groups it holds, just before its chain actor spawns, so a start that fails earlier records nothing. A start that holds more than the previous one records the slot after the highest block the directory holds (the head’s or a side branch’s, whose blocks carry only the old set’s columns), and <code>Status</code> v2 reports the later of that and the anchor as <code>earliest_available_slot</code>, since nothing backfills the new groups’ older columns. A directory with no record is taken as holding its set from the anchor</td></tr>
+</tbody>
+</table>
+</div>
+<p>Known gaps:</p>
+<ul>
+<li><strong>The custody set is fixed for the life of the process.</strong> The gossip
+subscriptions (<code>BeaconWire::custody_columns</code>), the chain actor’s
+availability check and envelope gate, the engine’s <code>forkchoiceUpdatedV4</code>
+custody columns and the Beacon API’s <code>CustodyColumns</code> each hold a copy made
+at startup, so a requirement past the startup sampling size takes a restart.
+Advertising and custodying therefore never disagree: the runtime raise stays
+inside the held set.</li>
+<li><strong>The ENR’s <code>cgc</code> keeps its startup value until a restart.</strong> ethrex’s
+<code>DiscoveryServer</code> cannot replace the record it serves, the same gap as the
+<code>eth2</code> entry at a fork boundary. A runtime raise reaches <code>MetaData</code> only,
+which understates nothing a peer relies on: a peer reading only the record
+asks this node for fewer columns than it holds.</li>
+<li><strong>No backfill.</strong> After a start that grew the set, <code>earliest_available_slot</code>
+stays at that start’s slot rather than moving back as a backfill would let it.</li>
+</ul>
 <h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
 <div class="table-wrapper">
 <table>
