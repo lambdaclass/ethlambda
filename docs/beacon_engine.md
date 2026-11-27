@@ -354,21 +354,23 @@ is also admitted against a budget, before the precheck runs:
 `MAX_ASKS_PER_SLOT` (4) per block slot, spent whether or not the precheck
 passes, and `MAX_ASKS_IN_FLIGHT` (4) at once, held from the engine call through
 the cell computation and the chain checks. That bounds the BLS verifications
-on the chain actor and the blocking-pool work a flood of forged roots can buy.
-The cost: forged roots that arrive first can spend a slot's budget before the
-genuine block, which is then left to gossip and the peer asks, where a miss
-leaves it anyway. Skips are counted in
+this ask adds on the chain actor and the blocking-pool work a flood of roots
+can buy. A root whose signature fails never gets that far: the import runs the
+same precheck before it holds a block (`precheck_before_waiting`) and refuses
+it instead. What reaches the budget was signed by the validator it names,
+which past the parent state's proposer lookahead need not be the slot's
+proposer (see below). The cost: such roots that arrive first can spend a
+slot's budget before the genuine block, which is then left to gossip and the
+peer asks, where a miss leaves it anyway. Skips are counted in
 `lean_engine_get_blobs_skipped_total{reason}`.
 
 The precheck is a filter, not the guard: the built columns go through every
-chain check before they are published (see the build below). It saves an engine
-call and a cell computation for a block whose signature already fails, which
-range sync and by-root answers can deliver, since they never pass gossip
-validation and the import checks the signature only after data availability.
-It cannot catch everything: past the parent state's proposer lookahead,
+chain check before they are published (see the build below). Since the import
+ran it before the hold, it repeats a check the block has already passed, at one
+more BLS verification per first hold of a block that would be asked about. It
+cannot catch everything: past the parent state's proposer lookahead,
 `precheck_block` checks the signature against whichever validator the block
-names, not that this validator is the slot's proposer. It costs one BLS
-verification per first hold of a block that would be asked about.
+names, not that this validator is the slot's proposer.
 
 **The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
 value `osaka.md` gives the method), outside the retry ladder. The call races
