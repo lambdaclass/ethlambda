@@ -1151,6 +1151,61 @@ async fn valid_preferences_are_cached_and_published_once() {
     assert_eq!(world.network.proposer_preferences.lock().unwrap().len(), 1);
 }
 
+/// `GET /eth/v1/beacon/proposer_preferences` serves what the market holds,
+/// filtered by slot and dependent root, in JSON or SSZ.
+#[tokio::test]
+async fn held_preferences_are_listed_and_filtered() {
+    let world = World::new();
+    let app = world.app(None);
+    let signed = world.preferences(address(0xaa), 30_000_000);
+    let reply = send(
+        &app,
+        preferences_request(std::slice::from_ref(&signed), Some("gloas")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // One for a slot the clock has passed, which the market keeps until it
+    // next records preferences: not upcoming, so never listed.
+    let mut stale = signed.clone();
+    stale.message.proposal_slot = HEAD_SLOT - 1;
+    assert!(world.market.record_preferences(stale, 0));
+
+    let get = |query: String, accept: &'static str| {
+        Request::get(format!("/eth/v1/beacon/proposer_preferences{query}"))
+            .header("accept", accept)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let json = "application/json";
+    let root = format!("0x{}", hex::encode(signed.message.dependent_root.0));
+
+    let reply = send(&app, get(String::new(), json)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["version"], "gloas");
+    assert_eq!(body["data"], serde_json::json!([signed.clone()]));
+
+    let reply = send(
+        &app,
+        get(format!("?slot={SLOT}&dependent_root={root}"), json),
+    )
+    .await;
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    let reply = send(&app, get(format!("?slot={}", SLOT + 1), json)).await;
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(body["data"].as_array().unwrap().is_empty());
+
+    let reply = send(&app, get(String::new(), "application/octet-stream")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, signed.to_ssz());
+
+    for bad in ["?slot=soon", "?dependent_root=0x1234"] {
+        let reply = send(&app, get(bad.to_string(), json)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
 /// The validator client's own path for a proposal at `slot`, end to end
 /// against `world`'s node: it reads the proposer duty and its v2
 /// `dependent_root` from the served duties route, signs with

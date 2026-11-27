@@ -450,8 +450,10 @@ passing the fork epoch no longer forces the sync status to syncing. Fork choice
 records the head node's payload status next to the head root
 (`Store::head_payload_status`, in memory, recomputed by the first head
 computation after a restart), which the envelope by-range server reads to
-withhold the head's envelope while the head is the EMPTY node. The node is
-still only a follower: the validator-client endpoints refuse a gloas epoch.
+withhold the head's envelope while the head is the EMPTY node. The node also
+serves gloas validator duties: block and envelope production, attestation and
+aggregation, payload timeliness committee duties and proposer preferences (see
+[rpc.md](./rpc.md)).
 
 ### The envelope pipeline in the chain actor
 
@@ -843,8 +845,8 @@ that is not ignored passes on both presets:
 
 | Preset | Fixture cases passed | Ignored |
 |--------|----------------------|---------|
-| mainnet | 7556 | 986 |
-| minimal | 49650 | 6410 |
+| mainnet | 7640 | 902 |
+| minimal | 49734 | 6326 |
 
 These are the counts at `v1.7.0-beta.5`, each the spec binary's own run
 (`make test-beacon-mainnet` also runs the lib tests, which are not counted
@@ -870,9 +872,11 @@ ignored runs. The ignored cases are deliberate exclusions:
   through gloas. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
 - `networking/gossip_*` cases outside what the node validates: every fork's
-  cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
-  of the aggregate and attestation topics (block and data column validate fulu
-  and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
+  cases for topics it has no validator for (`IGNORED_HANDLERS`), cases from
+  forks a validated topic's rules do not cover (`validated_forks`: fulu and
+  gloas for every validated topic except the four gloas-only ones, and
+  electra too for the four operation topics, whose rules take an electra
+  head), and the vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
 - Cases generated with BLS ignored (`bls_setting: 2`), whose stub signatures

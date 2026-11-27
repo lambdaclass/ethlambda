@@ -213,7 +213,7 @@ out over req/resp is under [Data column sidecars](#data-column-sidecars).
 Every beacon message is held by gossipsub until it has a verdict
 (`validate_messages()` is on for this wire only). Blocks, data column
 sidecars, aggregates, subnet attestations and the four operation topics are all
-validated by fulu's gossip rules, or (operations aside) gloas's modified ones
+validated by fulu's gossip rules, or gloas's modified ones
 from the fork on (`ethlambda_state_transition::beacon::gossip`, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded `spawn_blocking` task whose verdict comes back to the actor
@@ -298,14 +298,27 @@ proposer, and the validators an attester slashing slashes) live in
 operation a block already included and a peer re-gossips is IGNOREd rather than
 REJECTed. An attester slashing's range and slashability checks run before its
 BLS checks. What Accepts goes into `Store::operation_pool`, which block
-production packs from (see [rpc.md](./rpc.md#validator-endpoints)). The rules
-are electra's shapes against an electra or fulu head: under a gloas head every
-operation is IGNOREd (`state_unavailable`), and a gloas-shaped attester
-slashing is IGNOREd (`no_consumer`) at decode, like a phase0-shaped one.
+production packs from, fulu and gloas blocks alike (see
+[rpc.md](./rpc.md#validator-endpoints)). The rules run against an electra, fulu
+or gloas head; an older head IGNOREs (`state_unavailable`). Gloas changes none
+of the four rules, only the attester slashing's container: EIP-7688 makes
+`IndexedAttestation` progressive, which changes its merkle root and drops the
+indices' SSZ bound, but no field and no byte of the encoding. An
+`attester_slashing` payload is decoded in the container of its topic digest's
+fork, not the fork of its votes' slot (evidence about an old vote is still the
+current fork's payload type), then held in electra's shape by the rules, the
+pool and block production. Every valid gloas slashing fits that shape, since
+gloas's `is_valid_indexed_attestation` bounds the indices by
+`MAX_VALIDATORS_PER_SLOT` as electra's container does; one that does not is
+REJECTed at decode. A phase0-shaped slashing (a pre-electra digest) is IGNOREd
+(`no_consumer`). Publishing sends the same bytes under any digest from electra
+on.
 
-`sync_committee_contribution_and_proof` is decoded, logged at `debug`, and
-IGNOREd, since nothing consumes it; an undecodable payload on any topic is
-REJECTed.
+`sync_committee_contribution_and_proof` and the `sync_committee_{subnet_id}`
+messages are validated in p2p on their own permit pool
+(`gossip::sync_committee`, `p2p/src/beacon/sync_committee.rs`), and accepted
+ones go into the shared `SyncCommitteePool`. An undecodable payload on any
+topic is REJECTed.
 
 Publication runs on the Beacon API's `POST /eth/v2/beacon/blocks`, the only
 path that puts a block of this node's own on the wire. It gossips the block on

@@ -47,7 +47,7 @@ use super::topics;
 /// module's own logging uses came with it.
 pub use ethlambda_types::beacon::containers::SignedAggregateAndProof;
 
-/// Slashing evidence, in whichever shape the slot's fork gives it. Electra
+/// Slashing evidence, in whichever shape the topic's fork gives it. Electra
 /// widened `IndexedAttestation`'s committee bound; gloas made it progressive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttesterSlashing {
@@ -178,6 +178,42 @@ pub fn attester_slashing_slot(bytes: &[u8]) -> Result<Slot, DecodeError> {
         bytes,
         attestation_1.checked_add(4).ok_or(DecodeError::Truncated)?,
     )
+}
+
+/// Decode an `attester_slashing` payload in `fork`'s container.
+///
+/// The gossip handler passes the fork of the topic's digest, which is what
+/// sets a gossip payload's type: evidence about an old vote is still the
+/// current fork's container. The three shapes share a byte layout and differ
+/// in their index bound (and, at gloas, merkle root), so reading the slot's
+/// fork instead would decode a slashing over a pre-electra vote as phase0's,
+/// which nothing consumes. [`decode_gossip`], which has no topic to read,
+/// falls back to the fork of the first attestation's slot.
+pub fn decode_attester_slashing(
+    fork: ForkName,
+    bytes: &[u8],
+) -> Result<AttesterSlashing, DecodeError> {
+    let decoded = match fork {
+        ForkName::Electra | ForkName::Fulu => {
+            electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
+        }
+        ForkName::Gloas => {
+            gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => {
+            phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
+        }
+        ForkName::Lean => {
+            unreachable!(
+                "no beacon topic digest or slot maps to Lean: it is absent from ForkName::ALL"
+            )
+        }
+    };
+    decoded.map_err(|_| DecodeError::Ssz)
 }
 
 /// The fork whose rules apply to `slot`.
@@ -369,27 +405,8 @@ pub fn decode_gossip(
             .map(|value| BeaconGossip::AggregateAndProof(Box::new(value))),
         topics::ATTESTER_SLASHING => {
             let fork = fork_at_slot(config, attester_slashing_slot(bytes)?);
-            let decoded = match fork {
-                ForkName::Electra | ForkName::Fulu => {
-                    electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
-                }
-                ForkName::Gloas => {
-                    gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
-                }
-                ForkName::Phase0
-                | ForkName::Altair
-                | ForkName::Bellatrix
-                | ForkName::Capella
-                | ForkName::Deneb => {
-                    phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
-                }
-                ForkName::Lean => {
-                    unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
-                }
-            };
-            decoded
+            decode_attester_slashing(fork, bytes)
                 .map(|value| BeaconGossip::AttesterSlashing(Box::new(value)))
-                .map_err(|_| DecodeError::Ssz)
         }
         topics::VOLUNTARY_EXIT => shared::SignedVoluntaryExit::from_ssz_bytes(bytes)
             .map(BeaconGossip::VoluntaryExit)

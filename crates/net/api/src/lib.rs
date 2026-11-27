@@ -830,6 +830,10 @@ pub enum GossipEvent {
     /// element its ring stores, which is boxed to keep that ring's slots
     /// small.
     SingleAttestation(Box<SingleAttestation>),
+    /// A voluntary exit, proposer slashing, attester slashing or BLS change
+    /// passed its topic's gossip rules, from gossip or the Beacon API's pool
+    /// routes (the four operation events). Boxed like the other wide payloads.
+    Operation(Box<BeaconOperation>),
 }
 
 /// Where `ethlambda-p2p` reports [`GossipEvent`]s.

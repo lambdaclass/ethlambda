@@ -57,10 +57,15 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
-    block_production::{empty_sync_aggregate, verified_sync_aggregate},
+    block_production::{
+        Operations, empty_sync_aggregate, pack_operations, verified_sync_aggregate,
+    },
     bls,
     builder_market::SharedBuilderMarket,
-    fork_choice::{gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs},
+    fork_choice::{
+        gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs,
+        is_proposer_equivocation,
+    },
     gloas_block_production::{
         GloasBidBlockInputs, GloasBlockInputs, GloasPayloadInputs, GloasProduced,
         assemble_gloas_block, assemble_gloas_block_on_bid, bid_is_includable,
@@ -70,12 +75,16 @@ use ethlambda_state_transition::beacon::{
     helpers::{accessors::get_domain, misc::compute_signing_root},
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::{
+        ExecutionEngine,
         block::{BlockProcessingOptions, RandaoVerification},
-        gloas::verify_execution_payload_envelope_signature,
+        gloas::{
+            apply_parent_execution_payload, verify_execution_payload_envelope,
+            verify_execution_payload_envelope_signature,
+        },
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
-use ethlambda_storage::{PubkeyIndexCache, Store};
+use ethlambda_storage::{ActiveBalanceCache, PubkeyIndexCache, Store};
 use ethlambda_types::{
     beacon::{
         config::Config,
@@ -524,6 +533,15 @@ async fn produce(
     );
 
     let candidates = store.attestation_pool().block_candidates();
+    let operation_candidates = {
+        let pool = store.operation_pool();
+        Operations {
+            proposer_slashings: pool.proposer_slashings(),
+            attester_slashings: pool.attester_slashings(),
+            voluntary_exits: pool.voluntary_exits(),
+            bls_to_execution_changes: pool.bls_to_execution_changes(),
+        }
+    };
     let messages = ptc_pool
         .lock()
         .expect("payload attestation pool lock poisoned")
@@ -543,13 +561,19 @@ async fn produce(
         let assembled = {
             let (config, prepared, bid) = (config.clone(), prepared.clone(), bid.clone());
             let (candidates, messages) = (candidates.clone(), messages.clone());
+            let (operation_candidates, sync_candidate) =
+                (operation_candidates.clone(), sync_candidate.clone());
             tokio::task::spawn_blocking(move || {
                 assemble_on_bid(
                     &config,
                     &prepared,
                     bid,
-                    candidates,
-                    messages,
+                    Candidates {
+                        attestations: candidates,
+                        operations: operation_candidates,
+                        payload_attestations: messages,
+                        sync_aggregate: sync_candidate,
+                    },
                     randao_reveal,
                     graffiti,
                 )
@@ -595,9 +619,12 @@ async fn produce(
                 &prepared,
                 built,
                 execution_requests,
-                candidates,
-                messages,
-                sync_candidate,
+                Candidates {
+                    attestations: candidates,
+                    operations: operation_candidates,
+                    payload_attestations: messages,
+                    sync_aggregate: sync_candidate,
+                },
                 randao_reveal,
                 graffiti,
             )
@@ -845,113 +872,202 @@ async fn build_payload(
     })
 }
 
+/// What the pools offer a block, before it is checked against the block's
+/// pre-state.
+struct Candidates {
+    attestations: Vec<containers::electra::Attestation>,
+    /// Slashings, exits and credential changes, in the pool's electra shapes.
+    operations: Operations,
+    payload_attestations: Vec<containers::gloas::PayloadAttestationMessage>,
+    /// What the committee signed at the previous slot over this block's parent.
+    sync_aggregate: Option<SyncAggregate>,
+}
+
+/// The body contents [`Candidates`] pack to against a block's pre-state.
+struct Packed {
+    attestations: Vec<containers::gloas::Attestation>,
+    operations: Operations,
+    payload_attestations: Vec<containers::gloas::PayloadAttestation>,
+    sync_aggregate: SyncAggregate,
+}
+
+impl Packed {
+    /// A body with nothing in it beyond what the chain requires, the fallback
+    /// when a packed one fails to build.
+    fn bare() -> Self {
+        Self {
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            payload_attestations: Vec::new(),
+            sync_aggregate: empty_sync_aggregate(),
+        }
+    }
+
+    fn is_bare(&self) -> bool {
+        self.attestations.is_empty()
+            && self.operations.is_empty()
+            && self.payload_attestations.is_empty()
+            && self.sync_aggregate == empty_sync_aggregate()
+    }
+}
+
+/// Each candidate list packed against `prepared.state`, the block's pre-state:
+/// what `process_block` would accept, in the order it applies them. The sync
+/// aggregate is verified exactly as `process_sync_aggregate` will check it; a
+/// candidate that fails becomes the empty aggregate rather than a block the
+/// chain would refuse. The slashings, exits and credential changes are packed
+/// against that state with the parent payload applied (see
+/// [`parent_payload_applied`]).
+fn pack(config: &Config, prepared: &Prepared, candidates: Candidates) -> Packed {
+    let Prepared {
+        state,
+        head_root,
+        head_slot,
+        ..
+    } = prepared;
+    let applied = parent_payload_applied(config, prepared);
+    Packed {
+        attestations: pack_gloas_attestations(state, candidates.attestations),
+        operations: pack_operations(
+            applied.as_ref().unwrap_or(state),
+            candidates.operations,
+            config,
+        ),
+        payload_attestations: pack_payload_attestations(
+            state,
+            *head_root,
+            *head_slot,
+            candidates.payload_attestations,
+            config,
+        ),
+        sync_aggregate: candidates
+            .sync_aggregate
+            .map_or_else(empty_sync_aggregate, |candidate| {
+                verified_sync_aggregate(state, candidate)
+            }),
+    }
+}
+
+/// `prepared.state` with the parent payload's execution requests applied, the
+/// state a gloas block's operations actually meet: `process_block` runs
+/// `process_parent_execution_payload` before `process_operations`. A parent
+/// withdrawal request may already have started a validator's exit or queued a
+/// partial withdrawal for it, and a consolidation request exits its source,
+/// so a pooled exit for that validator passes on `prepared.state` alone and
+/// then fails the block, whose retry drops everything else with it.
+///
+/// `None` when there is nothing to apply (`parent_requests` is empty unless
+/// the block builds on a full gloas parent) or the requests do not apply,
+/// which fails the block whatever is packed.
+fn parent_payload_applied(config: &Config, prepared: &Prepared) -> Option<BeaconState> {
+    if prepared.parent_requests == ExecutionRequests::default() {
+        return None;
+    }
+    let mut applied = prepared.state.clone();
+    apply_parent_execution_payload(
+        &mut applied,
+        &prepared.parent_requests,
+        config,
+        &ActiveBalanceCache::default(),
+        &prepared.pubkey_indices,
+    )
+    .inspect_err(|err| warn!(%err, "Applying the parent payload's requests failed"))
+    .ok()?;
+    Some(applied)
+}
+
 /// The pure half: the pooled operations and the built payload into a block and
 /// its envelope.
-#[allow(clippy::too_many_arguments)]
 fn assemble(
     config: &Config,
     prepared: &Prepared,
     built: BuiltGloasPayload,
     execution_requests: ExecutionRequests,
-    candidates: Vec<containers::electra::Attestation>,
-    messages: Vec<containers::gloas::PayloadAttestationMessage>,
-    sync_candidate: Option<SyncAggregate>,
+    candidates: Candidates,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<GloasProduced, ApiError> {
     let Prepared {
         state,
-        head_root,
-        head_slot,
         parent_requests,
         options,
         pubkey_indices,
         ..
     } = prepared;
-    let attestations = pack_gloas_attestations(state, candidates);
-    let payload_attestations =
-        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
     let commitments = built.blobs_bundle.commitments;
-    // Verified exactly as `process_sync_aggregate` will check it, against the
-    // state the block is built on; a candidate that fails becomes the empty
-    // aggregate rather than a block the chain would refuse.
-    let sync_aggregate = sync_candidate.map_or_else(empty_sync_aggregate, |candidate| {
-        verified_sync_aggregate(state, candidate)
-    });
-    let has_sync_aggregate = sync_aggregate != empty_sync_aggregate();
-    let inputs = |attestations, payload_attestations, sync_aggregate| GloasBlockInputs {
-        sync_aggregate,
+    let inputs = |packed: Packed| GloasBlockInputs {
+        sync_aggregate: packed.sync_aggregate,
         randao_reveal,
         graffiti,
-        attestations,
-        payload_attestations,
+        attestations: packed.attestations,
+        operations: packed.operations,
+        payload_attestations: packed.payload_attestations,
         parent_execution_requests: parent_requests.clone(),
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: commitments.clone(),
         execution_requests: execution_requests.clone(),
     };
-    let operations = attestations.len() + payload_attestations.len();
-    let attempt = inputs(attestations, payload_attestations, sync_aggregate);
-    match assemble_gloas_block(state, attempt, config, pubkey_indices, *options) {
+    let packed = pack(config, prepared, candidates);
+    let bare = packed.is_bare();
+    match assemble_gloas_block(state, inputs(packed), config, pubkey_indices, *options) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, and
-        // the sync aggregate was verified above, so this should not happen; but
-        // a block without them still earns the proposal, and one that fails to build earns nothing.
-        Err(err) if operations > 0 || has_sync_aggregate => {
+        // the sync aggregate was verified, so this should not happen; but a
+        // block without them still earns the proposal, and one that fails to
+        // build earns nothing.
+        Err(err) if !bare => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
-            let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
-            assemble_gloas_block(state, bare, config, pubkey_indices, *options)
-                .map_err(|_| ApiError::Internal("the block failed to build"))
+            assemble_gloas_block(
+                state,
+                inputs(Packed::bare()),
+                config,
+                pubkey_indices,
+                *options,
+            )
+            .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
     }
 }
 
 /// [`assemble`] for a block that commits to a builder's bid: no payload, no
-/// envelope. `process_block` on the block enforces the bid's own rules.
+/// envelope. `process_block` on the block enforces the bid's own rules. The
+/// body carries the same packed contents a self-built block would, sync
+/// aggregate and operations included.
 fn assemble_on_bid(
     config: &Config,
     prepared: &Prepared,
     signed_bid: SignedExecutionPayloadBid,
-    candidates: Vec<containers::electra::Attestation>,
-    messages: Vec<containers::gloas::PayloadAttestationMessage>,
+    candidates: Candidates,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<BeaconBlock, ApiError> {
     let Prepared {
         state,
-        head_root,
-        head_slot,
         parent_requests,
         options,
         pubkey_indices,
         ..
     } = prepared;
-    let attestations = pack_gloas_attestations(state, candidates);
-    let payload_attestations =
-        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
-    let inputs = |attestations, payload_attestations| GloasBidBlockInputs {
+    let inputs = |packed: Packed| GloasBidBlockInputs {
         randao_reveal,
         graffiti,
-        attestations,
-        payload_attestations,
+        attestations: packed.attestations,
+        operations: packed.operations,
+        payload_attestations: packed.payload_attestations,
         parent_execution_requests: parent_requests.clone(),
         signed_bid: signed_bid.clone(),
+        sync_aggregate: packed.sync_aggregate,
     };
-    let operations = attestations.len() + payload_attestations.len();
-    match assemble_gloas_block_on_bid(
-        state,
-        inputs(attestations, payload_attestations),
-        config,
-        pubkey_indices,
-        *options,
-    ) {
+    let packed = pack(config, prepared, candidates);
+    let bare = packed.is_bare();
+    match assemble_gloas_block_on_bid(state, inputs(packed), config, pubkey_indices, *options) {
         Ok(block) => Ok(block),
-        Err(err) if operations > 0 => {
+        Err(err) if !bare => {
             warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
             assemble_gloas_block_on_bid(
                 state,
-                inputs(Vec::new(), Vec::new()),
+                inputs(Packed::bare()),
                 config,
                 pubkey_indices,
                 *options,
@@ -989,7 +1105,7 @@ async fn get_envelope(
     with_consensus_version(response, ForkName::Gloas)
 }
 
-fn parse_root(text: &str) -> Option<H256> {
+pub(crate) fn parse_root(text: &str) -> Option<H256> {
     let bytes: [u8; 32] = hex::decode(text.strip_prefix("0x")?)
         .ok()?
         .try_into()
@@ -1018,7 +1134,42 @@ async fn wait_for_block(
     }
 }
 
-/// `POST /eth/v1/beacon/execution_payload_envelopes`, SSZ only.
+/// `broadcast_validation` on the envelope POST: how much is checked before
+/// anything is broadcast. A failure at the requested level is a `400`, and
+/// nothing goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EnvelopeValidation {
+    /// The default: the checks below, which are the topic's gossip rules for
+    /// an envelope this node's own block names, plus its data columns.
+    Gossip,
+    /// Also `verify_execution_payload_envelope` against the block's
+    /// post-state, every field and the execution requests included. The
+    /// execution client's verdict is left to the import, which runs anyway.
+    Consensus,
+    /// Also refuse an envelope whose block's proposer published another block
+    /// for the slot that this node holds, the builders' guard against a
+    /// proposer that equivocates to unbundle a revealed payload.
+    ConsensusAndEquivocation,
+}
+
+impl EnvelopeValidation {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value {
+            None | Some("gossip") => Ok(Self::Gossip),
+            Some("consensus") => Ok(Self::Consensus),
+            Some("consensus_and_equivocation") => Ok(Self::ConsensusAndEquivocation),
+            Some(_) => Err(ApiError::BadRequest("invalid broadcast_validation")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvelopeQuery {
+    broadcast_validation: Option<String>,
+}
+
+/// `POST /eth/v1/beacon/execution_payload_envelopes`, JSON or SSZ by
+/// `Content-Type`.
 ///
 /// The envelope must fulfill the bid of a gloas block this node holds (waiting
 /// briefly for the block, see [`BLOCK_WAIT`]), carry the proposer's signature
@@ -1028,14 +1179,21 @@ async fn wait_for_block(
 /// blobs, checked against the bid's commitments, and gossiped with the
 /// envelope. Their cell proofs are verified only when the blobs came in the
 /// body: cached ones are this node's own execution client's (see the check).
+/// `broadcast_validation` adds the consensus checks, and the equivocation
+/// check after them (see [`EnvelopeValidation`]).
 async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(cache): Extension<PayloadCache>,
     events: Option<Extension<EventBus>>,
+    Query(query): Query<EnvelopeQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let validation = match EnvelopeValidation::parse(query.broadcast_validation.as_deref()) {
+        Ok(validation) => validation,
+        Err(err) => return err.into_response(),
+    };
     post_envelope_emitting(
         &store,
         &p2p,
@@ -1044,6 +1202,7 @@ async fn post_envelope(
         &headers,
         &body,
         BLOCK_WAIT,
+        validation,
     )
     .await
 }
@@ -1058,9 +1217,20 @@ async fn post_envelope_waiting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
-    post_envelope_emitting(store, p2p, cache, None, headers, body, block_wait).await
+    post_envelope_emitting(
+        store,
+        p2p,
+        cache,
+        None,
+        headers,
+        body,
+        block_wait,
+        EnvelopeValidation::Gossip,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn post_envelope_emitting(
     store: &Store,
     p2p: &RpcToP2PRef,
@@ -1069,6 +1239,7 @@ async fn post_envelope_emitting(
     headers: &HeaderMap,
     body: &[u8],
     block_wait: Duration,
+    validation: EnvelopeValidation,
 ) -> Response {
     if consensus_version(headers) != Some(ForkName::Gloas) {
         return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
@@ -1159,11 +1330,31 @@ async fn post_envelope_emitting(
     // Signature and the columns' proofs are CPU-bound; off the runtime.
     let commitments: Vec<_> = bid.blob_kzg_commitments.iter().copied().collect();
     let envelope_for_check = signed.clone();
+    let (store_for_check, config) = (store.clone(), store.config());
     let checked = tokio::task::spawn_blocking(move || {
         if !verify_execution_payload_envelope_signature(&post_state, &envelope_for_check)
             .map_err(|_| ApiError::BadRequest("the envelope's signer is unknown"))?
         {
             return Err(ApiError::BadRequest("invalid envelope signature"));
+        }
+        if validation >= EnvelopeValidation::Consensus {
+            verify_execution_payload_envelope(
+                &post_state,
+                &envelope_for_check,
+                &config,
+                &ExecutionEngine::valid(),
+            )
+            .map_err(|_| ApiError::BadRequest("the envelope fails the consensus checks"))?;
+        }
+        if validation >= EnvelopeValidation::ConsensusAndEquivocation {
+            let index = store_for_check.block_index();
+            let equivocation = is_proposer_equivocation(&store_for_check, &index, block_root)
+                .map_err(|_| ApiError::Internal("the equivocation check failed"))?;
+            if equivocation {
+                return Err(ApiError::BadRequest(
+                    "the envelope's block is an equivocation",
+                ));
+            }
         }
         let sidecars = if blobs.is_empty() {
             Vec::new()
@@ -1610,6 +1801,7 @@ mod tests {
         assemble_gloas_block(
             state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate:
                     ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(state),
@@ -1657,6 +1849,19 @@ mod tests {
 
     /// `assemble` over the fixture's build state with `candidate` pooled.
     fn assembled_with(state: &BeaconState, candidate: Option<SyncAggregate>) -> GloasProduced {
+        assembled_from(
+            state,
+            Candidates {
+                attestations: Vec::new(),
+                operations: Operations::default(),
+                payload_attestations: Vec::new(),
+                sync_aggregate: candidate,
+            },
+        )
+    }
+
+    /// `assemble` over the fixture's build state with `candidates` pooled.
+    fn assembled_from(state: &BeaconState, candidates: Candidates) -> GloasProduced {
         use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
             payload_for, randao_reveal,
         };
@@ -1692,13 +1897,179 @@ mod tests {
             &prepared,
             built,
             requests,
-            Vec::new(),
-            Vec::new(),
-            candidate,
+            candidates,
             randao_reveal(state),
             Bytes32::ZERO,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_pooled_proposer_slashing_is_packed_into_the_gloas_body() {
+        use ethlambda_state_transition::beacon::{
+            gloas_block_production::test_support::state_to_build_on, helpers::test_state::sign_for,
+        };
+        use ethlambda_types::beacon::containers::shared::{
+            BeaconBlockHeader, ProposerSlashing, SignedBeaconBlockHeader,
+        };
+        let state = state_to_build_on();
+        // Not the block's own proposer, which the slashing would leave slashed.
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let offender = (proposer + 1) % state.validator_count() as u64;
+        let slot = state.slot() - 1;
+        let domain = get_domain(
+            &state,
+            constants::DOMAIN_BEACON_PROPOSER,
+            Some(compute_epoch_at_slot(slot)),
+        );
+        let signed = |body_byte: u8| {
+            let message = BeaconBlockHeader {
+                slot,
+                proposer_index: offender,
+                body_root: H256::repeat_byte(body_byte),
+                ..Default::default()
+            };
+            let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+            SignedBeaconBlockHeader {
+                message,
+                signature: sign_for(offender as usize, signing_root),
+            }
+        };
+        let slashing = ProposerSlashing {
+            signed_header_1: signed(1),
+            signed_header_2: signed(2),
+        };
+        // A second, forged copy for another validator: packing drops it.
+        let mut forged = slashing.clone();
+        forged.signed_header_1.message.proposer_index = (offender + 1) % 64;
+        forged.signed_header_2.message.proposer_index = (offender + 1) % 64;
+        let produced = assembled_from(
+            &state,
+            Candidates {
+                attestations: Vec::new(),
+                operations: Operations {
+                    proposer_slashings: vec![slashing.clone(), forged],
+                    ..Operations::default()
+                },
+                payload_attestations: Vec::new(),
+                sync_aggregate: None,
+            },
+        );
+        assert_eq!(
+            produced.block.body.proposer_slashings.to_vec(),
+            vec![slashing]
+        );
+    }
+
+    /// Gloas applies the parent payload's execution requests before the
+    /// block's operations, so a pooled exit for a validator the parent's
+    /// full-exit request has already exited would fail the block. Packing
+    /// leaves it out, and packs it when the parent carries no such request.
+    #[test]
+    fn an_exit_the_parent_payload_already_started_is_not_packed() {
+        use ethlambda_state_transition::beacon::helpers::test_state::sign_for;
+        use ethlambda_types::beacon::containers::{
+            electra::WithdrawalRequest,
+            shared::{SignedVoluntaryExit, VoluntaryExit},
+        };
+        use ethlambda_types::beacon::signing::compute_domain;
+
+        // Every validator of the fixture is active since epoch 0; with no
+        // `SHARD_COMMITTEE_PERIOD` any of them may exit at the state's epoch.
+        let mut config = config();
+        config.shard_committee_period = 0;
+        let mut state = state_to_build_on();
+        let exiting = 3u64;
+        let address = ExecutionAddress::repeat_byte(0x42);
+        {
+            let validator = state.validator_mut(exiting).unwrap();
+            let mut credentials = [0u8; 32];
+            credentials[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
+            credentials[12..].copy_from_slice(&address.0);
+            validator.withdrawal_credentials = H256(credentials);
+        }
+        state.apply_pending_mutations();
+
+        let message = VoluntaryExit {
+            epoch: 0,
+            validator_index: exiting,
+        };
+        let domain = compute_domain(
+            constants::DOMAIN_VOLUNTARY_EXIT,
+            config.capella_fork_version,
+            state.genesis_validators_root(),
+        );
+        let exit = SignedVoluntaryExit {
+            message,
+            signature: sign_for(
+                exiting as usize,
+                compute_signing_root(message.hash_tree_root(), domain),
+            ),
+        };
+        let full_exit = WithdrawalRequest {
+            source_address: address,
+            validator_pubkey: state.validator(exiting).unwrap().pubkey,
+            amount: constants::FULL_EXIT_REQUEST_AMOUNT,
+        };
+        let requests = ExecutionRequests {
+            withdrawals: vec![full_exit].into(),
+            ..Default::default()
+        };
+
+        // The request does exit the validator once applied.
+        let mut applied = state.clone();
+        apply_parent_execution_payload(
+            &mut applied,
+            &requests,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            applied.validator(exiting).unwrap().exit_epoch,
+            constants::FAR_FUTURE_EPOCH
+        );
+
+        let packed_exits = |parent_requests: ExecutionRequests| {
+            // Packing reads no payload input.
+            let inputs = gloas_payload_inputs(
+                &state,
+                true,
+                &ExecutionRequests::default(),
+                &config,
+                &PubkeyIndexCache::default(),
+            )
+            .unwrap();
+            let prepared = Prepared {
+                state: state.clone(),
+                inputs,
+                proposer: get_beacon_proposer_index(&state).unwrap(),
+                head_root: H256::repeat_byte(5),
+                head_slot: state.slot() - 1,
+                parent_requests,
+                preferences: None,
+                options: BlockProcessingOptions::default(),
+                pubkey_indices: Default::default(),
+            };
+            let candidates = Candidates {
+                attestations: Vec::new(),
+                operations: Operations {
+                    voluntary_exits: vec![exit.clone()],
+                    ..Operations::default()
+                },
+                payload_attestations: Vec::new(),
+                sync_aggregate: None,
+            };
+            pack(&config, &prepared, candidates)
+                .operations
+                .voluntary_exits
+        };
+        assert_eq!(
+            packed_exits(ExecutionRequests::default()),
+            vec![exit.clone()]
+        );
+        assert!(packed_exits(requests).is_empty());
     }
 
     #[test]
@@ -1757,6 +2128,92 @@ mod tests {
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, signed);
         assert!(published[0].1.is_empty());
+    }
+
+    #[test]
+    fn broadcast_validation_names_three_levels_and_defaults_to_gossip() {
+        assert_eq!(
+            EnvelopeValidation::parse(None).unwrap(),
+            EnvelopeValidation::Gossip
+        );
+        for (name, level) in [
+            ("gossip", EnvelopeValidation::Gossip),
+            ("consensus", EnvelopeValidation::Consensus),
+            (
+                "consensus_and_equivocation",
+                EnvelopeValidation::ConsensusAndEquivocation,
+            ),
+        ] {
+            assert_eq!(EnvelopeValidation::parse(Some(name)).unwrap(), level);
+        }
+        assert!(EnvelopeValidation::parse(Some("full")).is_err());
+    }
+
+    /// An envelope whose `prev_randao` is not its bid's passes the gossip
+    /// level, which checks the signature and the bid's builder and block
+    /// hash, and is refused, unpublished, at `consensus` and above. A valid
+    /// one passes every level.
+    #[tokio::test]
+    async fn the_consensus_levels_refuse_what_gossip_lets_through() {
+        let state = state_to_build_on();
+        let produced = produced_without_blobs(&state);
+        let signature = sign_block(&state, &produced.block);
+        let (store, _root, post) = store_with_block(&state, &produced, signature);
+        let valid = signed_envelope(&post, &produced);
+        let mut tampered_message = produced.envelope.clone();
+        tampered_message.payload.prev_randao = Bytes32::repeat_byte(9);
+        let tampered = SignedExecutionPayloadEnvelope {
+            signature: sign_envelope(&post, produced.block.proposer_index, &tampered_message),
+            message: tampered_message,
+        };
+
+        let post_at = |signed: &SignedExecutionPayloadEnvelope, level| {
+            let (store, signed) = (store.clone(), signed.clone());
+            async move {
+                let network = Arc::new(RecordingNetwork::default());
+                let p2p: RpcToP2PRef = network.clone();
+                let (headers, body) = envelope_request(Some("false"), signed.to_ssz());
+                let response = post_envelope_emitting(
+                    &store,
+                    &p2p,
+                    &PayloadCache::default(),
+                    None,
+                    &headers,
+                    &body,
+                    Duration::from_millis(100),
+                    level,
+                )
+                .await;
+                let published = network.envelopes.lock().unwrap().len();
+                (response.status(), published)
+            }
+        };
+
+        for level in [
+            EnvelopeValidation::Gossip,
+            EnvelopeValidation::Consensus,
+            EnvelopeValidation::ConsensusAndEquivocation,
+        ] {
+            assert_eq!(
+                post_at(&valid, level).await,
+                (StatusCode::OK, 1),
+                "{level:?}"
+            );
+        }
+        assert_eq!(
+            post_at(&tampered, EnvelopeValidation::Gossip).await,
+            (StatusCode::OK, 1)
+        );
+        for level in [
+            EnvelopeValidation::Consensus,
+            EnvelopeValidation::ConsensusAndEquivocation,
+        ] {
+            assert_eq!(
+                post_at(&tampered, level).await,
+                (StatusCode::BAD_REQUEST, 0),
+                "{level:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1963,6 +2420,7 @@ mod tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate:
                     ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),

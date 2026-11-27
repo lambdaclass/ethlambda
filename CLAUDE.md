@@ -431,9 +431,13 @@ actual_slot = finalized_slot + 1 + relative_index
     record is written just before the chain actor spawns, so a failed start leaves it alone
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
-    which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
-    `Store::operation_pool`; the attestation pool is in `Store` too. Both are in memory, and
-    block production packs the operation pool through `pack_operations`
+    which must be electra, fulu or gloas) and feed `Store::operation_pool`; the attestation
+    pool is in `Store` too. Both are in memory, and block production (fulu and gloas, bid
+    blocks included) packs the operation pool through `pack_operations`. A gloas attester
+    slashing has electra's fields and SSZ bytes; its progressive `IndexedAttestation` changes
+    only the merkle root and the index bound. So it is decoded by the topic digest's fork,
+    held in electra's shape everywhere (`BeaconOperation`), published in those same bytes
+    and converted to gloas's container only for the gloas body
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
@@ -1147,11 +1151,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   choice. Ignored cases are the `LightClient*` containers (a different layer,
   out of scope), `networking/gossip_*` cases outside what the node validates
   (every fork's cases for topics it has no validator for, cases from forks a
-  validated topic's rules do not cover per `validated_forks`, gloas's
-  operation vectors among them, and the vectors in `SKIPPED`, which assume a
-  bad-block cache), cases generated with BLS ignored (`bls_setting: 2`, every
-  `fast_confirmation` case at v1.7.0-beta.5; see the signature-checks bullet
-  above), and the `heze` fixture tree. `heze` does
+  validated topic's rules do not cover per `validated_forks`, and the vectors
+  in `SKIPPED`, which assume a bad-block cache), cases generated with BLS
+  ignored (`bls_setting: 2`, every `fast_confirmation` case at
+  v1.7.0-beta.5; see the signature-checks bullet above), and the `heze`
+  fixture tree. `heze` does
   not parse as a `ForkName`, so `collect` would skip it silently;
   `UNMODELED_FORKS` names it and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory

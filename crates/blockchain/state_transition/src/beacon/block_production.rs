@@ -25,6 +25,7 @@ use ethlambda_types::beacon::{
             self, AggregationBits, Attestation, BeaconBlock, BeaconBlockBody, CommitteeBits,
             ConsolidationRequest, DepositRequest, ExecutionRequests, WithdrawalRequest,
         },
+        gloas,
         shared::{ProposerSlashing, SignedVoluntaryExit},
     },
     preset,
@@ -389,8 +390,22 @@ impl Operations {
 /// the scratch state (after the proposer slashings), most first, and packed up
 /// to `MAX_ATTESTER_SLASHINGS_ELECTRA`. Every list is capped at its preset
 /// maximum.
+///
+/// The same function packs a gloas block, run on a gloas `state` with gloas's
+/// own slashing rules. Candidates and the result stay in electra's shape, which
+/// [`super::gloas_block_production`] converts into the gloas body. A gloas
+/// block applies its parent payload's execution requests before its
+/// operations, and those can exit a validator or queue a partial withdrawal
+/// for it, which invalidates its exit; so a gloas caller passes `state` with
+/// the parent payload already applied, or the packed exits may fail the block.
 pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Config) -> Operations {
     let mut scratch = state.clone();
+    // Gloas reads its own `AttesterSlashing`; the proposer-slashing, exit and
+    // credential-change rules are electra's at both forks (since
+    // consensus-specs v1.7.0-beta.5, `slash_validator` itself clears a slashed
+    // proposer's builder payments, so gloas no longer modifies
+    // `process_proposer_slashing`).
+    let at_gloas = matches!(state, BeaconState::Gloas(_));
     // One table for the whole scratch pass, slashings included (a slashing
     // starts an exit too): the scratch state is at the block's own slot, so
     // its total active balance cannot change between candidates.
@@ -426,13 +441,23 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         preset::MAX_ATTESTER_SLASHINGS_ELECTRA,
         config,
         |state, slashing, config, signatures| {
-            stf::electra::process_attester_slashing(
-                state,
-                slashing,
-                config,
-                &active_balances,
-                signatures,
-            )
+            if at_gloas {
+                stf::gloas::process_attester_slashing(
+                    state,
+                    &gloas::AttesterSlashing::from(slashing),
+                    config,
+                    &active_balances,
+                    signatures,
+                )
+            } else {
+                stf::electra::process_attester_slashing(
+                    state,
+                    slashing,
+                    config,
+                    &active_balances,
+                    signatures,
+                )
+            }
         },
     );
 
@@ -466,8 +491,10 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
 /// Candidates are applied in place, with no copy to roll back to. That is safe
 /// because every `process_*` used here runs all its checks (BLS verifies
 /// included) before its first write: `process_proposer_slashing` checks before
-/// `slash_validator`; electra's `process_attester_slashing` checks before its
-/// loop, and its final `slashed_any` check fails only if nothing was written;
+/// `slash_validator` (gloas's runs the same checks first, then clears the
+/// builder payment and slashes); electra's and gloas's
+/// `process_attester_slashing` check before their loop, and its final
+/// `slashed_any` check fails only if nothing was written;
 /// electra's `process_voluntary_exit` checks before `initiate_validator_exit`;
 /// `process_bls_to_execution_change` writes last. A rejected candidate
 /// therefore leaves the state untouched. Even a half-applied one could only

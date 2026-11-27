@@ -4,12 +4,12 @@
 //! The rules are the specification's `validate_voluntary_exit_gossip`
 //! (`phase0/p2p-interface.md`, modified in `deneb/p2p-interface.md` to pin the
 //! signature domain to the capella fork version), `validate_proposer_slashing_gossip`,
-//! `validate_attester_slashing_gossip` (phase0; electra changes only the
-//! `AttesterSlashing` type) and `validate_bls_to_execution_change_gossip`
+//! `validate_attester_slashing_gossip` (phase0; electra and gloas change only
+//! the `AttesterSlashing` type) and `validate_bls_to_execution_change_gossip`
 //! (`capella/p2p-interface.md`), as of consensus-specs v1.7.0-beta.5, which is
 //! what the conformance vectors are generated from. Electra modifies the exit
 //! rule (consensus-specs #5764): an exit for a validator with pending partial
-//! withdrawals is ignored.
+//! withdrawals is ignored. They apply under an electra, fulu or gloas head.
 //!
 //! Each function splits where the specification first reads `state`:
 //! `cheap_checks` is everything before it (the seen records, the clock, and
@@ -198,10 +198,16 @@ pub fn cheap_checks(
 /// The remaining conditions, checked against the head state as it stands
 /// (never advanced). Runs on a blocking thread.
 ///
-/// `Ignore(StateUnavailable)` when there is no head state, or when it is not
-/// electra or fulu. That is a deliberate deviation: this build only serves
-/// electra-shaped operations, where the specification would validate older
+/// `Ignore(StateUnavailable)` when there is no head state, or when it is
+/// older than electra. That is a deliberate deviation: this build serves the
+/// operations of electra onward, where the specification would validate older
 /// forks' shapes too.
+///
+/// Gloas changes none of these four rules. Its attester slashing has electra's
+/// fields (only the merkle root differs), so the gossip layer hands it over in
+/// electra's shape (see [`BeaconOperation`]), and gloas's
+/// `is_valid_indexed_attestation` bounds the indices by
+/// `MAX_VALIDATORS_PER_SLOT` exactly as electra's container does.
 pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
     let Some((_slot, head_root)) = store.beacon_head() else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
@@ -209,7 +215,10 @@ pub fn stateful_checks(store: &Store, operation: &BeaconOperation) -> Outcome {
     let Ok(Some(state)) = store.get_state(&head_root) else {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     };
-    if !matches!(state.fork_name(), ForkName::Electra | ForkName::Fulu) {
+    if !matches!(
+        state.fork_name(),
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas
+    ) {
         return Outcome::Ignore(IgnoreReason::StateUnavailable);
     }
     let config = store.config();
@@ -528,7 +537,19 @@ mod tests {
 
     #[test]
     fn a_validly_signed_exit_is_accepted() {
-        let mut state = fulu_parent(0);
+        assert_eq!(signed_exit_verdict(fulu_parent(0)), Outcome::Accept);
+    }
+
+    #[test]
+    fn a_validly_signed_exit_is_accepted_under_a_gloas_head() {
+        let state =
+            crate::beacon::helpers::test_state::with_signing_validators_at(ForkName::Gloas, 8);
+        assert_eq!(signed_exit_verdict(state), Outcome::Accept);
+    }
+
+    /// The verdict on validator 2's exit, signed by its own key, under a head
+    /// whose post-state is `state` moved past `SHARD_COMMITTEE_PERIOD`.
+    fn signed_exit_verdict(mut state: crate::beacon::containers::BeaconState) -> Outcome {
         // Past `SHARD_COMMITTEE_PERIOD` epochs since activation.
         let config = crate::beacon::config::Config::mainnet();
         *state.slot_mut() =
@@ -550,6 +571,6 @@ mod tests {
             message,
             signature: sign_for(2, signing_root),
         });
-        assert_eq!(stateful_checks(&store, &exit), Outcome::Accept);
+        stateful_checks(&store, &exit)
     }
 }

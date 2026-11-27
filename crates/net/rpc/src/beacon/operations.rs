@@ -28,7 +28,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_blockchain::EventBus;
+use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::gossip::{
     Outcome,
     operations::{SeenOperations, validate},
@@ -43,7 +44,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, error, warn};
 
 use crate::beacon::{
-    ApiError,
+    ApiError, emit_accepted,
     pool::{Failure, batch_response},
 };
 use crate::shared::content::with_consensus_version;
@@ -109,41 +110,64 @@ async fn get_bls_to_execution_changes(State(store): State<Store>) -> Response {
 async fn post_proposer_slashing(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    events: Option<Extension<EventBus>>,
     body: Bytes,
 ) -> Response {
-    submit::<shared::ProposerSlashing>(&store, &p2p, &body, "proposer slashing", |op| {
-        BeaconOperation::ProposerSlashing(op)
-    })
+    let events = events.map(|Extension(events)| events);
+    submit::<shared::ProposerSlashing>(
+        &store,
+        &p2p,
+        events.as_ref(),
+        &body,
+        "proposer slashing",
+        BeaconOperation::ProposerSlashing,
+    )
     .await
 }
 
 async fn post_attester_slashing(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    events: Option<Extension<EventBus>>,
     body: Bytes,
 ) -> Response {
-    submit::<electra::AttesterSlashing>(&store, &p2p, &body, "attester slashing", |op| {
-        BeaconOperation::AttesterSlashing(op)
-    })
+    let events = events.map(|Extension(events)| events);
+    submit::<electra::AttesterSlashing>(
+        &store,
+        &p2p,
+        events.as_ref(),
+        &body,
+        "attester slashing",
+        BeaconOperation::AttesterSlashing,
+    )
     .await
 }
 
 async fn post_voluntary_exit(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    events: Option<Extension<EventBus>>,
     body: Bytes,
 ) -> Response {
-    submit::<shared::SignedVoluntaryExit>(&store, &p2p, &body, "voluntary exit", |op| {
-        BeaconOperation::VoluntaryExit(op)
-    })
+    let events = events.map(|Extension(events)| events);
+    submit::<shared::SignedVoluntaryExit>(
+        &store,
+        &p2p,
+        events.as_ref(),
+        &body,
+        "voluntary exit",
+        BeaconOperation::VoluntaryExit,
+    )
     .await
 }
 
 async fn post_bls_to_execution_changes(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    events: Option<Extension<EventBus>>,
     body: Bytes,
 ) -> Response {
+    let events = events.map(|Extension(events)| events);
     let Ok(changes) = serde_json::from_slice::<Vec<SignedBLSToExecutionChange>>(&body) else {
         return ApiError::BadRequest("invalid request body").into_response();
     };
@@ -151,7 +175,15 @@ async fn post_bls_to_execution_changes(
     for (index, change) in changes.into_iter().enumerate() {
         let validator = change.message.validator_index;
         let operation = BeaconOperation::BlsToExecutionChange(change);
-        if let Err(rejection) = accept(&store, &p2p, operation, "BLS to execution change").await {
+        if let Err(rejection) = accept(
+            &store,
+            &p2p,
+            events.as_ref(),
+            operation,
+            "BLS to execution change",
+        )
+        .await
+        {
             // An internal failure stays a failure entry, as a publish failure
             // does for the attestation pool.
             let message = rejection.message();
@@ -172,6 +204,7 @@ async fn post_bls_to_execution_changes(
 async fn submit<T: DeserializeOwned>(
     store: &Store,
     p2p: &RpcToP2PRef,
+    events: Option<&EventBus>,
     body: &[u8],
     kind: &'static str,
     wrap: fn(T) -> BeaconOperation,
@@ -179,7 +212,7 @@ async fn submit<T: DeserializeOwned>(
     let Ok(operation) = serde_json::from_slice::<T>(body) else {
         return ApiError::BadRequest("invalid request body").into_response();
     };
-    match accept(store, p2p, wrap(operation), kind).await {
+    match accept(store, p2p, events, wrap(operation), kind).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(Rejection::Refused(message)) => {
             warn!(kind, reason = %message, "Refused a submitted operation");
@@ -206,10 +239,12 @@ impl Rejection {
     }
 }
 
-/// Validates `operation` under the gossip rules, then pools and publishes it.
+/// Validates `operation` under the gossip rules, then pools and publishes it,
+/// and reports it on the event stream as gossip's accepts are.
 async fn accept(
     store: &Store,
     p2p: &RpcToP2PRef,
+    events: Option<&EventBus>,
     operation: BeaconOperation,
     kind: &'static str,
 ) -> Result<(), Rejection> {
@@ -239,6 +274,9 @@ async fn accept(
     // Pooled as well as published: gossip never delivers a node its own
     // messages, so without this a block this node proposes would miss it.
     store.operation_pool().insert(operation.clone());
+    emit_accepted(events, || {
+        GossipEvent::Operation(Box::new(operation.clone()))
+    });
     p2p.publish_beacon_operation(operation)
         .map_err(|_| Rejection::Internal("the network actor is not running"))?;
     debug!(kind, "Accepted operation for gossip");
@@ -295,13 +333,15 @@ mod tests {
     /// `SHARD_COMMITTEE_PERIOD`, so any of them may exit. Validators 0 and 1
     /// hold BLS withdrawal credentials derived from their own key.
     fn fixture() -> Fixture {
-        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        fixture_at(ForkName::Fulu)
+    }
+
+    /// [`fixture`] with a head state of `fork`.
+    fn fixture_at(fork: ForkName) -> Fixture {
+        let mut state = with_signing_validators_at(fork, 64);
         let (probe, _) = beacon_store_at(state.clone());
         let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
-        let BeaconState::Fulu(fulu) = &mut state else {
-            unreachable!("built as fulu")
-        };
-        fulu.slot = compute_start_slot_at_epoch(wall_epoch);
+        *state.slot_mut() = compute_start_slot_at_epoch(wall_epoch);
         for index in 0..2u64 {
             let validator = state.validator_mut(index).unwrap();
             let mut credentials = hash(&validator.pubkey.0);
@@ -397,6 +437,41 @@ mod tests {
 
     const EXITS: &str = "/eth/v1/beacon/pool/voluntary_exits";
     const CHANGES: &str = "/eth/v1/beacon/pool/bls_to_execution_changes";
+
+    /// Under a gloas head the rules are unchanged: the exit is pooled,
+    /// published, and reported on the event stream like a gossip accept.
+    #[tokio::test]
+    async fn a_valid_exit_under_a_gloas_head_is_pooled_published_and_reported() {
+        let fixture = fixture_at(ForkName::Gloas);
+        let exit = signed_exit(&fixture, 3);
+        let events = EventBus::new(8);
+        let mut received = events.subscribe();
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network))
+            .layer(Extension(events));
+        let request = Request::post(EXITS)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&exit).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            fixture.store.operation_pool().voluntary_exits(),
+            vec![exit.clone()]
+        );
+        assert_eq!(
+            *fixture.network.operations.lock().unwrap(),
+            vec![BeaconOperation::VoluntaryExit(exit.clone())]
+        );
+        let ethlambda_blockchain::ChainEvent::VoluntaryExit(reported) =
+            received.try_recv().unwrap()
+        else {
+            panic!("expected the voluntary_exit event");
+        };
+        assert_eq!(*reported, exit);
+    }
 
     #[tokio::test]
     async fn a_valid_exit_is_pooled_and_published() {

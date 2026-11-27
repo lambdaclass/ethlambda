@@ -461,8 +461,9 @@ impl Validated {
 /// Report an accepted object on the Beacon API's event stream, for the topics
 /// whose objects never reach the chain actor that publishes the rest (bids
 /// and preferences stop here, the actor hearing only a preference's slot; a
-/// payload attestation message only ever feeds fork choice, and a subnet
-/// attestation is relayed and nothing more).
+/// payload attestation message only ever feeds fork choice, a subnet
+/// attestation is relayed and nothing more, and an operation goes to the
+/// pool).
 ///
 /// Only on `Accept`, since each event names objects that passed the topic's
 /// rules. A queued envelope has not, so `execution_payload_gossip` waits for
@@ -493,6 +494,11 @@ fn publish_gossip_event(server: &P2PServer, object: &Validated) {
         // to. Any subscriber turns it on, whatever its topics.
         Validated::Attestation { attestation, .. } if sink.has_subscribers() => {
             GossipEvent::SingleAttestation(attestation.clone())
+        }
+        // The four operation events, whatever the fork: an attester
+        // slashing's JSON is the same in electra's container and gloas's.
+        Validated::Operation(operation) if sink.has_subscribers() => {
+            GossipEvent::Operation(operation.clone())
         }
         _ => return,
     };
