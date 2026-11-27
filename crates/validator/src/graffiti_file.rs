@@ -91,11 +91,14 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// answer.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GraffitiFileError {
-    #[error("graffiti file {path}: {source}")]
+    /// The I/O error is in the message and is not also the error's source:
+    /// the runtime logs print the message alone, and a startup report prints
+    /// the message and then every source, so it would print the I/O error
+    /// twice. (A field named `source` is a source whether marked or not.)
+    #[error("graffiti file {path}: {error}")]
     Read {
         path: String,
-        #[source]
-        source: Arc<std::io::Error>,
+        error: Arc<std::io::Error>,
     },
     #[error("graffiti file {path} is over {MAX_FILE_BYTES} bytes")]
     TooLarge { path: String },
@@ -246,9 +249,9 @@ impl GraffitiFile {
     /// [`MAX_FILE_BYTES`].
     pub fn read_now(&self) -> Result<GraffitiTable, GraffitiFileError> {
         let path = || self.path.display().to_string();
-        let read = |source| GraffitiFileError::Read {
+        let read = |error| GraffitiFileError::Read {
             path: path(),
-            source: Arc::new(source),
+            error: Arc::new(error),
         };
         let file = std::fs::File::open(&self.path).map_err(read)?;
         let mut bytes = Vec::new();
@@ -315,9 +318,9 @@ impl GraffitiFile {
             .name("graffiti-file".to_string())
             .spawn(read)
             .map(drop)
-            .map_err(|source| GraffitiFileError::Read {
+            .map_err(|error| GraffitiFileError::Read {
                 path: self.path.display().to_string(),
-                source: Arc::new(source),
+                error: Arc::new(error),
             })
     }
 
@@ -333,7 +336,7 @@ impl GraffitiFile {
     fn unanswered(&self) -> GraffitiFileError {
         GraffitiFileError::Read {
             path: self.path.display().to_string(),
-            source: Arc::new(std::io::Error::other("the read ended without an answer")),
+            error: Arc::new(std::io::Error::other("the read ended without an answer")),
         }
     }
 }
@@ -494,6 +497,12 @@ mod tests {
         let path = dir.path().join("graffiti.txt");
         let err = GraffitiFile::open(&path).expect_err("no file");
         assert!(matches!(err, GraffitiFileError::Read { .. }), "got {err:?}");
+        // The I/O error is in the message once, and not also a source that a
+        // startup report would print again under it.
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "got a source under {err}"
+        );
 
         let over = "a".repeat(GRAFFITI_BYTES + 1);
         std::fs::write(&path, format!("default: {over}\n")).expect("writes");
