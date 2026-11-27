@@ -34,10 +34,12 @@ use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::{AttestationData, SignedAttestation};
 use ethlambda_types::beacon::containers::{
     BeaconState, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
-    capella::Withdrawal, electra, gloas, phase0,
+    capella::{self, Withdrawal},
+    electra, gloas, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_choice::{PayloadStatus, PayloadStatusEnum};
+use ethlambda_types::beacon::operation::BeaconOperation;
 use ethlambda_types::beacon::primitives::ExecutionAddress;
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
@@ -359,6 +361,18 @@ pub enum ChainEvent {
     /// to any topic: the bus does not track which ones (see
     /// [`EventBus::has_subscribers`]).
     SingleAttestation(Box<electra::SingleAttestation>),
+    /// Beacon `voluntary_exit`: an exit passed the `voluntary_exit` rules,
+    /// from gossip or `POST /eth/v1/beacon/pool/voluntary_exits`. The four
+    /// operation events are boxed for the reason
+    /// [`ChainEvent::BeaconAttestation`] is.
+    VoluntaryExit(Box<shared::SignedVoluntaryExit>),
+    /// Beacon `proposer_slashing`.
+    ProposerSlashing(Box<shared::ProposerSlashing>),
+    /// Beacon `attester_slashing`. Electra's container: its JSON is gloas's
+    /// too, field for field.
+    AttesterSlashing(Box<electra::AttesterSlashing>),
+    /// Beacon `bls_to_execution_change`.
+    BlsToExecutionChange(Box<capella::SignedBLSToExecutionChange>),
 }
 
 impl ChainEvent {
@@ -385,6 +399,10 @@ impl ChainEvent {
             ChainEvent::PayloadAttestationMessage(_) => Topic::PayloadAttestationMessage,
             ChainEvent::ProposerPreferences(_) => Topic::ProposerPreferences,
             ChainEvent::SingleAttestation(_) => Topic::SingleAttestation,
+            ChainEvent::VoluntaryExit(_) => Topic::VoluntaryExit,
+            ChainEvent::ProposerSlashing(_) => Topic::ProposerSlashing,
+            ChainEvent::AttesterSlashing(_) => Topic::AttesterSlashing,
+            ChainEvent::BlsToExecutionChange(_) => Topic::BlsToExecutionChange,
         }
     }
 }
@@ -806,6 +824,18 @@ impl GossipEventSink for EventBus {
             GossipEvent::SingleAttestation(attestation) => {
                 ChainEvent::SingleAttestation(attestation)
             }
+            GossipEvent::Operation(operation) => match *operation {
+                BeaconOperation::VoluntaryExit(exit) => ChainEvent::VoluntaryExit(Box::new(exit)),
+                BeaconOperation::ProposerSlashing(slashing) => {
+                    ChainEvent::ProposerSlashing(Box::new(slashing))
+                }
+                BeaconOperation::AttesterSlashing(slashing) => {
+                    ChainEvent::AttesterSlashing(Box::new(slashing))
+                }
+                BeaconOperation::BlsToExecutionChange(change) => {
+                    ChainEvent::BlsToExecutionChange(Box::new(change))
+                }
+            },
         };
         EventBus::emit(self, event);
     }
@@ -2150,6 +2180,46 @@ mod tests {
         assert_matches_example(event, Topic::ProposerPreferences, &wrap(&preferences));
     }
 
+    /// The four operation events carry the container as is, with no version
+    /// wrapper, as the specification's examples show.
+    #[test]
+    fn the_operation_events_match_the_specification_examples() {
+        let zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let zero_signature = format!("0x{}", "00".repeat(96));
+        let exit = format!(
+            r#"{{"message":{{"epoch":"1", "validator_index":"1"}}, "signature":"{SIGNATURE}"}}"#
+        );
+        let header = format!(
+            r#"{{"message":{{"slot":"0","proposer_index":"0","parent_root":"{zero}","state_root":"{zero}","body_root":"{zero}"}},"signature":"{zero_signature}"}}"#
+        );
+        let proposer_slashing =
+            format!(r#"{{"signed_header_1":{header},"signed_header_2":{header}}}"#);
+        let indexed = format!(
+            r#"{{"attesting_indices":["0", "1"],"data":{{"slot":"0","index":"0","beacon_block_root":"{zero}","source":{{"epoch":"0","root":"{zero}"}},"target":{{"epoch":"0","root":"{zero}"}}}},"signature":"{zero_signature}"}}"#
+        );
+        let attester_slashing =
+            format!(r#"{{"attestation_1":{indexed},"attestation_2":{indexed}}}"#);
+        // The specification's example spells the address in mixed case;
+        // ours is lowercase hex, which a JSON reader takes alike.
+        let change = format!(
+            r#"{{"message":{{"validator_index":"1", "from_bls_pubkey":"0x933ad9491b62059dd065b560d256d8957a8c402cc6e8d8ee7290ae11e8f7329267a8811c397529dac52ae1342ba58c95", "to_execution_address":"0x9be8d619c56699667c1fedcd15f6b14d8b067f72"}}, "signature":"{SIGNATURE}"}}"#
+        );
+
+        let event = ChainEvent::VoluntaryExit(Box::new(serde_json::from_str(&exit).unwrap()));
+        assert_matches_example(event, Topic::VoluntaryExit, &exit);
+        let event = ChainEvent::ProposerSlashing(Box::new(
+            serde_json::from_str(&proposer_slashing).unwrap(),
+        ));
+        assert_matches_example(event, Topic::ProposerSlashing, &proposer_slashing);
+        let event = ChainEvent::AttesterSlashing(Box::new(
+            serde_json::from_str(&attester_slashing).unwrap(),
+        ));
+        assert_matches_example(event, Topic::AttesterSlashing, &attester_slashing);
+        let event =
+            ChainEvent::BlsToExecutionChange(Box::new(serde_json::from_str(&change).unwrap()));
+        assert_matches_example(event, Topic::BlsToExecutionChange, &change);
+    }
+
     /// What p2p reports through the sink becomes the matching topic's event.
     #[tokio::test]
     async fn the_bus_turns_gossip_events_into_their_topics() {
@@ -2173,6 +2243,23 @@ mod tests {
                 signature: Default::default(),
             },
         ));
+        sink.emit(GossipEvent::Operation(Box::new(
+            BeaconOperation::VoluntaryExit(Default::default()),
+        )));
+        sink.emit(GossipEvent::Operation(Box::new(
+            BeaconOperation::AttesterSlashing(electra::AttesterSlashing {
+                attestation_1: electra::IndexedAttestation {
+                    attesting_indices: Default::default(),
+                    data: Default::default(),
+                    signature: Default::default(),
+                },
+                attestation_2: electra::IndexedAttestation {
+                    attesting_indices: Default::default(),
+                    data: Default::default(),
+                    signature: Default::default(),
+                },
+            }),
+        )));
 
         let topics: Vec<Topic> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|event| event.topic())
@@ -2184,6 +2271,8 @@ mod tests {
                 Topic::ExecutionPayloadBid,
                 Topic::ProposerPreferences,
                 Topic::PayloadAttestationMessage,
+                Topic::VoluntaryExit,
+                Topic::AttesterSlashing,
             ]
         );
     }

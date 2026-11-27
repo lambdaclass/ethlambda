@@ -1112,12 +1112,12 @@ these are ever sent:
 | `proposer_preferences` | `{"version":"gloas", "data":<SignedProposerPreferences>}` | Preferences passed the `proposer_preferences` gossip rules, or were accepted by `POST /eth/v1/validator/proposer_preferences` |
 | `payload_attributes` | `{"version":"fulu", "data":{"proposer_index":"…", "proposal_slot":"…", "parent_block_number":"…", "parent_block_root":"0x…", "parent_block_hash":"0x…", "payload_attributes":{…}}}`; from gloas, `parent_block_number` is gone and `safe_block_hash`/`finalized_block_hash` are added | The next slot's attributes, a third of a slot before it, for a proposer registered through `prepare_beacon_proposer` (every proposer with `--always-prepare-payload`); again when an input to them changes after that point (see below) |
 
-Never emitted: the operation topics (`voluntary_exit`,
-`proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
-`contribution_and_proof`: no operation pools), the light client topics and
+| `voluntary_exit`, `proposer_slashing`, `attester_slashing`, `bls_to_execution_change` | The `SignedVoluntaryExit`, `ProposerSlashing`, `AttesterSlashing` or `SignedBLSToExecutionChange` as is, with no version wrapper | The operation passed its topic's gossip rules, or was accepted by its `pool/*` POST route. An attester slashing's JSON is the same at electra and gloas |
+
+Never emitted: `contribution_and_proof`, the light client topics and
 `blob_sidecar`.
 
-The gloas topics and `single_attestation` are emitted by whichever part of the
+The gloas topics, `single_attestation` and the operation topics are emitted by whichever part of the
 node accepted the object, since several never reach the chain actor: the actor
 publishes `execution_payload` and `execution_payload_available`; p2p publishes
 the gossip-accepted `execution_payload_gossip`, `execution_payload_bid`,
