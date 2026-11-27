@@ -124,6 +124,7 @@ pub mod metrics;
 mod peer_heads;
 mod req_resp;
 pub(crate) mod swarm_adapter;
+pub mod waggle;
 
 pub use libp2p::PeerId;
 

@@ -780,6 +780,47 @@ pub struct SignedAggregateAndProof {
     pub signature: XmssSignature,
 }
 
+/// What an aggregator signs when its proof is broadcast in chunks over Waggle
+/// (the "Fast leanVM Proof Broadcast" draft EIP): its [`AggregateAndProof`]
+/// with `proof_chunks_root`, the commitment to the proof's chunks
+/// ([`super::proof_chunks::compute_proof_chunks_root`]), in place of the
+/// proof. A peer verifies each chunk on its own against this root, so the
+/// header travels with the first chunk a peer is sent and the proof never
+/// travels whole.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct AggregateHeader {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregator_index: ValidatorIndex,
+    pub aggregate: Attestation,
+    pub proof_chunks_root: Root,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct SignedAggregateHeader {
+    pub message: AggregateHeader,
+    pub signature: XmssSignature,
+}
+
 /// What the Beacon API's `aggregate_attestation` answers at a PQ slot: a
 /// committee's network aggregate and the proof of its attesters'
 /// signatures, which the aggregator wraps in its `AggregateAndProof`. Not a

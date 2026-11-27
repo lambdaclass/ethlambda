@@ -1,0 +1,13 @@
+syntax = "proto2";
+
+package waggle.pb;
+
+message TopicSubscription {
+  required bytes topicID = 1;
+}
+
+message ObjectPieces {
+  required bytes objectID = 2;
+  optional bytes piecesMetadata = 3;
+  optional bytes pieces = 4;
+}
