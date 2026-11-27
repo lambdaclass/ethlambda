@@ -36,18 +36,21 @@ use ethlambda_types::beacon::signing::{
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+use ethlambda_types::beacon::preset::slots_per_epoch;
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::doppelganger::Doppelganger;
 use crate::error::{Error, Result};
 use crate::keys::web3signer::{
     AggregationSlot, ForkInfo, RandaoReveal, SigningBody, SigningRequest, SyncCommitteeMessage,
     Versioned, VersionedHeader,
 };
 use crate::keys::{SigningMethod, ValidatorStore};
+use crate::shared_config::SharedConfig;
 
 pub use crate::keys::web3signer::AggregateAndProofRef;
 
@@ -71,7 +74,14 @@ fn verifies(pubkey: &BlsPubkey, root: Root, signature: &BlsSignature) -> bool {
         == blst::BLST_ERROR::BLST_SUCCESS
 }
 
-/// The chain-wide half of a signing domain, fixed for the life of the process.
+/// The chain-wide half of a signing domain: the genesis validators root, fixed
+/// for the life of the process, and the fork schedule, which is not.
+///
+/// The schedule lives behind a [`SharedConfig`], because a fork the network
+/// schedules after startup has to reach the signatures: the chain check swaps
+/// it through [`Self::replace_config`] while the duties run. A method that
+/// needs several schedule fields takes one snapshot with [`Self::config`] and
+/// reads them all from it, so a swap cannot land between two reads.
 ///
 /// The fork version deliberately does not live here. It is a function of the
 /// epoch being signed for, and for an attestation that is the **target** epoch,
@@ -79,22 +89,40 @@ fn verifies(pubkey: &BlsPubkey, root: Root, signature: &BlsSignature) -> bool {
 /// boundary silently invalid.
 pub struct SigningContext {
     /// The fork schedule signatures are resolved against.
-    pub config: Config,
+    config: SharedConfig,
     /// The chain's genesis validators root, mixed into every domain so a
     /// signature from one chain never verifies on another running the same
     /// fork schedule.
     pub genesis_validators_root: Root,
     /// Selection proofs already produced; see [`Self::sign_selection_proof`].
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
+    /// How many times the schedule has been replaced. Written with the
+    /// selection proofs' lock held, so a proof signed across a swap can tell
+    /// it was: see [`Self::sign_selection_proof`].
+    schedule_generation: AtomicU64,
     /// One permit per remote signature being verified; see [`Self::verified`].
     verifications: Arc<Semaphore>,
+    /// Which keys doppelganger protection lets sign an attestation, a block,
+    /// a RANDAO reveal or an aggregate, or `None` with the protection off.
+    /// See [`Self::doppelganger_allows`].
+    doppelganger: Option<Arc<Doppelganger>>,
+}
+
+/// Whether `a` and `b` give every fork the same epoch and version, and so
+/// every message the same domain. The genesis version is phase0's.
+fn same_fork_schedule(a: &Config, b: &Config) -> bool {
+    ForkName::ALL.iter().all(|&fork| {
+        a.fork_epoch(fork) == b.fork_epoch(fork) && a.fork_version(fork) == b.fork_version(fork)
+    })
 }
 
 /// How long a selection proof is remembered past its slot: the duty
 /// schedule holds the current epoch and the next, so a proof computed for a
 /// subscription at the start of an epoch is still wanted by the aggregation
 /// up to two epochs later.
-const SELECTION_PROOF_RETENTION_SLOTS: Slot = 3 * SLOTS_PER_EPOCH;
+fn selection_proof_retention_slots() -> Slot {
+    3 * slots_per_epoch()
+}
 
 /// How long one duty's batch of signatures may take, from when it is asked
 /// for.
@@ -164,6 +192,12 @@ where
 
 impl SigningContext {
     pub fn new(config: Config, genesis_validators_root: Root) -> Self {
+        Self::with_shared(SharedConfig::new(config), genesis_validators_root)
+    }
+
+    /// A context reading the schedule from `config`, shared with whatever else
+    /// holds the handle (the slot clock), so one swap moves them together.
+    pub fn with_shared(config: SharedConfig, genesis_validators_root: Root) -> Self {
         // One verification per core: each is a pairing, pure CPU, so more at
         // once would only take turns on the same cores.
         let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
@@ -171,8 +205,86 @@ impl SigningContext {
             config,
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
+            schedule_generation: AtomicU64::new(0),
             verifications: Arc::new(Semaphore::new(cores)),
+            doppelganger: None,
         }
+    }
+
+    /// Put the slashable signatures behind doppelganger protection.
+    pub fn with_doppelganger(mut self, doppelganger: Arc<Doppelganger>) -> Self {
+        self.doppelganger = Some(doppelganger);
+        self
+    }
+
+    /// Doppelganger protection, when it is on: what a keymanager import
+    /// registers a new key with.
+    pub fn doppelganger(&self) -> Option<&Arc<Doppelganger>> {
+        self.doppelganger.as_ref()
+    }
+
+    /// Whether `pubkey` may sign an attestation, a block, a RANDAO reveal or
+    /// an aggregate: always, with doppelganger protection off, and otherwise
+    /// once it has passed the check (see [`crate::doppelganger`]).
+    ///
+    /// The duty loop asks this before a duty is recorded or the beacon node
+    /// asked anything for it; the four signing methods ask it again, so a
+    /// path that skipped the loop's filter still signs nothing.
+    pub fn doppelganger_allows(&self, pubkey: &BlsPubkey) -> bool {
+        self.doppelganger
+            .as_ref()
+            .is_none_or(|doppelganger| doppelganger.allows_signing(pubkey))
+    }
+
+    fn require_doppelganger_clear(&self, pubkey: &BlsPubkey) -> Result<()> {
+        if self.doppelganger_allows(pubkey) {
+            Ok(())
+        } else {
+            Err(Error::DoppelgangerProtected(*pubkey))
+        }
+    }
+
+    /// The fork schedule as of now. A snapshot: it does not follow a later
+    /// swap, so a caller that reads several fields takes it once.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.load()
+    }
+
+    /// Swap in a new fork schedule, for every holder of the shared handle,
+    /// and forget the selection proofs signed under the old one.
+    ///
+    /// The one way to change the schedule, so the two cannot be done
+    /// separately: a remembered proof is a signature over a domain, and a
+    /// domain that moved makes it one no node accepts.
+    ///
+    /// All three steps happen with the proofs' lock held. A reader of the
+    /// memory therefore sees it either before the swap or emptied after it,
+    /// never the old proofs beside the new schedule, and a proof that was
+    /// being signed across the swap finds the generation moved and is not
+    /// remembered.
+    ///
+    /// A swap that moves no fork epoch or version (only the duty offsets,
+    /// which the chain check also follows) changes no domain: the proofs are
+    /// kept and the generation stays, so the duty loop does not resubscribe
+    /// every duty and re-sign every proof (a round trip each for a remote key)
+    /// for nothing.
+    pub fn replace_config(&self, config: Config) {
+        let mut proofs = self.selection_proofs();
+        let domains_moved = !same_fork_schedule(&self.config.load(), &config);
+        self.config.store(config);
+        if domains_moved {
+            self.schedule_generation.fetch_add(1, Ordering::Release);
+            proofs.clear();
+        }
+    }
+
+    /// How many times [`Self::replace_config`] has swapped in a schedule that
+    /// moved a fork. The duty loop sends its attestation subnet subscriptions
+    /// again when this moves: each one's `is_aggregator` came from a
+    /// selection proof signed under the old schedule's domain, which a moved
+    /// fork can change.
+    pub fn schedule_generation(&self) -> u64 {
+        self.schedule_generation.load(Ordering::Acquire)
     }
 
     /// Whether `signature` is `pubkey`'s signature over `root`, checked on
@@ -203,10 +315,16 @@ impl SigningContext {
 
     /// The domain for `domain_type` as of `epoch`.
     pub fn domain(&self, domain_type: DomainType, epoch: Epoch) -> Domain {
-        let fork = self.config.fork_at_epoch(epoch);
+        self.domain_in(&self.config(), domain_type, epoch)
+    }
+
+    /// [`Self::domain`] under `config`, for a caller that reads other fields
+    /// from the same snapshot.
+    fn domain_in(&self, config: &Config, domain_type: DomainType, epoch: Epoch) -> Domain {
+        let fork = config.fork_at_epoch(epoch);
         compute_domain(
             domain_type,
-            self.config.fork_version(fork),
+            config.fork_version(fork),
             self.genesis_validators_root,
         )
     }
@@ -347,17 +465,22 @@ impl SigningContext {
     /// effect. Phase0 has no predecessor and names itself twice, as the
     /// genesis state's own `Fork` does.
     pub fn fork_info(&self, epoch: Epoch) -> ForkInfo {
-        let fork = self.config.fork_at_epoch(epoch);
-        let current_version = self.config.fork_version(fork);
+        self.fork_info_in(&self.config(), epoch)
+    }
+
+    /// [`Self::fork_info`] under `config`: see [`Self::domain_in`].
+    fn fork_info_in(&self, config: &Config, epoch: Epoch) -> ForkInfo {
+        let fork = config.fork_at_epoch(epoch);
+        let current_version = config.fork_version(fork);
         let previous_version = fork
             .previous()
-            .map(|previous| self.config.fork_version(previous))
+            .map(|previous| config.fork_version(previous))
             .unwrap_or(current_version);
         ForkInfo {
             fork: Fork {
                 previous_version,
                 current_version,
-                epoch: self.config.fork_epoch(fork),
+                epoch: config.fork_epoch(fork),
             },
             genesis_validators_root: self.genesis_validators_root,
         }
@@ -366,7 +489,7 @@ impl SigningContext {
     /// Web3Signer's name for the fork at `epoch`: the specification's
     /// lowercase name in capitals (`ELECTRA`, `GLOAS`).
     fn fork_label(&self, epoch: Epoch) -> String {
-        self.config.fork_at_epoch(epoch).as_str().to_uppercase()
+        self.config().fork_at_epoch(epoch).as_str().to_uppercase()
     }
 
     /// The root a voluntary exit's signature is computed over.
@@ -404,13 +527,14 @@ impl SigningContext {
     /// The fork version `exit`'s domain is built from; the rule is spelled
     /// out on [`Self::voluntary_exit_signing_root`].
     fn voluntary_exit_fork_version(&self, exit: &VoluntaryExit, current_epoch: Epoch) -> Version {
-        let fork = self.config.fork_at_epoch(current_epoch.max(exit.epoch));
+        let config = self.config();
+        let fork = config.fork_at_epoch(current_epoch.max(exit.epoch));
         if fork >= ForkName::Deneb {
-            self.config.capella_fork_version
-        } else if exit.epoch < self.config.fork_epoch(fork) {
-            self.config.fork_version(fork.previous().unwrap_or(fork))
+            config.capella_fork_version
+        } else if exit.epoch < config.fork_epoch(fork) {
+            config.fork_version(fork.previous().unwrap_or(fork))
         } else {
-            self.config.fork_version(fork)
+            config.fork_version(fork)
         }
     }
 
@@ -440,25 +564,37 @@ impl SigningContext {
         }
     }
 
-    /// Sign an already-computed signing root on behalf of `pubkey`.
+    /// Sign `message_root` under `domain_type`, the domain at `epoch`, on
+    /// behalf of `pubkey`.
     ///
-    /// Every public signing method funnels through here, so there is one place
-    /// a signature is actually produced. Deliberately private: a caller that
-    /// can hand in an arbitrary root can make this client sign anything at
-    /// all, and the domain separation that keeps an attestation from being
-    /// read as a block lives in the callers above.
+    /// Every public signing method but two funnels through here, so there is
+    /// one place a signature is actually produced. Deliberately private: a
+    /// caller that can hand in an arbitrary root can make this client sign
+    /// anything at all, and the domain separation that keeps an attestation
+    /// from being read as a block lives in the callers above.
     ///
-    /// `epoch` is the epoch the root's domain was taken at, and `body` the
-    /// message itself; a local key needs neither, a remote signer needs both.
+    /// The signing root and the fork a remote signer is told are read from
+    /// one snapshot of the schedule. Read apart, a swap by the chain check
+    /// landing between the two would send the signer a fork the root was not
+    /// computed under: it would sign the root it derives for that fork, and
+    /// the signature would then fail the check against this one, costing the
+    /// duty its signature.
+    ///
+    /// `body` is the message itself; a local key does not need it, a remote
+    /// signer does.
     async fn sign(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
-        root: Root,
+        domain_type: DomainType,
+        message_root: Root,
         epoch: Epoch,
         body: SigningBody<'_>,
     ) -> Result<BlsSignature> {
-        let fork_info = self.fork_info(epoch);
+        let config = self.config();
+        let domain = self.domain_in(&config, domain_type, epoch);
+        let root = compute_signing_root(message_root, domain);
+        let fork_info = self.fork_info_in(&config, epoch);
         self.sign_under(store, pubkey, root, epoch, Some(fork_info), body)
             .await
     }
@@ -501,7 +637,7 @@ impl SigningContext {
                 // sent in a shape the signer answers with a 400; the proposal
                 // path refuses those forks long before this anyway.
                 if matches!(body, SigningBody::Block { .. })
-                    && self.config.fork_at_epoch(epoch) < ForkName::Bellatrix
+                    && self.config().fork_at_epoch(epoch) < ForkName::Bellatrix
                 {
                     return Err(Error::Signing {
                         pubkey: *pubkey,
@@ -535,17 +671,20 @@ impl SigningContext {
         }
     }
 
-    /// Sign `data` on behalf of `pubkey`.
+    /// Sign `data` on behalf of `pubkey`. Refused for a key doppelganger
+    /// protection has not cleared.
     pub async fn sign_attestation(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         data: &AttestationData,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         self.sign(
             store,
             pubkey,
-            self.attestation_signing_root(data),
+            DOMAIN_BEACON_ATTESTER,
+            data.hash_tree_root(),
             data.target.epoch,
             SigningBody::Attestation { attestation: data },
         )
@@ -557,17 +696,24 @@ impl SigningContext {
     /// Unlike the other two, this signature is not itself a slashable message:
     /// it commits to an epoch, not to a chain position, and producing one for
     /// an epoch a validator is not proposing in reveals nothing and risks
-    /// nothing. It is therefore not guarded, and does not need to be.
+    /// nothing. It is therefore not guarded by slashing protection, and does
+    /// not need to be.
+    ///
+    /// Doppelganger protection does withhold it, as Lighthouse's does: it is
+    /// only ever signed to ask for a block, which a key that has not passed
+    /// the check must not propose.
     pub async fn sign_randao(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         epoch: Epoch,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         self.sign(
             store,
             pubkey,
-            self.randao_signing_root(epoch),
+            DOMAIN_RANDAO,
+            epoch.hash_tree_root(),
             epoch,
             SigningBody::RandaoReveal {
                 randao_reveal: RandaoReveal { epoch },
@@ -607,21 +753,34 @@ impl SigningContext {
         if let Some(proof) = remembered {
             return Ok(proof);
         }
-        let proof = self
-            .sign(
-                store,
-                pubkey,
-                self.selection_proof_signing_root(slot),
-                compute_epoch_at_slot(slot),
-                SigningBody::AggregationSlot {
-                    aggregation_slot: AggregationSlot { slot },
-                },
-            )
-            .await?;
-        let mut proofs = self.selection_proofs();
-        proofs.retain(|(_, held), _| held + SELECTION_PROOF_RETENTION_SLOTS >= slot);
-        proofs.insert((*pubkey, slot), proof);
-        Ok(proof)
+        loop {
+            // Read before the signing root is computed, so a schedule swap
+            // that lands anywhere from here to the insert below is seen.
+            let generation = self.schedule_generation.load(Ordering::Acquire);
+            let proof = self
+                .sign(
+                    store,
+                    pubkey,
+                    DOMAIN_SELECTION_PROOF,
+                    slot.hash_tree_root(),
+                    compute_epoch_at_slot(slot),
+                    SigningBody::AggregationSlot {
+                        aggregation_slot: AggregationSlot { slot },
+                    },
+                )
+                .await?;
+            let mut proofs = self.selection_proofs();
+            if self.schedule_generation.load(Ordering::Acquire) != generation {
+                // The schedule was replaced while this was being signed (a
+                // remote signer's round trip is long enough). The proof may
+                // be over the old domain, and remembering it would put back
+                // what the swap just cleared: sign again under the new one.
+                continue;
+            }
+            proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
+            proofs.insert((*pubkey, slot), proof);
+            return Ok(proof);
+        }
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of
@@ -644,12 +803,17 @@ impl SigningContext {
     ///
     /// Takes the whole wrapper rather than its root: a remote signer wants to
     /// read what it signs, and the wrapper's own fork decides its JSON shape.
+    ///
+    /// Withheld by doppelganger protection all the same: a node marks an
+    /// aggregate's aggregator live, so one published by a key under the
+    /// check would be read back as a doppelganger of itself.
     pub async fn sign_aggregate_and_proof(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         message: AggregateAndProofRef<'_>,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         let slot = message.slot();
         let epoch = compute_epoch_at_slot(slot);
         let version = match message {
@@ -659,7 +823,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.aggregate_and_proof_signing_root(message.hash_tree_root(), slot),
+            DOMAIN_AGGREGATE_AND_PROOF,
+            message.hash_tree_root(),
             epoch,
             SigningBody::AggregateAndProof {
                 aggregate_and_proof: Versioned {
@@ -689,7 +854,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.envelope_signing_root(envelope, slot),
+            DOMAIN_BEACON_BUILDER,
+            envelope.hash_tree_root(),
             compute_epoch_at_slot(slot),
             SigningBody::ExecutionPayloadEnvelope {
                 execution_payload_envelope: Versioned {
@@ -718,7 +884,7 @@ impl SigningContext {
         store: &RwLock<ValidatorStore>,
         registration: &ValidatorRegistrationV1,
     ) -> Result<BlsSignature> {
-        let domain = compute_builder_domain(self.config.genesis_fork_version);
+        let domain = compute_builder_domain(self.config().genesis_fork_version);
         let root = compute_signing_root(registration.hash_tree_root(), domain);
         // The epoch is only read for a block; a registration has none.
         self.sign_under(
@@ -762,12 +928,11 @@ impl SigningContext {
         preferences: &ProposerPreferences,
     ) -> Result<BlsSignature> {
         let proposal_epoch = compute_epoch_at_slot(preferences.proposal_slot);
-        let domain = self.domain(DOMAIN_PROPOSER_PREFERENCES, proposal_epoch);
-        let root = compute_signing_root(preferences.hash_tree_root(), domain);
         self.sign(
             store,
             pubkey,
-            root,
+            DOMAIN_PROPOSER_PREFERENCES,
+            preferences.hash_tree_root(),
             proposal_epoch,
             SigningBody::ProposerPreferences {
                 proposer_preferences: Versioned {
@@ -793,7 +958,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.payload_attestation_signing_root(data),
+            DOMAIN_PTC_ATTESTER,
+            data.hash_tree_root(),
             compute_epoch_at_slot(data.slot),
             SigningBody::PayloadAttestationMessage {
                 payload_attestation_message: Versioned {
@@ -820,7 +986,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.sync_committee_message_signing_root(slot, beacon_block_root),
+            DOMAIN_SYNC_COMMITTEE,
+            beacon_block_root,
             compute_epoch_at_slot(slot),
             SigningBody::SyncCommitteeMessage {
                 sync_committee_message: SyncCommitteeMessage {
@@ -842,16 +1009,18 @@ impl SigningContext {
         slot: Slot,
         subcommittee_index: u64,
     ) -> Result<BlsSignature> {
+        let data = SyncAggregatorSelectionData {
+            slot,
+            subcommittee_index,
+        };
         self.sign(
             store,
             pubkey,
-            self.sync_selection_proof_signing_root(slot, subcommittee_index),
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            data.hash_tree_root(),
             compute_epoch_at_slot(slot),
             SigningBody::SyncCommitteeSelectionProof {
-                sync_aggregator_selection_data: SyncAggregatorSelectionData {
-                    slot,
-                    subcommittee_index,
-                },
+                sync_aggregator_selection_data: data,
             },
         )
         .await
@@ -867,7 +1036,8 @@ impl SigningContext {
         self.sign(
             store,
             pubkey,
-            self.contribution_and_proof_signing_root(message),
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            message.hash_tree_root(),
             compute_epoch_at_slot(message.contribution.slot),
             SigningBody::SyncCommitteeContributionAndProof {
                 contribution_and_proof: message,
@@ -921,18 +1091,20 @@ impl SigningContext {
     /// validator to be caught, since the two signed headers are the whole
     /// evidence. Callers must have it allowed and recorded by
     /// [`crate::slashing_protection::SlashingProtection::check_and_record_block`]
-    /// first.
+    /// first. Refused for a key doppelganger protection has not cleared.
     pub async fn sign_block(
         &self,
         store: &RwLock<ValidatorStore>,
         pubkey: &BlsPubkey,
         header: &BeaconBlockHeader,
     ) -> Result<BlsSignature> {
+        self.require_doppelganger_clear(pubkey)?;
         let epoch = compute_epoch_at_slot(header.slot);
         self.sign(
             store,
             pubkey,
-            self.block_signing_root(header.hash_tree_root(), header.slot),
+            DOMAIN_BEACON_PROPOSER,
+            header.hash_tree_root(),
             epoch,
             SigningBody::Block {
                 beacon_block: VersionedHeader {
@@ -960,6 +1132,43 @@ mod tests {
 
     fn context() -> SigningContext {
         SigningContext::new(Config::mainnet(), Root::ZERO)
+    }
+
+    /// A schedule swap moves every domain and forgets the selection proofs
+    /// signed under the old one, which no node would accept any more.
+    #[test]
+    fn replacing_the_config_changes_the_domains_and_clears_remembered_proofs() {
+        let context = context();
+        let epoch = 10;
+        let before = context.domain(DOMAIN_RANDAO, epoch);
+        context
+            .selection_proofs()
+            .insert((BlsPubkey([1; 48]), 5), BlsSignature([2; 96]));
+
+        context.replace_config(Config::mainnet().with_fork_version(ForkName::Phase0, [9, 9, 9, 9]));
+        let after = context.domain(DOMAIN_RANDAO, epoch);
+
+        assert_ne!(before, after, "the swap reaches the domains");
+        assert!(context.selection_proofs().is_empty());
+    }
+
+    /// A swap that moves only the duty offsets moves no domain: the proofs
+    /// stay, and the generation the duty loop resubscribes on does not move.
+    #[test]
+    fn replacing_only_the_offsets_keeps_remembered_proofs() {
+        let context = context();
+        context
+            .selection_proofs()
+            .insert((BlsPubkey([1; 48]), 5), BlsSignature([2; 96]));
+        let generation = context.schedule_generation();
+
+        let mut offsets_only = Config::mainnet();
+        offsets_only.attestation_due_bps_gloas = 2_000;
+        context.replace_config(offsets_only);
+
+        assert_eq!(context.config().attestation_due_bps_gloas, 2_000);
+        assert_eq!(context.selection_proofs().len(), 1);
+        assert_eq!(context.schedule_generation(), generation);
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {
@@ -1101,8 +1310,8 @@ mod tests {
         // gap has to cross an actual fork boundary, not just be a large
         // number, since `domain()` only changes with the epoch insofar as the
         // epoch selects a different fork version.
-        let mut data = attestation_data(context.config.altair_fork_epoch + 1);
-        data.slot = 3 * preset::SLOTS_PER_EPOCH;
+        let mut data = attestation_data(context.config().altair_fork_epoch + 1);
+        data.slot = 3 * preset::slots_per_epoch();
 
         let from_target = compute_signing_root(
             data.hash_tree_root(),
@@ -1268,8 +1477,8 @@ mod tests {
             verify(&pubkey, &signature, root)
         };
         (
-            verifies_under(context.config.fulu_fork_version),
-            verifies_under(context.config.gloas_fork_version),
+            verifies_under(context.config().fulu_fork_version),
+            verifies_under(context.config().gloas_fork_version),
         )
     }
 
@@ -1280,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_first_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+        let slot = gloas_epoch * preset::slots_per_epoch() + 2;
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1293,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn a_preference_for_the_second_gloas_epoch_is_signed_under_the_gloas_version() {
         let (_, gloas_epoch) = gloas_scheduled_context();
-        let slot = (gloas_epoch + 1) * preset::SLOTS_PER_EPOCH;
+        let slot = (gloas_epoch + 1) * preset::slots_per_epoch();
 
         let (under_fulu, under_gloas) = preference_verifies_under_fulu_and_gloas(slot).await;
 
@@ -1369,7 +1578,7 @@ mod tests {
         let context = context();
         let epoch: Epoch = 100;
         let object = epoch.hash_tree_root();
-        let slot = epoch * preset::SLOTS_PER_EPOCH;
+        let slot = epoch * preset::slots_per_epoch();
 
         let roots = [
             compute_signing_root(object, context.domain(DOMAIN_BEACON_ATTESTER, epoch)),
@@ -1416,7 +1625,7 @@ mod tests {
     #[test]
     fn a_blocks_domain_comes_from_its_own_slots_epoch() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config().altair_fork_epoch * preset::slots_per_epoch();
         let before = after - 1;
 
         assert_ne!(
@@ -1513,7 +1722,7 @@ mod tests {
     #[test]
     fn a_sync_message_domain_follows_the_fork_schedule_at_its_slot() {
         let context = context();
-        let after = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let after = context.config().altair_fork_epoch * preset::slots_per_epoch();
         assert_ne!(
             context.sync_committee_message_signing_root(after - 1, Root::ZERO),
             context.sync_committee_message_signing_root(after, Root::ZERO),
@@ -1590,7 +1799,7 @@ mod tests {
         let (store, pubkey) = store_with_key();
         let context = context();
         let exit = VoluntaryExit {
-            epoch: context.config.deneb_fork_epoch + 10,
+            epoch: context.config().deneb_fork_epoch + 10,
             validator_index: 42,
         };
 
@@ -1612,13 +1821,13 @@ mod tests {
     #[test]
     fn an_exit_at_or_after_deneb_signs_under_the_capella_fork_version() {
         let context = context();
-        let far_beyond_deneb = context.config.electra_fork_epoch + 1_000;
-        for epoch in [context.config.deneb_fork_epoch, far_beyond_deneb] {
+        let far_beyond_deneb = context.config().electra_fork_epoch + 1_000;
+        for epoch in [context.config().deneb_fork_epoch, far_beyond_deneb] {
             let exit = VoluntaryExit {
                 epoch,
                 validator_index: 1,
             };
-            let expected = exit_root_under(&context, &exit, context.config.capella_fork_version);
+            let expected = exit_root_under(&context, &exit, context.config().capella_fork_version);
             assert_eq!(context.voluntary_exit_signing_root(&exit, epoch), expected);
             assert_ne!(
                 expected,
@@ -1638,7 +1847,7 @@ mod tests {
     #[test]
     fn an_exit_naming_a_pre_deneb_epoch_signs_under_capella_on_a_chain_past_deneb() {
         let context = context();
-        let config = &context.config;
+        let config = &context.config();
         let now = config.electra_fork_epoch + 1_000;
         for epoch in [
             0,
@@ -1681,7 +1890,7 @@ mod tests {
     #[test]
     fn a_remote_signer_derives_the_exits_root_from_the_fork_it_is_told() {
         let context = context();
-        let config = &context.config;
+        let config = &context.config();
         let derived = |exit: &VoluntaryExit, told: &ForkInfo| {
             let version = if config.fork_at_epoch(told.fork.epoch) >= ForkName::Deneb {
                 config.capella_fork_version
@@ -1742,7 +1951,7 @@ mod tests {
     fn an_exit_before_deneb_signs_under_its_epochs_fork_version() {
         let context = context();
         let exit = VoluntaryExit {
-            epoch: context.config.altair_fork_epoch + 1,
+            epoch: context.config().altair_fork_epoch + 1,
             validator_index: 1,
         };
         assert_eq!(
@@ -1761,7 +1970,7 @@ mod tests {
     #[test]
     fn an_exit_before_deneb_signs_under_what_the_processing_state_verifies() {
         let context = context();
-        let config = &context.config;
+        let config = &context.config();
         let in_bellatrix = config.bellatrix_fork_epoch + 5;
 
         let one_fork_back = VoluntaryExit {
@@ -1800,12 +2009,12 @@ mod tests {
     #[test]
     fn fork_info_names_the_fork_at_the_epoch_and_its_predecessor() {
         let context = context();
-        let altair = context.config.altair_fork_epoch;
+        let altair = context.config().altair_fork_epoch;
 
         let before = context.fork_info(altair - 1);
         assert_eq!(
             before.fork.current_version,
-            context.config.genesis_fork_version
+            context.config().genesis_fork_version
         );
         assert_eq!(
             before.fork.previous_version, before.fork.current_version,
@@ -1816,11 +2025,11 @@ mod tests {
         let after = context.fork_info(altair);
         assert_eq!(
             after.fork.current_version,
-            context.config.altair_fork_version
+            context.config().altair_fork_version
         );
         assert_eq!(
             after.fork.previous_version,
-            context.config.genesis_fork_version
+            context.config().genesis_fork_version
         );
         assert_eq!(after.fork.epoch, altair);
         assert_eq!(
@@ -1959,7 +2168,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let data = attestation_data(context.config.altair_fork_epoch + 1);
+            let data = attestation_data(context.config().altair_fork_epoch + 1);
 
             let signature = context
                 .sign_attestation(&store, &pubkey, &data)
@@ -1995,7 +2204,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.electra_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config().electra_fork_epoch * preset::slots_per_epoch();
             let header = header(slot);
 
             context
@@ -2034,7 +2243,7 @@ mod tests {
                 .expect("signs");
             let root = compute_signing_root(
                 registration.hash_tree_root(),
-                compute_builder_domain(context.config.genesis_fork_version),
+                compute_builder_domain(context.config().genesis_fork_version),
             );
             assert!(verify(&pubkey, &signature, root));
 
@@ -2083,7 +2292,7 @@ mod tests {
                 service.register_all(0, vec![remote, local], store).await;
 
                 let sent = node.registrations.lock().expect("lock").clone();
-                let domain = compute_builder_domain(context.config.genesis_fork_version);
+                let domain = compute_builder_domain(context.config().genesis_fork_version);
                 for registration in &sent {
                     let root = compute_signing_root(registration.message.hash_tree_root(), domain);
                     assert!(verify(
@@ -2110,7 +2319,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let (context, gloas_epoch) = gloas_scheduled_context();
-            let slot = gloas_epoch * preset::SLOTS_PER_EPOCH + 2;
+            let slot = gloas_epoch * preset::slots_per_epoch() + 2;
             let preferences = preferences_for(slot);
 
             let signature = context
@@ -2119,7 +2328,7 @@ mod tests {
                 .expect("signs");
             let gloas_domain = compute_domain(
                 DOMAIN_PROPOSER_PREFERENCES,
-                context.config.gloas_fork_version,
+                context.config().gloas_fork_version,
                 context.genesis_validators_root,
             );
             let root = compute_signing_root(preferences.hash_tree_root(), gloas_domain);
@@ -2149,10 +2358,10 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let now = context.config.electra_fork_epoch + 1_000;
+            let now = context.config().electra_fork_epoch + 1_000;
             // Naming an epoch from before deneb, on a chain well past it.
             let exit = VoluntaryExit {
-                epoch: context.config.altair_fork_epoch,
+                epoch: context.config().altair_fork_epoch,
                 validator_index: 42,
             };
 
@@ -2174,8 +2383,8 @@ mod tests {
                 serde_json::to_value(root).expect("root")
             );
             let capella = serde_json::to_value(Fork {
-                previous_version: context.config.capella_fork_version,
-                current_version: context.config.capella_fork_version,
+                previous_version: context.config().capella_fork_version,
+                current_version: context.config().capella_fork_version,
                 epoch: exit.epoch,
             })
             .expect("fork");
@@ -2189,7 +2398,7 @@ mod tests {
             let (fake, url) = serve(Answer::Signature).await;
             let (store, pubkey) = remote_store(&url);
             let context = context();
-            let slot = context.config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+            let slot = context.config().altair_fork_epoch * preset::slots_per_epoch();
 
             let err = context
                 .sign_block(&store, &pubkey, &header(slot))
@@ -2354,5 +2563,127 @@ mod tests {
                 .expect_err("must fail");
             assert!(matches!(err, Error::Signing { .. }), "got {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod doppelganger_tests {
+    use super::*;
+    use ethlambda_types::beacon::containers::electra;
+    use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    fn secret() -> [u8; 32] {
+        hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    fn data() -> AttestationData {
+        AttestationData {
+            slot: 3200,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: Checkpoint {
+                epoch: 99,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: 100,
+                root: Root::ZERO,
+            },
+        }
+    }
+
+    /// A key registered after genesis, so still under the check.
+    fn withheld() -> (SigningContext, RwLock<ValidatorStore>, BlsPubkey) {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let doppelganger = Arc::new(Doppelganger::new());
+        doppelganger.register(pubkey, 100);
+        let context =
+            SigningContext::new(Config::mainnet(), Root::ZERO).with_doppelganger(doppelganger);
+        (context, RwLock::new(store), pubkey)
+    }
+
+    fn protected<T: std::fmt::Debug>(result: Result<T>) {
+        let err = result.expect_err("withheld");
+        assert!(
+            matches!(err, Error::DoppelgangerProtected(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The four signatures a doppelganger makes slashable, or that the node
+    /// reads as liveness, are refused while the key is checked.
+    #[tokio::test]
+    async fn the_slashable_signatures_are_refused_under_the_check() {
+        let (context, store, pubkey) = withheld();
+        assert!(!context.doppelganger_allows(&pubkey));
+
+        protected(context.sign_attestation(&store, &pubkey, &data()).await);
+        protected(context.sign_randao(&store, &pubkey, 100).await);
+        let header = BeaconBlockHeader {
+            slot: 3200,
+            proposer_index: 7,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body_root: Root::ZERO,
+        };
+        protected(context.sign_block(&store, &pubkey, &header).await);
+        let message = electra::AggregateAndProof {
+            aggregator_index: 9,
+            aggregate: electra::Attestation {
+                aggregation_bits: Default::default(),
+                data: data(),
+                signature: BlsSignature([2; 96]),
+                committee_bits: Default::default(),
+            },
+            selection_proof: BlsSignature([3; 96]),
+        };
+        let aggregate = AggregateAndProofRef::Electra(&message);
+        protected(
+            context
+                .sign_aggregate_and_proof(&store, &pubkey, aggregate)
+                .await,
+        );
+    }
+
+    /// Everything else goes on, as in Lighthouse: the key's subnets need
+    /// their selection proofs, and nothing here is slashable or counted as
+    /// liveness.
+    #[tokio::test]
+    async fn the_other_signatures_go_on_under_the_check() {
+        let (context, store, pubkey) = withheld();
+
+        context
+            .sign_selection_proof(&store, &pubkey, 3200)
+            .await
+            .expect("a selection proof");
+        context
+            .sign_sync_committee_message(&store, &pubkey, 3200, Root::ZERO)
+            .await
+            .expect("a sync committee message");
+        let exit = VoluntaryExit {
+            epoch: context.config().deneb_fork_epoch + 10,
+            validator_index: 42,
+        };
+        context
+            .sign_voluntary_exit(&store, &pubkey, &exit, exit.epoch)
+            .await
+            .expect("a voluntary exit");
+    }
+
+    /// With the protection off nothing is withheld.
+    #[tokio::test]
+    async fn without_the_protection_every_key_signs() {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let context = SigningContext::new(Config::mainnet(), Root::ZERO);
+        assert!(context.doppelganger_allows(&pubkey));
+        context
+            .sign_attestation(&RwLock::new(store), &pubkey, &data())
+            .await
+            .expect("signs");
     }
 }

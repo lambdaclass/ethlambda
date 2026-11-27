@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 // Re-exported at this old path (`crate::beacon::helpers::accessors::CommitteeCache`,
 // and so on), so every existing import of the type this module used to define
 // is unaffected by its move to `ethlambda-storage`; see [`CommitteeCacheExt`]
@@ -15,6 +17,7 @@ pub use ethlambda_storage::{
     ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, PubkeyIndexCache, ShufflingKey,
 };
 
+use crate::beacon::bls::{AggregatePubkey, CommitteeKeySums, IndexedPubkey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
@@ -65,10 +68,10 @@ pub fn get_previous_epoch(state: &BeaconState) -> Epoch {
 /// rather than a miss.
 pub fn get_block_root_at_slot(state: &BeaconState, slot: Slot) -> Result<Root> {
     crate::beacon::verify(
-        slot < state.slot() && state.slot() <= slot + preset::SLOTS_PER_HISTORICAL_ROOT as u64,
+        slot < state.slot() && state.slot() <= slot + preset::slots_per_historical_root() as u64,
         "slot < state.slot <= slot + SLOTS_PER_HISTORICAL_ROOT",
     )?;
-    Ok(state.block_roots()[slot as usize % preset::SLOTS_PER_HISTORICAL_ROOT])
+    Ok(state.block_roots()[slot as usize % preset::slots_per_historical_root()])
 }
 
 /// The block root at the start of a recent epoch, which is what a checkpoint
@@ -113,7 +116,7 @@ pub fn get_validator_churn_limit(state: &BeaconState, config: &Config) -> u64 {
 /// genesis, and this keeps that form.
 pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> Bytes32 {
     let lookback =
-        epoch + preset::EPOCHS_PER_HISTORICAL_VECTOR as u64 - preset::MIN_SEED_LOOKAHEAD - 1;
+        epoch + preset::epochs_per_historical_vector() as u64 - preset::MIN_SEED_LOOKAHEAD - 1;
     let mix = get_randao_mix(state, lookback);
 
     let mut input = Vec::with_capacity(4 + 8 + 32);
@@ -135,8 +138,8 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
 /// for p2p's gossipsub scoring, which sizes expected aggregate traffic from
 /// a validator count rather than from a state.
 pub fn committee_count_per_slot(active_count: u64) -> u64 {
-    let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
-    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+    let ideal = active_count / preset::slots_per_epoch() / preset::target_committee_size();
+    ideal.clamp(1, preset::max_committees_per_slot() as u64)
 }
 
 /// How many committees each slot of `epoch` has.
@@ -278,6 +281,66 @@ pub trait CommitteeCacheExt {
     /// the previous head pinned stays resident until an insertion evicts it
     /// on epoch like any other entry.
     fn update_head(&self, head_root: Root, head_state: &BeaconState);
+
+    /// `epoch`'s committee key sums as `state` names them, if they have been
+    /// warmed.
+    ///
+    /// Lookup only, and it never builds: building costs a pass over every
+    /// active validator's key, which is more than the sums save for
+    /// committees attested once, so block import must never be the one to pay
+    /// it. `None` (cold, evicted, or an epoch `state` cannot key) means the
+    /// caller sums its attesters directly. Warmed by [`Self::warm_key_sums`].
+    ///
+    /// # Why the sums can be shared on the shuffling's key
+    ///
+    /// The sums are filed under the same [`ShufflingKey`] as the committees,
+    /// so two states with one key must agree on every member's *public key* as
+    /// well as on who the members are. They do, for three reasons, each
+    /// checked against this crate's spec code:
+    ///
+    /// - A validator's index and public key are fixed when it is appended to
+    ///   the registry and never change after: the registry only grows
+    ///   (`process_deposit`, and electra's pending-deposit path through
+    ///   `add_validator_to_registry`, push; nothing removes or reorders), and
+    ///   no code assigns `validator.pubkey` after construction.
+    /// - A new validator is appended with `activation_epoch` at
+    ///   `FAR_FUTURE_EPOCH`. The only writer that gives it a real one is
+    ///   `process_registry_updates`, running in epoch `N`'s epoch processing,
+    ///   and it writes `compute_activation_exit_epoch(N)`, which is
+    ///   `N + 1 + MAX_SEED_LOOKAHEAD`. (Genesis validators are active from
+    ///   `GENESIS_EPOCH` and are in every state's history.)
+    /// - A validator in `epoch`'s committees is active there, so its
+    ///   `activation_epoch <= epoch`, so it was activated by epoch processing
+    ///   at some `N <= epoch - 1 - MAX_SEED_LOOKAHEAD`, and appended no later
+    ///   than that. That is before the end of `epoch - 2`, so the block the
+    ///   [`ShufflingKey`] names as the decision root already has it in its
+    ///   registry, at that index, with that key. Every state descending from
+    ///   that block inherits it.
+    ///
+    /// So the member list and each member's key are functions of the key,
+    /// and so is their sum. This is a stronger claim than the committees'
+    /// own (which need only the activation and exit epochs to be fixed), but
+    /// it follows from the same lookahead and from the registry being
+    /// append-only.
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>>;
+
+    /// Builds `epoch`'s committee key sums as `state` names them, unless they
+    /// are already there. Meant for a background task: it derives the
+    /// committees if they are not resident, then spends one pass over the
+    /// registry and one key sum per committee, parallel across committees.
+    ///
+    /// A committee with a member whose key fails validation gets no sum
+    /// (`None` in its slot), so lookups of it fall back to the direct path
+    /// rather than to a sum that omits the member. Does nothing for an epoch
+    /// `state` cannot key, since there is nowhere to file the result, nor
+    /// before electra, whose attestations never read the sums. Idempotent, so
+    /// a caller unsure whether an epoch is warm can just ask again.
+    ///
+    /// Deriving the committees, when they are not resident yet, is part of a
+    /// warm-up's cost, but `lean_beacon_committee_key_sums_warm_seconds`
+    /// times the sums alone: the committees are the shuffling every
+    /// attestation of the epoch needs anyway, warm or not.
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch);
 }
 
 impl CommitteeCacheExt for CommitteeCache {
@@ -303,6 +366,81 @@ impl CommitteeCacheExt for CommitteeCache {
         let keys = epochs.map(|epoch| shuffling_key(head_state, epoch));
         self.pin_head(head_root, keys);
     }
+
+    fn key_sums(&self, state: &BeaconState, epoch: Epoch) -> Option<Arc<CommitteeKeySums>> {
+        self.resident_key_sums(shuffling_key(state, epoch)?)
+    }
+
+    fn warm_key_sums(&self, state: &BeaconState, epoch: Epoch) {
+        if state.fork_name() < ForkName::Electra {
+            return;
+        }
+        let Some(key) = shuffling_key(state, epoch) else {
+            return;
+        };
+        if self.resident_key_sums(key).is_some() {
+            return;
+        }
+        // Resident before the sums are filed into it; a no-op when the import
+        // path already built them.
+        let committees = self.committees(state, epoch);
+        self.get_or_init_key_sums(key, || {
+            // The sums alone: not the committees above, nor a lookup that
+            // found the work already done.
+            let _timing = crate::metrics::time_key_sums_warm();
+            build_committee_key_sums(state, &committees, epoch)
+        });
+    }
+}
+
+/// Every committee of `committees`' epoch summed, indexed by committee number.
+///
+/// One `state.iter_validators()` pass copies each validator's key bytes into a
+/// flat list (a per-index `state.validator(i)` is a tree descent, and the
+/// whole active set is read), then committees are summed in parallel. An entry
+/// is `None` for a committee with a member whose key fails validation or whose
+/// index is outside the registry, and for an empty committee.
+///
+/// The flat key list is transient, about 48 MB on a mainnet-sized registry.
+/// The parallel sums run on rayon's global pool, which block import's key
+/// validation also uses (blst's pairings and leanVM's prover have pools of
+/// their own). A warm-up is short, about 70 ms per epoch measured on a mainnet
+/// node, and runs once or twice an epoch, so it delays import's key work only
+/// briefly when the two coincide.
+fn build_committee_key_sums(
+    state: &BeaconState,
+    committees: &EpochCommittees,
+    epoch: Epoch,
+) -> CommitteeKeySums {
+    let pubkeys: Vec<BlsPubkey> = state.iter_validators().map(|v| v.pubkey).collect();
+    let per_slot = committees.committees_per_slot();
+    let first_slot = compute_start_slot_at_epoch(epoch);
+
+    let members: Vec<&[ValidatorIndex]> = (0..preset::slots_per_epoch())
+        .flat_map(|offset| (0..per_slot).map(move |index| (first_slot + offset, index)))
+        .map(|(slot, index)| {
+            committees
+                .committee(slot, index)
+                .expect("slot is in the epoch and index is below the committee count")
+        })
+        .collect();
+
+    let sums = members
+        .par_iter()
+        .map(|committee| {
+            // The index is attached per committee rather than stored in the
+            // flat list, which spans the whole registry.
+            let keys: Option<Vec<IndexedPubkey>> = committee
+                .iter()
+                .map(|&index| {
+                    let pubkey = *pubkeys.get(index as usize)?;
+                    Some(IndexedPubkey { index, pubkey })
+                })
+                .collect();
+            AggregatePubkey::sum(&keys?)
+        })
+        .collect();
+    CommitteeKeySums::new(sums)
 }
 
 /// The key `state`'s total active balance is cached under, or `None` if
@@ -522,7 +660,7 @@ pub fn get_beacon_committee(
         &active_indices,
         get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER),
         committee_number(slot, committees_per_slot, index)?,
-        committees_per_slot * preset::SLOTS_PER_EPOCH,
+        committees_per_slot * preset::slots_per_epoch(),
     )
 }
 
@@ -705,7 +843,7 @@ mod tests {
         *state.slot_mut() = 0;
         assert_eq!(get_previous_epoch(&state), constants::GENESIS_EPOCH);
 
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * 3;
+        *state.slot_mut() = preset::slots_per_epoch() * 3;
         assert_eq!(get_previous_epoch(&state), 2);
     }
 
@@ -728,7 +866,7 @@ mod tests {
         let per_slot = get_committee_count_per_slot(&state, epoch);
 
         let mut all = Vec::new();
-        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+        for slot_offset in 0..preset::slots_per_epoch() {
             let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
             for index in 0..per_slot {
                 all.extend(get_beacon_committee(&state, slot, index).unwrap());
@@ -752,7 +890,7 @@ mod tests {
     /// those boundary computations untested.
     #[test]
     fn sliced_committees_match_the_per_member_derivation() {
-        let several_per_slot = preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2 + 1;
+        let several_per_slot = preset::slots_per_epoch() * preset::target_committee_size() * 2 + 1;
 
         for count in [100, several_per_slot as usize] {
             let state = with_validators(count);
@@ -767,7 +905,7 @@ mod tests {
             }
 
             let mut lengths = Vec::new();
-            for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+            for slot_offset in 0..preset::slots_per_epoch() {
                 let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
                 for index in 0..per_slot {
                     let sliced = committees.committee(slot, index).unwrap();
@@ -798,7 +936,7 @@ mod tests {
         // the genesis state cannot key its own epochs, which
         // `an_unkeyable_epoch_is_not_cached` covers separately.
         let mut state = with_validators(64);
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * 4;
+        *state.slot_mut() = preset::slots_per_epoch() * 4;
         let epoch = get_current_epoch(&state);
         let cache = CommitteeCache::default();
 
@@ -869,7 +1007,7 @@ mod tests {
     fn state_on_branch(branch: u8, epoch: Epoch) -> BeaconState {
         let mut state = with_validators(64);
         *state.slot_mut() = compute_start_slot_at_epoch(epoch);
-        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+        for slot in 0..preset::slots_per_historical_root() {
             state.block_roots_mut()[slot] = Root::repeat_byte(branch);
         }
         state
@@ -1004,7 +1142,7 @@ mod tests {
     fn state_at_epoch_with_root(epoch: Epoch, root: u8) -> BeaconState {
         let mut state = with_validators(16);
         *state.slot_mut() = compute_start_slot_at_epoch(epoch);
-        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+        for slot in 0..preset::slots_per_historical_root() {
             state.block_roots_mut()[slot] = Root::repeat_byte(root);
         }
         state
@@ -1059,7 +1197,7 @@ mod tests {
         state.apply_pending_mutations();
         *state.slot_mut() = compute_start_slot_at_epoch(4);
         let last_slot =
-            (compute_start_slot_at_epoch(4) - 1) as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+            (compute_start_slot_at_epoch(4) - 1) as usize % preset::slots_per_historical_root();
         state.block_roots_mut()[last_slot] = Root::repeat_byte(9);
 
         let new_key = active_balance_key(&state).unwrap();

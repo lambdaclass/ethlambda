@@ -85,15 +85,44 @@ mod vector;
 pub use cursor::{ElemCow, IterCow};
 pub use interface::SortedReader;
 pub use iter::Iter;
-pub use list::List;
+pub use list::{List, ListOf};
 pub use progressive_list::{
     ProgressiveIter, ProgressiveIterCow, ProgressiveList, ProgressiveSortedReader,
 };
 pub use update_map::{UpdateMap, VecMap};
-pub use vector::Vector;
+pub use vector::{Vector, VectorOf};
 
 use libssz::{SszDecode, SszEncode};
 use libssz_merkle::HashTreeRoot;
+
+/// The `N` of an SSZ `List[T, N]` or `Vector[T, N]`, carried as a type.
+///
+/// [`Const`] is the ordinary case, a bound fixed when the code is compiled.
+/// The other case is a bound read at runtime: the consensus specs' presets
+/// size several state vectors and lists (`SLOTS_PER_HISTORICAL_ROOT`,
+/// `EPOCHS_PER_HISTORICAL_VECTOR`, ...), and a node that picks its preset
+/// from the network's config at startup implements this trait on a marker
+/// type that reads the selected preset. A const generic cannot be that,
+/// since its value has to be known when the type is compiled.
+///
+/// [`get`](Length::get) is called on every length check, decode and root, so
+/// an implementation must return the same value for the whole life of the
+/// process: a tree built under one length and hashed under another would
+/// give a root that matches neither.
+pub trait Length: 'static {
+    /// The bound.
+    fn get() -> usize;
+}
+
+/// A [`Length`] fixed at compile time.
+pub struct Const<const N: usize>;
+
+impl<const N: usize> Length for Const<N> {
+    #[inline]
+    fn get() -> usize {
+        N
+    }
+}
 
 /// The buffered-write surface of a [`List`] or [`Vector`], independent of its
 /// element type and update map.

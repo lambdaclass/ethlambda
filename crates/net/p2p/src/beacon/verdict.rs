@@ -42,7 +42,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::{builder_market, column_checks};
+use crate::beacon::column_checks;
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
@@ -215,9 +215,10 @@ impl Validated {
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.builder_market.record_bid((**bid).clone())
             }
-            Self::ProposerPreferences(preferences) => server
-                .builder_market
-                .record_preferences((**preferences).clone(), builder_market::wall_slot(server)),
+            Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
+                (**preferences).clone(),
+                crate::wall_clock_slot(&server.store),
+            ),
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
@@ -236,8 +237,16 @@ impl Validated {
     /// Hand this object on towards the chain actor, given its gossip
     /// `outcome`.
     ///
-    /// A block goes straight to the chain actor whatever the outcome, since
-    /// its import runs the state transition, which judges it again. A column
+    /// A block goes on only on `Accept` or `Queue`, the two outcomes that
+    /// mean its proposer signature verified (see
+    /// `gossip::block::queue_if_signed`). Its import runs the state transition,
+    /// which judges it again, but a block that has to wait first (for its
+    /// parent, then for its custody columns) is kept unjudged the whole time,
+    /// so one whose signature nobody checked must never reach the actor:
+    /// mainnet gossip carries altered copies of real blocks that no peer has
+    /// columns for. Anything else (`Overloaded` included) is dropped, and a
+    /// real block dropped here still arrives through a child's by-root fetch
+    /// or range sync. A column
     /// goes straight there only on `Accept`: the chain actor keeps a column
     /// without checking it, so one gossip did not finish judging goes through
     /// [`column_checks`] first. An aggregate goes on only on `Accept`, and
@@ -257,6 +266,9 @@ impl Validated {
     /// actor checks it before it parks one. Any other outcome keeps it away. A
     /// payload attestation goes on only when accepted: it is only valid within
     /// its own slot, and the specification makes queueing one optional.
+    /// Accepted preferences go on as their proposal slot alone, for the
+    /// actor's `payload_attributes` event; the market already holds them. A
+    /// bid never does.
     ///
     /// What an accepted subnet attestation does feed is the attestation pool,
     /// when its subnet is one a validator client's aggregator had this node
@@ -332,7 +344,7 @@ impl Validated {
             return;
         };
         match self {
-            Self::Block { block, .. } => {
+            Self::Block { block, .. } if matches!(outcome, Outcome::Accept | Outcome::Queue(_)) => {
                 // `decode_start` is the wire arrival, so the import's decode
                 // section spans the decode and gossip validation.
                 let arrival = BlockArrival {
@@ -341,9 +353,8 @@ impl Validated {
                     deferred_from: None,
                 };
                 // Only a block that passed validation is announced: one
-                // forwarded on `Queue` or `Ignore(Overloaded)` still imports,
-                // but `block_gossip` names blocks that passed the topic's
-                // rules.
+                // forwarded on `Queue` still imports, but `block_gossip`
+                // names blocks that passed the topic's rules.
                 let announcement = if outcome == Outcome::Accept {
                     BlockAnnouncement::Announce
                 } else {
@@ -354,11 +365,26 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
             Self::Column(sidecar) if outcome == Outcome::Accept => {
+                // Accept means gossip already ran every rule. This instant is
+                // taken in `forward`, after the verdict's trip back through
+                // the p2p actor, where `check_and_forward` takes the instant
+                // its check finished.
+                ethlambda_telemetry::emit(|| {
+                    column_checks::passed_rows(
+                        &sidecar,
+                        column_checks::ColumnArrival::received("gossip", received_at),
+                        Instant::now(),
+                    )
+                });
                 let _ = blockchain
                     .new_data_column_sidecars(vec![*sidecar])
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
-            Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
+            Self::Column(sidecar) => column_checks::check_and_forward(
+                server,
+                vec![*sidecar],
+                column_checks::ColumnArrival::received("gossip", received_at),
+            ),
             Self::Aggregate {
                 aggregate,
                 attesting_indices,
@@ -391,7 +417,16 @@ impl Validated {
                     .new_payload_attestation_message(message, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a payload attestation"));
             }
-            Self::Aggregate { .. }
+            Self::ProposerPreferences(preferences) if outcome == Outcome::Accept => {
+                // The market recorded them in `settle`; the actor only hears
+                // that they exist, for its `payload_attributes` event.
+                let proposal_slot = preferences.message.proposal_slot;
+                let _ = blockchain
+                    .new_proposer_preferences(proposal_slot)
+                    .inspect_err(|err| warn!(%err, "Failed to report proposer preferences"));
+            }
+            Self::Block { .. }
+            | Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
             // Their events went out above, in `publish_gossip_event`.
@@ -405,10 +440,11 @@ impl Validated {
     }
 }
 
-/// Report an accepted gloas object on the Beacon API's event stream, for the
-/// four topics whose objects never reach the chain actor that publishes the
-/// rest (bids and preferences stop here, and a payload attestation message
-/// only ever feeds fork choice).
+/// Report an accepted object on the Beacon API's event stream, for the topics
+/// whose objects never reach the chain actor that publishes the rest (bids
+/// and preferences stop here, the actor hearing only a preference's slot; a
+/// payload attestation message only ever feeds fork choice, and a subnet
+/// attestation is relayed and nothing more).
 ///
 /// Only on `Accept`, since each event names objects that passed the topic's
 /// rules. A queued envelope has not, so `execution_payload_gossip` waits for
@@ -433,6 +469,12 @@ fn publish_gossip_event(server: &P2PServer, object: &Validated) {
         }
         Validated::PayloadAttestation(message) if sink.has_subscribers() => {
             GossipEvent::PayloadAttestationMessage(message.clone())
+        }
+        // The highest-rate event the node has (every attestation on its
+        // backbone subnets), so nothing is cloned for a node nobody listens
+        // to. Any subscriber turns it on, whatever its topics.
+        Validated::Attestation { attestation, .. } if sink.has_subscribers() => {
+            GossipEvent::SingleAttestation(attestation.clone())
         }
         _ => return,
     };
@@ -582,6 +624,27 @@ fn settle(server: &mut P2PServer, outcome: Outcome, object: &Validated) -> Outco
     }
 }
 
+/// [`settle`] for the gossip message delivered as `message_id`.
+///
+/// An accepted column the execution-layer path published under the same id
+/// keeps its `Accept` without being recorded: the key is taken by that very
+/// column, and that publish sent nothing, so this copy is the only one
+/// gossipsub can relay. See [`crate::beacon::engine_columns`]'s module doc.
+pub(crate) fn settle_message(
+    server: &mut P2PServer,
+    message_id: &MessageId,
+    outcome: Outcome,
+    object: &Validated,
+) -> Outcome {
+    if outcome == Outcome::Accept
+        && matches!(object, Validated::Column(_))
+        && server.engine_published_columns.take(message_id)
+    {
+        return Outcome::Accept;
+    }
+    settle(server, outcome, object)
+}
+
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict {
@@ -589,7 +652,7 @@ impl Handler<GossipVerdict> for P2PServer {
             outcome,
             object,
         } = msg;
-        let outcome = settle(self, outcome, &object);
+        let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
         if report(self, id, outcome) {
             object.forward(self, received_at, outcome);
@@ -671,13 +734,14 @@ fn pool_of(object: &Validated) -> &'static str {
 ///
 /// With every permit taken, the object is reported `Ignore(Overloaded)`
 /// instead of queued: queueing it would only make its verdict later than
-/// gossipsub's cache can wait for, so it never propagates unvalidated. A block
-/// still goes on towards the chain actor regardless: its import runs the
-/// state transition, which judges it again. A column goes through
-/// [`column_checks`] instead (see [`Validated::forward`]); dropping either
-/// here would leave the actor to learn of it only through a child's by-root
-/// fetch or range sync, both far slower than gossip. An aggregate or a subnet
-/// attestation is not forwarded on this outcome at all: see
+/// gossipsub's cache can wait for, so it never propagates unvalidated. A
+/// column still goes on, through [`column_checks`] (see
+/// [`Validated::forward`]); dropping it here would leave the actor to learn of
+/// it only through a by-root fetch, far slower than gossip. A block is
+/// dropped: its signature went unchecked, and [`Validated::forward`] keeps
+/// every such block off the chain actor. None was measured overloaded on the
+/// mainnet followers over the 24 hours before this changed. An aggregate or a
+/// subnet attestation is not forwarded on this outcome either: see
 /// [`Validated::forward`]'s own documentation for why.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
@@ -957,8 +1021,9 @@ mod tests {
     /// `Ignore`/`Reject` too, since `forward`'s guard is the same `if let ...
     /// if outcome == Outcome::Accept` for all three) must never reach the
     /// chain actor.
-    /// `block_gossip` names blocks that passed validation, so a block
-    /// forwarded on any other verdict still imports but is not announced.
+    /// `block_gossip` names blocks that passed validation. A queued block is
+    /// still forwarded, to import once it can, but is not announced; one the
+    /// validation pool never judged (`Overloaded`) is not forwarded at all.
     #[tokio::test]
     async fn only_an_accepted_gossip_block_is_announced() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -983,11 +1048,7 @@ mod tests {
 
         assert_eq!(
             *chain.announcements.lock().unwrap(),
-            [
-                BlockAnnouncement::Announce,
-                BlockAnnouncement::Silent,
-                BlockAnnouncement::Silent
-            ]
+            [BlockAnnouncement::Announce, BlockAnnouncement::Silent]
         );
     }
 
@@ -1008,6 +1069,42 @@ mod tests {
         );
 
         assert!(chain.aggregates.lock().unwrap().is_empty());
+    }
+
+    /// A block reaches the chain actor only on the outcomes that mean its
+    /// signature verified: a block the validation pool had no permit for was
+    /// never judged at all, so it is dropped rather than handed on.
+    #[tokio::test]
+    async fn only_an_accepted_or_queued_block_is_forwarded() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forwarded = |server: &mut P2PServer, outcome: Outcome| {
+            let chain = Arc::new(RecordingChain::default());
+            server.blockchain = Some(chain.clone());
+            let object = Validated::Block {
+                block: Box::new(fulu_block(5, 1)),
+                block_root: Root::repeat_byte(5),
+            };
+            object.forward(server, Instant::now(), outcome);
+            !chain.announcements.lock().unwrap().is_empty()
+        };
+
+        assert!(forwarded(&mut server, Outcome::Accept));
+        assert!(forwarded(
+            &mut server,
+            Outcome::Queue(QueueReason::ParentNotReady)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Ignore(IgnoreReason::Overloaded)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Ignore(IgnoreReason::SignatureUnverified)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Reject(RejectReason::BadSignature)
+        ));
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -1162,14 +1259,68 @@ mod tests {
         assert!(chain.aggregates.lock().unwrap().is_empty());
     }
 
+    /// A sink that keeps what p2p reported, with a switchable audience.
+    #[derive(Default)]
+    struct RecordingSink {
+        subscribed: bool,
+        events: std::sync::Mutex<Vec<GossipEvent>>,
+    }
+
+    impl ethlambda_network_api::GossipEventSink for RecordingSink {
+        fn has_subscribers(&self) -> bool {
+            self.subscribed
+        }
+
+        fn emit(&self, event: GossipEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// A subnet attestation reaches the event sink on `Accept` alone, and only
+    /// when someone listens.
+    #[tokio::test]
+    async fn an_accepted_subnet_attestation_reaches_the_event_sink_only_when_listened_to() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forward = |server: &P2PServer, outcome| {
+            Validated::Attestation {
+                attestation: Box::new(electra_attestation(5, 1)),
+                subnet_id: 0,
+            }
+            .forward(server, Instant::now(), outcome)
+        };
+
+        // No subscriber: the `has_subscribers` guard keeps even an accepted
+        // attestation from being cloned and sent.
+        let silent = Arc::new(RecordingSink::default());
+        server.gossip_events = Some(silent.clone());
+        forward(&server, Outcome::Accept);
+        assert!(silent.events.lock().unwrap().is_empty());
+
+        let sink = Arc::new(RecordingSink {
+            subscribed: true,
+            ..Default::default()
+        });
+        server.gossip_events = Some(sink.clone());
+        forward(&server, Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(&server, Outcome::Reject(RejectReason::BadSignature));
+        assert!(sink.events.lock().unwrap().is_empty());
+        forward(&server, Outcome::Accept);
+        let events = sink.events.lock().unwrap();
+        let [GossipEvent::SingleAttestation(attestation)] = events.as_slice() else {
+            panic!("expected exactly one single attestation event, got {events:?}");
+        };
+        assert_eq!(**attestation, electra_attestation(5, 1));
+    }
+
     /// What `forward` handed the chain actor, by method.
     #[derive(Debug, PartialEq)]
     enum Sent {
         Envelope,
         PayloadAttestation,
+        ProposerPreferences(u64),
     }
 
-    /// A chain actor stand-in that reports only the two gloas deliveries.
+    /// A chain actor stand-in that reports only the gloas deliveries.
     struct GloasRecorder(tokio::sync::mpsc::UnboundedSender<Sent>);
 
     impl P2PToBlockChain for GloasRecorder {
@@ -1225,6 +1376,10 @@ mod tests {
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Sent::PayloadAttestation);
+            Ok(())
+        }
+        fn new_proposer_preferences(&self, proposal_slot: u64) -> Result<(), ActorError> {
+            let _ = self.0.send(Sent::ProposerPreferences(proposal_slot));
             Ok(())
         }
     }
@@ -1490,10 +1645,11 @@ mod tests {
         assert!(server.builder_market.preferences(40, Root::ZERO).is_some());
     }
 
-    /// Neither builder market type has a consumer on the chain actor, on any
-    /// outcome.
+    /// A bid never reaches the chain actor, on any outcome. Preferences reach
+    /// it on `Accept` alone, and only as their proposal slot: the market holds
+    /// them, and the actor's `payload_attributes` event reads them there.
     #[tokio::test]
-    async fn bids_and_preferences_never_reach_the_chain_actor() {
+    async fn only_accepted_preferences_reach_the_chain_actor_and_only_as_a_slot() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
         server.blockchain = Some(Arc::new(GloasRecorder(sender)));
@@ -1504,14 +1660,27 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         ] {
             bid_object(&server, bid(5, 3, 10)).forward(&server, Instant::now(), outcome);
+        }
+        assert!(received.try_recv().is_err());
+
+        for outcome in [
+            Outcome::Queue(QueueReason::BlockUnknown),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+            Outcome::Reject(RejectReason::BadSignature),
+        ] {
             Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
                 &server,
                 Instant::now(),
                 outcome,
             );
         }
-
         assert!(received.try_recv().is_err());
+        Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
+            &server,
+            Instant::now(),
+            Outcome::Accept,
+        );
+        assert_eq!(received.try_recv(), Ok(Sent::ProposerPreferences(40)));
     }
 
     /// Bids and preferences draw from a pool of their own, so a burst of them

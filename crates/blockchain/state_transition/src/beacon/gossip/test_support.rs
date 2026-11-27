@@ -215,14 +215,18 @@ pub(crate) mod builder_scene {
     use crate::beacon::primitives::{ExecutionAddress, ExecutionBlockHash};
 
     pub(crate) const PARENT: Root = Root::repeat_byte(0x50);
-    pub(crate) const BID_SLOT: Slot = PARENT_SLOT + 2;
+    pub(crate) fn scene_bid_slot() -> Slot {
+        scene_parent_slot() + 2
+    }
     /// The slot the scene's parent sits at: epoch 1's first, whose state can hold a
     /// funded builder only with a finalized epoch that a real chain cannot have
     /// there (a builder is active once the finalized epoch passes its deposit
     /// epoch, and the finalized epoch never exceeds the previous one). Fine for
     /// a rule that reads the state as it is; a test that advances it through
     /// an epoch's end needs [`scene_at`] with a parent in epoch 2 or later.
-    pub(crate) const PARENT_SLOT: Slot = preset::SLOTS_PER_EPOCH;
+    pub(crate) fn scene_parent_slot() -> Slot {
+        preset::slots_per_epoch()
+    }
     pub(crate) const PARENT_GAS_LIMIT: u64 = 30_000_000;
 
     pub(crate) fn fee_recipient() -> ExecutionAddress {
@@ -283,7 +287,7 @@ pub(crate) mod builder_scene {
     /// finalizing epoch 1: reachable once `parent_slot` is in epoch 2 or later.
     fn parent_state_at(parent_slot: Slot) -> BeaconState {
         let mut state = test_support::gloas_state_with_builder(0, 100_000_000_000, 0);
-        if parent_slot == PARENT_SLOT {
+        if parent_slot == scene_parent_slot() {
             return state;
         }
         let BeaconState::Gloas(inner) = &mut state else {
@@ -322,13 +326,13 @@ pub(crate) mod builder_scene {
     /// The scene with `edit` applied to the parent's state before it is stored,
     /// and the prerequisites of a passing bid recorded in the market.
     pub(crate) fn scene_with(edit: impl FnOnce(&mut gloas::BeaconState)) -> Scene {
-        scene_at(PARENT_SLOT, edit)
+        scene_at(scene_parent_slot(), edit)
     }
 
     /// [`scene_with`] for a parent at `parent_slot`, whose bid is for the slot
     /// two after it.
     pub(crate) fn scene_at(parent_slot: Slot, edit: impl FnOnce(&mut gloas::BeaconState)) -> Scene {
-        let bid_slot = parent_slot + (BID_SLOT - PARENT_SLOT);
+        let bid_slot = parent_slot + (scene_bid_slot() - scene_parent_slot());
         let mut state = parent_state_at(parent_slot);
         let BeaconState::Gloas(inner) = &mut state else {
             unreachable!("built as gloas")

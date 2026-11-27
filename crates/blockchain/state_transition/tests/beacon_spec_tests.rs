@@ -4,8 +4,9 @@
 //! [`beacon_spec`] is compiled once and each runner lives in its own file with a single
 //! owner. Add a runner by adding a module to [`beacon_spec`] and one line below.
 //!
-//! Run with `make test-beacon`, which downloads the fixtures and builds the
-//! crate once per preset.
+//! Run with `make test-beacon`, which downloads the fixtures, builds this
+//! binary once, and runs it once per preset (`BEACON_SPEC_PRESET`, see
+//! [`beacon_spec::select_preset`]).
 //!
 //! # Why this binary supplies its own harness
 //!
@@ -28,6 +29,8 @@
 mod beacon_spec;
 
 fn main() {
+    // First: every runner below reads the preset, and the first read freezes it.
+    beacon_spec::select_preset();
     let args = libtest_mimic::Arguments::from_args();
 
     let mut trials = Vec::new();
@@ -49,10 +52,11 @@ fn main() {
     trials.extend(beacon_spec::sync::trials());
     trials.extend(beacon_spec::transition::trials());
 
-    // The release ships genesis fixtures for the minimal preset only, so the
-    // whole module is compiled out otherwise (see its own inner attribute).
-    #[cfg(feature = "preset-minimal")]
-    trials.extend(beacon_spec::genesis::trials());
+    // The release ships genesis fixtures for the minimal preset only (see the
+    // module's own doc).
+    if beacon_spec::preset() == "minimal" {
+        trials.extend(beacon_spec::genesis::trials());
+    }
 
     libtest_mimic::run(&args, trials).exit();
 }

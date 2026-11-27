@@ -1,7 +1,7 @@
 //! Runtime chain configuration: the values `configs/mainnet.yaml` and
 //! `configs/minimal.yaml` set per network, as opposed to constants (fixed by
-//! the specification, see [`crate::beacon::constants`]) or preset values (compile-time
-//! container bounds, see [`crate::beacon::preset`]).
+//! the specification, see [`crate::beacon::constants`]) or preset values (container
+//! bounds, one preset per process, see [`crate::beacon::preset`]).
 //!
 //! Fork *scheduling* lives here rather than at compile time specifically
 //! because the `transition` fixture suite needs to move a fork's activation
@@ -52,6 +52,7 @@ use libssz_types::SszList;
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
+use crate::beacon::preset::Preset;
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
 use crate::chain_config::ChainConfig;
 use crate::constants::INTERVALS_PER_SLOT;
@@ -225,8 +226,9 @@ pub struct Config {
     // -- Identity ---------------------------------------------------------
     /// `PRESET_BASE`: which preset the file was written for.
     ///
-    /// Startup refuses a file whose value differs from the compiled preset, so
-    /// on a running node this always names [`crate::beacon::preset::Preset::ACTIVE`].
+    /// Startup selects the preset this names before anything reads one, and
+    /// refuses a name it has no values for, so on a running node this always
+    /// names [`Preset::active`].
     ///
     /// Defaults to empty rather than to mainnet's value when the file omits
     /// it: the startup check has to fail on an absent key rather than guess.
@@ -1005,19 +1007,23 @@ impl Config {
         ChainConfig::new(self.genesis_time, self.slot_duration_ms)
     }
 
-    /// The configuration matching the compiled-in preset: [`Config::minimal`]
-    /// when this crate is built with the `preset-minimal` feature,
-    /// [`Config::mainnet`] otherwise.
+    /// The specification's configuration for `preset`: [`Config::mainnet`] or
+    /// [`Config::minimal`].
+    pub fn for_preset(preset: Preset) -> Self {
+        match preset {
+            Preset::Mainnet => Self::mainnet(),
+            Preset::Minimal => Self::minimal(),
+        }
+    }
+
+    /// [`Config::for_preset`] of the preset this process runs
+    /// ([`Preset::active`]).
     ///
-    /// For code that already knows its preset at compile time (unlike the
+    /// For code that has no network config of its own to read (unlike the
     /// `transition` fixture suite, which needs to pick a configuration, and
     /// possibly override a fork epoch, per test case).
     pub fn active() -> Self {
-        if cfg!(feature = "preset-minimal") {
-            Self::minimal()
-        } else {
-            Self::mainnet()
-        }
+        Self::for_preset(Preset::active())
     }
 
     /// The fork active at `epoch`: the newest fork whose activation epoch is

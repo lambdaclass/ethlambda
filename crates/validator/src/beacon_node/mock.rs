@@ -1,7 +1,7 @@
 //! A `BeaconNodeApi` that answers from values a test sets, used by the duty
 //! service tests. Compiled only under `cfg(test)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,9 +25,11 @@ use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
+use crate::beacon_node::events::{EventSource, EventStream, NodeEvent, Topic};
+use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
+    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
     ValidatorEntry, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -58,11 +60,39 @@ pub struct MockBeaconNode {
     /// When set, every method fails with this message, regardless of `failures`.
     pub fail_everything: Option<String>,
     pub genesis: Option<Genesis>,
+    /// What `spec` answers with. `None` is mainnet's. A test changes it to
+    /// have a node start reporting a new schedule after startup.
+    pub spec_config: Mutex<Option<Config>>,
+    /// When set, `spec` fails with what this builds, for the errors a real
+    /// node's answer raises (a body that is not JSON, a spec missing a key)
+    /// rather than the request failure `failures` stands for.
+    pub spec_error: Mutex<Option<fn() -> Error>>,
+    /// How many times `genesis` and `spec` were called, for a test that
+    /// checks a node was (or was not) asked.
+    pub genesis_calls: std::sync::atomic::AtomicUsize,
+    pub spec_calls: std::sync::atomic::AtomicUsize,
     pub syncing: bool,
     /// Tracking a head its execution client has not validated. Separate from
     /// `syncing`, because the pair a real node can report and this client must
     /// still refuse is exactly "synced, but optimistic".
     pub optimistic: bool,
+    /// What the node reports about its sync status once set, in place of
+    /// `syncing` and `optimistic`: a node whose status changes while a test
+    /// runs. See [`MockBeaconNode::set_sync_status`].
+    pub sync_status_override: Mutex<Option<SyncStatus>>,
+    /// How long `sync_status` takes before it answers, as a hung node would.
+    pub sync_status_delay: Option<std::time::Duration>,
+    /// When set, a node that takes the request and never answers, as the HTTP
+    /// client sees one: each call that checks it ([`Self::stall`]) waits this
+    /// long, the request timeout, and then fails as a timeout. Settable while
+    /// a test runs, so a hung node can come back. See [`Self::set_hang`].
+    pub hang: Mutex<Option<std::time::Duration>>,
+    /// The method of every call made while [`Self::hang`] was set, recorded
+    /// on entry.
+    pub hung_calls: Mutex<Vec<&'static str>>,
+    /// When set, a node that answers every call that checks [`Self::hang`],
+    /// but this much later: slower than its peers, not hung.
+    pub slow: Option<std::time::Duration>,
     pub validators: Vec<ValidatorEntry>,
     pub duties: Mutex<Vec<(Epoch, AttesterDuties)>>,
     pub proposers: Mutex<Vec<(Epoch, ProposerDuties)>>,
@@ -184,7 +214,8 @@ pub struct MockBeaconNode {
     /// Every published gloas aggregate batch.
     pub published_gloas_aggregates: Mutex<Vec<(ForkName, Vec<gloas::SignedAggregateAndProof>)>>,
     pub ptc: Mutex<Vec<(Epoch, PtcDuties)>>,
-    pub ptc_calls: Mutex<usize>,
+    /// The epoch of every `ptc_duties` request, in call order.
+    pub ptc_requests: Mutex<Vec<Epoch>>,
     /// What `payload_attestation_data` answers with. `None` is the 204.
     pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
     pub payload_attestation_data_calls: Mutex<usize>,
@@ -224,6 +255,95 @@ pub struct MockBeaconNode {
     /// reason and records nothing: an exit the node judged invalid, as
     /// opposed to a node that could not be reached (`failures`).
     pub exit_refusal: Option<String>,
+    /// The (epoch, validator) pairs `liveness` answers live; every other pair
+    /// it is asked about is answered not live.
+    pub live: Mutex<Vec<(Epoch, ValidatorIndex)>>,
+    /// Every `liveness` request that got past the configured failures and the
+    /// syncing check, as (epoch, indices), in call order.
+    pub liveness_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
+    /// How long `liveness` takes before it answers, as a hung node would.
+    pub liveness_delay: Option<std::time::Duration>,
+    /// How long `spec` takes before it answers, as a hung node would.
+    pub spec_delay: Option<std::time::Duration>,
+    /// A delay for the first call of each named method only (see
+    /// [`Self::with_first_call_delay`]).
+    pub first_call_delays: Mutex<HashMap<&'static str, std::time::Duration>>,
+    /// The event streams `subscribe` hands out, one per call, in order: the
+    /// first one for any topic asked for, or scripted for any topic (`None`).
+    /// Once none fits, a subscription fails as an unreachable node's does.
+    pub event_streams: Mutex<VecDeque<(Option<Topic>, ScriptedStream)>>,
+    /// The topics of every `subscribe` call, in call order.
+    pub event_subscriptions: Mutex<Vec<Vec<Topic>>>,
+}
+
+/// One step of a scripted event stream.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamStep {
+    /// Send nothing for this long.
+    Wait(std::time::Duration),
+    /// Deliver this event.
+    Event(NodeEvent),
+}
+
+/// What a scripted stream does once its steps run out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The node closes it.
+    Close,
+    /// It breaks, as a dropped connection does.
+    Fail,
+    /// It stays open and sends nothing more.
+    Hang,
+}
+
+/// An event stream the mock hands out: its steps, then its end.
+#[derive(Debug, Clone)]
+pub struct ScriptedStream {
+    pub steps: VecDeque<StreamStep>,
+    pub end: StreamEnd,
+}
+
+#[async_trait]
+impl EventStream for ScriptedStream {
+    async fn next_event(&mut self) -> Result<Option<NodeEvent>> {
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                StreamStep::Wait(delay) => tokio::time::sleep(delay).await,
+                StreamStep::Event(event) => return Ok(Some(event)),
+            }
+        }
+        match self.end {
+            StreamEnd::Close => Ok(None),
+            StreamEnd::Fail => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Body,
+                detail: "the event stream broke".to_string(),
+            }),
+            StreamEnd::Hang => std::future::pending().await,
+        }
+    }
+}
+
+#[async_trait]
+impl EventSource for MockBeaconNode {
+    async fn subscribe(&self, topics: &[Topic]) -> Result<Box<dyn EventStream>> {
+        self.event_subscriptions
+            .lock()
+            .expect("lock")
+            .push(topics.to_vec());
+        let mut streams = self.event_streams.lock().expect("lock");
+        let fits = streams
+            .iter()
+            .position(|(topic, _)| topic.is_none_or(|topic| topics.contains(&topic)));
+        match fits.and_then(|position| streams.remove(position)) {
+            Some((_, stream)) => Ok(Box::new(stream)),
+            None => Err(Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Connect,
+                detail: "no event stream scripted".to_string(),
+            }),
+        }
+    }
 }
 
 impl MockBeaconNode {
@@ -361,6 +481,28 @@ impl MockBeaconNode {
         *self.proposer_duties_v2_calls.lock().expect("lock")
     }
 
+    /// Serve `config` as the spec, in place of mainnet's.
+    pub fn with_spec(self, config: Config) -> Self {
+        self.set_spec(config);
+        self
+    }
+
+    /// Change the spec this node serves, as an upgraded node does.
+    pub fn set_spec(&self, config: Config) {
+        *self.spec_config.lock().expect("lock") = Some(config);
+    }
+
+    /// Serve this validators root as the chain's, in place of the default.
+    pub fn with_genesis_root(mut self, root: Root) -> Self {
+        let mut genesis = self.genesis.unwrap_or(Genesis {
+            genesis_time: 0,
+            genesis_validators_root: Root::ZERO,
+        });
+        genesis.genesis_validators_root = root;
+        self.genesis = Some(genesis);
+        self
+    }
+
     pub fn with_attestation_data(mut self, slot: Slot) -> Self {
         self.attestation_data = Some(AttestationData {
             slot,
@@ -376,6 +518,43 @@ impl MockBeaconNode {
             },
         });
         self
+    }
+
+    /// Answer `attestation_data` naming `root` as the head block. Over
+    /// [`Self::with_attestation_data`], which names the zero root.
+    pub fn with_attestation_block_root(mut self, root: Root) -> Self {
+        if let Some(data) = &mut self.attestation_data {
+            data.beacon_block_root = root;
+        }
+        self
+    }
+
+    /// Hand `steps`, then `end`, to the next `subscribe`, whatever its topic,
+    /// that no stream scripted before this one goes to.
+    pub fn with_event_stream(self, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(None, steps, end)
+    }
+
+    /// [`Self::with_event_stream`], for a subscription to `topic` only.
+    pub fn with_topic_stream(self, topic: Topic, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        self.script_stream(Some(topic), steps, end)
+    }
+
+    fn script_stream(self, topic: Option<Topic>, steps: Vec<StreamStep>, end: StreamEnd) -> Self {
+        let stream = ScriptedStream {
+            steps: steps.into(),
+            end,
+        };
+        self.event_streams
+            .lock()
+            .expect("lock")
+            .push_back((topic, stream));
+        self
+    }
+
+    /// The topics of every `subscribe` call, in call order.
+    pub fn event_subscriptions(&self) -> Vec<Vec<Topic>> {
+        self.event_subscriptions.lock().expect("lock").clone()
     }
 
     /// Answer `produce_block` with a minimal well-formed electra block for
@@ -442,9 +621,119 @@ impl MockBeaconNode {
         self
     }
 
+    /// Make the first call to `what` (`attestation_data`, `head_block_root`
+    /// or `payload_attestation_data`) take `delay` before it answers, and
+    /// every later one answer at once: an early request still out at a
+    /// duty's deadline, then the deadline's own request.
+    pub fn with_first_call_delay(self, what: &'static str, delay: std::time::Duration) -> Self {
+        self.first_call_delays
+            .lock()
+            .expect("lock")
+            .insert(what, delay);
+        self
+    }
+
+    /// Wait out the delay set for `what`'s first call, if this is it.
+    async fn delay_first_call(&self, what: &'static str) {
+        let delay = self.first_call_delays.lock().expect("lock").remove(what);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Make `produce_block` wait for a permit from `gate` before it answers.
     pub fn with_produce_gate(mut self, gate: Arc<Semaphore>) -> Self {
         self.produce_gate = Some(gate);
+        self
+    }
+
+    /// Make `liveness` take `delay` before it answers.
+    pub fn with_liveness_delay(mut self, delay: std::time::Duration) -> Self {
+        self.liveness_delay = Some(delay);
+        self
+    }
+
+    /// Make `sync_status` take `delay` before it answers.
+    pub fn with_sync_status_delay(mut self, delay: std::time::Duration) -> Self {
+        self.sync_status_delay = Some(delay);
+        self
+    }
+
+    /// Hang every call that checks [`Self::hang`] for `timeout`, then fail it
+    /// as a timeout, as a node that accepts the request and never answers.
+    pub fn with_hang(self, timeout: std::time::Duration) -> Self {
+        self.set_hang(Some(timeout));
+        self
+    }
+
+    /// Start or stop hanging: `None` is a node that answers again.
+    pub fn set_hang(&self, timeout: Option<std::time::Duration>) {
+        *self.hang.lock().expect("lock") = timeout;
+    }
+
+    /// Answer every call that checks [`Self::hang`] `delay` late, as a node
+    /// that is slower than its peers but answers.
+    pub fn with_slow_answers(mut self, delay: std::time::Duration) -> Self {
+        self.slow = Some(delay);
+        self
+    }
+
+    /// How many calls to `what` were made while the node hung.
+    pub fn hung_calls_to(&self, what: &str) -> usize {
+        self.hung_calls
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|called| **called == what)
+            .count()
+    }
+
+    /// For a call that checks it: when the node hangs, wait out the timeout
+    /// and fail as the HTTP client fails a request that got no answer. Checked
+    /// by `sync_status`, `attestation_data`, `publish_block`,
+    /// `submit_attestations` and `publish_execution_payload_envelope`, which
+    /// all also wait out [`Self::slow`] first.
+    async fn stall(&self, what: &'static str) -> Result<()> {
+        if let Some(delay) = self.slow {
+            tokio::time::sleep(delay).await;
+        }
+        let hang = *self.hang.lock().expect("lock");
+        let Some(timeout) = hang else {
+            return Ok(());
+        };
+        self.hung_calls.lock().expect("lock").push(what);
+        tokio::time::sleep(timeout).await;
+        Err(Error::BeaconNode {
+            url: "mock".to_string(),
+            failure: BeaconNodeFailure::Timeout,
+            detail: format!("{what}: no answer within {} ms", timeout.as_millis()),
+        })
+    }
+
+    /// Report `status` from now on, whatever `syncing` and `optimistic` say:
+    /// the node went optimistic, say, after a test's first probe.
+    pub fn set_sync_status(&self, status: SyncStatus) {
+        *self.sync_status_override.lock().expect("lock") = Some(status);
+    }
+
+    /// What the node reports about its sync status now: the override when one
+    /// is set, else `syncing` and `optimistic`, with no head slot.
+    pub fn current_status(&self) -> SyncStatus {
+        self.sync_status_override
+            .lock()
+            .expect("lock")
+            .unwrap_or(SyncStatus {
+                head_slot: None,
+                sync_distance: None,
+                is_syncing: self.syncing,
+                is_optimistic: self.optimistic,
+                el_offline: false,
+            })
+    }
+
+    /// Make `spec` take `delay` before it answers.
+    pub fn with_spec_delay(mut self, delay: std::time::Duration) -> Self {
+        self.spec_delay = Some(delay);
         self
     }
 
@@ -594,7 +883,12 @@ impl MockBeaconNode {
     }
 
     pub fn ptc_call_count(&self) -> usize {
-        *self.ptc_calls.lock().expect("lock")
+        self.ptc_requests.lock().expect("lock").len()
+    }
+
+    /// The epochs `ptc_duties` was asked for, in call order.
+    pub fn ptc_requested_epochs(&self) -> Vec<Epoch> {
+        self.ptc_requests.lock().expect("lock").clone()
     }
 
     /// Answer `payload_attestation_data` with `data`.
@@ -719,6 +1013,16 @@ impl MockBeaconNode {
         self.failures.lock().expect("lock").remove(what);
     }
 
+    /// Start failing the named method mid-test, the converse of
+    /// [`Self::stop_failing`]: for a call that must answer during a test's
+    /// setup and fail after it.
+    pub fn start_failing(&self, what: &'static str, message: &str) {
+        self.failures
+            .lock()
+            .expect("lock")
+            .insert(what, message.to_string());
+    }
+
     /// The attestations submitted so far, in submission order.
     pub fn submitted(&self) -> Vec<SingleAttestationDto> {
         self.submitted.lock().expect("lock").clone()
@@ -762,6 +1066,11 @@ impl MockBeaconNode {
         *self.proposer_duties_calls.lock().expect("lock")
     }
 
+    /// The `liveness` requests answered so far, in call order.
+    pub fn liveness_requests(&self) -> Vec<(Epoch, Vec<ValidatorIndex>)> {
+        self.liveness_requests.lock().expect("lock").clone()
+    }
+
     /// How many times `attestation_data` has been called, successes and
     /// failures alike.
     pub fn attestation_data_call_count(&self) -> usize {
@@ -790,6 +1099,8 @@ impl MockBeaconNode {
 #[async_trait]
 impl BeaconNodeApi for MockBeaconNode {
     async fn genesis(&self) -> Result<Genesis> {
+        self.genesis_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.guard("genesis")?;
         self.genesis.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -799,13 +1110,37 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn spec(&self) -> Result<Config> {
+        self.spec_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(delay) = self.spec_delay {
+            tokio::time::sleep(delay).await;
+        }
         self.guard("spec")?;
-        Ok(Config::mainnet())
+        if let Some(error) = *self.spec_error.lock().expect("lock") {
+            return Err(error());
+        }
+        Ok(self
+            .spec_config
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or_else(Config::mainnet))
     }
 
     async fn is_optimistic_or_syncing(&self) -> Result<bool> {
         self.guard("is_syncing")?;
-        Ok(self.syncing || self.optimistic)
+        Ok(!self.current_status().is_synced())
+    }
+
+    /// Fails with `is_optimistic_or_syncing`, under the same key: both are the
+    /// one `/eth/v1/node/syncing` request on a real node.
+    async fn sync_status(&self) -> Result<SyncStatus> {
+        if let Some(delay) = self.sync_status_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.stall("sync_status").await?;
+        self.guard("is_syncing")?;
+        Ok(self.current_status())
     }
 
     async fn validator_indices(&self, pubkeys: &[BlsPubkey]) -> Result<Vec<ValidatorEntry>> {
@@ -855,8 +1190,10 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
+        self.stall("attestation_data").await?;
         self.guard("attestation_data")?;
         *self.attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("attestation_data").await;
         self.attestation_data_forks.lock().expect("lock").push(fork);
         let data = self.attestation_data.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
@@ -951,6 +1288,7 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
+        self.stall("publish_block").await?;
         self.guard("publish_block")?;
         self.published_blocks
             .lock()
@@ -1083,6 +1421,7 @@ impl BeaconNodeApi for MockBeaconNode {
         body: &[u8],
         blob_data_included: bool,
     ) -> Result<()> {
+        self.stall("publish_execution_payload_envelope").await?;
         self.guard("publish_execution_payload_envelope")?;
         self.envelope_publish_entered.notify_one();
         if let Some(gate) = &self.envelope_publish_gate {
@@ -1100,7 +1439,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn ptc_duties(&self, epoch: Epoch, _indices: &[ValidatorIndex]) -> Result<PtcDuties> {
         self.guard("ptc_duties")?;
-        *self.ptc_calls.lock().expect("lock") += 1;
+        self.ptc_requests.lock().expect("lock").push(epoch);
         self.ptc
             .lock()
             .expect("lock")
@@ -1120,6 +1459,7 @@ impl BeaconNodeApi for MockBeaconNode {
     ) -> Result<Option<gloas::PayloadAttestationData>> {
         self.guard("payload_attestation_data")?;
         *self.payload_attestation_data_calls.lock().expect("lock") += 1;
+        self.delay_first_call("payload_attestation_data").await;
         let Some(data) = self.payload_attestation_data else {
             return Ok(None);
         };
@@ -1149,6 +1489,7 @@ impl BeaconNodeApi for MockBeaconNode {
         attestations: &[SingleAttestationDto],
         fork_name: &str,
     ) -> Result<usize> {
+        self.stall("submit_attestations").await?;
         self.guard("submit_attestations")?;
         self.submitted
             .lock()
@@ -1276,6 +1617,7 @@ impl BeaconNodeApi for MockBeaconNode {
 
     async fn head_block_root(&self) -> Result<Root> {
         self.guard("head_block_root")?;
+        self.delay_first_call("head_block_root").await;
         if self.head_optimistic {
             return Err(Error::BeaconNodeSyncing);
         }
@@ -1367,5 +1709,43 @@ impl BeaconNodeApi for MockBeaconNode {
             self.set_validator_details(Some(details));
         }
         Ok(())
+    }
+
+    /// Honours the trait's contracts the way a real implementation does: an
+    /// empty request is answered without asking, and a syncing or optimistic
+    /// node answers `BeaconNodeSyncing`. Each epoch asked about is recorded
+    /// as its own request, as it is one on the wire.
+    async fn liveness(
+        &self,
+        epochs: &[Epoch],
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<Vec<Liveness>>> {
+        // Ahead of the configured failures: an empty request never reaches
+        // a node, so no node can fail it.
+        if indices.is_empty() {
+            return Ok(vec![Vec::new(); epochs.len()]);
+        }
+        if let Some(delay) = self.liveness_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.guard("liveness")?;
+        if !self.current_status().is_synced() {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        let live = self.live.lock().expect("lock");
+        let mut requests = self.liveness_requests.lock().expect("lock");
+        Ok(epochs
+            .iter()
+            .map(|&epoch| {
+                requests.push((epoch, indices.to_vec()));
+                indices
+                    .iter()
+                    .map(|&index| Liveness {
+                        index,
+                        is_live: live.contains(&(epoch, index)),
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }

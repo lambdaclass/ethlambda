@@ -146,7 +146,7 @@ use ethlambda_state_transition::beacon::stf::signatures::SignatureBatch;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
+use super::{Case, collect_all_handlers, lean_is_not_a_fixture_fork, preset};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -175,6 +175,7 @@ fn apply(
     case: &Case,
     state: &mut BeaconState,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     // Every signature an operation defers is checked once the operation has
     // run, which is how a block's own driver treats them: a case whose only
@@ -185,12 +186,12 @@ fn apply(
     // case no handler covers ran nothing, so it passes through the batch
     // (empty, so it verifies) as the closure's `Ok(Err(..))`, and the last
     // step hands that error back.
-    SignatureBatch::deferred(
-        |signatures| match run(handler, case, state, config, signatures) {
+    SignatureBatch::deferred(|signatures| {
+        match run(handler, case, state, config, committees, signatures) {
             Ok(verdict) => verdict.map(Ok),
             Err(unhandled) => Ok(Err(unhandled)),
-        },
-    )
+        }
+    })
     .map_err(|err| format!("{err:?}"))
     .and_then(|handled| handled)
 }
@@ -203,12 +204,12 @@ fn run(
     case: &Case,
     state: &mut BeaconState,
     config: &Config,
+    committees: &CommitteeCache,
     signatures: &mut SignatureBatch,
 ) -> Result<Result<(), ethlambda_state_transition::beacon::Error>, String> {
-    // Only the `attestation` handler reads this. Bound up here so each of its
-    // calls fits on one line; a case processes a single attestation, so there
-    // is nothing for the cache to share between calls.
-    let committees = CommitteeCache::default();
+    // `committees` is only read by the `attestation` handler. The caller owns
+    // it so that an electra-or-later attestation can be run once with a cold
+    // cache and once with a warmed one; see [`trials`].
     let active_balances = ActiveBalanceCache::default();
     let pubkey_indices = PubkeyIndexCache::default();
     let outcome = match handler {
@@ -318,7 +319,7 @@ fn run(
                         &attestation,
                         proposer,
                         config,
-                        &committees,
+                        committees,
                         signatures,
                     )
                 })
@@ -333,7 +334,7 @@ fn run(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
                         None,
                         signatures,
@@ -349,7 +350,7 @@ fn run(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
                         None,
                         signatures,
@@ -366,7 +367,7 @@ fn run(
                         state,
                         &attestation,
                         proposer,
-                        &committees,
+                        committees,
                         &active_balances,
                         None,
                         signatures,
@@ -386,7 +387,7 @@ fn run(
                     state,
                     &attestation,
                     meta.parent_slot,
-                    &committees,
+                    committees,
                     &active_balances,
                     None,
                     signatures,
@@ -775,7 +776,7 @@ fn run(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "operations");
+    let cases = collect_all_handlers(preset(), "operations");
     let mut trials = vec![super::discovery_trial("operations", cases.len())];
 
     for (handler, case) in cases {
@@ -784,7 +785,26 @@ pub fn trials() -> Vec<Trial> {
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
             let config = super::case_config(case);
-            let outcome = apply(&handler, case, &mut state, &config);
+            // An electra-or-later attestation picks its aggregate key from the
+            // shuffling's committee key sums when they are warm, and a fresh
+            // cache is never warm, so the case runs a second time on a copy
+            // of the pre-state with the sums built. Both runs must agree.
+            let warm_run = (handler == "attestation" && case.fork >= ForkName::Electra)
+                .then(|| state.clone());
+
+            let outcome = apply(&handler, case, &mut state, &config, &CommitteeCache::default());
+            if let Some(mut warm_state) = warm_run {
+                let committees = CommitteeCache::default();
+                super::warm_key_sums_around(&committees, &warm_state);
+                let warm = apply(&handler, case, &mut warm_state, &config, &committees);
+                if warm != outcome {
+                    return Err(format!(
+                        "the warm-sums run answered {warm:?} where the cold run answered {outcome:?}"
+                    ));
+                }
+                super::check_transition(case, warm, &warm_state)
+                    .map_err(|err| format!("warm sums: {err}"))?;
+            }
             super::check_transition(case, outcome, &state)
         }));
     }
@@ -830,7 +850,7 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "withdrawals",
     ];
 
-    let mut unknown: Vec<String> = collect_all_handlers(PRESET, "operations")
+    let mut unknown: Vec<String> = collect_all_handlers(preset(), "operations")
         .into_iter()
         .filter(|(_, case): &(String, Case)| case.in_scope())
         .map(|(handler, _)| handler)

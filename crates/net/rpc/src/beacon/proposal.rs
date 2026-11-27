@@ -26,10 +26,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
+use ethlambda_blockchain::{
+    BuildAttributes, PreparedPayloads, SyncStatusController,
+    metrics::SyncStatus,
+    payload_attributes::{
+        FeeRecipientSource, advance_for_proposal, building_forkchoice_state, payload_attributes_v3,
+    },
+};
 use ethlambda_engine::{
-    EngineClient, ForkchoiceStateV1,
-    building::{BuiltPayload, PayloadAttributesV3},
+    EngineClient,
+    building::{BuiltPayload, PayloadId},
     types::{ClientVersionV1, uint256},
 };
 use ethlambda_network_api::RpcToP2PRef;
@@ -63,8 +69,8 @@ use ethlambda_types::{
         fork::ForkName,
         preset,
         primitives::{
-            BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash,
-            HashTreeRoot as _, KzgProof, Slot, Uint256, ValidatorIndex,
+            BlsPubkey, BlsSignature, Bytes32, ExecutionBlockHash, HashTreeRoot as _, KzgProof,
+            Slot, Uint256, ValidatorIndex,
         },
         signing::compute_epoch_at_slot,
     },
@@ -528,6 +534,7 @@ async fn get_block(
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     Extension(sync_status): Extension<SyncStatusController>,
     builder: Option<Extension<Arc<Builder>>>,
+    prepared: Option<Extension<PreparedPayloads>>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -571,6 +578,7 @@ async fn get_block(
         &engine,
         &sync_pool,
         &fee_recipients,
+        prepared.as_ref().map(|Extension(prepared)| prepared),
         &own_version,
         builder.as_ref().map(|Extension(builder)| builder.as_ref()),
         query.builder_boost_factor.unwrap_or(DEFAULT_BOOST_FACTOR),
@@ -691,6 +699,7 @@ async fn produce(
     engine: &EngineClient,
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
+    prepared: Option<&PreparedPayloads>,
     own_version: &ClientVersionV1,
     builder: Option<&Builder>,
     boost_factor: u64,
@@ -707,7 +716,14 @@ async fn produce(
         if slot <= head_state.slot() {
             return Err(ApiError::BadRequest("slot is not after the head block"));
         }
-        let state = advance_to_slot(&head_state, slot, &advance_config).map_err(|err| {
+        let state = advance_for_proposal(
+            &advance_store,
+            head_root,
+            &head_state,
+            slot,
+            &advance_config,
+        )
+        .map_err(|err| {
             warn!(%slot, %err, "Advancing the head state to the proposal slot failed");
             ApiError::Internal("advancing the head state failed")
         })?;
@@ -727,7 +743,15 @@ async fn produce(
     // at most the version's own timeout. The builder's bid is asked alongside
     // as well, bounded by its own header timeout, and checked as soon as it
     // arrives, so a valid one can bound the wait for the local payload.
-    let local = build_payload(store, engine, fee_recipients, &state, head_root, proposer);
+    let local = build_payload(
+        store,
+        engine,
+        fee_recipients,
+        prepared,
+        &state,
+        head_root,
+        proposer,
+    );
     let bid = async {
         let request = request.as_ref()?;
         let bid = fetch_bid(request, slot).await?;
@@ -1205,18 +1229,55 @@ fn blinded_block(
     }
 }
 
-/// Ask the execution client to build on the head for `state`'s slot, then
-/// collect what it built.
+/// How long block production lets the execution client build between
+/// `forkchoiceUpdated` (which starts the build) and `getPayload` (which ends
+/// it), for a proposal the chain actor did not start a build for ahead of the
+/// slot.
 ///
-/// Collected straight away rather than after waiting: the execution client
-/// starts with a valid (possibly empty) payload and improves it, so an early
-/// `getPayload` always answers, with less time for transactions to arrive. The
-/// validator client asks at the start of the slot, which is when the block is
-/// due.
+/// An execution client answers a `getPayload` that follows the update at once
+/// with whatever it built in that instant: geth and ethrex start from an
+/// empty payload and add transactions as they execute them, so without a
+/// window a block carries few or none of the transactions pending
+/// (lambdaclass/ethlambda#894: 0 to 3 of 16 back to back, 48 of 48 after
+/// 500 ms). Lodestar and Nimbus wait the same on this path. A proposal the
+/// actor prepared waits only for what is left of it since that build
+/// started, which is nothing for a build started seconds ahead.
+pub(crate) const PAYLOAD_BUILD_WINDOW: Duration = Duration::from_millis(500);
+
+/// The payload id of the build the chain actor started ahead of `slot` with
+/// exactly these inputs, if it did ([`PreparedPayloads`]), once that build
+/// has had [`PAYLOAD_BUILD_WINDOW`] to fill. A build started seconds ahead
+/// has, and is returned at once; one restarted moments before the slot (the
+/// head or an attribute changed late) is waited on for the rest of the
+/// window, as a build started here would be.
+pub(crate) async fn prepared_build(
+    prepared: Option<&PreparedPayloads>,
+    slot: Slot,
+    parent_hash: H256,
+    attributes: &BuildAttributes,
+) -> Option<PayloadId> {
+    let prepared = prepared?;
+    let Some(build) = prepared.take(slot, parent_hash, attributes) else {
+        info!(%slot, "No payload build was started ahead for these attributes; building now");
+        return None;
+    };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW.saturating_sub(build.started.elapsed())).await;
+    Some(build.payload_id)
+}
+
+/// The execution client's payload for `state`'s slot, on the head.
+///
+/// The chain actor starts the build a third of a slot ahead, and again when
+/// its inputs change ([`PreparedPayloads`]). When one of those builds has
+/// exactly these attributes it is collected ([`prepared_build`]: at once, the
+/// execution client having filled it since, unless it started less than
+/// [`PAYLOAD_BUILD_WINDOW`] ago). Otherwise the build starts here and is
+/// collected after [`PAYLOAD_BUILD_WINDOW`].
 async fn build_payload(
     store: &Store,
     engine: &EngineClient,
     fee_recipients: &FeeRecipients,
+    prepared: Option<&PreparedPayloads>,
     state: &BeaconState,
     head_root: H256,
     proposer: u64,
@@ -1224,38 +1285,33 @@ async fn build_payload(
     let config = store.config();
     let inputs = payload_inputs(state, &config)
         .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
-    let fee_recipient = fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&proposer)
-        .copied()
-        .unwrap_or_else(|| {
-            warn!(
-                proposer,
-                "No fee recipient prepared for the proposer; using the zero address"
-            );
-            ExecutionAddress::ZERO
-        });
-    // The same rule `forkchoiceUpdated` uses for a checkpoint block (a gloas
-    // one is its bid's parent hash), so the two calls never disagree.
-    let forkchoice = ForkchoiceStateV1 {
-        head_block_hash: inputs.parent_hash,
-        safe_block_hash: ethlambda_blockchain::checkpoint_hash(
-            store,
-            store.beacon_justified_checkpoint().root,
+    let (fee_recipient, source) = fee_recipients.for_proposer(proposer);
+    match source {
+        FeeRecipientSource::Prepared | FeeRecipientSource::Preferences => {}
+        FeeRecipientSource::Fallback => debug!(
+            proposer,
+            "No fee recipient prepared for the proposer; using --fallback-fee-recipient"
         ),
-        finalized_block_hash: ethlambda_blockchain::checkpoint_hash(
-            store,
-            store.beacon_finalized_checkpoint().root,
+        FeeRecipientSource::Unknown => warn!(
+            proposer,
+            "No fee recipient prepared for the proposer and no --fallback-fee-recipient; using the zero address"
         ),
-    };
-    let attributes = PayloadAttributesV3 {
-        timestamp: inputs.timestamp,
-        prev_randao: inputs.prev_randao,
-        suggested_fee_recipient: fee_recipient,
-        withdrawals: inputs.withdrawals,
-        parent_beacon_block_root: head_root,
-    };
+    }
+    let forkchoice = building_forkchoice_state(store, head_root, inputs.parent_hash);
+    let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
+    let slot = state.slot();
+    let ahead = BuildAttributes::V3(attributes.clone());
+    if let Some(payload_id) = prepared_build(prepared, slot, inputs.parent_hash, &ahead).await {
+        match engine.get_payload(payload_id).await {
+            Ok(built) => {
+                info!(%slot, "Collected the payload build started ahead of the slot");
+                return Ok(built);
+            }
+            Err(err) => {
+                warn!(%slot, %err, "Collecting the payload build started ahead failed; building now");
+            }
+        }
+    }
     let (status, payload_id) = engine
         .forkchoice_updated_with_attributes(&forkchoice, &attributes)
         .await
@@ -1269,6 +1325,7 @@ async fn build_payload(
             "the execution client declined to build a payload",
         ));
     };
+    tokio::time::sleep(PAYLOAD_BUILD_WINDOW).await;
     engine.get_payload(payload_id).await.map_err(|err| {
         warn!(%err, "getPayload failed");
         ApiError::ServiceUnavailable("the execution client did not return a payload")
@@ -1291,6 +1348,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
     use http_body_util::BodyExt as _;
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -2393,7 +2451,7 @@ mod tests {
 
         let (mut store, head_slot) = fulu_store();
         let (head_root, head_state) = super::super::validator::head(&store).unwrap();
-        let next_epoch_start = head_slot + preset::SLOTS_PER_EPOCH;
+        let next_epoch_start = head_slot + preset::slots_per_epoch();
         let finalized = Checkpoint {
             root: head_root,
             slot: next_epoch_start,
@@ -2561,6 +2619,7 @@ pub(crate) mod test_support {
     use ethlambda_types::beacon::containers::capella;
     use ethlambda_types::beacon::containers::deneb::{ExecutionPayloadHeader, KzgCommitments};
     use ethlambda_types::beacon::containers::electra;
+    use ethlambda_types::beacon::primitives::ExecutionAddress;
     use std::time::Duration;
 
     /// A fulu head with its proposer lookahead and sync committee filled in,

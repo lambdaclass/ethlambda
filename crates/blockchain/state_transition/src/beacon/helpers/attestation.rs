@@ -9,7 +9,7 @@
 //! the aggregation bits from one committee to a whole slot's worth and adding a
 //! committee bitfield, so it gets its own versions rather than reusing these.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::phase0::{Attestation, AttestingIndices, IndexedAttestation};
@@ -126,7 +126,7 @@ pub(crate) fn attesters_signature_set(
     domain: Option<Domain>,
 ) -> Option<SignatureSet> {
     if attesting_indices.is_empty()
-        || attesting_indices.len() > preset::MAX_VALIDATORS_PER_SLOT
+        || attesting_indices.len() > preset::max_validators_per_slot()
         || !are_indices_sorted_and_unique(attesting_indices)
     {
         return None;
@@ -135,7 +135,10 @@ pub(crate) fn attesters_signature_set(
     let mut pubkeys = Vec::with_capacity(attesting_indices.len());
     for index in attesting_indices {
         match state.validator(*index) {
-            Ok(validator) => pubkeys.push(validator.pubkey),
+            Ok(validator) => pubkeys.push(IndexedPubkey {
+                index: *index,
+                pubkey: validator.pubkey,
+            }),
             Err(_) => return None,
         }
     }

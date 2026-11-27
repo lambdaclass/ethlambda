@@ -10,7 +10,7 @@
 //! any other config can fail this way; it carries the path so the caller does
 //! not have to guess which file it was.
 
-use ethlambda_types::beacon::primitives::BlsPubkey;
+use ethlambda_types::beacon::primitives::{BlsPubkey, ValidatorIndex};
 
 /// The EIP-2335 keystore schema version this client understands.
 pub const EIP2335_KEYSTORE_VERSION: u64 = 4;
@@ -119,6 +119,13 @@ pub enum Error {
     /// `ProposalService::propose_by`).
     #[error("proposal for slot {slot} ran past the point attesters stop waiting for its block")]
     ProposalDeadline { slot: u64 },
+    /// An epoch's duty refresh, run after the slot's block with a schedule
+    /// already held, ran past the end of the slot it started in and was
+    /// abandoned, so that a slow beacon node holds the duty loop for one slot
+    /// at most. Retryable: the refresh runs again at the next slot. A refresh
+    /// run with nothing held is never cut off (see `ahead_of_block`).
+    #[error("duty refresh for epoch {epoch} ran past the end of slot {slot}")]
+    DutyRefreshDeadline { epoch: u64, slot: u64 },
     /// Slashing protection refused to sign a block for this slot, or could not
     /// record it.
     ///
@@ -138,6 +145,16 @@ pub enum Error {
     ExitRefused(String),
     #[error("malformed response: {0}")]
     Decode(String),
+    /// The node's `/eth/v1/config/spec` was JSON, but not a spec this client
+    /// can read: a required key absent or malformed. Unlike [`Self::Decode`],
+    /// which a proxy answering for a node still booting also raises, this is
+    /// the node's own answer, and asking again gives the same one.
+    #[error("unreadable config/spec: {0}")]
+    UnreadableSpec(String),
+    /// The beacon node runs a preset this process cannot adopt: one with no
+    /// values here, or a different one from what this process already runs.
+    #[error("cannot run the beacon node's preset: {0}")]
+    Preset(String),
 
     #[error("keystore {path}: {reason}")]
     Keystore { path: String, reason: String },
@@ -158,6 +175,36 @@ pub enum Error {
     /// within the slot would change.
     #[error("signing failed for {pubkey:?}: {reason}")]
     Signing { pubkey: BlsPubkey, reason: String },
+    /// Doppelganger protection has not cleared this key to sign an
+    /// attestation, a block, a RANDAO reveal or an aggregate: it is still
+    /// being checked, or a doppelganger was seen and the client is stopping.
+    /// See [`crate::doppelganger`].
+    ///
+    /// Not retryable within the slot: the check clears a key at an epoch
+    /// boundary, never mid-slot.
+    #[error("doppelganger protection has not cleared {0:?} to sign")]
+    DoppelgangerProtected(BlsPubkey),
+    /// The beacon network saw these validators act in an epoch this client
+    /// withheld their duties for, so another client is running their keys.
+    /// What the client stops with. Never retryable: it takes an operator to
+    /// find the other client.
+    #[error(
+        "doppelganger detected for validators {validators:?}: another client is running their \
+         keys"
+    )]
+    DoppelgangerDetected { validators: Vec<ValidatorIndex> },
+    /// The doppelganger check's task ended, which it only does by panicking.
+    /// Its keys would stay withheld for the rest of the process with nothing
+    /// saying why, so the client stops for its supervisor to restart, as it
+    /// does for an unusable slashing-protection record. Never retryable.
+    #[error("the doppelganger check stopped: {reason}")]
+    DoppelgangerCheckStopped { reason: String },
+    /// The beacon node chain check's task ended, which it only does by
+    /// panicking. No node it took out would be let back in and no later fork
+    /// followed, so the client stops for its supervisor to restart, as it
+    /// does when the doppelganger check stops. Never retryable.
+    #[error("the beacon node chain check stopped: {reason}")]
+    ChainCheckStopped { reason: String },
 
     /// The slashing-protection record could not be opened, read or written,
     /// or refuses to start: a key with no record, another chain's record,
@@ -239,16 +286,24 @@ impl Error {
             | Self::InconsistentResponse(_)
             | Self::AttestationDeadline { .. }
             | Self::ProposalDeadline { .. }
+            | Self::DutyRefreshDeadline { .. }
             | Self::Decode(_) => true,
             // A refusal repeats itself, and a record that could not be written
             // needs an operator: retrying within the slot helps neither.
+            // The node's preset does not change under a running client.
             Self::ProposalRefused { .. }
             | Self::ExitRefused(_)
+            | Self::Preset(_)
+            | Self::UnreadableSpec(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)
             | Self::KeystoreBadPassword
             | Self::UnknownValidator(_)
             | Self::Signing { .. }
+            | Self::DoppelgangerProtected(_)
+            | Self::DoppelgangerDetected { .. }
+            | Self::DoppelgangerCheckStopped { .. }
+            | Self::ChainCheckStopped { .. }
             | Self::SlashingProtection { .. }
             | Self::SlashingProtectionUnusable { .. }
             | Self::Io { .. }

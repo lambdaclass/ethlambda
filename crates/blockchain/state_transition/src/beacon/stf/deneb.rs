@@ -25,7 +25,7 @@
 //! caches two new blob-gas fields for EIP-4844, and [`process_voluntary_exit`]
 //! signs under a fixed fork version for EIP-7044.
 
-use crate::beacon::bls::SignatureSet;
+use crate::beacon::bls::{IndexedPubkey, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::capella::SignedBLSToExecutionChange;
@@ -57,6 +57,8 @@ use crate::beacon::primitives::{
 };
 use crate::beacon::stf::signatures::SignatureBatch;
 
+use crate::metrics::{StfPhase, timed, try_for_each_timed};
+
 use super::{BlockCaches, ExecutionEngine};
 
 // ---------------------------------------------------------------------------
@@ -86,21 +88,27 @@ pub fn process_block(
     options: super::block::BlockProcessingOptions,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    super::block::process_block_header(
-        state,
-        block.slot,
-        block.proposer_index,
-        block.parent_root,
-        block.body.hash_tree_root(),
-    )?;
-    process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(
-        state,
-        &block.body.execution_payload,
-        &block.body.blob_kzg_commitments,
-        config,
-        engine,
-    )?;
+    // The body's root is an argument, so it is hashed inside the timed span:
+    // it is part of what a header costs.
+    timed(StfPhase::BlockHeader, || {
+        super::block::process_block_header(
+            state,
+            block.slot,
+            block.proposer_index,
+            block.parent_root,
+            block.body.hash_tree_root(),
+        )
+    })?;
+    timed(StfPhase::ExecutionPayload, || -> Result<()> {
+        process_withdrawals(state, &block.body.execution_payload)?;
+        process_execution_payload(
+            state,
+            &block.body.execution_payload,
+            &block.body.blob_kzg_commitments,
+            config,
+            engine,
+        )
+    })?;
     super::block::process_randao(state, &block.body.randao_reveal, options.randao, signatures)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     process_operations(
@@ -180,49 +188,70 @@ fn process_operations(
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in proposer_slashings {
-        super::operations::process_proposer_slashing(
-            state,
-            proposer_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
-    for attester_slashing in attester_slashings {
-        super::operations::process_attester_slashing(
-            state,
-            attester_slashing,
-            config,
-            active_balances,
-            signatures,
-        )?;
-    }
-    // One proposer lookup for the list, not one per attestation: see the same
-    // loop in `super::operations::process_operations`.
-    if !attestations.is_empty() {
-        let proposer_index = get_beacon_proposer_index(state)?;
-        for attestation in attestations {
-            process_attestation(
+    try_for_each_timed(
+        StfPhase::ProposerSlashings,
+        proposer_slashings,
+        |slashing| {
+            super::operations::process_proposer_slashing(
                 state,
-                attestation,
-                proposer_index,
-                committees,
+                slashing,
+                config,
                 active_balances,
-                target_delta,
                 signatures,
-            )?;
-        }
+            )
+        },
+    )?;
+    try_for_each_timed(
+        StfPhase::AttesterSlashings,
+        attester_slashings,
+        |slashing| {
+            super::operations::process_attester_slashing(
+                state,
+                slashing,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
+    )?;
+    // One proposer lookup for the list, not one per attestation, timed with
+    // the attestations it serves: see the same loop in
+    // `super::operations::process_operations`.
+    if !attestations.is_empty() {
+        timed(StfPhase::Attestations, || -> Result<()> {
+            let proposer_index = get_beacon_proposer_index(state)?;
+            for attestation in attestations {
+                process_attestation(
+                    state,
+                    attestation,
+                    proposer_index,
+                    committees,
+                    active_balances,
+                    target_delta,
+                    signatures,
+                )?;
+            }
+            Ok(())
+        })?;
     }
-    for deposit in deposits {
-        super::operations::process_deposit(state, deposit, config)?;
-    }
-    for voluntary_exit in voluntary_exits {
-        process_voluntary_exit(state, voluntary_exit, config, signatures)?;
-    }
-    for signed_change in bls_to_execution_changes {
-        super::capella::process_bls_to_execution_change(state, signed_change, config, signatures)?;
-    }
+    try_for_each_timed(StfPhase::Deposits, deposits, |deposit| {
+        super::operations::process_deposit(state, deposit, config)
+    })?;
+    try_for_each_timed(StfPhase::VoluntaryExits, voluntary_exits, |exit| {
+        process_voluntary_exit(state, exit, config, signatures)
+    })?;
+    try_for_each_timed(
+        StfPhase::BlsToExecutionChanges,
+        bls_to_execution_changes,
+        |signed_change| {
+            super::capella::process_bls_to_execution_change(
+                state,
+                signed_change,
+                config,
+                signatures,
+            )
+        },
+    )?;
 
     Ok(())
 }
@@ -268,28 +297,28 @@ pub fn process_withdrawals(
     }
 
     let validator_count = state.validator_count() as ValidatorIndex;
-    let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
-    {
-        let latest_withdrawal = expected_withdrawals
-            .last()
-            .expect("MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty");
-        latest_withdrawal
-            .validator_index
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow(
-                "latest_withdrawal.validator_index + 1",
-            ))?
-            % validator_count
-    } else {
-        let current_cursor =
-            deneb_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
-        current_cursor
-            .checked_add(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP)
-            .ok_or(Error::ArithmeticOverflow(
-                "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
-            ))?
-            % validator_count
-    };
+    let next_validator_index =
+        if expected_withdrawals.len() == preset::max_withdrawals_per_payload() {
+            let latest_withdrawal = expected_withdrawals.last().expect(
+                "MAX_WITHDRAWALS_PER_PAYLOAD is never zero, so a full payload is non-empty",
+            );
+            latest_withdrawal
+                .validator_index
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow(
+                    "latest_withdrawal.validator_index + 1",
+                ))?
+                % validator_count
+        } else {
+            let current_cursor =
+                deneb_state_ref(state, "process_withdrawals")?.next_withdrawal_validator_index;
+            current_cursor
+                .checked_add(preset::max_validators_per_withdrawals_sweep())
+                .ok_or(Error::ArithmeticOverflow(
+                    "next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP",
+                ))?
+                % validator_count
+        };
     deneb_state(state, "process_withdrawals")?.next_withdrawal_validator_index =
         next_validator_index;
 
@@ -546,7 +575,7 @@ fn attestation_participation_flag_indices(
     verify(is_matching_source, "is_matching_source")?;
 
     let mut participation_flag_indices = Vec::new();
-    if is_matching_source && inclusion_delay <= integer_squareroot(preset::SLOTS_PER_EPOCH) {
+    if is_matching_source && inclusion_delay <= integer_squareroot(preset::slots_per_epoch()) {
         participation_flag_indices.push(constants::TIMELY_SOURCE_FLAG_INDEX);
     }
     // [EIP-7045]: no `inclusion_delay` bound, unlike altair's
@@ -768,7 +797,10 @@ pub fn process_voluntary_exit(
     let signing_root = compute_signing_root(voluntary_exit.hash_tree_root(), domain);
     signatures.push(
         SignatureSet::single(
-            &validator.pubkey,
+            &IndexedPubkey {
+                index: voluntary_exit.validator_index,
+                pubkey: validator.pubkey,
+            },
             signing_root,
             &signed_voluntary_exit.signature,
         ),

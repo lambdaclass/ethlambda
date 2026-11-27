@@ -81,7 +81,9 @@ use ethlambda_storage::CacheKey;
 /// The most aggregation bits a gloas aggregate may carry: electra's type
 /// bound (every committee of a slot at full size). Gloas's progressive bitlist
 /// has no bound of its own, so the gossip rules enforce this one.
-const MAX_AGGREGATION_BITS: usize = preset::MAX_VALIDATORS_PER_SLOT;
+fn max_aggregation_bits() -> usize {
+    preset::max_validators_per_slot()
+}
 
 /// One committee's worth of aggregation bits, packed a `u64` at a time.
 ///
@@ -275,7 +277,7 @@ pub fn cheap_checks(
     // read without expanding the list. Earlier forks' bitlists carry this bound
     // in their type.
     if matches!(aggregate, SignedAggregateAndProof::Gloas(_))
-        && aggregate.aggregation_bits_len() > MAX_AGGREGATION_BITS
+        && aggregate.aggregation_bits_len() > max_aggregation_bits()
     {
         return Err(Outcome::Reject(RejectReason::BitsLength));
     }
@@ -387,12 +389,16 @@ pub fn stateful_checks(
     let Ok(aggregator) = state.validator(aggregator_index) else {
         return Err(Outcome::Reject(RejectReason::UnknownValidator));
     };
+    let aggregator_pubkey = bls::IndexedPubkey {
+        index: aggregator_index,
+        pubkey: aggregator.pubkey,
+    };
     // [REJECT] The selection proof selects the validator as an aggregator.
     let selection_proof = aggregate.selection_proof();
     let selection_domain =
         get_domain_from_schedule(&config, &state, DOMAIN_SELECTION_PROOF, target_epoch);
     let selection_signing_root = compute_signing_root(data.slot.hash_tree_root(), selection_domain);
-    if !bls::verify(&aggregator.pubkey, selection_signing_root, &selection_proof) {
+    if !bls::verify(&aggregator_pubkey, selection_signing_root, &selection_proof) {
         return Err(Outcome::Reject(RejectReason::SelectionProof));
     }
     // [REJECT] The aggregator's own signature, over the whole envelope.
@@ -401,7 +407,7 @@ pub fn stateful_checks(
     let aggregator_signing_root =
         compute_signing_root(aggregate_and_proof_root(aggregate), aggregator_domain);
     if !bls::verify(
-        &aggregator.pubkey,
+        &aggregator_pubkey,
         aggregator_signing_root,
         &aggregate.signature(),
     ) {
@@ -626,7 +632,7 @@ mod tests {
             cheap_checks(
                 &seen_aggregates(),
                 &store,
-                &aggregate_with_len(MAX_AGGREGATION_BITS + 1),
+                &aggregate_with_len(max_aggregation_bits() + 1),
                 now_ms
             ),
             Err(Outcome::Reject(RejectReason::BitsLength))
@@ -637,7 +643,7 @@ mod tests {
             cheap_checks(
                 &seen_aggregates(),
                 &store,
-                &aggregate_with_len(MAX_AGGREGATION_BITS),
+                &aggregate_with_len(max_aggregation_bits()),
                 now_ms
             ),
             Err(Outcome::Reject(RejectReason::NoParticipants))
@@ -896,6 +902,6 @@ mod tests {
     }
 
     fn preset_slots_per_epoch() -> Slot {
-        crate::beacon::preset::SLOTS_PER_EPOCH
+        crate::beacon::preset::slots_per_epoch()
     }
 }

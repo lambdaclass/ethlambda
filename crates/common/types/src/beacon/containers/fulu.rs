@@ -48,6 +48,7 @@ use super::shared::{
 };
 use super::shared::{BeaconBlockHeader, Checkpoint, Eth1Data, Fork, SignedBeaconBlockHeader};
 use crate::beacon::preset;
+use crate::beacon::preset_sized::PresetVector;
 use crate::beacon::primitives::{
     Bytes32, ColumnIndex, Epoch, Gwei, KzgProof, Root, Slot, ValidatorIndex, WithdrawalIndex,
 };
@@ -59,7 +60,7 @@ use crate::beacon::primitives::{
 /// The window of upcoming proposer indices `BeaconState::proposer_lookahead`
 /// precomputes: the rest of the current epoch plus `MIN_SEED_LOOKAHEAD` full
 /// epochs beyond it.
-pub type ProposerLookahead = SszVector<ValidatorIndex, { preset::PROPOSER_LOOKAHEAD_LENGTH }>;
+pub type ProposerLookahead = PresetVector<ValidatorIndex, preset::ProposerLookaheadLength>;
 
 /// One cell of the extended data matrix: a fixed-size slice of a blob's
 /// Reed-Solomon extension, small enough that a node can fetch and verify one

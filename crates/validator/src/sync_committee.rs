@@ -3,7 +3,9 @@
 //! # What is owed
 //!
 //! A member of the current sync committee signs the head block root once per
-//! slot (`SyncCommitteeMessage`), at the sync-message deadline. The 512 seats
+//! slot (`SyncCommitteeMessage`), when the slot's block arrives or at the
+//! sync-message deadline, whichever comes first (see
+//! [`crate::head_monitor`]). The 512 seats
 //! are split into four subcommittees; within each, a few members are selected
 //! by a hash of their selection proof to fold the subcommittee's messages into
 //! a `SyncCommitteeContribution` and publish it, which is how the messages
@@ -11,8 +13,9 @@
 //!
 //! # Which slot, and which root
 //!
-//! The message carries the wall slot and the head root at the deadline, which
-//! may be an older block when slots were skipped. A member assigned to wall
+//! The message carries the wall slot and the head root when it is signed (on
+//! the slot's block, or at the deadline), which may be an older block when
+//! slots were skipped. A member assigned to wall
 //! slot `S` signs for `S - 1`; the caller picks the duties accordingly (see
 //! [`crate::duties::DutiesService::sync_at_slot`]).
 //!
@@ -21,6 +24,12 @@
 //! The optimistic-sync specification forbids signing `DOMAIN_SYNC_COMMITTEE`
 //! over an optimistic head, so [`BeaconNodeApi::head_block_root`] fails with
 //! `BeaconNodeSyncing` for one, and nothing is signed.
+//!
+//! A node that is syncing but not optimistic answers its stale head with
+//! `execution_optimistic: false`, and the Beacon API has no 503 for it. The
+//! fallback therefore does not ask a node whose last sync probe reported
+//! syncing or optimistic for the head (see [`crate::beacon_node::health`]):
+//! with every node in that state, the fetch answers `BeaconNodeSyncing` too.
 //!
 //! # Duplicates
 //!
@@ -34,8 +43,8 @@ use ethlambda_types::beacon::constants::{
     SYNC_COMMITTEE_SUBNET_COUNT, TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE,
 };
 use ethlambda_types::beacon::containers::altair::{
-    ContributionAndProof, SYNC_SUBCOMMITTEE_SIZE, SignedContributionAndProof,
-    SyncCommitteeContribution, SyncCommitteeMessage,
+    ContributionAndProof, SignedContributionAndProof, SyncCommitteeContribution,
+    SyncCommitteeMessage, sync_subcommittee_size,
 };
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root, Slot, ValidatorIndex};
 use sha2::{Digest, Sha256};
@@ -55,7 +64,8 @@ const HISTORY_SLOTS: u64 = 64;
 /// the selection proof's SHA-256, little-endian, divide evenly by
 /// `max(1, SYNC_SUBCOMMITTEE_SIZE / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE)`.
 pub fn is_sync_committee_aggregator(selection_proof: &BlsSignature) -> bool {
-    let modulo = (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+    let modulo =
+        (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
     let digest = Sha256::digest(selection_proof.0);
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest[..8]);
@@ -68,7 +78,7 @@ pub fn subnets_of(duty: &SyncDutyDto) -> BTreeSet<u64> {
     duty.validator_sync_committee_indices
         .iter()
         .filter_map(|seat| {
-            let subnet = seat / SYNC_SUBCOMMITTEE_SIZE as u64;
+            let subnet = seat / sync_subcommittee_size() as u64;
             if subnet < SYNC_COMMITTEE_SUBNET_COUNT as u64 {
                 Some(subnet)
             } else {
@@ -109,18 +119,11 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<Option<Root>> {
-        let pending: Vec<&SyncDutyDto> = {
-            let done = self.lock();
-            duties
-                .iter()
-                .filter(|duty| !done.contains(&(duty.validator_index, slot)))
-                .collect()
-        };
-        if pending.is_empty() {
+        if self.pending(slot, duties).is_empty() {
             return Ok(None);
         }
 
-        let root = match self.beacon_node.head_block_root().await {
+        let root = match self.head_block_root().await {
             Ok(root) => root,
             Err(Error::BeaconNodeSyncing) => {
                 warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
@@ -128,6 +131,33 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             }
             Err(err) => return Err(err),
         };
+        self.publish_messages_over(slot, duties, store, root).await
+    }
+
+    /// The head root a message would sign, with nothing recorded and nothing
+    /// signed. `BeaconNodeSyncing` for a head the node reports optimistic.
+    ///
+    /// For a caller that must look at the root before committing to it: the
+    /// duty loop's early trigger signs only the block a head event announced,
+    /// and otherwise leaves the duty to its deadline (see
+    /// [`crate::head_monitor`]).
+    pub async fn head_block_root(&self) -> Result<Root> {
+        self.beacon_node.head_block_root().await
+    }
+
+    /// [`Self::publish_messages`] over `root`, a head root already fetched
+    /// with [`Self::head_block_root`], instead of fetching it here.
+    pub async fn publish_messages_over(
+        &self,
+        slot: Slot,
+        duties: &[SyncDutyDto],
+        store: &RwLock<ValidatorStore>,
+        root: Root,
+    ) -> Result<Option<Root>> {
+        let pending = self.pending(slot, duties);
+        if pending.is_empty() {
+            return Ok(None);
+        }
 
         // Recorded one by one, then signed all at once, each within the
         // signing budget: a hung remote signer costs only its own keys'
@@ -318,6 +348,15 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         Ok(signed.len())
     }
 
+    /// The duties not yet served for `slot`.
+    fn pending<'d>(&self, slot: Slot, duties: &'d [SyncDutyDto]) -> Vec<&'d SyncDutyDto> {
+        let done = self.lock();
+        duties
+            .iter()
+            .filter(|duty| !done.contains(&(duty.validator_index, slot)))
+            .collect()
+    }
+
     fn record(&self, validator: ValidatorIndex, slot: Slot) -> bool {
         let Ok(mut done) = self.done.lock() else {
             error!(%slot, "Sync committee record is poisoned; refusing to sign");
@@ -388,7 +427,7 @@ mod tests {
     /// A signature hashing to a multiple of the modulus, or to a non-multiple.
     fn found(selected: bool) -> BlsSignature {
         let modulo =
-            (SYNC_SUBCOMMITTEE_SIZE as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
+            (sync_subcommittee_size() as u64 / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE).max(1);
         for seed in 0u32..100_000 {
             let mut bytes = [0u8; 96];
             bytes[..4].copy_from_slice(&seed.to_le_bytes());
@@ -411,7 +450,7 @@ mod tests {
     #[test]
     fn seats_map_to_subnets_and_stray_ones_are_dropped() {
         let (_, pubkey) = store();
-        let size = SYNC_SUBCOMMITTEE_SIZE as u64;
+        let size = sync_subcommittee_size() as u64;
         let subnets = subnets_of(&duty(
             &pubkey,
             1,
@@ -508,7 +547,7 @@ mod tests {
     }
 
     fn all_subnet_duty(pubkey: &BlsPubkey) -> SyncDutyDto {
-        let size = SYNC_SUBCOMMITTEE_SIZE as u64;
+        let size = sync_subcommittee_size() as u64;
         duty(pubkey, 9, vec![0, size, 2 * size, 3 * size])
     }
 

@@ -685,7 +685,7 @@ pub mod test_support {
         };
         // The window entry `get_ptc` reads for a slot of the state's own epoch.
         let window_index =
-            (preset::SLOTS_PER_EPOCH + inner.slot % preset::SLOTS_PER_EPOCH) as usize;
+            (preset::slots_per_epoch() + inner.slot % preset::slots_per_epoch()) as usize;
         inner.ptc_window[window_index] = ptc;
         state
     }
@@ -854,7 +854,7 @@ mod gloas_block_production_tests {
         let domain = get_domain(
             state,
             constants::DOMAIN_SYNC_COMMITTEE,
-            Some(previous_slot / preset::SLOTS_PER_EPOCH),
+            Some(previous_slot / preset::slots_per_epoch()),
         );
         let signing_root = compute_signing_root(root, domain);
         let (committee, _) = state.sync_committees().unwrap();
@@ -1207,7 +1207,7 @@ mod gloas_block_production_tests {
             .filter(|(_, validator)| **validator == first || **validator == second)
             .map(|(position, _)| position)
             .collect();
-        let set: Vec<usize> = (0..preset::PTC_SIZE)
+        let set: Vec<usize> = (0..preset::ptc_size())
             .filter(|&position| aggregate.aggregation_bits.get(position).unwrap_or(false))
             .collect();
         assert_eq!(set, expected_bits);

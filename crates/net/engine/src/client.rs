@@ -1,4 +1,4 @@
-//! The JSON-RPC client, its retry ladder, and the four methods.
+//! The JSON-RPC client, its retry ladder, and the methods a follower calls.
 
 use std::time::Duration;
 
@@ -10,8 +10,9 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
-    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    BlobAndProofV2, BlobAndProofV2Json, ClientVersionV1, CustodyColumns, ExecutionPayloadV3,
+    ExecutionPayloadV4, ForkchoiceStateV1, ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    decode_blobs_v2,
 };
 
 /// Per-attempt timeout.
@@ -25,6 +26,10 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
 /// for the older methods.
 pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Per-attempt timeout for `engine_getBlobsV2`, the value `osaka.md` gives that
+/// method.
+pub const ENGINE_GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Timeout for `engine_getPayloadV5` and `engine_getPayloadV6`, which get this
 /// one attempt and no retry.
@@ -282,9 +287,11 @@ impl EngineClient {
 
     /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
     ///
-    /// A follower never proposes, so it never asks an execution client to start
-    /// building. That also keeps this call outside the fork-scheduling rules
-    /// attached to `payloadAttributes.timestamp`.
+    /// The head update, which never asks an execution client to start
+    /// building: a build goes through
+    /// [`Self::forkchoice_updated_with_attributes`]. That also keeps this call
+    /// outside the fork-scheduling rules attached to
+    /// `payloadAttributes.timestamp`.
     pub async fn forkchoice_updated(
         &self,
         state: &ForkchoiceStateV1,
@@ -298,10 +305,10 @@ impl EngineClient {
     /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
     /// a `null` `payloadAttributes` and the consensus client's custody set.
     ///
-    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
-    /// follower never asks for a build. `custody_columns` of `None` sends
-    /// `null`, meaning the consensus client provides no custody. The response
-    /// is V3's.
+    /// The head update, which never asks for a build: a build goes through
+    /// [`Self::forkchoice_updated_v4_with_attributes`]. `custody_columns` of
+    /// `None` sends `null`, meaning the consensus client provides no custody.
+    /// The response is V3's.
     pub async fn forkchoice_updated_v4(
         &self,
         state: &ForkchoiceStateV1,
@@ -379,6 +386,37 @@ impl EngineClient {
             .call_with_attempts("engine_getPayloadV6", params, ENGINE_GET_PAYLOAD_TIMEOUT, 1)
             .await?;
         response.try_into()
+    }
+
+    /// `engine_getBlobsV2`: every blob named by `versioned_hashes`, in order,
+    /// with its cell proofs, or `None` when the execution client is missing
+    /// any of them.
+    ///
+    /// One attempt, bounded by [`ENGINE_GET_BLOBS_TIMEOUT`], and deliberately
+    /// not through the retry ladder: this call races the gossip delivery of the
+    /// same data columns, and a retry after the ladder's first backoff would
+    /// land after that race is lost. A failure leaves the block to gossip and
+    /// peers, which is where it was anyway.
+    ///
+    /// An answer that is not shaped as the specification requires (wrong
+    /// length, blob size or proof count, or a `null` element) is a
+    /// [`EngineError::Decode`].
+    pub async fn get_blobs_v2(
+        &self,
+        versioned_hashes: &[Bytes32],
+    ) -> Result<Option<Vec<BlobAndProofV2>>, EngineError> {
+        let hashes: Vec<String> = versioned_hashes
+            .iter()
+            .map(|hash| data(hash.as_slice()))
+            .collect();
+        let result: Option<Vec<Option<BlobAndProofV2Json>>> = self
+            .call_once(
+                "engine_getBlobsV2",
+                &json!([hashes]),
+                ENGINE_GET_BLOBS_TIMEOUT,
+            )
+            .await?;
+        decode_blobs_v2(result, versioned_hashes.len())
     }
 
     /// `engine_exchangeCapabilities`. Returns what the execution client says it

@@ -44,9 +44,11 @@ use blst::blst_scalar;
 use blst::min_pk::{PublicKey, Signature};
 use rand::RngExt;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, Root};
+use ethlambda_types::beacon::primitives::{BlsSignature, Root};
 
-use super::{DST, G2_POINT_AT_INFINITY, validated_pubkey, validated_pubkeys};
+use super::{
+    AggregatePubkey, DST, G2_POINT_AT_INFINITY, PubkeySource, validated_pubkey, validated_pubkeys,
+};
 
 /// How many bits of each random weight the batch check uses.
 const RAND_BITS: usize = 64;
@@ -77,7 +79,11 @@ impl SignatureSet {
     ///
     /// `None` when the key or the signature fails validation, which is exactly
     /// when [`super::verify`] returns false before reaching the pairing.
-    pub fn single(pubkey: &BlsPubkey, message: Root, signature: &BlsSignature) -> Option<Self> {
+    pub fn single<K: PubkeySource>(
+        pubkey: &K,
+        message: Root,
+        signature: &BlsSignature,
+    ) -> Option<Self> {
         let pubkey = validated_pubkey(pubkey)?;
         let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
         Some(Self {
@@ -93,8 +99,8 @@ impl SignatureSet {
     /// `None` for an empty `pubkeys`, any key that fails `key_validate`, or a
     /// signature that fails `sig_validate`: the cases
     /// [`super::fast_aggregate_verify`] answers false for before the pairing.
-    pub fn fast_aggregate(
-        pubkeys: &[BlsPubkey],
+    pub fn fast_aggregate<K: PubkeySource>(
+        pubkeys: &[K],
         message: Root,
         signature: &BlsSignature,
     ) -> Option<Self> {
@@ -114,6 +120,27 @@ impl SignatureSet {
         })
     }
 
+    /// `bls.FastAggregateVerify`'s inputs with the key already summed, as
+    /// committee key sums produce it.
+    ///
+    /// `None` when `signature` fails `sig_validate`. The key needs no check: a
+    /// sum of validated points is in the subgroup, and the identity, the one
+    /// sum that is not a valid key, is refused by [`Self::verify`] and by the
+    /// batch at pairing time, as it is for a key summed here from scratch.
+    pub fn from_aggregate(
+        key: AggregatePubkey,
+        message: Root,
+        signature: &BlsSignature,
+    ) -> Option<Self> {
+        let signature = Signature::sig_validate(signature.as_ref(), false).ok()?;
+        Some(Self {
+            pubkey: key.to_public_key(),
+            message,
+            signature,
+            aggregated: true,
+        })
+    }
+
     /// `eth_fast_aggregate_verify`'s inputs (`specs/altair/bls.md`): what
     /// [`Self::fast_aggregate`] builds, except that no participants at all is
     /// valid exactly when the signature is [`G2_POINT_AT_INFINITY`], and needs
@@ -123,8 +150,8 @@ impl SignatureSet {
     /// is [`EthFastAggregate::verify`] over this, and a block's sync
     /// aggregate goes through it, so block production's own check of an
     /// aggregate and the state transition's cannot disagree.
-    pub fn eth_fast_aggregate(
-        pubkeys: &[BlsPubkey],
+    pub fn eth_fast_aggregate<K: PubkeySource>(
+        pubkeys: &[K],
         message: Root,
         signature: &BlsSignature,
     ) -> EthFastAggregate {
@@ -251,6 +278,7 @@ mod tests {
 
     use super::*;
     use crate::bls;
+    use ethlambda_types::beacon::primitives::BlsPubkey;
 
     fn secret_key(seed: u8) -> SecretKey {
         let mut ikm = [seed; 32];
@@ -436,7 +464,7 @@ mod tests {
 
         assert!(SignatureSet::single(&garbage_key, msg, &signature).is_none());
         assert!(SignatureSet::single(&pubkey, msg, &garbage_signature).is_none());
-        assert!(SignatureSet::fast_aggregate(&[], msg, &signature).is_none());
+        assert!(SignatureSet::fast_aggregate::<BlsPubkey>(&[], msg, &signature).is_none());
         assert!(SignatureSet::fast_aggregate(&[pubkey, garbage_key], msg, &signature).is_none());
         assert!(SignatureSet::fast_aggregate(&[pubkey], msg, &garbage_signature).is_none());
         // The identity signature is a valid encoding: it builds a set that fails.
@@ -506,12 +534,12 @@ mod tests {
         let infinity = BlsSignature(bls::G2_POINT_AT_INFINITY);
         let real = sign(&secret_key(50), msg);
         assert!(matches!(
-            SignatureSet::eth_fast_aggregate(&[], msg, &infinity),
+            SignatureSet::eth_fast_aggregate::<BlsPubkey>(&[], msg, &infinity),
             EthFastAggregate::Valid
         ));
         for signature in [real, BlsSignature([0; 96])] {
             assert!(matches!(
-                SignatureSet::eth_fast_aggregate(&[], msg, &signature),
+                SignatureSet::eth_fast_aggregate::<BlsPubkey>(&[], msg, &signature),
                 EthFastAggregate::Invalid
             ));
         }
