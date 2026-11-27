@@ -103,8 +103,8 @@ pub(crate) struct ValidatorOptions {
     pub(crate) metrics_port: u16,
 
     /// Text to put in the graffiti field of every block this client proposes,
-    /// unless `--graffiti-file` or the keymanager API gives a validator its
-    /// own.
+    /// unless the keymanager API gives a validator its own. Cannot be given
+    /// with `--graffiti-file`, as in Lighthouse.
     ///
     /// At most 32 bytes once encoded as UTF-8, right-padded with zeros.
     /// Consensus never reads it.
@@ -120,12 +120,12 @@ pub(crate) struct ValidatorOptions {
     /// A file of per-validator graffiti, read again before every proposal:
     /// `default: <text>` and `<0xpubkey>: <text>` lines, Lighthouse's format.
     ///
-    /// Read ahead of the keymanager API's per-validator graffiti and
-    /// `--graffiti`: the file's line for a validator wins, then its `default`
-    /// line, then those two in that order. A file that does not parse refuses
-    /// startup; once running, a bad read logs a warning and the next source
-    /// applies.
-    #[arg(long)]
+    /// Read ahead of the keymanager API's per-validator graffiti: the file's
+    /// line for a validator wins, then its `default` line, then the
+    /// validator's own. Cannot be given with `--graffiti`, as in Lighthouse. A
+    /// file that does not parse refuses startup; once running, a bad read logs
+    /// a warning and the validator's own graffiti applies, else none.
+    #[arg(long, conflicts_with = "graffiti")]
     pub(crate) graffiti_file: Option<PathBuf>,
 
     /// Execution address to receive block rewards from blocks this client
@@ -1084,15 +1084,16 @@ mod tests {
         assert_eq!(bytes, Some(Bytes32::ZERO));
     }
 
-    /// The file comes first and `--graffiti` is where its misses fall
-    /// through to, so the two go together, unlike Lighthouse's flags.
+    /// Refused together, as Lighthouse refuses them: beside a file,
+    /// `--graffiti` would apply only to a validator the file has no line for
+    /// and no `default` line covers, or when a read of the file fails.
     #[test]
-    fn a_graffiti_file_is_taken_beside_the_graffiti_flag() {
-        let options =
-            parse(&["--graffiti", "fallback", "--graffiti-file", "/tmp/g.txt"]).expect("parses");
+    fn a_graffiti_file_conflicts_with_the_graffiti_flag() {
+        let options = parse(&["--graffiti-file", "/tmp/g.txt"]).expect("parses");
         assert_eq!(options.graffiti_file, Some(PathBuf::from("/tmp/g.txt")));
-        assert!(options.graffiti().expect("valid").is_some());
         assert_eq!(parse(&[]).expect("parses").graffiti_file, None);
+        parse(&["--graffiti", "fallback", "--graffiti-file", "/tmp/g.txt"])
+            .expect_err("the two conflict");
     }
 
     #[test]
