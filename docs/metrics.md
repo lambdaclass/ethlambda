@@ -1013,9 +1013,10 @@ signature failed, slashing protection refused it, or the duty ran past its
 deadline. What the unlabelled series count as neither is neither here too: a
 duty doppelganger protection withholds, an attestation for a key deleted since
 the schedule was fetched (once the slot's attestation data was fetched; a
-failed fetch counts every duty of the slot `failed`), every duty of a slot the
-per-slot sync check withholds (`slots_skipped_syncing_total`), a sync committee
-message or payload vote when no beacon node has a head that is not optimistic,
+failed fetch, or one still out at the end of the slot, counts every duty of
+the slot `failed`), every duty of a slot the per-slot sync check withholds
+(`slots_skipped_syncing_total`), a sync committee message or payload vote
+when no beacon node has a head that is not optimistic,
 a payload vote for a slot the node knows no block for, and a blinded block the
 node did not confirm.
 

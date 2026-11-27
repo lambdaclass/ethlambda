@@ -113,15 +113,21 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         store: &RwLock<ValidatorStore>,
     ) -> Result<usize> {
         // Cheap pre-check, so a slot already served costs the node no request.
-        if self.pending(slot, duties).is_empty() {
+        let pending = self.pending(slot, duties);
+        if pending.is_empty() {
             return Ok(0);
         }
+        // Counted from before the data is fetched: a fetch that fails, or one
+        // the duty loop drops at the end of the slot (a hung node), counts
+        // every pending vote failed.
+        let mut outcomes = self.batch(slot, &pending);
 
         let data = match self.data(slot).await {
             Ok(Some(data)) => data,
             Ok(None) => {
                 // Not a failure: there is nothing to vote on, so nothing is
                 // counted.
+                outcomes.skip_all();
                 info!(%slot, "No block known for this slot; not voting on its payload");
                 return Ok(0);
             }
@@ -129,24 +135,14 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             // was asked: see "Optimistic heads" above. Not a failure either:
             // nothing may be signed over such a head.
             Err(Error::BeaconNodeSyncing) => {
+                outcomes.skip_all();
                 warn!(%slot, "Every beacon node is syncing or on an optimistic head; not voting on this slot's payload");
                 return Ok(0);
             }
-            Err(err) => {
-                // `attest_with`'s count never starts, so the pending votes
-                // are counted failed here, as an early `?` there counts them.
-                drop(Batch::new(
-                    self.performance.as_ref(),
-                    Duty::PayloadAttestation,
-                    slot,
-                    self.pending(slot, duties)
-                        .iter()
-                        .map(|duty| duty.validator_index),
-                ));
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
-        self.attest_with(slot, duties, store, data).await
+        self.attest_counted(slot, pending, store, data, outcomes)
+            .await
     }
 
     /// What the node says the committee should vote at `slot`, checked to be
@@ -178,15 +174,34 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         if pending.is_empty() {
             return Ok(0);
         }
-        // Each pending vote counts once, published or failed, however this
-        // call ends: an early `?` or the duty loop's deadline counts it failed.
-        let mut outcomes = Batch::new(
+        let outcomes = self.batch(slot, &pending);
+        self.attest_counted(slot, pending, store, data, outcomes)
+            .await
+    }
+
+    /// Where the `pending` votes' outcomes at `slot` are counted.
+    fn batch(&self, slot: Slot, pending: &[&PtcDutyDto]) -> Batch {
+        Batch::new(
             self.performance.as_ref(),
             Duty::PayloadAttestation,
             slot,
             pending.iter().map(|duty| duty.validator_index),
-        );
+        )
+    }
 
+    /// Sign and submit the `pending` members' votes on `data`, counting into
+    /// `outcomes`, which the caller created for exactly those members before
+    /// it fetched `data`. Each vote counts once, published or failed, however
+    /// this call ends: an early `?` or the duty loop's deadline counts it
+    /// failed.
+    async fn attest_counted(
+        &self,
+        slot: Slot,
+        pending: Vec<&PtcDutyDto>,
+        store: &RwLock<ValidatorStore>,
+        data: PayloadAttestationData,
+        mut outcomes: Batch,
+    ) -> Result<usize> {
         // Checked again here, having already been checked by the
         // implementation (see `BeaconNodeApi::payload_attestation_data`), for
         // the reason the attestation duty does: the trait is public, and this

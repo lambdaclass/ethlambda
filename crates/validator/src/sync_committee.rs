@@ -130,34 +130,28 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<Option<Root>> {
-        if self.pending(slot, duties).is_empty() {
+        let pending = self.pending(slot, duties);
+        if pending.is_empty() {
             return Ok(None);
         }
+        // Counted from before the root is fetched: a fetch that fails, or one
+        // the duty loop drops at the end of the slot (a hung node), counts
+        // every pending duty failed.
+        let mut outcomes = self.batch(slot, &pending);
 
         let root = match self.head_block_root().await {
             Ok(root) => root,
             Err(Error::BeaconNodeSyncing) => {
                 // Not a failure: nothing may be signed over this head, so
                 // nothing is counted.
+                outcomes.skip_all();
                 warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
                 return Ok(None);
             }
-            Err(err) => {
-                // `publish_messages_over`'s count never starts, so the
-                // pending duties are counted failed here, as an early `?`
-                // there counts them.
-                drop(Batch::new(
-                    self.performance.as_ref(),
-                    Duty::SyncCommitteeMessage,
-                    slot,
-                    self.pending(slot, duties)
-                        .iter()
-                        .map(|duty| duty.validator_index),
-                ));
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
-        self.publish_messages_over(slot, duties, store, root).await
+        self.publish_counted(slot, pending, store, root, outcomes)
+            .await
     }
 
     /// The head root a message would sign, with nothing recorded and nothing
@@ -184,15 +178,34 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         if pending.is_empty() {
             return Ok(None);
         }
-        // Each pending duty counts once, published or failed, however this
-        // call ends: an early `?` or the duty loop's deadline counts it failed.
-        let mut outcomes = Batch::new(
+        let outcomes = self.batch(slot, &pending);
+        self.publish_counted(slot, pending, store, root, outcomes)
+            .await
+    }
+
+    /// Where the `pending` duties' outcomes at `slot` are counted.
+    fn batch(&self, slot: Slot, pending: &[&SyncDutyDto]) -> Batch {
+        Batch::new(
             self.performance.as_ref(),
             Duty::SyncCommitteeMessage,
             slot,
             pending.iter().map(|duty| duty.validator_index),
-        );
+        )
+    }
 
+    /// Sign and submit the `pending` duties' messages over `root`, counting
+    /// into `outcomes`, which the caller created for exactly those duties
+    /// before it fetched `root`. Each counts once, published or failed,
+    /// however this call ends: an early `?` or the duty loop's deadline
+    /// counts it failed.
+    async fn publish_counted(
+        &self,
+        slot: Slot,
+        pending: Vec<&SyncDutyDto>,
+        store: &RwLock<ValidatorStore>,
+        root: Root,
+        mut outcomes: Batch,
+    ) -> Result<Option<Root>> {
         // Recorded one by one, then signed all at once, each within the
         // signing budget: a hung remote signer costs only its own keys'
         // messages, not the whole batch's.

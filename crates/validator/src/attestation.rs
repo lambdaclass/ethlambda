@@ -121,21 +121,13 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 data: None,
             });
         }
-        let data = match self.attestation_data(slot).await {
-            Ok(data) => data,
-            Err(err) => {
-                // `attest_with`'s count never starts, so the duties are
-                // counted failed here, as an early `?` there counts them.
-                drop(Batch::new(
-                    self.performance.as_ref(),
-                    Duty::Attestation,
-                    slot,
-                    duties.iter().map(|duty| duty.validator_index),
-                ));
-                return Err(err);
-            }
-        };
-        self.attest_with(slot, duties, store, data).await
+        // Counted from before the data is fetched: a fetch that fails, or one
+        // the duty loop drops at the end of the slot (a hung node), counts
+        // every duty failed.
+        let outcomes = self.batch(slot, duties);
+        let data = self.attestation_data(slot).await?;
+        self.attest_counted(slot, duties, store, data, outcomes)
+            .await
     }
 
     /// The beacon node's attestation data for `slot`, checked as [`Self::attest`]
@@ -167,14 +159,33 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         store: &RwLock<ValidatorStore>,
         data: AttestationData,
     ) -> Result<Attested> {
-        // Each duty counts once, published or failed, however this call ends:
-        // an early `?` or the duty loop's deadline counts it failed.
-        let mut outcomes = Batch::new(
+        let outcomes = self.batch(slot, duties);
+        self.attest_counted(slot, duties, store, data, outcomes)
+            .await
+    }
+
+    /// Where `duties`' outcomes at `slot` are counted.
+    fn batch(&self, slot: Slot, duties: &[AttesterDutyDto]) -> Batch {
+        Batch::new(
             self.performance.as_ref(),
             Duty::Attestation,
             slot,
             duties.iter().map(|duty| duty.validator_index),
-        );
+        )
+    }
+
+    /// [`Self::attest_with`], counting into `outcomes`, which the caller
+    /// created for `duties` before it fetched `data`. Each duty counts once,
+    /// published or failed, however this call ends: an early `?` or the duty
+    /// loop's deadline counts it failed.
+    async fn attest_counted(
+        &self,
+        slot: Slot,
+        duties: &[AttesterDutyDto],
+        store: &RwLock<ValidatorStore>,
+        data: AttestationData,
+        mut outcomes: Batch,
+    ) -> Result<Attested> {
         // The fork of the slot, by this client's own schedule, decides which
         // `index` the answer may carry: from gloas it is the payload signal.
         // It is signed as received, never reset to zero.

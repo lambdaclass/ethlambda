@@ -24,13 +24,13 @@
 //! count them: a duty doppelganger protection withholds (dropped before any
 //! service sees it), an attestation for a key the keymanager deleted since the
 //! schedule was fetched (once the slot's attestation data was fetched: the
-//! held keys are read after it, so a failed fetch counts every duty of the
-//! slot as failed), every duty of a slot the per-slot sync check withholds
-//! (none reaches a service), a sync committee message or payload vote already
-//! served this slot, a sync committee message or payload vote not signed over
-//! an optimistic head, a payload vote for a slot the node knows no block
-//! for, and a blinded
-//! block the node did not confirm. The proposal check below says whether that
+//! held keys are read after it, so a failed fetch, or one still out at the
+//! end of the slot, counts every duty of the slot as failed), every duty of a
+//! slot the per-slot sync check withholds (none reaches a service), a sync
+//! committee message or payload vote already served this slot, a sync
+//! committee message or payload vote not signed over an optimistic head, a
+//! payload vote for a slot the node knows no block for, and a blinded block
+//! the node did not confirm. The proposal check below says whether that
 //! last one went out. The sync committee and payload vote services do not
 //! filter on held keys, so a deleted key's duty there fails to sign and counts
 //! as failed. An attestation served twice is refused by slashing protection
@@ -506,6 +506,11 @@ fn log_summaries(summaries: BTreeMap<Epoch, EpochTally>) {
 /// through `?`, or one the duty loop drops at the slot's deadline, still
 /// counts each of its validators once, and a refusal or a failed signature
 /// needs no line of its own. With no [`Performance`] it counts nothing.
+///
+/// A service creates it before its first request to the node, the fetch of
+/// the slot's data included: a fetch still out at the end of the slot is the
+/// usual way a hung node costs a duty, and the duty loop then drops the call
+/// mid-fetch, with nothing after that point left to count it.
 pub(crate) struct Batch {
     performance: Option<Arc<Performance>>,
     duty: Duty,
@@ -536,6 +541,12 @@ impl Batch {
     /// service did not take up.
     pub(crate) fn skip(&mut self, validator: ValidatorIndex) {
         self.pending.remove(&validator);
+    }
+
+    /// [`Self::skip`] every validator still unresolved: the slot turned out to
+    /// hold nothing to do, such as a head nothing may be signed over.
+    pub(crate) fn skip_all(&mut self) {
+        self.pending.clear();
     }
 
     /// What the node made of the messages `sent` carried: every one accepted
@@ -638,16 +649,22 @@ pub(crate) async fn check_proposal_at<B: BeaconNodeApi>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::attestation::AttestationService;
-    use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, SyncDutyDto, encode_hex};
+    use crate::beacon_node::dto::{
+        AttesterDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto, encode_hex,
+    };
     use crate::beacon_node::fallback::FallbackBeaconNode;
     use crate::beacon_node::mock::MockBeaconNode;
+    use crate::payload_attestation::PayloadAttestationService;
     use crate::proposal::ProposalService;
     use crate::signing::SigningContext;
     use crate::slashing_protection::SlashingProtection;
     use crate::sync_committee::SyncCommitteeService;
     use crate::test_support::{settings, store_with_keys};
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
     use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::BlsPubkey;
     use tokio::sync::RwLock;
@@ -905,6 +922,104 @@ mod tests {
             .expect_err("every node failed");
         let tally = performance.tally(epoch, Some(21)).expect("counted");
         assert_eq!(tally.sync_committee_messages, counts(0, 1));
+    }
+
+    /// A node that has not answered the slot's first request when the duty
+    /// loop drops the call at the end of the slot, as a hung node does with
+    /// its 8 s request timeout: every duty of the three batch services counts
+    /// failed, though none got past its fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_still_out_at_the_end_of_the_slot_counts_every_duty_failed() {
+        let (store, pubkeys) = store_with_keys(2);
+        let store = RwLock::new(store);
+        let performance = Arc::new(Performance::new(LABELLED_VALIDATORS));
+        let slot = 96;
+        let epoch = compute_epoch_at_slot(slot);
+        // The node answers long after the slot's end, which comes first.
+        let hung = Duration::from_secs(3600);
+        let end_of_slot = Duration::from_secs(8);
+
+        let node = MockBeaconNode::new()
+            .with_attestation_data(slot)
+            .with_first_call_delay("attestation_data", hung);
+        let protection = SlashingProtection::in_memory();
+        let attestation = AttestationService::new(Arc::new(node), context(), protection)
+            .with_performance(performance.clone());
+        let duties = [
+            attester_duty(&pubkeys[0], 30, slot),
+            attester_duty(&pubkeys[1], 31, slot),
+        ];
+        let attested = attestation.attest(slot, &duties, &store);
+        tokio::time::timeout(end_of_slot, attested)
+            .await
+            .expect_err("cut at the end of the slot");
+
+        let node = MockBeaconNode::new()
+            .with_head_root(Root::repeat_byte(7))
+            .with_first_call_delay("head_block_root", hung);
+        let sync = SyncCommitteeService::new(Arc::new(node), context())
+            .with_performance(performance.clone());
+        let duties = [SyncDutyDto {
+            pubkey: encode_hex(&pubkeys[0].0),
+            validator_index: 32,
+            validator_sync_committee_indices: vec![3],
+        }];
+        let published = sync.publish_messages(slot, &duties, &store);
+        tokio::time::timeout(end_of_slot, published)
+            .await
+            .expect_err("cut at the end of the slot");
+
+        let data = PayloadAttestationData {
+            beacon_block_root: Root::repeat_byte(7),
+            slot,
+            payload_present: true,
+            blob_data_available: true,
+        };
+        let node = MockBeaconNode::new()
+            .with_payload_attestation_data(data)
+            .with_first_call_delay("payload_attestation_data", hung);
+        let payload = PayloadAttestationService::new(Arc::new(node), context())
+            .with_performance(performance.clone());
+        let duties = [PtcDutyDto {
+            pubkey: encode_hex(&pubkeys[1].0),
+            validator_index: 33,
+            slot,
+        }];
+        let voted = payload.attest(slot, &duties, &store);
+        tokio::time::timeout(end_of_slot, voted)
+            .await
+            .expect_err("cut at the end of the slot");
+
+        let tally = |validator| performance.tally(epoch, Some(validator)).expect("counted");
+        assert_eq!(tally(30).attestations, counts(0, 1));
+        assert_eq!(tally(31).attestations, counts(0, 1));
+        assert_eq!(tally(32).sync_committee_messages, counts(0, 1));
+        assert_eq!(tally(33).payload_attestations, counts(0, 1));
+    }
+
+    /// A slot the node knows no block for (its 204) is no vote to count,
+    /// though the batch is created before the data is fetched.
+    #[tokio::test]
+    async fn no_block_for_the_slot_counts_no_payload_vote() {
+        let (store, pubkeys) = store_with_keys(1);
+        let store = RwLock::new(store);
+        let performance = Arc::new(Performance::new(LABELLED_VALIDATORS));
+        let slot = 96;
+        let payload = PayloadAttestationService::new(Arc::new(MockBeaconNode::new()), context())
+            .with_performance(performance.clone());
+        let duties = [PtcDutyDto {
+            pubkey: encode_hex(&pubkeys[0].0),
+            validator_index: 34,
+            slot,
+        }];
+
+        let published = payload
+            .attest(slot, &duties, &store)
+            .await
+            .expect("a 204 is not an error");
+        assert_eq!(published, 0);
+        let epoch = compute_epoch_at_slot(slot);
+        assert_eq!(performance.tally(epoch, Some(34)), None, "neither");
     }
 
     /// Through the proposal service and a mock node: a block the node took is
