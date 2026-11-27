@@ -2357,17 +2357,18 @@ async fn fetch_initial_beacon_state(
             // compare, so it is added from the config file rather than
             // refused; `replace_config` below writes it.
             let (persisted, added) = store.fill_missing_config_keys(&config);
-            for key in &added {
-                info!(
-                    key,
-                    "Config key this data directory predates; adding the config file's"
-                );
-            }
             if let Some(difference) =
                 first_config_difference(&persisted, &config, processed_through)
             {
                 error!(%difference, "Persisted config disagrees with the network config");
                 return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
+            }
+            // Only once the resume is accepted: a refused one adds nothing.
+            for key in &added {
+                info!(
+                    key,
+                    "Config key this data directory predates; adding the config file's"
+                );
             }
             // Not a chain value, so not refused (see `first_config_difference`).
             if persisted.config_name != config.config_name {
