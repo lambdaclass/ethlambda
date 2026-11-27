@@ -136,8 +136,11 @@ pub(crate) fn recent_enough_to_ask(slot: u64, current_slot: u64) -> bool {
 /// registered validator's signature passes the precheck), an engine call, a
 /// cell computation and a parent-state advance in [`check_built`]. An honest
 /// slot has one block, two when its proposer equivocates; the rest is room for
-/// a forged copy arriving first. Once a slot's budget is spent its blocks are
-/// left to gossip and the peer asks, which is where a miss leaves them anyway.
+/// a forged one arriving first. A copy whose signature fails never reaches
+/// the hold (the import's `precheck_before_waiting` refuses it), so "forged"
+/// here means a block past the lookahead signed by a validator that is not
+/// the slot's proposer. Once a slot's budget is spent its blocks are left to
+/// gossip and the peer asks, which is where a miss leaves them anyway.
 pub(crate) const MAX_ASKS_PER_SLOT: u8 = 4;
 
 /// How many execution-client asks may be in flight at once, from the engine
@@ -202,9 +205,10 @@ impl Drop for AskPermit {
 /// built columns before they leave this module, and is what keeps a forged
 /// header out of p2p's seen cache and off the wire. This only saves asking the
 /// execution client, and computing cells, for a block whose signature already
-/// fails here. A block can reach its hold unverified, since range sync and
-/// by-root answers never pass gossip validation and the import checks the
-/// signature only after data availability.
+/// fails here. The chain actor's import runs the same check before any hold
+/// (`BlockChainServer::precheck_before_waiting`), so a block the node holds
+/// has passed it once already and this repeats it; it still guards a direct
+/// caller of `hold_block_for_columns`.
 ///
 /// It cannot catch everything [`check_built`] does: past the parent state's
 /// proposer lookahead, [`precheck_block`] checks the signature against the
