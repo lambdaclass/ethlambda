@@ -155,6 +155,11 @@ pub enum Error {
     /// values here, or a different one from what this process already runs.
     #[error("cannot run the beacon node's preset: {0}")]
     Preset(String),
+    /// The client was configured with settings that cannot run together.
+    /// The binary's flags refuse such a pair before [`crate::run`] is
+    /// reached; this is what any other caller is told. Never retryable.
+    #[error("conflicting configuration: {0}")]
+    ConflictingConfig(String),
 
     #[error("keystore {path}: {reason}")]
     Keystore { path: String, reason: String },
@@ -294,6 +299,7 @@ impl Error {
             Self::ProposalRefused { .. }
             | Self::ExitRefused(_)
             | Self::Preset(_)
+            | Self::ConflictingConfig(_)
             | Self::UnreadableSpec(_)
             | Self::Keystore { .. }
             | Self::KeystoreVersion(_)

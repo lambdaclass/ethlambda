@@ -188,7 +188,9 @@ pub struct ValidatorConfig {
     pub broadcast: beacon_node::fallback::Broadcast,
     /// The keys are shares of distributed validators, behind middleware
     /// that combines their signatures: aggregation is decided by the
-    /// combined selection proofs it returns. See [`distributed`].
+    /// combined selection proofs it returns. See [`distributed`]. Refused
+    /// together with [`Self::doppelganger_protection`]; see
+    /// [`refuse_conflicting_modes`].
     pub distributed: bool,
     /// Read the beacon nodes' event streams, so attestations and sync
     /// committee messages go out when the slot's block arrives and payload
@@ -206,6 +208,25 @@ pub struct BuilderProposals {
     /// `u64::MAX` takes the builder whenever there is a bid. From gloas
     /// [`ValidatorConfig::gloas_boost_factor`] is sent, with or without these.
     pub boost_factor: u64,
+}
+
+/// Refuse distributed mode together with doppelganger protection.
+///
+/// The cluster's other operators keep a share's validator live, so the
+/// liveness check would see it attesting and stop this client as a
+/// doppelganger on every start, with nothing naming the two settings. The
+/// binary's flags refuse the pair, but they are not the only way to build a
+/// [`ValidatorConfig`], so [`run`] checks it too, beside the code that relies
+/// on it.
+fn refuse_conflicting_modes(distributed: bool, doppelganger_protection: bool) -> Result<()> {
+    if distributed && doppelganger_protection {
+        return Err(Error::ConflictingConfig(
+            "distributed mode cannot run with doppelganger protection: the cluster's other \
+             operators keep the validator live, so the check would stop this client"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Run the validator client until the future `stop` returns resolves, or
@@ -228,6 +249,7 @@ where
     S: Future<Output = &'static str>,
 {
     metrics::init();
+    refuse_conflicting_modes(config.distributed, config.doppelganger_protection)?;
 
     // Said at startup, where an operator reads it: an operator
     // who never sets this proposes blocks that pay their execution-layer
@@ -2404,6 +2426,21 @@ mod tests {
 
     fn pubkey(byte: u8) -> BlsPubkey {
         BlsPubkey([byte; 48])
+    }
+
+    /// Distributed mode and doppelganger protection are refused together by
+    /// the client itself, since the binary's flags are not the only way to
+    /// reach `run`. Either alone, or neither, starts.
+    #[test]
+    fn distributed_mode_is_refused_with_doppelganger_protection() {
+        assert!(refuse_conflicting_modes(false, false).is_ok());
+        assert!(refuse_conflicting_modes(true, false).is_ok());
+        assert!(refuse_conflicting_modes(false, true).is_ok());
+        let refused = refuse_conflicting_modes(true, true);
+        assert!(
+            matches!(refused, Err(Error::ConflictingConfig(_))),
+            "got {refused:?}"
+        );
     }
 
     /// A node that resolves two validators and has duties for epoch 3, so
