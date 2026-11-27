@@ -4609,8 +4609,9 @@ mod tests {
     ///
     /// The peer subscribes before it dials, so its subscriptions reach the
     /// node the way a connecting peer's do: all at once, in the one hello RPC
-    /// gossipsub sends a new connection (rust-libp2p since gossipsub 0.50, the
-    /// go, js and jvm implementations always). That RPC is never resent.
+    /// gossipsub sends a new connection (rust-libp2p since gossipsub 0.50,
+    /// go-libp2p-pubsub always; Teku's jvm-libp2p splits it into RPCs of at
+    /// most 200). That RPC is never resent.
     async fn node_learns_every_subscription(topics: &[libp2p::gossipsub::IdentTopic]) -> bool {
         use ethlambda_types::beacon::config::Config;
         use ethlambda_types::beacon::primitives::Root;
