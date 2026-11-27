@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c2d41824.js";
+            window.path_to_searchindex_js = "searchindex-81a3a205.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -658,7 +658,8 @@ slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p
 <tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
 <tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, <code>beacon --fallback-fee-recipient</code>), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one <code>prepare_beacon_proposer</code> request every slot, listing each validator that has an index on chain and an address, as Lighthouse’s validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay</td></tr>
 <tr><td><code>--gas-limit</code></td><td><code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. <strong>Sepolia and Platåberget schedule <code>200000000</code></strong> (their <code>config.yaml</code>’s <code>GAS_LIMIT_SCHEDULE</code>, which this client does not read yet, <a href="https://github.com/lambdaclass/ethlambda/issues/795">#795</a>), so on either pass <code>--gas-limit 200000000</code>. Must be positive</td></tr>
-<tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients’ versions to it (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>)</td></tr>
+<tr><td><code>--graffiti</code></td><td>none</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. Conflicts with <code>--graffiti-file</code>, as in Lighthouse. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. Without it a block request carries no graffiti and the beacon node applies its own default; an ethlambda beacon node appends both clients’ versions to whatever the graffiti is (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>). See <a href="#graffiti">Graffiti</a></td></tr>
+<tr><td><code>--graffiti-file</code></td><td>none</td><td>A file of per-validator graffiti in Lighthouse’s format (<code>default: &lt;text&gt;</code>, <code>&lt;0xpubkey&gt;: &lt;text&gt;</code>), read again before every proposal and ahead of the keymanager API’s per-validator graffiti. Conflicts with <code>--graffiti</code>, as in Lighthouse. A file that does not parse refuses startup; once running, a bad read logs a warning and the validator’s own graffiti applies, else none. See <a href="#graffiti">Graffiti</a></td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, remote keys, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
 <tr><td><code>--keymanager-token-file</code></td><td><code>api-token.txt</code> in <code>--validators-dir</code></td><td>File to read the keymanager API’s bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an <code>Authorization</code> header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with <code>--enable-keymanager</code>; set without it, startup warns. See <a href="#the-keymanager-api">The keymanager API</a></td></tr>
 <tr><td><code>--web3signer-url</code></td><td>none</td><td>Base URL of a Web3Signer (<code>https://signer:9000</code>): the signer a remote key imported through <code>POST /eth/v1/remotekeys</code> without a <code>url</code> of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default</td></tr>
@@ -1255,7 +1256,7 @@ give one validator its own value in place of the command line’s default:</p>
 </thead>
 <tbody>
 <tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot’s duties (the next slot’s while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With <code>--builder-proposals</code>, the next builder registration carries it too, usually at the next slot (later while the epoch’s full registration send is still running) and again every slot until a node accepts it or the epoch’s full send carries it, and an ethlambda beacon node takes it from there. A <code>DELETE</code> that leaves a validator with no address at all (no <code>--suggested-fee-recipient</code> either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on</td></tr>
-<tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal</td></tr>
+<tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal, unless <code>--graffiti-file</code> names the key or has a <code>default</code> line (see <a href="#graffiti">Graffiti</a>)</td></tr>
 <tr><td><code>gas_limit</code></td><td><code>--gas-limit</code></td><td>Before gloas, the next builder registration with <code>--builder-proposals</code> (usually at the next slot, later while the epoch’s full registration send is still running, and again every slot until a node accepts it or the epoch’s full send carries it), and stored and served only without it. From gloas, the proposer preferences’ target gas limit, from the next dependent root on, flag or not</td></tr>
 </tbody>
 </table>
@@ -1287,7 +1288,9 @@ nothing is written.</p>
 <p>A few answers worth knowing: <code>GET feerecipient</code> is a <code>500</code> when the validator
 has no address and there is no <code>--suggested-fee-recipient</code> default, as
 Lighthouse answers it; <code>POST feerecipient</code> refuses the zero address, as the
-specification requires; <code>POST graffiti</code> refuses text over 32 bytes rather than
+specification requires; <code>GET graffiti</code> answers what the next proposal would
+carry, <code>--graffiti-file</code> included, and an empty string when no graffiti is set
+anywhere; <code>POST graffiti</code> refuses text over 32 bytes rather than
 truncating it; <code>POST gas_limit</code> refuses <code>0</code>, as <code>--gas-limit</code> does; and every
 route answers <code>404</code> for a key this client does not hold.</p>
 <p>The keystore routes carry slashing-protection history. <code>POST</code> refuses every
@@ -1299,6 +1302,80 @@ returns the deleted keys’ records as a minimal EIP-3076 interchange, answering
 <code>not_active</code> for a key that is gone but still has a record.</p>
 <p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
 default; exposing it further means putting a TLS terminator in front.</p>
+<h3 id="graffiti"><a class="header" href="#graffiti">Graffiti</a></h3>
+<p>A block’s graffiti comes from the first of these that has one for the
+proposing validator, Lighthouse’s order:</p>
+<ol>
+<li><code>--graffiti-file</code>’s line for the validator’s public key;</li>
+<li><code>--graffiti-file</code>’s <code>default</code> line;</li>
+<li>the validator’s own graffiti, set through the keymanager API or written by
+hand into <code>validator_definitions.yml</code>;</li>
+<li><code>--graffiti</code>.</li>
+</ol>
+<p><code>--graffiti-file</code> and <code>--graffiti</code> cannot be given together, as in
+Lighthouse, so the file and the last step never both apply. With a file, a
+validator it has no line for and no <code>default</code> line covers, or a proposal whose
+read of it fails, takes the validator’s own graffiti, else none.</p>
+<p>With none of them, the block request carries no <code>graffiti</code> parameter and the
+beacon node applies its own default. An ethlambda beacon node reads an absent
+graffiti as an empty one and appends both clients’ codes and commits to it,
+as it does to any graffiti (see <a href="rpc.html#validator-endpoints"><code>rpc.md</code></a>).</p>
+<p><code>--graffiti-file</code> takes Lighthouse’s format, so a file written for
+Lighthouse’s flag works unchanged:</p>
+<pre><code class="language-text">default: ethlambda
+0x87a580d31d7bc69069b55f5a01995a610dd391a26dc9e36e81057a17211983a79266800ab8531f21f1083d7d84085007: mr f was here
+</code></pre>
+<p>A line splits at its first <code>:</code>. The key before it is exactly <code>default</code> or a
+<code>0x</code>-prefixed public key, and the text after it, trimmed, is the graffiti, so
+the text may hold colons of its own (<code>graffitiwall:720:641:#ffff00</code>). An empty
+graffiti is a graffiti, 32 zero bytes, which a beacon node may treat apart
+from an absent one. Lines of whitespace alone are skipped; there is no comment
+syntax, so a <code>#</code> line is refused. A key named twice takes its last line.</p>
+<p>The file is read again before every proposal, and for every <code>GET graffiti</code>,
+and each read starts from nothing: an edited line applies from the next
+proposal, and a deleted one stops applying there. (Lighthouse merges each read
+into what it read at startup, so a deleted line stays in effect there until a
+restart.) A script can therefore rotate graffiti by rewriting the file; write
+it to a temporary path and rename it over the old one, so a proposal never
+reads it half-written.</p>
+<p>A file that cannot be read or does not parse, a graffiti over 32 bytes among
+them, refuses startup, as an over-long <code>--graffiti</code> does. So does a path that
+is not a regular file (a FIFO, a directory, a device), a file over 16 MiB, and
+one not read within 5 seconds, so a stalled mount refuses startup rather than
+hang it. A FIFO is refused at once, not after the 5 seconds: the file is
+opened without waiting for a writer (<code>O_NONBLOCK</code>), and what was opened is
+checked to be a regular file before it is read. One read within 5 seconds
+but in more than 250 ms starts with a warning, since a proposal gives up on a
+read that slow (see below); a cold cache can make one read that slow and the
+next ones fast, so it is not refused. Once the client is running,
+the same failure costs only the file: the proposal takes its graffiti from the
+next source in the list and logs a warning, and the client logs an info line
+once the file reads again. <code>GET graffiti</code> skips the file the same way, but
+warns only at the first of a run of failed reads, so a client polling it does
+not repeat the warning. A read that takes longer than 250 ms is given up on
+the same way, so a stalled mount cannot cost a proposal its slot; the read
+runs alongside the RANDAO signature, so it adds nothing when that takes as
+long. A UTF-8 byte-order mark at the start of the file is ignored.</p>
+<p>Each read runs on a thread of its own, and only one runs at a time: a
+proposal or <code>GET graffiti</code> that comes while one runs takes that read’s answer
+rather than starting another. The 250 ms count from the read’s start, so a
+caller that joins a running read waits only what is left of them, and one
+that finds the read running longer than that skips the file at once. So a
+stalled file holds one thread, never one slashing protection runs on, and
+costs a proposal at most 250 ms; and a caller that joins a read takes the
+file as it was at most 250 ms before it asked. The price of one read at a
+time: a read that never returns, as one of a hung network mount does, turns
+the file off until it returns or the client restarts. Every proposal
+meanwhile skips the file with a warning, even once the file is put right,
+since the stuck read is still the running one. A FIFO put in the file’s place
+cannot cause this, since it is refused at once like a directory, and the next
+proposal reads the file again; only a filesystem that never answers an
+<code>open</code>, <code>fstat</code> or <code>read</code> can.</p>
+<p>One thing differs from Lighthouse besides the reload: the keymanager API’s
+graffiti routes stay open while the file is set: a <code>POST graffiti</code> is written to <code>validator_definitions.yml</code> and
+applied as usual, and shows in proposals and in <code>GET graffiti</code> whenever the
+file names neither the key nor a <code>default</code>. Until then <code>GET graffiti</code> keeps
+answering the file’s text, since that is what the next proposal carries.</p>
 <h3 id="stopping"><a class="header" href="#stopping">Stopping</a></h3>
 <p>SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
 <code>Shutdown signal received</code>, starts no other slot, and lets the work in flight

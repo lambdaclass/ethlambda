@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c2d41824.js";
+            window.path_to_searchindex_js = "searchindex-81a3a205.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -758,7 +758,8 @@ commits appended as far as they fit: <code>hello RH1a2bLA3c4d</code> for reth at
 <code>1a2b…</code> under ethlambda at <code>3c4d…</code>. The execution client’s half comes from
 <code>engine_getClientVersionV1</code>, asked alongside the payload build and given up
 on after <code>EL_VERSION_TIMEOUT</code>, and is left out when it cannot be had
-(<code>hello LA3c4d</code>). The
+(<code>hello LA3c4d</code>). A request without <code>graffiti</code> is read as an empty one, so
+its block carries the suffix alone (<code>RH1a2bLA3c4d</code>). The
 suffix shrinks rather than cutting the validator’s text short, in
 Lighthouse’s tiers, and is appended to every block with no opt-out; the
 <code>graffiti_policy</code> parameter Lighthouse’s validator client sends is not read.
