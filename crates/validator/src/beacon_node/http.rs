@@ -26,7 +26,7 @@
 //! `Error::Decode`. Reading through `reqwest`'s own `json` would let its
 //! `is_decode` compete with `Error::Decode` for the same failure.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
@@ -90,7 +90,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// because an ethlambda node forwards the registrations to its relay and waits
 /// up to 10 s for the answer before replying; a client that gave up at 8 s
 /// would report a failure for a registration the node went on to install.
-const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How much of a failed answer's body is read. Enough for a pool submission's
 /// 400, which lists each refused entry and is parsed for them.
@@ -203,13 +203,13 @@ fn is_media_type(content_type: &str, media_type: &str) -> bool {
 ///
 /// `builders` stays empty, since the builder API (relay or `builder_pubkeys`
 /// bids) is a later phase. The top-level `min_bid` and factor govern the pooled
-/// p2p bids. The factor is the configured `builder_boost_factor` with
-/// `--builder-proposals`, so such a bid can win on value, and `0` without it:
+/// p2p bids. The proposal service always sets a gloas request's factor
+/// (`--builder-boost-factor`, 100 unless given, with or without
+/// `--builder-proposals`), so such a bid can win on value; `None` sends `0`,
 /// the local payload unless it cannot be built, as beacon-APIs defines `0`.
-/// A node whose local build fails may then still build on a pooled bid (see
-/// `proposal.rs`'s module doc for why that block is signed). `min_bid` is
-/// `--builder-min-bid`, in gwei, the floor below which no p2p bid is taken,
-/// with or without builder proposals, so it also bounds that fallback.
+/// `min_bid` is `--builder-min-bid`, in gwei, the floor below which no p2p bid
+/// is taken. `--self-build-only` sends a factor of `0` and a `min_bid` of
+/// `u64::MAX` (see `proposal.rs`'s module doc).
 fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
@@ -253,6 +253,16 @@ impl HttpBeaconNode {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_dated(path).await.map(|(value, _)| value)
+    }
+
+    /// [`Self::get`], with the answer's `Date` header when it is an
+    /// IMF-fixdate. Read on the sync probe's request alone (see
+    /// [`crate::clock_check`]).
+    async fn get_dated<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, Option<SystemTime>)> {
         let url = format!("{}{path}", self.base_url);
         debug!(%url, "Beacon API GET");
         let response = self
@@ -265,7 +275,12 @@ impl HttpBeaconNode {
                 failure: BeaconNodeFailure::classify(&err),
                 detail: err.to_string(),
             })?;
-        Self::decode(response).await
+        let date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::clock_check::parse_http_date);
+        Ok((Self::decode(response).await?, date))
     }
 
     async fn post<B: Serialize, T: serde::de::DeserializeOwned>(
@@ -954,7 +969,7 @@ impl HttpBeaconNode {
 /// those errors are logged, and the chain check logs them at `warn`). Anything
 /// that does not parse as a URL is returned as it is: it cannot be a URL that
 /// carries credentials a request would send.
-fn without_credentials(url: &str) -> String {
+pub(crate) fn without_credentials(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
             // Neither fails on a URL that already has a user name or password.
@@ -1032,6 +1047,13 @@ impl BeaconNodeApi for HttpBeaconNode {
     async fn sync_status(&self) -> Result<SyncStatus> {
         let response: DataResponse<SyncingDto> = self.get("/eth/v1/node/syncing").await?;
         Ok(response.data.into())
+    }
+
+    /// Logs nothing, as [`Self::sync_status`].
+    async fn sync_status_with_date(&self) -> Result<(SyncStatus, Option<SystemTime>)> {
+        let (response, date): (DataResponse<SyncingDto>, _) =
+            self.get_dated("/eth/v1/node/syncing").await?;
+        Ok((response.data.into(), date))
     }
 
     /// Resolves each pubkey to its validator index and current status.
@@ -1896,10 +1918,15 @@ mod tests {
     /// The body reaches the wire: a gloas production request posts it.
     #[tokio::test]
     async fn a_gloas_production_request_posts_the_factor_and_min_bid_in_its_body() {
+        let max = u64::MAX.to_string();
         let cases = [
             (None, 0, "0", "0"),
             (None, 1_000_000, "0", "1000000"),
             (Some(250), 1_000_000, "250", "1000000"),
+            // The proposal service's default at gloas.
+            (Some(100), 0, "100", "0"),
+            // `--self-build-only`.
+            (Some(0), u64::MAX, "0", max.as_str()),
         ];
         for (factor, min_bid, expected_factor, expected_min_bid) in cases {
             let served = serve(500, vec![], vec![]).await;
@@ -2753,6 +2780,32 @@ mod tests {
         let status = served.node.sync_status().await.expect("decodes");
         assert!(status.is_synced());
         assert!(!status.el_offline);
+    }
+
+    /// The probe's request reads the answer's `Date`, and one that is not an
+    /// IMF-fixdate is no `Date`.
+    #[tokio::test]
+    async fn the_sync_status_with_date_reads_the_date_header() {
+        let reply = br#"{"data":{"head_slot":"640","sync_distance":"0","is_syncing":false}}"#;
+        let headers = vec![
+            ("content-type", "application/json"),
+            ("date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+        ];
+        let served = serve(200, headers, reply.to_vec()).await;
+        let (status, date) = served.node.sync_status_with_date().await.expect("decodes");
+        assert_eq!(status.head_slot, Some(640));
+        assert_eq!(
+            date,
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
+
+        let headers = vec![
+            ("content-type", "application/json"),
+            ("date", "Sunday, 06-Nov-94 08:49:37 GMT"),
+        ];
+        let served = serve(200, headers, reply.to_vec()).await;
+        let (_, date) = served.node.sync_status_with_date().await.expect("decodes");
+        assert_eq!(date, None);
     }
 
     #[tokio::test]

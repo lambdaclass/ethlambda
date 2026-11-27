@@ -287,9 +287,11 @@ impl EngineClient {
 
     /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
     ///
-    /// A follower never proposes, so it never asks an execution client to start
-    /// building. That also keeps this call outside the fork-scheduling rules
-    /// attached to `payloadAttributes.timestamp`.
+    /// The head update, which never asks an execution client to start
+    /// building: a build goes through
+    /// [`Self::forkchoice_updated_with_attributes`]. That also keeps this call
+    /// outside the fork-scheduling rules attached to
+    /// `payloadAttributes.timestamp`.
     pub async fn forkchoice_updated(
         &self,
         state: &ForkchoiceStateV1,
@@ -303,10 +305,10 @@ impl EngineClient {
     /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
     /// a `null` `payloadAttributes` and the consensus client's custody set.
     ///
-    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
-    /// follower never asks for a build. `custody_columns` of `None` sends
-    /// `null`, meaning the consensus client provides no custody. The response
-    /// is V3's.
+    /// The head update, which never asks for a build: a build goes through
+    /// [`Self::forkchoice_updated_v4_with_attributes`]. `custody_columns` of
+    /// `None` sends `null`, meaning the consensus client provides no custody.
+    /// The response is V3's.
     pub async fn forkchoice_updated_v4(
         &self,
         state: &ForkchoiceStateV1,

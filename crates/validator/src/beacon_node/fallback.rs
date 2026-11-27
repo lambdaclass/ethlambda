@@ -1,11 +1,35 @@
-//! Ordered failover across several beacon nodes.
+//! Ranked failover across several beacon nodes.
 //!
-//! First healthy wins. The nodes whose last sync probe passed (neither syncing
-//! nor optimistic, see [`super::health`]) are tried first, in the order given on
-//! the command line, then the rest in the same order. Deliberately no finer
-//! than passed or not: Lighthouse ranks its nodes by sync distance, optimistic
-//! status and `el_offline`, and tie-breaks on list order, which is better, and
-//! is a refinement this does not need yet.
+//! # Queries: the best-ranked node that answers
+//!
+//! A request walks the nodes in [`NodeHealth::ranked`]'s order and returns the
+//! first answer. The order is [`Tier`]'s, as Lighthouse ranks its nodes: synced
+//! and validated first; then synced but optimistic, or with the execution
+//! client offline; then syncing, or more than [`super::health::SYNC_TOLERANCE`]
+//! slots behind by the node's own `sync_distance`; then nodes not probed yet;
+//! then failing ones. Command-line order breaks ties, so a single healthy node,
+//! or several equally healthy ones, are asked exactly as listed. The probe that
+//! feeds it runs once a slot ([`super::health::run`]), and a request that times
+//! out or cannot connect ranks its node failing at once, until a probe sent
+//! after it answers ([`NodeHealth::record_request_failure`]): a hung node costs one
+//! request timeout per probe, not one per request.
+//!
+//! The nodes themselves stay in command-line order, and only a list of
+//! positions is ranked, so a [`Producer`] still names the node that produced a
+//! blinded block.
+//!
+//! # Signed messages: one node, or every node with `--broadcast`
+//!
+//! By default a signed message goes to the first node in the walk that accepts
+//! it, as a query does. [`Broadcast`] sends a chosen kind to every node at
+//! once instead, succeeding when any accepts, so it reaches the network through
+//! every node's gossip mesh rather than one. A node ranked failing is sent it
+//! only when none of the others accepted, so a hung node does not hold back
+//! the answer. Subscriptions and the other state installed on a node
+//! ([`FallbackBeaconNode::try_all`]) go to every node whatever the flag says,
+//! and a blinded block only ever goes back to its producer. Every message is
+//! signed once, before it reaches this module, so slashing protection records
+//! it once however many nodes are sent it.
 //!
 //! # Only nodes on this client's chain
 //!
@@ -41,7 +65,9 @@ use crate::beacon_node::dto::{
     CommitteeSubscriptionDto, ProposerPreparationDto, SingleAttestationDto,
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
-use crate::beacon_node::health::{NodeHealth, Probe, Standing, SyncStatus, SyncVerdict};
+use crate::beacon_node::health::{
+    NodeHealth, Probe, Reply, Standing, SyncStatus, SyncVerdict, Tier,
+};
 use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
@@ -57,6 +83,42 @@ use crate::error::{Error, Result};
 /// to `Self`.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// How long a broadcast waits for the nodes still sending once one node has
+/// accepted. The message is on the network by then, and a caller with a
+/// deadline (a proposal's is the attestation offset, 3 s into a 12 s gloas
+/// slot) would otherwise wait out a hung node's whole request timeout, be cut
+/// at its deadline. A node still sending when this runs out is cut off, but
+/// not ranked failing for it: a node that imports a block more slowly than the
+/// fastest one, or uploads a large envelope over a slower link, answers late
+/// every time, and ranking it failing would cut it out of every broadcast
+/// until the next probe, slot after slot. A node that really hung is ranked
+/// failing by its probe, and until then costs each broadcast this much.
+const BROADCAST_GRACE: Duration = Duration::from_millis(500);
+
+/// How long an envelope's producer is waited on alone before the other nodes
+/// are sent the envelope too, under `--broadcast blocks`. Long enough for a
+/// producer holding the block to answer, so the others get the envelope a
+/// round trip after it; short enough that a producer that holds the request
+/// open (one that answered 202 and never imported the block waits for it) does
+/// not keep the envelope from every node until the proposal's deadline.
+const PRODUCER_HEAD_START: Duration = BROADCAST_GRACE;
+
+/// What a caller of [`FallbackBeaconNode::broadcast_to_all`] has already done
+/// with one node, which the broadcast then leaves out of its own sends.
+enum Sent<'p, T> {
+    /// Nothing: every node is the broadcast's.
+    Nothing,
+    /// Sent and answered; `accepted` counts as an acceptance for the
+    /// broadcast's rules.
+    Answered { position: usize, accepted: bool },
+    /// Sent and not answered yet: the broadcast waits on it as on its own
+    /// sends.
+    Pending {
+        position: usize,
+        send: BoxFuture<'p, Result<T>>,
+    },
+}
+
 /// Which nodes a request may be sent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
@@ -67,6 +129,85 @@ enum Reach {
     /// for in that state. A node with no probe to read is still asked (see
     /// [`Standing::may_serve_ungated`]).
     SkipUnsynced,
+    /// Every node but the one at this position, which the caller has already
+    /// asked.
+    EveryBut(usize),
+}
+
+/// One kind of signed message `--broadcast` can send to every node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BroadcastTopic {
+    /// Attestations, aggregates and payload attestations.
+    Attestations,
+    /// Blocks and execution payload envelopes. Never a blinded block, which
+    /// goes back to its producer alone.
+    Blocks,
+    /// Sync committee messages and contributions.
+    SyncCommittee,
+    /// Committee and sync committee subscriptions, fee recipient preparations,
+    /// builder registrations and proposer preferences. Always sent to every
+    /// node, so naming it changes nothing; accepted as Lighthouse's flag
+    /// accepts it.
+    Subscriptions,
+    /// `none`, which turns Lighthouse's default subscriptions broadcast off.
+    /// Subscriptions always go to every node here, so it changes nothing;
+    /// accepted so a Lighthouse command line carries over.
+    Nothing,
+}
+
+impl BroadcastTopic {
+    /// Every topic, by the name the command line takes.
+    pub const NAMES: [(&'static str, Self); 5] = [
+        ("attestations", Self::Attestations),
+        ("blocks", Self::Blocks),
+        ("sync-committee", Self::SyncCommittee),
+        ("subscriptions", Self::Subscriptions),
+        ("none", Self::Nothing),
+    ];
+}
+
+impl std::str::FromStr for BroadcastTopic {
+    type Err = String;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, topic)| *topic)
+            .ok_or_else(|| {
+                let known: Vec<&str> = Self::NAMES.iter().map(|(known, _)| *known).collect();
+                format!(
+                    "unknown broadcast topic {name:?}; expected one of {}",
+                    known.join(", ")
+                )
+            })
+    }
+}
+
+/// Which signed messages go to every node at once, rather than to the first
+/// node in the walk that accepts them. All off by default, as Lighthouse's
+/// `--broadcast` defaults to subscriptions alone, which always go to every
+/// node here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Broadcast {
+    pub attestations: bool,
+    pub blocks: bool,
+    pub sync_committee: bool,
+}
+
+impl FromIterator<BroadcastTopic> for Broadcast {
+    fn from_iter<I: IntoIterator<Item = BroadcastTopic>>(topics: I) -> Self {
+        let mut broadcast = Self::default();
+        for topic in topics {
+            match topic {
+                BroadcastTopic::Attestations => broadcast.attestations = true,
+                BroadcastTopic::Blocks => broadcast.blocks = true,
+                BroadcastTopic::SyncCommittee => broadcast.sync_committee = true,
+                BroadcastTopic::Subscriptions | BroadcastTopic::Nothing => {}
+            }
+        }
+        broadcast
+    }
 }
 
 /// What an error says when every node was skipped for being on another chain
@@ -181,15 +322,19 @@ impl NodeState {
     }
 }
 
-/// A `BeaconNodeApi` backed by an ordered list of others, answering from the
-/// first one that succeeds.
+/// A `BeaconNodeApi` backed by a list of others, answering from the
+/// best-ranked one that succeeds.
 pub struct FallbackBeaconNode<B> {
     /// In the order given, which never changes: a [`Producer`] is a position
-    /// in it, so a blinded block goes back to the node that produced it.
+    /// in it, so a blinded block goes back to the node that produced it. Only
+    /// the walk's list of positions is ranked.
     nodes: Vec<B>,
-    /// Each node's last sync probe, by the same positions. What orders the
-    /// walk, and what the duty loop gates each slot on.
+    /// Each node's last sync probe and unanswered request, by the same
+    /// positions. What orders the walk, and what the duty loop gates each slot
+    /// on.
     health: Arc<NodeHealth>,
+    /// The signed messages sent to every node rather than to one.
+    broadcast: Broadcast,
     /// The chain check's state of each node, by position in `nodes`. Built
     /// with it and never resized, so the two always line up.
     states: Vec<NodeState>,
@@ -209,9 +354,17 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         Self {
             nodes,
             health,
+            broadcast: Broadcast::default(),
             states,
             readmissions: AtomicU64::new(0),
         }
+    }
+
+    /// Send the signed messages `broadcast` names to every node. See the
+    /// module doc.
+    pub fn with_broadcast(mut self, broadcast: Broadcast) -> Self {
+        self.broadcast = broadcast;
+        self
     }
 
     /// Each node's last sync probe. Shared, so whatever reports on the nodes
@@ -231,11 +384,24 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         let health = &self.health;
         let asks = self.usable_nodes().map(|(position, node)| async move {
             let at = SystemTime::now();
-            let outcome = match tokio::time::timeout(budget, node.sync_status()).await {
-                Ok(answer) => answer.map_err(|err| err.to_string()),
-                Err(_) => Err(format!("no answer within {} ms", budget.as_millis())),
+            let answer = tokio::time::timeout(budget, node.sync_status_with_date()).await;
+            // Stamped here, as the answer lands, for the clock check.
+            let received = SystemTime::now();
+            let (outcome, reply) = match answer {
+                Ok(Ok((status, date))) => (Ok(status), Some(Reply { received, date })),
+                Ok(Err(err)) => (Err(err.to_string()), None),
+                Err(_) => (
+                    Err(format!("no answer within {} ms", budget.as_millis())),
+                    None,
+                ),
             };
-            health.record(position, Probe { slot, at, outcome });
+            let probe = Probe {
+                slot,
+                at,
+                outcome,
+                reply,
+            };
+            health.record(position, probe);
         });
         futures_util::future::join_all(asks).await;
     }
@@ -536,9 +702,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     /// whose usable flag is down (on another chain, or not checked yet) is
     /// skipped without a request.
     ///
-    /// The order is [`NodeHealth::ranked`]'s: the nodes whose last sync probe
-    /// passed first, then the rest, each in command-line order. With no probe
-    /// held it is the command-line order.
+    /// The order is [`NodeHealth::ranked`]'s: by [`Tier`], command-line order
+    /// breaking ties. With no probe held and no request failed it is the
+    /// command-line order. A node that times out or cannot be connected to is
+    /// recorded as such, which ranks it last until its next probe answers.
     ///
     /// "Success" means the node returned `Ok`, nothing more. That is the right
     /// rule only where an `Ok` is an answer this client can act on, which is
@@ -625,7 +792,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             let Some(node) = self.nodes.get(position) else {
                 continue;
             };
-            if !self.is_usable(position) {
+            if !self.is_usable(position) || reach == Reach::EveryBut(position) {
                 continue;
             }
             if reach == Reach::SkipUnsynced && !standing.may_serve_ungated() {
@@ -639,8 +806,10 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                     // Debug, not warn: with more than one node configured, an
                     // outage on one of them fires this every slot for as long
                     // as it lasts. The event that actually means the client
-                    // missed a duty is every node failing, below.
+                    // missed a duty is every node failing, below. A node that
+                    // stopped answering is warned about once, by the record.
                     debug!(%what, position, %err, "Beacon node request failed; trying the next");
+                    self.health.record_request_failure(position, what, &err);
                     last = Some(err);
                 }
             }
@@ -761,6 +930,7 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                     } else {
                         debug!(%what, position, %err, node_effect, "Beacon node did not accept");
                     }
+                    self.health.record_request_failure(position, what, &err);
                     last = Some(err);
                 }
             }
@@ -785,6 +955,205 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             warn!(%what, %detail, all_failed, "No configured beacon node accepted");
         }
         Err(Error::AllBeaconNodesFailed(detail))
+    }
+
+    /// Send a signed message to every node at once, for `--broadcast`, and
+    /// hand back each node's answer by its command-line position.
+    ///
+    /// Every node not ranked [`Tier::Failing`] is sent it together. The call
+    /// waits for them until one accepts, and then at most [`BROADCAST_GRACE`]
+    /// longer: a node still sending by then is cut off, though not ranked
+    /// failing for it (see [`BROADCAST_GRACE`]). The failing ones are sent it
+    /// only when none of the others accepted: a node that timed out on the
+    /// last request or probe would otherwise hold every broadcast back, while
+    /// a node that accepted has already put the message on the network.
+    /// `sent` is a node the caller has already sent to itself, left out here:
+    /// its acceptance counts for both rules, and a send still waiting for its
+    /// answer is waited on with the broadcast's own.
+    ///
+    /// Each answer that says the node stopped answering is recorded, as the
+    /// walk records it. What each answer means is the caller's to read.
+    ///
+    /// "Every node" is every node on this client's chain: a node whose usable
+    /// flag is down is never sent a signed message.
+    async fn broadcast_to_all<'p, T, F>(
+        &'p self,
+        what: &'static str,
+        sent: Sent<'p, T>,
+        call: F,
+    ) -> Vec<(usize, Result<T>)>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        let (skip, accepted_already, pending) = match sent {
+            Sent::Nothing => (None, false, None),
+            Sent::Answered { position, accepted } => (Some(position), accepted, None),
+            Sent::Pending { position, send } => (Some(position), false, Some((position, send))),
+        };
+        let (failing, first): (Vec<_>, Vec<_>) = self
+            .health
+            .tiers()
+            .into_iter()
+            .filter(|(position, _)| Some(*position) != skip && self.is_usable(*position))
+            .partition(|(_, tier)| *tier == Tier::Failing);
+        let sends = pending
+            .into_iter()
+            .chain(self.sends_to(first, &call))
+            .collect();
+        let mut answers = self.send_to(what, sends, accepted_already).await;
+        if !accepted_already && !answers.iter().any(|(_, answer)| answer.is_ok()) {
+            let sends = self.sends_to(failing, &call).collect();
+            answers.extend(self.send_to(what, sends, false).await);
+        }
+        answers
+    }
+
+    /// `call` started on each node at `positions`, by position.
+    fn sends_to<'p, T, F>(
+        &'p self,
+        positions: Vec<(usize, Tier)>,
+        call: &F,
+    ) -> impl Iterator<Item = (usize, BoxFuture<'p, Result<T>>)>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        positions
+            .into_iter()
+            .filter_map(|(position, _)| Some((position, call(self.nodes.get(position)?))))
+    }
+
+    /// Await `sends` at once, and record each node that said it is not
+    /// answering. Waits for every send until one accepts (or from the start,
+    /// when `accepted` says one already has), then at most
+    /// [`BROADCAST_GRACE`] for the rest, which are then dropped.
+    async fn send_to<'p, T>(
+        &'p self,
+        what: &'static str,
+        sends: Vec<(usize, BoxFuture<'p, Result<T>>)>,
+        accepted: bool,
+    ) -> Vec<(usize, Result<T>)> {
+        use futures_util::StreamExt as _;
+
+        let mut outstanding: Vec<usize> = sends.iter().map(|(position, _)| *position).collect();
+        let mut sends: futures_util::stream::FuturesUnordered<_> = sends
+            .into_iter()
+            .map(|(position, send)| async move {
+                let answer = send
+                    .await
+                    .inspect_err(|err| self.health.record_request_failure(position, what, err));
+                (position, answer)
+            })
+            .collect();
+        let mut grace_ends = accepted.then(|| tokio::time::Instant::now() + BROADCAST_GRACE);
+        let mut answers = Vec::new();
+        loop {
+            let next = match grace_ends {
+                None => sends.next().await,
+                Some(ends) => match tokio::time::timeout_at(ends, sends.next()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                },
+            };
+            let Some((position, answer)) = next else {
+                break;
+            };
+            outstanding.retain(|&waiting| waiting != position);
+            if answer.is_ok() && grace_ends.is_none() {
+                grace_ends = Some(tokio::time::Instant::now() + BROADCAST_GRACE);
+            }
+            answers.push((position, answer));
+        }
+        // Not ranked failing: a node that answers late is not a hung one, and
+        // its probe says which (see `BROADCAST_GRACE`).
+        for position in outstanding {
+            debug!(%what, position, "Beacon node had not answered a broadcast another node accepted; not waiting for it");
+        }
+        answers
+    }
+
+    /// A broadcast's answers read as one: the best accepted answer by
+    /// `better`, or every node failing. A node that refused while another
+    /// accepted is logged at `debug!`, since a node down for a while would
+    /// otherwise warn on every message; none accepting is warned about as
+    /// [`Self::try_each`] warns about it.
+    fn best_answer<T>(
+        what: &'static str,
+        answers: Vec<(usize, Result<T>)>,
+        better: impl Fn(&T, &T) -> bool,
+    ) -> Result<T> {
+        let mut best: Option<T> = None;
+        let mut refusals = Vec::new();
+        for (position, answer) in answers {
+            match answer {
+                Ok(value) => {
+                    if best.as_ref().is_none_or(|held| better(&value, held)) {
+                        best = Some(value);
+                    }
+                }
+                Err(err) => refusals.push((position, err)),
+            }
+        }
+        if let Some(best) = best {
+            for (position, err) in refusals {
+                debug!(%what, position, %err, "Beacon node did not accept a broadcast another node accepted");
+            }
+            return Ok(best);
+        }
+        // No answer at all: every node was skipped for not being on this
+        // client's chain.
+        let detail = refusals
+            .pop()
+            .map(|(_, err)| err.to_string())
+            .unwrap_or_else(|| NO_USABLE_NODE.to_string());
+        warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+        Err(Error::AllBeaconNodesFailed(detail))
+    }
+
+    /// A count of accepted entries, sent to every node under `--broadcast` and
+    /// to the first that accepts otherwise. Under broadcast the answer is the
+    /// most any node accepted: each of those reached the network through that
+    /// node at least.
+    async fn send_counted<'p, F>(
+        &'p self,
+        what: &'static str,
+        broadcast: bool,
+        call: F,
+    ) -> Result<usize>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<usize>>,
+    {
+        if !broadcast {
+            return self.try_each(what, call).await;
+        }
+        let answers = self.broadcast_to_all(what, Sent::Nothing, call).await;
+        Self::best_answer(what, answers, |count, held| count > held)
+    }
+
+    /// [`Self::send_counted`] for a message whose acceptance is all a node
+    /// says about it.
+    async fn send_signed<'p, F>(
+        &'p self,
+        what: &'static str,
+        broadcast: bool,
+        call: F,
+    ) -> Result<()>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<()>>,
+    {
+        if !broadcast {
+            return self.try_each(what, call).await;
+        }
+        let answers = self.broadcast_to_all(what, Sent::Nothing, call).await;
+        Self::best_answer(what, answers, |_, _| false)
+    }
+}
+
+/// How good a block publish's answer is, for picking a broadcast's best: a node
+/// that imported the block over one that only broadcast it.
+fn publish_rank(published: Published) -> u8 {
+    match published {
+        Published::Imported | Published::HandedToBuilder => 2,
+        Published::BroadcastNotImported => 1,
     }
 }
 
@@ -903,25 +1272,54 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         Ok(block)
     }
 
-    /// First node that accepts it wins, rather than a broadcast to every node.
+    /// First node in the walk that accepts it wins, unless `--broadcast blocks`
+    /// sends it to every node.
     ///
-    /// Publishing is the one call where that choice is not obvious, because
-    /// sending to every node would reach more of the network's gossip mesh at
-    /// once. It stays first-wins for now because a node that accepts a block
-    /// gossips it, so the second node would receive it over the network in any
-    /// case, and because a broadcast makes the outcome ambiguous: with three
-    /// nodes answering 200, 202 and a timeout, there is no single answer to
-    /// report.
+    /// First-wins by default because a node that accepts a block gossips it,
+    /// so the other nodes receive it over the network in any case. A broadcast
+    /// reaches more of the network's gossip mesh at once, which is what gets a
+    /// block from a node with few peers out in time.
     ///
     /// A 202 counts as success and stops the walk. The node could not import
     /// the block, but it did broadcast it, so the network has it and offering
     /// it to another node would not change that.
+    ///
+    /// Under broadcast the answer is the best any node gave: imported (200)
+    /// over broadcast but not imported (202), either over a refusal, so a
+    /// proposal is reported clean when some node imported it. Each node's
+    /// answer is logged, a refusal at `warn!`, since a proposal is rare and a
+    /// node refusing one is worth seeing. Only when no node accepted is this
+    /// an error.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published> {
-        self.try_each("publish_block", |node| node.publish_block(fork, body))
-            .await
+        let what = "publish_block";
+        if !self.broadcast.blocks {
+            return self
+                .try_each(what, |node| node.publish_block(fork, body))
+                .await;
+        }
+        let answers = self
+            .broadcast_to_all(what, Sent::Nothing, |node| node.publish_block(fork, body))
+            .await;
+        let accepted = answers.iter().any(|(_, answer)| answer.is_ok());
+        for (position, answer) in &answers {
+            match answer {
+                Ok(published) => debug!(%what, position, ?published, "Beacon node took the block"),
+                Err(err) if accepted => warn!(
+                    %what,
+                    position,
+                    %err,
+                    "Beacon node did not take the block; another node did"
+                ),
+                Err(_) => {}
+            }
+        }
+        Self::best_answer(what, answers, |published, held| {
+            publish_rank(*published) > publish_rank(*held)
+        })
     }
 
-    /// Only on the node that produced the block, with no failover.
+    /// Only on the node that produced the block, with no failover, whatever
+    /// `--broadcast` says.
     ///
     /// Unlike [`Self::publish_block`], offering the block to another node
     /// would not reach the network: only the producing node's builder holds
@@ -963,6 +1361,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         // The node behind this one is a single node, with nothing to choose.
         node.publish_blinded_block(Producer::default(), fork, body)
             .await
+            .inspect_err(|err| {
+                self.health.record_request_failure(
+                    producer.position(),
+                    "publish_blinded_block",
+                    err,
+                );
+            })
     }
 
     /// To every node, like the other calls that install state on a node: a
@@ -1016,6 +1421,8 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
                     Ok(()) => accepted[batch] = true,
                     Err(err) => {
                         refused += 1;
+                        self.health
+                            .record_request_failure(position, "register_validators", &err);
                         let detail = err.to_string();
                         first_refusal.get_or_insert_with(|| detail.clone());
                         last[batch] = Some(detail);
@@ -1109,7 +1516,9 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     }
 
     /// First node that accepts it wins, for the reason [`Self::publish_block`]
-    /// is: the accepting node gossips it.
+    /// is: the accepting node gossips it. Never broadcast: with no producer
+    /// named there is no node to send it to first (see
+    /// [`Self::publish_execution_payload_envelope_produced_by`]).
     async fn publish_execution_payload_envelope(
         &self,
         body: &[u8],
@@ -1119,6 +1528,113 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             node.publish_execution_payload_envelope(body, blob_data_included)
         })
         .await
+    }
+
+    /// Without `--broadcast blocks`, [`Self::publish_execution_payload_envelope`]:
+    /// the first node in the walk that accepts it. A body without its blobs is
+    /// the exception, below, with or without the flag.
+    ///
+    /// With it, the producer first, then every other node. The producer is
+    /// the one node certain to hold the block the envelope reveals (it built
+    /// it, and imported it on publish), so its answer comes first and puts
+    /// the envelope on the network. The others are sent it once the producer
+    /// has answered, or once [`PRODUCER_HEAD_START`] has passed without an
+    /// answer: a node that has not imported the block yet queues or drops
+    /// its envelope, and each has had the block a round trip longer by then,
+    /// but a producer that holds the request open (one that answered the
+    /// block 202 and never imported it waits for it) must not keep the
+    /// envelope from every node until the proposal's deadline cuts the reveal.
+    /// Past the head start the producer's answer is awaited with the others'.
+    /// It succeeds when any node accepted.
+    ///
+    /// Two exceptions. A body without its blobs (`blob_data_included: false`)
+    /// goes to the producer first, whatever its rank and with or without the
+    /// flag, since only it cached the blobs at production time; if it does
+    /// not take it, the walk follows among the other nodes, as without the
+    /// flag, since a block with no blobs can be revealed through any node.
+    /// And for a body with them, a
+    /// producer ranked failing (it did not answer a request since its last
+    /// probe, the block's own publish perhaps) is not waited on first: it is
+    /// one of the failing nodes the broadcast reaches only if no other node
+    /// accepts.
+    async fn publish_execution_payload_envelope_produced_by(
+        &self,
+        producer: Producer,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        let what = "publish_execution_payload_envelope";
+        if !self.broadcast.blocks && blob_data_included {
+            return self
+                .publish_execution_payload_envelope(body, blob_data_included)
+                .await;
+        }
+        let position = producer.position();
+        let node = self.nodes.get(position).ok_or_else(|| {
+            Error::InconsistentResponse(format!(
+                "an envelope names beacon node {position} as its producer, but {} are configured",
+                self.nodes.len()
+            ))
+        })?;
+        // A producer that left this client's chain is not sent it, as no call
+        // goes to such a node: the walk, or the broadcast, takes it instead.
+        let producer_usable = self.is_usable(position);
+        if !blob_data_included {
+            if !producer_usable {
+                return self.publish_execution_payload_envelope(body, false).await;
+            }
+            let answer = node
+                .publish_execution_payload_envelope(body, false)
+                .await
+                .inspect_err(|err| self.health.record_request_failure(position, what, err));
+            let Err(err) = answer else {
+                return Ok(());
+            };
+            // The walk leaves the producer out: it just answered this very
+            // body. With no other node to walk, its answer is the outcome.
+            if self.usable_nodes().all(|(usable, _)| usable == position) {
+                let detail = self.failure_detail(Some(err));
+                warn!(%what, %detail, "All configured beacon nodes failed; duty likely missed");
+                return Err(Error::AllBeaconNodesFailed(detail));
+            }
+            debug!(%what, position, %err, "The producer did not take its envelope; trying the walk");
+            return self
+                .try_each_at_inner(what, true, Reach::EveryBut(position), |node| {
+                    node.publish_execution_payload_envelope(body, false)
+                })
+                .await
+                .map(|(_, ())| ());
+        }
+        let producer_failing =
+            !producer_usable || self.health.tiers().contains(&(position, Tier::Failing));
+
+        // The producer alone first, for at most `PRODUCER_HEAD_START`; past
+        // that, the rest are sent it while its answer is still awaited.
+        let mut answers = Vec::new();
+        let mut sent = Sent::Nothing;
+        if !producer_failing {
+            let mut send = node.publish_execution_payload_envelope(body, true);
+            sent = match tokio::time::timeout(PRODUCER_HEAD_START, &mut send).await {
+                Ok(answer) => {
+                    let answer = answer
+                        .inspect_err(|err| self.health.record_request_failure(position, what, err));
+                    let accepted = answer.is_ok();
+                    answers.push((position, answer));
+                    Sent::Answered { position, accepted }
+                }
+                Err(_) => {
+                    debug!(%what, position, "The producer has not answered its envelope yet; sending it to the other nodes too");
+                    Sent::Pending { position, send }
+                }
+            };
+        }
+        let rest = self
+            .broadcast_to_all(what, sent, |node| {
+                node.publish_execution_payload_envelope(body, true)
+            })
+            .await;
+        answers.extend(rest);
+        Self::best_answer(what, answers, |_, _| false)
     }
 
     async fn ptc_duties(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<PtcDuties> {
@@ -1143,22 +1659,26 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// To every node with `--broadcast attestations`, the most any accepted.
     async fn submit_payload_attestations(
         &self,
         messages: &[gloas::PayloadAttestationMessage],
     ) -> Result<usize> {
-        self.try_each("submit_payload_attestations", |node| {
-            node.submit_payload_attestations(messages)
-        })
+        self.send_counted(
+            "submit_payload_attestations",
+            self.broadcast.attestations,
+            |node| node.submit_payload_attestations(messages),
+        )
         .await
     }
 
+    /// To every node with `--broadcast attestations`, the most any accepted.
     async fn submit_attestations(
         &self,
         attestations: &[SingleAttestationDto],
         fork_name: &str,
     ) -> Result<usize> {
-        self.try_each("submit_attestations", |node| {
+        self.send_counted("submit_attestations", self.broadcast.attestations, |node| {
             node.submit_attestations(attestations, fork_name)
         })
         .await
@@ -1179,12 +1699,13 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// To every node with `--broadcast attestations`.
     async fn publish_aggregates(
         &self,
         fork: ForkName,
         aggregates: &SignedAggregates,
     ) -> Result<()> {
-        self.try_each("publish_aggregates", |node| {
+        self.send_signed("publish_aggregates", self.broadcast.attestations, |node| {
             node.publish_aggregates(fork, aggregates)
         })
         .await
@@ -1251,13 +1772,16 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             .await
     }
 
+    /// To every node with `--broadcast sync-committee`, the most any accepted.
     async fn submit_sync_committee_messages(
         &self,
         messages: &[altair::SyncCommitteeMessage],
     ) -> Result<usize> {
-        self.try_each("submit_sync_committee_messages", |node| {
-            node.submit_sync_committee_messages(messages)
-        })
+        self.send_counted(
+            "submit_sync_committee_messages",
+            self.broadcast.sync_committee,
+            |node| node.submit_sync_committee_messages(messages),
+        )
         .await
     }
 
@@ -1275,13 +1799,16 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    /// To every node with `--broadcast sync-committee`.
     async fn publish_contribution_and_proofs(
         &self,
         contributions: &[altair::SignedContributionAndProof],
     ) -> Result<()> {
-        self.try_each("publish_contribution_and_proofs", |node| {
-            node.publish_contribution_and_proofs(contributions)
-        })
+        self.send_signed(
+            "publish_contribution_and_proofs",
+            self.broadcast.sync_committee,
+            |node| node.publish_contribution_and_proofs(contributions),
+        )
         .await
     }
 
@@ -2470,6 +2997,612 @@ mod tests {
         for node in &fallback.nodes {
             assert_eq!(*node.registration_batches.lock().expect("lock"), vec![0]);
         }
+    }
+
+    /// Every `--broadcast` topic on.
+    fn every_topic() -> Broadcast {
+        Broadcast {
+            attestations: true,
+            blocks: true,
+            sync_committee: true,
+        }
+    }
+
+    /// The request timeout an HTTP node fails a hung request after.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+    /// The issue's first test: a node that takes every request and never
+    /// answers, listed first, with a healthy node second. Once the first probe
+    /// has found it silent, attestation data comes from the second at once,
+    /// slot after slot, and the hung node is not asked again until it answers
+    /// a probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_first_node_is_not_asked_once_a_probe_finds_it_silent() {
+        use std::time::Duration;
+        let hung = MockBeaconNode::new()
+            .with_attestation_data(96)
+            .with_hang(TIMEOUT);
+        let fallback =
+            FallbackBeaconNode::new(vec![hung, MockBeaconNode::new().with_attestation_data(96)]);
+        fallback.probe(96, Duration::from_secs(2)).await;
+
+        for _ in 0..3 {
+            let started = tokio::time::Instant::now();
+            fallback
+                .attestation_data(96, fork_of(96))
+                .await
+                .expect("the second node answers");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "within the slot"
+            );
+        }
+        assert_eq!(fallback.nodes[0].hung_calls_to("attestation_data"), 0);
+        assert_eq!(fallback.nodes[1].attestation_data_call_count(), 3);
+
+        // It answers its next probe, and is first again.
+        fallback.nodes[0].set_hang(None);
+        fallback.probe(97, Duration::from_secs(2)).await;
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the first node answers");
+        assert_eq!(fallback.nodes[0].attestation_data_call_count(), 1);
+        assert_eq!(fallback.nodes[1].attestation_data_call_count(), 3);
+    }
+
+    /// Before any probe has found it, a hung node costs one request timeout:
+    /// the request that timed out ranks it last at once, so the next request
+    /// goes straight to the healthy node, and so does every one after it until
+    /// the hung node answers a probe. A probe it does not answer keeps it last.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_timed_out_ranks_its_node_last_until_a_probe_answers() {
+        use std::time::Duration;
+        let hung = MockBeaconNode::new()
+            .with_attestation_data(96)
+            .with_hang(TIMEOUT);
+        let fallback =
+            FallbackBeaconNode::new(vec![hung, MockBeaconNode::new().with_attestation_data(96)]);
+
+        let started = tokio::time::Instant::now();
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the second node answers after the first timed out");
+        assert!(started.elapsed() >= TIMEOUT);
+        assert_eq!(fallback.nodes[0].hung_calls_to("attestation_data"), 1);
+
+        let started = tokio::time::Instant::now();
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the second node answers");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fallback.nodes[0].hung_calls_to("attestation_data"), 1);
+
+        fallback.probe(97, Duration::from_secs(2)).await;
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the second node answers");
+        assert_eq!(fallback.nodes[0].hung_calls_to("attestation_data"), 1);
+
+        fallback.nodes[0].set_hang(None);
+        fallback.probe(98, Duration::from_secs(2)).await;
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the first node answers");
+        assert_eq!(fallback.nodes[0].attestation_data_call_count(), 1);
+        assert_eq!(fallback.nodes[1].attestation_data_call_count(), 3);
+    }
+
+    /// A node that reports itself not syncing but further behind its clock
+    /// than the tolerance is asked after a synced node listed behind it; one
+    /// within the tolerance keeps its place.
+    #[tokio::test]
+    async fn a_node_behind_by_its_sync_distance_is_asked_after_a_synced_one() {
+        for (sync_distance, first_asked) in
+            [(crate::beacon_node::health::SYNC_TOLERANCE + 1, 1), (5, 0)]
+        {
+            let lagging = MockBeaconNode::new().with_attestation_data(96);
+            lagging.set_sync_status(SyncStatus {
+                head_slot: Some(96 - sync_distance),
+                sync_distance: Some(sync_distance),
+                is_syncing: false,
+                is_optimistic: false,
+                el_offline: false,
+            });
+            let fallback = FallbackBeaconNode::new(vec![
+                lagging,
+                MockBeaconNode::new().with_attestation_data(96),
+            ]);
+            fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+            fallback
+                .attestation_data(96, fork_of(96))
+                .await
+                .expect("attestation data");
+            assert_eq!(
+                fallback.nodes[first_asked].attestation_data_call_count(),
+                1,
+                "sync distance {sync_distance}"
+            );
+            assert_eq!(
+                fallback.nodes[1 - first_asked].attestation_data_call_count(),
+                0,
+                "sync distance {sync_distance}"
+            );
+        }
+    }
+
+    /// Two nodes that both answered synced are asked in the order listed.
+    #[tokio::test]
+    async fn two_healthy_nodes_are_asked_in_command_line_order() {
+        let fallback = FallbackBeaconNode::new(vec![answering(1), answering(2)]);
+        fallback.probe(96, std::time::Duration::from_secs(1)).await;
+
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("attestation data");
+        assert_eq!(
+            fallback.head_block_root().await.expect("a head"),
+            Root::repeat_byte(1)
+        );
+        assert_eq!(fallback.nodes[0].attestation_data_call_count(), 1);
+        assert_eq!(fallback.nodes[1].attestation_data_call_count(), 0);
+    }
+
+    /// The issue's blinded-block test: a node ranked first but listed second
+    /// produces the block, which goes back to position 1, under `--broadcast
+    /// blocks` too.
+    #[tokio::test]
+    async fn a_blinded_block_ranked_first_but_listed_second_goes_back_to_position_one() {
+        let lagging = blinded_node();
+        lagging.set_sync_status(SyncStatus {
+            head_slot: Some(1),
+            sync_distance: Some(40),
+            is_syncing: false,
+            is_optimistic: false,
+            el_offline: false,
+        });
+        let fallback =
+            FallbackBeaconNode::new(vec![lagging, blinded_node()]).with_broadcast(every_topic());
+        fallback.probe(5, std::time::Duration::from_secs(1)).await;
+        assert_eq!(fallback.health().tiers()[0], (1, Tier::Synced));
+
+        let produced = fallback
+            .produce_block(&blinded_request(5, 7))
+            .await
+            .expect("node 1 produces");
+        assert_eq!(produced.producer, Producer::at(1));
+        fallback
+            .publish_blinded_block(produced.producer, ForkName::Electra, &[4])
+            .await
+            .expect("published");
+        assert!(
+            fallback.nodes[0]
+                .published_blinded
+                .lock()
+                .expect("lock")
+                .is_empty()
+        );
+        assert_eq!(
+            *fallback.nodes[1].published_blinded.lock().expect("lock"),
+            vec![(ForkName::Electra, vec![4])]
+        );
+    }
+
+    /// The issue's broadcast test: answers of 202, a hang and 200 report the
+    /// 200, wherever it is in the list, and every node that answered got the
+    /// same body. The hung node is not waited for past the grace, so a caller
+    /// with a deadline shorter than the request timeout, as a proposal has,
+    /// still gets the answer. Being cut off does not rank it failing (its
+    /// probe does that), so the next broadcast is sent to it again, and again
+    /// waits for it no longer than the grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_broadcast_block_answered_202_a_hang_and_200_reports_the_200() {
+        use std::time::Duration;
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new().with_publish_outcome(Published::BroadcastNotImported),
+            MockBeaconNode::new().with_hang(TIMEOUT),
+            MockBeaconNode::new(),
+        ])
+        .with_broadcast(Broadcast {
+            blocks: true,
+            ..Broadcast::default()
+        });
+
+        let deadline = TIMEOUT / 4;
+        let outcome =
+            tokio::time::timeout(deadline, fallback.publish_block(ForkName::Electra, b"body"))
+                .await
+                .expect("answered before a deadline shorter than the hang")
+                .expect("two nodes took it");
+        assert_eq!(outcome, Published::Imported);
+        assert!(!fallback.health().tiers().contains(&(1, Tier::Failing)));
+        for position in [0, 2] {
+            assert_eq!(
+                fallback.nodes[position].published_blocks(),
+                vec![(ForkName::Electra, b"body".to_vec())],
+                "node {position}"
+            );
+        }
+        assert_eq!(fallback.nodes[1].hung_calls_to("publish_block"), 1);
+
+        let started = tokio::time::Instant::now();
+        fallback
+            .publish_block(ForkName::Electra, b"next")
+            .await
+            .expect("two nodes took it");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fallback.nodes[1].hung_calls_to("publish_block"), 2);
+    }
+
+    /// A node that answers every broadcast a little later than the grace, as
+    /// one slower to import a block does, is cut off each time but never
+    /// ranked failing for it: it is sent every broadcast, rather than being
+    /// cut out of the rest of each slot's broadcasts until its next probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_node_cut_off_by_a_broadcast_is_not_ranked_failing() {
+        use std::time::Duration;
+        let slower = BROADCAST_GRACE + Duration::from_millis(100);
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new(),
+            MockBeaconNode::new().with_slow_answers(slower),
+        ])
+        .with_broadcast(every_topic());
+
+        for _ in 0..2 {
+            let started = tokio::time::Instant::now();
+            fallback
+                .submit_attestations(&[single_attestation(11)], "electra")
+                .await
+                .expect("the first node took it");
+            // Waited out the grace: the slow node was sent it, every time.
+            assert!(started.elapsed() >= BROADCAST_GRACE);
+            assert!(started.elapsed() < slower);
+            assert!(!fallback.health().tiers().contains(&(1, Tier::Failing)));
+        }
+    }
+
+    /// A 202 is still a block on the network, so it is the answer when no node
+    /// imported; no node taking it at all is every node failing.
+    #[tokio::test]
+    async fn a_broadcast_block_no_node_imported_is_a_202_and_none_taking_it_an_error() {
+        let blocks = Broadcast {
+            blocks: true,
+            ..Broadcast::default()
+        };
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::new().with_publish_outcome(Published::BroadcastNotImported),
+        ])
+        .with_broadcast(blocks);
+        let outcome = fallback
+            .publish_block(ForkName::Electra, b"body")
+            .await
+            .expect("one node took it");
+        assert_eq!(outcome, Published::BroadcastNotImported);
+
+        let down = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("down"),
+            MockBeaconNode::failing("also down"),
+        ])
+        .with_broadcast(blocks);
+        let err = down
+            .publish_block(ForkName::Electra, b"body")
+            .await
+            .expect_err("no node took it");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+    }
+
+    fn single_attestation(attester_index: ValidatorIndex) -> SingleAttestationDto {
+        let data = MockBeaconNode::new()
+            .with_attestation_data(96)
+            .attestation_data
+            .expect("set");
+        SingleAttestationDto {
+            committee_index: 0,
+            attester_index,
+            data: crate::beacon_node::dto::AttestationDataOutDto::from(&data),
+            signature: crate::beacon_node::dto::encode_hex(&[7u8; 96]),
+        }
+    }
+
+    fn payload_vote() -> gloas::PayloadAttestationMessage {
+        gloas::PayloadAttestationMessage {
+            validator_index: 3,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: Root::repeat_byte(1),
+                slot: 96,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// `--broadcast attestations` sends attestations, aggregates and payload
+    /// votes to every node, the same signed message to each, and succeeds
+    /// past a node that refused. Without it the first node takes them alone.
+    #[tokio::test]
+    async fn broadcast_attestations_reach_every_node() {
+        let nodes = || {
+            vec![
+                MockBeaconNode::new(),
+                MockBeaconNode::failing("down"),
+                MockBeaconNode::new(),
+            ]
+        };
+        let fallback = FallbackBeaconNode::new(nodes()).with_broadcast(Broadcast {
+            attestations: true,
+            ..Broadcast::default()
+        });
+        let accepted = fallback
+            .submit_attestations(&[single_attestation(11)], "electra")
+            .await
+            .expect("two nodes took it");
+        assert_eq!(accepted, 1);
+        fallback
+            .publish_aggregates(ForkName::Electra, &SignedAggregates::Electra(Vec::new()))
+            .await
+            .expect("two nodes took it");
+        fallback
+            .submit_payload_attestations(&[payload_vote()])
+            .await
+            .expect("two nodes took it");
+        for position in [0, 2] {
+            let node = &fallback.nodes[position];
+            let submitted = node.submitted();
+            assert_eq!(submitted.len(), 1, "node {position}");
+            assert_eq!(submitted[0].attester_index, 11);
+            assert_eq!(submitted[0].signature, single_attestation(11).signature);
+            assert_eq!(node.published_aggregates().len(), 1, "node {position}");
+            assert_eq!(node.submitted_payload_attestations(), vec![payload_vote()]);
+        }
+
+        let one_node = FallbackBeaconNode::new(nodes());
+        one_node
+            .submit_attestations(&[single_attestation(11)], "electra")
+            .await
+            .expect("the first node takes it");
+        assert_eq!(one_node.nodes[0].submitted().len(), 1);
+        assert!(one_node.nodes[2].submitted().is_empty());
+    }
+
+    /// `--broadcast sync-committee` sends messages and contributions to every
+    /// node.
+    #[tokio::test]
+    async fn broadcast_sync_committee_messages_reach_every_node() {
+        let fallback = FallbackBeaconNode::new(vec![MockBeaconNode::new(), MockBeaconNode::new()])
+            .with_broadcast(Broadcast {
+                sync_committee: true,
+                ..Broadcast::default()
+            });
+        let message = altair::SyncCommitteeMessage {
+            slot: 96,
+            beacon_block_root: Root::repeat_byte(2),
+            validator_index: 5,
+            signature: Default::default(),
+        };
+        let accepted = fallback
+            .submit_sync_committee_messages(std::slice::from_ref(&message))
+            .await
+            .expect("both took it");
+        assert_eq!(accepted, 1);
+        fallback
+            .publish_contribution_and_proofs(&[])
+            .await
+            .expect("both took it");
+        for node in &fallback.nodes {
+            assert_eq!(node.submitted_sync_messages(), vec![message.clone()]);
+        }
+    }
+
+    /// A node ranked failing is sent a broadcast only when no other node
+    /// took it: here the only other node is down, so the one that timed out
+    /// last time, and answers now, is asked after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_node_is_sent_a_broadcast_when_no_other_node_takes_it() {
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new().with_hang(TIMEOUT),
+            MockBeaconNode::failing("down"),
+        ])
+        .with_broadcast(every_topic());
+
+        let err = fallback
+            .submit_attestations(&[single_attestation(11)], "electra")
+            .await
+            .expect_err("neither took it");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
+        assert_eq!(fallback.health().tiers()[1], (0, Tier::Failing));
+
+        fallback.nodes[0].set_hang(None);
+        let accepted = fallback
+            .submit_attestations(&[single_attestation(11)], "electra")
+            .await
+            .expect("the failing node takes it once the other refused");
+        assert_eq!(accepted, 1);
+        assert_eq!(fallback.nodes[0].submitted().len(), 1);
+    }
+
+    /// Under `--broadcast blocks` an envelope goes to the node that produced
+    /// its block first, and to the rest only once that node has answered (or
+    /// its head start ran out; see the next test). One
+    /// without its blobs goes to the producer alone, since only it cached
+    /// them, with or without the flag. Without the flag, one with its blobs is
+    /// the first node in the walk that takes it, as before.
+    #[tokio::test]
+    async fn a_broadcast_envelope_goes_to_its_producer_first_then_to_the_rest() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let producer = MockBeaconNode::new().with_envelope_publish_gate(gate.clone());
+        let blocks = Broadcast {
+            blocks: true,
+            ..Broadcast::default()
+        };
+        let fallback = Arc::new(
+            FallbackBeaconNode::new(vec![MockBeaconNode::new(), producer, MockBeaconNode::new()])
+                .with_broadcast(blocks),
+        );
+
+        let publish = tokio::spawn({
+            let fallback = fallback.clone();
+            async move {
+                fallback
+                    .publish_execution_payload_envelope_produced_by(
+                        Producer::at(1),
+                        b"envelope",
+                        true,
+                    )
+                    .await
+            }
+        });
+        fallback.nodes[1].envelope_publish_entered.notified().await;
+        assert!(fallback.nodes[0].published_envelopes().is_empty());
+        assert!(fallback.nodes[2].published_envelopes().is_empty());
+        gate.add_permits(1);
+        publish.await.expect("the publish ends").expect("published");
+        for node in fallback.nodes.iter() {
+            assert_eq!(
+                node.published_envelopes(),
+                vec![(b"envelope".to_vec(), true)]
+            );
+        }
+
+        let bare = FallbackBeaconNode::new(vec![MockBeaconNode::new(), MockBeaconNode::new()])
+            .with_broadcast(blocks);
+        bare.publish_execution_payload_envelope_produced_by(Producer::at(1), b"bare", false)
+            .await
+            .expect("published");
+        assert!(bare.nodes[0].published_envelopes().is_empty());
+        assert_eq!(
+            bare.nodes[1].published_envelopes(),
+            vec![(b"bare".to_vec(), false)]
+        );
+
+        let one_node = FallbackBeaconNode::new(vec![MockBeaconNode::new(), MockBeaconNode::new()]);
+        one_node
+            .publish_execution_payload_envelope_produced_by(Producer::at(1), b"walked", true)
+            .await
+            .expect("published");
+        assert_eq!(one_node.nodes[0].published_envelopes().len(), 1);
+        assert!(one_node.nodes[1].published_envelopes().is_empty());
+
+        one_node
+            .publish_execution_payload_envelope_produced_by(Producer::at(1), b"bare", false)
+            .await
+            .expect("published");
+        assert_eq!(one_node.nodes[0].published_envelopes().len(), 1);
+        assert_eq!(
+            one_node.nodes[1].published_envelopes(),
+            vec![(b"bare".to_vec(), false)],
+            "a body without its blobs goes to its producer without the flag too"
+        );
+
+        // A producer that does not take it is followed by the walk: a block
+        // with no blobs can be revealed through any node.
+        let refusing = || {
+            MockBeaconNode::new()
+                .failing_call("publish_execution_payload_envelope", "no cached blobs")
+        };
+        for broadcast in [Broadcast::default(), blocks] {
+            let fallback = FallbackBeaconNode::new(vec![MockBeaconNode::new(), refusing()])
+                .with_broadcast(broadcast);
+            fallback
+                .publish_execution_payload_envelope_produced_by(Producer::at(1), b"bare", false)
+                .await
+                .expect("the other node takes it");
+            assert_eq!(
+                fallback.nodes[0].published_envelopes(),
+                vec![(b"bare".to_vec(), false)]
+            );
+        }
+
+        // The walk leaves out the producer that just refused it: with no
+        // other node, its refusal is the outcome.
+        let alone = FallbackBeaconNode::new(vec![refusing()]).with_broadcast(blocks);
+        let err = alone
+            .publish_execution_payload_envelope_produced_by(Producer::at(0), b"bare", false)
+            .await
+            .expect_err("the only node refused it");
+        assert!(
+            matches!(&err, Error::AllBeaconNodesFailed(detail) if detail.contains("no cached blobs")),
+            "got {err:?}"
+        );
+    }
+
+    /// A producer that holds its envelope's request open, as one that
+    /// answered the block 202 and waits for a block it never imported does,
+    /// keeps the envelope from the other nodes for its head start only. They
+    /// are sent it then, so the reveal lands well inside a proposal's
+    /// deadline, which would otherwise cut it before any other node had it.
+    #[tokio::test(start_paused = true)]
+    async fn a_producer_that_holds_its_envelope_open_does_not_keep_it_from_the_rest() {
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new(),
+            MockBeaconNode::new().with_hang(TIMEOUT),
+            MockBeaconNode::new(),
+        ])
+        .with_broadcast(Broadcast {
+            blocks: true,
+            ..Broadcast::default()
+        });
+
+        let deadline = TIMEOUT / 4;
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            deadline,
+            fallback.publish_execution_payload_envelope_produced_by(
+                Producer::at(1),
+                b"envelope",
+                true,
+            ),
+        )
+        .await
+        .expect("answered before the deadline")
+        .expect("the other nodes took it");
+        assert!(started.elapsed() <= PRODUCER_HEAD_START + BROADCAST_GRACE);
+        assert_eq!(
+            fallback.nodes[1].hung_calls_to("publish_execution_payload_envelope"),
+            1,
+            "the producer was sent it first, and once"
+        );
+        for position in [0, 2] {
+            assert_eq!(
+                fallback.nodes[position].published_envelopes(),
+                vec![(b"envelope".to_vec(), true)],
+                "node {position}"
+            );
+        }
+    }
+
+    /// Doppelganger protection's liveness query asks every node at once and
+    /// takes the first answer, so the ranking does not decide who answers: a
+    /// node ranked failing for a timed-out request still answers it.
+    #[tokio::test(start_paused = true)]
+    async fn liveness_is_answered_whatever_the_ranking() {
+        let seeing = MockBeaconNode::new()
+            .with_attestation_data(96)
+            .with_hang(TIMEOUT);
+        seeing.live.lock().expect("lock").push((12, 7));
+        let fallback = FallbackBeaconNode::new(vec![seeing, MockBeaconNode::failing("down")]);
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect_err("neither answers");
+        assert_eq!(fallback.health().tiers()[1], (0, Tier::Failing));
+
+        fallback.nodes[0].set_hang(None);
+        let answers = fallback.liveness(&[12], &[7]).await.expect("answers");
+        assert_eq!(
+            answers,
+            vec![vec![Liveness {
+                index: 7,
+                is_live: true
+            }]]
+        );
     }
 
     /// `count` registrations with distinct keys. Unsigned: no mock checks.
