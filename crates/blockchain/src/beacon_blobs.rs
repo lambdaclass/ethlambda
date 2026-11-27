@@ -1,5 +1,8 @@
 //! Data columns from this node's own execution client (`engine_getBlobsV2`).
 //!
+//! The flow below is a fulu block's; a gloas envelope waiting on its columns
+//! takes the same path from the engine call on (see "Gloas" below).
+//!
 //! A fulu block held for its custody columns (see
 //! `BlockChainServer::hold_block_for_columns`) is usually answered by gossip
 //! within a fraction of a second. When it is not, the execution client may
@@ -66,9 +69,13 @@
 //!   block for good or import it on data nobody checked. The cost is one KZG
 //!   batch over the custody columns, on the blocking pool. See
 //!   `docs/spec_deviations.md`.
-//! - **Not gloas.** From gloas on, data availability moves from the block to
-//!   the payload envelope, so a held gloas block has no columns to fill this
-//!   way.
+//! - **Gloas: on the envelope's hold.** From gloas on, data availability
+//!   moves from the block to the payload envelope, and gloas keeps fulu's rule
+//!   unchanged. So the ask fires when an envelope is first held for its
+//!   sampled columns (`BlockChainServer::ask_execution_client_for_columns`),
+//!   with the bid's commitments, under the same age bound and budget, and
+//!   without the proposer precheck: its block has imported by then. The
+//!   sidecars are gloas's, named by the block ([`spawn_gloas_fetch`]).
 //!
 //! The cell computation is CPU-heavy, so it runs on tokio's blocking pool: off
 //! the async runtime and off the chain actor, which only ever sees the
@@ -79,9 +86,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use ethlambda_engine::EngineClient;
+use ethlambda_engine::{BlobAndProofV2, EngineClient};
 use ethlambda_network_api::{BlockChainToP2PRef, SidecarOrigin};
 use ethlambda_state_transition::beacon::data_columns;
+use ethlambda_state_transition::beacon::gloas_block_production::gloas_data_column_sidecars;
 use ethlambda_state_transition::beacon::gossip::column::{self, ChainPrechecks, ChainVerdict};
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::precheck::{Reference, precheck_block};
@@ -90,7 +98,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, deneb, electra};
 use ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB;
-use ethlambda_types::beacon::primitives::KzgProof;
+use ethlambda_types::beacon::primitives::{KzgCommitment, KzgProof};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{debug, error, info, warn};
@@ -237,6 +245,74 @@ pub(crate) fn signed_by_its_proposer(
         .is_ok()
 }
 
+/// What an ask builds columns for.
+enum Source {
+    /// A fulu block held for its custody columns: its sidecars carry its
+    /// signed header and inclusion proof.
+    Fulu(Box<electra::SignedBeaconBlock>),
+    /// A gloas block whose envelope waits on its sampled columns: its sidecars
+    /// name the block, and their commitments are its bid's.
+    Gloas(Vec<KzgCommitment>),
+}
+
+impl Source {
+    fn versioned_hashes(&self) -> Vec<H256> {
+        match self {
+            Self::Fulu(block) => block
+                .message
+                .body
+                .blob_kzg_commitments
+                .iter()
+                .map(kzg_commitment_to_versioned_hash)
+                .collect(),
+            Self::Gloas(commitments) => commitments
+                .iter()
+                .map(kzg_commitment_to_versioned_hash)
+                .collect(),
+        }
+    }
+
+    /// The sidecars of `missing` built from the execution client's answer,
+    /// unverified, or why the answer does not fit the block.
+    fn build(
+        &self,
+        slot: u64,
+        block_root: H256,
+        entries: Vec<BlobAndProofV2>,
+        missing: &[u64],
+    ) -> Result<Vec<DataColumnSidecar>, String> {
+        let mut proofs: Vec<KzgProof> = Vec::with_capacity(entries.len() * CELLS_PER_EXT_BLOB);
+        let mut blobs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            blobs.push(entry.blob);
+            proofs.extend(entry.proofs);
+        }
+        match self {
+            Self::Fulu(block) => {
+                let blobs = blobs
+                    .into_iter()
+                    .map(deneb::Blob::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "a blob has the wrong size".to_string())?;
+                let sidecars = data_columns::unverified_sidecars(block, &blobs, &proofs, missing)
+                    .map_err(|err| err.to_string())?;
+                Ok(sidecars.into_iter().map(DataColumnSidecar::Fulu).collect())
+            }
+            // Builds every column, since computing a blob's cells computes
+            // them all, and keeps the missing ones.
+            Self::Gloas(_) => {
+                let sidecars = gloas_data_column_sidecars(block_root, slot, &blobs, &proofs)
+                    .map_err(|err| err.to_string())?;
+                Ok(sidecars
+                    .into_iter()
+                    .filter(|sidecar| missing.contains(&sidecar.index))
+                    .map(DataColumnSidecar::Gloas)
+                    .collect())
+            }
+        }
+    }
+}
+
 /// Ask the execution client for a held fulu block's blobs on a task of its
 /// own, and hand the custody columns built from them to the p2p layer.
 pub(crate) fn spawn_fetch(
@@ -248,36 +324,64 @@ pub(crate) fn spawn_fetch(
     custody_columns: Vec<u64>,
     permit: AskPermit,
 ) {
+    let slot = block.message.slot;
+    let source = Source::Fulu(Box::new(block));
     tokio::spawn(fetch_and_publish(
         engine,
         p2p,
         store,
-        block,
+        source,
+        slot,
         block_root,
         custody_columns,
         permit,
     ));
 }
 
+/// [`spawn_fetch`] for a gloas block whose envelope waits on its sampled
+/// columns: `commitments` are its bid's.
+///
+/// No proposer precheck: an envelope is held for columns only once its block
+/// has imported (and its own signature has verified), so the block's
+/// signature already has. The built columns still go through every chain
+/// check before they leave this module.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_gloas_fetch(
+    engine: EngineClient,
+    p2p: BlockChainToP2PRef,
+    store: Store,
+    commitments: Vec<KzgCommitment>,
+    slot: u64,
+    block_root: H256,
+    sampled_columns: Vec<u64>,
+    permit: AskPermit,
+) {
+    tokio::spawn(fetch_and_publish(
+        engine,
+        p2p,
+        store,
+        Source::Gloas(commitments),
+        slot,
+        block_root,
+        sampled_columns,
+        permit,
+    ));
+}
+
 /// `permit` is held until the blocking work ends, so it bounds the cell
 /// computation and the chain checks too, not only the engine call.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_publish(
     engine: EngineClient,
     p2p: BlockChainToP2PRef,
     store: Store,
-    block: electra::SignedBeaconBlock,
+    source: Source,
+    slot: u64,
     block_root: H256,
     custody_columns: Vec<u64>,
     permit: AskPermit,
 ) {
-    let slot = block.message.slot;
-    let versioned_hashes: Vec<H256> = block
-        .message
-        .body
-        .blob_kzg_commitments
-        .iter()
-        .map(kzg_commitment_to_versioned_hash)
-        .collect();
+    let versioned_hashes = source.versioned_hashes();
 
     let started = Instant::now();
     let answer = engine.get_blobs_v2(&versioned_hashes).await;
@@ -303,14 +407,18 @@ async fn fetch_and_publish(
     let blob_count = entries.len();
     let work = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        // The block was imported while the execution client answered (gossip
-        // completed it first): nothing left to supply.
-        match store.has_state(&block_root) {
-            Ok(false) => {}
-            Ok(true) => return None,
-            Err(err) => {
-                error!(%slot, block_root = %ShortRoot(&block_root.0), %err, "Failed to check whether a held block was imported");
-                return None;
+        // A fulu block imported while the execution client answered (gossip
+        // completed it first) has nothing left to supply. A gloas block is
+        // imported before its envelope waits on columns, so only the missing
+        // columns below say whether anything is left.
+        if matches!(source, Source::Fulu(_)) {
+            match store.has_state(&block_root) {
+                Ok(false) => {}
+                Ok(true) => return None,
+                Err(err) => {
+                    error!(%slot, block_root = %ShortRoot(&block_root.0), %err, "Failed to check whether a held block was imported");
+                    return None;
+                }
             }
         }
         let present = match store.data_column_indices_for(slot, &block_root) {
@@ -330,19 +438,7 @@ async fn fetch_and_publish(
         }
 
         let converted = Instant::now();
-        let mut blobs = Vec::with_capacity(entries.len());
-        let mut proofs: Vec<KzgProof> = Vec::with_capacity(entries.len() * CELLS_PER_EXT_BLOB);
-        for entry in entries {
-            match deneb::Blob::try_from(entry.blob) {
-                Ok(blob) => blobs.push(blob),
-                Err(_) => {
-                    warn!(%slot, block_root = %ShortRoot(&block_root.0), "Execution client's blob has the wrong size");
-                    return None;
-                }
-            }
-            proofs.extend(entry.proofs);
-        }
-        let sidecars = match data_columns::unverified_sidecars(&block, &blobs, &proofs, &missing) {
+        let sidecars = match source.build(slot, block_root, entries, &missing) {
             Ok(sidecars) => sidecars,
             Err(err) => {
                 warn!(%slot, block_root = %ShortRoot(&block_root.0), %err, "Execution client's blobs do not fit the block");
@@ -350,7 +446,6 @@ async fn fetch_and_publish(
             }
         };
         metrics::observe_engine_blobs_to_columns(converted.elapsed());
-        let sidecars = sidecars.into_iter().map(DataColumnSidecar::Fulu).collect();
         Some(check_built(&store, slot, block_root, sidecars))
     })
     .await;
@@ -818,11 +913,13 @@ mod tests {
         let permit = AskBudget::default()
             .admit(1, 1)
             .expect("an empty budget admits");
+        let slot = inner.message.slot;
         fetch_and_publish(
             engine,
             p2p.clone(),
             store,
-            inner,
+            Source::Fulu(Box::new(inner)),
+            slot,
             root,
             CUSTODY.to_vec(),
             permit,
@@ -831,6 +928,89 @@ mod tests {
 
         assert_eq!(requests.load(Ordering::SeqCst), 1, "the engine was asked");
         assert!(p2p.checks.lock().unwrap().is_empty());
+    }
+
+    /// A gloas block whose envelope waits on columns: the answer becomes the
+    /// sampled columns still missing, gloas-shaped (named by the block, no
+    /// header), checked against the bid's commitments, and handed to p2p.
+    #[tokio::test]
+    async fn a_gloas_hit_hands_over_the_missing_sampled_columns() {
+        use ethlambda_types::beacon::containers::gloas;
+
+        let blobs = vec![blob_bytes(11), blob_bytes(12)];
+        let commitments: Vec<KzgCommitment> = blobs
+            .iter()
+            .map(|blob| kzg::blob_to_kzg_commitment(blob).unwrap())
+            .collect();
+        let mut block = gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let bid = &mut block.message.body.signed_execution_payload_bid.message;
+        bid.blob_kzg_commitments = commitments.clone().into();
+        let root = H256::repeat_byte(0x9a);
+        let mut store = beacon_store(0, 0);
+        store
+            .insert_pending_block(root, SignedBeaconBlock::Gloas(block))
+            .expect("insert");
+        store
+            .insert_state(root, test_state::with_validators_at(ForkName::Gloas, 1))
+            .expect("insert");
+        // Column 5 arrived already, so only 0 and 77 are built.
+        let stored = gloas_data_column_sidecars(root, 1, &blobs, &proofs_of(&blobs))
+            .expect("columns")
+            .swap_remove(5);
+        store
+            .put_data_column(&DataColumnSidecar::Gloas(stored))
+            .expect("store column 5");
+        let (engine, requests) = mock_engine(answer_for(&blobs)).await;
+        let p2p = Arc::new(crate::tests::RecordingP2P::default());
+        let permit = AskBudget::default()
+            .admit(1, 1)
+            .expect("an empty budget admits");
+
+        fetch_and_publish(
+            engine,
+            p2p.clone(),
+            store,
+            Source::Gloas(commitments),
+            1,
+            root,
+            CUSTODY.to_vec(),
+            permit,
+        )
+        .await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let checks = p2p.checks.lock().unwrap();
+        assert_eq!(checks.len(), 1, "one hand-over");
+        let handed: Vec<(u64, H256, usize)> = checks[0]
+            .iter()
+            .map(|sidecar| match sidecar {
+                DataColumnSidecar::Gloas(sidecar) => (
+                    sidecar.index,
+                    sidecar.beacon_block_root,
+                    sidecar.column.len(),
+                ),
+                DataColumnSidecar::Fulu(_) => panic!("a gloas block yields gloas sidecars"),
+            })
+            .collect();
+        assert_eq!(handed, vec![(0, root, 2), (77, root, 2)]);
+    }
+
+    /// The flattened cell proofs of `blobs`, as a `getBlobsV2` answer carries
+    /// them.
+    fn proofs_of(blobs: &[Vec<u8>]) -> Vec<KzgProof> {
+        blobs
+            .iter()
+            .flat_map(|blob| kzg::compute_cells_and_kzg_proofs(blob).unwrap().1.to_vec())
+            .collect()
     }
 
     /// A block more than `MAX_ASK_AGE_SLOTS` behind the clock (range sync's)

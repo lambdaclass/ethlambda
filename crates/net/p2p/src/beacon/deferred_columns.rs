@@ -266,8 +266,17 @@ pub(crate) fn report_expired(server: &mut P2PServer, now: Instant) {
 fn report_held(server: &mut P2PServer, held: Held, outcome: Outcome) {
     let Held { id, sidecar, .. } = held;
     let (block_root, index) = (sidecar.block_root(), sidecar.index());
-    let object = Validated::Column(Box::new(sidecar));
-    let outcome = verdict::settle_message(server, &id.message_id, outcome, &object);
+    // The execution-layer path published these very bytes (one message id),
+    // which gossipsub refused as a duplicate of this held copy, and then
+    // stored them, so the recheck finds them `AlreadyStored`. This copy is
+    // the only one gossipsub can relay, and its bytes are ones this node
+    // built and verified.
+    let outcome = if server.engine_published_columns.take(&id.message_id) {
+        Outcome::Accept
+    } else {
+        let object = Validated::Column(Box::new(sidecar));
+        verdict::settle_message(server, &id.message_id, outcome, &object)
+    };
     let (outcome_label, reason) = outcome.labels();
     debug!(
         %block_root,
@@ -453,6 +462,30 @@ mod tests {
         assert!(matches!(
             reported(&mut commands).as_slice(),
             [MessageAcceptance::Ignore]
+        ));
+    }
+
+    /// The execution-layer path published and stored these very bytes, which
+    /// gossipsub refused as a duplicate of the held copy: that copy is the
+    /// one to relay, although the recheck found its column stored.
+    #[tokio::test]
+    async fn a_held_copy_of_a_column_this_node_published_is_relayed() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        let held = id(9, Instant::now());
+        server
+            .engine_published_columns
+            .insert(held.message_id.clone());
+        let held = server.deferred_columns.hold(held, QUEUED, &sidecar(1, 0));
+        assert!(held.is_none());
+
+        let stored = ColumnVerdict::Dropped(Outcome::Ignore(IgnoreReason::AlreadyStored));
+        settle(&mut server, Root::repeat_byte(1), vec![(0, stored)]);
+
+        assert!(matches!(
+            reported(&mut commands).as_slice(),
+            [MessageAcceptance::Accept]
         ));
     }
 

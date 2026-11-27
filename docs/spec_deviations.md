@@ -827,8 +827,9 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   verifying them, and MUST then treat them as received on gossip.
 - **ethlambda:** the built sidecars go through every chain check a fetched
   column gets, KZG proofs included, before they are published, recorded seen
-  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`). Columns
-  that fail are dropped and counted in `lean_engine_blob_columns_refused_total`.
+  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`), fulu
+  and gloas alike. Columns that fail are dropped and counted in
+  `lean_engine_blob_columns_refused_total`.
 - **Why:** a stored column keeps every later copy of it out (`AlreadyStored`),
   and block import trusts the stored columns, so a wrong blob or proof taken
   on trust from a faulty execution client would either stop its block for

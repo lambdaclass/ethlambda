@@ -24,7 +24,7 @@ Seven:
 | `engine_forkchoiceUpdatedV4` | amsterdam | The same, from a gloas head on; also carries the node's custody columns |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
-| `engine_getBlobsV2` | osaka | Rebuild a held fulu block's custody columns from the execution client's blob pool |
+| `engine_getBlobsV2` | osaka | Rebuild a held fulu block's custody columns, or the sampled columns a gloas envelope waits on, from the execution client's blob pool |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
 `engine_getPayloadV5` and `engine_getBlobsV2`/`V3`, of which this node calls
@@ -437,11 +437,27 @@ verified. The block then waits for gossip and the peer asks, as on a miss. The
 price is one KZG batch over the custody columns per hit, on the blocking pool,
 before the columns are published.
 
+**Gloas.** Data availability moves from the block to the payload envelope, and
+gloas keeps fulu's rule unchanged, so the ask fires when an envelope is first
+held for its sampled columns (`hold_envelope_awaiting_columns`), under the same
+age bound and ask budget. The commitments are the block's bid's. There is no
+proposer precheck: an envelope waits on columns only once its block has
+imported and the envelope's own signature has verified. The sidecars are built
+in gloas's container (`gloas_data_column_sidecars`, named by the block, no
+header or inclusion proof), only the sampled columns still missing are kept,
+and they go through the same chain checks and the same hand-over, p2p recording
+them in its gloas seen cache (`seen_block_columns`). `engine_getBlobsV2` is
+still the method at Amsterdam: its execution-apis spec restricts only
+`newPayloadV4`, `getPayloadV5` and `forkchoiceUpdatedV3` by fork, and
+`getBlobsV4` (cells) is optional. A gossip copy of one of those columns whose
+verdict was held for its block (`deferred_columns`) keeps the `Accept` the
+recheck would otherwise lose to `AlreadyStored`, for the reason above.
+
 **Not done.**
 
-- No ask when a sidecar arrives, only on a block's first hold.
-- Gloas: data availability moves to the payload envelope, so a held gloas block
-  has no columns to fill this way.
+- No ask when a sidecar arrives, only on a block's first hold or an envelope's.
+- A gloas block is not asked about before its envelope arrives, although its
+  bid already names the commitments.
 - Partial columns (see V3 above).
 
 **Metrics.**

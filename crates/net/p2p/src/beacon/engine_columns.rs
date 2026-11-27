@@ -7,7 +7,10 @@
 //! MUST publish the sidecar on its `data_column_sidecar_{subnet_id}` topic if
 //! and only if it is subscribed to that topic, and MUST update the gossip rule
 //! data structures (the anti-equivocation cache, here
-//! [`P2PServer::seen_columns`]).
+//! [`P2PServer::seen_columns`] for a fulu sidecar and
+//! [`P2PServer::seen_block_columns`] for a gloas one). Gloas keeps the rule,
+//! and the chain actor builds gloas sidecars for an envelope waiting on its
+//! columns.
 //!
 //! That is all this module does, and why no checks run here: the chain actor
 //! already ran every chain check on these sidecars, KZG proofs included,
@@ -41,7 +44,7 @@ use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use libp2p::gossipsub::{IdentTopic, MessageId};
 use lru::LruCache;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::beacon::topics as beacon_topics;
 use crate::gossipsub::compress_message;
@@ -63,7 +66,7 @@ impl PublishedColumns {
         Self(LruCache::new(capacity))
     }
 
-    fn insert(&mut self, id: MessageId) {
+    pub(crate) fn insert(&mut self, id: MessageId) {
         self.0.put(id, ());
     }
 
@@ -95,27 +98,35 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
     let mut missing_digest = false;
     let mut batch_header = None;
     for sidecar in sidecars {
-        let DataColumnSidecar::Fulu(fulu) = &sidecar else {
-            debug!("Skipping a gloas sidecar from the execution layer");
-            continue;
-        };
-        let index = fulu.index;
+        let index = sidecar.index();
         if !custody_columns.contains(&index) {
             not_custody += 1;
             continue;
         }
-        let header = &fulu.signed_block_header.message;
-        batch_header.get_or_insert_with(|| (header.slot, header.hash_tree_root()));
-        // The key is taken: not published, but still forwarded. The key is
+        let slot = sidecar.slot();
+        // The key is taken: not published, but still forwarded. A fulu key is
         // (slot, proposer, index) with no root, so it may belong to another
         // block of the same slot (an equivocating proposer's), whose stored
         // columns do nothing for this one; these passed every chain check, and
-        // dropping them would leave this block held on data this node has.
-        // When it is this block's own copy, the chain finds it stored.
-        if !server
-            .seen_columns
-            .record(header.slot, header.proposer_index, index)
-        {
+        // dropping them would leave this block held on data this node has. A
+        // gloas key names the block, so a taken one is this block's own copy,
+        // which the chain finds stored. Either way forwarding costs nothing.
+        let recorded = match &sidecar {
+            DataColumnSidecar::Fulu(fulu) => {
+                let header = &fulu.signed_block_header.message;
+                batch_header.get_or_insert_with(|| (slot, header.hash_tree_root()));
+                server
+                    .seen_columns
+                    .record(header.slot, header.proposer_index, index)
+            }
+            DataColumnSidecar::Gloas(gloas) => {
+                batch_header.get_or_insert((slot, gloas.beacon_block_root));
+                server
+                    .seen_block_columns
+                    .record(gloas.beacon_block_root, index)
+            }
+        };
+        if !recorded {
             already_seen += 1;
             fresh.push((sidecar, None));
             continue;
@@ -123,7 +134,7 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
         let topic = server
             .wire
             .beacon()
-            .and_then(|beacon| beacon.publish_digest(header.slot))
+            .and_then(|beacon| beacon.publish_digest(slot))
             .map(|digest| {
                 let subnet = das::compute_subnet_for_data_column_sidecar(index);
                 IdentTopic::new(beacon_topics::data_column_topic_name(digest, subnet))
@@ -333,6 +344,45 @@ mod tests {
             Outcome::Ignore(IgnoreReason::AlreadySeen),
             "the id is taken once"
         );
+    }
+
+    /// A gloas column from the execution layer is recorded under its block
+    /// and index, published once on its subnet in the gloas container, and
+    /// forwarded; a second copy of the key is forwarded only.
+    #[tokio::test]
+    async fn a_gloas_column_is_recorded_by_block_and_published_once() {
+        let (mut server, chain) = server_custodying(&[1, 2]).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        let root = ethlambda_types::beacon::primitives::Root::repeat_byte(0x4c);
+        let gloas_sidecar = |index| {
+            DataColumnSidecar::Gloas(
+                ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+                    index,
+                    slot: SLOT,
+                    beacon_block_root: root,
+                    ..Default::default()
+                },
+            )
+        };
+
+        publish_and_forward(&mut server, vec![gloas_sidecar(1), gloas_sidecar(9)]);
+        publish_and_forward(&mut server, vec![gloas_sidecar(1)]);
+
+        assert!(server.seen_block_columns.contains(root, 1));
+        assert!(!server.seen_block_columns.contains(root, 9));
+        assert_eq!(forwarded_indices(&chain), [vec![1], vec![1]]);
+        let mut published = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let SwarmCommand::Publish { data, .. } = command {
+                published.push(data);
+            }
+        }
+        assert_eq!(published.len(), 1, "the second copy's key was taken");
+        let bytes = decompress_message(&published[0]).expect("snappy-compressed");
+        let decoded = decode_data_column_sidecar(ForkName::Gloas, &bytes)
+            .expect("the gloas container gossip decodes");
+        assert_eq!(decoded, gloas_sidecar(1));
     }
 
     #[tokio::test]
