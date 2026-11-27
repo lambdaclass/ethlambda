@@ -71,10 +71,11 @@ jobs:
   # free-disk action, which kurtosis_assertoor.yml still uses). It took 1.5-3.5
   # min per job, and hosted runners now have a 145 GB root disk: the daily run,
   # which never freed anything, ended each test half at 65-70 GB used. The test
-  # halves and the beacon jobs still print `df -h /` after their build, so a
-  # runner change that leaves too little room shows up there. If one does, a
-  # full disk reaches `rust-lld` through `mmap`, so it is reported as
-  # `ld terminated with signal 7 [Bus error]` rather than as ENOSPC.
+  # jobs (both halves and `include-ethrex`) and the beacon jobs still print
+  # `df -h /` after their build, so a runner change that leaves too little room
+  # shows up there. If one does, a full disk reaches `rust-lld` through `mmap`,
+  # so it is reported as `ld terminated with signal 7 [Bus error]` rather than
+  # as ENOSPC.
   #
   # `lint`, `presets` and `tooling` were one job. Split because serially they
   # took 34 minutes and, at the time, more disk than a runner had.
@@ -114,6 +115,12 @@ jobs:
       - name: Clippy (skipped spectests)
         run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
 
+      # The binary's `include-ethrex` code (the `--ethrex.*` flags, the
+      # embedded client's startup and shutdown) is cfg'd out of every pass
+      # above.
+      - name: Clippy (include-ethrex)
+        run: cargo clippy --locked --workspace --all-targets --features ethlambda/include-ethrex -- -D warnings
+
       # `ethlambda-storage` with its `rocksdb` feature off, test targets
       # included. Every other build of its tests goes through the workspace,
       # where `bin/ethlambda` turns the feature on, so a test or helper that
@@ -130,6 +137,35 @@ jobs:
       # job's `cargo run` used to be the build that caught it.
       - name: Cargo check (binary, shipped features)
         run: cargo check --locked -p ethlambda
+
+  # The embedded execution client, in a job of its own: `make test-ethrex`
+  # (the third part of `make test`) says why it is kept out of
+  # `test-consensus` and `test-node`. No leanSpec fixtures:
+  # its integration tests run ethrex against a checked-in dev genesis.
+  ethrex:
+    name: Test (include-ethrex)
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    needs: detect-changes
+    if: ${{ !cancelled() && needs.detect-changes.outputs.run_tests != 'false' }}
+    # Its tests start and stop an embedded ethrex; a hung shutdown should fail
+    # the job rather than hold the runner for GitHub's six-hour default.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - name: Setup Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          cache-key: test-ethrex
+
+      - name: Run tests
+        run: make test-ethrex
+
+      # Frees nothing first either, so it reports its disk use like the test
+      # halves do (`run-fixture-tests` says why, and why `always()`).
+      - name: Report disk usage after the build
+        if: always()
+        run: df -h /
 
   # Two features gate code that no step in `lint` reaches, so both would rot
   # silently between merges.

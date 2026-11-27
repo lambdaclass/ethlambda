@@ -42,9 +42,10 @@ The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the
 published ENR inherits that same `0.0.0.0`, which is not a dialable address:
 set the flag to `127.0.0.1` for a local devnet or to the host's public address
-so the ENR is usable as soon as it is published. discv5's PONG-based IP voting
-may still replace the advertised address later, once a peer's response tells
-the node what its external address looks like.
+so the ENR is usable as soon as it is published. An address set with the flag
+is kept. Without one, or with an unspecified one (`0.0.0.0`, `::`), discv5's
+PONG-based IP voting may replace the advertised address later, once a peer's
+response tells the node what its external address looks like.
 
 ## The ENR
 

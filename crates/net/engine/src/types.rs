@@ -244,6 +244,14 @@ impl CustodyColumns {
     }
 }
 
+/// The bitmap as the `u128` ethrex reads it into: the same sixteen bytes,
+/// little-endian (`u128::from_le_bytes`), so column `i` is bit `i`.
+impl From<CustodyColumns> for u128 {
+    fn from(columns: CustodyColumns) -> Self {
+        u128::from_le_bytes(columns.0)
+    }
+}
+
 impl Serialize for CustodyColumns {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_data())
@@ -355,6 +363,12 @@ mod tests {
         // is bit 7 of byte 15.
         let columns = CustodyColumns::from_indices([0, 9, 127]).unwrap();
         assert_eq!(columns.to_data(), "0x01020000000000000000000000000080");
+    }
+
+    #[test]
+    fn custody_columns_as_u128_put_column_i_at_bit_i() {
+        let columns = CustodyColumns::from_indices([0, 9, 127]).unwrap();
+        assert_eq!(u128::from(columns), 1 | (1 << 9) | (1 << 127));
     }
 
     #[test]
