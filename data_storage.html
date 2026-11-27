@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3eb0cdda.js";
+            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -441,7 +441,8 @@ different checkpoints.</p>
 <tr><td><code>chain</code></td><td>raw byte</td><td>both</td><td>Which consensus protocol this directory holds (<code>Chain</code>)</td></tr>
 <tr><td><code>preset</code></td><td>raw byte</td><td>both</td><td>Which SSZ preset the writing build used (<code>Preset</code>)</td></tr>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>both</td><td>The store clock, as a <strong>UNIX timestamp in milliseconds</strong></td></tr>
-<tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration</td></tr>
+<tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration, except the keys below that have rows of their own</td></tr>
+<tr><td><code>config_gas_limit_schedule</code></td><td><code>List[GasLimitScheduleEntry, 32]</code></td><td>both</td><td><code>GAS_LIMIT_SCHEDULE</code> (gloas, EIP-8261); absent in a directory written before it</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
 <tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
 <tr><td><code>states_pruned_below</code></td><td><code>u64</code></td><td>both</td><td>Exclusive upper bound of the <code>States</code>/<code>StateDiffs</code> slots already range-deleted; absent means 0</td></tr>
@@ -459,6 +460,17 @@ different checkpoints.</p>
 <p>Rows marked for one chain are never written on the other, so reaching one
 through the wrong chain’s accessor panics naming the key rather than reading a
 zero. That is deliberate: a data directory holds one chain for its whole life.</p>
+<p><code>config</code> is a positional SSZ container, so a field added to it would leave
+every row written before it undecodable. A <code>Config</code> key added since
+<code>DB_VERSION</code> 7 therefore takes zero bytes there and gets a <code>config_*</code> row of its
+own (<code>CONFIG_ROWS</code> in <code>store.rs</code>). An older directory just lacks the row: a
+beacon resume reports the key as missing, adds the config file’s value and
+writes the row, instead of failing. An older build never reads the row. Every
+<code>config*</code> row is written in one batch, at bootstrap and by <code>replace_config</code>.
+A lean resume never rewrites <code>config</code>, so a lean directory that predates a row
+goes on lacking it and runs on the field’s zero-width default; each such key’s
+default must therefore be the value <code>Config::lean</code> holds, as
+<code>GAS_LIMIT_SCHEDULE</code>’s empty schedule is.</p>
 <h4 id="one-clock-three-readings"><a class="header" href="#one-clock-three-readings">One clock, three readings</a></h4>
 <p><code>time</code> is the only clock either chain keeps, and it is a UNIX millisecond.
 Milliseconds because the row has to be fine enough for the finest grid either
@@ -501,9 +513,10 @@ migration path.</p>
 <p><code>config</code> and <code>chain</code> are the odd ones out among the mutable rows: written at
 bootstrap (<code>init_store</code> for lean, <code>init_beacon</code> for beacon) and not mutated as
 the chain progresses. <code>chain</code> is never rewritten (it has a getter,
-<code>Store::chain</code>, and no setter). <code>config</code> is rewritten in one place,
-<code>Store::replace_config</code>, by a beacon resume whose config file changed values
-the directory does not contradict (see below), and that method panics unless
+<code>Store::chain</code>, and no setter). <code>config</code> (with its <code>config_*</code> rows) is
+rewritten in one place, <code>Store::replace_config</code>, by a beacon resume whose
+config file changed values the directory does not contradict (see below) or
+whose directory predates a <code>config_*</code> row, and that method panics unless
 its <code>Store</code> holds the only handle to the cached copy. Because neither changes
 once a <code>Store</code> is shared, the <code>Store</code> keeps a copy of each in memory, and
 reads of them never reach the backend. Every other <code>Metadata</code> key is mutated
@@ -551,8 +564,8 @@ rule for it.</p>
 because a second row denominated in <code>slot ‖ root</code> would be a value that could
 drift from the first.</p>
 <p><code>init_beacon</code> writes the two beacon-only keys plus <code>db_version</code>, <code>chain</code>,
-<code>preset</code>, <code>config</code>, <code>time</code>, <code>head</code>, <code>anchor_slot</code>, <code>latest_justified</code> and
-<code>latest_finalized</code> in one atomic batch.</p>
+<code>preset</code>, <code>config</code> and its <code>config_*</code> rows, <code>time</code>, <code>head</code>, <code>anchor_slot</code>,
+<code>latest_justified</code> and <code>latest_finalized</code> in one atomic batch.</p>
 <p><code>anchor_slot</code> is the odd one among these: every other row is either a format
 tag or something a later writer moves, while this one is written once at
 bootstrap and never again, like <code>config</code> and <code>chain</code>. It has to be persisted
@@ -1029,7 +1042,8 @@ network. Everything persisted in the thirteen tables survives, except <code>Pend
 </div>
 <p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
 atomic batch</strong>: the <code>Metadata</code> keys a lean directory needs (the format version
-and the chain and preset tags, time, config, head = safe_target = anchor root,
+and the chain and preset tags, time, config and its <code>config_*</code> rows, head =
+safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
 <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> keyed by the anchor’s slot and root (the
 base of every future diff chain), and the anchor’s <code>LiveChain</code> entry. <code>time</code>
@@ -1046,7 +1060,8 @@ same order every later block’s import follows too — see
 one row an import does not write is the anchor’s <code>BlockRoots</code> entry, which
 <code>index_beacon_anchor</code> adds right after the block (see <a href="#blockroots">BlockRoots</a>).</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>db_version</code>, <code>preset</code>, <code>chain</code>,
-<code>config</code> and <code>anchor_slot</code> from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
+<code>config</code> (with whichever <code>config_*</code> rows the directory has) and <code>anchor_slot</code>
+from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
 mismatch is still fatal, failing with <code>Error::DbVersionMismatch</code> or
 <code>Error::PresetMismatch</code> rather than reading on, but <code>from_db_state</code> no longer
 judges the network or the chain, and it does not mutate anything either: it

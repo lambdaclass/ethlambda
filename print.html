@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3eb0cdda.js";
+            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -4979,8 +4979,15 @@ a node reporting it unscheduled may only be the one not upgraded yet, while the
 upgraded one is restarting. A fork the network cancels therefore needs a
 restart. A node that stops answering loses its say after three slots, so it cannot
 hold a fork at an epoch the network has postponed (unless the postponement comes in
-the fork’s last three slots); the duty offsets are still read from the first node
-through a round it misses. A merge that would put a fork before the one it follows
+the fork’s last three slots); the duty offsets and the gas limit schedule are still
+read from the first node through a round it misses. Those two identify no chain, so
+no vote is taken: the offsets come from the first node alone, and the gas limit
+schedule from the first node that serves a non-empty one, so a node that leaves the
+key out cannot erase another’s. A schedule a node starts serving after startup (a
+Lighthouse node shows <code>GAS_LIMIT_SCHEDULE</code> only once gloas is scheduled) becomes the
+default gas limit from the next round on. A schedule the client cannot decode, or one
+that breaks the specification’s rules or names a zero gas limit, is ignored with a
+warning rather than costing the client the node. A merge that would put a fork before the one it follows
 is refused whole and warned about. A fork that is already active is never moved: a
 node that reports another epoch or version for it is on another chain.
 The client does not need a restart for a fork the network schedules after it
@@ -5008,7 +5015,7 @@ slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p
 <tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>
 <tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
 <tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, <code>beacon --fallback-fee-recipient</code>), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one <code>prepare_beacon_proposer</code> request every slot, listing each validator that has an index on chain and an address, as Lighthouse’s validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay</td></tr>
-<tr><td><code>--gas-limit</code></td><td><code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. <strong>Sepolia and Platåberget schedule <code>200000000</code></strong> (their <code>config.yaml</code>’s <code>GAS_LIMIT_SCHEDULE</code>, which this client does not read yet, <a href="https://github.com/lambdaclass/ethlambda/issues/795">#795</a>), so on either pass <code>--gas-limit 200000000</code>. Must be positive</td></tr>
+<tr><td><code>--gas-limit</code></td><td>the network’s schedule, else <code>60000000</code></td><td>The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with <code>--builder-proposals</code>). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client’s own payloads toward it as well. Without it, each validator targets the gas limit the network’s <code>GAS_LIMIT_SCHEDULE</code> (served on the beacon node’s <code>/eth/v1/config/spec</code>) names for the proposal’s epoch, and <code>60000000</code> for an epoch the schedule names none or a node that does not serve it, as Lighthouse does; Sepolia’s and Platåberget’s schedules name <code>200000000</code>, so neither needs the flag. Must be positive</td></tr>
 <tr><td><code>--graffiti</code></td><td>none</td><td>Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. Conflicts with <code>--graffiti-file</code>, as in Lighthouse. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. Without it a block request carries no graffiti and the beacon node applies its own default; an ethlambda beacon node appends both clients’ versions to whatever the graffiti is (see <a href="#validator-endpoints"><code>rpc.md</code></a>). See <a href="#graffiti">Graffiti</a></td></tr>
 <tr><td><code>--graffiti-file</code></td><td>none</td><td>A file of per-validator graffiti in Lighthouse’s format (<code>default: &lt;text&gt;</code>, <code>&lt;0xpubkey&gt;: &lt;text&gt;</code>), read again before every proposal and ahead of the keymanager API’s per-validator graffiti. Conflicts with <code>--graffiti</code>, as in Lighthouse. A file that does not parse refuses startup; once running, a bad read logs a warning and the validator’s own graffiti applies, else none. See <a href="#graffiti">Graffiti</a></td></tr>
 <tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API: keystores, remote keys, plus each validator’s own fee recipient, graffiti and gas limit. Off by default because it mutates key material</td></tr>
@@ -5666,7 +5673,7 @@ give one validator its own value in place of the command line’s default:</p>
 <tbody>
 <tr><td><code>feerecipient</code></td><td><code>--suggested-fee-recipient</code></td><td>Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot’s duties (the next slot’s while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With <code>--builder-proposals</code>, the next builder registration carries it too, usually at the next slot (later while the epoch’s full registration send is still running) and again every slot until a node accepts it or the epoch’s full send carries it, and an ethlambda beacon node takes it from there. A <code>DELETE</code> that leaves a validator with no address at all (no <code>--suggested-fee-recipient</code> either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on</td></tr>
 <tr><td><code>graffiti</code></td><td><code>--graffiti</code></td><td>The next proposal, unless <code>--graffiti-file</code> names the key or has a <code>default</code> line (see <a href="#graffiti">Graffiti</a>)</td></tr>
-<tr><td><code>gas_limit</code></td><td><code>--gas-limit</code></td><td>Before gloas, the next builder registration with <code>--builder-proposals</code> (usually at the next slot, later while the epoch’s full registration send is still running, and again every slot until a node accepts it or the epoch’s full send carries it), and stored and served only without it. From gloas, the proposer preferences’ target gas limit, from the next dependent root on, flag or not</td></tr>
+<tr><td><code>gas_limit</code></td><td><code>--gas-limit</code>, else the network’s schedule</td><td>Before gloas, the next builder registration with <code>--builder-proposals</code> (usually at the next slot, later while the epoch’s full registration send is still running, and again every slot until a node accepts it or the epoch’s full send carries it), and stored and served only without it. From gloas, the proposer preferences’ target gas limit, from the next dependent root on, flag or not</td></tr>
 </tbody>
 </table>
 </div>
@@ -7016,7 +7023,14 @@ them (<code>GAS_LIMIT_ADJUSTMENT_FACTOR</code>, <code>RESP_TIMEOUT</code>, <code
 gloas’s <code>MAX_*_SIZE</code> preset keys, which bound gossip message sizes the node does
 not run on. Domain types and withdrawal prefixes are <code>0x</code>-prefixed hex;
 <code>VERSIONED_HASH_VERSION_KZG</code> is a decimal, as lighthouse reports it.
-<code>GENESIS_TIME</code> is absent: <code>/eth/v1/beacon/genesis</code> reports it.</p>
+<code>GENESIS_TIME</code> is absent: <code>/eth/v1/beacon/genesis</code> reports it.
+<code>GAS_LIMIT_SCHEDULE</code> (gloas, EIP-8261) is a list of <code>{"EPOCH", "GAS_LIMIT"}</code>
+entries with quoted values, ascending by epoch, as <code>BLOB_SCHEDULE</code> is and as
+lighthouse reports it, and <code>[]</code> on a network that schedules nothing (lighthouse
+leaves the key out while gloas is unscheduled). Validator clients, this one’s
+included, take their default gas limit from it. The data directory stores it,
+in a row of its own; a directory written before that row existed takes the
+network <code>config.yaml</code>’s on its next start.</p>
 <p>The configuration keys come from the <code>Config</code> the data directory was
 initialized with. Some of them (the custody and subnet counts, the
 <code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains,
@@ -9202,7 +9216,8 @@ different checkpoints.</p>
 <tr><td><code>chain</code></td><td>raw byte</td><td>both</td><td>Which consensus protocol this directory holds (<code>Chain</code>)</td></tr>
 <tr><td><code>preset</code></td><td>raw byte</td><td>both</td><td>Which SSZ preset the writing build used (<code>Preset</code>)</td></tr>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>both</td><td>The store clock, as a <strong>UNIX timestamp in milliseconds</strong></td></tr>
-<tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration</td></tr>
+<tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration, except the keys below that have rows of their own</td></tr>
+<tr><td><code>config_gas_limit_schedule</code></td><td><code>List[GasLimitScheduleEntry, 32]</code></td><td>both</td><td><code>GAS_LIMIT_SCHEDULE</code> (gloas, EIP-8261); absent in a directory written before it</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
 <tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
 <tr><td><code>states_pruned_below</code></td><td><code>u64</code></td><td>both</td><td>Exclusive upper bound of the <code>States</code>/<code>StateDiffs</code> slots already range-deleted; absent means 0</td></tr>
@@ -9220,6 +9235,17 @@ different checkpoints.</p>
 <p>Rows marked for one chain are never written on the other, so reaching one
 through the wrong chain’s accessor panics naming the key rather than reading a
 zero. That is deliberate: a data directory holds one chain for its whole life.</p>
+<p><code>config</code> is a positional SSZ container, so a field added to it would leave
+every row written before it undecodable. A <code>Config</code> key added since
+<code>DB_VERSION</code> 7 therefore takes zero bytes there and gets a <code>config_*</code> row of its
+own (<code>CONFIG_ROWS</code> in <code>store.rs</code>). An older directory just lacks the row: a
+beacon resume reports the key as missing, adds the config file’s value and
+writes the row, instead of failing. An older build never reads the row. Every
+<code>config*</code> row is written in one batch, at bootstrap and by <code>replace_config</code>.
+A lean resume never rewrites <code>config</code>, so a lean directory that predates a row
+goes on lacking it and runs on the field’s zero-width default; each such key’s
+default must therefore be the value <code>Config::lean</code> holds, as
+<code>GAS_LIMIT_SCHEDULE</code>’s empty schedule is.</p>
 <h4 id="one-clock-three-readings"><a class="header" href="#one-clock-three-readings">One clock, three readings</a></h4>
 <p><code>time</code> is the only clock either chain keeps, and it is a UNIX millisecond.
 Milliseconds because the row has to be fine enough for the finest grid either
@@ -9262,9 +9288,10 @@ migration path.</p>
 <p><code>config</code> and <code>chain</code> are the odd ones out among the mutable rows: written at
 bootstrap (<code>init_store</code> for lean, <code>init_beacon</code> for beacon) and not mutated as
 the chain progresses. <code>chain</code> is never rewritten (it has a getter,
-<code>Store::chain</code>, and no setter). <code>config</code> is rewritten in one place,
-<code>Store::replace_config</code>, by a beacon resume whose config file changed values
-the directory does not contradict (see below), and that method panics unless
+<code>Store::chain</code>, and no setter). <code>config</code> (with its <code>config_*</code> rows) is
+rewritten in one place, <code>Store::replace_config</code>, by a beacon resume whose
+config file changed values the directory does not contradict (see below) or
+whose directory predates a <code>config_*</code> row, and that method panics unless
 its <code>Store</code> holds the only handle to the cached copy. Because neither changes
 once a <code>Store</code> is shared, the <code>Store</code> keeps a copy of each in memory, and
 reads of them never reach the backend. Every other <code>Metadata</code> key is mutated
@@ -9312,8 +9339,8 @@ rule for it.</p>
 because a second row denominated in <code>slot ‖ root</code> would be a value that could
 drift from the first.</p>
 <p><code>init_beacon</code> writes the two beacon-only keys plus <code>db_version</code>, <code>chain</code>,
-<code>preset</code>, <code>config</code>, <code>time</code>, <code>head</code>, <code>anchor_slot</code>, <code>latest_justified</code> and
-<code>latest_finalized</code> in one atomic batch.</p>
+<code>preset</code>, <code>config</code> and its <code>config_*</code> rows, <code>time</code>, <code>head</code>, <code>anchor_slot</code>,
+<code>latest_justified</code> and <code>latest_finalized</code> in one atomic batch.</p>
 <p><code>anchor_slot</code> is the odd one among these: every other row is either a format
 tag or something a later writer moves, while this one is written once at
 bootstrap and never again, like <code>config</code> and <code>chain</code>. It has to be persisted
@@ -9790,7 +9817,8 @@ network. Everything persisted in the thirteen tables survives, except <code>Pend
 </div>
 <p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
 atomic batch</strong>: the <code>Metadata</code> keys a lean directory needs (the format version
-and the chain and preset tags, time, config, head = safe_target = anchor root,
+and the chain and preset tags, time, config and its <code>config_*</code> rows, head =
+safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
 <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> keyed by the anchor’s slot and root (the
 base of every future diff chain), and the anchor’s <code>LiveChain</code> entry. <code>time</code>
@@ -9807,7 +9835,8 @@ same order every later block’s import follows too — see
 one row an import does not write is the anchor’s <code>BlockRoots</code> entry, which
 <code>index_beacon_anchor</code> adds right after the block (see <a href="#blockroots">BlockRoots</a>).</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>db_version</code>, <code>preset</code>, <code>chain</code>,
-<code>config</code> and <code>anchor_slot</code> from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
+<code>config</code> (with whichever <code>config_*</code> rows the directory has) and <code>anchor_slot</code>
+from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
 mismatch is still fatal, failing with <code>Error::DbVersionMismatch</code> or
 <code>Error::PresetMismatch</code> rather than reading on, but <code>from_db_state</code> no longer
 judges the network or the chain, and it does not mutate anything either: it

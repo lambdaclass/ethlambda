@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3eb0cdda.js";
+            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1193,7 +1193,14 @@ them (<code>GAS_LIMIT_ADJUSTMENT_FACTOR</code>, <code>RESP_TIMEOUT</code>, <code
 gloas’s <code>MAX_*_SIZE</code> preset keys, which bound gossip message sizes the node does
 not run on. Domain types and withdrawal prefixes are <code>0x</code>-prefixed hex;
 <code>VERSIONED_HASH_VERSION_KZG</code> is a decimal, as lighthouse reports it.
-<code>GENESIS_TIME</code> is absent: <code>/eth/v1/beacon/genesis</code> reports it.</p>
+<code>GENESIS_TIME</code> is absent: <code>/eth/v1/beacon/genesis</code> reports it.
+<code>GAS_LIMIT_SCHEDULE</code> (gloas, EIP-8261) is a list of <code>{"EPOCH", "GAS_LIMIT"}</code>
+entries with quoted values, ascending by epoch, as <code>BLOB_SCHEDULE</code> is and as
+lighthouse reports it, and <code>[]</code> on a network that schedules nothing (lighthouse
+leaves the key out while gloas is unscheduled). Validator clients, this one’s
+included, take their default gas limit from it. The data directory stores it,
+in a row of its own; a directory written before that row existed takes the
+network <code>config.yaml</code>’s on its next start.</p>
 <p>The configuration keys come from the <code>Config</code> the data directory was
 initialized with. Some of them (the custody and subnet counts, the
 <code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains,
