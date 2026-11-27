@@ -357,7 +357,7 @@ the chain progresses. `chain` is never rewritten (it has a getter,
 `Store::chain`, and no setter). `config` (with its `config_*` rows) is
 rewritten in one place, `Store::replace_config`, by a beacon resume whose
 config file changed values the directory does not contradict (see below) or
-names a key the directory predates, and that method panics unless
+whose directory predates a `config_*` row, and that method panics unless
 its `Store` holds the only handle to the cached copy. Because neither changes
 once a `Store` is shared, the `Store` keeps a copy of each in memory, and
 reads of them never reach the backend. Every other `Metadata` key is mutated
