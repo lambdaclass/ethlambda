@@ -5,6 +5,8 @@
 //! `reqwest` from inside the duty logic, makes the interesting behaviour
 //! (a reorg invalidating duties, a node failing mid-slot) untestable.
 
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 use ethlambda_types::beacon::builder::SignedValidatorRegistrationV1;
 use ethlambda_types::beacon::config::Config;
@@ -28,6 +30,7 @@ use ethlambda_types::beacon::containers::gloas;
 
 pub mod block_contents;
 pub mod dto;
+pub mod events;
 pub mod fallback;
 pub mod health;
 pub mod http;
@@ -212,15 +215,16 @@ pub struct BlockRequest {
     /// Thirty-two bytes consensus never reads.
     pub graffiti: Bytes32,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
-    /// off. `None` sends `0` and refuses a blinded answer; `Some` sends the
-    /// factor and accepts one. From gloas the factor travels in
-    /// `produceBlockV4`'s body instead of the query, so a pooled p2p bid can
-    /// win on value; a gloas answer is never blinded.
+    /// off before gloas. `None` sends `0` and refuses a blinded answer; `Some`
+    /// sends the factor and accepts one. From gloas the factor travels in
+    /// `produceBlockV4`'s body instead of the query, and the proposal service
+    /// always sets it, builder proposals or not, so a pooled p2p bid can win
+    /// on value; a gloas answer is never blinded.
     pub builder_boost_factor: Option<u64>,
     /// The smallest p2p bid, in gwei, the node may take for a gloas block
     /// (`produceBlockV4`'s `min_bid`): `--builder-min-bid`, with or without
-    /// builder proposals, since a node whose local build fails may still build
-    /// on a pooled bid. Not sent before gloas, where no endpoint takes it.
+    /// builder proposals, or `u64::MAX` with `--self-build-only`. Not sent
+    /// before gloas, where no endpoint takes it.
     pub builder_min_bid: u64,
 }
 
@@ -440,6 +444,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// and sync distance it reports. What [`health`]'s per-slot probe asks each
     /// node.
     async fn sync_status(&self) -> Result<SyncStatus>;
+
+    /// [`Self::sync_status`], with the answer's `Date` header when it carried
+    /// an IMF-fixdate: what [`health`]'s per-slot probe actually asks, so
+    /// [`crate::clock_check`] can compare this client's clock with the node's.
+    /// A node with no such header to give answers `None`, which leaves that
+    /// node to the slot comparison alone.
+    async fn sync_status_with_date(&self) -> Result<(SyncStatus, Option<SystemTime>)> {
+        Ok((self.sync_status().await?, None))
+    }
 
     /// Resolves each pubkey to its current validator index and status, so the
     /// rest of the client can address validators by index, as the Beacon API
@@ -695,6 +708,27 @@ pub trait BeaconNodeApi: Send + Sync {
         body: &[u8],
         blob_data_included: bool,
     ) -> Result<()>;
+
+    /// [`Self::publish_execution_payload_envelope`] for the envelope of a block
+    /// `producer` produced (the [`ProducedBlock::producer`] of the block it
+    /// reveals the payload of).
+    ///
+    /// A single node has no one to choose and ignores `producer`, which is
+    /// the default. The fallback reads it under `--broadcast blocks`, to send
+    /// the envelope to the producing node first, and for a body without its
+    /// blobs, with or without the flag, to send it to the producing node
+    /// first, the one that cached them, and to the others only if it does not
+    /// take it.
+    async fn publish_execution_payload_envelope_produced_by(
+        &self,
+        producer: Producer,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        let _ = producer;
+        self.publish_execution_payload_envelope(body, blob_data_included)
+            .await
+    }
 
     /// The payload timeliness committee duties for `indices` in `epoch`.
     ///

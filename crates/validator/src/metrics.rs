@@ -7,9 +7,11 @@
 use std::sync::LazyLock;
 
 use ethlambda_metrics::{
-    Histogram, IntCounter, IntGauge, TimingGuard, register_histogram, register_int_counter,
-    register_int_gauge,
+    GaugeVec, Histogram, IntCounter, IntCounterVec, IntGauge, TimingGuard, register_gauge_vec,
+    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
 };
+
+use crate::head_monitor::{Duty, Fired};
 
 static VALIDATORS_LOADED: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
@@ -327,10 +329,25 @@ static SLOTS_SKIPPED_SYNCING_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Set on every scrape from the same report `/health` answers with. See
+/// `crate::client_health`.
 static BEACON_NODE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_beacon_node_available",
-        "1 when a beacon node answered the last duty refresh or attestation"
+        "1 when at least one beacon node answered its latest sync probe neither syncing nor \
+         optimistic"
+    )
+    .unwrap()
+});
+
+/// What `/health` answers, as a series: 1 for its `200`, 0 for its `503`.
+/// Set on every scrape from the same report, so an alert on it and a probe of
+/// the endpoint cannot disagree. See `crate::client_health`.
+static HEALTHY: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_healthy",
+        "1 when /health answers 200: the client has started, a beacon node is usable and the \
+         last slashing-protection write went through"
     )
     .unwrap()
 });
@@ -464,6 +481,61 @@ static DOPPELGANGER_CHECK_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|
     .unwrap()
 });
 
+/// What started each slot's attestation, sync committee message and payload
+/// timeliness committee vote, once per duty per slot. See
+/// `crate::head_monitor`.
+///
+/// `event` is the beacon node's event for the slot's block (its payload, for
+/// the vote), confirmed by the node's own data. `deadline` is the clock's
+/// offset with no such event before it, which is every slot with the event
+/// stream off or down. `mismatch` is an event the node's data did not bear
+/// out (or had not answered by the deadline), so the duty waited for its
+/// deadline after all: a rise there points
+/// at beacon nodes that disagree with each other, or a vote whose payload was
+/// announced but not seen present.
+static DUTY_TRIGGERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "ethlambda_validator_duty_triggers_total",
+        "Slot duties by what started them: the beacon node's event, or the clock's deadline",
+        &["duty", "trigger"]
+    )
+    .unwrap()
+});
+
+/// Each beacon node's clock minus this client's, labelled by the node's
+/// position in `--beacon-nodes`, from zero. See `clock_check`. Labelled by
+/// position, not URL: a URL can carry credentials.
+static BEACON_NODE_CLOCK_OFFSET_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "ethlambda_validator_beacon_node_clock_offset_seconds",
+        "A beacon node's clock minus this client's, from its Date header, else what its sync \
+         status's slots allow; positive when this client's clock is behind",
+        &["node"]
+    )
+    .unwrap()
+});
+
+/// Event streams open, one per beacon node and topic. Zero with
+/// `--disable-event-stream`.
+static EVENT_STREAMS_OPEN: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_event_streams_open",
+        "Beacon node event streams open, one per node and topic"
+    )
+    .unwrap()
+});
+
+/// Steps of this client's wall clock against its monotonic one, found by the
+/// duty loop. See `clock_check::StepWatch`.
+static CLOCK_STEPS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_clock_steps_total",
+        "Steps of half a second or more of this client's wall clock, forward or back, against its \
+         monotonic clock"
+    )
+    .unwrap()
+});
+
 /// Register every series with the Prometheus registry so `/metrics` lists them
 /// at zero from startup, rather than only after whatever first touches them.
 ///
@@ -510,11 +582,22 @@ pub fn init() {
     LazyLock::force(&FEE_RECIPIENT_MISMATCHES_TOTAL);
     LazyLock::force(&SLOTS_SKIPPED_SYNCING_TOTAL);
     LazyLock::force(&BEACON_NODE_AVAILABLE);
+    LazyLock::force(&HEALTHY);
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
+    // A labelled series exists only once a label pair is touched.
+    for duty in Duty::ALL {
+        for fired in Fired::ALL {
+            DUTY_TRIGGERS_TOTAL.with_label_values(&[duty.as_str(), fired.as_str()]);
+        }
+    }
+    LazyLock::force(&EVENT_STREAMS_OPEN);
+    // A labelled gauge has no series until a node's first answer sets one.
+    LazyLock::force(&BEACON_NODE_CLOCK_OFFSET_SECONDS);
+    LazyLock::force(&CLOCK_STEPS_TOTAL);
 }
 
 pub fn set_validators_loaded(count: u64) {
@@ -662,6 +745,10 @@ pub fn set_beacon_node_available(available: bool) {
     BEACON_NODE_AVAILABLE.set(i64::from(available));
 }
 
+pub fn set_healthy(healthy: bool) {
+    HEALTHY.set(i64::from(healthy));
+}
+
 pub fn set_doppelganger_detecting(count: u64) {
     DOPPELGANGER_DETECTING.set(count as i64);
 }
@@ -693,21 +780,75 @@ pub fn inc_slashing_protection_write_failures() {
     SLASHING_PROTECTION_WRITE_FAILURES_TOTAL.inc();
 }
 
+/// Count what started one slot's `duty`.
+pub fn inc_duty_trigger(duty: Duty, fired: Fired) {
+    DUTY_TRIGGERS_TOTAL
+        .with_label_values(&[duty.as_str(), fired.as_str()])
+        .inc();
+}
+
+/// One event stream counted as open, for as long as this is held.
+///
+/// A guard rather than an increment and a decrement: a reader aborted while
+/// its stream is open (`HeadMonitor`'s drop) never reaches the code after the
+/// stream ends, but its future's locals are still dropped.
+pub struct OpenEventStream(());
+
+impl OpenEventStream {
+    pub fn count() -> Self {
+        EVENT_STREAMS_OPEN.inc();
+        Self(())
+    }
+}
+
+impl Drop for OpenEventStream {
+    fn drop(&mut self) {
+        EVENT_STREAMS_OPEN.dec();
+    }
+}
+
 /// Record how long after a slot's start its attestations were accepted.
 pub fn observe_publication_delay(seconds: f64) {
     PUBLICATION_DELAY_SECONDS.observe(seconds);
 }
 
-/// A Prometheus endpoint for this process.
+/// Record what the clock check last read for the node at `position`.
+pub fn set_beacon_node_clock_offset(position: usize, seconds: f64) {
+    BEACON_NODE_CLOCK_OFFSET_SECONDS
+        .with_label_values(&[position.to_string().as_str()])
+        .set(seconds);
+}
+
+/// Drop the node at `position`'s clock offset series: it did not answer the
+/// probe the check read.
+pub fn clear_beacon_node_clock_offset(position: usize) {
+    // An error only says there was no series yet.
+    let _ = BEACON_NODE_CLOCK_OFFSET_SECONDS.remove_label_values(&[position.to_string().as_str()]);
+}
+
+pub fn inc_clock_steps() {
+    CLOCK_STEPS_TOTAL.inc();
+}
+
+/// A Prometheus endpoint for this process, and `/health`, both answered from
+/// `health`.
 ///
 /// Deliberately not `ethlambda-rpc`'s router: reaching that would put the
 /// blockchain and storage crates, and RocksDB with them, on a process that
 /// only signs attestations.
-pub fn router() -> axum::Router {
+pub fn router(health: std::sync::Arc<crate::client_health::ClientHealth>) -> axum::Router {
+    use std::sync::Arc;
+
+    use axum::extract::State;
     use axum::response::IntoResponse;
     use axum::routing::get;
 
-    async fn serve() -> impl IntoResponse {
+    use crate::client_health::ClientHealth;
+
+    async fn serve(State(health): State<Arc<ClientHealth>>) -> impl IntoResponse {
+        // The gauges that mirror `/health`, from the report it would answer
+        // now, before the series are read.
+        crate::client_health::publish(&health.report());
         match ethlambda_metrics::gather_default_metrics() {
             Ok(body) => (
                 [(
@@ -724,14 +865,16 @@ pub fn router() -> axum::Router {
         }
     }
 
-    async fn health() -> impl IntoResponse {
-        (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            r#"{"status":"healthy","service":"ethlambda-validator"}"#,
-        )
+    /// `200` when the client can do its duties, `503` when it cannot or has
+    /// not started yet, with the checks behind the answer. See
+    /// `crate::client_health`.
+    async fn report(State(health): State<Arc<ClientHealth>>) -> impl IntoResponse {
+        let report = health.report();
+        (report.status_code(), axum::Json(report))
     }
 
     axum::Router::new()
         .route("/metrics", get(serve))
-        .route("/health", get(health))
+        .route("/health", get(report))
+        .with_state(health)
 }

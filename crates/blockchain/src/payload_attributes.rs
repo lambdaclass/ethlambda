@@ -14,22 +14,28 @@
 //!   slot: the head, on gloas the parent payload branch (the head's payload
 //!   arriving, or the PTC's votes on it) and the proposer's signed
 //!   preferences, and the fee recipient `prepare_beacon_proposer` names
-//!   ([`AttributesKey`]). It does so only when someone is subscribed, and
+//!   ([`AttributesKey`]). It publishes only when someone is subscribed, and
 //!   only for a proposer a validator client registered through
 //!   `prepare_beacon_proposer`, unless `--always-prepare-payload` asks for
 //!   every slot. External block builders (buildoor, for one) build from this
 //!   stream.
 //!
-//! Nothing is sent to the execution client ahead of `produceBlock`: the early
-//! `forkchoiceUpdated` other clients send with these attributes is not done
-//! here yet.
+//! The same computation starts the payload build ahead of the slot, as every
+//! other consensus client does (lambdaclass/ethlambda#894): with an execution
+//! client configured, the actor sends `forkchoiceUpdated` with the attributes
+//! and keeps the payload id in [`PreparedPayloads`]. `produceBlockV3` and
+//! `produceBlockV4` collect that build when their own attributes match, at
+//! once when it started at least `PAYLOAD_BUILD_WINDOW` before (the execution
+//! client has then had seconds to fill it), and otherwise start one
+//! themselves. This runs for the same proposers as the event, whether or not
+//! anyone is subscribed to it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ethlambda_engine::ForkchoiceStateV1;
-use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4};
+use ethlambda_engine::building::{PayloadAttributesV3, PayloadAttributesV4, PayloadId};
+use ethlambda_engine::{CustodyColumns, EngineClient, ForkchoiceStateV1};
 use ethlambda_state_transition::beacon::block_production::{
     PayloadInputs, advance_to_slot, payload_inputs,
 };
@@ -58,10 +64,11 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use ethlambda_types::primitives::H256;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler, send_after};
-use tracing::{debug, warn};
+use tokio::task::AbortHandle;
+use tracing::{debug, info, warn};
 
 use crate::BlockChainServer;
-use crate::beacon_payloads::checkpoint_hash;
+use crate::beacon_payloads::{checkpoint_hash, get_safe_execution_block_hash};
 use crate::events::{
     PayloadAttributesEvent, PayloadAttributesEventData, PayloadAttributesEventV3,
     PayloadAttributesEventV4,
@@ -145,6 +152,114 @@ pub struct PayloadPreparation {
     pub builder_market: SharedBuilderMarket,
     /// `--always-prepare-payload`.
     pub always_prepare: bool,
+    /// The payload builds the actor started ahead of their slots, shared
+    /// with block production.
+    pub prepared_payloads: PreparedPayloads,
+}
+
+/// The attributes a payload build was started with: fulu's
+/// `PayloadAttributesV3` or gloas's `PayloadAttributesV4`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildAttributes {
+    V3(PayloadAttributesV3),
+    V4(PayloadAttributesV4),
+}
+
+/// Payload builds started ahead of their slot, by the payload id the
+/// execution client gave each.
+///
+/// The chain actor fills it once it sends `forkchoiceUpdated` with the next
+/// slot's attributes. Block production takes the entry its own attributes
+/// match and collects that build with `getPayload` (once it has had
+/// `PAYLOAD_BUILD_WINDOW` to fill, which a build started seconds ahead has),
+/// rather than start a build at the slot. A build is named by its parent
+/// payload and its attributes, which is what the execution client derives its
+/// payload id from. The safe and finalized hashes are left out: they do not
+/// change what is built, and they can move between the two calls, at an
+/// epoch boundary for one.
+#[derive(Clone, Default)]
+pub struct PreparedPayloads(Arc<Mutex<Vec<PreparedPayload>>>);
+
+#[derive(Debug, Clone)]
+struct PreparedPayload {
+    slot: Slot,
+    parent_hash: H256,
+    attributes: BuildAttributes,
+    build: PreparedBuild,
+}
+
+/// A build [`PreparedPayloads::take`] hands out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedBuild {
+    pub payload_id: PayloadId,
+    /// When the execution client answered the `forkchoiceUpdated` that
+    /// started the build: a build restarted moments before the slot has had
+    /// no time to fill yet.
+    pub started: Instant,
+}
+
+/// The most builds held at once. One slot has more than one only when the
+/// head or an attribute changed after the first, and each insert drops the
+/// builds for earlier slots.
+const MAX_PREPARED_PAYLOADS: usize = 8;
+
+impl PreparedPayloads {
+    /// Records the build the execution client started for `slot`, on the
+    /// payload `parent_hash`, with `attributes`. Drops the builds for earlier
+    /// slots, and an older build with the same inputs. When that older build
+    /// has the same payload id, the execution client kept building it rather
+    /// than starting over, so its start time stays.
+    pub fn insert(
+        &self,
+        slot: Slot,
+        parent_hash: H256,
+        attributes: BuildAttributes,
+        payload_id: PayloadId,
+    ) {
+        let mut held = self.0.lock().expect("prepared payloads lock poisoned");
+        let mut started = Instant::now();
+        held.retain(|build| {
+            let same_inputs = build.slot == slot
+                && build.parent_hash == parent_hash
+                && build.attributes == attributes;
+            if same_inputs && build.build.payload_id == payload_id {
+                started = build.build.started;
+            }
+            build.slot >= slot && !same_inputs
+        });
+        held.push(PreparedPayload {
+            slot,
+            parent_hash,
+            attributes,
+            build: PreparedBuild {
+                payload_id,
+                started,
+            },
+        });
+        // `held` stays in insertion order (`take` keeps it), so the first is
+        // the oldest.
+        if held.len() > MAX_PREPARED_PAYLOADS {
+            held.remove(0);
+        }
+    }
+
+    /// Takes the build started for `slot` on `parent_hash` with exactly
+    /// `attributes`. A build is taken once: an execution client may stop
+    /// building once `getPayload` has served it.
+    pub fn take(
+        &self,
+        slot: Slot,
+        parent_hash: H256,
+        attributes: &BuildAttributes,
+    ) -> Option<PreparedBuild> {
+        let mut held = self.0.lock().expect("prepared payloads lock poisoned");
+        let index = held.iter().position(|build| {
+            build.slot == slot
+                && build.parent_hash == parent_hash
+                && build.attributes == *attributes
+        })?;
+        Some(held.remove(index).build)
+    }
 }
 
 /// `head_state` (the post-state of `head_root`) advanced to `slot`.
@@ -181,15 +296,34 @@ pub fn advance_for_proposal(
     advance_to_slot(&epoch_start, slot, config)
 }
 
-/// The forkchoice state a payload build on `head_block_hash` is started
-/// with: safe and finalized are the checkpoint blocks' hashes, by the same
-/// rule the head's own `forkchoiceUpdated` uses, so the two calls never
-/// disagree.
-pub fn building_forkchoice_state(store: &Store, head_block_hash: H256) -> ForkchoiceStateV1 {
+/// The forkchoice state a payload build on the block `head_root` is started
+/// with, `head_block_hash` being the payload the build extends: the safe and
+/// finalized hashes the head's own `forkchoiceUpdated` sends (the Fast
+/// Confirmation Rule's confirmed block and the finalized checkpoint's block,
+/// `beacon_payloads::forkchoice_plan`), so a build never moves the execution
+/// client's safe block back to the justified one.
+///
+/// The confirmed block is safe only on the chain it was checked against, the
+/// stored head's. A caller read `head_root` some time ago (production first
+/// advances the state to the slot), so when the stored head is no longer
+/// `head_root`, before or after the safe hash is read, the finalized block
+/// stands in: the execution client refuses a safe block that is not an
+/// ancestor of the head (`-38002`), and that would lose the proposal.
+pub fn building_forkchoice_state(
+    store: &Store,
+    head_root: H256,
+    head_block_hash: H256,
+) -> ForkchoiceStateV1 {
+    let finalized_block_hash = checkpoint_hash(store, store.beacon_finalized_checkpoint().root);
+    let on_build_head = || store.head().is_ok_and(|head| head == head_root);
+    let safe_block_hash = match on_build_head().then(|| get_safe_execution_block_hash(store)) {
+        Some(safe) if on_build_head() => safe,
+        _ => finalized_block_hash,
+    };
     ForkchoiceStateV1 {
         head_block_hash,
-        safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
-        finalized_block_hash: checkpoint_hash(store, store.beacon_finalized_checkpoint().root),
+        safe_block_hash,
+        finalized_block_hash,
     }
 }
 
@@ -422,16 +556,27 @@ fn prepare_gloas_proposal_on(
 // The event
 // ---------------------------------------------------------------------------
 
+/// A payload build to start ahead of its slot: the forkchoice state and the
+/// attributes `forkchoiceUpdated` is sent with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PayloadBuild {
+    pub(crate) forkchoice: ForkchoiceStateV1,
+    pub(crate) attributes: BuildAttributes,
+}
+
+/// What a worker computed for the next slot's proposal: the
+/// `payload_attributes` event, and the payload build to start ahead of the
+/// slot, both from the same attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NextPayload {
+    pub(crate) event: PayloadAttributesEvent,
+    pub(crate) build: PayloadBuild,
+}
+
 /// The `payload_attributes` event for a block at `proposal_slot` on
 /// `head_root`, or `None` when the slot's proposer is not one this node
 /// prepares for (or the slot's fork has no block production here).
-///
-/// The attributes are the ones `produceBlockV3`/`produceBlockV4` would send
-/// for that block, from the same preparation. On gloas, `build_on_full` is the
-/// parent payload branch the publication was keyed on ([`AttributesKey`]), so
-/// the event describes exactly that branch; `None` leaves the choice to
-/// [`parent_builds_on_full`]. Runs a state transition to the proposal slot,
-/// so it belongs on a blocking thread.
+#[cfg(test)]
 pub(crate) fn payload_attributes_event(
     store: &Store,
     preparation: &PayloadPreparation,
@@ -440,12 +585,42 @@ pub(crate) fn payload_attributes_event(
     proposal_slot: Slot,
     build_on_full: Option<bool>,
 ) -> Result<Option<PayloadAttributesEvent>, String> {
+    next_payload(
+        store,
+        preparation,
+        head_root,
+        head_state,
+        proposal_slot,
+        build_on_full,
+    )
+    .map(|next| next.map(|next| next.event))
+}
+
+/// What the next slot's proposal asks the execution client for, when the
+/// proposer is one this node prepares for (`None` otherwise, or when the
+/// slot's fork has no block production here): the `payload_attributes` event
+/// and the build to start ahead of the slot.
+///
+/// The attributes are the ones `produceBlockV3`/`produceBlockV4` would send
+/// for that block, from the same preparation. On gloas, `build_on_full` is the
+/// parent payload branch the worker was keyed on ([`AttributesKey`]), so the
+/// result describes exactly that branch; `None` leaves the choice to
+/// [`parent_builds_on_full`]. Runs a state transition to the proposal slot,
+/// so it belongs on a blocking thread.
+pub(crate) fn next_payload(
+    store: &Store,
+    preparation: &PayloadPreparation,
+    head_root: H256,
+    head_state: &BeaconState,
+    proposal_slot: Slot,
+    build_on_full: Option<bool>,
+) -> Result<Option<NextPayload>, String> {
     let config = store.config();
     let fork = config.fork_at_epoch(compute_epoch_at_slot(proposal_slot));
     let prepares_for = |proposer| {
         preparation.always_prepare || preparation.fee_recipients.prepared(proposer).is_some()
     };
-    let data = match fork {
+    let (data, build) = match fork {
         ForkName::Fulu => {
             let state = advance_for_proposal(store, head_root, head_state, proposal_slot, &config)
                 .map_err(|err| format!("advancing the head state failed: {err}"))?;
@@ -458,14 +633,19 @@ pub(crate) fn payload_attributes_event(
                 .map_err(|err| format!("computing the payload inputs failed: {err}"))?;
             let (fee_recipient, _) = preparation.fee_recipients.for_proposer(proposer);
             let attributes = payload_attributes_v3(&inputs, fee_recipient, head_root);
-            PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
+            let data = PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
                 proposer_index: proposer,
                 proposal_slot,
                 parent_block_number: inputs.parent_block_number,
                 parent_block_root: head_root,
                 parent_block_hash: inputs.parent_hash,
                 payload_attributes: (&attributes).into(),
-            })
+            });
+            let build = PayloadBuild {
+                forkchoice: building_forkchoice_state(store, head_root, inputs.parent_hash),
+                attributes: BuildAttributes::V3(attributes),
+            };
+            (data, build)
         }
         ForkName::Gloas => {
             let build_on_full = match build_on_full {
@@ -491,8 +671,9 @@ pub(crate) fn payload_attributes_event(
                 proposal.preferences.as_ref(),
             );
             let attributes = payload_attributes_v4(&proposal.inputs, fee_recipient);
-            let forkchoice = building_forkchoice_state(store, proposal.inputs.head_block_hash);
-            PayloadAttributesEventData::V4(PayloadAttributesEventV4 {
+            let forkchoice =
+                building_forkchoice_state(store, head_root, proposal.inputs.head_block_hash);
+            let data = PayloadAttributesEventData::V4(PayloadAttributesEventV4 {
                 proposer_index: proposal.proposer,
                 proposal_slot,
                 parent_block_root: head_root,
@@ -500,7 +681,12 @@ pub(crate) fn payload_attributes_event(
                 safe_block_hash: forkchoice.safe_block_hash,
                 finalized_block_hash: forkchoice.finalized_block_hash,
                 payload_attributes: (&attributes).into(),
-            })
+            });
+            let build = PayloadBuild {
+                forkchoice,
+                attributes: BuildAttributes::V4(attributes),
+            };
+            (data, build)
         }
         ForkName::Phase0
         | ForkName::Altair
@@ -510,7 +696,10 @@ pub(crate) fn payload_attributes_event(
         | ForkName::Electra
         | ForkName::Lean => return Ok(None),
     };
-    Ok(Some(PayloadAttributesEvent::new(fork, data)))
+    Ok(Some(NextPayload {
+        event: PayloadAttributesEvent::new(fork, data),
+        build,
+    }))
 }
 
 /// How far into a slot the next slot's attributes are first published: a
@@ -519,11 +708,11 @@ pub(crate) fn lookahead_start(slot_duration_ms: u64) -> Duration {
     Duration::from_millis(slot_duration_ms - slot_duration_ms / 3)
 }
 
-/// Whether this moment may publish at all: someone is subscribed (nobody
-/// would hear it otherwise), the node is not syncing (its head is not the
-/// chain's), and the wall clock is past [`lookahead_start`]. Asked before
-/// anything reads the head, subscriber first, since every payload attestation
-/// asks and most nodes have no subscriber.
+/// Whether this moment may prepare at all: someone would use the result (an
+/// event subscriber, or an execution client to start the build on), the node
+/// is not syncing (its head is not the chain's), and the wall clock is past
+/// [`lookahead_start`]. Asked before anything reads the head, the cheap check
+/// first, since every payload attestation asks.
 pub(crate) fn may_publish(
     has_subscribers: bool,
     syncing: bool,
@@ -611,12 +800,27 @@ const MAX_ATTEMPTS: u8 = 3;
 pub(crate) struct PayloadAttributesPublisher {
     preparation: Option<PayloadPreparation>,
     /// The last key whose worker finished while it was current, having
-    /// published its event or found no proposer to publish it for.
+    /// started its build and published its event (or held it, with nobody
+    /// subscribed), or found no proposer to prepare for. Governs the worker,
+    /// and so the build; the event has its own record below.
     published: Option<AttributesKey>,
+    /// The event a worker computed for this key while nobody was subscribed
+    /// (with an execution client it runs for the build regardless), held for
+    /// the first re-check that finds a subscriber ([`Self::held_event`]).
+    unsent: Option<(AttributesKey, PayloadAttributesEvent)>,
+    /// The last key whose event went out, so a key's event is sent once
+    /// however many times it is computed, as when a worker runs for its build
+    /// again.
+    event_sent: Option<AttributesKey>,
     /// The key a worker is running for now. At most one runs.
     in_flight: Option<AttributesKey>,
     /// The last key a worker failed on, and how many have.
     failed: Option<(AttributesKey, u8)>,
+    /// The task sending the last build's `forkchoiceUpdated`, with the key it
+    /// was started for. Aborted as soon as the current key differs (a new
+    /// head, for one), whether or not a newer build follows
+    /// ([`BlockChainServer::start_payload_build`]).
+    build_task: Option<(AttributesKey, AbortHandle)>,
 }
 
 impl PayloadAttributesPublisher {
@@ -668,6 +872,52 @@ impl PayloadAttributesPublisher {
         // not now; one that no longer holds gives way to the current key.
         !current
     }
+
+    /// A current worker's `event` for `key`, `listening` saying whether
+    /// anyone is subscribed. Returns it when it is to go out now: someone
+    /// listens and `key`'s event has not gone out yet. With nobody listening
+    /// it is held for [`Self::held_event`] instead, replacing any older one.
+    pub(crate) fn event_computed(
+        &mut self,
+        key: AttributesKey,
+        event: PayloadAttributesEvent,
+        listening: bool,
+    ) -> Option<PayloadAttributesEvent> {
+        if !listening {
+            self.unsent = Some((key, event));
+            return None;
+        }
+        self.unsent = None;
+        self.send_once(key, event)
+    }
+
+    /// The held event for `key`, the current key, once someone listens: what
+    /// a worker computed for the build while nobody was subscribed, and what
+    /// a node that only publishes would have computed at this re-check
+    /// instead. Taken once, and never for a key whose event already went out.
+    pub(crate) fn held_event(
+        &mut self,
+        key: AttributesKey,
+        listening: bool,
+    ) -> Option<PayloadAttributesEvent> {
+        if !listening || self.unsent.as_ref().is_none_or(|(held, _)| *held != key) {
+            return None;
+        }
+        let (_, event) = self.unsent.take()?;
+        self.send_once(key, event)
+    }
+
+    fn send_once(
+        &mut self,
+        key: AttributesKey,
+        event: PayloadAttributesEvent,
+    ) -> Option<PayloadAttributesEvent> {
+        if self.event_sent == Some(key) {
+            return None;
+        }
+        self.event_sent = Some(key);
+        Some(event)
+    }
 }
 
 /// Self-message armed at a slot's start, delivered at its lookahead point.
@@ -676,10 +926,11 @@ impl Message for PayloadAttributesCheck {
     type Result = ();
 }
 
-/// A worker's result, sent back to the actor, which publishes it.
+/// A worker's result, sent back to the actor, which publishes its event and
+/// starts its build.
 pub(crate) struct PayloadAttributesComputed {
     key: AttributesKey,
-    result: Result<Option<PayloadAttributesEvent>, String>,
+    result: Result<Option<NextPayload>, String>,
 }
 impl Message for PayloadAttributesComputed {
     type Result = ();
@@ -739,8 +990,15 @@ impl BlockChainServer {
             Duration::from_millis(ms_into_slot)
                 >= lookahead_start(self.store.config().slot_duration_ms)
         };
+        // With an execution client the worker also starts the payload build,
+        // so a proposal is prepared whether or not anyone listens. Only when
+        // this node prepares for some proposer, though: otherwise `wanted`
+        // below refuses every key, and a follower with no validator client
+        // would read the key on every payload attestation for nothing.
+        let builds = self.engine.is_some()
+            && (preparation.always_prepare || preparation.fee_recipients.any_prepared());
         if !may_publish(
-            self.events.has_subscribers(),
+            self.events.has_subscribers() || builds,
             self.sync_status.is_syncing(),
             past_lookahead,
         ) {
@@ -750,6 +1008,37 @@ impl BlockChainServer {
         else {
             return;
         };
+        // A build still sending its update for other inputs (an older head,
+        // for one) is superseded whether or not a build for this key follows:
+        // its retries must not reach the execution client after the head's
+        // own update. Its build may then never have started, so its key is no
+        // longer counted as done: should the inputs return to it, it builds
+        // again.
+        if self
+            .payload_attributes
+            .build_task
+            .as_ref()
+            .is_some_and(|(building, _)| *building != key)
+            && let Some((building, task)) = self.payload_attributes.build_task.take()
+            && !task.is_finished()
+        {
+            task.abort();
+            if self.payload_attributes.published == Some(building) {
+                self.payload_attributes.published = None;
+            }
+        }
+        // A subscriber that arrived after this key's worker ran for the build
+        // (nobody listening then) gets the event now, whether or not the
+        // worker below runs.
+        let listening = self.events.has_subscribers();
+        if let Some(event) = self.payload_attributes.held_event(key, listening) {
+            debug!(
+                proposal_slot = key.proposal_slot,
+                head_root = %ShortRoot(&key.head_root.0),
+                "Publishing payload attributes computed before anyone subscribed"
+            );
+            self.events.publish_payload_attributes(event);
+        }
         if !self.payload_attributes.wants(key) {
             return;
         }
@@ -771,7 +1060,7 @@ impl BlockChainServer {
         let store = self.store.clone();
         let actor = ctx.actor_ref();
         tokio::task::spawn_blocking(move || {
-            let result = payload_attributes_event(
+            let result = next_payload(
                 &store,
                 &preparation,
                 key.head_root,
@@ -781,6 +1070,104 @@ impl BlockChainServer {
             );
             let _ = actor.send(PayloadAttributesComputed { key, result });
         });
+    }
+
+    /// Ask the execution client to start building the next slot's payload,
+    /// and record the build for block production to collect. Off the actor:
+    /// it only waits on the execution client. A build that fails is not
+    /// started again, since production then starts its own.
+    ///
+    /// Bounded by the proposal slot's start, and cut short once the current
+    /// key differs from this build's (a new head, a newer build;
+    /// [`Self::maybe_prepare_payload_attributes`] checks after every import).
+    /// The engine client retries a failed attempt (up to three, at 8 s each),
+    /// and a retry of a superseded update could otherwise reach the execution
+    /// client after the head's own `forkchoiceUpdated` or a newer build's,
+    /// moving its head back to this one's. Production looks for the build at
+    /// the slot's start, so a later answer is of no use either.
+    fn start_payload_build(&mut self, key: AttributesKey, build: PayloadBuild) {
+        let (Some(engine), Some(preparation)) = (
+            self.engine.clone(),
+            self.payload_attributes.preparation.as_ref(),
+        ) else {
+            return;
+        };
+        let prepared = preparation.prepared_payloads.clone();
+        let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
+        let until_slot = Duration::from_millis(self.ms_until_slot_start(key.proposal_slot));
+        if let Some((_, previous)) = self.payload_attributes.build_task.take() {
+            previous.abort();
+        }
+        let task = tokio::spawn(start_build(
+            engine, prepared, custody, key, build, until_slot,
+        ));
+        self.payload_attributes.build_task = Some((key, task.abort_handle()));
+    }
+}
+
+async fn start_build(
+    engine: EngineClient,
+    prepared: PreparedPayloads,
+    custody: Option<CustodyColumns>,
+    key: AttributesKey,
+    build: PayloadBuild,
+    until_slot: Duration,
+) {
+    let proposal_slot = key.proposal_slot;
+    let head_root = ShortRoot(&key.head_root.0);
+    let PayloadBuild {
+        forkchoice,
+        attributes,
+    } = build;
+    let request = async {
+        match &attributes {
+            BuildAttributes::V3(attributes) => {
+                engine
+                    .forkchoice_updated_with_attributes(&forkchoice, attributes)
+                    .await
+            }
+            BuildAttributes::V4(attributes) => {
+                engine
+                    .forkchoice_updated_v4_with_attributes(&forkchoice, attributes, custody)
+                    .await
+            }
+        }
+    };
+    let Ok(started) = tokio::time::timeout(until_slot, request).await else {
+        warn!(
+            proposal_slot,
+            %head_root,
+            "The execution client did not start the next slot's payload build before the slot"
+        );
+        return;
+    };
+    match started {
+        Ok((_, Some(payload_id))) => {
+            info!(
+                proposal_slot,
+                %head_root,
+                build_on_full = ?key.build_on_full,
+                "Started the next slot's payload build"
+            );
+            prepared.insert(
+                proposal_slot,
+                forkchoice.head_block_hash,
+                attributes,
+                payload_id,
+            );
+        }
+        Ok((status, None)) => warn!(
+            proposal_slot,
+            %head_root,
+            status = ?status.status,
+            "The execution client declined to start the next slot's payload build"
+        ),
+        Err(err) => warn!(
+            proposal_slot,
+            %head_root,
+            %err,
+            "Starting the next slot's payload build failed"
+        ),
     }
 }
 
@@ -806,13 +1193,27 @@ impl Handler<PayloadAttributesComputed> for BlockChainServer {
                 .is_some_and(|(now, _)| now == key);
         let recheck = self.payload_attributes.finish(key, current, result.is_ok());
         match result {
-            Ok(Some(event)) if current => {
-                debug!(
-                    proposal_slot = key.proposal_slot,
-                    head_root = %ShortRoot(&key.head_root.0),
-                    "Publishing payload attributes"
-                );
-                self.events.publish_payload_attributes(event);
+            // Only while still current, so a stale worker's build never
+            // names an old head to the execution client; and
+            // the update is stopped at the slot's start or once the key
+            // changes (`start_payload_build`).
+            Ok(Some(NextPayload { event, build })) if current => {
+                // With nobody subscribed the event is held for the first
+                // re-check that finds a subscriber; the build starts either
+                // way.
+                let listening = self.events.has_subscribers();
+                if let Some(event) = self
+                    .payload_attributes
+                    .event_computed(key, event, listening)
+                {
+                    debug!(
+                        proposal_slot = key.proposal_slot,
+                        head_root = %ShortRoot(&key.head_root.0),
+                        "Publishing payload attributes"
+                    );
+                    self.events.publish_payload_attributes(event);
+                }
+                self.start_payload_build(key, build);
             }
             Ok(_) => {}
             Err(err) => warn!(
@@ -1338,6 +1739,243 @@ mod tests {
     fn a_failure_on_a_stale_key_rechecks_at_once() {
         let mut publisher = idle_publisher();
         assert!(publisher.finish(key(10), false, false));
+    }
+
+    fn event(proposal_slot: Slot) -> PayloadAttributesEvent {
+        PayloadAttributesEvent::new(
+            ForkName::Fulu,
+            PayloadAttributesEventData::V3(PayloadAttributesEventV3 {
+                proposer_index: 3,
+                proposal_slot,
+                parent_block_number: 9,
+                parent_block_root: H256([7; 32]),
+                parent_block_hash: H256::repeat_byte(2),
+                payload_attributes: BeaconPayloadAttributesV3 {
+                    timestamp: 12 * proposal_slot,
+                    prev_randao: H256::repeat_byte(3),
+                    suggested_fee_recipient: ExecutionAddress::repeat_byte(1),
+                    withdrawals: Vec::new(),
+                    parent_beacon_block_root: H256([7; 32]),
+                },
+            }),
+        )
+    }
+
+    /// With an execution client the worker runs for the payload build while
+    /// nobody is subscribed. A subscriber that arrives later in the window
+    /// (buildoor reconnecting, say) still gets the slot's event, from the
+    /// first re-check after it subscribed, and only once; the build is not
+    /// run again for it.
+    #[test]
+    fn an_event_computed_before_anyone_subscribed_goes_out_at_the_next_recheck() {
+        let mut publisher = idle_publisher();
+        publisher.in_flight = Some(key(10));
+        assert!(publisher.finish(key(10), true, true));
+        assert_eq!(publisher.event_computed(key(10), event(10), false), None);
+        // The worker is done with the key: its build started.
+        assert!(!publisher.wants(key(10)));
+
+        // Still nobody listening, or the inputs moved on: nothing goes out.
+        assert_eq!(publisher.held_event(key(10), false), None);
+        let moved = AttributesKey {
+            build_on_full: Some(false),
+            ..key(10)
+        };
+        assert_eq!(publisher.held_event(moved, true), None);
+
+        // A subscriber appears: the next re-check publishes the event, once.
+        assert_eq!(publisher.held_event(key(10), true), Some(event(10)));
+        assert_eq!(publisher.held_event(key(10), true), None);
+        // A worker run again for the key (its build aborted, say) does not
+        // send it a second time.
+        assert_eq!(publisher.event_computed(key(10), event(10), true), None);
+    }
+
+    /// With a subscriber, the event goes out as soon as it is computed and is
+    /// not held; a key that comes back after another one's event went out is
+    /// published again, as a fresh computation for it would be.
+    #[test]
+    fn an_event_computed_with_a_subscriber_goes_out_at_once() {
+        let mut publisher = idle_publisher();
+        assert_eq!(
+            publisher.event_computed(key(10), event(10), true),
+            Some(event(10))
+        );
+        assert_eq!(publisher.held_event(key(10), true), None);
+
+        let other = AttributesKey {
+            build_on_full: Some(false),
+            ..key(10)
+        };
+        assert_eq!(
+            publisher.event_computed(other, event(10), true),
+            Some(event(10))
+        );
+        assert_eq!(
+            publisher.event_computed(key(10), event(10), true),
+            Some(event(10))
+        );
+    }
+
+    /// The build the actor starts for a fulu proposal asks for exactly what
+    /// `produceBlockV3` asks for on the same head, so production finds it:
+    /// `payload_attributes_v3` on the same inputs, on the head's payload.
+    #[test]
+    fn a_fulu_proposal_is_prepared_with_the_attributes_production_asks_for() {
+        let (store, head_root, head_state) = fulu_store();
+        let config = store.config();
+        let proposal_slot = head_state.slot() + 1;
+        let advanced = advance_to_slot(&head_state, proposal_slot, &config).unwrap();
+        let proposer = get_beacon_proposer_index(&advanced).unwrap();
+        let inputs = payload_inputs(&advanced, &config).unwrap();
+        let fee_recipient = ExecutionAddress::repeat_byte(0xab);
+        let preparation = preparation(false);
+        preparation.fee_recipients.insert(proposer, fee_recipient);
+
+        let next = next_payload(
+            &store,
+            &preparation,
+            head_root,
+            &head_state,
+            proposal_slot,
+            None,
+        )
+        .unwrap()
+        .expect("the proposer is registered");
+
+        assert_eq!(
+            next.build,
+            PayloadBuild {
+                forkchoice: building_forkchoice_state(&store, head_root, inputs.parent_hash),
+                attributes: BuildAttributes::V3(payload_attributes_v3(
+                    &inputs,
+                    fee_recipient,
+                    head_root
+                )),
+            }
+        );
+    }
+
+    fn attributes(slot: Slot) -> BuildAttributes {
+        BuildAttributes::V4(PayloadAttributesV4 {
+            v3: PayloadAttributesV3 {
+                timestamp: 12 * slot,
+                prev_randao: H256::repeat_byte(3),
+                suggested_fee_recipient: ExecutionAddress::repeat_byte(4),
+                withdrawals: Vec::new(),
+                parent_beacon_block_root: H256::repeat_byte(1),
+            },
+            slot_number: slot,
+            target_gas_limit: 60_000_000,
+        })
+    }
+
+    /// Production collects a build only when it asks for exactly what was
+    /// prepared: the slot, the parent payload and every attribute.
+    #[test]
+    fn a_prepared_build_is_taken_only_for_its_own_inputs() {
+        let prepared = PreparedPayloads::default();
+        let parent = H256::repeat_byte(9);
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+
+        assert_eq!(prepared.take(11, parent, &attributes(10)), None);
+        assert_eq!(
+            prepared.take(10, H256::repeat_byte(8), &attributes(10)),
+            None
+        );
+        let BuildAttributes::V4(v4) = attributes(10) else {
+            unreachable!("built as V4")
+        };
+        let other_recipient = BuildAttributes::V4(PayloadAttributesV4 {
+            v3: PayloadAttributesV3 {
+                suggested_fee_recipient: ExecutionAddress::repeat_byte(5),
+                ..v4.v3.clone()
+            },
+            ..v4.clone()
+        });
+        assert_eq!(prepared.take(10, parent, &other_recipient), None);
+        // The same fields asked as fulu's V3 are a different build.
+        assert_eq!(prepared.take(10, parent, &BuildAttributes::V3(v4.v3)), None);
+
+        assert_eq!(
+            prepared
+                .take(10, parent, &attributes(10))
+                .map(|build| build.payload_id),
+            Some(PayloadId([1; 8]))
+        );
+        // Once: the execution client may stop building after serving it.
+        assert_eq!(prepared.take(10, parent, &attributes(10)), None);
+    }
+
+    /// A slot can hold a build per head or payload branch, the newest id
+    /// replaces an older one with the same inputs, and a build for a later
+    /// slot drops the earlier slots'.
+    #[test]
+    fn builds_are_kept_per_inputs_and_dropped_once_their_slot_passed() {
+        let prepared = PreparedPayloads::default();
+        let (first, second) = (H256::repeat_byte(1), H256::repeat_byte(2));
+        prepared.insert(10, first, attributes(10), PayloadId([1; 8]));
+        prepared.insert(10, second, attributes(10), PayloadId([2; 8]));
+        prepared.insert(10, first, attributes(10), PayloadId([3; 8]));
+        assert_eq!(
+            prepared
+                .take(10, first, &attributes(10))
+                .map(|build| build.payload_id),
+            Some(PayloadId([3; 8]))
+        );
+
+        prepared.insert(11, first, attributes(11), PayloadId([4; 8]));
+        assert_eq!(prepared.take(10, second, &attributes(10)), None);
+        assert_eq!(
+            prepared
+                .take(11, first, &attributes(11))
+                .map(|build| build.payload_id),
+            Some(PayloadId([4; 8]))
+        );
+    }
+
+    /// Past the cap the oldest build goes, also after a `take` from the
+    /// middle: the newest is the one production is likeliest to ask for.
+    #[test]
+    fn the_oldest_build_is_dropped_past_the_cap() {
+        let prepared = PreparedPayloads::default();
+        let parent = |n: u8| H256::repeat_byte(n);
+        for n in 1..=MAX_PREPARED_PAYLOADS as u8 {
+            prepared.insert(10, parent(n), attributes(10), PayloadId([n; 8]));
+        }
+        assert!(prepared.take(10, parent(1), &attributes(10)).is_some());
+        let newest = MAX_PREPARED_PAYLOADS as u8;
+        prepared.insert(10, parent(newest + 1), attributes(10), PayloadId([0xf0; 8]));
+        prepared.insert(10, parent(newest + 2), attributes(10), PayloadId([0xf1; 8]));
+
+        assert_eq!(prepared.take(10, parent(2), &attributes(10)), None);
+        assert_eq!(
+            prepared
+                .take(10, parent(newest), &attributes(10))
+                .map(|build| build.payload_id),
+            Some(PayloadId([newest; 8]))
+        );
+    }
+
+    /// The same inputs answered with the same payload id are the build the
+    /// execution client kept running, so production does not wait on it
+    /// again; a new payload id is a build started over.
+    #[test]
+    fn a_repeated_build_keeps_its_start_time() {
+        let prepared = PreparedPayloads::default();
+        let parent = H256::repeat_byte(9);
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let between = Instant::now();
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let kept = prepared.take(10, parent, &attributes(10)).unwrap();
+        assert!(kept.started <= between);
+
+        prepared.insert(10, parent, attributes(10), PayloadId([1; 8]));
+        let between = Instant::now();
+        prepared.insert(10, parent, attributes(10), PayloadId([2; 8]));
+        let restarted = prepared.take(10, parent, &attributes(10)).unwrap();
+        assert_eq!(restarted.payload_id, PayloadId([2; 8]));
+        assert!(restarted.started >= between);
     }
 
     #[test]

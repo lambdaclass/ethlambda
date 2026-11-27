@@ -198,6 +198,7 @@ mod tests {
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::primitives::{Bytes32, H160, Root};
     use tokio_util::sync::CancellationToken;
+    use tokio_util::task::TaskTracker;
 
     use super::*;
     use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto};
@@ -440,11 +441,18 @@ mod tests {
         assert!(node.preparations().is_empty());
 
         let protection = slashing_protection::SlashingProtection::in_memory();
-        let stopped =
-            run_until_stopped(async { err }, &protection, CancellationToken::new(), None).await;
+        let stopped = run_until_stopped(
+            async { Err(err) },
+            &protection,
+            std::future::pending(),
+            CancellationToken::new(),
+            None,
+            &TaskTracker::new(),
+        )
+        .await;
         assert!(
-            matches!(stopped, Error::ValidatorSlashed { .. }),
-            "got {stopped}"
+            matches!(stopped, Err(Error::ValidatorSlashed { .. })),
+            "got {stopped:?}"
         );
     }
 
