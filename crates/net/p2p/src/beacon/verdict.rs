@@ -607,14 +607,26 @@ pub(crate) struct GossipVerdict {
     id: GossipId,
     outcome: Outcome,
     object: Validated,
-    /// Whether this is the first check, which may park a vote for a block
-    /// that is not ready yet (see [`parked_votes`](crate::beacon::parked_votes)). A check run again after
-    /// parking may not park again.
-    parkable: bool,
+    check: Check,
 }
 
 impl Message for GossipVerdict {
     type Result = ();
+}
+
+/// Which check of its message a [`GossipVerdict`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Its first, which may park a vote for a block that is not ready yet
+    /// (see [`parked_votes`](crate::beacon::parked_votes)).
+    First,
+    /// The first check run once more at once, because the vote's block had
+    /// been imported after all (see [`spawn_stateful_checks`]). Final: the
+    /// vote is never parked.
+    Repeated,
+    /// The second check of a vote held for it ([`recheck`]). Final, and it
+    /// gives back the vote's place under the parked-vote caps.
+    Recheck,
 }
 
 /// Re-check the seen cache at verdict time: two copies of one key can be in
@@ -679,8 +691,12 @@ pub(crate) fn receive_verdict(server: &mut P2PServer, verdict: GossipVerdict) ->
         id,
         outcome,
         object,
-        parkable,
+        check,
     } = verdict;
+    if check == Check::Recheck {
+        server.parked_votes.answered(&object);
+    }
+    let parkable = check == Check::First;
     let Some(root) = parkable.then(|| parkable_root(&object, outcome)).flatten() else {
         conclude(server, id, outcome, object);
         return AfterVerdict::Done;
@@ -788,12 +804,20 @@ pub(crate) fn schedule_parked_vote_sweep(ctx: &Context<P2PServer>) {
 /// prevent. A batch waits for a permit rather than failing without one, and
 /// each vote's deadline is checked again right before its turn (see
 /// [`recheck`]), so a vote reached too late still gets its first verdict.
+///
+/// Every vote handed in is still held under the parked-vote caps, and gives
+/// its place back once its final verdict is in ([`ParkedVotes::answered`]):
+/// here for one already past its deadline, and otherwise when its
+/// [`Check::Recheck`] verdict reaches [`receive_verdict`].
+///
+/// [`ParkedVotes::answered`]: crate::beacon::parked_votes::ParkedVotes::answered
 fn spawn_rechecks(server: &mut P2PServer, ctx: &Context<P2PServer>, votes: Vec<ParkedVote>) {
     let now = Instant::now();
     let mut by_kind: HashMap<&'static str, Vec<ParkedVote>> = HashMap::new();
     for vote in votes {
         if vote.expired(now) {
             metrics::inc_parked_votes(vote.id.kind, "expired");
+            server.parked_votes.answered(&vote.object);
             conclude(server, vote.id, vote.outcome, vote.object);
         } else {
             by_kind.entry(vote.id.kind).or_default().push(vote);
@@ -820,10 +844,11 @@ fn spawn_recheck_batch(
     let store = server.store.clone();
     let actor = ctx.actor_ref();
     tokio::spawn(async move {
-        let Ok(permit) = permits.acquire_owned().await else {
-            warn!("The recheck permit pool closed before a batch of parked votes ran");
-            return;
-        };
+        // `acquire_owned` fails only on a closed pool, and nothing closes
+        // this one. The batch runs either way: each vote in it is held under
+        // the parked-vote caps until its verdict reaches the actor, so each
+        // must get one.
+        let permit = permits.acquire_owned().await.ok();
         let in_use = metrics::PoolInUse::new(RECHECK_POOL);
         let task = metrics::BlockingTask::new(recheck_task_kind(kind));
         tokio::task::spawn_blocking(move || {
@@ -862,7 +887,7 @@ fn recheck(store: &Store, vote: ParkedVote, now: Instant) -> GossipVerdict {
         id,
         outcome,
         object,
-        parkable: false,
+        check: Check::Recheck,
     }
 }
 
@@ -991,7 +1016,7 @@ pub(crate) fn spawn_stateful_checks(
         let _in_use = in_use;
         let _run = task.start();
         let mut object = object;
-        let mut parkable = true;
+        let mut check = Check::First;
         // One `guarded` around the probe too: `has_state` panics, rather
         // than returning an error, on a storage failure.
         let outcome = guarded(|| {
@@ -1008,7 +1033,7 @@ pub(crate) fn spawn_stateful_checks(
             if !imported {
                 return outcome;
             }
-            parkable = false;
+            check = Check::Repeated;
             object.stateful_checks(&store)
         });
         let _ = actor
@@ -1016,7 +1041,7 @@ pub(crate) fn spawn_stateful_checks(
                 id,
                 outcome,
                 object,
-                parkable,
+                check,
             })
             .inspect_err(|_| warn!("P2P actor stopped before a gossip verdict arrived"));
     });
@@ -2047,7 +2072,7 @@ mod tests {
         }
     }
 
-    fn attestation_verdict(attester: u64, outcome: Outcome, parkable: bool) -> GossipVerdict {
+    fn attestation_verdict(attester: u64, outcome: Outcome, check: Check) -> GossipVerdict {
         GossipVerdict {
             id: gossip_id(attester as u8, "beacon_attestation", Instant::now()),
             outcome,
@@ -2055,7 +2080,7 @@ mod tests {
                 attestation: Box::new(electra_attestation(1, attester)),
                 subnet_id: 0,
             },
-            parkable,
+            check,
         }
     }
 
@@ -2080,11 +2105,11 @@ mod tests {
         let deadline = arrived + crate::beacon::parked_votes::PARKED_VOTE_DEADLINE;
         let late = recheck(&server.store, parked(arrived), deadline);
         assert_eq!(late.outcome, first);
-        assert!(!late.parkable);
+        assert_eq!(late.check, Check::Recheck);
 
         let in_time = recheck(&server.store, parked(arrived), arrived);
         assert_ne!(in_time.outcome, first, "the checks ran again");
-        assert!(!in_time.parkable);
+        assert_eq!(in_time.check, Check::Recheck);
     }
 
     /// The verdicts reported to gossipsub so far, in order, by name:
@@ -2124,7 +2149,7 @@ mod tests {
             (1, IgnoreReason::StateUnavailable),
             (2, IgnoreReason::UnknownBlock),
         ] {
-            let verdict = attestation_verdict(attester, Outcome::Ignore(reason), true);
+            let verdict = attestation_verdict(attester, Outcome::Ignore(reason), Check::First);
             receive_verdict(&mut server, verdict);
         }
         let aggregate = GossipVerdict {
@@ -2134,7 +2159,7 @@ mod tests {
                 aggregate: Box::new(electra_aggregate(1, 9)),
                 attesting_indices: Vec::new(),
             },
-            parkable: true,
+            check: Check::First,
         };
         receive_verdict(&mut server, aggregate);
 
@@ -2150,8 +2175,8 @@ mod tests {
         let (mut server, _commands) = capturing_server().await;
         let outcome = Outcome::Ignore(IgnoreReason::StateUnavailable);
 
-        let first = receive_verdict(&mut server, attestation_verdict(1, outcome, true));
-        let second = receive_verdict(&mut server, attestation_verdict(2, outcome, true));
+        let first = receive_verdict(&mut server, attestation_verdict(1, outcome, Check::First));
+        let second = receive_verdict(&mut server, attestation_verdict(2, outcome, Check::First));
 
         assert!(matches!(first, AfterVerdict::ScheduleSweep));
         assert!(matches!(second, AfterVerdict::Done));
@@ -2163,12 +2188,15 @@ mod tests {
         let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
 
         // A second check may not park again.
-        receive_verdict(&mut server, attestation_verdict(1, unavailable, false));
+        receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::Repeated),
+        );
         // Only a missing block or state parks.
         let reject = Outcome::Reject(RejectReason::BadSignature);
-        receive_verdict(&mut server, attestation_verdict(2, reject, true));
+        receive_verdict(&mut server, attestation_verdict(2, reject, Check::First));
         let seen = Outcome::Ignore(IgnoreReason::AlreadySeen);
-        receive_verdict(&mut server, attestation_verdict(3, seen, true));
+        receive_verdict(&mut server, attestation_verdict(3, seen, Check::First));
         // And only a vote: a block waits in the chain actor instead.
         let block = GossipVerdict {
             id: gossip_id(4, "beacon_block", Instant::now()),
@@ -2177,7 +2205,7 @@ mod tests {
                 block: Box::new(fulu_block(5, 1)),
                 block_root: Root::repeat_byte(1),
             },
-            parkable: true,
+            check: Check::First,
         };
         receive_verdict(&mut server, block);
 
@@ -2195,23 +2223,57 @@ mod tests {
         server.parked_votes.take_ready(Root::ZERO);
 
         let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
-        let after = receive_verdict(&mut server, attestation_verdict(1, unavailable, true));
+        let after = receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::First),
+        );
 
         assert!(matches!(after, AfterVerdict::Recheck(_)));
         assert!(server.parked_votes.is_empty());
         assert!(reported(&mut commands).is_empty());
     }
 
+    /// A released vote keeps its place under the parked-vote caps until its
+    /// second check's verdict reaches the actor, and that verdict gives the
+    /// place back.
+    #[tokio::test]
+    async fn a_released_vote_is_held_until_its_recheck_answers() {
+        let (mut server, mut commands) = capturing_server().await;
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+        receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::First),
+        );
+
+        // `electra_attestation` votes for the zero root.
+        let released = server.parked_votes.take_ready(Root::ZERO);
+        assert_eq!(released.len(), 1);
+        assert!(server.parked_votes.is_empty());
+        assert_eq!(server.parked_votes.held(), 1);
+
+        // Past its deadline, so the verdict is its first one, an IGNORE.
+        let late = Instant::now() + crate::beacon::parked_votes::PARKED_VOTE_DEADLINE;
+        for vote in released {
+            let verdict = recheck(&server.store, vote, late);
+            receive_verdict(&mut server, verdict);
+        }
+        assert_eq!(server.parked_votes.held(), 0);
+        assert_eq!(reported(&mut commands), vec!["ignore"]);
+    }
+
     #[tokio::test]
     async fn a_parked_vote_past_its_deadline_gets_its_first_verdict() {
         let (mut server, mut commands) = capturing_server().await;
         let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
-        let mut verdict = attestation_verdict(1, unavailable, true);
+        let mut verdict = attestation_verdict(1, unavailable, Check::First);
         verdict.id.received_at = Instant::now()
             .checked_sub(crate::beacon::parked_votes::PARKED_VOTE_DEADLINE)
             .expect("the clock is past the deadline");
         receive_verdict(&mut server, verdict);
-        receive_verdict(&mut server, attestation_verdict(2, unavailable, true));
+        receive_verdict(
+            &mut server,
+            attestation_verdict(2, unavailable, Check::First),
+        );
 
         let more_due = sweep_parked_votes(&mut server);
 
@@ -2224,7 +2286,7 @@ mod tests {
     async fn a_sweep_that_empties_the_queue_schedules_no_other() {
         let (mut server, _commands) = capturing_server().await;
         let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
-        let mut verdict = attestation_verdict(1, unavailable, true);
+        let mut verdict = attestation_verdict(1, unavailable, Check::First);
         verdict.id.received_at = Instant::now()
             .checked_sub(crate::beacon::parked_votes::PARKED_VOTE_DEADLINE)
             .expect("the clock is past the deadline");
@@ -2233,7 +2295,10 @@ mod tests {
         assert!(!sweep_parked_votes(&mut server));
         assert!(server.parked_votes.is_empty());
         // The next park schedules a sweep of its own.
-        let after = receive_verdict(&mut server, attestation_verdict(2, unavailable, true));
+        let after = receive_verdict(
+            &mut server,
+            attestation_verdict(2, unavailable, Check::First),
+        );
         assert!(matches!(after, AfterVerdict::ScheduleSweep));
     }
 

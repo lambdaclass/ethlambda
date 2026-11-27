@@ -36,7 +36,10 @@
 //!   [`MAX_PARKED_VOTES`] the next one is reported as it would have been
 //!   before this queue existed. Aggregates have a smaller cap of their own,
 //!   [`MAX_PARKED_AGGREGATES`], since one can be far larger than a subnet
-//!   attestation.
+//!   attestation. A released vote keeps its place under both until its
+//!   second check has answered: its batch may wait for a recheck permit, and
+//!   releases can follow one another faster than the batches run, so a cap
+//!   counting only the votes still parked would bound nothing.
 //!
 //! The import signal can win the race against the verdict it releases: the
 //! check reads the store on a blocking thread, the import caches the state
@@ -54,11 +57,12 @@ use ethlambda_types::beacon::primitives::Root;
 
 use crate::beacon::verdict::{GossipId, Validated};
 
-/// How many votes may be parked at once. Lighthouse's
+/// How many votes may be held at once: parked, or released and not yet
+/// answered by their second check. Lighthouse's
 /// `MAXIMUM_QUEUED_ATTESTATIONS`.
 pub(crate) const MAX_PARKED_VOTES: usize = 16_384;
 
-/// How many of the parked votes may be aggregates.
+/// How many of the held votes may be aggregates.
 ///
 /// An electra aggregate's bits run to `MAX_VALIDATORS_PER_COMMITTEE *
 /// MAX_COMMITTEES_PER_SLOT`, 16 KiB decoded and a few hundred bytes on the
@@ -101,20 +105,46 @@ impl ParkedVote {
 
     /// Whether this is an aggregate, which [`MAX_PARKED_AGGREGATES`] caps.
     fn is_aggregate(&self) -> bool {
-        matches!(self.object, Validated::Aggregate { .. })
+        is_aggregate(&self.object)
     }
 }
 
-/// How many of `votes` are aggregates.
-fn aggregates_in(votes: &[ParkedVote]) -> usize {
-    votes.iter().filter(|vote| vote.is_aggregate()).count()
+/// Whether `object` is an aggregate, which [`MAX_PARKED_AGGREGATES`] caps.
+fn is_aggregate(object: &Validated) -> bool {
+    matches!(object, Validated::Aggregate { .. })
+}
+
+/// A number of votes, and how many of them are aggregates.
+#[derive(Clone, Copy, Default)]
+struct Count {
+    votes: usize,
+    aggregates: usize,
+}
+
+impl Count {
+    /// Whether one more vote, an aggregate when `aggregate`, still fits under
+    /// [`MAX_PARKED_VOTES`] and [`MAX_PARKED_AGGREGATES`].
+    fn has_room(self, aggregate: bool) -> bool {
+        self.votes < MAX_PARKED_VOTES && !(aggregate && self.aggregates >= MAX_PARKED_AGGREGATES)
+    }
+
+    fn add(&mut self, aggregate: bool) {
+        self.votes += 1;
+        self.aggregates += usize::from(aggregate);
+    }
+
+    fn remove(&mut self, aggregate: bool) {
+        self.votes -= 1;
+        self.aggregates -= usize::from(aggregate);
+    }
 }
 
 /// What [`ParkedVotes::park`] did with a vote.
 pub(crate) enum Parking {
     /// Parked until its root is announced or its deadline passes.
     Parked,
-    /// Its root was already announced: check it again now.
+    /// Its root was already announced: check it again now. It is held, as a
+    /// released vote is, until [`ParkedVotes::answered`].
     Ready(ParkedVote),
     /// The queue is full: report its first verdict now.
     Full(ParkedVote),
@@ -124,9 +154,14 @@ pub(crate) enum Parking {
 #[derive(Default)]
 pub(crate) struct ParkedVotes {
     by_root: HashMap<Root, Vec<ParkedVote>>,
-    len: usize,
-    /// How many of the `len` are aggregates.
-    aggregates: usize,
+    /// The votes in `by_root`.
+    parked: Count,
+    /// The votes parked, plus those released (or sent straight to their
+    /// second check, [`Parking::Ready`]) whose second check has not answered
+    /// yet: what the caps bound. A released vote is still in memory, in a
+    /// batch that may wait for a recheck permit, so it keeps its place until
+    /// [`ParkedVotes::answered`].
+    held: Count,
     recently_ready: VecDeque<Root>,
     /// Whether an expiry sweep is already scheduled, so parking a vote never
     /// starts a second timer.
@@ -136,22 +171,23 @@ pub(crate) struct ParkedVotes {
 impl ParkedVotes {
     /// Park `vote` under `root`, the block it votes for.
     pub(crate) fn park(&mut self, root: Root, vote: ParkedVote) -> Parking {
+        let aggregate = vote.is_aggregate();
+        if !self.held.has_room(aggregate) {
+            return Parking::Full(vote);
+        }
+        self.held.add(aggregate);
         if self.recently_ready.contains(&root) {
             return Parking::Ready(vote);
         }
-        let aggregate = vote.is_aggregate();
-        if self.len >= MAX_PARKED_VOTES || (aggregate && self.aggregates >= MAX_PARKED_AGGREGATES) {
-            return Parking::Full(vote);
-        }
         self.by_root.entry(root).or_default().push(vote);
-        self.len += 1;
-        self.aggregates += usize::from(aggregate);
+        self.parked.add(aggregate);
         Parking::Parked
     }
 
     /// `root` has a post-state now: take every vote parked under it, and
     /// remember the root for a verdict still on its way (see the module
-    /// documentation).
+    /// documentation). Each vote taken stays held until
+    /// [`ParkedVotes::answered`].
     pub(crate) fn take_ready(&mut self, root: Root) -> Vec<ParkedVote> {
         if !self.recently_ready.contains(&root) {
             if self.recently_ready.len() == RECENTLY_READY_ROOTS {
@@ -160,12 +196,14 @@ impl ParkedVotes {
             self.recently_ready.push_back(root);
         }
         let votes = self.by_root.remove(&root).unwrap_or_default();
-        self.len -= votes.len();
-        self.aggregates -= aggregates_in(&votes);
+        for vote in &votes {
+            self.parked.remove(vote.is_aggregate());
+        }
         votes
     }
 
-    /// Take every vote past its deadline at `now`.
+    /// Take every vote past its deadline at `now`. They are no longer held:
+    /// the caller reports their first verdict at once.
     pub(crate) fn take_expired(&mut self, now: Instant) -> Vec<ParkedVote> {
         let mut expired = Vec::new();
         self.by_root.retain(|_, votes| {
@@ -176,17 +214,35 @@ impl ParkedVotes {
             *votes = waiting;
             !votes.is_empty()
         });
-        self.len -= expired.len();
-        self.aggregates -= aggregates_in(&expired);
+        for vote in &expired {
+            self.parked.remove(vote.is_aggregate());
+            self.held.remove(vote.is_aggregate());
+        }
         expired
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.len
+    /// A vote taken by [`ParkedVotes::take_ready`] or handed back as
+    /// [`Parking::Ready`] has its final verdict now: give back its place
+    /// under the caps.
+    pub(crate) fn answered(&mut self, object: &Validated) {
+        self.held.remove(is_aggregate(object));
     }
 
+    /// How many votes are parked: held votes already released are not
+    /// counted.
+    pub(crate) fn len(&self) -> usize {
+        self.parked.votes
+    }
+
+    /// Whether no vote is parked, so no expiry sweep is due.
     pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+        self.parked.votes == 0
+    }
+
+    /// How many votes are held: parked, or released and not answered yet.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.held.votes
     }
 
     /// Mark a sweep as scheduled. `true` when none was, meaning the caller
@@ -351,18 +407,56 @@ mod tests {
         ));
         assert_eq!(parked.len(), MAX_PARKED_VOTES);
 
-        // Releasing a root makes room again.
-        let released = parked.take_ready(Root::repeat_byte(0)).len();
-        assert_eq!(parked.len(), MAX_PARKED_VOTES - released);
+        // Released votes are no longer parked, but they keep their place
+        // until their second check answers: only that makes room again.
+        let released = parked.take_ready(Root::repeat_byte(0));
+        assert_eq!(parked.len(), MAX_PARKED_VOTES - released.len());
+        assert!(matches!(
+            parked.park(Root::repeat_byte(9), vote(u64::MAX, now)),
+            Parking::Full(_)
+        ));
+        for released_vote in &released {
+            parked.answered(&released_vote.object);
+        }
         assert!(matches!(
             parked.park(Root::repeat_byte(9), vote(u64::MAX, now)),
             Parking::Parked
         ));
     }
 
+    /// A vote sent straight to its second check, its root already announced,
+    /// is held like a released one, so a full queue refuses it too.
+    #[test]
+    fn a_vote_checked_again_at_once_is_held_until_answered() {
+        let now = Instant::now();
+        let mut parked = ParkedVotes::default();
+        let ready = Root::repeat_byte(1);
+        parked.take_ready(ready);
+        for attester in 0..MAX_PARKED_VOTES as u64 - 1 {
+            assert!(matches!(
+                parked.park(Root::repeat_byte(2), vote(attester, now)),
+                Parking::Parked
+            ));
+        }
+
+        let Parking::Ready(checked) = parked.park(ready, vote(u64::MAX - 1, now)) else {
+            panic!("its root was announced");
+        };
+        assert!(matches!(
+            parked.park(ready, vote(u64::MAX, now)),
+            Parking::Full(_)
+        ));
+        parked.answered(&checked.object);
+        assert!(matches!(
+            parked.park(ready, vote(u64::MAX, now)),
+            Parking::Ready(_)
+        ));
+    }
+
     /// Aggregates fill a cap of their own, well below the queue's: past it
     /// the next aggregate is handed back, while a subnet attestation still
-    /// parks, and releasing or expiring aggregates makes room for more.
+    /// parks, and answering released aggregates, or expiring parked ones,
+    /// makes room for more.
     #[test]
     fn aggregates_have_a_smaller_cap_of_their_own() {
         let now = Instant::now();
@@ -382,7 +476,11 @@ mod tests {
         ));
         assert!(matches!(parked.park(a, vote(1, now)), Parking::Parked));
 
-        assert_eq!(parked.take_ready(a).len(), MAX_PARKED_AGGREGATES / 2 + 1);
+        let released = parked.take_ready(a);
+        assert_eq!(released.len(), MAX_PARKED_AGGREGATES / 2 + 1);
+        for released_vote in &released {
+            parked.answered(&released_vote.object);
+        }
         assert!(matches!(
             parked.park(Root::repeat_byte(3), aggregate(u64::MAX, now)),
             Parking::Parked

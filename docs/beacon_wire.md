@@ -473,7 +473,9 @@ cap, since nothing about a parked vote has been verified, and at most 2,048
 aggregates among them, since an aggregate's bits can reach 16 KiB before its
 signature is checked; past either, a vote gets its first verdict at once.
 Released votes are checked again on a permit pool of their own, so a big
-release takes no permit from the votes arriving meanwhile. A vote whose block
+release takes no permit from the votes arriving meanwhile, and each keeps its
+place under both caps until that check answers, since its batch may wait for
+a permit while the next releases come in. A vote whose block
 was imported but whose state has left the cache is checked once more at once
 and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
 node has never seen does not start a lookup for that block: it waits for
