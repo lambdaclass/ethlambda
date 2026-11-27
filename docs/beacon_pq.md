@@ -112,6 +112,37 @@ path: a PQ block's columns are judged against its bid's commitments, as a
 gloas block's are. A block of a fork the node does not follow is ignored
 before any rule.
 
+### Aggregates over Waggle
+
+Lighthouse's `pq-devnet-0-waggle` image broadcasts PQ aggregates over Waggle
+(`/waggle/1.0`, the "Fast leanVM Proof Broadcast" draft EIP) and not on
+gossipsub. The aggregator signs an `AggregateHeader`, the `AggregateAndProof`
+with `proof_chunks_root` (the root of the proof's 64 chunks) in place of the
+proof, and the proof travels in chunks, each checked on its own against that
+root, with the header sent alongside a peer's first chunk.
+
+The node does both. Every held PQ digest subscribes its
+`beacon_aggregate_and_proof` topic name on Waggle as well as on gossipsub
+(`p2p/src/beacon/waggle.rs`, the transport in `p2p/src/waggle/`), and a
+dissemination service per topic (`waggle_aggregates.rs`, a port of
+Lighthouse's `aggregate.rs`) pushes, announces and requests chunks. A
+header is judged when its first chunk arrives (`gossip::pq::aggregate_header_checks`:
+every rule but the proof's and the seen cache's), the proof once all 64 are
+held (`aggregate_proof_checks`), and an accepted aggregate is handed on as a
+gossip one is. The two transports share the seen cache, so an aggregate
+heard on both is applied once.
+
+The node cannot carry one transport's aggregate onto the other: the two
+signatures are over different containers, and signing the second at the
+same leaf would reuse an XMSS leaf. So publishing is the validator client's
+choice, `--pq-aggregate-transport gossipsub` (the default, the specification's
+`AggregateAndProof`) or `waggle` (the header, posted with its proof as
+Lighthouse's `SignedPqAggregate` to the same `aggregate_and_proofs`
+endpoint, whose body shape tells the node which). A node publishes a Waggle
+aggregate only over Waggle, as Lighthouse does. On a devnet mixing the two,
+an aggregate reaches only the nodes listening on its transport: run
+ethlambda's validator clients with `waggle` next to Lighthouse's Waggle image.
+
 ## The XMSS scheme
 
 The specification's `xmss` module is EthLib's leanXMSS: Keccak-256, two layers

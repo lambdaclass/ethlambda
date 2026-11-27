@@ -459,6 +459,25 @@ pub struct CheckedHeader {
 }
 
 impl CheckedHeader {
+    /// The header of an aggregate whose header and proof the caller already
+    /// checked ([`aggregate_header_checks`], then [`aggregate_proof_checks`]),
+    /// rebuilt from what those checks resolved. It carries no statements: it
+    /// is for disseminating the aggregate, and no proof is checked against it
+    /// again.
+    pub fn proven(
+        signed_header: pq::SignedAggregateHeader,
+        committee_index: CommitteeIndex,
+        attesting_indices: Vec<ValidatorIndex>,
+    ) -> Self {
+        Self {
+            header_root: signed_header.message.hash_tree_root(),
+            signed_header,
+            committee_index,
+            attesting_indices,
+            statements: Vec::new(),
+        }
+    }
+
     pub fn aggregate(&self) -> &pq::Attestation {
         &self.signed_header.message.aggregate
     }

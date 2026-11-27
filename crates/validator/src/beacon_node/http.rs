@@ -1351,6 +1351,19 @@ impl BeaconNodeApi for HttpBeaconNode {
         .await
     }
 
+    async fn publish_pq_waggle_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedPqAggregate],
+    ) -> Result<()> {
+        // The body's field names tell the node the aggregates are for Waggle.
+        self.post_no_content(
+            "/eth/v2/validator/aggregate_and_proofs",
+            &aggregates,
+            Some(ForkName::Pq.as_str()),
+        )
+        .await
+    }
+
     async fn publish_aggregates(
         &self,
         fork: ForkName,

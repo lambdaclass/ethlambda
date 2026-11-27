@@ -688,6 +688,16 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
+    async fn publish_pq_waggle_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedPqAggregate],
+    ) -> Result<()> {
+        self.try_each("publish_pq_waggle_aggregates", |node| {
+            node.publish_pq_waggle_aggregates(aggregates)
+        })
+        .await
+    }
+
     async fn submit_pq_payload_attestations(
         &self,
         messages: &[ethlambda_types::beacon::containers::pq::PayloadAttestationMessage],

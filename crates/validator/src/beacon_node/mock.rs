@@ -1303,6 +1303,13 @@ impl BeaconNodeApi for MockBeaconNode {
         self.guard("publish_pq_aggregates")
     }
 
+    async fn publish_pq_waggle_aggregates(
+        &self,
+        _aggregates: &[ethlambda_types::beacon::containers::pq::SignedPqAggregate],
+    ) -> Result<()> {
+        self.guard("publish_pq_waggle_aggregates")
+    }
+
     async fn submit_pq_proposer_preferences(
         &self,
         preferences: &[ethlambda_types::beacon::containers::pq::SignedProposerPreferences],

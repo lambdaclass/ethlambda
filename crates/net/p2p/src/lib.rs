@@ -50,9 +50,9 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishPayloadAttestationMessage, PublishPqGossip, PublishProposerPreferences,
-        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
-        SubscribePqAttestationSubnets, SubscribeSyncCommitteeSubnets,
+        PublishPayloadAttestationMessage, PublishPqGossip, PublishPqWaggleAggregate,
+        PublishProposerPreferences, PublishSyncCommitteeContribution, PublishSyncCommitteeMessage,
+        SubscribeAttestationSubnets, SubscribePqAttestationSubnets, SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::max_aggregates_per_slot;
@@ -2349,6 +2349,17 @@ impl Handler<PublishBeaconOperation> for P2PServer {
 impl Handler<PublishPqGossip> for P2PServer {
     async fn handle(&mut self, msg: PublishPqGossip, _ctx: &Context<Self>) {
         beacon::pq::publish_pq_gossip(self, msg.object);
+    }
+}
+
+impl Handler<PublishPqWaggleAggregate> for P2PServer {
+    async fn handle(&mut self, msg: PublishPqWaggleAggregate, _ctx: &Context<Self>) {
+        beacon::waggle::publish(
+            self,
+            msg.aggregate,
+            msg.committee_index,
+            msg.attesting_indices,
+        );
     }
 }
 

@@ -493,7 +493,14 @@ async fn post_aggregate_and_proofs(
         .and_then(|value| value.to_str().ok())
         == Some(ForkName::Pq.as_str());
     if is_pq {
-        return post_pq_aggregate_and_proofs(&store, &p2p, &headers, &body);
+        // The proofs are STARKs, checked off the async workers.
+        let posted = tokio::task::spawn_blocking(move || {
+            post_pq_aggregate_and_proofs(&store, &p2p, &headers, &body)
+        });
+        return posted.await.unwrap_or_else(|err| {
+            warn!(%err, "Checking submitted PQ aggregates failed");
+            ApiError::Internal("checking the aggregates failed").into_response()
+        });
     }
     let header_fork = match submission_fork(&headers) {
         Ok(fork) => fork,
@@ -592,15 +599,17 @@ fn post_pq_aggregate_and_proofs(
     body: &[u8],
 ) -> Response {
     use ethlambda_state_transition::beacon::gossip::pq as pq_gossip;
-    use ethlambda_types::beacon::containers::pq;
-    let aggregates = match decode_list::<pq::SignedAggregateAndProof>(headers, body) {
-        Ok(aggregates) => aggregates,
-        Err(err) => return err.into_response(),
-    };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0);
+    let aggregates = match decode_pq_aggregates(headers, body) {
+        Ok(PqAggregates::Gossipsub(aggregates)) => aggregates,
+        Ok(PqAggregates::Waggle(aggregates)) => {
+            return post_waggle_aggregates(store, p2p, aggregates, now_ms);
+        }
+        Err(err) => return err.into_response(),
+    };
     let capacity = std::num::NonZeroUsize::MIN;
     let mut failures = Vec::new();
     for (index, signed) in aggregates.into_iter().enumerate() {
@@ -620,6 +629,102 @@ fn post_pq_aggregate_and_proofs(
         });
         match published {
             Ok(()) => debug!(%slot, aggregator, "Accepted a PQ aggregate for gossip"),
+            Err(message) => {
+                warn!(%slot, aggregator, reason = %message, "Refused a submitted PQ aggregate");
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
+            }
+        }
+    }
+    batch_response(
+        failures,
+        "some aggregates failed validation and were not published",
+    )
+}
+
+/// The two shapes `aggregate_and_proofs` takes at a PQ slot, which say how
+/// the aggregates are to be broadcast.
+enum PqAggregates {
+    /// `SignedAggregateAndProof`s, gossiped on `beacon_aggregate_and_proof`.
+    Gossipsub(Vec<ethlambda_types::beacon::containers::pq::SignedAggregateAndProof>),
+    /// `SignedPqAggregate`s, a signed header and its proof, broadcast in
+    /// chunks over Waggle (Lighthouse's PQ branch's shape).
+    Waggle(Vec<ethlambda_types::beacon::containers::pq::SignedPqAggregate>),
+}
+
+/// Decode a PQ `aggregate_and_proofs` body in whichever shape it is. In JSON
+/// the field names tell them apart; in SSZ, where they do not, the gossipsub
+/// list is tried first, and a body that decodes as neither is refused.
+fn decode_pq_aggregates(headers: &HeaderMap, body: &[u8]) -> Result<PqAggregates, ApiError> {
+    use ethlambda_types::beacon::containers::pq;
+    let invalid = || ApiError::BadRequest("invalid request body");
+    match crate::beacon::BodyEncoding::from_headers(headers)? {
+        crate::beacon::BodyEncoding::Json => {
+            let list: Vec<serde_json::Value> =
+                serde_json::from_slice(body).map_err(|_| invalid())?;
+            let waggle = list
+                .first()
+                .is_some_and(|first| first.get("signed_aggregate_header").is_some());
+            let value = serde_json::Value::Array(list);
+            if waggle {
+                serde_json::from_value(value)
+                    .map(PqAggregates::Waggle)
+                    .map_err(|_| invalid())
+            } else {
+                serde_json::from_value(value)
+                    .map(PqAggregates::Gossipsub)
+                    .map_err(|_| invalid())
+            }
+        }
+        crate::beacon::BodyEncoding::Ssz => {
+            use libssz::SszDecode as _;
+            Vec::<pq::SignedAggregateAndProof>::from_ssz_bytes(body)
+                .map(PqAggregates::Gossipsub)
+                .or_else(|_| {
+                    Vec::<pq::SignedPqAggregate>::from_ssz_bytes(body).map(PqAggregates::Waggle)
+                })
+                .map_err(|_| invalid())
+        }
+    }
+}
+
+/// [`post_pq_aggregate_and_proofs`] for aggregates to broadcast over Waggle:
+/// each header is judged as a peer's is when its first chunk arrives, then
+/// its proof as once every chunk is held, and the network actor splits the
+/// proof into chunks and disseminates them. Lighthouse publishes them the
+/// same way, and never on gossipsub.
+fn post_waggle_aggregates(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    aggregates: Vec<ethlambda_types::beacon::containers::pq::SignedPqAggregate>,
+    now_ms: u64,
+) -> Response {
+    use ethlambda_state_transition::beacon::gossip::pq as pq_gossip;
+    let mut failures = Vec::new();
+    for (index, signed) in aggregates.into_iter().enumerate() {
+        let header = &signed.signed_aggregate_header.message;
+        let (slot, aggregator) = (header.aggregate.data.slot, header.aggregator_index);
+        let checked =
+            pq_gossip::aggregate_header_checks(store, &signed.signed_aggregate_header, now_ms)
+                .and_then(|checked| {
+                    match pq_gossip::aggregate_proof_checks(&checked, &signed.proof) {
+                        Outcome::Accept => Ok(checked),
+                        outcome => Err(outcome),
+                    }
+                })
+                .map_err(|outcome| format!("{outcome:?}"));
+        let published = checked.and_then(|checked| {
+            p2p.publish_pq_waggle_aggregate(
+                signed,
+                checked.committee_index,
+                checked.attesting_indices,
+            )
+            .map_err(|_| "the network actor is not running".to_string())
+        });
+        match published {
+            Ok(()) => debug!(%slot, aggregator, "Accepted a PQ aggregate for Waggle"),
             Err(message) => {
                 warn!(%slot, aggregator, reason = %message, "Refused a submitted PQ aggregate");
                 failures.push(Failure {
@@ -780,6 +885,81 @@ mod tests {
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint, Fork};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
+
+    /// A PQ aggregate in each of `aggregate_and_proofs`' two PQ shapes.
+    fn pq_aggregates() -> (
+        ethlambda_types::beacon::containers::pq::SignedAggregateAndProof,
+        ethlambda_types::beacon::containers::pq::SignedPqAggregate,
+    ) {
+        use ethlambda_types::beacon::containers::pq;
+        let aggregate = pq::Attestation {
+            aggregation_bits: libssz_types::ProgressiveBitlist::with_length(4),
+            data: Default::default(),
+            committee_bits: Default::default(),
+        };
+        let proof = pq::AttestationProof::try_from(vec![7u8; 300]).expect("fits");
+        let gossipsub = pq::SignedAggregateAndProof {
+            message: pq::AggregateAndProof {
+                aggregator_index: 3,
+                aggregate: aggregate.clone(),
+                proof: proof.clone(),
+            },
+            signature: Default::default(),
+        };
+        let waggle = pq::SignedPqAggregate {
+            signed_aggregate_header: pq::SignedAggregateHeader {
+                message: pq::AggregateHeader {
+                    aggregator_index: 3,
+                    aggregate,
+                    proof_chunks_root: Root::repeat_byte(5),
+                },
+                signature: Default::default(),
+            },
+            proof,
+        };
+        (gossipsub, waggle)
+    }
+
+    fn content_type(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", value.parse().expect("valid header"));
+        headers
+    }
+
+    /// The validator client's shape says the transport: field names in
+    /// JSON, and whichever list the bytes decode as in SSZ.
+    #[test]
+    fn a_pq_submission_is_told_apart_by_its_shape() {
+        use libssz::SszEncode as _;
+        let (gossipsub, waggle) = pq_aggregates();
+        let json = content_type("application/json");
+        let ssz = content_type("application/octet-stream");
+
+        let body = serde_json::to_vec(&[&gossipsub]).expect("serializes");
+        assert!(matches!(
+            decode_pq_aggregates(&json, &body),
+            Ok(PqAggregates::Gossipsub(list)) if list == [gossipsub.clone()]
+        ));
+        let body = serde_json::to_vec(&[&waggle]).expect("serializes");
+        assert!(matches!(
+            decode_pq_aggregates(&json, &body),
+            Ok(PqAggregates::Waggle(list)) if list == [waggle.clone()]
+        ));
+
+        let body = vec![gossipsub.clone()].to_ssz();
+        assert!(matches!(
+            decode_pq_aggregates(&ssz, &body),
+            Ok(PqAggregates::Gossipsub(list)) if list == [gossipsub]
+        ));
+        let body = vec![waggle.clone()].to_ssz();
+        assert!(matches!(
+            decode_pq_aggregates(&ssz, &body),
+            Ok(PqAggregates::Waggle(list)) if list == [waggle]
+        ));
+
+        assert!(decode_pq_aggregates(&json, b"[{\"nope\": 1}]").is_err());
+        assert!(decode_pq_aggregates(&ssz, &[1, 2, 3]).is_err());
+    }
 
     struct Fixture {
         store: Store,

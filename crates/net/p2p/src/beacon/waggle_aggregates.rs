@@ -457,9 +457,7 @@ pub(crate) enum AggregateDisseminationMessage {
         connection_id: ConnectionId,
         sender: PieceSender,
     },
-    /// An aggregate of a local aggregator, to publish. Sent once local
-    /// aggregates are published over Waggle.
-    #[allow(dead_code)]
+    /// An aggregate of a local aggregator, to publish.
     NewAggregate(NewAggregate),
     /// The beacon processor checked the header of the aggregate `id`, which `peer_id` sent.
     HeaderVerified {

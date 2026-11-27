@@ -12,7 +12,7 @@ use ethlambda_types::{
         gloas::{PayloadAttestationMessage, SignedExecutionPayloadBid, SignedProposerPreferences},
         pq::{
             PayloadAttestationMessage as PqPayloadAttestationMessage,
-            SignedAggregateAndProof as PqSignedAggregateAndProof,
+            SignedAggregateAndProof as PqSignedAggregateAndProof, SignedPqAggregate,
             SignedProposerPreferences as PqSignedProposerPreferences,
             SingleAttestation as PqSingleAttestation,
         },
@@ -491,6 +491,18 @@ pub trait RpcToP2P: Send + Sync {
     /// what fork choice reads to the chain actor, since gossip never delivers
     /// a node its own messages.
     fn publish_pq_gossip(&self, object: PqGossipObject) -> Result<(), ActorError>;
+    /// Broadcast one of a validator client's PQ aggregates over Waggle rather
+    /// than gossipsub: its signed header and the proof the header commits to,
+    /// both already checked by the caller, with the committee and attesters
+    /// those checks resolved. The network splits the proof into chunks for
+    /// the aggregate topic's dissemination service, and hands the aggregate to
+    /// the chain actor as [`Self::publish_pq_gossip`] does.
+    fn publish_pq_waggle_aggregate(
+        &self,
+        aggregate: SignedPqAggregate,
+        committee_index: u64,
+        attesting_indices: Vec<ValidatorIndex>,
+    ) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.

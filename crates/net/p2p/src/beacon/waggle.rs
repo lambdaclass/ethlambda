@@ -30,13 +30,15 @@ use ethlambda_state_transition::beacon::gossip::pq::{
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_storage::{Store, pools::PooledPqAggregate};
 use ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
-use ethlambda_types::beacon::containers::pq::{AttestationProof, SignedAggregateHeader};
+use ethlambda_types::beacon::containers::pq::{
+    AttestationProof, SignedAggregateHeader, SignedPqAggregate,
+};
 use ethlambda_types::beacon::containers::proof_chunks::{
-    AggregateId, AggregatePiece, ProofChunk, proof_from_chunks,
+    AggregateId, AggregatePiece, ProofChunk, build_proof_chunks, proof_from_chunks,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::{ForkDigest, Slot, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{CommitteeIndex, ForkDigest, Slot, ValidatorIndex};
 use ethlambda_types::time::unix_now_ms;
 use libp2p::PeerId;
 use libp2p::swarm::ConnectionId;
@@ -51,8 +53,8 @@ use super::topics::{BEACON_AGGREGATE_AND_PROOF, topic_name};
 use super::verdict::guarded;
 use super::waggle_aggregates::{
     AggregateDisseminationMessage, AggregateDisseminationService, AggregateOutcome,
-    HeaderRejection, Host, HostError, PeerPenalties, Penalty, time_to_next_tracking_window,
-    tracked_slots,
+    HeaderRejection, Host, HostError, NewAggregate, PeerPenalties, Penalty,
+    time_to_next_tracking_window, tracked_slots,
 };
 use crate::swarm_adapter::SwarmHandle;
 use crate::waggle::{self as transport, PieceSender};
@@ -222,6 +224,79 @@ pub(crate) fn on_event(server: &mut P2PServer, event: transport::Event) {
             }
         }
     }
+}
+
+/// Disseminate a validator client's aggregate, whose header and proof the
+/// Beacon API checked, on the Waggle topic of its slot's digest: its proof
+/// split into chunks for that topic's service, which pushes them to peers and
+/// sends the header along with the first. The aggregate is recorded as seen
+/// and handed on as a peer's accepted one is, since Waggle never brings a
+/// node its own aggregate back. One the seen cache already covers is not
+/// published, as peers would ignore it (Lighthouse's rule).
+pub(crate) fn publish(
+    server: &mut P2PServer,
+    aggregate: SignedPqAggregate,
+    committee_index: CommitteeIndex,
+    attesting_indices: Vec<ValidatorIndex>,
+) {
+    let SignedPqAggregate {
+        signed_aggregate_header,
+        proof,
+    } = aggregate;
+    let header = CheckedHeader::proven(signed_aggregate_header, committee_index, attesting_indices);
+    let (slot, aggregator_index) = (header.aggregate().data.slot, header.aggregator_index());
+    let Some(digest) = server
+        .wire
+        .beacon()
+        .and_then(|beacon| beacon.publish_digest(slot))
+    else {
+        warn!(
+            slot,
+            aggregator_index, "No held fork digest covers this aggregate's slot; not publishing"
+        );
+        return;
+    };
+    let Some(service) = server.waggle.services.get(&digest) else {
+        warn!(
+            slot,
+            aggregator_index,
+            fork_digest = %hex::encode(digest),
+            "No Waggle aggregate topic for this aggregate's digest; not publishing"
+        );
+        return;
+    };
+    let chunks = match build_proof_chunks(&proof) {
+        Ok((chunks, _)) => chunks.into_iter().map(Arc::new).collect(),
+        Err(err) => {
+            warn!(slot, aggregator_index, %err, "Could not split an aggregate's proof into chunks");
+            return;
+        }
+    };
+    if !server
+        .seen_aggregates
+        .record_parts(&header.seen_key(), &header.aggregation_bits())
+    {
+        debug!(
+            slot,
+            aggregator_index, "Aggregate already seen; not publishing it over Waggle"
+        );
+        return;
+    }
+    let header = Arc::new(header);
+    let message = AggregateDisseminationMessage::NewAggregate(NewAggregate {
+        header: header.clone(),
+        chunks,
+    });
+    match service.messages.try_send(message) {
+        Ok(()) => debug!(
+            slot,
+            aggregator_index, "Publishing an aggregate over Waggle"
+        ),
+        Err(err) => {
+            warn!(slot, aggregator_index, %err, "Waggle service mailbox full; aggregate not published")
+        }
+    }
+    hand_on(server, &header, proof, StdInstant::now());
 }
 
 /// [`Host`] for a running node.
@@ -546,6 +621,82 @@ mod tests {
         assert_eq!(
             topic_id(digest),
             b"/eth2/abcd0102/beacon_aggregate_and_proof/ssz_snappy".to_vec()
+        );
+    }
+
+    /// A validator client's aggregate goes to its digest's service as all 64
+    /// chunks of its proof, in order, under the header it was posted with, and
+    /// into the aggregate pool; posted again, it is seen and not published.
+    #[tokio::test]
+    async fn a_published_aggregate_reaches_its_topics_service_once() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::containers::pq::{AggregateHeader, Attestation};
+        use ethlambda_types::beacon::containers::proof_chunks::{
+            TOTAL_PROOF_CHUNKS, compute_proof_chunks_root,
+        };
+        use libssz_types::ProgressiveBitlist;
+
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Eip8483, 0)
+            .with_fork_epoch(ForkName::Pq, 0);
+        let mut server = crate::test_support::unconnected_beacon_server(config, 0).await;
+        let slot = 3;
+        // The test server holds a placeholder digest; hold the slot's own.
+        let Wire::Beacon(wire) = &mut server.wire else {
+            panic!("a beacon server");
+        };
+        let digest = wire.digest_for_slot(slot);
+        wire.fork_digest = digest;
+        wire.topics.fork_digest = digest;
+        let (messages, mut mailbox) = mpsc::channel(8);
+        let (stop, _stopped) = oneshot::channel();
+        server.waggle.services.insert(
+            digest,
+            Service {
+                messages,
+                _stop: stop,
+            },
+        );
+
+        let proof = AttestationProof::try_from((0..5_000).map(|i| i as u8).collect::<Vec<_>>())
+            .expect("fits");
+        let mut aggregate = Attestation {
+            aggregation_bits: ProgressiveBitlist::with_length(4),
+            data: Default::default(),
+            committee_bits: Default::default(),
+        };
+        aggregate.data.slot = slot;
+        let header = AggregateHeader {
+            aggregator_index: 7,
+            aggregate,
+            proof_chunks_root: compute_proof_chunks_root(&proof).expect("splits"),
+        };
+        let posted = SignedPqAggregate {
+            signed_aggregate_header: SignedAggregateHeader {
+                message: header.clone(),
+                signature: Default::default(),
+            },
+            proof,
+        };
+
+        publish(&mut server, posted.clone(), 0, vec![1, 2]);
+        let Ok(AggregateDisseminationMessage::NewAggregate(new)) = mailbox.try_recv() else {
+            panic!("the service is handed the aggregate");
+        };
+        assert_eq!(new.header.signed_header.message, header);
+        assert_eq!(new.header.attesting_indices, vec![1, 2]);
+        assert_eq!(new.chunks.len(), TOTAL_PROOF_CHUNKS);
+        for (index, chunk) in new.chunks.iter().enumerate() {
+            assert_eq!(chunk.index as usize, index);
+            assert!(chunk.verify_inclusion_proof(header.proof_chunks_root));
+        }
+        assert_eq!(server.store.pq_aggregate_pool().len(), 1);
+
+        publish(&mut server, posted, 0, vec![1, 2]);
+        assert!(
+            mailbox.try_recv().is_err(),
+            "a seen aggregate is not published"
         );
     }
 

@@ -9,7 +9,7 @@ use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
-use ethlambda_validator::{BuilderProposals, ValidatorConfig};
+use ethlambda_validator::{BuilderProposals, PqAggregateTransport, ValidatorConfig};
 use eyre::WrapErr as _;
 
 use crate::shutdown::ShutdownSignals;
@@ -206,6 +206,19 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) xmss_cache_url: Option<String>,
 
+    /// How the validators' PQ aggregates are broadcast, on a network that
+    /// schedules the PQ fork: `gossipsub` signs the `AggregateAndProof` and
+    /// gossips it with its proof (the pq-devnet-0 specification); `waggle`
+    /// signs the `AggregateHeader`, which commits to the proof's chunks, and
+    /// the beacon node broadcasts the proof in chunks over Waggle (what
+    /// Lighthouse's `pq-devnet-0-waggle` does).
+    ///
+    /// One or the other, never both: an aggregator signs once per slot, at
+    /// the slot's one aggregate leaf. Either way the beacon node hears
+    /// aggregates on both.
+    #[arg(long, value_enum, default_value_t = PqAggregateTransportArg::Gossipsub)]
+    pub(crate) pq_aggregate_transport: PqAggregateTransportArg,
+
     /// Read no beacon node's event stream: every attestation and sync
     /// committee message waits for its offset into the slot, and every
     /// payload timeliness committee vote for its deadline, even when the
@@ -216,6 +229,22 @@ pub(crate) struct ValidatorOptions {
     /// broken, or a proxy in front of it that holds events back.
     #[arg(long, default_value = "false")]
     pub(crate) disable_event_stream: bool,
+}
+
+/// `--pq-aggregate-transport`'s values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PqAggregateTransportArg {
+    Gossipsub,
+    Waggle,
+}
+
+impl From<PqAggregateTransportArg> for PqAggregateTransport {
+    fn from(arg: PqAggregateTransportArg) -> Self {
+        match arg {
+            PqAggregateTransportArg::Gossipsub => Self::Gossipsub,
+            PqAggregateTransportArg::Waggle => Self::Waggle,
+        }
+    }
 }
 
 impl ValidatorOptions {
@@ -336,6 +365,7 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         doppelganger_protection: options.enable_doppelganger_protection,
         vrf_state_url: options.vrf_state_url,
         xmss_cache_url: options.xmss_cache_url,
+        pq_aggregate_transport: options.pq_aggregate_transport.into(),
         event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, stop)
@@ -368,6 +398,7 @@ mod tests {
             enable_doppelganger_protection: false,
             vrf_state_url: None,
             xmss_cache_url: None,
+            pq_aggregate_transport: PqAggregateTransportArg::Gossipsub,
             disable_event_stream: false,
         }
     }

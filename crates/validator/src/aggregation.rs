@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::proof_chunks::compute_proof_chunks_root;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, BlsSignature, HashTreeRoot as _, Slot};
@@ -50,6 +51,32 @@ use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::{AggregateAndProofRef, SigningContext, sign_all};
 
+/// What a PQ aggregator signs, held between building it and signing it.
+enum PqMessage {
+    Gossipsub(ethlambda_types::beacon::containers::pq::AggregateAndProof),
+    Waggle {
+        header: ethlambda_types::beacon::containers::pq::AggregateHeader,
+        proof: ethlambda_types::beacon::containers::pq::AttestationProof,
+    },
+}
+
+impl PqMessage {
+    /// The root the aggregator's signature is over.
+    fn root(&self) -> ethlambda_types::beacon::primitives::Root {
+        match self {
+            Self::Gossipsub(message) => message.hash_tree_root(),
+            Self::Waggle { header, .. } => header.hash_tree_root(),
+        }
+    }
+
+    fn aggregator_index(&self) -> u64 {
+        match self {
+            Self::Gossipsub(message) => message.aggregator_index,
+            Self::Waggle { header, .. } => header.aggregator_index,
+        }
+    }
+}
+
 /// An `AggregateAndProof` of either fork, held between building it and
 /// signing it.
 enum Wrapper {
@@ -57,9 +84,29 @@ enum Wrapper {
     Gloas(gloas::AggregateAndProof),
 }
 
+/// How a PQ aggregate is broadcast, which decides what its aggregator signs.
+///
+/// An aggregator signs once per slot, at the slot's one aggregate leaf, so it
+/// signs one of the two containers and never both: signing a second message
+/// at a leanXMSS leaf breaks the key's security. The beacon node takes either
+/// shape on `aggregate_and_proofs` and broadcasts it on the matching
+/// transport, and hears aggregates on both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PqAggregateTransport {
+    /// The `AggregateAndProof`, with the proof, gossiped on
+    /// `beacon_aggregate_and_proof` (the pq-devnet-0 specification).
+    #[default]
+    Gossipsub,
+    /// The `AggregateHeader`, committing to the proof's chunks, with the proof
+    /// broadcast in chunks over Waggle (the "Fast leanVM Proof Broadcast"
+    /// draft EIP, Lighthouse's `pq-devnet-0-waggle`).
+    Waggle,
+}
+
 pub struct AggregationService<B> {
     beacon_node: Arc<B>,
     context: Arc<SigningContext>,
+    pq_transport: PqAggregateTransport,
 }
 
 impl<B: BeaconNodeApi> AggregationService<B> {
@@ -75,7 +122,14 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         Self {
             beacon_node,
             context,
+            pq_transport: PqAggregateTransport::default(),
         }
+    }
+
+    /// Broadcast PQ aggregates on `transport`.
+    pub fn with_pq_transport(mut self, transport: PqAggregateTransport) -> Self {
+        self.pq_transport = transport;
+        self
     }
 
     /// Publish an aggregate for every duty at `slot` this client was selected
@@ -93,7 +147,10 @@ impl<B: BeaconNodeApi> AggregationService<B> {
     /// with leanXMSS at the slot's aggregate leaf (PQ `validator.md`,
     /// "Broadcast aggregate"). There is no selection proof, and the proof of
     /// the attesters' signatures is the node's: it collects them and proves
-    /// ahead, since proving takes seconds.
+    /// ahead, since proving takes seconds. On [`PqAggregateTransport::Waggle`]
+    /// the wrapper is the `AggregateHeader`, which commits to the proof's
+    /// chunks in place of the proof, and the proof is posted beside it for the
+    /// node to split. Either is signed at the same leaf under the same domain.
     pub async fn aggregate_pq(
         &self,
         slot: Slot,
@@ -155,14 +212,16 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                     continue;
                 }
             };
-            let message = pq::AggregateAndProof {
-                aggregator_index: duty.validator_index,
-                aggregate: proven.aggregate.clone(),
-                proof: proven.proof.clone(),
+            let message = match self.pq_message(duty.validator_index, proven) {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!(%slot, validator = duty.validator_index, %err, "Could not build a PQ aggregate");
+                    continue;
+                }
             };
             let root = self
                 .context
-                .aggregate_and_proof_signing_root(message.hash_tree_root(), slot);
+                .aggregate_and_proof_signing_root(message.root(), slot);
             let leaf = crate::pq::slot_leaf(slot, LEAF_OFFSET_AGGREGATE_AND_PROOF);
             let request = crate::pq::SignRequest { pubkey, leaf, root };
             owed.push((message, request));
@@ -170,24 +229,73 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         // Signed together, in parallel off this task.
         let requests = owed.iter().map(|(_, request)| *request).collect();
         let signatures = crate::pq::sign_all(requests).await;
-        let mut signed = Vec::with_capacity(owed.len());
+        let mut gossipsub = Vec::new();
+        let mut waggle = Vec::new();
         for ((message, _), signature) in owed.into_iter().zip(signatures) {
-            match signature {
-                Ok(signature) => signed.push(pq::SignedAggregateAndProof { message, signature }),
-                Err(err) => {
-                    let validator = message.aggregator_index;
+            match (message, signature) {
+                (PqMessage::Gossipsub(message), Ok(signature)) => {
+                    gossipsub.push(pq::SignedAggregateAndProof { message, signature })
+                }
+                (PqMessage::Waggle { header, proof }, Ok(signature)) => {
+                    waggle.push(pq::SignedPqAggregate {
+                        signed_aggregate_header: pq::SignedAggregateHeader {
+                            message: header,
+                            signature,
+                        },
+                        proof,
+                    })
+                }
+                (message, Err(err)) => {
+                    let validator = message.aggregator_index();
                     warn!(%slot, validator, %err, "Failed to sign a PQ aggregate");
                 }
             }
         }
-        if signed.is_empty() {
+        let count = gossipsub.len() + waggle.len();
+        if count == 0 {
             return Ok(0);
         }
-        let count = signed.len();
-        self.beacon_node.publish_pq_aggregates(&signed).await?;
-        info!(%slot, count, "Published PQ aggregates");
+        if !gossipsub.is_empty() {
+            self.beacon_node.publish_pq_aggregates(&gossipsub).await?;
+        }
+        if !waggle.is_empty() {
+            self.beacon_node
+                .publish_pq_waggle_aggregates(&waggle)
+                .await?;
+        }
+        info!(%slot, count, transport = ?self.pq_transport, "Published PQ aggregates");
         crate::metrics::inc_aggregates_published(count as u64);
         Ok(count)
+    }
+
+    /// What `aggregator_index` signs for `proven` on this client's transport.
+    fn pq_message(
+        &self,
+        aggregator_index: u64,
+        proven: &ethlambda_types::beacon::containers::pq::ProvenAggregate,
+    ) -> Result<PqMessage> {
+        use ethlambda_types::beacon::containers::pq;
+        Ok(match self.pq_transport {
+            PqAggregateTransport::Gossipsub => PqMessage::Gossipsub(pq::AggregateAndProof {
+                aggregator_index,
+                aggregate: proven.aggregate.clone(),
+                proof: proven.proof.clone(),
+            }),
+            PqAggregateTransport::Waggle => {
+                let proof_chunks_root =
+                    compute_proof_chunks_root(&proven.proof).map_err(|err| {
+                        Error::InconsistentResponse(format!("the node's PQ proof: {err}"))
+                    })?;
+                PqMessage::Waggle {
+                    header: pq::AggregateHeader {
+                        aggregator_index,
+                        aggregate: proven.aggregate.clone(),
+                        proof_chunks_root,
+                    },
+                    proof: proven.proof.clone(),
+                }
+            }
+        })
     }
 
     pub async fn aggregate(
@@ -658,6 +766,47 @@ mod tests {
 
         assert_eq!(published, 0);
         assert!(node.published_aggregates().is_empty());
+    }
+
+    /// On Waggle the aggregator signs the `AggregateHeader`, committing to
+    /// the proof's chunks, and posts the proof beside it; on gossipsub it
+    /// signs the `AggregateAndProof`. The two roots differ, so the one leaf
+    /// signs one or the other.
+    #[test]
+    fn a_waggle_aggregator_signs_the_header_over_the_proofs_chunks() {
+        use ethlambda_types::beacon::containers::pq;
+        let proven = pq::ProvenAggregate {
+            aggregate: pq::Attestation {
+                aggregation_bits: libssz_types::ProgressiveBitlist::with_length(4),
+                data: Default::default(),
+                committee_bits: Default::default(),
+            },
+            proof: pq::AttestationProof::try_from(vec![3u8; 1_000]).expect("fits"),
+        };
+        let node = Arc::new(MockBeaconNode::new());
+        let gossipsub = AggregationService::new(node.clone(), context())
+            .pq_message(7, &proven)
+            .expect("builds");
+        let waggle = AggregationService::new(node, context())
+            .with_pq_transport(PqAggregateTransport::Waggle)
+            .pq_message(7, &proven)
+            .expect("builds");
+
+        let PqMessage::Gossipsub(message) = &gossipsub else {
+            panic!("gossipsub signs the AggregateAndProof");
+        };
+        assert_eq!(message.proof, proven.proof);
+        let PqMessage::Waggle { header, proof } = &waggle else {
+            panic!("waggle signs the AggregateHeader");
+        };
+        assert_eq!(header.aggregator_index, 7);
+        assert_eq!(header.aggregate, proven.aggregate);
+        assert_eq!(
+            header.proof_chunks_root,
+            compute_proof_chunks_root(&proven.proof).expect("splits")
+        );
+        assert_eq!(*proof, proven.proof);
+        assert_ne!(gossipsub.root(), waggle.root());
     }
 
     #[tokio::test]
