@@ -62,7 +62,10 @@ use ethlambda_state_transition::beacon::{
     },
     bls,
     builder_market::SharedBuilderMarket,
-    fork_choice::{gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs},
+    fork_choice::{
+        gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs,
+        is_proposer_equivocation,
+    },
     gloas_block_production::{
         GloasBidBlockInputs, GloasBlockInputs, GloasPayloadInputs, GloasProduced,
         assemble_gloas_block, assemble_gloas_block_on_bid, bid_is_includable,
@@ -72,8 +75,9 @@ use ethlambda_state_transition::beacon::{
     helpers::{accessors::get_domain, misc::compute_signing_root},
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::{
+        ExecutionEngine,
         block::{BlockProcessingOptions, RandaoVerification},
-        gloas::verify_execution_payload_envelope_signature,
+        gloas::{verify_execution_payload_envelope, verify_execution_payload_envelope_signature},
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
@@ -1092,7 +1096,42 @@ async fn wait_for_block(
     }
 }
 
-/// `POST /eth/v1/beacon/execution_payload_envelopes`, SSZ only.
+/// `broadcast_validation` on the envelope POST: how much is checked before
+/// anything is broadcast. A failure at the requested level is a `400`, and
+/// nothing goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EnvelopeValidation {
+    /// The default: the checks below, which are the topic's gossip rules for
+    /// an envelope this node's own block names, plus its data columns.
+    Gossip,
+    /// Also `verify_execution_payload_envelope` against the block's
+    /// post-state, every field and the execution requests included. The
+    /// execution client's verdict is left to the import, which runs anyway.
+    Consensus,
+    /// Also refuse an envelope whose block's proposer published another block
+    /// for the slot that this node holds, the builders' guard against a
+    /// proposer that equivocates to unbundle a revealed payload.
+    ConsensusAndEquivocation,
+}
+
+impl EnvelopeValidation {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value {
+            None | Some("gossip") => Ok(Self::Gossip),
+            Some("consensus") => Ok(Self::Consensus),
+            Some("consensus_and_equivocation") => Ok(Self::ConsensusAndEquivocation),
+            Some(_) => Err(ApiError::BadRequest("invalid broadcast_validation")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvelopeQuery {
+    broadcast_validation: Option<String>,
+}
+
+/// `POST /eth/v1/beacon/execution_payload_envelopes`, JSON or SSZ by
+/// `Content-Type`.
 ///
 /// The envelope must fulfill the bid of a gloas block this node holds (waiting
 /// briefly for the block, see [`BLOCK_WAIT`]), carry the proposer's signature
@@ -1100,15 +1139,21 @@ async fn wait_for_block(
 /// from the body (`Eth-Blob-Data-Included: true`) or from what
 /// `produceBlockV4` cached (`false`). The data columns are built from the
 /// blobs, checked against the bid's commitments, and gossiped with the
-/// envelope.
+/// envelope. `broadcast_validation` adds the consensus checks, and the
+/// equivocation check after them (see [`EnvelopeValidation`]).
 async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
     Extension(cache): Extension<PayloadCache>,
     events: Option<Extension<EventBus>>,
+    Query(query): Query<EnvelopeQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let validation = match EnvelopeValidation::parse(query.broadcast_validation.as_deref()) {
+        Ok(validation) => validation,
+        Err(err) => return err.into_response(),
+    };
     post_envelope_emitting(
         &store,
         &p2p,
@@ -1117,6 +1162,7 @@ async fn post_envelope(
         &headers,
         &body,
         BLOCK_WAIT,
+        validation,
     )
     .await
 }
@@ -1131,9 +1177,20 @@ async fn post_envelope_waiting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
-    post_envelope_emitting(store, p2p, cache, None, headers, body, block_wait).await
+    post_envelope_emitting(
+        store,
+        p2p,
+        cache,
+        None,
+        headers,
+        body,
+        block_wait,
+        EnvelopeValidation::Gossip,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn post_envelope_emitting(
     store: &Store,
     p2p: &RpcToP2PRef,
@@ -1142,6 +1199,7 @@ async fn post_envelope_emitting(
     headers: &HeaderMap,
     body: &[u8],
     block_wait: Duration,
+    validation: EnvelopeValidation,
 ) -> Response {
     if consensus_version(headers) != Some(ForkName::Gloas) {
         return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
@@ -1231,11 +1289,31 @@ async fn post_envelope_emitting(
     // Signature and the columns' proofs are CPU-bound; off the runtime.
     let commitments: Vec<_> = bid.blob_kzg_commitments.iter().copied().collect();
     let envelope_for_check = signed.clone();
+    let (store_for_check, config) = (store.clone(), store.config());
     let checked = tokio::task::spawn_blocking(move || {
         if !verify_execution_payload_envelope_signature(&post_state, &envelope_for_check)
             .map_err(|_| ApiError::BadRequest("the envelope's signer is unknown"))?
         {
             return Err(ApiError::BadRequest("invalid envelope signature"));
+        }
+        if validation >= EnvelopeValidation::Consensus {
+            verify_execution_payload_envelope(
+                &post_state,
+                &envelope_for_check,
+                &config,
+                &ExecutionEngine::valid(),
+            )
+            .map_err(|_| ApiError::BadRequest("the envelope fails the consensus checks"))?;
+        }
+        if validation >= EnvelopeValidation::ConsensusAndEquivocation {
+            let index = store_for_check.block_index();
+            let equivocation = is_proposer_equivocation(&store_for_check, &index, block_root)
+                .map_err(|_| ApiError::Internal("the equivocation check failed"))?;
+            if equivocation {
+                return Err(ApiError::BadRequest(
+                    "the envelope's block is an equivocation",
+                ));
+            }
         }
         let sidecars = if blobs.is_empty() {
             Vec::new()
@@ -1884,6 +1962,92 @@ mod tests {
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].0, signed);
         assert!(published[0].1.is_empty());
+    }
+
+    #[test]
+    fn broadcast_validation_names_three_levels_and_defaults_to_gossip() {
+        assert_eq!(
+            EnvelopeValidation::parse(None).unwrap(),
+            EnvelopeValidation::Gossip
+        );
+        for (name, level) in [
+            ("gossip", EnvelopeValidation::Gossip),
+            ("consensus", EnvelopeValidation::Consensus),
+            (
+                "consensus_and_equivocation",
+                EnvelopeValidation::ConsensusAndEquivocation,
+            ),
+        ] {
+            assert_eq!(EnvelopeValidation::parse(Some(name)).unwrap(), level);
+        }
+        assert!(EnvelopeValidation::parse(Some("full")).is_err());
+    }
+
+    /// An envelope whose `prev_randao` is not its bid's passes the gossip
+    /// level, which checks the signature and the bid's builder and block
+    /// hash, and is refused, unpublished, at `consensus` and above. A valid
+    /// one passes every level.
+    #[tokio::test]
+    async fn the_consensus_levels_refuse_what_gossip_lets_through() {
+        let state = state_to_build_on();
+        let produced = produced_without_blobs(&state);
+        let signature = sign_block(&state, &produced.block);
+        let (store, _root, post) = store_with_block(&state, &produced, signature);
+        let valid = signed_envelope(&post, &produced);
+        let mut tampered_message = produced.envelope.clone();
+        tampered_message.payload.prev_randao = Bytes32::repeat_byte(9);
+        let tampered = SignedExecutionPayloadEnvelope {
+            signature: sign_envelope(&post, produced.block.proposer_index, &tampered_message),
+            message: tampered_message,
+        };
+
+        let post_at = |signed: &SignedExecutionPayloadEnvelope, level| {
+            let (store, signed) = (store.clone(), signed.clone());
+            async move {
+                let network = Arc::new(RecordingNetwork::default());
+                let p2p: RpcToP2PRef = network.clone();
+                let (headers, body) = envelope_request(Some("false"), signed.to_ssz());
+                let response = post_envelope_emitting(
+                    &store,
+                    &p2p,
+                    &PayloadCache::default(),
+                    None,
+                    &headers,
+                    &body,
+                    Duration::from_millis(100),
+                    level,
+                )
+                .await;
+                let published = network.envelopes.lock().unwrap().len();
+                (response.status(), published)
+            }
+        };
+
+        for level in [
+            EnvelopeValidation::Gossip,
+            EnvelopeValidation::Consensus,
+            EnvelopeValidation::ConsensusAndEquivocation,
+        ] {
+            assert_eq!(
+                post_at(&valid, level).await,
+                (StatusCode::OK, 1),
+                "{level:?}"
+            );
+        }
+        assert_eq!(
+            post_at(&tampered, EnvelopeValidation::Gossip).await,
+            (StatusCode::OK, 1)
+        );
+        for level in [
+            EnvelopeValidation::Consensus,
+            EnvelopeValidation::ConsensusAndEquivocation,
+        ] {
+            assert_eq!(
+                post_at(&tampered, level).await,
+                (StatusCode::BAD_REQUEST, 0),
+                "{level:?}"
+            );
+        }
     }
 
     #[tokio::test]

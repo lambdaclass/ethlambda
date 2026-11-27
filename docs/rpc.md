@@ -743,7 +743,15 @@ that is a `400` (`unknown block`). The envelope must fulfill the block's bid
 (builder index and block hash), the blobs must match the bid's commitments, the
 signature must verify under `DOMAIN_BEACON_BUILDER` against the block's
 post-state, and every data column built from the blobs must verify against the
-commitments and cell proofs; any failure is a `400`. A success is `200` once the
+commitments and cell proofs; any failure is a `400`. That is the `gossip` level
+of `broadcast_validation`, the default. `?broadcast_validation=consensus` adds
+`verify_execution_payload_envelope` against the block's post-state (every
+payload field against the bid and the state, and the execution requests' root;
+the execution client's verdict is left to the import), and
+`consensus_and_equivocation` then refuses an envelope whose block's proposer
+has another block for the slot in this node's store. A failure at the requested
+level is a `400` and nothing is broadcast; an unknown level is a `400` too. A
+success is `200` once the
 envelope and all `NUMBER_OF_COLUMNS` gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column's
 subnet publishes through gossipsub fanout.
