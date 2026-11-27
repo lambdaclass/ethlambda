@@ -191,9 +191,12 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
 selects the preset the process runs, before anything is decoded against it; a
-missing or unknown one is a hard startup error. The validator client has no
-`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
-reports. Sepolia's config schedules gloas, which this build follows, so
+missing or unknown one is a hard startup error. The validator client adopts
+the preset its beacon node's `/eth/v1/config/spec` reports. With its optional
+`--network`, resolving the network selects that network's `PRESET_BASE`
+first, and only a node reporting the same preset can be the one the client
+adopts it from (see [the chain check](#several-beacon-nodes-the-chain-check)).
+Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
@@ -380,8 +383,27 @@ said, and asks them all again every 2 seconds, as Lighthouse's validator client
 does, rather than exiting: a client started beside its beacon node otherwise
 exits before the node's API is up. Only when every node answered, each with a
 preset this client cannot run on or a spec it cannot read, does startup fail; a
-body that is not JSON at all (a proxy's page while the node boots) is waited out. A
-response without the slot
+body that is not JSON at all (a proxy's page while the node boots) is waited out.
+
+With `--network`, the reference must also be on the network it names, compared
+on the fields that never move over a network's life: `PRESET_BASE`,
+`genesis_time`, `genesis_validators_root`, the slot duration and
+`GENESIS_FORK_VERSION`. A node that differs in one is never the reference and is
+not used, and a node on another network counts as a final answer: when every
+node answered, each on another network, on a preset this client cannot run on,
+or with a spec it cannot read, startup fails naming why each is off; otherwise it
+waits for one on the network. The fork schedule is not held to the network's,
+since the beacon nodes or the network's config (this binary's, for a built-in
+network; the directory's `config.yaml` otherwise) may predate a change to it:
+the client still follows the nodes' schedule (below), and warns once an epoch,
+naming both values, when it differs from the network's config. Nor does the
+network's schedule pick the reference among nodes on the network that disagree
+on a fork: list order does, as without `--network`, since preferring the node
+that matches a stale config would follow the stale schedule and drop the
+upgraded node at the old epoch. Without `--network` the first
+node to answer sets the chain, whatever it is.
+
+A response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
 absent, meaning unscheduled.
@@ -444,6 +466,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check), [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
+| `--network` | none | The network every beacon node must be on: a built-in name (`mainnet`, `sepolia`, `hoodi`, `plataberget`) or a directory of published network files, resolved as `beacon --network` resolves it (a directory's `genesis.ssz` is decoded and its bootnodes file read, at startup). A node on another network (preset, genesis, slot duration or genesis fork version) is not used. Startup fails once every configured node has answered and none is on it, and waits while one has not answered. The fork schedule still comes from the beacon nodes and is only warned about when it differs from the network's, so a rescheduled fork needs the beacon nodes upgraded for the client to follow it. Nor does it pick which node the client starts from, since the network's config may be the stale side. Without it the client runs on the first answering node's chain. See [the chain check](#several-beacon-nodes-the-chain-check) |
 | `--broadcast` | none | Signed messages to send to every beacon node on this client's chain at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
