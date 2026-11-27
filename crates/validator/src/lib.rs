@@ -360,7 +360,7 @@ where
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
         gas_limit = ?config.gas_limit,
-        gas_limit_schedule = ?spec.gas_limit_schedule.entries(),
+        gas_limit_schedule = %chain_check::gas_limit_schedule_text(&spec.gas_limit_schedule),
         "Validator client starting"
     );
 

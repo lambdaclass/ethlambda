@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::config::{Config, GasLimitSchedule};
+use ethlambda_types::beacon::config::{Config, GasLimitSchedule, MAX_GAS_LIMIT_SCHEDULE_ENTRIES};
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::slots_per_epoch;
@@ -57,14 +57,26 @@ fn version_text(version: Version) -> String {
     encode_hex(&version)
 }
 
-/// `[epoch: gas limit, ...]`, for a change line.
-fn gas_limit_schedule_text(schedule: &GasLimitSchedule) -> String {
-    let entries: Vec<String> = schedule
-        .entries()
+/// `[epoch: gas limit, ...]`, for a log line: the change line and the startup
+/// line.
+///
+/// Bounded like every other text a node sends that reaches a log line. A node
+/// can serve a schedule of any length (only a beacon node's own config file is
+/// held to [`MAX_GAS_LIMIT_SCHEDULE_ENTRIES`]), so at most that many entries
+/// are written out and the rest are counted.
+pub(crate) fn gas_limit_schedule_text(schedule: &GasLimitSchedule) -> String {
+    let entries = schedule.entries();
+    let shown: Vec<String> = entries
         .iter()
+        .take(MAX_GAS_LIMIT_SCHEDULE_ENTRIES)
         .map(|entry| format!("{}: {}", entry.epoch, entry.gas_limit))
         .collect();
-    format!("[{}]", entries.join(", "))
+    let rest = entries.len() - shown.len();
+    if rest == 0 {
+        format!("[{}]", shown.join(", "))
+    } else {
+        format!("[{}, ... and {rest} more]", shown.join(", "))
+    }
 }
 
 /// Whether every fork in `config` comes at or after the one before it. An
@@ -898,6 +910,43 @@ mod tests {
         let changed = with_gas_limit_schedule(NOW + 20, 300_000_000);
         let moved = merge(&served, &[(0, changed.clone())], NOW);
         assert_eq!(moved.config.gas_limit_schedule, changed.gas_limit_schedule);
+    }
+
+    /// A node can serve a schedule of any length, and its text goes into the
+    /// change line and the startup line: at most
+    /// `MAX_GAS_LIMIT_SCHEDULE_ENTRIES` entries are written out, the rest
+    /// counted.
+    #[test]
+    fn the_gas_limit_schedule_text_is_bounded() {
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let schedule = |count: u64| -> GasLimitSchedule {
+            let entries = (0..count).map(|epoch| GasLimitScheduleEntry {
+                epoch,
+                gas_limit: 60_000_000,
+            });
+            entries.collect::<Vec<_>>().into()
+        };
+        assert_eq!(gas_limit_schedule_text(&schedule(0)), "[]");
+        assert_eq!(
+            gas_limit_schedule_text(&schedule(2)),
+            "[0: 60000000, 1: 60000000]"
+        );
+
+        let full = gas_limit_schedule_text(&schedule(MAX_GAS_LIMIT_SCHEDULE_ENTRIES as u64));
+        assert!(!full.contains("more"), "{full}");
+
+        let over = gas_limit_schedule_text(&schedule(100_000));
+        let last_shown = format!("{}: 60000000", MAX_GAS_LIMIT_SCHEDULE_ENTRIES - 1);
+        let first_hidden = format!(" {MAX_GAS_LIMIT_SCHEDULE_ENTRIES}: 60000000");
+        let hidden = 100_000 - MAX_GAS_LIMIT_SCHEDULE_ENTRIES;
+        assert!(over.contains(&last_shown), "{over}");
+        assert!(!over.contains(&first_hidden), "{over}");
+        assert!(
+            over.ends_with(&format!(", ... and {hidden} more]")),
+            "{over}"
+        );
+        assert!(over.len() < full.len() + 64, "{} bytes", over.len());
     }
 
     /// A schedule the check swapped into the configuration reaches the
