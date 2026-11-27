@@ -72,8 +72,8 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
 and moves its discv5 admission filter, then publishes again the proposer
-preferences whose earlier publish reached no peer. From gloas on, a slot
-before each boundary, it also gossips the proposer preferences it held back
+preferences whose earlier publish reached no peer. From gloas on, a slot and
+a half before each boundary, it also gossips the proposer preferences it held back
 for the new digest's slots (both under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
