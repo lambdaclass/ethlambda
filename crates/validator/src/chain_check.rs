@@ -1182,29 +1182,19 @@ mod tests {
         );
     }
 
-    /// Two nodes on the named network that disagree on a fork: the second,
-    /// whose schedule is the network's, is the reference, though the first is
-    /// listed ahead of it. With neither on the network's schedule, list order
-    /// decides, as without a network.
+    /// Two nodes on the named network that disagree on a fork: the first
+    /// listed is the reference, though the second's schedule is the
+    /// network's. The network's config may be the stale side (a binary built
+    /// before a reschedule), so it never picks the schedule the client starts
+    /// from; the warning names the difference instead.
     #[tokio::test]
-    async fn a_node_on_the_named_network_and_its_schedule_is_the_preferred_reference() {
+    async fn the_named_networks_schedule_does_not_pick_the_reference() {
         let network = named_network();
         let gloas_at = network.chain.config.fork_epoch(ForkName::Gloas);
-        let stale = Config::mainnet().with_fork_epoch(ForkName::Gloas, NOW + 10);
-        assert_ne!(stale.fork_epoch(ForkName::Gloas), gloas_at);
+        let moved = Config::mainnet().with_fork_epoch(ForkName::Gloas, NOW + 10);
+        assert_ne!(moved.fork_epoch(ForkName::Gloas), gloas_at);
 
-        let fallback = FallbackBeaconNode::new(vec![node().with_spec(stale.clone()), node()]);
-        let chain = fallback
-            .establish_on(Some(&network), |_| Ok(NOW))
-            .await
-            .expect("both nodes are on the network");
-        assert_eq!(chain.config.fork_epoch(ForkName::Gloas), gloas_at);
-
-        let other = Config::mainnet().with_fork_epoch(ForkName::Gloas, NOW + 20);
-        let fallback = FallbackBeaconNode::new(vec![
-            node().with_spec(stale.clone()),
-            node().with_spec(other),
-        ]);
+        let fallback = FallbackBeaconNode::new(vec![node().with_spec(moved), node()]);
         let chain = fallback
             .establish_on(Some(&network), |_| Ok(NOW))
             .await

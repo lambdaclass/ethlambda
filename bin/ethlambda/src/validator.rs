@@ -53,8 +53,9 @@ pub(crate) struct ValidatorOptions {
     /// The fork schedule still comes from the beacon nodes. One that differs
     /// from this network's config is warned about once an epoch, never
     /// refused, so a fork the network schedules or moves needs the beacon
-    /// nodes upgraded for the client to follow it. The network's schedule
-    /// only picks the reference among nodes that disagree.
+    /// nodes upgraded for the client to follow it. Nor does it pick which
+    /// node the client starts from: this binary's copy of the network's
+    /// config may be the stale side.
     #[arg(long)]
     pub(crate) network: Option<String>,
 

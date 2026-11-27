@@ -74,7 +74,6 @@ use crate::beacon_node::{
 };
 use crate::chain_check::{
     ChainId, ExpectedNetwork, Served, first_chain_difference, first_identity_difference,
-    schedule_differences,
 };
 use crate::error::{Error, Result};
 
@@ -595,12 +594,12 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
     ///
     /// The fork schedule is not held to the network's: it may differ while a
     /// change rolls out, and is followed from the nodes as without a network
-    /// (see [`crate::chain_check::warn_if_schedule_differs`]). It only breaks
-    /// a tie: among the nodes on the network, the first that also serves the
-    /// network's schedule is the reference, and the first on the network
-    /// when none does. With the nodes disagreeing on a fork, the named
-    /// network's config is the third opinion, rather than list order alone
-    /// picking the schedule a stale node serves.
+    /// (see [`crate::chain_check::warn_if_schedule_differs`]). Nor does it
+    /// pick the reference among nodes on the network that disagree on a fork:
+    /// the network's config may be the stale side (a binary built before a
+    /// reschedule), and preferring the node that matches it would follow the
+    /// stale schedule and drop the upgraded node at the old epoch. List order
+    /// decides, as without a network, and the warning names the difference.
     pub async fn establish_on(
         &self,
         network: Option<&ExpectedNetwork>,
@@ -612,25 +611,13 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             first_identity_difference(&network.chain, chain)
                 .map(|difference| format!("not on {}: {difference}", network.name))
         };
-        // Whether an answer serves the named network's fork schedule; every
-        // answer does without a network.
-        let on_schedule = |chain: &ChainId| {
-            network.is_none_or(|network| {
-                schedule_differences(&chain.config, &network.chain.config).is_empty()
-            })
-        };
-        let on_network = |answer: &Result<ChainId>| {
-            answer
-                .as_ref()
-                .is_ok_and(|chain| off_network(chain).is_none())
-        };
         let (reference_at, asked) = loop {
             let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
-            let reference_at = asked
-                .iter()
-                .position(|answer| on_network(answer) && answer.as_ref().is_ok_and(&on_schedule))
-                .or_else(|| asked.iter().position(on_network));
-            if let Some(reference_at) = reference_at {
+            if let Some(reference_at) = asked.iter().position(|answer| {
+                answer
+                    .as_ref()
+                    .is_ok_and(|chain| off_network(chain).is_none())
+            }) {
                 break (reference_at, asked);
             }
             let detail = asked
