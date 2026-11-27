@@ -72,9 +72,7 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
 and moves its discv5 admission filter, then publishes again the proposer
-preferences whose earlier publish reached no peer. From gloas on, a slot and
-a half before each boundary, it also gossips the proposer preferences it held back
-for the new digest's slots (both under Gossip). While the window is open a gossip
+preferences whose earlier publish reached no peer (under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
@@ -115,45 +113,36 @@ its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
 
-Peers join that digest when their own client decides to: this node an epoch
-ahead, as Lighthouse does since v8.3.0, but Lighthouse before it only two slots
-before the boundary, and Grandine 2.0.6 five. A message's gossipsub id
+This node joins that digest's topics an epoch ahead, as Lighthouse does since
+v8.3.0 and Prysm does, and so at the same moment as every peer that does: at
+the start of the epoch before the boundary, which is also when the validator
+client sends the next epoch's preferences. The first publish can therefore
+find no peer on the topic yet. So a preference publish waits for a peer, as
+Prysm's does. The market remembers, for each preference this node publishes,
+whether it is still owed a publish (`BuilderMarket::record_preferences_publish`):
+after a publish no peer was handed. One still owed is published again while
+its slot is ahead (`publish_owed_proposer_preferences`):
+
+- when a peer joins a `proposer_preferences` topic (gossipsub's `Subscribed`
+  event, which comes once the peer is counted on the topic);
+- when the validator client sends it again (once an epoch, at the epoch's
+  second-to-last slot, see `docs/cli.md`);
+- at every fork-digest switch. The new digest's first slot has started by
+  then, so its preference is past helping and is left out.
+
+Only a publish that found no peer subscribed can be retried: it left no trace
+in the duplicate cache, so its retry goes out. One refused because every
+peer's queue was full did leave its id there, so its retry is answered as a
+duplicate, which ends the retries.
+
+A preference that reached one peer is not sent again. A message's gossipsub id
 is its topic and payload alone, and gossipsub keeps the id of every message it
 handed to a peer, or received from one, for `seen_ttl` (two epochs) and refuses
-to publish it again until then (`Duplicate`). So a preference gossiped in the
-epoch before the boundary reaches the early joiners only (other ethlambda
-nodes, say) and can never be sent to the late ones, or reaches no peer at all.
-
-The node therefore holds back its own preferences for a slot of the next
-digest (`is_held_back` in `p2p/src/beacon/builder_market.rs`), from gloas on,
-at every digest boundary (a blob-parameter-only one too). They are accepted,
-pooled in the market and reported to the chain actor as usual, and the Beacon
-API answers as it would for any other, but they are not gossiped until
-`PREFERENCES_RELEASE_LEAD_BPS` (a slot and a half) before the boundary, halfway
-through the slot two before it. That is half a slot after the latest join
-(Lighthouse before v8.3.0, at the start of that slot), and half a slot less
-`MAXIMUM_GOSSIP_CLOCK_DISPARITY` before a bid for the boundary's first slot is
-first current or next (`MAXIMUM_GOSSIP_CLOCK_DISPARITY` before the slot ahead
-of the boundary starts). A peer that sees such a bid before the preferences
-ignores it and never takes it again, so the preferences go out with time to
-reach every peer first. At that moment a timer the fork schedule
-arms once the next digest's topics are joined
-(`release_held_proposer_preferences`) publishes every held one, on the new
-digest's topic. Preferences gossip delivers are never held back: gossipsub
-relays them on `Accept` as it does every other message.
-
-The market remembers, for each preference this node publishes, whether it is
-still owed a publish (`BuilderMarket::record_preferences_publish`): while it is
-held back, or after a publish no peer was handed. One still owed is published
-again while its slot is ahead: when the validator client sends it again (once
-an epoch, at the epoch's second-to-last slot, see `docs/cli.md`; a held one
-stays held), at the release, and at every fork-digest switch, when every peer
-following the fork has joined (`publish_owed_proposer_preferences`). The new
-digest's first slot has started by the switch, so its preference is past
-helping there and is left out. Only a publish that found no peer subscribed
-can be retried: it left no trace in the duplicate cache, so its retry goes
-out. One refused because every peer's queue was full did leave its id there,
-so its retry is answered as a duplicate, which ends the retries.
+to publish it again until then (`Duplicate`). Peers that join the topic later
+get it only if a peer already on it relays it to them, which gossip does not
+do for a message older than its gossip window. Lighthouse before v8.3.0 joins
+two slots before the boundary, and Grandine 2.0.6 five, so on a network with
+those they may miss the first epoch's preferences.
 
 A publish of a bid, a preference, an envelope or a payload attestation that no
 peer was handed is logged at `warn` with gossipsub's reason

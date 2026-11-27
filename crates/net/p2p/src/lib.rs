@@ -2076,12 +2076,6 @@ pub(crate) trait P2PProtocol: Send + Sync {
     /// then by its own timer for the next join, switch or leave.
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
-    /// Gossip the proposer preferences held back for the digest that activates
-    /// at `activation_epoch`, a slot and a half before it; see
-    /// [`beacon::builder_market::PREFERENCES_RELEASE_LEAD_BPS`]. Scheduled by
-    /// the fork schedule's run once that digest's topics are joined.
-    #[allow(dead_code)] // invoked via send_after, not called directly
-    fn release_held_proposer_preferences(&self, activation_epoch: u64) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
     /// Re-ask the connected peers that are due for their `Status`; see
@@ -2213,45 +2207,11 @@ impl P2PServer {
         if let Some(delay) = beacon::transition::advance(self) {
             send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
         }
-        // Once the next digest's topics are joined (this run is the join, or a
-        // startup inside the window), the preferences held back for its slots
-        // have a release to wait for.
-        if let Some((activation_epoch, delay)) =
-            beacon::builder_market::next_preferences_release(self)
-        {
-            send_after(
-                delay,
-                ctx.clone(),
-                p2p_protocol::ReleaseHeldProposerPreferences { activation_epoch },
-            );
-        }
         // A switch is when every peer following the fork has joined the new
         // digest's topics, so what reached no peer before can now.
         if self.wire.beacon().map(|wire| wire.fork_digest) != digest {
             beacon::builder_market::publish_owed_proposer_preferences(self).await;
         }
-    }
-
-    #[send_handler]
-    async fn handle_release_held_proposer_preferences(
-        &mut self,
-        msg: p2p_protocol::ReleaseHeldProposerPreferences,
-        ctx: &Context<Self>,
-    ) {
-        let activation_epoch = msg.activation_epoch;
-        // A timer that fires a hair early finds the preferences still held
-        // back; look again when the release has come.
-        if let Some(delay) =
-            beacon::builder_market::until_preferences_release(self, activation_epoch)
-        {
-            send_after(
-                delay,
-                ctx.clone(),
-                p2p_protocol::ReleaseHeldProposerPreferences { activation_epoch },
-            );
-            return;
-        }
-        beacon::builder_market::publish_owed_proposer_preferences(self).await;
     }
 
     #[send_handler]
@@ -3111,6 +3071,15 @@ async fn handle_behaviour_event(
                 message,
             )
             .await;
+        }
+        // A peer joined a proposer_preferences topic: preferences whose
+        // publish found no peer on theirs go out now. This is how a publish
+        // waits for a peer (see `publish_owed_proposer_preferences`).
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Subscribed { topic, .. })
+            if beacon::topics::topic_kind(topic.as_str())
+                == Some(beacon::topics::PROPOSER_PREFERENCES) =>
+        {
+            return beacon::builder_market::publish_owed_proposer_preferences(server).await;
         }
         BehaviourEvent::Gossipsub(_) => return,
         BehaviourEvent::ReqResp(event) => match event {

@@ -435,37 +435,13 @@ from the Beacon API, and no other way.
   separate status for it. The message names the verdict and the reason, such as
   `ignore: preferences_unseen`.
 - **An identical resubmission is a `200`** and is not published again, except
-  preferences this node still owes a publish (no peer was handed them, or they
-  are held back for the next fork digest), which are handed to p2p again while
-  their slot is ahead; p2p holds a held-back one again.
+  preferences this node still owes a publish (no peer was handed them), which
+  are handed to p2p again while their slot is ahead.
 - **The prose and the rules disagree** on a mismatched fee recipient or gas
   limit: the Beacon API text says the bid is rejected, while consensus-specs
   IGNOREs it. ethlambda follows consensus-specs.
 - **`Eth-Consensus-Version` may be absent** on the bid and preferences posts. If
   present it must name a gloas-compatible fork.
-
-## Preferences for the next fork digest are gossiped a slot and a half before its boundary
-
-- **The specification:** the Beacon API broadcasts accepted
-  `SignedProposerPreferences` at once, and `p2p-interface.md` leaves when a
-  node joins the next digest's topics to the client.
-- **ethlambda:** preferences a validator client submits for a slot past the
-  next fork-digest boundary (from gloas on) are validated, pooled, reported
-  to the chain actor and answered at once, but gossiped only a slot and a
-  half before the boundary (`PREFERENCES_RELEASE_LEAD_BPS`). Gossip-delivered
-  preferences are relayed as usual.
-- **Why:** clients join the next digest at different times (this node an epoch
-  ahead, Lighthouse before v8.3.0 two slots ahead), and gossipsub refuses to
-  publish a message again for `seen_ttl` (two epochs) once any peer has it. Gossiped at
-  once, a preference reaches only the early joiners and never the late ones.
-  Halfway through the slot two before the boundary, every client has joined,
-  and a bid for the boundary's first slot, first current or next
-  `MAXIMUM_GOSSIP_CLOCK_DISPARITY` before the slot ahead of it starts, is
-  still half a slot less that disparity away, so the preference reaches
-  peers before it (a peer that saw the bid first would ignore it for good).
-- **Consequence:** an early joiner's builders see the warm-up epoch's
-  preferences only from that moment on, shortly before bids for them start to
-  be gossiped anyway.
 
 ## No minimum bid increment or rate limit
 

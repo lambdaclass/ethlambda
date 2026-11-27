@@ -93,8 +93,7 @@ type PreferencesCache = BTreeMap<(Slot, Root), PooledPreferences>;
 #[derive(Debug)]
 struct PooledPreferences {
     signed: gloas::SignedProposerPreferences,
-    /// Set while this node owes them a publish: p2p held them back for a
-    /// digest whose boundary is still ahead, or its last publish reached no
+    /// Set while this node owes them a publish: its last publish reached no
     /// peer. Cleared once a publish goes out. Never set for preferences gossip
     /// delivered, which peers already relay. Kept with the entry so it is
     /// pruned with it.
@@ -248,8 +247,7 @@ impl BuilderMarket {
     }
 
     /// Records whether `signed` is still owed a gossip publish by this node:
-    /// `owed` when p2p held it back or no peer was handed it, not once a
-    /// publish went out. Applies only to the very message pooled under its
+    /// `owed` when no peer was handed it, not once a publish went out. Applies only to the very message pooled under its
     /// key; one pruned, or other preferences pooled first, are left alone.
     pub fn record_preferences_publish(
         &self,
@@ -656,7 +654,7 @@ mod tests {
         assert!(market.preferences(41, Root::repeat_byte(1)).is_none());
     }
 
-    /// Owed are the preferences held back or whose publish failed, and whose slot is still
+    /// Owed are the preferences whose publish failed and whose slot is still
     /// ahead: a slot that has started is stale, and one that went out is not
     /// owed anything.
     #[test]

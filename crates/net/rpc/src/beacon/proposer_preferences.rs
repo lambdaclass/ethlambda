@@ -1,9 +1,8 @@
 //! `POST /eth/v1/validator/proposer_preferences`: signed proposer preferences
 //! from a validator client, validated with the gossip rules, cached in the
-//! shared `BuilderMarket` and gossiped on `proposer_preferences`. Preferences
-//! for the next fork digest's slots are held back by p2p until a slot and a
-//! half before its boundary, and a re-send of cached preferences whose
-//! publish reached no peer is gossiped again.
+//! shared `BuilderMarket` and gossiped on `proposer_preferences`. A publish
+//! that found no peer on the topic goes out once one joins, and a re-send of
+//! cached preferences whose publish reached no peer is gossiped again.
 //!
 //! Not gated on the sync status: the specification lists no 503, and a node
 //! that lacks the dependent block simply answers `ignore: unknown_block` per
@@ -61,9 +60,9 @@ struct Failure {
 /// dependent block, the proposer the lookahead names, the signature), since a
 /// message that fails them is one every peer would score this node down for
 /// relaying. Valid ones are cached for block production and for the bids judged
-/// against them, then gossiped (those for the next fork digest's slots only a
-/// slot and a half before its boundary, which the answer does not reflect); the others
-/// are reported by position and the rest still go out. An entry already
+/// against them, then gossiped (once a peer is on the topic, which the answer
+/// does not reflect); the others are reported by position and the rest still
+/// go out. An entry already
 /// cached, identical, is a success that is not republished, unless this node
 /// still owes it a publish and its slot is still ahead: then the re-send is
 /// handed to p2p again.
@@ -142,10 +141,9 @@ fn submit(
         // while this copy is being validated.
         if holds(market, &signed) {
             // This node still owes it a publish: its publish reached no peer
-            // (none had joined the topic yet, say), or p2p is holding it back
-            // for the next fork digest, in which case p2p holds it again. The
-            // re-send is a chance to publish it before the next release or
-            // digest switch. Not recorded again, and no second event.
+            // (none had joined the topic yet, say). The re-send is a chance to
+            // publish it before a peer joins or the next digest switch. Not
+            // recorded again, and no second event.
             if market.preferences_publish_owed(&signed) && slot > wall_slot {
                 match p2p.republish_proposer_preferences(signed) {
                     Ok(()) => debug!(
