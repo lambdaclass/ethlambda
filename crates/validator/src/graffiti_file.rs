@@ -87,6 +87,15 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// mount or a FIFO refuses startup naming the file rather than hanging it.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The read timeout of a test that reads a file whole and compares what it
+/// holds ([`GraffitiFile::with_read_timeout`]). Under [`READ_TIMEOUT`], a
+/// loaded test runner can take longer than that to start a thread and read a
+/// temporary file, and the read would then be skipped, so the test would
+/// compare the next source's graffiti. A read that fails answers at once, so
+/// this costs a passing test nothing.
+#[cfg(test)]
+pub(crate) const PATIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Cloneable, so that one read's failure can be every waiting caller's
 /// answer.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -205,6 +214,9 @@ type ReadAnswer = Result<GraffitiTable, GraffitiFileError>;
 #[derive(Debug, Clone)]
 pub struct GraffitiFile {
     path: PathBuf,
+    /// How long [`Self::read`] waits for the file: [`READ_TIMEOUT`], except
+    /// in tests (`with_read_timeout`).
+    read_timeout: Duration,
     /// The read running now, if any, as the channel its answer comes on
     /// (`None` until it does). A caller that comes while it runs waits on it
     /// rather than starting another read, so a stalled file holds one thread.
@@ -220,6 +232,7 @@ impl GraffitiFile {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, GraffitiFileError> {
         let file = Self {
             path: path.into(),
+            read_timeout: READ_TIMEOUT,
             running: Arc::default(),
         };
         let (answer, answered) = std::sync::mpsc::channel();
@@ -243,6 +256,15 @@ impl GraffitiFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This file with [`Self::read`] waiting `read_timeout` rather than
+    /// [`READ_TIMEOUT`]; see [`PATIENT_READ_TIMEOUT`]. Clones share their
+    /// running read, so a clone given another timeout still joins it.
+    #[cfg(test)]
+    pub(crate) fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
     }
 
     /// Read and parse the file on the calling thread, refusing one over
@@ -278,11 +300,12 @@ impl GraffitiFile {
     /// waits on it rather than starting another.
     pub async fn read(&self) -> ReadAnswer {
         let mut answer = self.join_or_start()?;
-        let answered = tokio::time::timeout(READ_TIMEOUT, answer.wait_for(Option::is_some)).await;
+        let answered =
+            tokio::time::timeout(self.read_timeout, answer.wait_for(Option::is_some)).await;
         match answered {
             Ok(Ok(answer)) => answer.clone().expect("waited for an answer"),
             Ok(Err(_)) => Err(self.unanswered()),
-            Err(_) => Err(self.timed_out(READ_TIMEOUT)),
+            Err(_) => Err(self.timed_out(self.read_timeout)),
         }
     }
 
@@ -547,7 +570,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("graffiti.txt");
         std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
-        let file = GraffitiFile::open(&path).expect("opens");
+        let file = GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(PATIENT_READ_TIMEOUT);
         let table = file.read().await.expect("reads");
         assert_eq!(table.graffiti(&key(PK1)), graffiti("mine"));
 
@@ -585,6 +610,7 @@ mod tests {
 
         // What the read's own thread does once it answers.
         *file.running.lock().expect("not poisoned") = None;
+        let file = file.with_read_timeout(PATIENT_READ_TIMEOUT);
         let table = file.read().await.expect("reads");
         assert_eq!(table.graffiti(&key(PK1)), graffiti("mine"));
     }
@@ -596,7 +622,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("graffiti.txt");
         std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
-        let file = GraffitiFile::open(&path).expect("opens");
+        let file = GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(PATIENT_READ_TIMEOUT);
 
         let (answering, answer) = watch::channel(None);
         *file.running.lock().expect("not poisoned") = Some(answer);
@@ -611,7 +639,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("graffiti.txt");
         std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
-        let file = GraffitiFile::open(&path).expect("opens");
+        let file = GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(PATIENT_READ_TIMEOUT);
 
         let reads = (0..8).map(|_| file.read());
         for table in futures_util::future::join_all(reads).await {

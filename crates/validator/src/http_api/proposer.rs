@@ -700,7 +700,11 @@ mod tests {
         let file_path = dir.path().join("graffiti.txt");
         let line = format!("{}: from the file\n", encode_hex(&harness.pubkey.0));
         std::fs::write(&file_path, &line).expect("writes");
-        let file = crate::graffiti_file::GraffitiFile::open(&file_path).expect("opens");
+        // A timeout a loaded runner cannot reach, so a slow read is not
+        // skipped for the next source.
+        let file = crate::graffiti_file::GraffitiFile::open(&file_path)
+            .expect("opens")
+            .with_read_timeout(crate::graffiti_file::PATIENT_READ_TIMEOUT);
         let settings =
             ProposerSettings::new(default_graffiti(), None).with_graffiti_file(Some(file));
         let context = KeymanagerContext {

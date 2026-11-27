@@ -1283,7 +1283,8 @@ mod tests {
     }
 
     /// A graffiti file at a fresh path holding `contents`, and the directory
-    /// that keeps it alive.
+    /// that keeps it alive. Read with a timeout a loaded runner cannot reach,
+    /// so a slow read is not skipped for the next source.
     fn graffiti_file(
         contents: &str,
     ) -> (
@@ -1294,7 +1295,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("graffiti.txt");
         std::fs::write(&path, contents).expect("writes");
-        let file = crate::graffiti_file::GraffitiFile::open(&path).expect("opens");
+        let file = crate::graffiti_file::GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(crate::graffiti_file::PATIENT_READ_TIMEOUT);
         (dir, path, file)
     }
 
