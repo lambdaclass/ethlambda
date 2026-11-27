@@ -75,11 +75,16 @@ default, too.
   image reports `vX.Y.Z-stable-<sha>`. Both run the same code; see
   [`RELEASE.md`](./RELEASE.md#version-string).
 
-To skip payload validation, run the node without ethrex: drop it, the JWT
-secret and the two `--execution-*` flags. The node then follows the chain and
-serves the Beacon API without validating execution payloads, but it cannot
-serve a validator client, since it answers attestation data, aggregation and
-block production requests with `503`.
+To skip payload validation, run the node without ethrex: download
+`ethlambda-minimal-<platform>` in place of `ethlambda-<platform>`, and drop
+ethrex, the JWT secret and the two `--execution-*` flags. The node then follows
+the chain and serves the Beacon API without validating execution payloads, but
+it cannot serve a validator client, since it answers attestation data,
+aggregation and block production requests with `503`. `ethlambda-<platform>`
+would instead start the ethrex it embeds, since no `--execution-endpoint` is
+given. Releases up to v1.0.0 have no `-minimal` binaries, and their
+`ethlambda-<platform>` is the build without ethrex: while v1.0.0 is the latest
+release, keep it.
 
 The first start downloads the finalized state (several hundred MB) and logs
 `Beacon checkpoint sync complete`, then a few minutes of
@@ -173,13 +178,15 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --
 <details>
 <summary>Running without an execution client</summary>
 
-The node without ethrex, as described above: no shared network, no JWT secret
-and no `--execution-*` flags. From the first release after v1.0.0, use the
-`latest-minimal` tag here: `latest` embeds ethrex and starts it when no
-`--execution-endpoint` is given.
+The node without ethrex, as described above: the `latest-minimal` image, no
+shared network, no JWT secret and no `--execution-*` flags. `latest` would
+instead start the ethrex it embeds, since no `--execution-endpoint` is given.
+Releases up to v1.0.0 have no `-minimal` image, and their `latest` is the build
+without ethrex: while v1.0.0 is the latest release, use `latest` in both
+commands.
 
 ```sh
-docker pull ghcr.io/lambdaclass/ethlambda:latest
+docker pull ghcr.io/lambdaclass/ethlambda:latest-minimal
 
 mkdir -p beacon-data
 # This host's public address, published in the node's ENR (see above)
@@ -193,7 +200,7 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
-  ghcr.io/lambdaclass/ethlambda:latest beacon \
+  ghcr.io/lambdaclass/ethlambda:latest-minimal beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
   --data-dir               /data/db \
