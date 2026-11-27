@@ -78,12 +78,15 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         | "gossip_payload_attestation_message"
         | "gossip_execution_payload_bid"
         | "gossip_proposer_preferences" => &[ForkName::Gloas],
-        // Phase0's and capella's rules, which neither fulu nor gloas changes
-        // beyond gloas's `AttesterSlashing` container.
+        // Phase0's and capella's rules as electra leaves them (its
+        // `AttesterSlashing`, its exit domain and its pending-withdrawal exit
+        // rule), which neither fulu nor gloas changes beyond gloas's
+        // `AttesterSlashing` container. `gossip::operations` takes an
+        // electra, fulu or gloas head, so all three forks' vectors run.
         "gossip_voluntary_exit"
         | "gossip_proposer_slashing"
         | "gossip_attester_slashing"
-        | "gossip_bls_to_execution_change" => &[ForkName::Fulu, ForkName::Gloas],
+        | "gossip_bls_to_execution_change" => &[ForkName::Electra, ForkName::Fulu, ForkName::Gloas],
         // Altair's rules, which neither fulu nor gloas changes.
         "gossip_sync_committee_message" | "gossip_sync_committee_contribution_and_proof" => {
             &[ForkName::Fulu, ForkName::Gloas]
@@ -363,6 +366,7 @@ fn rebase_stale_header(state: &mut BeaconState, anchor: &mut SignedBeaconBlock) 
         };
     }
     let header = match anchor {
+        SignedBeaconBlock::Electra(block) => header_of!(block.message),
         SignedBeaconBlock::Fulu(block) => header_of!(block.message),
         SignedBeaconBlock::Gloas(block) => header_of!(block.message),
         _ => return,
@@ -373,6 +377,7 @@ fn rebase_stale_header(state: &mut BeaconState, anchor: &mut SignedBeaconBlock) 
     *state.latest_block_header_mut() = header;
     let state_root = state.hash_tree_root();
     match anchor {
+        SignedBeaconBlock::Electra(block) => block.message.state_root = state_root,
         SignedBeaconBlock::Fulu(block) => block.message.state_root = state_root,
         SignedBeaconBlock::Gloas(block) => block.message.state_root = state_root,
         _ => unreachable!("returned above for every other fork"),
