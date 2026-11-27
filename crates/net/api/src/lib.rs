@@ -52,6 +52,11 @@ pub trait BlockChainToP2P: Send + Sync {
         sidecars: Vec<DataColumnSidecar>,
         origin: SidecarOrigin,
     ) -> Result<(), ActorError>;
+    /// A beacon block's post-state is now cached under `block_root`. The p2p
+    /// layer holds the subnet attestations and aggregates that voted for it
+    /// before it got there, since their checks read that state, and checks
+    /// them again now.
+    fn block_state_ready(&self, block_root: H256) -> Result<(), ActorError>;
 }
 
 /// Where the sidecars handed to [`BlockChainToP2P::check_data_column_sidecars`]

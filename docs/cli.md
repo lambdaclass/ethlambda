@@ -123,6 +123,7 @@ from a normal build.
 | `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | The fewest custody groups this node custodies, advertised as the ENR's `cgc` and `MetaData`'s `custody_group_count`. Validator custody can raise it (see below) |
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
+| `--ethrex.*` | see [Embedded ethrex](./ethrex.md#flags) | Only in a build with the `include-ethrex` feature: configure the ethrex that build runs in-process when `--execution-endpoint` is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers), and are refused together with it |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). With `--execution-endpoint` it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer's signed preferences on gloas, else `--fallback-fee-recipient`, else the zero address. Lighthouse's flag of the same name |
 | `--fallback-fee-recipient` | none | Execution address (20 bytes of hex, `0x` optional) a locally built payload pays when no validator client named a fee recipient for the proposer through `prepare_beacon_proposer` or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: `payload_attributes` events still need `prepare_beacon_proposer` or `--always-prepare-payload`. Lighthouse's beacon-node `--suggested-fee-recipient` |
@@ -176,9 +177,11 @@ it. The ENR's `cgc` keeps its startup value until a restart, the same
 limitation as the fork digest's `eth2` entry (ethrex's `DiscoveryServer`
 cannot replace the record it serves).
 
-With neither execution flag, the follower contacts no execution client and
-imports blocks without validating their payloads, which is what it did before
-those flags existed. It then answers `attestation_data`,
+With neither execution flag, what happens depends on the build. A build with
+the `include-ethrex` feature starts its embedded ethrex and validates payloads
+through it (see [Embedded ethrex](./ethrex.md)). Any other build contacts no
+execution client and imports blocks without validating their payloads, which is
+what it did before those flags existed. It then answers `attestation_data`,
 `aggregate_attestation` and block production with `503`, so a validator
 client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
@@ -228,8 +231,8 @@ does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
 cleanly; none exists today. The keys this
 build runs on compile-time constants for (the custody and subnet counts, the
-`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains and
-`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
+`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains,
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY` and `MIN_TRANSACTION_GAS`) must equal those
 constants, or startup fails naming each key that differs: the node cannot
 follow a network that sets them otherwise, and `/eth/v1/config/spec` would
 report values it does not use. For a directory, both checks run before its
@@ -472,8 +475,15 @@ a node reporting it unscheduled may only be the one not upgraded yet, while the
 upgraded one is restarting. A fork the network cancels therefore needs a
 restart. A node that stops answering loses its say after three slots, so it cannot
 hold a fork at an epoch the network has postponed (unless the postponement comes in
-the fork's last three slots); the duty offsets are still read from the first node
-through a round it misses. A merge that would put a fork before the one it follows
+the fork's last three slots); the duty offsets and the gas limit schedule are still
+read from the first node through a round it misses. Those two identify no chain, so
+no vote is taken: the offsets come from the first node alone, and the gas limit
+schedule from the first node that serves a non-empty one, so a node that leaves the
+key out cannot erase another's. A schedule a node starts serving after startup (a
+Lighthouse node shows `GAS_LIMIT_SCHEDULE` only once gloas is scheduled) becomes the
+default gas limit from the next round on. A schedule the client cannot decode, or one
+that breaks the specification's rules or names a zero gas limit, is ignored with a
+warning rather than costing the client the node. A merge that would put a fork before the one it follows
 is refused whole and warned about. A fork that is already active is never moved: a
 node that reports another epoch or version for it is on another chain.
 The client does not need a restart for a fork the network schedules after it
@@ -500,7 +510,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
-| `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
+| `--gas-limit` | the network's schedule, else `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well. Without it, each validator targets the gas limit the network's `GAS_LIMIT_SCHEDULE` (served on the beacon node's `/eth/v1/config/spec`) names for the proposal's epoch, and `60000000` for an epoch the schedule names none or a node that does not serve it, as Lighthouse does; Sepolia's and Platåberget's schedules name `200000000`, so neither needs the flag. Must be positive |
 | `--graffiti` | none | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. Conflicts with `--graffiti-file`, as in Lighthouse. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. Without it a block request carries no graffiti and the beacon node applies its own default; an ethlambda beacon node appends both clients' versions to whatever the graffiti is (see [`rpc.md`](rpc.md#validator-endpoints)). See [Graffiti](#graffiti) |
 | `--graffiti-file` | none | A file of per-validator graffiti in Lighthouse's format (`default: <text>`, `<0xpubkey>: <text>`), read again before every proposal and ahead of the keymanager API's per-validator graffiti. Conflicts with `--graffiti`, as in Lighthouse. A file that does not parse refuses startup; once running, a bad read logs a warning and the validator's own graffiti applies, else none. See [Graffiti](#graffiti) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
@@ -979,7 +989,8 @@ The slot length and the duty offsets are read from the beacon node's
 `/eth/v1/config/spec`, not divided out of a compiled-in constant. The
 specification states them as `SLOT_DURATION_MS` plus basis points of it,
 `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, which on mainnet's 12-second slot
-work out at 3999 ms and 8000 ms. Gloas moves both earlier
+work out at 4000 ms and 8000 ms, rounded to the nearest millisecond since
+consensus-specs #5756. Gloas moves both earlier
 (`ATTESTATION_DUE_BPS_GLOAS`, `AGGREGATE_DUE_BPS_GLOAS`) and adds
 `PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
 the clock picks the pair by the fork of each slot's own epoch. The sync
@@ -1212,7 +1223,7 @@ give one validator its own value in place of the command line's default:
 |---|---|---|
 | `feerecipient` | `--suggested-fee-recipient` | Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot's duties (the next slot's while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next builder registration carries it too, usually at the next slot (later while the epoch's full registration send is still running) and again every slot until a node accepts it or the epoch's full send carries it, and an ethlambda beacon node takes it from there. A `DELETE` that leaves a validator with no address at all (no `--suggested-fee-recipient` either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on |
 | `graffiti` | `--graffiti` | The next proposal, unless `--graffiti-file` names the key or has a `default` line (see [Graffiti](#graffiti)) |
-| `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
+| `gas_limit` | `--gas-limit`, else the network's schedule | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
 **These persist.** Each is written onto the validator's entry in
 `validator_definitions.yml` (`suggested_fee_recipient`, `graffiti`, `gas_limit`,

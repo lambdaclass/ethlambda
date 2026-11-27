@@ -1,13 +1,14 @@
 //! The Fast Confirmation Rule (FCR), after consensus-specs' `phase0`,
 //! `bellatrix` and `gloas` `fast-confirmation.md`.
 //!
-//! **Spec version: consensus-specs `master` at commit `f993cf2`**, not the
-//! `v1.7.0-beta.2` the rest of this crate is pinned to. The release ships no
-//! FCR fixtures, so nothing ties this module to it, and `master` carries
-//! fixes the release lacks: the gloas empty-slot support discount (#5672),
-//! precise committee weight (#5670), the restart-resilient confirmed root
-//! (#5673) and the `support_discount <= maximum_support` assertion (#5788).
-//! A later bump should diff the three files above against that commit.
+//! **Spec version: consensus-specs `v1.7.0-beta.5`**, the release the rest of
+//! this crate is pinned to, whose `fast_confirmation` fixtures run against this
+//! module (`tests/beacon_spec/fast_confirmation.rs`). The rule was ported from
+//! `master` at `f993cf2` before that, and `v1.7.0-beta.5` adds one change on
+//! top of it: `get_node_support_between_slots` takes a set of nodes, so the
+//! gloas empty-slot discount counts the parent's PENDING node beside its
+//! payload node (#5789). A later bump should diff the three files above
+//! against `v1.7.0-beta.5`.
 //!
 //! One Rust function per specification function, named as the specification
 //! names it, so the two can be read side by side. Two deliberate shapes differ
@@ -708,8 +709,8 @@ fn previous_slot(fcr_store: &FastConfirmationStore) -> Result<Slot> {
 // LMD-GHOST helpers
 // ---------------------------------------------------------------------------
 
-/// Whether `message` supports `node`, the equality in
-/// `get_supported_node(store, message) == node`.
+/// Whether `message` supports any of `nodes`, the membership in
+/// `get_supported_node(store, message) in nodes`.
 ///
 /// Before gloas a node is a bare root. Under gloas the root is compared first,
 /// which settles all but the votes for the block itself, and only those pay
@@ -723,9 +724,9 @@ fn previous_slot(fcr_store: &FastConfirmationStore) -> Result<Slot> {
 fn supports_node(
     fcr_store: &FastConfirmationStore,
     message: LatestMessage,
-    node: ForkChoiceNode,
+    nodes: &[ForkChoiceNode],
 ) -> Result<bool> {
-    if message.root != node.root {
+    if !nodes.iter().any(|node| node.root == message.root) {
         return Ok(false);
     }
     match fcr_store.run.rules {
@@ -738,18 +739,25 @@ fn supports_node(
             let block_is_pre_gloas = ForkRules::of(block_fork) == ForkRules::PreGloas;
             let payload_status =
                 fork_choice::supported_payload_status(block_slot, block_is_pre_gloas, &message);
-            Ok(payload_status == node.payload_status)
+            Ok(nodes
+                .iter()
+                .any(|node| node.root == message.root && node.payload_status == payload_status))
         }
     }
 }
 
-/// `get_node_support_between_slots`: support of `node` by validators assigned
-/// to the slots in `[start_slot, end_slot]`, unslashed and active in
+/// `get_node_support_between_slots`: support of any of `nodes` by validators
+/// assigned to the slots in `[start_slot, end_slot]`, unslashed and active in
 /// `balance_source`, excluding equivocators.
+///
+/// A set of nodes since consensus-specs #5789 (v1.7.0-beta.5), so gloas's
+/// [`compute_empty_slot_support_discount`] can count the parent's PENDING node
+/// together with its payload node; a validator counts once, whichever it
+/// supports. A slice here: the callers pass one or two nodes.
 pub fn get_node_support_between_slots(
     fcr_store: &FastConfirmationStore,
     balance_source: &BalanceSource,
-    node: ForkChoiceNode,
+    nodes: &[ForkChoiceNode],
     start_slot: Slot,
     end_slot: Slot,
 ) -> Result<Gwei> {
@@ -762,7 +770,7 @@ pub fn get_node_support_between_slots(
         let Some(message) = fcr_store.store.latest_message(index) else {
             continue;
         };
-        if supports_node(fcr_store, message, node)? {
+        if supports_node(fcr_store, message, nodes)? {
             support = support.saturating_add(balance);
         }
     }
@@ -1047,6 +1055,33 @@ pub fn get_adversarial_weight(
     }
 }
 
+/// The nodes whose support from the empty slots' committees
+/// [`compute_empty_slot_support_discount`] discounts for `block_root`.
+///
+/// Before gloas, the parent's own node. Gloas counts the parent's PENDING
+/// node together with the payload node `block_root` builds on, which its
+/// `get_ancestor` names (consensus-specs #5789, v1.7.0-beta.5; the payload
+/// node alone before it), so a vote cast at the parent's own slot counts too.
+fn empty_slot_parent_nodes(
+    fcr_store: &FastConfirmationStore,
+    block_root: Root,
+    parent_root: Root,
+    parent_slot: Slot,
+) -> Result<Vec<ForkChoiceNode>> {
+    let parent_block_node = get_node_for_root(fcr_store, parent_root);
+    Ok(match fcr_store.run.rules {
+        ForkRules::Gloas => vec![
+            parent_block_node,
+            fork_choice::gloas_get_ancestor(
+                fcr_store.store,
+                get_node_for_root(fcr_store, block_root),
+                parent_slot,
+            )?,
+        ],
+        ForkRules::PreGloas => vec![parent_block_node],
+    })
+}
+
 /// `compute_empty_slot_support_discount`: weight that can be discounted from
 /// the safety threshold when empty slots precede the block.
 pub fn compute_empty_slot_support_discount(
@@ -1061,24 +1096,12 @@ pub fn compute_empty_slot_support_discount(
         return Ok(0);
     }
 
-    // Discount votes supporting the parent block if they are from the committees of empty slots.
-    // Gloas's `get_ancestor` names the parent node by the payload branch this block builds on;
-    // before it the node is the bare root.
-    let parent_node = match fcr_store.run.rules {
-        ForkRules::Gloas => fork_choice::gloas_get_ancestor(
-            fcr_store.store,
-            get_node_for_root(fcr_store, block_root),
-            parent_slot,
-        )?,
-        ForkRules::PreGloas => ForkChoiceNode {
-            root: get_ancestor_root(fcr_store, block_root, parent_slot)?,
-            payload_status: PayloadStatus::Full,
-        },
-    };
+    // Discount votes supporting the parent block if they are from the committees of empty slots
+    let parent_nodes = empty_slot_parent_nodes(fcr_store, block_root, parent_root, parent_slot)?;
     let parent_support_in_empty_slots = get_node_support_between_slots(
         fcr_store,
         balance_source,
-        parent_node,
+        &parent_nodes,
         parent_slot + 1,
         block_slot - 1,
     )?;
@@ -1865,9 +1888,13 @@ fn reported_root(fcr_store: &FastConfirmationStore) -> Result<Root> {
 // Tests
 // ---------------------------------------------------------------------------
 //
-// consensus-specs ships no FCR fixtures, so the scenarios of its pyspec tests
-// (`tests/core/pyspec/.../phase0/fast_confirmation`) are ported here, on a
-// fork-choice store built directly rather than through the state transition.
+// consensus-specs shipped no FCR fixtures until v1.7.0-beta.5, so the
+// scenarios of its pyspec tests (`tests/core/pyspec/.../phase0/fast_confirmation`)
+// were ported here, on a fork-choice store built directly rather than through
+// the state transition. Every scenario now also runs from the release's own
+// `fast_confirmation` vectors (`tests/beacon_spec/fast_confirmation.rs`,
+// minimal preset, altair through gloas), the ones listed below as not ported
+// included; these stay as the faster, preset-independent unit tests.
 // The harness below stands in for the pyspec `FCRTest`: it fabricates blocks
 // and their post-states, casts votes into the store's latest messages one slot
 // late (as `on_attestation` applies them), and emulates the one thing a real
@@ -2543,7 +2570,7 @@ mod tests {
             let parent_support = get_node_support_between_slots(
                 &fcr,
                 &source,
-                parent_node,
+                &[parent_node],
                 parent_slot + 1,
                 block_slot - 1,
             )
@@ -3420,13 +3447,15 @@ mod tests {
     }
 
     /// The gloas `test_is_one_confirmed_delayed_with_mixed_payload_votes_in_empty_slot`
-    /// scenario, down to the term it exercises: after an empty slot, only the
-    /// votes for the parent's payload branch that B builds on (FULL) count as
-    /// parent support in the empty slot (the discount's first term), where
-    /// pre-gloas every vote for the parent does. The scenario's later
-    /// accumulation steps are not ported (no gloas chain builder here).
+    /// scenario, down to the term it exercises: after an empty slot, the votes
+    /// for the parent's payload branch that B builds on (FULL) count as parent
+    /// support in the empty slot (the discount's first term), and since
+    /// consensus-specs #5789 so do votes for the parent's PENDING node; votes
+    /// for the other branch (EMPTY) do not. Pre-gloas every vote for the
+    /// parent does. The scenario's later accumulation steps are not ported (no
+    /// gloas chain builder here); the fixture runner covers them.
     #[test]
-    fn gloas_empty_slot_support_counts_only_the_payload_branch_the_block_builds_on() {
+    fn gloas_empty_slot_support_counts_the_pending_node_and_the_branch_the_block_builds_on() {
         let config = Config::active().with_fork_epoch(ForkName::Gloas, 1);
         let gloas_start = compute_start_slot_at_epoch(1);
         let anchor_root = Root::repeat_byte(0xa0);
@@ -3473,22 +3502,30 @@ mod tests {
             .set_time_ms((block_slot + 1) * config.slot_duration_ms)
             .unwrap();
 
-        // The empty slot's committee splits: half vote for the parent with
-        // its payload, half without.
+        // The empty slot's committee splits three ways: a third vote for the
+        // parent with its payload, a third without, and a third last voted at
+        // the parent's own slot, which supports its PENDING node.
         let empty_slot = parent_slot + 1;
         let committee = {
             let variables = FastConfirmationVariables::at_finalized(anchor);
             let fcr = FastConfirmationStore::new(&store, &config, variables, block_root);
             get_slot_committee(&fcr, empty_slot).unwrap().to_vec()
         };
-        let (full_voters, empty_voters) = committee.split_at(committee.len() / 2);
-        for (voters, payload_present) in [(full_voters, true), (empty_voters, false)] {
+        let third = committee.len() / 3;
+        let (full_voters, rest) = committee.split_at(third);
+        let (empty_voters, pending_voters) = rest.split_at(third);
+        assert!(!pending_voters.is_empty());
+        for (voters, slot, payload_present) in [
+            (full_voters, empty_slot, true),
+            (empty_voters, empty_slot, false),
+            (pending_voters, parent_slot, false),
+        ] {
             for &index in voters {
                 store.set_latest_message(
                     index,
                     LatestMessage {
                         epoch: 1,
-                        slot: empty_slot,
+                        slot,
                         root: parent_root,
                         payload_present,
                     },
@@ -3500,25 +3537,11 @@ mod tests {
             let variables = FastConfirmationVariables::at_finalized(anchor);
             let fcr = FastConfirmationStore::new(&store, config, variables, block_root);
             let source = balance_source(&fcr, BalanceKey::of(anchor)).unwrap();
-            let support = get_node_support_between_slots(
-                &fcr,
-                &source,
-                match fcr.run.rules {
-                    ForkRules::Gloas => fork_choice::gloas_get_ancestor(
-                        &store,
-                        get_node_for_root(&fcr, block_root),
-                        parent_slot,
-                    )
-                    .unwrap(),
-                    ForkRules::PreGloas => ForkChoiceNode {
-                        root: parent_root,
-                        payload_status: PayloadStatus::Full,
-                    },
-                },
-                empty_slot,
-                empty_slot,
-            )
-            .unwrap();
+            let nodes = empty_slot_parent_nodes(&fcr, block_root, parent_root, parent_slot)
+                .expect("the parent nodes");
+            let support =
+                get_node_support_between_slots(&fcr, &source, &nodes, empty_slot, empty_slot)
+                    .unwrap();
             (fcr.run.rules, support)
         };
 
@@ -3532,16 +3555,22 @@ mod tests {
             let fcr = FastConfirmationStore::new(&store, &config, variables, block_root);
             balance_source(&fcr, BalanceKey::of(anchor)).unwrap()
         };
-        let full_weight: Gwei = full_voters
-            .iter()
-            .map(|&index| state_for_weights.unslashed(index))
-            .sum();
-        let all_weight: Gwei = committee
-            .iter()
-            .map(|&index| state_for_weights.unslashed(index))
-            .sum();
-        assert_eq!(gloas_support, full_weight, "only FULL votes");
-        assert_eq!(pre_gloas_support, all_weight, "every vote for the parent");
+        let weight = |voters: &[ValidatorIndex]| -> Gwei {
+            voters
+                .iter()
+                .map(|&index| state_for_weights.unslashed(index))
+                .sum()
+        };
+        assert_eq!(
+            gloas_support,
+            weight(full_voters) + weight(pending_voters),
+            "the FULL votes and the PENDING ones (#5789), not the EMPTY ones"
+        );
+        assert_eq!(
+            pre_gloas_support,
+            weight(&committee),
+            "every vote for the parent"
+        );
         assert!(gloas_support < pre_gloas_support);
     }
 

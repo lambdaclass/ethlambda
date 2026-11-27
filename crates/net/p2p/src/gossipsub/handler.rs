@@ -39,6 +39,7 @@ use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
+use crate::swarm_adapter::PublishOutcome;
 use crate::{P2PServer, metrics};
 
 /// What `P2PServer` does with a gossip message, whichever chain it came from.
@@ -1084,15 +1085,12 @@ pub async fn publish_execution_payload_envelope(
         digest,
         beacon_topics::EXECUTION_PAYLOAD,
     ));
-    server
+    // Read once the columns and the chain actor have their share: the publish
+    // is queued now, in order, and only its answer waits.
+    let envelope_published = server
         .swarm_handle
-        .publish(topic, compress_message(&envelope.to_ssz()));
-    info!(
-        slot,
-        builder_index = envelope.message.builder_index,
-        block_root = %ShortRoot(&block_root.0),
-        "Published execution payload envelope to gossipsub"
-    );
+        .publish_reporting(topic, compress_message(&envelope.to_ssz()));
+    let builder_index = envelope.message.builder_index;
 
     let mut published_columns = 0usize;
     for sidecar in &sidecars {
@@ -1130,6 +1128,27 @@ pub async fn publish_execution_payload_envelope(
         sidecars,
         ColumnArrival::received("local", Instant::now()),
     );
+    match envelope_published.outcome().await {
+        PublishOutcome::Published => info!(
+            slot,
+            builder_index,
+            block_root = %ShortRoot(&block_root.0),
+            "Published execution payload envelope to gossipsub"
+        ),
+        PublishOutcome::Duplicate => debug!(
+            slot,
+            builder_index,
+            block_root = %ShortRoot(&block_root.0),
+            "Gossipsub already holds this execution payload envelope; not sent again"
+        ),
+        PublishOutcome::Failed(err) => warn!(
+            slot,
+            builder_index,
+            block_root = %ShortRoot(&block_root.0),
+            %err,
+            "Failed to publish execution payload envelope to gossipsub"
+        ),
+    }
 }
 
 /// Gossip a payload attestation message a validator client signed, handed
@@ -1165,23 +1184,44 @@ pub async fn publish_payload_attestation_message(
         digest,
         beacon_topics::PAYLOAD_ATTESTATION_MESSAGE,
     ));
-    server
+    // Read once the chain actor has the vote: the publish is queued now, and
+    // only its answer waits.
+    let published = server
         .swarm_handle
-        .publish(topic, compress_message(&message.to_ssz()));
+        .publish_reporting(topic, compress_message(&message.to_ssz()));
     server.seen_payload_attestations.record(slot, validator);
-    info!(
-        slot,
-        validator,
-        block_root = %ShortRoot(&message.data.beacon_block_root.0),
-        payload_present = message.data.payload_present,
-        "Published payload attestation to gossipsub"
-    );
+    let block_root = message.data.beacon_block_root;
+    let payload_present = message.data.payload_present;
     if let Some(ref blockchain) = server.blockchain {
         let _ = blockchain
             .new_payload_attestation_message(message, BlockArrival::now())
             .inspect_err(
                 |err| error!(%err, "Failed to hand the published payload attestation to the chain"),
             );
+    }
+    match published.outcome().await {
+        PublishOutcome::Published => info!(
+            slot,
+            validator,
+            block_root = %ShortRoot(&block_root.0),
+            payload_present,
+            "Published payload attestation to gossipsub"
+        ),
+        PublishOutcome::Duplicate => debug!(
+            slot,
+            validator,
+            block_root = %ShortRoot(&block_root.0),
+            payload_present,
+            "Gossipsub already holds this payload attestation; not sent again"
+        ),
+        PublishOutcome::Failed(err) => warn!(
+            slot,
+            validator,
+            block_root = %ShortRoot(&block_root.0),
+            payload_present,
+            %err,
+            "Failed to publish payload attestation to gossipsub"
+        ),
     }
 }
 

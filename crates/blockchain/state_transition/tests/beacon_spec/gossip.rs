@@ -3,7 +3,7 @@
 //! consensus-specs), run against `beacon::gossip`.
 //!
 //! These used to come from a separate, newer-release fixture tree of their
-//! own; v1.7.0-beta.2's main tree now ships the same vectors under
+//! own; since v1.7.0-beta.2 the main tree ships the same vectors under
 //! `networking/gossip_*` alongside every other runner, so they are collected
 //! from there like any other handler (see [`super::collect`]). `networking.rs`
 //! filters these same directories out of its own collection, so the two
@@ -159,37 +159,12 @@ struct Meta {
     #[serde(default)]
     blocks: Vec<StoreBlock>,
     finalized_checkpoint: Option<FinalizedOverride>,
-    /// Read through [`Meta::base_ms`]: only the operation vectors may omit it.
-    current_time_ms: Option<u64>,
     messages: Vec<GossipMessage>,
 }
 
 impl Meta {
     fn is_operation_topic(&self) -> bool {
         OPERATION_TOPICS.contains(&self.topic.as_str())
-    }
-
-    /// The case's clock. The state-only operation vectors omit it, and their
-    /// clock is genesis; every other topic must say.
-    fn base_ms(&self) -> Result<u64, String> {
-        match self.current_time_ms {
-            Some(ms) => Ok(ms),
-            None if self.is_operation_topic() => Ok(0),
-            None => Err("meta.yaml lacks current_time_ms".into()),
-        }
-    }
-
-    /// The clock reading `message` arrives at, in milliseconds since genesis
-    /// (see [`GossipMessage::arrival_ms`]). The operation vectors may omit
-    /// the message's timing too, and then arrive at the case clock; every
-    /// other topic must name it.
-    fn arrival_ms(&self, message: &GossipMessage) -> Result<u64, String> {
-        let base_ms = self.base_ms()?;
-        let untimed = message.offset_ms.is_none() && message.current_time_ms.is_none();
-        if untimed && self.is_operation_topic() {
-            return Ok(base_ms);
-        }
-        message.arrival_ms(base_ms)
     }
 }
 
@@ -204,6 +179,10 @@ struct StoreBlock {
     /// The block's execution payload envelope, delivered once the block is
     /// imported so `is_payload_verified` answers true for its root.
     payload: Option<String>,
+    /// Received after its slot's attestation deadline; every other block is
+    /// timely. See [`build_store`].
+    #[serde(default)]
+    late: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -215,10 +194,9 @@ struct FinalizedOverride {
 
 #[derive(serde::Deserialize)]
 struct GossipMessage {
-    /// The format's offset from `meta.current_time_ms`. Some of gloas's
-    /// column vectors carry `current_time_ms` instead; see
-    /// [`GossipMessage::arrival_ms`].
-    offset_ms: Option<u64>,
+    /// The Unix time in milliseconds the message arrives at. Present exactly
+    /// when the specification's validation function takes `current_time_ms`;
+    /// see [`GossipMessage::arrival_ms`] for the others.
     current_time_ms: Option<u64>,
     subnet_id: Option<u64>,
     message: String,
@@ -227,23 +205,14 @@ struct GossipMessage {
 }
 
 impl GossipMessage {
-    /// The clock reading, in milliseconds since genesis, the message arrives
-    /// at: the format's `meta.current_time_ms + offset_ms`.
+    /// The Unix time in milliseconds the message arrives at.
     ///
-    /// Some of gloas's column vectors carry a per-message `current_time_ms`
-    /// instead: the generator (`test/gloas/networking/
-    /// test_gossip_data_column_sidecar.py`) writes `compute_time_at_slot_ms`
-    /// plus 500 there, the same basis as `meta.current_time_ms`, so it is the
-    /// absolute reading.
-    fn arrival_ms(&self, base_ms: u64) -> Result<u64, String> {
-        match (self.offset_ms, self.current_time_ms) {
-            (Some(offset), _) => Ok(base_ms + offset),
-            (None, Some(absolute)) => Ok(absolute),
-            (None, None) => Err(format!(
-                "{}: names neither offset_ms nor current_time_ms",
-                self.message
-            )),
-        }
+    /// A message whose specification rule takes no time (the envelope and
+    /// the slashings, as of v1.7.0-beta.5) names none, yet every rule here
+    /// takes one, so it arrives at `store_ms`, the clock [`build_store`] left
+    /// the store at. Nothing that rule checks depends on the reading.
+    fn arrival_ms(&self, store_ms: u64) -> u64 {
+        self.current_time_ms.unwrap_or(store_ms)
     }
 }
 
@@ -345,6 +314,20 @@ fn is_builder_market_topic(topic: &str) -> bool {
     matches!(topic, "execution_payload_bid" | "proposer_preferences")
 }
 
+/// The topics whose rules read the fork-choice head: the builder market's,
+/// the operations' and the sync committee's (each against the head state),
+/// and the payload attestation's (the head state's PTC window).
+fn rule_reads_head(topic: &str) -> bool {
+    is_builder_market_topic(topic)
+        || OPERATION_TOPICS.contains(&topic)
+        || matches!(
+            topic,
+            "sync_committee"
+                | "sync_committee_contribution_and_proof"
+                | "payload_attestation_message"
+        )
+}
+
 /// The operation vectors build their anchor pair loosely: the state's
 /// `latest_block_header` need not describe the anchor block (different slot,
 /// proposer, parent or body), and the block's `state_root` is simply the
@@ -426,22 +409,34 @@ fn build_store(
     let trusted = builder_market;
     let mut imported = Vec::new();
 
-    // The store's clock at the case's base time, so `on_block` accepts every
-    // listed block; a block from a slot past that time advances it to that
-    // slot's start, since a vector may place its base time just before the
-    // slot a clock-disparity case sends its sidecar for.
-    let mut clock_s = (config.genesis_time_ms() + meta.base_ms()?) / 1000;
-    fork_choice::on_tick(&mut store, clock_s, config);
+    // The store's clock starts at the anchor's slot, where
+    // `get_forkchoice_store` put it. The format records no clock of its own
+    // (every timed message carries its own reading), only whether each block
+    // arrived after its slot's attestation deadline, so each block is
+    // imported at its slot's start, timely, unless it is `late`: then past
+    // every deadline its slot has, where `on_block` records it late the way
+    // the generators' `record_block_in_store(late=True)` writes `[False,
+    // False]`. The clock never moves back, and the blocks are oldest first.
+    let mut clock_s = store
+        .time_ms()
+        .map_err(|err| format!("reading the store's clock: {err}"))?
+        / 1000;
     deliver_payload(&mut store, case, anchor, config, trusted)?;
 
     for entry in rest {
         let block = decode_block(case, &entry.block)?;
         let root = block.message_hash_tree_root();
         let block_slot = block.slot();
-        let block_start_s =
-            (config.genesis_time_ms() + block.slot() * config.slot_duration_ms) / 1000;
-        if block_start_s > clock_s {
-            clock_s = block_start_s;
+        let block_start_ms = config.genesis_time_ms() + block.slot() * config.slot_duration_ms;
+        // The slot's last whole second: `on_tick` takes seconds, and every
+        // deadline in a slot falls before it.
+        let arrival_ms = if entry.late {
+            block_start_ms + config.slot_duration_ms - 1000
+        } else {
+            block_start_ms
+        };
+        if arrival_ms / 1000 > clock_s {
+            clock_s = arrival_ms / 1000;
             fork_choice::on_tick(&mut store, clock_s, config);
         }
         // Gloas's `payload_status` is the verdict on the block's envelope, not
@@ -579,9 +574,14 @@ fn run_case(case: &Case) -> Result<(), String> {
         .map_err(|err| format!("decoding state: {err:?}"))?;
     let config = case_config(case, &state);
     let mut store = build_store(case, &meta, state, &config)?;
-    if is_builder_market_topic(&meta.topic) {
-        // `on_block` records no head, and the bid and preference rules read
-        // the recorded one.
+    // `on_block` records no head, and the rules that read `get_head(store)`
+    // read the recorded one, which the chain actor keeps current. Without
+    // this it stays at the anchor, which v1.7.0-beta.5's
+    // `missed_period_boundary_slot` vectors tell apart: their head is a block
+    // a sync committee period past the anchor. Only for those topics: a case
+    // for another may override finality with a root the store does not hold,
+    // which no head walk can start from.
+    if rule_reads_head(&meta.topic) {
         fork_choice::get_head(&mut store, &config)
             .map_err(|err| format!("computing the head: {err:?}"))?;
     }
@@ -598,11 +598,11 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_sync_messages = SeenSyncCommitteeMessages::new(capacity);
     let mut seen_sync_contributions = SeenSyncContributions::new(capacity, capacity);
 
+    let store_ms = store
+        .time_ms()
+        .map_err(|err| format!("reading the store's clock: {err}"))?;
     for (index, message) in meta.messages.iter().enumerate() {
-        let now_ms = config.genesis_time_ms()
-            + meta
-                .arrival_ms(message)
-                .map_err(|err| format!("message {index}: {err}"))?;
+        let now_ms = message.arrival_ms(store_ms);
         let outcome = match meta.topic.as_str() {
             "beacon_block" => {
                 let block = decode_block(case, &message.message)?;

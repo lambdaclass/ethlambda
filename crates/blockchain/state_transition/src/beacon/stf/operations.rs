@@ -41,7 +41,7 @@ use crate::beacon::helpers::predicates::{
 use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Gwei, HashTreeRoot as _, ValidatorIndex};
 use crate::beacon::stf::signatures::SignatureBatch;
 use crate::metrics::{StfPhase, timed, try_for_each_timed};
 
@@ -210,23 +210,20 @@ pub fn process_operations(
 /// this returns, since the caller slashes on the strength of them (see
 /// [`SignatureBatch::verify_pending`]).
 ///
-/// Shared between phase0's own [`process_proposer_slashing`] below and
-/// `crate::beacon::stf::gloas::process_proposer_slashing`: gloas's own
-/// specification modifies the function (EIP-7732: it also clears a
-/// `BuilderPendingPayment`), but not this prologue, which the two share line
-/// for line. Returns the slashed proposer's index and the state's current
-/// epoch, both of which gloas's own caller also needs for its own
-/// payment-window check, so neither has to be recomputed.
+/// Returns the slashed proposer's index. Every fork runs this function since
+/// consensus-specs #5719 (v1.7.0-beta.4) moved gloas's own modification,
+/// clearing the slashed proposer's `BuilderPendingPayment`s, into
+/// `slash_validator`.
 ///
 /// The two headers must actually differ: a proposer can be asked to co-sign
 /// the same header twice (by different requesters, or the same one twice),
 /// and that is not evidence of anything. Only a genuine equivocation, two
 /// distinct headers for the one slot, is slashable.
-pub(crate) fn verify_proposer_slashing(
+fn verify_proposer_slashing(
     state: &BeaconState,
     proposer_slashing: &ProposerSlashing,
     signatures: &mut SignatureBatch,
-) -> Result<(ValidatorIndex, Epoch)> {
+) -> Result<ValidatorIndex> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
 
@@ -269,7 +266,7 @@ pub(crate) fn verify_proposer_slashing(
     }
     signatures.verify_pending()?;
 
-    Ok((proposer_index, current_epoch))
+    Ok(proposer_index)
 }
 
 /// Slashes a proposer caught signing two different headers for the same
@@ -282,8 +279,7 @@ pub fn process_proposer_slashing(
     active_balances: &ActiveBalanceCache,
     signatures: &mut SignatureBatch,
 ) -> Result<()> {
-    let (proposer_index, _current_epoch) =
-        verify_proposer_slashing(state, proposer_slashing, signatures)?;
+    let proposer_index = verify_proposer_slashing(state, proposer_slashing, signatures)?;
     slash_validator(state, proposer_index, None, config, Some(active_balances))?;
     Ok(())
 }

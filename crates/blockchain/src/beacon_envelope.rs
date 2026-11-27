@@ -1276,10 +1276,10 @@ pub(crate) mod tests {
     }
 
     const TIEBREAK: &str = "get_head_full_payload_tiebreak";
-    const PARENT: &str = "780218dcb4c1afc8ba72f325eb4f9ad43523356242345752d0e7a52391c15582";
-    const CHILD: &str = "14f9d9ee25f47e0d8dd8ea7d01b206737e2aede3a7732d953546348511f58128";
+    const PARENT: &str = "fc524e6bbad6db5cfe8d89678ee41152a638b20d83807421581cd227ac3d7628";
+    const CHILD: &str = "e2bb2918635847159837c8437aa181fe6c0e9e73ee3706b61a6d60f24ed2765c";
     const PARENT_ENVELOPE: &str =
-        "bba7bbe6c4fb93af68a15e1048436396821dfaf7af6e2a5049dbef906df6801e";
+        "9e529d8b342171455ed61ba823185f46d3f3f6fc0f64e2a0b25682ca55e124a3";
 
     fn root(hex_root: &str) -> H256 {
         let bytes: [u8; 32] = hex::decode(hex_root).unwrap().try_into().unwrap();
@@ -1308,6 +1308,25 @@ pub(crate) mod tests {
         assert!(server.store.has_state(&root(PARENT)).unwrap());
         assert!(server.blocks_awaiting_columns.is_empty());
         assert!(server.envelopes.blocks_awaiting_parent_payload.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_imported_block_tells_the_p2p_layer_its_state_is_ready() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let p2p = Arc::new(crate::tests::RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+
+        server
+            .on_block(case.block(PARENT), ImportTimings::default())
+            .await;
+
+        assert!(server.store.has_state(&root(PARENT)).unwrap());
+        assert_eq!(*p2p.states_ready.lock().unwrap(), vec![root(PARENT)]);
     }
 
     #[tokio::test]
@@ -1346,15 +1365,15 @@ pub(crate) mod tests {
     /// first block, so the valid case's envelope fits the invalid-full-child
     /// case's chain: the one place a block built on a FULL parent exists.
     const FULL_CHILD_CASE: &str = "on_execution_payload_envelope_invalid_full_child";
-    const FULL_PARENT: &str = "76bf14e70fc96a5a3442a46dff3bfb897d5568cdb4dc7e94419f625df2fcd9e5";
-    const FULL_CHILD: &str = "7a25db19479cdcc24bd59bb8f5feaeee2e9b24bd25f5eddd54dd809c567b5e5b";
+    const FULL_PARENT: &str = "218fa44746e1b5dcf132f4c9ea021b55748daea5a4c44ef23ee4e9ab29049d13";
+    const FULL_CHILD: &str = "d2cd55255172490a5ce7ec8252aa4529cbafb6c6d011bbc366ab1cbb959ac670";
 
     fn valid_envelope_for_full_parent() -> gloas::SignedExecutionPayloadEnvelope {
         Case::new(
             "on_execution_payload_envelope",
             "on_execution_payload_envelope_valid",
         )
-        .envelope("240ec2c17454f3e653fd3b43961e3c9a16770d336b0e882535c01f99b9223b41")
+        .envelope("f55a87cc11448f3bae0946875a60003013a61cbcf52c903ed44dfca7ed21f322")
     }
 
     #[tokio::test]
@@ -1401,9 +1420,9 @@ pub(crate) mod tests {
             "on_execution_payload_envelope",
             "on_execution_payload_envelope_invalid_full_child",
         );
-        let parent = "76bf14e70fc96a5a3442a46dff3bfb897d5568cdb4dc7e94419f625df2fcd9e5";
-        let child = "7a25db19479cdcc24bd59bb8f5feaeee2e9b24bd25f5eddd54dd809c567b5e5b";
-        let bad_envelope = "73c5948d041ccb171b9331c0eac4a3bb8cdcf01994916fee4c7493e63e890559";
+        let parent = "218fa44746e1b5dcf132f4c9ea021b55748daea5a4c44ef23ee4e9ab29049d13";
+        let child = "d2cd55255172490a5ce7ec8252aa4529cbafb6c6d011bbc366ab1cbb959ac670";
+        let bad_envelope = "0def44b37e6ecc5369e85346ade702d0afe9a1d63427870d488e34ee6c69d869";
         let mut server = case.server(12);
         server
             .on_block(case.block(parent), ImportTimings::default())
@@ -2206,8 +2225,8 @@ pub(crate) mod tests {
             "on_payload_attestation_message",
             "on_payload_attestation_message_valid",
         );
-        let block = "76bf14e70fc96a5a3442a46dff3bfb897d5568cdb4dc7e94419f625df2fcd9e5";
-        let message_name = "payload_attestation_message_0xeaae966a9a1931c94efc5ca0280b35bac86166ebf8d47a936156bbeb1e7179d1";
+        let block = "218fa44746e1b5dcf132f4c9ea021b55748daea5a4c44ef23ee4e9ab29049d13";
+        let message_name = "payload_attestation_message_0x4cdecd4b03746453611fd550fdb14c4fcd7e3e39be87a812d78506f548e451d6";
         let mut server = case.server(12);
         server
             .on_block(case.block(block), ImportTimings::default())
@@ -2583,9 +2602,8 @@ pub(crate) mod tests {
         assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
     }
 
-    /// The fixture payloads all hash to zero, which `forkchoiceUpdated` rightly
-    /// treats as "nothing to say"; give `root`'s bid and cached payload a real
-    /// hash so the call can be observed.
+    /// Give `root`'s bid and cached payload `hash`, a value the test knows, so
+    /// the `forkchoiceUpdated` that names it can be recognized.
     fn give_payload_a_hash(server: &mut BlockChainServer, root: H256, hash: H256) {
         let mut block = server
             .store
@@ -2613,16 +2631,17 @@ pub(crate) mod tests {
 
     /// A server whose only block is `FULL_PARENT`, its envelope applied with
     /// `new_payload`'s verdict, then given a nonzero payload hash and made the
-    /// FULL head.
+    /// FULL head. The mock answers `forkchoice` only from then on.
     async fn full_head_server(
         new_payload: &str,
         forkchoice: &str,
     ) -> (BlockChainServer, Arc<std::sync::Mutex<MockState>>, H256) {
-        let (client, mock) = mock_engine(
-            status_json(new_payload, None),
-            status_json(forkchoice, None),
-        )
-        .await;
+        // `SYNCING` while the envelope is applied: its payload has a real
+        // block hash, so applying it already sends a `forkchoiceUpdated`, and
+        // an `INVALID` answer there would unverify the payload before the
+        // test asks.
+        let (client, mock) =
+            mock_engine(status_json(new_payload, None), status_json("SYNCING", None)).await;
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
         server.engine = Some(client);
@@ -2641,6 +2660,7 @@ pub(crate) mod tests {
         server
             .store
             .set_head_payload_status(root(FULL_PARENT), PayloadStatus::Full);
+        mock.lock().unwrap().forkchoice = status_json(forkchoice, None);
         (server, mock, hash)
     }
 
@@ -2837,7 +2857,7 @@ pub(crate) mod tests {
         let (client, mock) =
             mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
-        let bad_envelope = "73c5948d041ccb171b9331c0eac4a3bb8cdcf01994916fee4c7493e63e890559";
+        let bad_envelope = "0def44b37e6ecc5369e85346ade702d0afe9a1d63427870d488e34ee6c69d869";
         let mut server = case.server(12);
         server.engine = Some(client);
         server

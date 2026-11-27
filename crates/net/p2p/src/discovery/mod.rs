@@ -15,13 +15,14 @@ pub mod enr;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
-use ethrex_p2p::types::Node;
+use ethrex_p2p::types::{LocalNode, Node, SharedLocalNode};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
@@ -231,6 +232,17 @@ pub async fn spawn_discovery(
     // lean peer applying our own admission rules to it admits us. ethrex
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
+    //
+    // ethrex mirrors each re-signed record into the shared identity for its own
+    // RPC and shutdown; nothing here reads it back, so it is handed over and
+    // dropped. The fork id channel republishes an execution chain's EIP-2124
+    // `eth` entry, which a consensus record does not carry: it starts at `None`
+    // and its sender is dropped at once, which ethrex reads as "never changes".
+    let shared_local_node: SharedLocalNode = Arc::new(RwLock::new(LocalNode {
+        node: local_node.clone(),
+        record: local_record.clone(),
+    }));
+    let (_, no_fork_id) = watch::channel(None);
     DiscoveryServer::spawn(
         local_node,
         local_record,
@@ -241,13 +253,23 @@ pub async fn spawn_discovery(
         DiscoveryConfig {
             discv4_enabled: false,
             discv5_enabled: true,
+            // An operator-supplied advertise IP is the address peers should
+            // reach us on, so IP voting must not replace it. An unspecified
+            // one (`0.0.0.0`, `::`, `::ffff:0.0.0.0`) names no address, so
+            // voting stays on to find one, as it does with no advertise IP at
+            // all.
+            nat_extip_set: config
+                .advertise_ip
+                .is_some_and(|ip| !unspecified_as_published(ip)),
         },
+        shared_local_node,
+        no_fork_id,
     )
     .await
     .map_err(|err| DiscoveryError::Server(err.to_string()))?;
 
     info!(enr = %local_enr, "Local ENR");
-    if advertise_ip.is_unspecified() {
+    if unspecified_as_published(advertise_ip) {
         warn!(
             "Local ENR advertises an unspecified IP; peers can still reach us once \
              discv5 IP voting resolves our external address, but this ENR is not \
@@ -289,6 +311,15 @@ pub(crate) fn update_served_enr(fork_id: &EnrForkId) {
         "The served ENR keeps its startup eth2 entry: the discovery server offers no way to \
          replace its record at runtime"
     );
+}
+
+/// Whether `ip` is the unspecified address once read the way the ENR
+/// publishes it, an IPv4-mapped IPv6 address as the IPv4 address it maps
+/// (`LocalEnrParams::local_pairs`): `0.0.0.0`, `::` and `::ffff:0.0.0.0`
+/// alike. `IpAddr::is_unspecified` alone answers no for the last, which the
+/// record still publishes as `0.0.0.0`.
+fn unspecified_as_published(ip: IpAddr) -> bool {
+    ip.to_canonical().is_unspecified()
 }
 
 #[cfg(test)]
@@ -376,5 +407,20 @@ mod tests {
         let result = spawn_discovery(config(busy, None)).await;
 
         assert!(result.is_err(), "a busy discovery port must not be silent");
+    }
+
+    /// The IPv4-mapped form of `0.0.0.0` is published as `0.0.0.0`, so it must
+    /// leave IP voting on like the other two spellings, where the raw
+    /// `is_unspecified` would have locked it.
+    #[test]
+    fn every_spelling_of_the_unspecified_address_counts_as_unspecified() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        for unspecified in ["0.0.0.0", "::", "::ffff:0.0.0.0"] {
+            assert!(unspecified_as_published(ip(unspecified)), "{unspecified}");
+        }
+        for specified in ["203.0.113.7", "::1", "::ffff:203.0.113.7"] {
+            assert!(!unspecified_as_published(ip(specified)), "{specified}");
+        }
     }
 }

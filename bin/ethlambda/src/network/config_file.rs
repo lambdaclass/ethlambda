@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::config::{Config, GasLimitScheduleError};
 use serde::Deserialize;
 use serde::de::{IgnoredAny, Visitor};
 
@@ -47,6 +47,11 @@ pub(crate) enum ConfigFileError {
          (SECONDS_PER_SLOT * 1000) to fit in a u64"
     )]
     SlotDurationOverflow { seconds: u64 },
+    /// A schedule the specification forbids. Refused rather than read, as
+    /// Lighthouse refuses it: with two entries at one epoch there is no one
+    /// gas limit to report for it.
+    #[error("GAS_LIMIT_SCHEDULE is malformed: {0}")]
+    GasLimitSchedule(#[from] GasLimitScheduleError),
 }
 
 impl ConfigFile {
@@ -60,6 +65,7 @@ impl ConfigFile {
             document.contains_key("SECONDS_PER_SLOT"),
             document.contains_key("SLOT_DURATION_MS"),
         )?;
+        config.gas_limit_schedule.check(config.gloas_fork_epoch)?;
 
         let claimed = config_field_names();
         let ignored = document
@@ -250,7 +256,6 @@ mod tests {
         for key in [
             "HEZE_FORK_VERSION",
             "HEZE_FORK_EPOCH",
-            "GAS_LIMIT_SCHEDULE",
             "INCLUSION_LIST_DUE_BPS",
         ] {
             assert!(
@@ -258,6 +263,79 @@ mod tests {
                 "{key} not reported"
             );
         }
+    }
+
+    #[test]
+    fn the_gas_limit_schedule_is_claimed_rather_than_ignored() {
+        // The devnet's is empty, Sepolia's and Platåberget's are not; none is
+        // reported as ignored any more.
+        for text in [
+            DEVNET,
+            include_str!("../../assets/sepolia/config.yaml"),
+            include_str!("../../assets/plataberget/config.yaml"),
+        ] {
+            let parsed = ConfigFile::parse(text).unwrap();
+            assert!(
+                !parsed.ignored.iter().any(|key| key == "GAS_LIMIT_SCHEDULE"),
+                "GAS_LIMIT_SCHEDULE reported as ignored"
+            );
+        }
+        let sepolia = ConfigFile::parse(include_str!("../../assets/sepolia/config.yaml")).unwrap();
+        assert_eq!(
+            sepolia.config.gas_limit_schedule.gas_limit_at(353_024),
+            Some(200_000_000)
+        );
+    }
+
+    #[test]
+    fn a_gas_limit_schedule_the_specification_forbids_is_refused() {
+        let before_gloas = concat!(
+            "GLOAS_FORK_EPOCH: 10\n",
+            "GAS_LIMIT_SCHEDULE:\n",
+            "  - EPOCH: 9\n",
+            "    GAS_LIMIT: 100000000\n",
+        );
+        let err = ConfigFile::parse(before_gloas).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigFileError::GasLimitSchedule(GasLimitScheduleError::BeforeGloas {
+                    epoch: 9,
+                    gloas_fork_epoch: 10
+                })
+            ),
+            "got {err}"
+        );
+
+        let shared_epoch = concat!(
+            "GLOAS_FORK_EPOCH: 10\n",
+            "GAS_LIMIT_SCHEDULE:\n",
+            "  - EPOCH: 10\n",
+            "    GAS_LIMIT: 100000000\n",
+            "  - EPOCH: 10\n",
+            "    GAS_LIMIT: 200000000\n",
+        );
+        let err = ConfigFile::parse(shared_epoch).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigFileError::GasLimitSchedule(GasLimitScheduleError::DuplicateEpoch {
+                    epoch: 10
+                })
+            ),
+            "got {err}"
+        );
+
+        // Starting at the fork itself is allowed.
+        let from_gloas = concat!(
+            "GLOAS_FORK_EPOCH: 10\n",
+            "GAS_LIMIT_SCHEDULE:\n",
+            "  - EPOCH: 10\n",
+            "    GAS_LIMIT: 100000000\n",
+            "  - EPOCH: 11\n",
+            "    GAS_LIMIT: 200000000\n",
+        );
+        ConfigFile::parse(from_gloas).unwrap();
     }
 
     #[test]

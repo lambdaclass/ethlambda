@@ -64,6 +64,11 @@ libssz.workspace = true
 # gets the same.
 sha2.workspace = true
 
+# Keccak-256, for `beacon::execution_block_hash`: the gloas `execution_payload`
+# gossip rule recomputes a payload's execution block hash (consensus-specs
+# #5770). The 0.10 line, already in the lockfile through other dependencies.
+sha3 = "0.10.8"
+
 # BLS12-381. Assembly-optimized, and the canonical consensus-layer backend.
 blst = "0.3.16"
 

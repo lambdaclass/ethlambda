@@ -13,6 +13,7 @@
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
 
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
@@ -39,12 +40,13 @@ use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{Context, Handler};
+use spawned_concurrency::tasks::{Context, Handler, send_after};
 use tracing::{debug, error, warn};
 
 use crate::beacon::column_checks;
+use crate::beacon::parked_votes::{PARKED_VOTE_SWEEP_INTERVAL, ParkedVote, Parking};
 use crate::gossipsub::operation_kind;
-use crate::{P2PServer, metrics};
+use crate::{P2PServer, metrics, p2p_protocol};
 
 /// Which gossip message a verdict is for.
 pub(crate) struct GossipId {
@@ -94,6 +96,11 @@ pub(crate) enum Validated {
     ExecutionPayloadBid {
         bid: Box<SignedExecutionPayloadBid>,
         market: SharedBuilderMarket,
+        /// The builder's bid limit its stateful checks compared the count
+        /// with. Zero, which records nothing, until
+        /// [`Validated::stateful_checks`] fills it in on `Accept`; recording
+        /// compares it again, since bids are validated concurrently.
+        bid_limit: u64,
     },
     /// A gloas `proposer_preferences`.
     ProposerPreferences(Box<SignedProposerPreferences>),
@@ -147,8 +154,19 @@ impl Validated {
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
             Self::Envelope(envelope) => gossip::envelope::stateful_checks(store, envelope),
-            Self::ExecutionPayloadBid { bid, market } => {
-                gossip::execution_payload_bid::stateful_checks(store, market, bid)
+            Self::ExecutionPayloadBid {
+                bid,
+                market,
+                bid_limit,
+            } => {
+                match gossip::execution_payload_bid::stateful_checks_with_limit(store, market, bid)
+                {
+                    Ok(limit) => {
+                        *bid_limit = limit;
+                        Outcome::Accept
+                    }
+                    Err(outcome) => outcome,
+                }
             }
             Self::ProposerPreferences(preferences) => {
                 gossip::proposer_preferences::stateful_checks(store, preferences)
@@ -212,9 +230,9 @@ impl Validated {
                 }
                 recorded
             }
-            Self::ExecutionPayloadBid { bid, .. } => {
-                server.builder_market.record_bid((**bid).clone())
-            }
+            Self::ExecutionPayloadBid { bid, bid_limit, .. } => server
+                .builder_market
+                .record_bid_within((**bid).clone(), *bid_limit),
             Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
                 (**preferences).clone(),
                 crate::wall_clock_slot(&server.store),
@@ -611,10 +629,26 @@ pub(crate) struct GossipVerdict {
     id: GossipId,
     outcome: Outcome,
     object: Validated,
+    check: Check,
 }
 
 impl Message for GossipVerdict {
     type Result = ();
+}
+
+/// Which check of its message a [`GossipVerdict`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Its first, which may park a vote for a block that is not ready yet
+    /// (see [`parked_votes`](crate::beacon::parked_votes)).
+    First,
+    /// The first check run once more at once, because the vote's block had
+    /// been imported after all (see [`spawn_stateful_checks`]). Final: the
+    /// vote is never parked.
+    Repeated,
+    /// The second check of a vote held for it ([`recheck`]). Final, and it
+    /// gives back the vote's place under the parked-vote caps.
+    Recheck,
 }
 
 /// Re-check the seen cache at verdict time: two copies of one key can be in
@@ -652,19 +686,250 @@ pub(crate) fn settle_message(
 }
 
 impl Handler<GossipVerdict> for P2PServer {
-    async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
-        let GossipVerdict {
-            id,
-            outcome,
-            object,
-        } = msg;
-        let outcome = settle_message(self, &id.message_id, outcome, &object);
-        let received_at = id.received_at;
-        if report(self, id, outcome) {
-            object.forward(self, received_at, outcome);
+    async fn handle(&mut self, msg: GossipVerdict, ctx: &Context<Self>) {
+        match receive_verdict(self, msg) {
+            AfterVerdict::Done => {}
+            AfterVerdict::ScheduleSweep => schedule_parked_vote_sweep(ctx),
+            AfterVerdict::Recheck(vote) => spawn_rechecks(self, ctx, vec![*vote]),
         }
     }
 }
+
+/// What is left to do for a verdict once [`receive_verdict`] has done
+/// everything that needs no [`Context`].
+pub(crate) enum AfterVerdict {
+    Done,
+    /// A vote was parked into a queue with no expiry sweep scheduled yet.
+    ScheduleSweep,
+    /// A vote for a block whose state is already ready: check it again.
+    Recheck(Box<ParkedVote>),
+}
+
+/// Take a stateful check's verdict: park the vote it is for when its block is
+/// not ready yet (see [`parked_votes`](crate::beacon::parked_votes)), and settle, report and forward it
+/// otherwise.
+pub(crate) fn receive_verdict(server: &mut P2PServer, verdict: GossipVerdict) -> AfterVerdict {
+    let GossipVerdict {
+        id,
+        outcome,
+        object,
+        check,
+    } = verdict;
+    if check == Check::Recheck {
+        server.parked_votes.answered(&object);
+    }
+    let parkable = check == Check::First;
+    let Some(root) = parkable.then(|| parkable_root(&object, outcome)).flatten() else {
+        conclude(server, id, outcome, object);
+        return AfterVerdict::Done;
+    };
+    let kind = id.kind;
+    let vote = ParkedVote {
+        id,
+        object,
+        outcome,
+    };
+    match server.parked_votes.park(root, vote) {
+        Parking::Parked => {
+            metrics::inc_parked_votes(kind, "parked");
+            metrics::set_parked_votes(server.parked_votes.len());
+            if server.parked_votes.claim_sweep() {
+                AfterVerdict::ScheduleSweep
+            } else {
+                AfterVerdict::Done
+            }
+        }
+        Parking::Ready(vote) => AfterVerdict::Recheck(Box::new(vote)),
+        Parking::Full(vote) => {
+            metrics::inc_parked_votes(kind, "full");
+            conclude(server, vote.id, vote.outcome, vote.object);
+            AfterVerdict::Done
+        }
+    }
+}
+
+/// The root of the block `object` votes for, when `outcome` says only that
+/// block's post-state was missing: a subnet attestation or an aggregate
+/// answered `Ignore(UnknownBlock)` or `Ignore(StateUnavailable)`. Nothing
+/// else is ever parked.
+fn parkable_root(object: &Validated, outcome: Outcome) -> Option<Root> {
+    if !matches!(
+        outcome,
+        Outcome::Ignore(IgnoreReason::UnknownBlock | IgnoreReason::StateUnavailable)
+    ) {
+        return None;
+    }
+    match object {
+        Validated::Attestation { attestation, .. } => Some(attestation.data.beacon_block_root),
+        Validated::Aggregate { aggregate, .. } => Some(aggregate.data().beacon_block_root),
+        _ => None,
+    }
+}
+
+/// Settle `outcome` for `object`, report it to gossipsub, and hand the object
+/// on when the outcome lets it go on: everything a verdict does once it is
+/// final.
+fn conclude(server: &mut P2PServer, id: GossipId, outcome: Outcome, object: Validated) {
+    let outcome = settle_message(server, &id.message_id, outcome, &object);
+    let received_at = id.received_at;
+    if report(server, id, outcome) {
+        object.forward(server, received_at, outcome);
+    }
+}
+
+/// Check the votes parked under `block_root` again, now that its post-state
+/// is ready.
+pub(crate) fn release_parked_votes(
+    server: &mut P2PServer,
+    ctx: &Context<P2PServer>,
+    block_root: Root,
+) {
+    let votes = server.parked_votes.take_ready(block_root);
+    if votes.is_empty() {
+        return;
+    }
+    metrics::set_parked_votes(server.parked_votes.len());
+    spawn_rechecks(server, ctx, votes);
+}
+
+/// Report the first verdict of every parked vote past its deadline. Returns
+/// whether votes are still parked, so another sweep is due.
+pub(crate) fn sweep_parked_votes(server: &mut P2PServer) -> bool {
+    server.parked_votes.sweep_started();
+    let expired = server.parked_votes.take_expired(Instant::now());
+    if !expired.is_empty() {
+        metrics::set_parked_votes(server.parked_votes.len());
+    }
+    for vote in expired {
+        metrics::inc_parked_votes(vote.id.kind, "expired");
+        conclude(server, vote.id, vote.outcome, vote.object);
+    }
+    !server.parked_votes.is_empty() && server.parked_votes.claim_sweep()
+}
+
+/// Schedule the next expiry sweep of the parked votes.
+pub(crate) fn schedule_parked_vote_sweep(ctx: &Context<P2PServer>) {
+    send_after(
+        PARKED_VOTE_SWEEP_INTERVAL,
+        ctx.clone(),
+        p2p_protocol::SweepParkedVotes,
+    );
+}
+
+/// Run the stateful checks of released votes again, a verdict each, in
+/// blocking batches of up to [`RECHECK_BATCH`] votes of one kind.
+///
+/// Batched because a root's votes are released together, and run on a pool
+/// of their own ([`P2PServer::recheck_permits`]): on the attestation pool, a
+/// big release would take the permits of the votes arriving meanwhile, which
+/// would then be ignored as overloaded, the very loss parking is there to
+/// prevent. A batch waits for a permit rather than failing without one, and
+/// each vote's deadline is checked again right before its turn (see
+/// [`recheck`]), so a vote reached too late still gets its first verdict.
+///
+/// Every vote handed in is still held under the parked-vote caps, and gives
+/// its place back once its final verdict is in ([`ParkedVotes::answered`]):
+/// here for one already past its deadline, and otherwise when its
+/// [`Check::Recheck`] verdict reaches [`receive_verdict`].
+///
+/// [`ParkedVotes::answered`]: crate::beacon::parked_votes::ParkedVotes::answered
+fn spawn_rechecks(server: &mut P2PServer, ctx: &Context<P2PServer>, votes: Vec<ParkedVote>) {
+    let now = Instant::now();
+    let mut by_kind: HashMap<&'static str, Vec<ParkedVote>> = HashMap::new();
+    for vote in votes {
+        if vote.expired(now) {
+            metrics::inc_parked_votes(vote.id.kind, "expired");
+            server.parked_votes.answered(&vote.object);
+            conclude(server, vote.id, vote.outcome, vote.object);
+        } else {
+            by_kind.entry(vote.id.kind).or_default().push(vote);
+        }
+    }
+    for (kind, mut votes) in by_kind {
+        while !votes.is_empty() {
+            let rest = votes.split_off(votes.len().min(RECHECK_BATCH));
+            spawn_recheck_batch(server, ctx, kind, votes);
+            votes = rest;
+        }
+    }
+}
+
+/// One blocking batch of [`spawn_rechecks`], started once a
+/// [`P2PServer::recheck_permits`] permit is free.
+fn spawn_recheck_batch(
+    server: &P2PServer,
+    ctx: &Context<P2PServer>,
+    kind: &'static str,
+    votes: Vec<ParkedVote>,
+) {
+    let permits = server.recheck_permits.clone();
+    let store = server.store.clone();
+    let actor = ctx.actor_ref();
+    tokio::spawn(async move {
+        // `acquire_owned` fails only on a closed pool, and nothing closes
+        // this one. The batch runs either way: each vote in it is held under
+        // the parked-vote caps until its verdict reaches the actor, so each
+        // must get one.
+        let permit = permits.acquire_owned().await.ok();
+        let in_use = metrics::PoolInUse::new(RECHECK_POOL);
+        let task = metrics::BlockingTask::new(recheck_task_kind(kind));
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _in_use = in_use;
+            let _run = task.start();
+            for vote in votes {
+                let verdict = recheck(&store, vote, Instant::now());
+                if actor.send(verdict).is_err() {
+                    warn!("P2P actor stopped before a rechecked vote's verdict arrived");
+                    return;
+                }
+            }
+        });
+    });
+}
+
+/// Check a released vote again at `now`, or, past its deadline by then, give
+/// it the outcome of its first check, since a second one could not reach
+/// gossipsub in time. Either way the verdict may not park it again.
+fn recheck(store: &Store, vote: ParkedVote, now: Instant) -> GossipVerdict {
+    let late = vote.expired(now);
+    let ParkedVote {
+        id,
+        mut object,
+        outcome,
+    } = vote;
+    let outcome = if late {
+        metrics::inc_parked_votes(id.kind, "expired");
+        outcome
+    } else {
+        metrics::inc_parked_votes(id.kind, "rechecked");
+        guarded(|| object.stateful_checks(store))
+    };
+    GossipVerdict {
+        id,
+        outcome,
+        object,
+        check: Check::Recheck,
+    }
+}
+
+/// The label of [`P2PServer::recheck_permits`] (see
+/// [`metrics::VALIDATION_POOLS`]).
+const RECHECK_POOL: &str = "recheck";
+
+/// The `kind` a batch of rechecked votes is timed under: its own, so the
+/// blocking-task histograms keep a batch of up to [`RECHECK_BATCH`] checks
+/// apart from the single checks of first arrivals.
+fn recheck_task_kind(kind: &'static str) -> &'static str {
+    match kind {
+        "beacon_attestation" => "beacon_attestation_recheck",
+        "beacon_aggregate_and_proof" => "beacon_aggregate_and_proof_recheck",
+        other => other,
+    }
+}
+
+/// How many released votes one blocking task checks again.
+const RECHECK_BATCH: usize = 64;
 
 /// How an outcome maps onto gossipsub, and whether the object still goes on
 /// towards the chain actor (see [`Validated::forward`] for the route).
@@ -773,12 +1038,32 @@ pub(crate) fn spawn_stateful_checks(
         let _in_use = in_use;
         let _run = task.start();
         let mut object = object;
-        let outcome = guarded(|| object.stateful_checks(&store));
+        let mut check = Check::First;
+        // One `guarded` around the probe too: `has_state` panics, rather
+        // than returning an error, on a storage failure.
+        let outcome = guarded(|| {
+            let outcome = object.stateful_checks(&store);
+            // A missing post-state means the block is still importing only
+            // when it has no stored state either. With one, it was imported:
+            // its state left the cache since, and no release will come for
+            // it, or it landed while this check ran, and its release may
+            // already be gone. Either way the vote is checked once more now
+            // and not parked.
+            let imported = outcome == Outcome::Ignore(IgnoreReason::StateUnavailable)
+                && parkable_root(&object, outcome)
+                    .is_some_and(|root| store.has_state(&root).is_ok_and(|stored| stored));
+            if !imported {
+                return outcome;
+            }
+            check = Check::Repeated;
+            object.stateful_checks(&store)
+        });
         let _ = actor
             .send(GossipVerdict {
                 id,
                 outcome,
                 object,
+                check,
             })
             .inspect_err(|_| warn!("P2P actor stopped before a gossip verdict arrived"));
     });
@@ -1571,10 +1856,13 @@ mod tests {
         preferences
     }
 
+    /// A bid object as its stateful checks leave it on `Accept`, with a
+    /// limit that never binds.
     fn bid_object(server: &P2PServer, bid: SignedExecutionPayloadBid) -> Validated {
         Validated::ExecutionPayloadBid {
             bid: Box::new(bid),
             market: server.builder_market.clone(),
+            bid_limit: u64::MAX,
         }
     }
 
@@ -1794,6 +2082,249 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Internal)
         );
         assert_eq!(guarded(|| Outcome::Accept), Outcome::Accept);
+    }
+
+    // -----------------------------------------------------------------
+    // Parked votes: a verdict withheld until the voted block is ready
+    // -----------------------------------------------------------------
+
+    fn gossip_id(byte: u8, kind: &'static str, received_at: Instant) -> GossipId {
+        GossipId {
+            message_id: MessageId::new(&[byte]),
+            propagation_source: PeerId::random(),
+            received_at,
+            kind,
+        }
+    }
+
+    fn attestation_verdict(attester: u64, outcome: Outcome, check: Check) -> GossipVerdict {
+        GossipVerdict {
+            id: gossip_id(attester as u8, "beacon_attestation", Instant::now()),
+            outcome,
+            object: Validated::Attestation {
+                attestation: Box::new(electra_attestation(1, attester)),
+                subnet_id: 0,
+            },
+            check,
+        }
+    }
+
+    /// A released vote still in time has its checks run again; one past its
+    /// deadline by its turn keeps the outcome of its first check. Neither
+    /// verdict may park the vote a second time. The first outcome here is one
+    /// the stateful checks never give, so a fresh check is told apart from it.
+    #[tokio::test]
+    async fn a_recheck_never_parks_again_and_keeps_the_first_outcome_past_the_deadline() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let first = Outcome::Ignore(IgnoreReason::Overloaded);
+        let parked = |received_at| ParkedVote {
+            id: gossip_id(1, "beacon_attestation", received_at),
+            object: Validated::Attestation {
+                attestation: Box::new(electra_attestation(1, 1)),
+                subnet_id: 0,
+            },
+            outcome: first,
+        };
+        let arrived = Instant::now();
+
+        let deadline = arrived + crate::beacon::parked_votes::PARKED_VOTE_DEADLINE;
+        let late = recheck(&server.store, parked(arrived), deadline);
+        assert_eq!(late.outcome, first);
+        assert_eq!(late.check, Check::Recheck);
+
+        let in_time = recheck(&server.store, parked(arrived), arrived);
+        assert_ne!(in_time.outcome, first, "the checks ran again");
+        assert_eq!(in_time.check, Check::Recheck);
+    }
+
+    /// The verdicts reported to gossipsub so far, in order, by name:
+    /// `MessageAcceptance` has no `PartialEq`.
+    fn reported(
+        commands: &mut tokio::sync::mpsc::UnboundedReceiver<crate::swarm_adapter::SwarmCommand>,
+    ) -> Vec<&'static str> {
+        let mut reported = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let crate::swarm_adapter::SwarmCommand::ReportValidation { acceptance, .. } = command
+            {
+                reported.push(match acceptance {
+                    MessageAcceptance::Accept => "accept",
+                    MessageAcceptance::Ignore => "ignore",
+                    MessageAcceptance::Reject => "reject",
+                });
+            }
+        }
+        reported
+    }
+
+    async fn capturing_server() -> (
+        P2PServer,
+        tokio::sync::mpsc::UnboundedReceiver<crate::swarm_adapter::SwarmCommand>,
+    ) {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (swarm_handle, commands) = crate::swarm_adapter::SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        (server, commands)
+    }
+
+    #[tokio::test]
+    async fn a_vote_for_a_block_not_ready_yet_is_parked_without_a_verdict() {
+        let (mut server, mut commands) = capturing_server().await;
+
+        for (attester, reason) in [
+            (1, IgnoreReason::StateUnavailable),
+            (2, IgnoreReason::UnknownBlock),
+        ] {
+            let verdict = attestation_verdict(attester, Outcome::Ignore(reason), Check::First);
+            receive_verdict(&mut server, verdict);
+        }
+        let aggregate = GossipVerdict {
+            id: gossip_id(9, "beacon_aggregate_and_proof", Instant::now()),
+            outcome: Outcome::Ignore(IgnoreReason::StateUnavailable),
+            object: Validated::Aggregate {
+                aggregate: Box::new(electra_aggregate(1, 9)),
+                attesting_indices: Vec::new(),
+            },
+            check: Check::First,
+        };
+        receive_verdict(&mut server, aggregate);
+
+        assert_eq!(server.parked_votes.len(), 3);
+        assert!(
+            reported(&mut commands).is_empty(),
+            "gossipsub still holds all three"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_first_parked_vote_schedules_a_sweep() {
+        let (mut server, _commands) = capturing_server().await;
+        let outcome = Outcome::Ignore(IgnoreReason::StateUnavailable);
+
+        let first = receive_verdict(&mut server, attestation_verdict(1, outcome, Check::First));
+        let second = receive_verdict(&mut server, attestation_verdict(2, outcome, Check::First));
+
+        assert!(matches!(first, AfterVerdict::ScheduleSweep));
+        assert!(matches!(second, AfterVerdict::Done));
+    }
+
+    #[tokio::test]
+    async fn a_vote_checked_again_or_refused_otherwise_is_reported_at_once() {
+        let (mut server, mut commands) = capturing_server().await;
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+
+        // A second check may not park again.
+        receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::Repeated),
+        );
+        // Only a missing block or state parks.
+        let reject = Outcome::Reject(RejectReason::BadSignature);
+        receive_verdict(&mut server, attestation_verdict(2, reject, Check::First));
+        let seen = Outcome::Ignore(IgnoreReason::AlreadySeen);
+        receive_verdict(&mut server, attestation_verdict(3, seen, Check::First));
+        // And only a vote: a block waits in the chain actor instead.
+        let block = GossipVerdict {
+            id: gossip_id(4, "beacon_block", Instant::now()),
+            outcome: Outcome::Ignore(IgnoreReason::UnknownBlock),
+            object: Validated::Block {
+                block: Box::new(fulu_block(5, 1)),
+                block_root: Root::repeat_byte(1),
+            },
+            check: Check::First,
+        };
+        receive_verdict(&mut server, block);
+
+        assert!(server.parked_votes.is_empty());
+        assert_eq!(
+            reported(&mut commands),
+            vec!["ignore", "reject", "ignore", "ignore"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vote_whose_block_was_announced_first_is_checked_again_at_once() {
+        let (mut server, mut commands) = capturing_server().await;
+        // `electra_attestation` votes for the zero root.
+        server.parked_votes.take_ready(Root::ZERO);
+
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+        let after = receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::First),
+        );
+
+        assert!(matches!(after, AfterVerdict::Recheck(_)));
+        assert!(server.parked_votes.is_empty());
+        assert!(reported(&mut commands).is_empty());
+    }
+
+    /// A released vote keeps its place under the parked-vote caps until its
+    /// second check's verdict reaches the actor, and that verdict gives the
+    /// place back.
+    #[tokio::test]
+    async fn a_released_vote_is_held_until_its_recheck_answers() {
+        let (mut server, mut commands) = capturing_server().await;
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+        receive_verdict(
+            &mut server,
+            attestation_verdict(1, unavailable, Check::First),
+        );
+
+        // `electra_attestation` votes for the zero root.
+        let released = server.parked_votes.take_ready(Root::ZERO);
+        assert_eq!(released.len(), 1);
+        assert!(server.parked_votes.is_empty());
+        assert_eq!(server.parked_votes.held(), 1);
+
+        // Past its deadline, so the verdict is its first one, an IGNORE.
+        let late = Instant::now() + crate::beacon::parked_votes::PARKED_VOTE_DEADLINE;
+        for vote in released {
+            let verdict = recheck(&server.store, vote, late);
+            receive_verdict(&mut server, verdict);
+        }
+        assert_eq!(server.parked_votes.held(), 0);
+        assert_eq!(reported(&mut commands), vec!["ignore"]);
+    }
+
+    #[tokio::test]
+    async fn a_parked_vote_past_its_deadline_gets_its_first_verdict() {
+        let (mut server, mut commands) = capturing_server().await;
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+        let mut verdict = attestation_verdict(1, unavailable, Check::First);
+        verdict.id.received_at = Instant::now()
+            .checked_sub(crate::beacon::parked_votes::PARKED_VOTE_DEADLINE)
+            .expect("the clock is past the deadline");
+        receive_verdict(&mut server, verdict);
+        receive_verdict(
+            &mut server,
+            attestation_verdict(2, unavailable, Check::First),
+        );
+
+        let more_due = sweep_parked_votes(&mut server);
+
+        assert!(more_due, "the vote within its deadline is still parked");
+        assert_eq!(server.parked_votes.len(), 1);
+        assert_eq!(reported(&mut commands), vec!["ignore"]);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_empties_the_queue_schedules_no_other() {
+        let (mut server, _commands) = capturing_server().await;
+        let unavailable = Outcome::Ignore(IgnoreReason::StateUnavailable);
+        let mut verdict = attestation_verdict(1, unavailable, Check::First);
+        verdict.id.received_at = Instant::now()
+            .checked_sub(crate::beacon::parked_votes::PARKED_VOTE_DEADLINE)
+            .expect("the clock is past the deadline");
+        receive_verdict(&mut server, verdict);
+
+        assert!(!sweep_parked_votes(&mut server));
+        assert!(server.parked_votes.is_empty());
+        // The next park schedules a sweep of its own.
+        let after = receive_verdict(
+            &mut server,
+            attestation_verdict(2, unavailable, Check::First),
+        );
+        assert!(matches!(after, AfterVerdict::ScheduleSweep));
     }
 
     /// The compressed BLS12-381 G2 generator: a signature that decodes and

@@ -6,9 +6,10 @@
 //! signature domain to the capella fork version), `validate_proposer_slashing_gossip`,
 //! `validate_attester_slashing_gossip` (phase0; electra and gloas change only
 //! the `AttesterSlashing` type) and `validate_bls_to_execution_change_gossip`
-//! (`capella/p2p-interface.md`), as of consensus-specs v1.7.0-beta.1, which is
-//! what the conformance vectors are generated from. They apply under an
-//! electra, fulu or gloas head.
+//! (`capella/p2p-interface.md`), as of consensus-specs v1.7.0-beta.5, which is
+//! what the conformance vectors are generated from. Electra modifies the exit
+//! rule (consensus-specs #5764): an exit for a validator with pending partial
+//! withdrawals is ignored. They apply under an electra, fulu or gloas head.
 //!
 //! Each function splits where the specification first reads `state`:
 //! `cheap_checks` is everything before it (the seen records, the clock, and
@@ -16,9 +17,9 @@
 //! state is the fork-choice head's post-state, read as it is and never
 //! advanced: an operation has no block of its own to name one, and the
 //! specification checks it against the head without a slot transition. The
-//! rules do not run `process_*`, so they also do not apply a block's own
-//! extra conditions (an exit's pending balance, say); block packing filters
-//! those.
+//! rules do not run `process_*`, so they apply a block's own extra conditions
+//! only where the specification's gossip rule repeats one (an exit's pending
+//! balance); block packing filters the rest.
 
 use std::collections::HashSet;
 
@@ -39,7 +40,9 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{get_current_epoch, get_domain};
-use crate::beacon::helpers::electra::is_valid_indexed_attestation;
+use crate::beacon::helpers::electra::{
+    get_pending_balance_to_withdraw, is_valid_indexed_attestation,
+};
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
@@ -249,6 +252,14 @@ fn voluntary_exit(state: &BeaconState, signed: &SignedVoluntaryExit, config: &Co
                 .saturating_add(config.shard_committee_period)
     {
         return Err(Outcome::Reject(RejectReason::InvalidOperation));
+    }
+    // [New in Electra:EIP7251] [IGNORE] The validator has no pending partial
+    // withdrawals (consensus-specs #5764): `process_voluntary_exit` would
+    // refuse the exit, so it is not forwarded.
+    let pending = get_pending_balance_to_withdraw(state, exit.validator_index)
+        .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
+    if pending != 0 {
+        return Err(Outcome::Ignore(IgnoreReason::PendingPartialWithdrawals));
     }
     // [Modified in Deneb:EIP7044] [REJECT] The signature, under the capella
     // fork version so exits stay valid across forks.

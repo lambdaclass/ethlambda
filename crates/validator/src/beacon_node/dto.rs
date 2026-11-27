@@ -28,7 +28,7 @@
 //! two of the endpoints used here, but no implementation exercises it: see the
 //! design document's "Wire format" section for the evidence.
 
-use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::config::{Config, GasLimitSchedule};
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::containers::electra::{
     AggregationBits, Attestation, CommitteeBits, SignedAggregateAndProof,
@@ -42,6 +42,8 @@ use ethlambda_types::beacon::primitives::{
 };
 use libssz::SszDecode as _;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 
@@ -757,7 +759,10 @@ fn check_preset(value: &serde_json::Value, preset: Preset) -> Result<()> {
 ///
 /// The `*_DUE_BPS` offsets and `SHARD_COMMITTEE_PERIOD` keep their defaults
 /// when absent: a node that predates the basis-point form is right with
-/// them, and they do not identify the chain. Every other `Config` field is
+/// them, and they do not identify the chain. So does `GAS_LIMIT_SCHEDULE`
+/// (an empty schedule), which a node that does not serve it leaves to
+/// `DEFAULT_GAS_LIMIT`; unlike the others, an unusable one is ignored rather
+/// than an error (see [`gas_limit_schedule_of`]). Every other `Config` field is
 /// its preset's default whatever the node reports, so code in this crate that starts
 /// reading one has to read its key here first.
 ///
@@ -860,7 +865,6 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     if let Some(epochs) = spec_u64(value, "SHARD_COMMITTEE_PERIOD")? {
         config.shard_committee_period = epochs;
     }
-
     let genesis_version = required(
         spec_version(value, &fork_version_key(ForkName::Phase0))?,
         "GENESIS_FORK_VERSION",
@@ -892,8 +896,53 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
         config = config.with_fork_epoch(fork, required(epoch, &epoch_key)?);
         config = config.with_fork_version(fork, required(version, &version_key)?);
     }
+    // After the loop: the schedule's rules read the gloas epoch.
+    config.gas_limit_schedule = gas_limit_schedule_of(value, config.gloas_fork_epoch);
 
     Ok(config)
+}
+
+/// `GAS_LIMIT_SCHEDULE`: the default gas limit, per epoch, when `--gas-limit`
+/// names none.
+///
+/// Empty when the node does not serve it, or serves `null` (how Go's JSON
+/// encoder writes a nil slice), which falls back to `DEFAULT_GAS_LIMIT`. Also
+/// empty, with a warning, when the node serves one this client cannot decode
+/// or that breaks [`GasLimitSchedule::check_rules`]: the schedule only names
+/// a default and identifies no chain, so it is no reason to stop using the
+/// node, and an empty schedule has no say when the nodes' schedules are
+/// merged (see `chain_check::merge_schedule`).
+///
+/// The spec is read every slot from every node, so the warning is given
+/// once per process and later ones are at `debug`.
+fn gas_limit_schedule_of(value: &serde_json::Value, gloas_fork_epoch: Epoch) -> GasLimitSchedule {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let Some(field) = value
+        .get("GAS_LIMIT_SCHEDULE")
+        .filter(|field| !field.is_null())
+    else {
+        return GasLimitSchedule::default();
+    };
+    // serde's message can quote the node's own text, so it is written out
+    // and bounded like every other JSON decode error from a node.
+    let schedule = serde_json::from_value::<GasLimitSchedule>(field.clone())
+        .map_err(|err| super::http::decode_text(&err))
+        .and_then(|schedule| {
+            let checked = schedule.check_rules(gloas_fork_epoch);
+            checked.map(|()| schedule).map_err(|err| err.to_string())
+        });
+    schedule.unwrap_or_else(|detail| {
+        if WARNED.swap(true, Ordering::Relaxed) {
+            debug!(%detail, "Ignoring a GAS_LIMIT_SCHEDULE a beacon node serves");
+        } else {
+            warn!(
+                %detail,
+                "A beacon node serves a GAS_LIMIT_SCHEDULE this client cannot use; ignoring it, \
+                 so the default gas limit comes from another node or DEFAULT_GAS_LIMIT"
+            );
+        }
+        GasLimitSchedule::default()
+    })
 }
 
 impl TryFrom<&AttestationDto> for Attestation {
@@ -1625,6 +1674,81 @@ mod tests {
         let response = complete_spec(&[("SHARD_COMMITTEE_PERIOD", "soon")]);
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// The schedule in the shape a beacon node serves it (this one's and
+    /// lighthouse's), looked up at the proposal's epoch; a node that does not
+    /// serve the key, or serves it empty, schedules nothing.
+    #[test]
+    fn the_gas_limit_schedule_is_read_and_defaults_to_empty() {
+        // A complete response with `GAS_LIMIT_SCHEDULE` set to `schedule`,
+        // gloas at Sepolia's epoch so the entries are not before it.
+        let serving = |schedule: serde_json::Value| {
+            let mut response = complete_spec(&[
+                ("GLOAS_FORK_EPOCH", "353024"),
+                ("GLOAS_FORK_VERSION", "0x90000075"),
+            ]);
+            response["GAS_LIMIT_SCHEDULE"] = schedule;
+            response
+        };
+
+        let response = serving(serde_json::json!([
+            {"EPOCH": "353024", "GAS_LIMIT": "200000000"},
+            {"EPOCH": "400000", "GAS_LIMIT": "300000000"},
+        ]));
+        let config = config_from_spec_response(&response).expect("builds");
+        let schedule = &config.gas_limit_schedule;
+        assert_eq!(schedule.entries().len(), 2);
+        assert_eq!(schedule.gas_limit_at(353_023), None);
+        assert_eq!(schedule.gas_limit_at(353_024), Some(200_000_000));
+        assert_eq!(schedule.gas_limit_at(400_000), Some(300_000_000));
+
+        let config = config_from_spec_response(&complete_spec(&[])).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+        let response = serving(serde_json::json!([]));
+        let config = config_from_spec_response(&response).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+        // Go's encoder writes a nil slice as `null`.
+        let response = serving(serde_json::Value::Null);
+        let config = config_from_spec_response(&response).expect("builds");
+        assert!(config.gas_limit_schedule.is_empty());
+    }
+
+    /// A schedule the client cannot use is ignored, not an error: it only
+    /// names a default gas limit, so it must not cost the client the node.
+    /// That covers one that does not decode and one that breaks the rules a
+    /// beacon node holds its own to (gloas at epoch 100 here).
+    #[test]
+    fn an_unusable_gas_limit_schedule_is_ignored() {
+        let serving = |schedule: serde_json::Value| {
+            let mut response = complete_spec(&[]);
+            response["GLOAS_FORK_EPOCH"] = serde_json::json!("100");
+            response["GLOAS_FORK_VERSION"] = serde_json::json!("0x07000000");
+            response["GAS_LIMIT_SCHEDULE"] = schedule;
+            response
+        };
+        let unusable = [
+            serde_json::json!("200000000"),
+            serde_json::json!([{"EPOCH": "100", "LIMIT": "200000000"}]),
+            serde_json::json!([
+                {"EPOCH": "100", "GAS_LIMIT": "100000000"},
+                {"EPOCH": "100", "GAS_LIMIT": "200000000"},
+            ]),
+            serde_json::json!([{"EPOCH": "99", "GAS_LIMIT": "200000000"}]),
+            serde_json::json!([{"EPOCH": "100", "GAS_LIMIT": "0"}]),
+        ];
+        for schedule in unusable {
+            let config = config_from_spec_response(&serving(schedule.clone()))
+                .unwrap_or_else(|err| panic!("{schedule}: {err:?}"));
+            assert!(config.gas_limit_schedule.is_empty(), "{schedule}");
+        }
+
+        let usable = serving(serde_json::json!([{"EPOCH": "100", "GAS_LIMIT": "200000000"}]));
+        let config = config_from_spec_response(&usable).expect("builds");
+        assert_eq!(
+            config.gas_limit_schedule.gas_limit_at(100),
+            Some(200_000_000)
+        );
     }
 
     #[test]

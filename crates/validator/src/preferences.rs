@@ -524,9 +524,11 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                 None => Before::Unsent,
             };
             // One read for both, so a keymanager write between two reads
-            // cannot pair an old address with a new gas limit.
+            // cannot pair an old address with a new gas limit. The gas limit
+            // is the one for the proposal's epoch, `target`, which is the next
+            // epoch's for a preference signed ahead.
             let Some((fee_recipient, target_gas_limit)) =
-                self.settings.fee_recipient_and_gas_limit(&pubkey)
+                self.settings.fee_recipient_and_gas_limit(&pubkey, target)
             else {
                 no_fee_recipient += 1;
                 continue;
@@ -938,6 +940,52 @@ mod tests {
             assert_eq!(entry.message.target_gas_limit, 31_000_000);
             assert!(verifies(&pubkeys[0], entry), "slot {slot}");
         }
+    }
+
+    /// Without `--gas-limit` or an override, each preference carries the gas
+    /// limit the schedule names for its proposal's epoch, not the wall
+    /// clock's: the next epoch's preference is signed now, at its own
+    /// epoch's limit.
+    #[tokio::test]
+    async fn the_target_gas_limit_is_the_one_scheduled_for_the_proposal_epoch() {
+        use crate::proposer_settings::DEFAULT_GAS_LIMIT;
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let settings = settings(Some(FEE_RECIPIENT));
+        settings.set_gas_limit_schedule(
+            vec![GasLimitScheduleEntry {
+                epoch: GLOAS_EPOCH + 1,
+                gas_limit: 200_000_000,
+            }]
+            .into(),
+        );
+        let node = MockBeaconNode::new()
+            .with_proposers_v2(
+                GLOAS_EPOCH,
+                Root::repeat_byte(0x11),
+                vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10))],
+            )
+            .with_proposers_v2(
+                GLOAS_EPOCH + 1,
+                Root::repeat_byte(0x22),
+                vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH + 1, 4))],
+            );
+        let (service, node) = service(node, settings);
+
+        service.poll(slot_in(GLOAS_EPOCH, 1), store).await;
+
+        let mut entries: Vec<_> = submitted(&node)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .collect();
+        entries.sort_by_key(|entry| entry.message.proposal_slot);
+        let gas_limits: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.message.target_gas_limit)
+            .collect();
+        assert_eq!(gas_limits, [DEFAULT_GAS_LIMIT, 200_000_000]);
     }
 
     #[tokio::test]

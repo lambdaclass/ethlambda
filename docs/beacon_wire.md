@@ -71,7 +71,8 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
-and moves its discv5 admission filter. While the window is open a gossip
+and moves its discv5 admission filter, then publishes again the proposer
+preferences whose earlier publish reached no peer (under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
@@ -111,6 +112,43 @@ block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
+
+This node joins that digest's topics an epoch ahead, as Lighthouse does since
+v8.3.0 and Prysm does, and so at the same moment as every peer that does: at
+the start of the epoch before the boundary, which is also when the validator
+client sends the next epoch's preferences. The first publish can therefore
+find no peer on the topic yet. So a preference publish waits for a peer, as
+Prysm's does. The market remembers, for each preference this node publishes,
+whether it is still owed a publish (`BuilderMarket::record_preferences_publish`):
+after a publish no peer was handed. One still owed is published again while
+its slot is ahead (`publish_owed_proposer_preferences`):
+
+- when a peer joins its topic (gossipsub's `Subscribed` event, which comes
+  once the peer is counted on the topic; `on_peer_subscribed`). A subscription
+  to any other topic, or to a digest this node does not hold, sends nothing;
+- at every fork-digest switch. The new digest's first slot has started by
+  then, so its preference is past helping and is left out.
+
+Only a publish that found no peer subscribed can be retried: it left no trace
+in the duplicate cache, so its retry goes out. One refused because every
+peer's queue was full did leave its id there, so its retry is answered as a
+duplicate, which ends the retries.
+
+A preference that reached one peer is not sent again. A message's gossipsub id
+is its topic and payload alone, and gossipsub keeps the id of every message it
+handed to a peer, or received from one, for `seen_ttl` (two epochs) and refuses
+to publish it again until then (`Duplicate`). Peers that join the topic later
+get it only if a peer already on it relays it to them, which gossip does not
+do for a message older than its gossip window. Lighthouse before v8.3.0 joins
+two slots before the boundary, and Grandine 2.0.6 five, so on a network with
+those they may miss the first epoch's preferences.
+
+A publish of a bid, a preference, an envelope or a payload attestation that no
+peer was handed is logged at `warn` with gossipsub's reason
+(`NoPeersSubscribedToTopic`, say), one gossipsub refuses as a duplicate at
+`debug`, and `Published ... to gossipsub` at `info` only once a peer has it.
+Every other topic's publish failures are logged by the swarm adapter, at
+`debug`.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -252,7 +290,7 @@ block, current slot, committee seat).
 `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 `bls_to_execution_change` are validated in p2p like aggregates, by
 `gossip::operations`: the specification's `validate_*_gossip` functions
-(consensus-specs v1.7.0-beta.1), run against the fork-choice head's post-state
+(consensus-specs v1.7.0-beta.5), run against the fork-choice head's post-state
 as it is, with no state advance and no `process_*`. The seen records (the
 first valid exit or credential change per validator, proposer slashing per
 proposer, and the validators an attester slashing slashes) live in
@@ -423,7 +461,8 @@ scored by its role:
   but its mesh, formed before the boundary, can already be past the
   deliveries' activation (one epoch for blocks and aggregates). P3 on the new
   digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
-  Lighthouse joins two slots ahead, so activation alone covers it there.
+  Lighthouse before v8.3.0 joins two slots ahead, so activation alone covers
+  it there.
 
 ## Aggregate attestations
 
@@ -465,6 +504,42 @@ thread, in this order:
 6. Ancestry against the vote state's `block_roots`: the target is the vote
    block's ancestor at the target epoch (REJECT), and the finalized checkpoint
    is an ancestor of the vote block (IGNORE).
+
+Steps 1 and 2 fail for a while on every block this node imports: validators
+vote as soon as the block reaches them, so the first votes for it arrive
+while this node is still waiting for its columns or running its state
+transition. Those IGNOREs are not reported straight away. The vote is parked
+under the block's root with its verdict withheld, so gossipsub keeps holding
+the message, and when the chain actor's import caches the post-state it tells
+p2p (`BlockChainToP2P::block_state_ready`), which runs the stateful checks
+again, in blocking batches, and reports what they answer then. An accepted
+vote propagates as the original message. This is lighthouse's reprocess
+queue, which the specification allows ("a client MAY queue attestations for
+processing once block is retrieved"). Without it, a devnet with ~130 ms
+imports lost 5 to 8% of each node's subnet votes, all of them the earliest.
+
+A vote is parked once: its second check reports whatever it answers. One
+still parked 2.5 s after it arrived gets its first verdict, since gossipsub
+drops a message awaiting a verdict as early as 3.5 s in (6 heartbeats of
+700 ms of history). The queue holds at most 16,384 votes, lighthouse's own
+cap, since nothing about a parked vote has been verified, and at most 2,048
+aggregates among them, since an aggregate's bits can reach 16 KiB before its
+signature is checked; past either, a vote gets its first verdict at once.
+Released votes are checked again on a permit pool of their own, so a big
+release takes no permit from the votes arriving meanwhile, and each keeps its
+place under both caps until that check answers, since its batch may wait for
+a permit while the next releases come in. Votes for a block this node has
+not stored at all take at most half of each cap: any peer can name a
+root nobody signed, and since no import releases it, its votes would sit
+until their deadline and end in an IGNORE that costs the peer nothing. A
+vote for a block this node has stored names one it was handed and is still
+importing, nearly always after checking its proposer's signature, and those
+are nearly every early vote an honest network sends, so a peer flooding
+made-up roots cannot crowd them out. A vote whose block
+was imported but whose state has left the cache is checked once more at once
+and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
+node has never seen does not start a lookup for that block: it waits for
+gossip or sync to bring it. See `crates/net/p2p/src/beacon/parked_votes.rs`.
 
 The seen caches (`SeenAggregates`, keyed both by `(target_epoch,
 aggregator_index)` and by `(hash_tree_root(data), committee_index)`;
@@ -1025,6 +1100,8 @@ Known gaps:
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
+| `lean_beacon_gossip_parked_votes_total{kind,result}` | Votes whose verdict waited for their block's post-state: `parked`, `full`, `rechecked`, `expired` |
+| `lean_beacon_gossip_parked_votes` | Votes parked right now |
 | `lean_beacon_status_digest_mismatch_total` | Peers whose `Status` moved onto another fork digest, once per move (not per refresh) |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |
