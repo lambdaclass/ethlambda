@@ -110,6 +110,10 @@ pub struct PayloadPreparation {
     /// The payload builds the actor started ahead of their slots, shared
     /// with block production.
     pub prepared_payloads: PreparedPayloads,
+    /// The attestations of the next PQ block, packed and merged ahead of its
+    /// slot alongside its payload build, shared with block production. See
+    /// [`crate::pq_attestation_packing`].
+    pub prepared_pq_attestations: crate::pq_attestation_packing::PreparedPqAttestations,
 }
 
 /// Payload builds started ahead of their slot, by the payload id the
@@ -1022,6 +1026,22 @@ impl BlockChainServer {
         let prepared = preparation.prepared_payloads.clone();
         let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
         tokio::spawn(start_build(engine, prepared, custody, key, build));
+
+        // A PQ block's attestation proofs are merged now too, rather than at
+        // the slot: everything the merge reads is already here (see
+        // `pq_attestation_packing`). Only for a proposer a validator client
+        // registered here, not for every slot `--always-prepare-payload`
+        // builds for: a merge is ~0.6 s of the prover nobody would collect.
+        let proposal_epoch = compute_epoch_at_slot(key.proposal_slot);
+        if self.store.config().fork_at_epoch(proposal_epoch) == ForkName::Pq
+            && key.fee_recipient.is_some()
+        {
+            preparation.prepared_pq_attestations.start(
+                self.store.clone(),
+                key.head_root,
+                key.proposal_slot,
+            );
+        }
     }
 }
 
