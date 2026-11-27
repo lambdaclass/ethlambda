@@ -277,17 +277,24 @@ impl SigningContext {
     }
 
     /// Swap in a new fork schedule, for every holder of the shared handle,
-    /// and forget the selection proofs signed under the old one.
+    /// and forget the selection proofs whose domain it moves.
     ///
     /// The one way to change the schedule, so the two cannot be done
     /// separately: a remembered proof is a signature over a domain, and a
     /// domain that moved makes it one no node accepts.
     ///
-    /// All three steps happen with the proofs' lock held. A reader of the
-    /// memory therefore sees it either before the swap or emptied after it,
-    /// never the old proofs beside the new schedule, and a proof that was
-    /// being signed across the swap finds the generation moved and is not
-    /// remembered.
+    /// Only those proofs: a slot whose epoch has the same fork version under
+    /// both schedules has the same domain, so its proof is as good as before.
+    /// With distributed mode on the memory holds the middleware's combined
+    /// proofs, which this client cannot sign again, so forgetting one the
+    /// swap did not touch (a fork scheduled far ahead, say) would leave its
+    /// duty without an aggregation until the middleware answered again.
+    ///
+    /// All the steps happen with the proofs' lock held. A reader of the
+    /// memory therefore sees it either before the swap or after it, never an
+    /// old proof beside a schedule that moved its domain, and a proof that
+    /// was being signed across the swap finds the generation moved and is
+    /// not remembered.
     ///
     /// A swap that moves no fork epoch or version (only the duty offsets,
     /// which the chain check also follows) changes no domain: the proofs are
@@ -296,11 +303,18 @@ impl SigningContext {
     /// for nothing.
     pub fn replace_config(&self, config: Config) {
         let mut proofs = self.selection_proofs();
-        let domains_moved = !same_fork_schedule(&self.config.load(), &config);
+        let old = self.config.load();
+        let domains_moved = !same_fork_schedule(&old, &config);
+        if domains_moved {
+            proofs.retain(|(_, slot), _| {
+                let epoch = compute_epoch_at_slot(*slot);
+                old.fork_version(old.fork_at_epoch(epoch))
+                    == config.fork_version(config.fork_at_epoch(epoch))
+            });
+        }
         self.config.store(config);
         if domains_moved {
             self.schedule_generation.fetch_add(1, Ordering::Release);
-            proofs.clear();
         }
     }
 
@@ -1316,6 +1330,36 @@ mod tests {
 
         assert_ne!(before, after, "the swap reaches the domains");
         assert!(context.selection_proofs().is_empty());
+    }
+
+    /// A swap that schedules a fork far ahead keeps the proofs of the slots
+    /// it leaves on the same fork version, and forgets those it moves onto
+    /// another. With distributed mode on these are the middleware's combined
+    /// proofs, which this client cannot sign again.
+    #[test]
+    fn replacing_the_config_keeps_the_proofs_whose_domain_did_not_move() {
+        let context = context().with_distributed();
+        let gloas = context.config().fork_epoch(ForkName::Fulu) + 100;
+        let (pubkey, proof) = (BlsPubkey([1; 48]), BlsSignature([2; 96]));
+        let untouched = 100 * preset::slots_per_epoch();
+        let moved = gloas * preset::slots_per_epoch();
+        context
+            .selection_proofs()
+            .insert((pubkey, untouched), proof);
+        context.selection_proofs().insert((pubkey, moved), proof);
+        let generation = context.schedule_generation();
+
+        context.replace_config(Config::mainnet().with_fork_epoch(ForkName::Gloas, gloas));
+
+        assert_ne!(context.schedule_generation(), generation, "a fork moved");
+        assert!(
+            context.holds_combined_selection_proof(&pubkey, untouched),
+            "still phase0's version"
+        );
+        assert!(
+            !context.holds_combined_selection_proof(&pubkey, moved),
+            "now gloas's version, not fulu's"
+        );
     }
 
     /// A swap that moves only the duty offsets moves no domain: the proofs
