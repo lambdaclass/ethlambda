@@ -819,6 +819,7 @@ mod tests {
             validator_committee_index: 0,
             slot: SLOT,
             is_aggregator: None,
+            aggregator_position: None,
         }
     }
 

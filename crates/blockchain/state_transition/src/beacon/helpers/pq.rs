@@ -1,6 +1,6 @@
 //! Helpers the PQ fork adds or modifies (consensus-specs
 //! `specs/_features/pq/beacon-chain.md`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! # Keys
 //!
@@ -105,19 +105,6 @@ pub fn verify_aggregates(statements: &[AggregateStatement], proof: &[u8]) -> boo
     stark::verify_aggregates(statements, proof)
 }
 
-/// [`verify_aggregates`], with a prover sidecar that could not be reached
-/// told apart from a proof that does not verify (`stark::try_verify_aggregates`),
-/// for gossip, which IGNOREs what it could not judge.
-pub fn try_verify_aggregates(
-    statements: &[AggregateStatement],
-    proof: &[u8],
-) -> std::result::Result<bool, stark::SidecarUnreachable> {
-    if !xmss_verification_enabled() {
-        return Ok(true);
-    }
-    stark::try_verify_aggregates(statements, proof)
-}
-
 // ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
@@ -134,11 +121,15 @@ pub fn compute_legacy_vrf_root(pubkey: &BlsPubkey) -> Root {
     legacy_digest(pubkey, constants::LEGACY_VRF_ROOT_DOMAIN)
 }
 
+/// `keccak256(pubkey + domain)`. SHA-256 before consensus-specs pq
+/// `4c296784`, which moved both legacy derivations to the hash the VRF tree
+/// already uses; the RANDAO mix and the aggregation committee seeds stay on
+/// SHA-256.
 fn legacy_digest(pubkey: &BlsPubkey, domain: u8) -> Bytes32 {
     let mut input = Vec::with_capacity(pubkey.0.len() + 1);
     input.extend_from_slice(&pubkey.0);
     input.push(domain);
-    hash(&input)
+    ethlambda_types::primitives::H256(ethlambda_crypto::keccak256(&input))
 }
 
 /// `is_legacy_pubkey`: whether a 48-byte request key names a BLS key (made
@@ -201,11 +192,14 @@ pub fn is_builder_bid_leaf_index(leaf_index: u64) -> bool {
     (start..start + constants::XMSS_BUILDER_BID_LEAVES).contains(&leaf_index)
 }
 
-/// `is_valid_vrf_proof`: whether `proof` opens the leaf at index `slot` of the
-/// tree under the VRF root of the validator at `validator_index`.
+/// `is_valid_vrf_proof`: whether `proof` reveals the secret that the leaf at
+/// index `slot` of the tree under the VRF root of the validator at
+/// `validator_index` commits to.
 ///
 /// The tree is hashed with Keccak-256, not the SHA-256 of
-/// `is_valid_merkle_branch`, and `proof[0]` is the leaf itself.
+/// `is_valid_merkle_branch`, and its leaf is `compute_vrf_leaf` of the
+/// revealed secret and the slot: the branch holds only commitments, so a
+/// reveal gives away no other slot's secret.
 pub fn is_valid_vrf_proof(
     state: &BeaconState,
     validator_index: ValidatorIndex,
@@ -607,6 +601,29 @@ mod tests {
             compute_legacy_xmss_pubkey(&bls).0,
             compute_legacy_vrf_root(&bls).0
         );
+    }
+
+    /// consensus-specs pq `4c296784`: `keccak256(pubkey + domain)`, the
+    /// domain one byte, not `sha256`.
+    #[test]
+    fn legacy_keys_are_keccak256_of_the_bls_key_and_domain() {
+        let bls = BlsPubkey([0xa5; 48]);
+        let digest = |domain: u8| {
+            let mut input = bls.0.to_vec();
+            input.push(domain);
+            ethlambda_crypto::keccak256(&input)
+        };
+        assert_eq!(
+            compute_legacy_xmss_pubkey(&bls).0,
+            digest(constants::LEGACY_XMSS_PUBKEY_DOMAIN)
+        );
+        assert_eq!(
+            compute_legacy_vrf_root(&bls).0,
+            digest(constants::LEGACY_VRF_ROOT_DOMAIN)
+        );
+        let mut sha_input = bls.0.to_vec();
+        sha_input.push(constants::LEGACY_XMSS_PUBKEY_DOMAIN);
+        assert_ne!(compute_legacy_xmss_pubkey(&bls).0, hash(&sha_input).0);
     }
 
     /// A PQ state at `slot` whose block root at each earlier slot is

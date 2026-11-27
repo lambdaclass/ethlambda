@@ -23,7 +23,7 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 leanvm.workspace = true
 leanvm_claims.workspace = true
 leanvm_lean_xmss.workspace = true
-leanvm_sidecar.workspace = true
+leanvm_prover.workspace = true
 postcard.workspace = true
 
 thiserror.workspace = true
@@ -31,6 +31,13 @@ tracing.workspace = true
 
 [features]
 shadow-integration = []
+# leanVM's PQ prover compiled once more per CPU tier (AVX-512, GFNI and
+# VPCLMULQDQ on x86-64, SHA3 on arm64), the fastest tier the running CPU has
+# picked at run time. Only a build with leanVM's `scripts/tier-rustc` as
+# `RUSTC_WRAPPER` gives the tiers their instructions, which the Dockerfile
+# does; without the wrapper the feature compiles the copies and uses none.
+# Off by default so that an ordinary build does not compile them.
+leanvm-cpu-tiers = ["leanvm_prover/cpu_tiers"]
 
 [dev-dependencies]
 hex.workspace = true

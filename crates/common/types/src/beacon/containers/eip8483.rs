@@ -1,6 +1,6 @@
 //! Containers whose shape is specific to EIP-8483 (consensus-specs
 //! `specs/_features/eip8483`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! EIP-8483 adds two execution-layer requests with which validators and
 //! builders register opaque post-quantum material: 64 bytes for a validator

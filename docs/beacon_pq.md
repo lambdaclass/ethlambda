@@ -1,7 +1,7 @@
 # The PQ fork
 
-consensus-specs' `pq` branch (pinned here at the pq-devnet-0 spec,
-`2f43bc0f989f47af81df390a90bc1f78e2436323`) specifies an emergency fork that
+consensus-specs' `pq` branch (pinned here at
+`4c296784bb6ff54cbdcf72ebdda2a1057cce8893`, pq-devnet-1's spec) specifies an emergency fork that
 replaces BLS with leanXMSS, a hash-based signature scheme believed secure
 against a quantum adversary. It comes as two feature forks after gloas:
 
@@ -14,7 +14,11 @@ against a quantum adversary. It comes as two feature forks after gloas:
    client protocol go, RANDAO reveals become VRF proofs, attestations lose their
    signatures to a block-wide STARK proof, voluntary exits move to the execution
    layer, and deposits carry a VRF root instead of a signature, guarded by
-   preregistrations (EIP-8205).
+   preregistrations (EIP-8205). A validator or builder that registered
+   nothing takes `keccak256(pubkey + domain)` of its BLS key as its XMSS key
+   (and, a validator, as its VRF root), against which nothing verifies, and
+   is exited (`compute_legacy_xmss_pubkey`, `compute_legacy_vrf_root`; SHA-256
+   before `4c296784`).
 
 Both are `ForkName`s (`Eip8483`, `Pq`), between `Gloas` and `Lean`, on-disk
 selectors 8 and 9. Neither is scheduled on a public network. **The node
@@ -50,7 +54,7 @@ changes.
 | Layer | Where | Status |
 | --- | --- | --- |
 | leanXMSS sign/verify | `ethlambda_crypto::lean_xmss` | KAT-pinned against consensus-specs and leanVM |
-| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs through a running `leanvm-sidecar` (`--pq-prover-socket`), which the image's `ethlambda-pq` supervisor starts (see [Proofs](#proofs)) |
+| Attestation proofs | `ethlambda_crypto::stark` | the specification's reference concatenation by default; leanVM proofs made in process (bindings v0.19.0) on a network that schedules PQ (see [Proofs](#proofs)) |
 | Containers | `ethlambda_types::beacon::containers::{eip8483, pq}` | SSZ round trips, gaps per the spec; the maximal aggregate, attester slashing and bid encode to `pq.yaml`'s size bounds |
 | Fork upgrades | `upgrade::{upgrade_to_eip8483, upgrade_to_pq}` | unit-tested |
 | Block processing | `stf::{eip8483, pq}` | unit-tested with real XMSS keys |
@@ -64,8 +68,8 @@ changes.
 | EIP-8483 gossip | `gossip`, `ethlambda_p2p::beacon::decode` | attestations, aggregates and attester slashings decode and validate as gloas's; blocks, envelopes and columns are ignored |
 | Block production | `pq_block_production`, `rpc::beacon::pq_proposal` | self-build; attestations packed from validated aggregates, their proofs merged under a deadline; blobs, their columns gossiped with the envelope. Every block it built on the devnet was canonical on Lighthouse |
 | VRF tree | `ethlambda_crypto::vrf` | the specification's Keccak-256 tree over all `2^31` leaves, each `keccak256(vrf_seed \|\| le64(slot))`; known answers from ethereum-package's published state. Restorable from a compact state (root and leaf 0's branch), which the package publishes for its genesis validators and `ethlambda pq-keys` writes |
-| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; run on devnets next to other clients' (see [Running a devnet](#running-a-devnet)) |
-| Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead on the sidecar |
+| Validator client | `ethlambda_validator::pq` and the duty services | seeds derived from each BLS key as ethereum-package's generator and Lighthouse derive them; attestations, aggregates, PTC votes, proposals and envelopes, each at its leaf; aggregators staggered by seat; run on devnets next to other clients' (see [Running a devnet](#running-a-devnet)) |
+| Aggregation | `rpc::beacon::pq_aggregation`, `pools::{PqSignaturePool, PqAggregatePool}` | the node collects its aggregators' committees' signatures and proves ahead with leanVM, seat by seat |
 | Beacon API | `rpc::beacon::{pool, pq_proposal, ptc, proposal}` | PQ attestations, aggregates (in and out), payload attestations, blocks, envelopes and `POST /eth/v1/validator/pq_blocks/{slot}`; the other endpoints refuse PQ's signed containers |
 
 ## Gossip
@@ -139,57 +143,69 @@ over a few leaves only, for tests.
 `ethlambda_crypto::stark` proves, merges and verifies the fork's attestation
 proofs through one of two backends, chosen once per process:
 
-- **Reference** (the default): the specification's stand-in for a recursive
-  STARK. A proof is the signatures concatenated in statement order, and
-  verification checks each, plus the exact length. It is capped by
-  `MAX_STARK_PROOF_SIZE` (1 MiB), about 436 signatures per block. The
-  specification's fixtures use it.
-- **Sidecar** (`--pq-prover-socket`, `stark::install_sidecar`): real leanVM
-  proofs, made and checked by a `leanvm-sidecar` process over a Unix socket,
-  through leanVM's own client crate at `c5ee9d239` (bindings v0.15.0,
-  `sidecar::LEANVM_REV`), the release pq-devnet-0 runs for its signer,
-  prover, verifier and sidecar. A statement list maps to leanVM
-  claims as Lighthouse maps it: the sorted, deduplicated
-  `(public key, message)` pairs, the empty proof for no claims, and merges
-  folded sixteen children at a time.
-- **Who starts the sidecar**: not the node, as for Lighthouse. The image's
-  `ethlambda-pq` supervisor (`bin/ethlambda/pq/ethlambda-pq`, Lighthouse's
-  `lighthouse-pq-bn` adapted) starts it on a private socket, waits for it to
-  listen, and runs `ethlambda <flags> --pq-prover-socket <socket>`. The node
-  exiting stops the sidecar. The sidecar exiting does not stop the node
-  (Lighthouse's script stops it): the sidecar is started again on the same
-  socket after a pause (one second, doubling to 32 while it keeps dying
-  within a minute), and the node's client reconnects on its next request.
-  Until then the node proves nothing, gossip aggregates it cannot verify are
-  IGNOREd (`prover_unreachable`) rather than held against their senders, and
-  a block whose proof it could not check fails import and is fetched again
-  later (there is no bad-block cache). The gap is the sidecar's warm-up, not
-  the pause: on the local devnet, a sidecar on 2 threads killed mid-run
-  served again 50 s later (12 s at the container's start, on an idle
-  machine). Its node's head stood still meanwhile, so the two blocks it
-  proposed were built on a stale head and orphaned, and it imported the
-  block it had missed 8 s after the sidecar came back. After
-  `LEANVM_MAX_RESTARTS` (10) quick exits in a row the supervisor stops the
-  node too. `LEANVM_THREADS` sets the
-  sidecar's proving threads, `LEANVM_SIDECAR` another executable. The image
-  builds `leanvm-sidecar` from the commit in the root `leanvm-revision` file,
-  or from
-  `--build-arg LEANVM_REV` (the publish workflow's `leanvm_rev` input), and
-  records the commit at `/usr/local/share/ethlambda/leanvm-revision`. The
-  node's client refuses a sidecar whose hello names another protocol version
-  or verifier tag; any other revision is accepted, and its proofs only have
-  to verify with the other clients' verifiers (Teku's v0.16.0 sidecar and
-  ethlambda's v0.15.0 one verified each other's on the interop devnet). A
-  verifier-tag change needs `sidecar::LEANVM_REV` and the client crates
-  moved with it.
+- **Reference**: the specification's stand-in for a recursive STARK. A proof
+  is the signatures concatenated in statement order, and verification checks
+  each, plus the exact length. It is capped by `MAX_STARK_PROOF_SIZE` (1 MiB),
+  about 436 signatures per block. The specification's fixtures use it, and so
+  does any process that never installs leanVM.
+- **leanVM** (`stark::install_leanvm`, `stark::leanvm`): real leanVM proofs,
+  made and checked in this process by `lean_vm` at `351f7ae4` (bindings
+  v0.19.0, `leanvm::LEANVM_REV`), the one release pq-devnet-1 runs for its
+  signer, prover and verifier. A statement list maps to leanVM claims as
+  Lighthouse maps it: the sorted, deduplicated `(public key, message)` pairs,
+  the empty proof for no claims, and merges folded sixteen children
+  (`MAX_RECURSIONS`) at a time. The node installs it itself, as soon as
+  `--network` resolves to a network that schedules PQ, after
+  `lean_vm::setup` starts the prover's pool (`--pq-prover-threads`, 0 for
+  one thread per core, and never more than the cores) and builds its
+  aggregation program. leanVM proves one proof at a time per process;
+  verifying takes no lock and runs on the calling thread, so it does not
+  wait for a proof.
+- **The self-check.** Setup ends by proving and verifying one throwaway
+  signature, and checking the proof does not verify against another claim.
+  A prover that cannot run on the machine stops the node at startup rather
+  than missing every aggregation duty, and the `leanVM prover ready` line
+  carries what the proof and its check took.
+- **Panics stay inside.** In a sidecar, an input that crashed leanVM cost
+  that process a restart. In the node, the caller is the thread importing a
+  block or judging gossip, and the proof bytes are a peer's. Every call into
+  leanVM is wrapped (`leanvm::guarded`): a panic in the verifier reads as a
+  proof that does not verify, one in the prover as a proof that was not
+  made, and both are logged as `leanVM panicked`.
+- **The build.** leanVM's experimental prover (the one pq-devnet-0's sidecar
+  ran; the same proofs as the stable one, faster). The image builds with the
+  `leanvm-cpu-tiers` feature and leanVM's `scripts/tier-rustc` as
+  `RUSTC_WRAPPER` (the Dockerfile fetches it at the pinned revision): the
+  prover is compiled once more per CPU tier (AVX-512, GFNI and VPCLMULQDQ
+  on x86-64, SHA3 on arm64) and picks the fastest one the host has at run
+  time, as the other clients' leanVM builds do. Every other crate keeps the
+  portable baseline in `.cargo/config.toml`. A build without the feature,
+  which is what `cargo build` gives, proves on that baseline alone, and
+  leanVM says so on stderr at the first proof when the CPU has more.
+- **What it costs.** `ethlambda pq-prover-check` proves and verifies an
+  aggregate of `--signatures` claims (128 by default) on the machine it runs
+  on and reports each round against a seat's proving window, 2.4 s of a
+  12-second slot. On 14 cores of an Apple M4 Max, a `release-fast` build
+  proves 128 signatures in about 0.28 s and 512 in about 0.86 s; verifying
+  takes about 6 ms either way, and the proofs are 160 to 200 KB.
+
+pq-devnet-0 ran the prover as a separate `leanvm-sidecar` (bindings v0.15.0),
+which the image built and its `ethlambda-pq` supervisor started and
+restarted; while it restarted, gossip aggregates were IGNOREd
+(`prover_unreachable`). v0.17.0 removed the sidecar and its client API, so
+the image builds none, nothing can be unreachable, and `ethlambda-pq` is a
+shim that execs `ethlambda` (`LEANVM_THREADS` becomes `--pq-prover-threads`)
+for launchers that still call it. A proof from another leanVM revision does
+not verify, and nothing on the wire says why: the root `leanvm-revision`
+file names the pin, and the image records it at
+`/usr/local/share/ethlambda/leanvm-revision`.
 
 The encodings are not interchangeable, so every node of a network must use
-the same backend; the PQ devnet's Lighthouse accepts only the sidecar. A
-leanVM proof does not attest the leaf a signature was made at, so the sidecar
-backend checks that each key signed the message at *some* leaf
-(`docs/spec_deviations.md`). Lighthouse's blocks replay through ethlambda's
-state transition with every proof verified this way, state root for state
-root.
+the same backend; the PQ devnet runs leanVM. A leanVM proof does not attest
+the leaf a signature was made at, so the leanVM backend checks that each key
+signed the message at *some* leaf (`docs/spec_deviations.md`). On
+pq-devnet-0, Lighthouse's blocks replayed through ethlambda's state
+transition with every proof verified this way, state root for state root.
 
 ### Leaves
 
@@ -251,9 +267,22 @@ fork too, and those are not applied to any fork yet, the PQ forks included. See
 
 ## Committees
 
-The PQ fork caps a slot's committees at `MAX_COMMITTEES_PER_SLOT_PQ` (16 on
-mainnet, 4 on minimal), for every epoch a PQ state is asked about, including a
-previous epoch that ran before the fork. The committee cache's `ShufflingKey`
+The PQ fork caps a slot's committees at `X_MAX_COMMITTEE_COUNT_PER_SLOT` (16
+on mainnet, 4 on minimal), for every epoch a PQ state is asked about,
+including a previous epoch that ran before the fork. The key is a temporary,
+testing-only config value (`af898d07`): a devnet lowers it to put its
+validators into fewer, larger committees. It may not exceed the preset's
+`MAX_COMMITTEES_PER_SLOT_PQ`, the length of `CommitteeBits`. The state
+transition counts committees from a state alone, so the node selects the cap
+once per process from the network's `config.yaml`, beside the preset
+(`network::select_committee_cap`). A file that omits the key runs on its
+preset's `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification's own
+configs set it to, not on the mainnet 16 an absent key otherwise parses as:
+a minimal network whose file predates the key keeps its four committees. A
+value above the preset's is refused at startup, as the specification
+forbids it; a zero is one committee, as `get_committee_count_per_slot` has
+it. A process that selects no cap (the spec tests) runs on the preset's
+value, and a resume refuses a changed cap. The committee cache's `ShufflingKey`
 carries the cap, since a state either side of the fork names the same epoch and
 deciding block but a different shuffling.
 
@@ -265,26 +294,27 @@ previous, current and lookahead epochs.
 ## The VRF tree
 
 XMSS signatures are not unique, so a RANDAO reveal signed with one could be
-ground. A validator instead registers as its VRF root the root of a Merkle
-tree of depth `VRF_TREE_DEPTH` (31), hashed with Keccak-256, whose leaf for a
-slot is `compute_vrf_leaf(vrf_seed, slot) = keccak256(vrf_seed || le64(slot))`
-(consensus-specs `pq` at `2f43bc0f`, the pq-devnet-0 spec). The reveal is the
-leaf followed by its branch, and `process_randao` mixes the leaf in.
+ground. A validator instead has a secret for each slot,
+`compute_vrf_secret(vrf_seed, slot)`, and registers as its VRF root the root
+of a Merkle tree of depth `VRF_TREE_DEPTH` (31), hashed with Keccak-256,
+whose leaf for a slot is `compute_vrf_leaf(secret, slot)`: a hash of
+`VRF_LEAF_DOMAIN`, the secret and the slot. The reveal is the secret followed
+by the leaf's branch, and `process_randao` mixes the secret in.
 
-The root costs the whole tree: a leaf hashes its index, so no two leaves are
-equal and no subtree can be reused, about two Keccak-256 calls for each of
-`2^31` leaves (`vrf::tests::the_whole_tree_...`, `--ignored`).
-ethereum-package publishes each genesis validator's root and leaf 0's branch,
-which `ethlambda_crypto::vrf::tests::matches_ethereum_packages_published_state`
-checks validator 0's against.
+Two consequences, both deliberate in the specification:
+
+- **A reveal discloses only its own slot's secret.** The branch holds
+  commitments, never secrets. (Before `b5d422b2` the leaf was the secret
+  itself, so the sibling leaf in a branch was the neighbouring slot's reveal.)
+- **The root costs the whole tree.** A leaf commits to its index, so no two
+  leaves are equal and no subtree can be reused: the root takes three
+  Keccak-256 calls for each of `2^31` leaves, about 100 seconds of all 14
+  cores of an Apple M4 Max (`vrf::tests::the_whole_tree_...`, `--ignored`).
 
 `is_valid_vrf_proof` folds the branch itself (`vrf::fold_vrf_branch`), not
-through the SHA-256 `is_valid_merkle_branch`. It reads the slot's low 31 bits
-only, so a proof for `slot` also opens `slot + 2^31`, as the specification
-has it.
-
-consensus-specs' later `b5d422b2` makes each leaf commit to a per-slot secret
-and reveals the secret instead; branch `pq-devnet-0-b5d422b2` follows it.
+through the SHA-256 `is_valid_merkle_branch`. The leaf commits to the whole
+slot while the branch reads only its low 31 bits, so a proof for `slot` does
+not open `slot + 2^31`.
 
 ## Inclusion delay
 
@@ -358,14 +388,13 @@ it:
 2. With `--vrf-state-url` (a URL or a path), the key's record in a file of
    precomputed states, read at its validator index: ethereum-package's
    `vrf_state_url` format, 1028 bytes a validator (the root, four zero
-   bytes, then leaf 0's branch), which ethereum-package publishes for its
-   genesis validators and `ethlambda pq-keys` writes. The record must fold
-   the key's own leaf 0 to its root, so a record of another validator's, or
-   of another VRF rule's, falls through to the next source.
+   bytes, then leaf 0's branch), which `ethlambda pq-keys` writes. The
+   record must fold the key's own leaf 0 to its root, so a record of another
+   validator's, or of another VRF rule's, falls through to the next source.
    A proof then hashes only the leaves below the slot's highest bit, a few
    milliseconds on a young chain.
 3. The whole tree, hashed. It keeps the `2^15` nodes 16 levels above the
-   leaves (1 MiB), and a proof rebuilds one
+   leaves (1 MiB, commitments only, so no secret), and a proof rebuilds one
    `2^16`-leaf subtree, about 30 ms. The hashing runs in a rayon pool of its
    own, one thread short of the cores: leanXMSS signing parallelizes on
    rayon's global pool, which runs a job from outside it only once a
@@ -389,7 +418,12 @@ A start drops the leaves of slots more than two epochs back, which nothing
 asks for again.
 
 - **Attesting**: a `SingleAttestation` signed at the target epoch's leaf,
-  published on one of PQ's 16 subnets. The client votes once a beacon node
+  published on one of PQ's 16 subnets. Each one is published as soon as its
+  signature exists (`AttestationService::publish_pq_as_signed`,
+  `pq::sign_each`), with whatever else was signed by then, not once the
+  slot's batch is signed: a key that has to build a bottom tree first takes
+  seconds, and held for it, every other key's vote would miss the
+  aggregators' cutoff too. The client votes once a beacon node
   reports a non-optimistic `head` at the slot whose block the attestation
   data names, or at the attestation deadline otherwise (`head_monitor`, as at
   every fork); it used to wait for the deadline every slot, which put its
@@ -406,17 +440,19 @@ asks for again.
   client registered here (`ethlambda_blockchain::pq_attestation_packing`):
   it picks, from the aggregates it validated, what `process_attestation`
   accepts at the slot and credits someone new, as `compute_on_chain_aggregate`
-  shapes them, and merges their proofs in `process_stark`'s order on the
-  sidecar. A block at `N` packs aggregates from `N - 2` and earlier, all held
+  shapes them, and merges their proofs in `process_stark`'s order with
+  leanVM. A block at `N` packs aggregates from `N - 2` and earlier, all held
   by then. Production takes that result when it is for the head it builds on
   and the pool still holds what it was packed from, and otherwise packs
   while the execution client builds the payload, as it always did. A merge
   must end three quarters of the way to the attestation deadline
   (Lighthouse's bound). One child needs no merge; when more do not finish in
   time, the block packs the most valuable single-committee attestation
-  alone, whose proof is the block's as it is. A two-child merge takes about
-  0.6 s on pq-devnet-0's hosts (about four seconds on the local devnet's VM),
-  which is what packing ahead takes off every block's path.
+  alone, whose proof is the block's as it is. A two-child merge took about
+  0.6 s on pq-devnet-0's sidecar and up to about 2 s in process in
+  pq-devnet-1's first hours (about four seconds on the local devnet's VM,
+  for Lighthouse too), which is what packing ahead takes off every block's
+  path.
   A payload with blobs keeps them on the node that built it, and the
   envelope's publication builds the data columns from them and gossips them
   with it (PQ keeps gloas's sidecar).
@@ -429,28 +465,40 @@ asks for again.
   two, as `pq/p2p-interface.md` asks.
 - **Aggregating**: a PQ aggregator is a member of its committee's
   aggregation committee, which the attester duties report as
-  `is_aggregator`. Every aggregator broadcasts at gloas's aggregate deadline
-  (`AGGREGATE_DUE_BPS_GLOAS`, 6 s into a 12-second slot); `2f43bc0f` neither
-  staggers them nor has them skip a covered aggregate (consensus-specs'
-  later `4595f0fc` does both; branch `pq-devnet-0-b5d422b2` follows it).
-  Proving takes seconds, so the node proves ahead, as Lighthouse's PQ branch
-  does: the client's committee subscriptions join the committee's subnet and
-  register it, the node keeps the validated votes' signatures for registered
-  committees, and halfway between the attestation and aggregate deadlines
-  seals the slot and proves each committee before the aggregate deadline.
-  `GET aggregate_attestation` then answers the proved aggregate and its
-  proof, or a 404 when the node proved none, and the client signs the
-  `AggregateAndProof` at the slot's aggregate leaf.
+  `is_aggregator`, with its seat in it as `aggregator_position`. The seats
+  are staggered (PQ `validator.md`, "Construct aggregate"): the one at
+  `position` stops collecting at `get_aggregation_cutoff_ms(position)`
+  (`AGGREGATION_CUTOFF_BPS` plus `position` times `AGGREGATOR_DELAY_BPS`) and
+  broadcasts at `get_aggregate_due_ms(position)` (`AGGREGATE_DUE_BPS_PQ` plus
+  the same delay); on a 12-second slot that is 4.8 s and 7.2 s for the first
+  seat, each later one 0.6 s after. Proving takes seconds, so the node proves
+  ahead, as Lighthouse's PQ branch does: the client's committee subscriptions
+  join the committee's subnet and register it with the aggregating validator,
+  the node keeps the validated votes' signatures for registered committees,
+  and at each seat's cutoff proves what it has for the committees one of its
+  validators holds that seat in. A node holding two seats of one committee
+  proves at the later one only if a vote arrived since the earlier one's
+  proof (`PqSignaturePool::is_proven`): otherwise the aggregate would be the
+  same, for as long again on a prover that makes one proof at a time. The
+  client asks for each aggregate at its seat's broadcast time, every seat on
+  its own, so a request the node holds while a proof is still being made
+  does not delay the seats after it; `GET aggregate_attestation` answers the proved
+  aggregate and its proof, or a 404 when an aggregate already broadcast for
+  the committee, gossip's or this node's, covers every attester of it
+  (`should_broadcast_aggregate`). The client signs the `AggregateAndProof` at
+  the slot's aggregate leaf.
 
 ## Running a devnet
 
 ethpandaops/ethereum-package's `pq` branch runs PQ-at-genesis devnets with
-ethlambda as beacon node, validator client or both (its
-`.github/tests/cl-pq.yaml` names every client's `pq-devnet-0` image; the
-pq-devnet-0 notes, `notes.ethereum.org/@ethpandaops/pq-devnet-0`, pin the
-rest). Build the image from the repository root (`docker build -t
-ethlambda:pq-local .`: it ships `leanvm-sidecar`, built from the commit in
-`leanvm-revision`, and the `ethlambda-pq` supervisor), then `kurtosis run
+ethlambda as beacon node, validator client or both. This branch targets
+pq-devnet-1 (`notes.ethereum.org/@ethpandaops/pq-devnet-1`): consensus-specs
+`pq` at `4c296784` and leanVM bindings v0.19.0, which every client must run,
+since proofs from another revision do not verify. The example below names
+pq-devnet-0's images for the other clients; swap in their pq-devnet-1 images
+once published (the notes list them as TBD). Build the image from the
+repository root (`docker build -t ethlambda:pq-local .`: the node proves in
+process, so there is no sidecar to ship), then `kurtosis run
 --enclave pq <ethereum-package at pq> --args-file params.yaml` with, for
 example, ethlambda next to Teku and Lodestar, and Silver's beacon node behind
 ethlambda's validator client (Silver has no client of its own):
@@ -461,8 +509,8 @@ participants:
     el_image: ethpandaops/geth:glamsterdam-devnet-8
     cl_type: ethlambda
     cl_image: ethlambda:pq-local
-    cl_extra_env_vars:
-      LEANVM_THREADS: "2"
+    cl_extra_params:
+      - --pq-prover-threads=2
     vc_type: ethlambda
     vc_image: ethlambda:pq-local
     validator_count: 16
@@ -499,21 +547,29 @@ package runs `ethereum/client-go:latest`.
 
 What the package does for ethlambda on a PQ network:
 
-- It runs the beacon node as `ethlambda-pq beacon <flags>`: the supervisor
-  starts the sidecar on a private socket, waits for it to listen, and runs
-  the node on it, restarting the sidecar if it exits (see [Proofs](#proofs)).
-  `LEANVM_THREADS` (through `cl_extra_env_vars`) caps the sidecar's threads.
+- It runs the beacon node as `ethlambda-pq beacon <flags>`, pq-devnet-0's
+  sidecar supervisor, which is now a shim that execs `ethlambda` (see
+  [Proofs](#proofs)); `LEANVM_THREADS`, if set, becomes
+  `--pq-prover-threads`.
 - It passes the validator client `--init-slashing-protection` and, for its
   default mnemonic, the leanXMSS tree caches and VRF tree states it
   publishes for that mnemonic's first 10000 validators (`--xmss-cache-url`,
   `--vrf-state-url`). The client refuses a flag given twice, so
   `vc_extra_params` must not repeat them.
 - Its genesis generator gives each validator the leanXMSS key and VRF seed
-  the validator client derives from the BLS key. For another mnemonic, or
+  the validator client derives from the BLS key. pq-devnet-1's VRF rule is
+  `b5d422b2`'s (leaves commit to revealed secrets), and its legacy keys are
+  keccak256 (`4c296784`): tree states and keys published for pq-devnet-0's
+  rule fail their check against the seed, and the validator client then
+  hashes the tree itself (minutes a key) rather than use them. For another mnemonic, or
   past the published 10000, `ethlambda pq-keys --mnemonic ... --count N
   --output-dir keys` writes the key file the generator reads
   (`xmss_pubkey_url`) and the VRF states (`vrf_state_url`); every root
   hashes a whole tree, minutes a validator, and the run is resumable.
+
+Before genesis, `docker run --rm --entrypoint ethlambda ethlambda:pq-local
+pq-prover-check` on a devnet host says whether its prover keeps up with a
+committee of 128 (see [Proofs](#proofs)).
 
 Limits worth knowing:
 
@@ -521,10 +577,14 @@ Limits worth knowing:
   asserts every slot has an attester, so with fewer, epoch processing fails
   at the first epoch boundary (`compute_balance_weighted_selection: total >
   0`) and the chain stops. The specification does the same.
-- **Memory.** Every `leanvm-sidecar` warms up by proving twice and stays
-  large. In Docker Desktop's default 8 GB VM a second sidecar next to
-  Lighthouse's has had the kernel kill Lighthouse's. Set `LEANVM_THREADS` on
-  nodes that only verify.
+- **Memory.** A proof's buffers are now the node's own allocations, on top
+  of everything else it holds, where they were a sidecar's. The node's
+  jemalloc returns them to the kernel some seconds after the proof, as it
+  does any freed memory. leanVM's own builds instead keep them
+  (`dirty_decay_ms:-1`), so the next proof does not fault each page in
+  again, at the price of the process holding its peak; the image's
+  jemalloc reads `MALLOC_CONF`, so `MALLOC_CONF=dirty_decay_ms:-1` trades
+  the same way, for the whole node. Not measured here.
 - **Lighthouse's envelopes over req/resp.** Its `pq-devnet-0` image (last
   checked at `sha256:f571048f`) answered
   `execution_payload_envelopes_by_{range,root}` with a gloas-shaped envelope
@@ -534,7 +594,7 @@ Limits worth knowing:
 
 What shows interop working: the beacon APIs agree on the head and finality;
 ethlambda's `lean_beacon_gossip_validation_total` is all `accept` (blocks,
-envelopes, aggregates with their proofs checked through the sidecar,
+envelopes, aggregates with their proofs checked by leanVM,
 attestations, payload attestations, proposer preferences);
 `lean_beacon_aggregate_total{outcome="applied"}` rises; every envelope is
 `VALID` (`Execution payload envelope verified ... status=Valid`); every block
@@ -548,7 +608,10 @@ each ethlambda validator client logs `Derived the validators' PQ keys ...
 stored=0 cached=N built=0 refused=0 trees_built=0` and `Every validator's VRF
 tree is ready ... loaded=N hashed=0`, about a second each. A restart on the
 same `--validators-dir` reads both from disk instead (`stored=N`), since the
-first start writes every key's trees and VRF state there.
+first start writes every key's trees and VRF state there. VRF states
+published for pq-devnet-0's rule (leaves revealed, before `b5d422b2`) fail
+their check against the seed instead, and show as `loaded=0 hashed=N` after
+minutes per key: the package has to publish states for pq-devnet-1's rule.
 
 To check ethlambda alone, give two participants `cl_type: ethlambda` and
 `vc_type: ethlambda` with 16 validators each (the 32 minimum), and no other
@@ -567,7 +630,7 @@ No consensus-specs release ships fixtures for either fork. The pyspec on the
 
 ```sh
 git clone https://github.com/ethereum/consensus-specs && cd consensus-specs
-git checkout 2f43bc0f989f47af81df390a90bc1f78e2436323
+git checkout 4c296784bb6ff54cbdcf72ebdda2a1057cce8893
 make test reftests=true fork=eip8483 preset=minimal
 make test reftests=true fork=pq preset=minimal
 ```
@@ -604,6 +667,11 @@ generated.
 - The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
   `DiscoveryServer` cannot replace the served record at runtime (the same gap
   as its `eth2` entry, see `CLAUDE.md`).
+- Interop at pq-devnet-1's spec (`4c296784`): its genesis and key
+  derivation are still TBD in the devnet notes, and until ethPandaOps'
+  generator and the other clients follow `b5d422b2`'s VRF rule and
+  `4c296784`'s keccak256 legacy keys, a mixed network cannot run. An
+  ethlambda-only network runs on files `ethlambda pq-keys` writes.
 - PQ block production does not weigh builder bids: it self-builds, and the
   PQ builder market it would read is filled but unused.
 - The pubkey index cache keys a pubkey by bytes 1 to 9, all zero for a PQ

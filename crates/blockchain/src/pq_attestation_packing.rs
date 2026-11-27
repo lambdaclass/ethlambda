@@ -3,12 +3,14 @@
 //!
 //! # Why ahead of the slot
 //!
-//! The merge folds the selected aggregates' proofs into one on the proving
-//! sidecar: about 0.6 s for two children on pq-devnet-0. Block production used
-//! to run it when the validator client asked for the block, at the slot's
-//! start, so every block this node proposed waited for it. Its blocks reached
-//! the network at about 1.0 to 1.2 s, against 0.15 to 0.4 s for Prysm's,
-//! Teku's, Lighthouse's and Silver's, which carry the same merged proof.
+//! The merge folds the selected aggregates' proofs into one, a leanVM proof
+//! made in process: about 0.6 s for two children on pq-devnet-0's sidecar,
+//! and up to about 2 s in pq-devnet-1's first hours. Block production used to
+//! run it when the validator client asked for the block, at the slot's start,
+//! so every block this node proposed waited for it. On pq-devnet-0 its blocks
+//! reached the network at about 1.0 to 1.2 s, against 0.15 to 0.4 s for
+//! Prysm's, Teku's, Lighthouse's and Silver's, which carry the same merged
+//! proof; Prysm merges about 9.6 s into the slot before.
 //!
 //! Nothing the merge reads is new at the slot. A block at slot `S` packs
 //! aggregates from `S - MIN_ATTESTATION_INCLUSION_DELAY_PQ` (two slots) and
@@ -29,12 +31,20 @@
 //!
 //! # One merge at a time
 //!
-//! The sidecar proves one request after another, so the merges share one
-//! permit ([`MERGE_PERMIT`]). A packing replaced by another (the head moved)
-//! is abandoned and does not start its merge; one already merging finishes,
+//! leanVM proves one request after another, so the merges share one permit
+//! ([`MERGE_PERMIT`]). A packing replaced by another (the head moved) is
+//! abandoned and does not start its merge; one already merging finishes,
 //! unheard. A packing ahead of the slot waits for the permit, having seconds
 //! to spare; production tries it once and packs one committee's attestation
 //! when it is held, as it always has.
+//!
+//! The node's own aggregates prove on the same leanVM, at each aggregator
+//! seat's cutoff (`rpc`'s `pq_aggregation`), and the last seat's cutoff is
+//! before a third of a slot ahead. So the slot's aggregate proofs have
+//! normally all started when a packing asks for leanVM: on pq-devnet-1 each
+//! takes about 0.7 s, and the last ends about 8 s into the slot. One still
+//! waiting for leanVM then may be proved after the packing's merge, since
+//! nothing orders the two.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,7 +120,7 @@ fn same_aggregates(a: &[Arc<PooledPqAggregate>], b: &[Arc<PooledPqAggregate>]) -
     addresses(a) == addresses(b)
 }
 
-/// One merge at a time: the sidecar proves one request after another, so a
+/// One merge at a time: leanVM proves one request after another, so a
 /// second merge started while one runs would only push both past their
 /// deadlines. A merge that missed its deadline keeps the permit until it
 /// ends. Shared by the merge ahead of the slot and the one at production.

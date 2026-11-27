@@ -34,6 +34,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
@@ -49,6 +50,7 @@ use crate::beacon_node::{AggregateKind, BeaconNodeApi, SignedAggregates};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::{AggregateAndProofRef, SigningContext, sign_all};
+use crate::slot_clock::SlotClock;
 
 /// An `AggregateAndProof` of either fork, held between building it and
 /// signing it.
@@ -94,27 +96,63 @@ impl<B: BeaconNodeApi> AggregationService<B> {
     /// "Broadcast aggregate"). There is no selection proof, and the proof of
     /// the attesters' signatures is the node's: it collects them and proves
     /// ahead, since proving takes seconds.
+    ///
+    /// The aggregators are staggered by seat: the one at `position` publishes
+    /// at `get_aggregate_due_ms(position)`. Each seat waits for its own time
+    /// and then runs on its own, beside the others: the node may hold a
+    /// seat's request for seconds while a proof is still being made, and a
+    /// seat served in turn behind it would publish that much late, into the
+    /// seats after it. The node answers 404 for an aggregate one already
+    /// broadcast covers (`should_broadcast_aggregate`), which skips it here.
     pub async fn aggregate_pq(
         &self,
+        clock: &SlotClock,
         slot: Slot,
         data: &AttestationData,
         duties: &[AttesterDutyDto],
     ) -> Result<usize> {
-        use ethlambda_types::beacon::constants::LEAF_OFFSET_AGGREGATE_AND_PROOF;
-        use ethlambda_types::beacon::containers::pq;
-
-        let selected: Vec<&AttesterDutyDto> = duties
+        let mut by_seat: BTreeMap<u64, Vec<&AttesterDutyDto>> = BTreeMap::new();
+        for duty in duties
             .iter()
             .filter(|duty| duty.is_aggregator == Some(true))
-            .collect();
-        if selected.is_empty() {
-            return Ok(0);
+        {
+            by_seat
+                .entry(duty.aggregator_position.unwrap_or(0))
+                .or_default()
+                .push(duty);
         }
+        let seats = by_seat.into_iter().map(|(position, seated)| async move {
+            let due = clock.pq_aggregation_time(slot, position);
+            let wait = due.duration_since(SystemTime::now()).unwrap_or_default();
+            tokio::time::sleep(wait).await;
+            self.publish_pq_seat(slot, data, &seated)
+                .await
+                .inspect_err(|err| {
+                    warn!(%slot, position, %err, "Failed to publish this seat's PQ aggregates")
+                })
+                .unwrap_or(0)
+        });
+        Ok(futures_util::future::join_all(seats)
+            .await
+            .into_iter()
+            .sum())
+    }
+
+    /// Fetch, sign and publish the aggregates of the aggregators `selected`,
+    /// all at one seat of their committees' aggregation committees.
+    async fn publish_pq_seat(
+        &self,
+        slot: Slot,
+        data: &AttestationData,
+        selected: &[&AttesterDutyDto],
+    ) -> Result<usize> {
+        use ethlambda_types::beacon::constants::LEAF_OFFSET_AGGREGATE_AND_PROOF;
+        use ethlambda_types::beacon::containers::pq;
 
         // One fetch per committee, as for the other forks.
         let data_root = data.hash_tree_root();
         let mut aggregates = BTreeMap::new();
-        for duty in &selected {
+        for duty in selected {
             if aggregates.contains_key(&duty.committee_index) {
                 continue;
             }
@@ -126,13 +164,14 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                 Ok(aggregate) => {
                     aggregates.insert(duty.committee_index, aggregate);
                 }
-                // The node proved nothing for the committee: no votes reached
-                // it, or the proof missed the aggregate deadline.
-                Err(Error::BeaconNodeStatus { status: 404, body }) => warn!(
+                // A 404 also when another aggregator's broadcast already
+                // covers every attester: nothing to publish, as the
+                // specification has it. The node's message says which.
+                Err(Error::BeaconNodeStatus { status: 404, body }) => info!(
                     %slot,
                     committee = duty.committee_index,
                     reason = %body,
-                    "No PQ aggregate available for this committee"
+                    "No PQ aggregate to publish for this committee"
                 ),
                 Err(err) => warn!(
                     %slot,
@@ -144,7 +183,7 @@ impl<B: BeaconNodeApi> AggregationService<B> {
         }
 
         let mut owed = Vec::new();
-        for duty in &selected {
+        for duty in selected {
             let Some(proven) = aggregates.get(&duty.committee_index) else {
                 continue;
             };
@@ -457,6 +496,52 @@ mod tests {
         }
     }
 
+    /// Each PQ seat asks for its aggregate at its own time. The node holds a
+    /// request while a proof is still being made, here for three seconds:
+    /// the next seat, due 0.6 s after the first, must not wait behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_answer_for_one_pq_seat_does_not_delay_the_next() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let held = Duration::from_secs(3);
+        let node = Arc::new(MockBeaconNode::new().with_pq_aggregate_delay(held));
+        let service = AggregationService::new(node.clone(), context());
+        let config = Config::mainnet().with_fork_epoch(ForkName::Pq, 0);
+        // Slot 64 began within the last second.
+        let slot = 64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let clock = SlotClock::from_config(now.as_secs() - slot * 12, &config);
+        let (_, pubkey) = store();
+        let seat = |position: u64| AttesterDutyDto {
+            is_aggregator: Some(true),
+            aggregator_position: Some(position),
+            // A committee each, so each seat has its own request.
+            ..duty(&pubkey, position, slot, position)
+        };
+
+        let started = tokio::time::Instant::now();
+        let published = service
+            .aggregate_pq(&clock, slot, &data(slot), &[seat(0), seat(1)])
+            .await
+            .expect("a 404 is no error");
+        assert_eq!(published, 0, "the mock proves no aggregate");
+
+        let calls = node.pq_aggregate_calls();
+        assert_eq!(calls.len(), 2);
+        let (first, second) = (calls[0].0 - started, calls[1].0 - started);
+        // 7.2 s and 7.8 s into the slot, less the fraction of a second the
+        // slot is already old.
+        assert!(first > Duration::from_millis(6_200) && first <= Duration::from_millis(7_200));
+        let apart = second - first;
+        assert!(
+            apart > Duration::from_millis(550) && apart < Duration::from_millis(650),
+            "the second seat asked {apart:?} after the first"
+        );
+        // Both answers were held three seconds, side by side.
+        let took = started.elapsed();
+        assert!(took < first + held + Duration::from_secs(1), "{took:?}");
+    }
+
     fn duty(
         pubkey: &BlsPubkey,
         validator_index: u64,
@@ -472,6 +557,7 @@ mod tests {
             validator_committee_index: 7,
             slot,
             is_aggregator: None,
+            aggregator_position: None,
         }
     }
 

@@ -68,10 +68,11 @@ impl BuiltInNetwork {
     /// Build this network's configuration, genesis values and bootnode list.
     pub(crate) fn resolve(self) -> eyre::Result<BuiltIn> {
         let chain = self.chain();
-        let parsed = ConfigFile::parse(chain.config_yaml)
+        let mut parsed = ConfigFile::parse(chain.config_yaml)
             .wrap_err_with(|| format!("the built-in {} config.yaml did not parse", self.name()))?;
         super::select_preset(parsed.config.preset_base.as_str())?;
         super::check_constants(&parsed.config)?;
+        super::select_committee_cap(&mut parsed)?;
         // A built-in config can carry a fork whose keys this build does not
         // even claim (heze), which the ignored-keys warning below says. A fork
         // whose keys it claims but whose rules it does not follow is

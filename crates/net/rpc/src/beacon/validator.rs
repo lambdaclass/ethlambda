@@ -295,11 +295,11 @@ fn liveness(store: &Store, epoch: &str, indices: &[String]) -> Result<serde_json
     Ok(serde_json::json!({ "data": data }))
 }
 
-/// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
-/// is refused, though `validator_index` is never read.
+/// One entry of `beacon_committee_subscriptions`. `validator_index` is read
+/// only at a PQ slot, where it names the aggregator whose seat in the
+/// aggregation committee decides when its aggregate is proved.
 #[derive(Debug, Deserialize)]
 struct CommitteeSubscription {
-    #[allow(dead_code)]
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -349,9 +349,12 @@ async fn post_committee_subscriptions(
         .iter()
         .filter(|entry| entry.is_aggregator && is_pq_slot(entry.slot))
         .filter(|entry| {
-            store
-                .pq_signature_pool()
-                .subscribe(now, entry.slot, entry.committee_index)
+            store.pq_signature_pool().subscribe(
+                now,
+                entry.slot,
+                entry.committee_index,
+                entry.validator_index,
+            )
         })
         .map(|entry| {
             let subnet_id = pq_compute_subnet_for_attestation(
@@ -683,6 +686,24 @@ struct AttesterDuty {
     /// aggregators select themselves. Lighthouse's PQ branch's field.
     #[serde(skip_serializing_if = "Option::is_none")]
     is_aggregator: Option<bool>,
+    /// A PQ aggregator's index in its aggregation committee, which staggers
+    /// it: the `position` of `get_aggregation_cutoff_ms` and
+    /// `get_aggregate_due_ms` (PQ `validator.md`, "Construct aggregate").
+    /// Absent for a validator that is not one.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "quoted_position"
+    )]
+    aggregator_position: Option<u64>,
+}
+
+/// An aggregator's position as the Beacon API writes an integer: a decimal
+/// string. Only called for `Some`, since `None` is skipped.
+fn quoted_position<S: serde::Serializer>(
+    position: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&position.unwrap_or_default())
 }
 
 /// `POST /eth/v1/validator/duties/attester/{epoch}`, with the validator
@@ -765,10 +786,14 @@ fn attester_duties(
                     .map_err(|_| ApiError::Internal("committee names an unknown validator"))?;
                 // A state not yet at PQ (the fork's first epoch, asked
                 // early) names no aggregation committee: not an aggregator.
-                let is_aggregator = is_pq.then(|| {
+                let aggregator_position = if is_pq {
                     get_aggregation_committee(&state, slot, committee_index)
-                        .is_ok_and(|members| members.contains(&validator_index))
-                });
+                        .ok()
+                        .and_then(|members| members.iter().position(|&m| m == validator_index))
+                        .map(|seat| seat as u64)
+                } else {
+                    None
+                };
                 duties.push(AttesterDuty {
                     pubkey: ApiPubkey::of(&state, validator.pubkey),
                     validator_index,
@@ -777,7 +802,8 @@ fn attester_duties(
                     committees_at_slot,
                     validator_committee_index: position as u64,
                     slot,
-                    is_aggregator,
+                    is_aggregator: is_pq.then_some(aggregator_position.is_some()),
+                    aggregator_position,
                 });
             }
         }

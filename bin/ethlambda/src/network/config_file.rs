@@ -27,6 +27,11 @@ pub(crate) struct ConfigFile {
     pub(crate) config: Config,
     /// Keys no field claimed: a typo, or a fork this build cannot process.
     pub(crate) ignored: Vec<String>,
+    /// Whether the file carried `X_MAX_COMMITTEE_COUNT_PER_SLOT`. An absent
+    /// key parses as mainnet's value, like every other, and for this one
+    /// that is not what an absent key means: see
+    /// [`super::select_committee_cap`].
+    pub(crate) committee_cap_declared: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,13 +66,18 @@ impl ConfigFile {
             document.contains_key("SLOT_DURATION_MS"),
         )?;
 
+        let committee_cap_declared = document.contains_key("X_MAX_COMMITTEE_COUNT_PER_SLOT");
         let claimed = config_field_names();
         let ignored = document
             .into_keys()
             .filter(|key| !claimed.contains(&key.as_str()))
             .collect();
 
-        Ok(Self { config, ignored })
+        Ok(Self {
+            config,
+            ignored,
+            committee_cap_declared,
+        })
     }
 
     /// Log what was ignored, as one line naming each key.

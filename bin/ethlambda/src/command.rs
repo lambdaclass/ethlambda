@@ -34,6 +34,7 @@ const EXPLICIT: &[&str] = &[
     SLASHING_PROTECTION,
     KEYGEN,
     PQ_KEYS,
+    PQ_PROVER_CHECK,
     "help",
     "-h",
     "--help",
@@ -50,6 +51,7 @@ const VOLUNTARY_EXIT: &str = "voluntary-exit";
 const SLASHING_PROTECTION: &str = "slashing-protection";
 const KEYGEN: &str = "keygen";
 const PQ_KEYS: &str = "pq-keys";
+const PQ_PROVER_CHECK: &str = "pq-prover-check";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -103,6 +105,9 @@ pub(crate) enum Command {
     /// Write a Beacon Chain PQ-fork genesis's leanXMSS keys and VRF roots for
     /// a mnemonic's validators, in ethPandaOps' genesis tooling's file formats.
     PqKeys(crate::pq_keys::PqKeysOptions),
+    /// Prove and verify a PQ-fork aggregate with leanVM on this machine, and
+    /// report what it took against an aggregator seat's proving window.
+    PqProverCheck(crate::pq_prover_check::PqProverCheckOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -473,6 +478,7 @@ mod tests {
             SLASHING_PROTECTION,
             KEYGEN,
             PQ_KEYS,
+            PQ_PROVER_CHECK,
         ] {
             let args = [OsString::from("ethlambda"), OsString::from(token)];
             assert_eq!(

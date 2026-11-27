@@ -41,6 +41,9 @@ test: test-consensus test-node ## 🧪 Run all tests
 
 test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
 	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
+	# The PQ fork's leanVM prover, end to end: ignored by a plain `cargo test`,
+	# which spends minutes on it unoptimized. A second or two here.
+	$(TEST) -p ethlambda-crypto --lib -- --ignored leanvm_proofs_merge_and_verify
 
 test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run the node half of the workspace suite
 	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))

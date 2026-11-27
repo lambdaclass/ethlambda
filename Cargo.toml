@@ -129,21 +129,21 @@ sha3 = "0.10.9"
 # hashes pay for a streaming hasher's buffering.
 keccak = "0.1.6"
 
-# The client of leanVM's `leanvm-sidecar` (`crates/sidecar` without its
-# `server` feature, which builds no prover) and its claim encoding: the PQ
-# fork's attestation proofs as the PQ devnet makes them, real leanVM STARKs
-# over leanXMSS signatures rather than the specification's concatenation
+# leanVM's in-process prover (`lean_vm`) and its claim encoding: the PQ fork's
+# attestation proofs as the PQ devnet makes them, real leanVM STARKs over
+# leanXMSS signatures rather than the specification's concatenation
 # (`ethlambda_crypto::stark`); and leanVM's leanXMSS, which signs and verifies.
-# Pinned to bindings v0.15.0, the release pq-devnet-0 runs for its signer,
-# prover, verifier and sidecar. The sidecar binary is built and started
-# outside the node (the image's `leanvm-revision` file and `ethlambda-pq`
-# supervisor), and the client refuses one whose hello names another protocol
-# version or verifier tag; beyond that nothing on the wire detects a
-# mismatch, a proof from an incompatible revision just fails to verify. Not
-# the `leanvm` revision below, which lean consensus proves with.
-leanvm_sidecar = { package = "sidecar", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
-leanvm_claims = { package = "claims", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
-leanvm_lean_xmss = { package = "lean_xmss", git = "https://github.com/leanEthereum/leanVM.git", rev = "c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764" }
+# Pinned to bindings v0.19.0 (351f7ae4), the one release pq-devnet-1 runs for
+# its signer, prover and verifier; the devnet takes no other revision.
+# `experimental_prover` is the prover the pq-devnet-0 sidecar ran; it makes
+# the same proofs as the stable one, faster. leanVM's `cpu_tiers` is behind
+# `ethlambda-crypto`'s `leanvm-cpu-tiers` feature, off by default: it only
+# does anything under leanVM's `scripts/tier-rustc` as `RUSTC_WRAPPER`, which
+# the Dockerfile sets.
+# Not the `leanvm` revision below, which lean consensus proves with.
+leanvm_prover = { package = "lean_vm", git = "https://github.com/leanEthereum/leanVM.git", rev = "351f7ae421529ce164ed747eee1f78bdeaec3e80", features = ["experimental_prover"] }
+leanvm_claims = { package = "claims", git = "https://github.com/leanEthereum/leanVM.git", rev = "351f7ae421529ce164ed747eee1f78bdeaec3e80" }
+leanvm_lean_xmss = { package = "lean_xmss", git = "https://github.com/leanEthereum/leanVM.git", rev = "351f7ae421529ce164ed747eee1f78bdeaec3e80" }
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the

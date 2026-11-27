@@ -9,6 +9,7 @@ mod fd_limit;
 mod keygen;
 mod network;
 mod pq_keys;
+mod pq_prover_check;
 mod shutdown;
 mod slashing_protection;
 mod validator;
@@ -137,6 +138,11 @@ fn main() -> eyre::Result<()> {
         Command::PqKeys(options) => {
             init_info_stderr_logging()?;
             pq_keys::run(options)
+        }
+        // Seconds of every core, for a report on stderr: as keygen.
+        Command::PqProverCheck(options) => {
+            init_info_stderr_logging()?;
+            pq_prover_check::run(options)
         }
     }
 }
@@ -399,17 +405,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         );
         ethlambda_crypto::init_leanvm(lean.prover_arena);
     }
-    // The PQ fork's attestation proofs: leanVM proofs from a sidecar this node
-    // starts, or one already listening, the specification's reference
-    // encoding otherwise. Before anything can verify a proof, since the first
-    // one used stays installed.
-    if let Network::Mainnet { mainnet, .. } = &network {
-        use ethlambda_crypto::stark::{self, sidecar::SidecarConfig};
-        if let Some(socket) = &mainnet.pq_prover_socket {
-            stark::install_sidecar(SidecarConfig::new(socket.clone()))
-                .wrap_err("cannot use the leanVM prover sidecar")?;
-        }
-    }
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -479,6 +474,26 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
             let source = network::NetworkSource::resolve(&spec)?;
             let bootnodes = beacon_bootnodes(&mainnet.bootnodes, source.bootnodes(), discovery_ip)?;
+            // The PQ fork's attestation proofs: leanVM proofs, made and
+            // checked in this process, on a network that schedules PQ (the
+            // specification's reference encoding otherwise, which nothing
+            // there uses). Here, once the network says whether it does, and
+            // before anything can verify a proof, since the first backend
+            // used stays installed.
+            let pq_epoch = source.config().pq_fork_epoch;
+            if pq_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+                use ethlambda_crypto::stark::{self, leanvm::LeanVmConfig};
+                let config = LeanVmConfig {
+                    threads: mainnet.pq_prover_threads,
+                    ..LeanVmConfig::default()
+                };
+                info!(
+                    pq_epoch,
+                    threads = config.threads,
+                    "Starting leanVM's prover for the PQ fork"
+                );
+                stark::install_leanvm(config).wrap_err("cannot start leanVM's prover")?;
+            }
             (Some(source), bootnodes)
         }
     };
@@ -2088,6 +2103,11 @@ fn first_config_difference(
         // Compared below: when an unregistered validator becomes withdrawable
         // at the PQ fork is a state-transition rule.
         unregistered_validator_withdrawability_delay: _,
+        // PQ's aggregation timing: when an aggregator proves and broadcasts,
+        // which changes no block's validity.
+        aggregation_cutoff_bps: _,
+        aggregate_due_bps_pq: _,
+        aggregator_delay_bps: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -2102,6 +2122,9 @@ fn first_config_difference(
         max_per_epoch_activation_exit_churn_limit: _,
         churn_limit_quotient_gloas: _,
         max_per_epoch_activation_churn_limit_gloas: _,
+        // Compared below: PQ's committee cap decides every PQ committee, so
+        // which attestations and aggregates a block may carry.
+        x_max_committee_count_per_slot: _,
 
         // Fork choice: weighting/timing knobs a node applies to its own view
         // of the chain. They change which head a node *prefers*, not which
@@ -2253,6 +2276,7 @@ fn first_config_difference(
         max_per_epoch_activation_exit_churn_limit,
         churn_limit_quotient_gloas,
         max_per_epoch_activation_churn_limit_gloas,
+        x_max_committee_count_per_slot,
         consolidation_churn_limit_quotient,
         max_blobs_per_block_deneb,
         max_blobs_per_block_electra,

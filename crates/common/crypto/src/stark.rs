@@ -7,9 +7,9 @@
 //!   of every statement's public keys, in statement order and within a
 //!   statement in public-key order, and verification checks each in turn. It
 //!   is what the specification's fixtures use.
-//! - **Sidecar** ([`install_sidecar`]): real leanVM proofs, made and checked
-//!   by a `leanvm-sidecar` process over a Unix socket, as the PQ devnet's
-//!   other clients make them. See [`sidecar`].
+//! - **leanVM** ([`install_leanvm`]): real leanVM proofs, made and checked
+//!   in this process (bindings v0.19.0), as the PQ devnet's other clients make
+//!   them. See [`leanvm`].
 //!
 //! The two encodings are not interchangeable: a node verifies only the proofs
 //! its own backend makes, so every node of a network must run the same one.
@@ -25,12 +25,12 @@ use rayon::prelude::*;
 
 use crate::lean_xmss::{self, Message, PUBKEY_SIZE, SIGNATURE_SIZE};
 
-pub mod sidecar;
+pub mod leanvm;
 
 /// The backend every proof of this process goes through.
 enum Backend {
     Reference,
-    Sidecar(sidecar::SidecarBackend),
+    LeanVm(leanvm::LeanVmBackend),
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
@@ -39,22 +39,26 @@ fn backend() -> &'static Backend {
     BACKEND.get_or_init(|| Backend::Reference)
 }
 
-/// Makes every proof of this process a leanVM proof from the sidecar at
-/// `config.socket`, after checking it answers with this protocol and
-/// verifier. Call once, at startup, before anything proves or verifies:
-/// whichever backend is first used stays for the life of the process.
-pub fn install_sidecar(config: sidecar::SidecarConfig) -> Result<(), sidecar::Error> {
-    let backend = sidecar::SidecarBackend::connect(config)?;
+/// Makes every proof of this process a leanVM proof, made and checked in
+/// process, after starting leanVM's prover pool and passing its self-check
+/// (about a second). Call once, at startup, before anything proves or
+/// verifies: whichever backend is first used stays for the life of the
+/// process.
+pub fn install_leanvm(config: leanvm::LeanVmConfig) -> Result<(), leanvm::Error> {
+    if BACKEND.get().is_some() {
+        return Err(leanvm::Error::AlreadyInstalled);
+    }
+    let backend = leanvm::LeanVmBackend::setup(config)?;
     BACKEND
-        .set(Backend::Sidecar(backend))
-        .map_err(|_| sidecar::Error::AlreadyInstalled)
+        .set(Backend::LeanVm(backend))
+        .map_err(|_| leanvm::Error::AlreadyInstalled)
 }
 
-/// The installed backend's name, for logs: `reference` or `sidecar`.
+/// The installed backend's name, for logs: `reference` or `leanvm`.
 pub fn backend_name() -> &'static str {
     match backend() {
         Backend::Reference => "reference",
-        Backend::Sidecar(_) => "sidecar",
+        Backend::LeanVm(_) => "leanvm",
     }
 }
 
@@ -90,15 +94,15 @@ pub enum ProveError {
         expected: u64,
         found: u64,
     },
-    #[error("the prover sidecar failed: {0}")]
-    Sidecar(String),
+    #[error("leanVM could not prove: {0}")]
+    LeanVm(String),
 }
 
 /// `stark.ProveAggregates(statements, signatures)`: `signatures[i][j]` is the
 /// signature of `statements[i].pubkeys[j]`. The reference verifies nothing
-/// and only asserts the shapes line up; the sidecar refuses a signature that
-/// does not verify. Blocks the calling thread for as long as the proof takes,
-/// which under the sidecar is seconds.
+/// and only asserts the shapes line up; leanVM refuses a signature that does
+/// not verify. Blocks the calling thread for as long as the proof takes,
+/// which under leanVM is seconds, and leanVM makes one proof at a time.
 pub fn prove_aggregates<S: AsRef<[u8]>>(
     statements: &[AggregateStatement],
     signatures: &[Vec<S>],
@@ -111,7 +115,7 @@ pub fn prove_aggregates<S: AsRef<[u8]>>(
             .flat_map(|signature| signature.as_ref())
             .copied()
             .collect()),
-        Backend::Sidecar(sidecar) => sidecar.prove(statements, signatures),
+        Backend::LeanVm(leanvm) => leanvm.prove(statements, signatures),
     }
 }
 
@@ -127,49 +131,20 @@ pub fn merge_proofs<S: AsRef<[AggregateStatement]>, P: AsRef<[u8]>>(
             .flat_map(|(_, proof)| proof.as_ref())
             .copied()
             .collect()),
-        Backend::Sidecar(sidecar) => sidecar.merge(children),
+        Backend::LeanVm(leanvm) => leanvm.merge(children),
     }
 }
 
 /// `stark.VerifyAggregates(statements, proof)`. Under the reference, `true`
 /// only if `proof` holds, for each statement in turn and each of its public
 /// keys in order, a signature `xmss.Verify` accepts at the statement's leaf
-/// index and message, and nothing else. Under the sidecar, whether the leanVM
-/// proof proves every `(public key, message)` claim; it cannot check the leaf
-/// indices, which leanVM proofs do not attest. A sidecar that cannot answer
-/// reads as `false`, and is logged; [`try_verify_aggregates`] tells it apart.
+/// index and message, and nothing else. Under leanVM, whether the proof
+/// proves every `(public key, message)` claim; it cannot check the leaf
+/// indices, which leanVM proofs do not attest.
 pub fn verify_aggregates(statements: &[AggregateStatement], proof: &[u8]) -> bool {
-    try_verify_aggregates(statements, proof).unwrap_or_else(|err| {
-        tracing::error!(%err, "The prover sidecar could not verify an attestation proof");
-        false
-    })
-}
-
-/// The sidecar could not be asked: no connection, or one that failed or timed
-/// out, as while `ethlambda-pq` restarts it. Says nothing about the proof.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the prover sidecar could not be reached: {0}")]
-pub struct SidecarUnreachable(pub String);
-
-/// [`verify_aggregates`], with a sidecar that could not be reached told apart
-/// from a proof that does not verify, so gossip can IGNORE a message it could
-/// not judge rather than penalize the peer that sent it. Only a connection
-/// failure is [`SidecarUnreachable`]: a sidecar that answered and refused the
-/// request is logged and reads as `false`, as an invalid proof does.
-pub fn try_verify_aggregates(
-    statements: &[AggregateStatement],
-    proof: &[u8],
-) -> Result<bool, SidecarUnreachable> {
     match backend() {
-        Backend::Reference => Ok(reference_verify(statements, proof)),
-        Backend::Sidecar(sidecar) => match sidecar.verify(statements, proof) {
-            Ok(valid) => Ok(valid),
-            Err(sidecar::Error::Io(err)) => Err(SidecarUnreachable(err.to_string())),
-            Err(err) => {
-                tracing::error!(%err, "The prover sidecar refused to verify an attestation proof");
-                Ok(false)
-            }
-        },
+        Backend::Reference => reference_verify(statements, proof),
+        Backend::LeanVm(leanvm) => leanvm.verify(statements, proof),
     }
 }
 

@@ -211,10 +211,6 @@ pub enum IgnoreReason {
     AlreadyExiting,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
-    /// A PQ aggregate's proof could not be checked: the prover sidecar did not
-    /// answer, as while `ethlambda-pq` restarts it. Nothing is known about the
-    /// proof, so this is not the sender's fault.
-    ProverUnreachable,
 }
 
 impl IgnoreReason {
@@ -258,7 +254,6 @@ impl IgnoreReason {
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
-            Self::ProverUnreachable => "prover_unreachable",
         }
     }
 }

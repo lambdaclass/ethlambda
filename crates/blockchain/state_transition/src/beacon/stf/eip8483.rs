@@ -1,6 +1,6 @@
 //! EIP-8483's block processing (consensus-specs
 //! `specs/_features/eip8483/beacon-chain.md`, on the `pq` branch at
-//! `2f43bc0f989f47af81df390a90bc1f78e2436323`).
+//! `4c296784bb6ff54cbdcf72ebdda2a1057cce8893`).
 //!
 //! Gloas's block processing, with two more execution-layer request lists in
 //! the parent payload: validators and builders register post-quantum material

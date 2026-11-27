@@ -460,9 +460,7 @@ The two topics add reasons the others do not, all `reason` label values on
 `lean_beacon_gossip_validation_total`: `outside_epoch_window`, `covered_bits`
 (aggregate only), `unknown_block`, `state_unavailable`,
 `finalized_not_ancestor`, `ancestry_unknown`, `payload_envelope_unseen` and
-`payload_optimistic` (gloas only), and `prover_unreachable` (PQ aggregate
-only: the prover sidecar did not answer, so the proof was not judged) on the
-ignore side;
+`payload_optimistic` (gloas only) on the ignore side;
 `epoch_mismatch`, `no_participants` (aggregate only), `non_zero_data_index`,
 `committee_bits` (aggregate only), `committee_index`, `bits_length` (aggregate
 only), `not_aggregator` (aggregate only), `not_in_committee`,

@@ -1,32 +1,5 @@
 # syntax=docker.io/docker/dockerfile:1.7-labs
 
-# leanVM's prover sidecar, which the `ethlambda-pq` supervisor starts beside
-# the node on a network scheduling the PQ fork, as Lighthouse's image does.
-# Built from the revision in `leanvm-revision` (bindings v0.15.0, the release
-# pq-devnet-0 runs), or from `--build-arg LEANVM_REV=<commit, tag or branch>`:
-# which prover a devnet runs is chosen here, not by the node, whose client
-# only requires the sidecar's protocol version and verifier tag to be its own.
-# The commit built is recorded at /usr/local/share/ethlambda/leanvm-revision.
-# leanVM's own .cargo/config.toml builds with `-C target-cpu=native`, which on
-# CI's arm64 runner (Neoverse, with SVE) gives a binary that dies with SIGILL
-# on Apple silicon, and on an amd64 runner with AVX-512 one that dies on hosts
-# without it. ethlambda's config replaces it, so the sidecar gets the node's
-# own portable CPU baseline (and the carryless-multiply features leanVM needs).
-FROM rust:1.97-bookworm AS sidecar
-ARG LEANVM_REV=""
-COPY leanvm-revision /leanvm-revision
-COPY .cargo/config.toml /ethlambda-cargo-config.toml
-RUN rev="${LEANVM_REV:-$(tr -d '[:space:]' < /leanvm-revision)}" \
-    && test -n "$rev" \
-    && git clone -q https://github.com/leanEthereum/leanVM.git /leanVM \
-    && cd /leanVM \
-    && git checkout -q "$rev" \
-    && mkdir -p .cargo \
-    && cp /ethlambda-cargo-config.toml .cargo/config.toml \
-    && cargo build --release -p leanvm-sidecar --features experimental_prover \
-    && cp target/release/leanvm-sidecar /leanvm-sidecar \
-    && git rev-parse HEAD > /leanvm-revision-built
-
 FROM rust:1.97-bookworm AS chef
 WORKDIR /app
 
@@ -47,12 +20,32 @@ COPY --from=planner /app/recipe.json recipe.json
 # cached deps are compiled with default flags and cargo reuses them.
 COPY .cargo/ .cargo/
 
+# leanVM's PQ prover is compiled once more per CPU tier (AVX-512, GFNI and
+# VPCLMULQDQ on x86-64, SHA3 on arm64), and picks the fastest one the host has
+# at run time: one image for every host, as the other clients' leanVM builds
+# are. A tier only gets its instructions when rustc is wrapped by leanVM's own
+# `scripts/tier-rustc`, which adds a tier's target features to that tier's
+# crates and leaves every other crate as asked, so the node itself keeps the
+# portable baseline in `.cargo/config.toml`. Fetched at the pinned revision
+# (`leanvm-revision`, which a test holds equal to the workspace's `rev`), so
+# the wrapper is the one the prover's sources were written against. Set before
+# `cargo chef cook`, which is what compiles the tiers. A build without the
+# `leanvm-cpu-tiers` feature has no tier crates, and the wrapper changes
+# nothing in it.
+COPY leanvm-revision leanvm-revision
+RUN rev="$(tr -d '[:space:]' < leanvm-revision)" \
+    && test -n "$rev" \
+    && curl -fsSL "https://raw.githubusercontent.com/leanEthereum/leanVM/${rev}/scripts/tier-rustc" \
+        -o /usr/local/bin/leanvm-tier-rustc \
+    && chmod +x /usr/local/bin/leanvm-tier-rustc
+ENV RUSTC_WRAPPER=/usr/local/bin/leanvm-tier-rustc
+
 # Build profile, release by default
 ARG BUILD_PROFILE=release
 ENV BUILD_PROFILE=$BUILD_PROFILE
 
-# Extra Cargo features
-ARG FEATURES=""
+# Cargo features. `leanvm-cpu-tiers` by default: see the wrapper above.
+ARG FEATURES="leanvm-cpu-tiers"
 ENV FEATURES=$FEATURES
 
 # Disable default features (e.g. for `shadow-integration`, which must drop the
@@ -106,10 +99,12 @@ LABEL org.opencontainers.image.version=$VERSION
 
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
-# The PQ prover sidecar and its supervisor, `ethlambda-pq beacon <flags>`
-COPY --from=sidecar /leanvm-sidecar /usr/local/bin/leanvm-sidecar
-COPY --from=sidecar /leanvm-revision-built /usr/local/share/ethlambda/leanvm-revision
+# pq-devnet-0's launcher name, `ethlambda-pq beacon <flags>`, kept for
+# launchers that still use it. Since bindings v0.17.0 leanVM proves in the node, so
+# there is no sidecar to start: the script only runs `ethlambda`. The leanVM
+# revision the node proves with is the one in `leanvm-revision`.
 COPY --chmod=755 bin/ethlambda/pq/ethlambda-pq /usr/local/bin/ethlambda-pq
+COPY leanvm-revision /usr/local/share/ethlambda/leanvm-revision
 
 # Copy licenses
 COPY LICENSE ./

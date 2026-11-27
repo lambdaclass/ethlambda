@@ -19,14 +19,14 @@
 //! that ahead of the slot, alongside the payload build, for the slots this
 //! node's proposers hold, and production collects it when it was for the head
 //! it builds on (`ethlambda_blockchain::pq_attestation_packing`); otherwise
-//! it merges here while the execution client builds the payload. A merge runs
-//! on the proving sidecar and costs about 0.6 s with two children, so it is
-//! bounded by a deadline three quarters of the way to the slot's attestation
-//! deadline (Lighthouse's PQ branch uses the same one). A merge that misses
-//! it or fails is dropped for the most valuable single-committee attestation
-//! alone, whose proof needs no merging; a block `process_stark` refuses is
-//! built again without attestations, so the block goes out rather than not
-//! at all.
+//! it merges here while the execution client builds the payload. A merge is a
+//! leanVM proof, in process, and costs from under a second to seconds when
+//! there is more than one child, so it is bounded by a deadline three quarters
+//! of the way to the slot's attestation deadline (Lighthouse's PQ branch uses
+//! the same one). A merge that misses it or fails is dropped for the most
+//! valuable single-committee attestation alone, whose proof needs no merging;
+//! a block `process_stark` refuses is built again without attestations, so the
+//! block goes out rather than not at all.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -116,7 +116,8 @@ impl PqBlobs {
 
 #[derive(Debug, Deserialize)]
 struct ProducePqBlock {
-    /// The proposer's VRF proof for the slot: the leaf, then its branch.
+    /// The proposer's VRF proof for the slot: the secret, then its leaf's
+    /// branch.
     randao_reveal: Vec<Root>,
     #[serde(default)]
     graffiti: Option<Bytes32>,

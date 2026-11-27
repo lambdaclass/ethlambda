@@ -52,7 +52,7 @@ use libssz_types::SszList;
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
-use crate::beacon::preset::Preset;
+use crate::beacon::preset::{self, Preset};
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
 use crate::chain_config::ChainConfig;
 use crate::constants::INTERVALS_PER_SLOT;
@@ -434,6 +434,25 @@ pub struct Config {
     /// `compute_validators`).
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub unregistered_validator_withdrawability_delay: Epoch,
+    /// PQ: basis points of [`Self::slot_duration_ms`] by which the first
+    /// aggregator of an aggregation committee stops collecting attestations
+    /// and starts proving its aggregate; each later one stops
+    /// [`Self::aggregator_delay_bps`] after the one before it
+    /// (`get_aggregation_cutoff_ms`).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregation_cutoff_bps: u64,
+    /// PQ: [`Self::aggregate_due_bps_gloas`]'s replacement, the basis points
+    /// by which the first aggregator of an aggregation committee broadcasts
+    /// its aggregate; later than gloas's, to leave time to prove one
+    /// (`get_aggregate_due_ms` modified in PQ).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregate_due_bps_pq: u64,
+    /// PQ: basis points of [`Self::slot_duration_ms`] between the cutoffs,
+    /// and between the broadcasts, of two aggregators next to each other in
+    /// an aggregation committee. Staggering them lets a later aggregator
+    /// skip an aggregate an earlier one already covered.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregator_delay_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -489,6 +508,20 @@ pub struct Config {
     /// builder-registry value; see [`Self::churn_limit_quotient_gloas`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_per_epoch_activation_churn_limit_gloas: Gwei,
+    /// PQ (consensus-specs pq `af898d07`): the most committees a PQ slot has,
+    /// `MAX_COMMITTEES_PER_SLOT_PQ` replaced in `get_committee_count_per_slot`.
+    /// Temporary and testing-only: a devnet lowers it to put its validators
+    /// into fewer, larger committees. It may not exceed the preset's
+    /// `MAX_COMMITTEES_PER_SLOT_PQ`, the length of `CommitteeBits`; the
+    /// state transition reads it through
+    /// [`x_max_committee_count_per_slot`], which the node sets from this.
+    ///
+    /// Like every key, absent from a file it parses as mainnet's value. For
+    /// this one that is wrong on a minimal network, so the node replaces an
+    /// absent key with its preset's `MAX_COMMITTEES_PER_SLOT_PQ` once the
+    /// preset is selected (`network::select_committee_cap` in the binary).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub x_max_committee_count_per_slot: u64,
 
     // -- Fork choice ---------------------------------------------------------
     /// Percentage boost, relative to a single committee's weight, given to a
@@ -652,6 +685,62 @@ pub struct Config {
     pub min_epochs_for_block_requests: u64,
 }
 
+/// The PQ committee cap this process runs on, `0` until
+/// [`select_x_max_committee_count_per_slot`] sets one.
+static X_MAX_COMMITTEE_COUNT_PER_SLOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// An `X_MAX_COMMITTEE_COUNT_PER_SLOT` above the preset's
+/// `MAX_COMMITTEES_PER_SLOT_PQ`, which the specification says it must not
+/// exceed: `CommitteeBits` has that many bits, so a slot with more committees
+/// could not name them all in an attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "X_MAX_COMMITTEE_COUNT_PER_SLOT is {declared}, above MAX_COMMITTEES_PER_SLOT_PQ ({max}), \
+     the most committees an attestation's committee bits can name"
+)]
+pub struct CommitteeCapTooLarge {
+    pub declared: u64,
+    pub max: u64,
+}
+
+/// Makes `config`'s `X_MAX_COMMITTEE_COUNT_PER_SLOT` the cap every PQ
+/// committee count of this process uses, and returns it.
+///
+/// One per process, like the preset (see `beacon::preset`), and selected
+/// after it: the state transition counts committees from a state alone, which
+/// carries no config. Refuses a value above the active preset's
+/// `MAX_COMMITTEES_PER_SLOT_PQ` and stores nothing then.
+pub fn select_x_max_committee_count_per_slot(config: &Config) -> Result<u64, CommitteeCapTooLarge> {
+    let cap = committee_cap(
+        config.x_max_committee_count_per_slot,
+        preset::max_committees_per_slot_pq() as u64,
+    )?;
+    X_MAX_COMMITTEE_COUNT_PER_SLOT.store(cap, std::sync::atomic::Ordering::Relaxed);
+    Ok(cap)
+}
+
+/// The cap a `declared` `X_MAX_COMMITTEE_COUNT_PER_SLOT` gives under a preset
+/// of `max` committees per slot. A zero is one: `get_committee_count_per_slot`
+/// never goes below one committee, whatever the cap.
+fn committee_cap(declared: u64, max: u64) -> Result<u64, CommitteeCapTooLarge> {
+    if declared > max {
+        return Err(CommitteeCapTooLarge { declared, max });
+    }
+    Ok(declared.max(1))
+}
+
+/// `X_MAX_COMMITTEE_COUNT_PER_SLOT` as selected for this process, or the
+/// preset's `MAX_COMMITTEES_PER_SLOT_PQ` when none was: the specification's
+/// own configs set the two equal, so a process that never selects one (a
+/// spec test, a lean node) runs on the specification's value.
+pub fn x_max_committee_count_per_slot() -> u64 {
+    match X_MAX_COMMITTEE_COUNT_PER_SLOT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => preset::max_committees_per_slot_pq() as u64,
+        cap => cap,
+    }
+}
+
 /// Mainnet's values, which is what an absent key in a `config.yaml` falls back
 /// to.
 ///
@@ -774,6 +863,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
             unregistered_validator_withdrawability_delay: 16_384,
+            aggregation_cutoff_bps: 4_000,
+            aggregate_due_bps_pq: 6_000,
+            aggregator_delay_bps: 500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -785,6 +877,7 @@ impl Config {
             max_per_epoch_activation_exit_churn_limit: 256_000_000_000,
             churn_limit_quotient_gloas: 32_768,
             max_per_epoch_activation_churn_limit_gloas: 256_000_000_000,
+            x_max_committee_count_per_slot: 16,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -914,6 +1007,9 @@ impl Config {
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
             unregistered_validator_withdrawability_delay: 16_384,
+            aggregation_cutoff_bps: 4_000,
+            aggregate_due_bps_pq: 6_000,
+            aggregator_delay_bps: 500,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -925,6 +1021,7 @@ impl Config {
             max_per_epoch_activation_exit_churn_limit: 128_000_000_000,
             churn_limit_quotient_gloas: 16,
             max_per_epoch_activation_churn_limit_gloas: 128_000_000_000,
+            x_max_committee_count_per_slot: 4,
 
             proposer_score_boost: 40,
             reorg_head_weight_threshold: 20,
@@ -1302,6 +1399,61 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
         assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
         assert_eq!(config.max_request_payloads, 128);
+    }
+
+    #[test]
+    fn the_pq_committee_cap_is_claimed_and_parses() {
+        assert_eq!(Config::mainnet().x_max_committee_count_per_slot, 16);
+        assert_eq!(Config::minimal().x_max_committee_count_per_slot, 4);
+        let config: Config =
+            serde_yaml_ng::from_str("X_MAX_COMMITTEE_COUNT_PER_SLOT: 1\n").unwrap();
+        assert_eq!(config.x_max_committee_count_per_slot, 1);
+        // Absent, it parses as mainnet's, like every other key a file omits;
+        // the node then replaces it with its preset's value.
+        let config: Config = serde_yaml_ng::from_str("CONFIG_NAME: x\n").unwrap();
+        assert_eq!(config.x_max_committee_count_per_slot, 16);
+    }
+
+    #[test]
+    fn the_pq_committee_cap_may_not_exceed_committee_bits() {
+        assert_eq!(committee_cap(1, 16), Ok(1));
+        assert_eq!(committee_cap(4, 16), Ok(4));
+        assert_eq!(committee_cap(16, 16), Ok(16));
+        // Mainnet's value on a minimal preset, and anything else above it.
+        let too_large = CommitteeCapTooLarge {
+            declared: 16,
+            max: 4,
+        };
+        assert_eq!(committee_cap(16, 4), Err(too_large));
+        assert!(too_large.to_string().contains("is 16, above"));
+        // `max(1, min(cap, ..))` in the specification: a zero cap is one
+        // committee, not none.
+        assert_eq!(committee_cap(0, 16), Ok(1));
+    }
+
+    #[test]
+    fn pq_timing_keys_are_claimed_and_parse() {
+        let yaml = "UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY: 8\n\
+                    AGGREGATION_CUTOFF_BPS: 3500\nAGGREGATE_DUE_BPS_PQ: 5500\n\
+                    AGGREGATOR_DELAY_BPS: 250\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.unregistered_validator_withdrawability_delay, 8);
+        assert_eq!(config.aggregation_cutoff_bps, 3_500);
+        assert_eq!(config.aggregate_due_bps_pq, 5_500);
+        assert_eq!(config.aggregator_delay_bps, 250);
+    }
+
+    /// consensus-specs' `test_config_invariants` for PQ: an aggregator stops
+    /// collecting before it broadcasts, and the last aggregator of a full
+    /// aggregation committee still broadcasts within the slot.
+    #[test]
+    fn pq_aggregation_timing_fits_the_slot() {
+        for config in [Config::mainnet(), Config::minimal()] {
+            assert!(config.aggregation_cutoff_bps < config.aggregate_due_bps_pq);
+            let last_delay =
+                (constants::AGGREGATORS_PER_COMMITTEE - 1) * config.aggregator_delay_bps;
+            assert!(config.aggregate_due_bps_pq + last_delay <= constants::BASIS_POINTS);
+        }
     }
 
     #[test]

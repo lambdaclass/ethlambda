@@ -420,19 +420,12 @@ pub(crate) struct MainnetOptions {
     )]
     pub(crate) bootnodes: Vec<String>,
 
-    /// The Unix socket of a running `leanvm-sidecar`, which makes and checks
-    /// the PQ fork's attestation proofs as leanVM STARKs, the encoding the PQ
-    /// devnet's clients use. Something else starts the sidecar, as for
-    /// Lighthouse: the image's `ethlambda-pq` supervisor does, and picks which
-    /// build. The node refuses one speaking another protocol version or
-    /// proving for another verifier than its client (leanVM
-    /// `c5ee9d239e42d0bc8113eb4aee3e2cae5faf1764`, bindings v0.15.0).
-    ///
-    /// Without it, the node uses the specification's reference encoding (a
-    /// proof is the signatures concatenated), which only another node on the
-    /// reference accepts.
-    #[arg(long)]
-    pub(crate) pq_prover_socket: Option<PathBuf>,
+    /// How many threads leanVM's in-process prover runs on, 0 for one per
+    /// core. Read only on a network that schedules the PQ fork, whose
+    /// attestation proofs this node makes and checks with leanVM (bindings
+    /// v0.19.0) in process.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) pq_prover_threads: usize,
 
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
