@@ -41,7 +41,7 @@ use ethlambda_types::{
     beacon::{
         containers::{
             BeaconState, SignedBeaconBlock,
-            gloas::{PayloadAttestation, PayloadAttestationData, PayloadAttestationMessage},
+            gloas::{self, PayloadAttestation, PayloadAttestationData, PayloadAttestationMessage},
         },
         fork::ForkName,
         primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex},
@@ -533,10 +533,14 @@ struct PoolQuery {
 /// window has no readable committee, so its votes are left out rather than
 /// listed unaggregated; the pool only ever accepts the current slot's votes,
 /// so in practice that is a vote the head has since left far behind.
+///
+/// JSON by default, or on `Accept: application/octet-stream` the SSZ
+/// `ProgressiveList[PayloadAttestation]`.
 async fn get_pool_payload_attestations(
     Query(query): Query<PoolQuery>,
     State(store): State<Store>,
     Extension(pool): Extension<SharedPayloadAttestationPool>,
+    headers: HeaderMap,
 ) -> Response {
     let held = pool
         .lock()
@@ -548,13 +552,15 @@ async fn get_pool_payload_attestations(
         Ok(Err(err)) => return err.into_response(),
         Err(_) => return ApiError::Internal("aggregating the pool failed").into_response(),
     };
-    with_consensus_version(
-        crate::json_response(serde_json::json!({
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let response = match Encoding::from_accept(accept) {
+        Encoding::Ssz => ssz_response(gloas::PayloadAttestations::from(data).to_ssz()),
+        Encoding::Json => crate::json_response(serde_json::json!({
             "version": ForkName::Gloas.as_str(),
             "data": data,
         })),
-        ForkName::Gloas,
-    )
+    };
+    with_consensus_version(response, ForkName::Gloas)
 }
 
 /// Group `held` by slot and aggregate each slot's votes against the head state.
@@ -1464,6 +1470,26 @@ mod tests {
         );
         assert_eq!(expected.len(), 1);
         assert_eq!(data[1], serde_json::to_value(&expected[0].1).unwrap());
+
+        // The same list as SSZ.
+        let ssz = send(
+            store.clone(),
+            pool.clone(),
+            Default::default(),
+            Vec::new(),
+            Default::default(),
+            Request::get("/eth/v1/beacon/pool/payload_attestations")
+                .header(header::ACCEPT, "application/octet-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(ssz.status, StatusCode::OK);
+        assert_eq!(ssz.headers["eth-consensus-version"], "gloas");
+        let decoded =
+            <gloas::PayloadAttestations as libssz::SszDecode>::from_ssz_bytes(&ssz.body).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(serde_json::to_value(&decoded[1]).unwrap(), data[1]);
 
         let slot = message.data.slot;
         let one = list(format!(

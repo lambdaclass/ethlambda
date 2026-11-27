@@ -313,7 +313,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
-| `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
+| `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON / SSZ | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s (JSON or SSZ body) |
