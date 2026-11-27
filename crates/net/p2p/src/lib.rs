@@ -1011,6 +1011,9 @@ pub(crate) struct Behaviour {
     identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: ReqResp,
+    /// Waggle (`/waggle/1.0`), for PQ aggregates broadcast in chunks; see
+    /// [`beacon::waggle`]. Accepts no topic on the lean wire.
+    waggle: waggle::Behaviour,
 }
 
 /// No connection limits, which is what the lean network has always run with: a
@@ -1335,11 +1338,21 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             .with_cache_size(0),
     );
 
+    let waggle_schedule = match &wire {
+        WireConfig::Beacon(beacon) => Some(beacon::fork_schedule::ForkSchedule::new(
+            &beacon.config,
+            beacon.genesis_validators_root,
+        )),
+        WireConfig::Lean(_) => None,
+    };
+    let waggle = waggle::Behaviour::new(beacon::waggle::transport_config(waggle_schedule.as_ref()));
+
     let behavior = Behaviour {
         connection_limits,
         identify,
         gossipsub,
         req_resp,
+        waggle,
     };
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
@@ -1671,6 +1684,7 @@ impl P2P {
             aggregator_subnets: HashMap::new(),
             aggregator_subnets_pq: HashMap::new(),
             parked_votes: Default::default(),
+            waggle: Default::default(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
@@ -1923,6 +1937,8 @@ pub struct P2PServer {
     /// Subnet attestations and aggregates whose verdict waits for the block
     /// they vote for to have a post-state. See [`beacon::parked_votes`].
     pub(crate) parked_votes: beacon::parked_votes::ParkedVotes,
+    /// The Waggle aggregate services of the held PQ digests.
+    pub(crate) waggle: beacon::waggle::WaggleTopics,
 
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
@@ -2204,7 +2220,9 @@ impl P2PServer {
         _msg: p2p_protocol::AdvanceForkSchedule,
         ctx: &Context<Self>,
     ) {
-        if let Some(delay) = beacon::transition::advance(self) {
+        let next = beacon::transition::advance(self);
+        beacon::waggle::sync(self, ctx);
+        if let Some(delay) = next {
             send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
         }
     }
@@ -3080,6 +3098,7 @@ async fn handle_behaviour_event(
             .await;
         }
         BehaviourEvent::Gossipsub(_) => return,
+        BehaviourEvent::Waggle(event) => return beacon::waggle::on_event(server, event),
         BehaviourEvent::ReqResp(event) => match event {
             ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
             ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
@@ -4233,6 +4252,7 @@ pub(crate) mod test_support {
             aggregator_subnets: HashMap::new(),
             aggregator_subnets_pq: HashMap::new(),
             parked_votes: Default::default(),
+            waggle: Default::default(),
             peer_scoring: None,
         }
     }

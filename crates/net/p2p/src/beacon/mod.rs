@@ -32,6 +32,8 @@ pub mod sync_committee;
 pub mod topics;
 pub mod transition;
 pub mod verdict;
+pub mod waggle;
+pub mod waggle_aggregates;
 
 use std::collections::BTreeMap;
 
