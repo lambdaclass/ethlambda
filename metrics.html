@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
+            window.path_to_searchindex_js = "searchindex-99750670.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -1187,6 +1187,7 @@ and absent is not the same as zero.</p>
 <tbody>
 <tr><td><code>ethlambda_validator_validators_loaded</code></td><td>Gauge</td><td>Validator keys this client holds, local and remote, the count <code>/health</code> reports as <code>validators.loaded</code>. Set at startup and again on every scrape, so keys imported or deleted through the keymanager API show up</td></tr>
 <tr><td><code>ethlambda_validator_validators_resolved</code></td><td>Gauge</td><td>Loaded keys that have an index on chain, out of <code>validators_loaded</code>. A persistent gap means validators are deposited but not yet activated</td></tr>
+<tr><td><code>ethlambda_validator_validators_slashed</code></td><td>Gauge</td><td>Loaded keys the chain reports slashed (their <code>validator.slashed</code>), as of the last epoch refresh. Should read zero forever: a slashed key gets no more proposer, attester or aggregation duties, and its setup is likely to put the other keys at risk. See <a href="./cli.html#slashed-validators">Slashed validators</a></td></tr>
 <tr><td><code>ethlambda_validator_duties_held</code></td><td>Gauge</td><td>Attester duties currently scheduled</td></tr>
 <tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
 <tr><td><code>ethlambda_validator_attestation_failures_total</code></td><td>Counter</td><td>Slots whose attestation duty failed and returned</td></tr>

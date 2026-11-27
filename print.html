@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f66f6f1c.js";
+            window.path_to_searchindex_js = "searchindex-99750670.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -4949,6 +4949,7 @@ slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p
 <tr><td><code>--self-build-only</code></td><td>off</td><td>Never sign a block built on a builder’s payload (Lodestar’s <code>executiononly</code>). From gloas each block request asks for no bid (<code>builder_boost_factor</code> <code>0</code>, <code>min_bid</code> <code>2^64 - 1</code>), and a block whose bid names a builder anyway, from a node that ignores <code>min_bid</code>, is refused before slashing protection records the slot. When the beacon node cannot build the payload itself, the slot is missed rather than built on a bid. Before gloas nothing changes: without <code>--builder-proposals</code> a blinded block is already refused. Conflicts with <code>--builder-proposals</code>, <code>--builder-boost-factor</code>, <code>--prefer-builder-proposals</code> and <code>--builder-min-bid</code></td></tr>
 <tr><td><code>--init-slashing-protection</code></td><td>off</td><td>Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing</td></tr>
 <tr><td><code>--enable-doppelganger-protection</code></td><td>off</td><td>Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See <a href="#doppelganger-protection">Doppelganger protection</a></td></tr>
+<tr><td><code>--shut-down-when-slashed</code></td><td>off</td><td>Stop when the chain reports a loaded validator slashed, exiting with code <code>3</code>, rather than only dropping that key’s proposer, attester and aggregation duties. See <a href="#slashed-validators">Slashed validators</a></td></tr>
 <tr><td><code>--disable-event-stream</code></td><td>off</td><td>Read no beacon node’s event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between <code>--disable-beacon-head-monitor</code> and <code>--disable-payload-available-monitor</code>; Prysm’s nearest is <code>--disable-attest-timely</code>. For a node whose stream is broken, or a proxy in front of it that holds events back. See <a href="#duties-start-on-the-block">Duties start on the block</a></td></tr>
 </tbody>
 </table>
@@ -5322,6 +5323,63 @@ both see silence and both start signing, and a doppelganger that is down for
 the epochs checked goes unseen until it comes back, when nothing is checking any
 more. <code>ethlambda_validator_doppelganger_detecting</code> counts the keys still
 withheld.</p>
+<h3 id="slashed-validators"><a class="header" href="#slashed-validators">Slashed validators</a></h3>
+<p>Each epoch’s refresh resolves every loaded key through
+<code>POST /eth/v1/beacon/states/head/validators</code>, and reads each one’s
+<code>validator.slashed</code> (not its <code>status</code>, which stops saying so once the validator
+reaches <code>withdrawal_possible</code>). A slashing shows in the head state once a block
+includes it, so it is seen within an epoch of that block. The client does not
+subscribe to the beacon node’s <code>proposer_slashing</code> or <code>attester_slashing</code>
+events yet, which would cut that to seconds.</p>
+<p>A key reported slashed:</p>
+<ul>
+<li>is logged at error, with its index, pubkey and status, by the first refresh
+that finds it, and counted in <code>ethlambda_validator_validators_slashed</code> while
+it stays loaded;</li>
+<li>gets no more proposals (the chain refuses a block from a slashed proposer),
+attestations or attestation aggregations (its attestations earn nothing).
+When the refresh that finds it runs beside the slot’s duties, as an epoch’s
+usually does after its block, that slot still serves the ones it read before
+the answer came;</li>
+<li>keeps its sync committee duties, contributions as a selected aggregator
+included, and its payload timeliness committee duties, which the chain
+still counts: a slashed sync committee member is rewarded for taking
+part and penalised for missing, as any other, and nothing in gloas refuses
+or ignores a slashed member’s payload attestation;</li>
+<li>is left out of builder registrations, fee recipient preparations and
+proposer preferences.</li>
+</ul>
+<p>The other keys go on. They are the ones at risk: a slashing means the setup is
+broken (a key running in a second place, slashing protection bypassed, a
+leaked key), and whatever caused it usually applies to every key that shares
+the validators directory or the copied setup. Each refresh’s answer replaces
+the last, so a key leaves the set only when it is no longer loaded or when a
+node’s earlier answer was wrong.</p>
+<p>With <code>--shut-down-when-slashed</code> the first refresh that finds a slashed key
+stops the client instead, before it sends anything else for the epoch, with an
+error saying not to restart it until the cause is found. An epoch’s refresh
+usually runs after the slot’s block, beside the slot’s other duties, and the
+stop drops those where they stand: no key attests, aggregates or serves a
+committee once the slashing is seen. The process exits
+with code <strong>3</strong>, distinct from the <code>1</code> of any other failure, clap’s <code>2</code> for a
+bad command line and the <code>101</code> of a panic. Every start finds the same key
+again, so tell the supervisor not to restart on it: systemd’s
+<code>RestartPreventExitStatus=3</code> next to <code>Restart=on-failure</code>. Kubernetes can
+match on exit codes from 1.34 on, through a container’s <code>restartPolicyRules</code>
+(alpha behind the <code>ContainerRestartRules</code> feature gate in 1.34, beta and on by
+default from 1.35): a rule that restarts the container on every exit code but
+3. An older cluster has no per-code equivalent, and restarts the pod into the
+same stop until the key is removed. The flag is off by default, as Teku’s
+<code>--shut-down-when-validator-slashed-enabled</code> is.</p>
+<p>With the flag on, the keymanager API is up only for the moment before the
+stop, too short to delete the slashed key through it. Once the cause is
+found, start the client without <code>--shut-down-when-slashed</code>, delete the key
+with <code>DELETE /eth/v1/keystores</code> (or <code>/eth/v1/remotekeys</code>), and turn the
+flag back on at the next restart.</p>
+<p>The answer is one beacon node’s: with several <code>--beacon-nodes</code> the lookup
+takes the first that answers, and nothing confirms it against another. A node
+that wrongly reports a key slashed stops the client with the flag on, and
+costs that key an epoch of duties without it.</p>
 <h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
 <p>The slot length and the duty offsets are read from the beacon node’s
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
@@ -8147,6 +8205,7 @@ and absent is not the same as zero.</p>
 <tbody>
 <tr><td><code>ethlambda_validator_validators_loaded</code></td><td>Gauge</td><td>Validator keys this client holds, local and remote, the count <code>/health</code> reports as <code>validators.loaded</code>. Set at startup and again on every scrape, so keys imported or deleted through the keymanager API show up</td></tr>
 <tr><td><code>ethlambda_validator_validators_resolved</code></td><td>Gauge</td><td>Loaded keys that have an index on chain, out of <code>validators_loaded</code>. A persistent gap means validators are deposited but not yet activated</td></tr>
+<tr><td><code>ethlambda_validator_validators_slashed</code></td><td>Gauge</td><td>Loaded keys the chain reports slashed (their <code>validator.slashed</code>), as of the last epoch refresh. Should read zero forever: a slashed key gets no more proposer, attester or aggregation duties, and its setup is likely to put the other keys at risk. See <a href="#slashed-validators">Slashed validators</a></td></tr>
 <tr><td><code>ethlambda_validator_duties_held</code></td><td>Gauge</td><td>Attester duties currently scheduled</td></tr>
 <tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
 <tr><td><code>ethlambda_validator_attestation_failures_total</code></td><td>Counter</td><td>Slots whose attestation duty failed and returned</td></tr>
