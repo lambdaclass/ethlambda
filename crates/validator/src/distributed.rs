@@ -304,7 +304,8 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     /// subscriptions of those the combined proof then selects again, now
     /// with the role. The others were already subscribed without it.
     ///
-    /// One request per slot, all sent at once. The middleware answers a
+    /// One request per slot, all sent at once, and each slot's subscriptions
+    /// sent as soon as its own answer is in. The middleware answers a
     /// request only once it has combined every entry in it (see the module
     /// doc), so an entry it cannot combine, one the other operators' clients
     /// never send, would otherwise hold back every other duty of the epoch
@@ -343,18 +344,22 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             return;
         }
 
-        let exchanges = missing
-            .values()
-            .map(|owed| self.exchange_attester(owed, store, false));
-        let mut combined = 0;
+        // Each slot's subscriptions follow its own answer, not every slot's:
+        // a slot the middleware holds until the request times out must not
+        // keep a duty it did combine off its subnet that long, which for a
+        // duty at this slot or the next is past its aggregation.
+        let exchanges = missing.values().map(|owed| async move {
+            let exchanged = self.exchange_attester(owed, store, false).await;
+            if exchanged.as_ref().is_ok_and(|combined| *combined > 0) {
+                self.subscribe_selected(epoch, owed, store).await;
+            }
+            exchanged
+        });
         let (mut failed, mut first_error) = (0, None);
         for exchanged in join_all(exchanges).await {
-            match exchanged {
-                Ok(answered) => combined += answered,
-                Err(err) => {
-                    failed += 1;
-                    first_error.get_or_insert(err);
-                }
+            if let Err(err) = exchanged {
+                failed += 1;
+                first_error.get_or_insert(err);
             }
         }
         if let Some(err) = first_error {
@@ -366,14 +371,21 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
                 "Middleware still did not combine some attester selection proofs; retrying next slot"
             );
         }
-        if combined == 0 {
-            return;
-        }
+    }
 
+    /// Send again, now with the role, the subscriptions of the duties in
+    /// `owed` whose combined proof selects them. The others were already
+    /// subscribed without it.
+    async fn subscribe_selected(
+        &self,
+        epoch: u64,
+        owed: &[AttesterDutyDto],
+        store: &RwLock<ValidatorStore>,
+    ) {
         let mut selected = Vec::new();
-        for duty in missing.into_values().flatten() {
-            if let Ok(Some(_)) = selection_for(&self.context, store, &duty).await {
-                selected.push(duty);
+        for duty in owed {
+            if let Ok(Some(_)) = selection_for(&self.context, store, duty).await {
+                selected.push(duty.clone());
             }
         }
         self.subscribe(epoch, &selected, store).await;
@@ -1118,6 +1130,45 @@ mod tests {
         );
         let resent: Vec<_> = node.subscriptions().into_iter().skip(subscribed).collect();
         assert_eq!(resent.len(), 1, "only the selected duty is re-sent");
+        assert_eq!(resent[0].validator_index, 1);
+        assert!(resent[0].is_aggregator);
+    }
+
+    /// A slot whose retry request the middleware holds, as Charon holds one
+    /// it cannot combine, keeps no other slot's subscription back: the duty
+    /// it did combine is subscribed with the role while that request is
+    /// still out.
+    #[tokio::test]
+    async fn a_held_retry_slot_holds_back_no_other_slots_subscription() {
+        let (store, pubkey) = store();
+        let (chosen, held) = (EPOCH_START + 5, EPOCH_START + 9);
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .failing_call("beacon_committee_selections", "middleware down")
+                .holding_uncombined_selections()
+                .with_combined_selection(1, chosen, attester_proof(true)),
+        );
+        let distributed = Distributed::new(node.clone(), distributed_context());
+        let duties = vec![duty(&pubkey, 1, chosen), duty(&pubkey, 2, held)];
+
+        distributed
+            .subscribe_epoch(EPOCH_START, &duties, &store)
+            .await;
+        let subscribed = node.subscriptions().len();
+        assert_eq!(subscribed, 2, "the round subscribes both, without the role");
+
+        node.failures
+            .lock()
+            .expect("lock")
+            .remove("beacon_committee_selections");
+        // The held slot's request is never answered, so neither is the retry.
+        let retry = distributed.retry(EPOCH_START + 1, &duties, &store);
+        let finished = tokio::time::timeout(Duration::from_secs(2), retry).await;
+        assert!(finished.is_err(), "the held slot's request is still out");
+
+        assert_eq!(node.selection_requests().len(), 2, "one request per slot");
+        let resent: Vec<_> = node.subscriptions().into_iter().skip(subscribed).collect();
+        assert_eq!(resent.len(), 1, "the combined duty is re-sent regardless");
         assert_eq!(resent[0].validator_index, 1);
         assert!(resent[0].is_aggregator);
     }
