@@ -39,14 +39,17 @@
 //! # A file that stalls
 //!
 //! Each read runs on a thread of its own, not on tokio's blocking pool, and
-//! at most [`MAX_READS`] run at once. A read of a stalled mount, or of a FIFO
-//! put in the file's place, never returns, and keeps its thread until the
-//! file answers. On the blocking pool, every proposal and `GET graffiti`
-//! would strand one more of the threads slashing protection runs on, until
-//! none were left for it, and the runtime would wait for the stuck ones
-//! forever when the client stops. Here a stalled file holds [`MAX_READS`]
-//! threads at most, the process exits past them, and every read meanwhile
-//! waits for a free one within [`READ_TIMEOUT`] and is given up on. At
+//! only one runs at a time: a caller that comes while one runs waits for that
+//! read's answer rather than starting another, since both would read the same
+//! file. A read of a stalled mount, or of a FIFO put in the file's place,
+//! never returns, and keeps its thread until the file answers. On the
+//! blocking pool, every proposal and `GET graffiti` would strand one more of
+//! the threads slashing protection runs on, until none were left for it, and
+//! the runtime would wait for the stuck ones forever when the client stops.
+//! Here a stalled file holds one thread, the process exits past it, and every
+//! caller meanwhile waits on that read for [`READ_TIMEOUT`] and gives up. A
+//! caller that joins a running read takes the file as that read found it,
+//! which for a local file is microseconds before the caller asked. At
 //! startup, [`GraffitiFile::open`] gives its read [`OPEN_TIMEOUT`] and
 //! refuses startup past it.
 //!
@@ -55,12 +58,12 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey, Bytes32};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::watch;
 use tracing::info;
 
 use crate::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
@@ -84,18 +87,15 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// mount or a FIFO refuses startup naming the file rather than hanging it.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many reads of the file run at once, each on a thread of its own: also
-/// how many threads a stalled file can hold. More than one, so a burst of
-/// `GET graffiti` requests does not queue a proposal past its timeout.
-pub const MAX_READS: usize = 4;
-
-#[derive(Debug, thiserror::Error)]
+/// Cloneable, so that one read's failure can be every waiting caller's
+/// answer.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum GraffitiFileError {
     #[error("graffiti file {path}: {source}")]
     Read {
         path: String,
         #[source]
-        source: std::io::Error,
+        source: Arc<std::io::Error>,
     },
     #[error("graffiti file {path} is over {MAX_FILE_BYTES} bytes")]
     TooLarge { path: String },
@@ -194,15 +194,19 @@ fn parse_key(key: &str) -> Result<BlsPubkey, String> {
     Ok(BlsPubkey(bytes))
 }
 
+/// What one read of the file gives: the table, or why there is none.
+type ReadAnswer = Result<GraffitiTable, GraffitiFileError>;
+
 /// Where `--graffiti-file` points. It holds no contents: every read parses
 /// the file afresh.
 #[derive(Debug, Clone)]
 pub struct GraffitiFile {
     path: PathBuf,
-    /// A permit per read running, held by the read's thread until the read
-    /// ends, so a stalled file holds [`MAX_READS`] threads at most. Shared by
-    /// every clone.
-    readers: Arc<Semaphore>,
+    /// The read running now, if any, as the channel its answer comes on
+    /// (`None` until it does). A caller that comes while it runs waits on it
+    /// rather than starting another read, so a stalled file holds one thread.
+    /// The read's thread clears it before answering. Shared by every clone.
+    running: Arc<Mutex<Option<watch::Receiver<Option<ReadAnswer>>>>>,
 }
 
 impl GraffitiFile {
@@ -213,16 +217,12 @@ impl GraffitiFile {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, GraffitiFileError> {
         let file = Self {
             path: path.into(),
-            readers: Arc::new(Semaphore::new(MAX_READS)),
+            running: Arc::default(),
         };
-        let reader = file
-            .readers
-            .clone()
-            .try_acquire_owned()
-            .expect("no read of a file just opened is running");
         let (answer, answered) = std::sync::mpsc::channel();
-        file.spawn_read(reader, move |table| {
-            let _ = answer.send(table);
+        let reader = file.clone();
+        file.spawn(move || {
+            let _ = answer.send(reader.read_now());
         })?;
         let table = match answered.recv_timeout(OPEN_TIMEOUT) {
             Ok(table) => table?,
@@ -248,7 +248,7 @@ impl GraffitiFile {
         let path = || self.path.display().to_string();
         let read = |source| GraffitiFileError::Read {
             path: path(),
-            source,
+            source: Arc::new(source),
         };
         let file = std::fs::File::open(&self.path).map_err(read)?;
         let mut bytes = Vec::new();
@@ -269,48 +269,55 @@ impl GraffitiFile {
     }
 
     /// [`Self::read_now`] on a thread of its own, off the runtime's workers
-    /// and its blocking pool (see the module doc), given up after
-    /// [`READ_TIMEOUT`], the wait for a free reader included. A read given up
-    /// on keeps its thread, and its reader, until the file answers.
-    pub async fn read(&self) -> Result<GraffitiTable, GraffitiFileError> {
-        let read = async {
-            let reader = self
-                .readers
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("the readers' semaphore is never closed");
-            let (answer, answered) = tokio::sync::oneshot::channel();
-            self.spawn_read(reader, move |table| {
-                let _ = answer.send(table);
-            })?;
-            answered.await.unwrap_or_else(|_| Err(self.unanswered()))
-        };
-        tokio::time::timeout(READ_TIMEOUT, read)
-            .await
-            .unwrap_or_else(|_| Err(self.timed_out(READ_TIMEOUT)))
+    /// and its blocking pool (see the module doc), or the answer of the read
+    /// already running, given up after [`READ_TIMEOUT`]. A read given up on
+    /// keeps its thread until the file answers, and every caller until then
+    /// waits on it rather than starting another.
+    pub async fn read(&self) -> ReadAnswer {
+        let mut answer = self.join_or_start()?;
+        let answered = tokio::time::timeout(READ_TIMEOUT, answer.wait_for(Option::is_some)).await;
+        match answered {
+            Ok(Ok(answer)) => answer.clone().expect("waited for an answer"),
+            Ok(Err(_)) => Err(self.unanswered()),
+            Err(_) => Err(self.timed_out(READ_TIMEOUT)),
+        }
     }
 
-    /// Start [`Self::read_now`] on a thread of its own, which holds `reader`
-    /// until the read ends, then hands the result to `answer`. The caller may
-    /// have stopped waiting by then; the thread ends all the same.
-    fn spawn_read(
-        &self,
-        reader: OwnedSemaphorePermit,
-        answer: impl FnOnce(Result<GraffitiTable, GraffitiFileError>) + Send + 'static,
-    ) -> Result<(), GraffitiFileError> {
+    /// The channel the running read answers on, or, with none running, that
+    /// of a read started now on a thread of its own.
+    ///
+    /// A running read whose thread ended without answering, which only a
+    /// panic in it does, is not waited on: a new read replaces it.
+    fn join_or_start(&self) -> Result<watch::Receiver<Option<ReadAnswer>>, GraffitiFileError> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(answer) = running.as_ref()
+            && answer.has_changed().is_ok()
+        {
+            return Ok(answer.clone());
+        }
+        let (answering, answer) = watch::channel(None);
         let file = self.clone();
+        self.spawn(move || {
+            let table = file.read_now();
+            // Cleared before answering, so a caller from now on reads the
+            // file again rather than taking this answer.
+            *file.running.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            answering.send_replace(Some(table));
+        })?;
+        *running = Some(answer.clone());
+        Ok(answer)
+    }
+
+    /// Run `read` on a thread of its own. The caller may have stopped waiting
+    /// by the time it ends; the thread ends all the same.
+    fn spawn(&self, read: impl FnOnce() + Send + 'static) -> Result<(), GraffitiFileError> {
         std::thread::Builder::new()
             .name("graffiti-file".to_string())
-            .spawn(move || {
-                let table = file.read_now();
-                drop(reader);
-                answer(table);
-            })
+            .spawn(read)
             .map(drop)
             .map_err(|source| GraffitiFileError::Read {
                 path: self.path.display().to_string(),
-                source,
+                source: Arc::new(source),
             })
     }
 
@@ -326,7 +333,7 @@ impl GraffitiFile {
     fn unanswered(&self) -> GraffitiFileError {
         GraffitiFileError::Read {
             path: self.path.display().to_string(),
-            source: std::io::Error::other("the read ended without an answer"),
+            source: Arc::new(std::io::Error::other("the read ended without an answer")),
         }
     }
 }
@@ -540,30 +547,70 @@ mod tests {
         assert!(matches!(err, GraffitiFileError::Read { .. }), "got {err:?}");
     }
 
-    /// With every reader held, as reads of a stalled file hold them, a read
-    /// waits for a free one within its timeout and is given up on, with no
-    /// thread started for it; once one is free, the file reads again.
+    /// A read running, as one of a stalled file keeps running, is waited on
+    /// rather than read again: a caller meanwhile is given up on in time,
+    /// with no thread started for it, and the read's answer, once it comes,
+    /// is the next caller's too. Once it is done, the file is read again.
     #[tokio::test]
-    async fn a_read_with_no_free_reader_is_given_up_on_in_time() {
+    async fn a_running_read_is_waited_on_rather_than_started_again() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("graffiti.txt");
         std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
         let file = GraffitiFile::open(&path).expect("opens");
 
-        let stalled = file
-            .readers
-            .clone()
-            .acquire_many_owned(MAX_READS as u32)
+        let (answering, answer) = watch::channel(None);
+        *file.running.lock().expect("not poisoned") = Some(answer);
+        let err = file
+            .read()
             .await
-            .expect("every reader is free once open returns");
-        let err = file.read().await.expect_err("no free reader");
+            .expect_err("the running read has not answered");
         assert!(
             matches!(err, GraffitiFileError::TimedOut { after, .. } if after == READ_TIMEOUT),
             "got {err:?}"
         );
 
-        drop(stalled);
+        let stalled = GraffitiTable::parse(&format!("{PK1}: stalled\n")).expect("parses");
+        answering.send_replace(Some(Ok(stalled)));
+        let table = file.read().await.expect("the running read's answer");
+        assert_eq!(table.graffiti(&key(PK1)), graffiti("stalled"));
+
+        // What the read's own thread does once it answers.
+        *file.running.lock().expect("not poisoned") = None;
         let table = file.read().await.expect("reads");
         assert_eq!(table.graffiti(&key(PK1)), graffiti("mine"));
+    }
+
+    /// A read whose thread ended without answering, which only a panic in it
+    /// does, is not waited on: the next caller reads the file again.
+    #[tokio::test]
+    async fn a_read_that_ended_unanswered_is_not_waited_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
+        let file = GraffitiFile::open(&path).expect("opens");
+
+        let (answering, answer) = watch::channel(None);
+        *file.running.lock().expect("not poisoned") = Some(answer);
+        drop(answering);
+        let table = file.read().await.expect("a new read");
+        assert_eq!(table.graffiti(&key(PK1)), graffiti("mine"));
+    }
+
+    /// Callers that come together all get the file's table.
+    #[tokio::test]
+    async fn callers_that_come_together_all_get_the_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
+        let file = GraffitiFile::open(&path).expect("opens");
+
+        let reads = (0..8).map(|_| file.read());
+        for table in futures_util::future::join_all(reads).await {
+            assert_eq!(table.expect("reads").graffiti(&key(PK1)), graffiti("mine"));
+        }
+        assert!(
+            file.running.lock().expect("not poisoned").is_none(),
+            "the read is done, so none is running"
+        );
     }
 }
