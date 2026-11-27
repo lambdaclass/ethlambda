@@ -41,7 +41,7 @@ use ethlambda_blockchain::{
     PreparedPayloads, PreparedPqAttestations, SyncStatusController,
     metrics::SyncStatus,
     payload_attributes::{PqProposal, ProposalError, prepare_pq_proposal, prepared_fee_recipient},
-    pq_attestation_packing::{merge_budget, pack_attestations},
+    pq_attestation_packing::{PermitWait, merge_budget, pack_attestations},
 };
 use ethlambda_engine::{EngineClient, types::ClientVersionV1};
 use ethlambda_state_transition::beacon::{
@@ -305,19 +305,19 @@ async fn attestations_for_block(
 ) -> (Vec<pq::Attestation>, Vec<u8>) {
     let slot = state.slot();
     if let Some(prepared) = prepared {
-        // Bounded like a merge here would be: one still running ahead holds
-        // the merge permit, so starting another would only fall back.
-        let budget = merge_budget(config, slot).unwrap_or_default();
-        if let Some(packed) = prepared.collect(slot, head_root, budget).await {
+        // Half the merge budget at most, so a packing that does not come
+        // through still leaves production the time to pack and merge itself.
+        let budget = merge_budget(config, slot).unwrap_or_default() / 2;
+        if let Some(packed) = prepared.take(store, slot, head_root, budget).await {
             info!(
                 %slot,
                 attestations = packed.attestations.len(),
                 proof_bytes = packed.proof.len(),
                 "Collected the PQ attestations packed ahead of the slot"
             );
-            return (packed.attestations.clone(), packed.proof.clone());
+            return (packed.attestations, packed.proof);
         }
     }
-    let packed = pack_attestations(store, state, config).await;
+    let packed = pack_attestations(store, state, config, PermitWait::TryOnce).await;
     (packed.attestations, packed.proof)
 }

@@ -1029,15 +1029,16 @@ impl BlockChainServer {
 
         // A PQ block's attestation proofs are merged now too, rather than at
         // the slot: everything the merge reads is already here (see
-        // `pq_attestation_packing`).
+        // `pq_attestation_packing`). Only for a proposer a validator client
+        // registered here, not for every slot `--always-prepare-payload`
+        // builds for: a merge is ~0.6 s of the prover nobody would collect.
         let proposal_epoch = compute_epoch_at_slot(key.proposal_slot);
         if self.store.config().fork_at_epoch(proposal_epoch) == ForkName::Pq
-            && let Ok(Some(head_state)) = self.store.get_state(&key.head_root)
+            && key.fee_recipient.is_some()
         {
             preparation.prepared_pq_attestations.start(
                 self.store.clone(),
                 key.head_root,
-                head_state,
                 key.proposal_slot,
             );
         }
