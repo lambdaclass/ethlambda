@@ -25,11 +25,11 @@
 //! given fork keeps calling whichever earlier fork's function last introduced
 //! or changed it.
 //!
-//! - `proposer_slashing` needs no routing through fulu: no fork's specification
-//!   before gloas ever lists a modified `process_proposer_slashing`, so
-//!   phase0's function serves every earlier fork. Gloas's own specification
-//!   does modify it (EIP-7732: clearing the `BuilderPendingPayment` tied to a
-//!   slashed proposal), so it gets its own routed arm and its own function.
+//! - `proposer_slashing` needs no routing at all: no fork's specification
+//!   lists a modified `process_proposer_slashing`, so phase0's function
+//!   serves every fork. Gloas's clearing of the slashed proposer's
+//!   `BuilderPendingPayment`s (EIP-7732) lives in `slash_validator` since
+//!   consensus-specs #5719, which every fork's copy reaches.
 //! - `attester_slashing` and `deposit` need no *function* routing through
 //!   deneb (neither fork's specification lists either as modified before
 //!   electra), but `attester_slashing`'s container does change shape at
