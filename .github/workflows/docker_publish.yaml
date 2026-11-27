@@ -5,7 +5,8 @@ name: Publish Docker Image
 # never fight over one: `unstable` (release.yaml, on every push to main), version
 # tags (release.yaml for candidates, release_promote.yaml for final releases),
 # and `latest` (release_promote.yaml). `sha-*` is refused too, since this
-# workflow already adds `sha-<7>` for the commit it builds. See RELEASE.md.
+# workflow already adds `sha-<7>` for the commit it builds, and so is any tag
+# ending in `-minimal` or `-shadow`, the suffixes it adds itself. See RELEASE.md.
 
 on:
   workflow_dispatch:
@@ -40,6 +41,14 @@ jobs:
           for t in "${TAG_ARRAY[@]}"; do
             if [[ "$t" =~ ^((latest|unstable)(-minimal|-shadow)?|sha-.*|v?[0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
               echo "::error::'$t' is reserved for the release pipeline or added automatically; see RELEASE.md"
+              status=1
+            # Every variant appends its suffix to every tag, so a tag already
+            # ending in one gets the default (ethrex) build under the variant's
+            # name: `devnet5-minimal` would publish ethrex as `devnet5-minimal`,
+            # and beside `devnet5` the two jobs would race to push the same
+            # `devnet5-minimal-<arch>` tag with different builds.
+            elif [[ "$t" =~ -(minimal|shadow)$ ]]; then
+              echo "::error::'$t' ends in a variant suffix, which this workflow adds to every tag itself; give the tag without it"
               status=1
             fi
           done
@@ -160,8 +169,9 @@ jobs:
 
           # Publish each tag three times: the regular image, its "-minimal"
           # and its "-shadow" twin. These suffixes must stay in sync with the
-          # `variant` matrix suffixes in the build-image job above: a new
-          # variant must be added in both.
+          # `variant` matrix suffixes in the build-image job above and with
+          # the suffixes check-tags refuses: a new variant must be added in
+          # all three.
           for suffix in "" "-minimal" "-shadow"; do
             # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \

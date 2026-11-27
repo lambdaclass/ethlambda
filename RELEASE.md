@@ -341,9 +341,10 @@ Devnet tags (`devnetX`) and other ad-hoc tags are published by hand:
 
 The workflow builds `amd64` and `arm64` images, regular (ethrex embedded),
 `-minimal` and `-shadow`, and publishes a multi-arch manifest for each tag plus
-a `sha-<7chars>` one for the commit. It refuses `latest`, `unstable` (and their
-`-minimal` and `-shadow` forms), `sha-*` and version tags, which belong to the
-release workflows.
+a `sha-<7chars>` one for the commit. It refuses `latest`, `unstable`, `sha-*`
+and version tags, which belong to the release workflows, and any tag ending in
+`-minimal` or `-shadow`, the suffixes it adds itself: enter `devnet5`, not
+`devnet5-minimal`.
 
 ## Building locally
 
