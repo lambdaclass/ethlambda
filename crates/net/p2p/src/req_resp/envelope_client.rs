@@ -5,12 +5,14 @@
 //! through `beacon::envelope_checks` before the chain actor sees it.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
+use lru::LruCache;
 use spawned_concurrency::tasks::{Context, send_after};
 use tracing::{debug, error, trace};
 
@@ -104,6 +106,64 @@ pub(crate) fn take_envelope_gate(server: &mut P2PServer, session: Option<u64>) -
         Some(state) if Some(state.id) == session => std::mem::take(&mut state.envelopes_pending),
         _ => false,
     }
+}
+
+/// How many block roots [`PayloadVoteFetches`] remembers. A vote for a
+/// payload names a recent block, so a handful of slots' worth is plenty; a
+/// root evicted early is only asked for again.
+const PAYLOAD_VOTE_FETCHES_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+
+/// When a vote's payload claim last started an envelope lookup, per block root.
+///
+/// `gloas/p2p-interface.md` IGNOREs an attestation or aggregate that votes for
+/// a payload (`data.index == 1`) this node has not verified, and says the node
+/// SHOULD then request the envelope by root. Every committee member casts such
+/// a vote, so one block's envelope would be asked for hundreds of times a slot,
+/// and `pending_envelope_requests` dedupes only while a lookup is in flight.
+/// Once it ends, the envelope may have arrived and still wait on its columns or
+/// the execution client (unverified, so the votes are still IGNOREd), or the
+/// retry ladder may have given up. Either way a vote does not start another
+/// lookup for that root until a slot has passed.
+pub(crate) struct PayloadVoteFetches(LruCache<H256, Instant>);
+
+impl Default for PayloadVoteFetches {
+    fn default() -> Self {
+        Self(LruCache::new(PAYLOAD_VOTE_FETCHES_CAPACITY))
+    }
+}
+
+impl PayloadVoteFetches {
+    /// Whether a vote for `block_root`'s payload may start a lookup at `now`,
+    /// recording that it did.
+    fn admit(&mut self, block_root: H256, now: Instant, cooldown: Duration) -> bool {
+        if let Some(asked) = self.0.get(&block_root)
+            && now.saturating_duration_since(*asked) < cooldown
+        {
+            return false;
+        }
+        self.0.put(block_root, now);
+        true
+    }
+}
+
+/// Ask for `block_root`'s envelope because a gossip vote said its payload is
+/// present and this node has not verified it (the vote's verdict was
+/// `Ignore(PayloadEnvelopeUnseen)`, which only a vote whose signatures verified
+/// can reach). At most once a slot per root; see [`PayloadVoteFetches`].
+pub(crate) async fn fetch_envelope_for_payload_vote(server: &mut P2PServer, block_root: H256) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let cooldown = Duration::from_millis(wire.config.slot_duration_ms);
+    if server.pending_envelope_requests.contains_key(&block_root)
+        || !server
+            .payload_vote_fetches
+            .admit(block_root, Instant::now(), cooldown)
+    {
+        return;
+    }
+    debug!(%block_root, "A vote names a payload not verified here, asking for its envelope");
+    fetch_envelope_from_peer(server, block_root).await;
 }
 
 /// Fetch the envelope of `block_root` from a random connected peer.
@@ -566,6 +626,40 @@ mod tests {
             ReqRespProtocol::ExecutionPayloadEnvelopesByRoot
         );
         assert!(matches!(kind, PendingRequestKind::EnvelopeRoot(r) if *r == root));
+    }
+
+    #[test]
+    fn a_vote_starts_a_lookup_for_a_root_at_most_once_a_slot() {
+        let mut fetches = PayloadVoteFetches::default();
+        let slot = Duration::from_secs(12);
+        let start = Instant::now();
+        let (root, other) = (H256::repeat_byte(1), H256::repeat_byte(2));
+
+        assert!(fetches.admit(root, start, slot));
+        assert!(!fetches.admit(root, start + Duration::from_secs(11), slot));
+        assert!(fetches.admit(other, start + Duration::from_secs(1), slot));
+        assert!(fetches.admit(root, start + slot, slot));
+    }
+
+    /// Votes keep arriving after a lookup ended (the envelope may be held on
+    /// its columns, or the ladder gave up), and none of them asks again within
+    /// the slot.
+    #[tokio::test]
+    async fn a_vote_after_the_lookup_ended_waits_for_the_next_slot() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        server
+            .connected_peers
+            .insert(PeerId::random(), ConnectionDirection::Outbound);
+        let root = H256::repeat_byte(7);
+
+        fetch_envelope_for_payload_vote(&mut server, root).await;
+        assert_eq!(server.outbound_requests.len(), 1);
+        server.outbound_requests.clear();
+        server.pending_envelope_requests.remove(&root);
+
+        fetch_envelope_for_payload_vote(&mut server, root).await;
+        assert!(server.outbound_requests.is_empty());
+        assert!(server.pending_envelope_requests.is_empty());
     }
 
     #[tokio::test]

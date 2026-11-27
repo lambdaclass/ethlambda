@@ -3680,6 +3680,7 @@ pub(crate) mod tests {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,

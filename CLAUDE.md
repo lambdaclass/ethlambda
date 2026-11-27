@@ -412,7 +412,8 @@ actual_slot = finalized_slot + 1 + relative_index
     Fetched blocks reach the actor as `BlockSource::Sync`.
   - Gloas adds `execution_payload_envelopes_by_{range,root}/1`. Server: canonical FULL
     envelopes only, and the head's envelope only when the head node is FULL. Client: by root
-    on `needs_envelope` (same dedup and retry ladder as block fetches), by range after a
+    on `needs_envelope` (same dedup and retry ladder as block fetches) and on a gossip vote
+    for a payload not verified here (at most once a slot per root), by range after a
     gloas span's blocks were handed to the actor, with range sync holding the next batch
     until the envelope answer is forwarded (the actor keeps unmatched envelopes only briefly)
     Their chunks carry four `<context-bytes>` (the block's own epoch's fork digest), which is why

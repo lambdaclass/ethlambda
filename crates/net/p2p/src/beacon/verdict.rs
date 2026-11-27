@@ -176,6 +176,16 @@ impl Validated {
         }
     }
 
+    /// The block an attestation or aggregate votes for. `None` for every
+    /// other object.
+    fn voted_block_root(&self) -> Option<Root> {
+        match self {
+            Self::Aggregate { aggregate, .. } => Some(aggregate.data().beacon_block_root),
+            Self::Attestation { attestation, .. } => Some(attestation.data.beacon_block_root),
+            _ => None,
+        }
+    }
+
     /// Record this object as the first valid one for its key. `false` when
     /// another verdict recorded one first.
     fn record_seen(&self, server: &mut P2PServer) -> bool {
@@ -652,8 +662,15 @@ impl Handler<GossipVerdict> for P2PServer {
         } = msg;
         let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
+        // Taken before `forward` consumes the object.
+        let unverified_payload = (outcome == Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen))
+            .then(|| object.voted_block_root())
+            .flatten();
         if report(self, id, outcome) {
             object.forward(self, received_at, outcome);
+        }
+        if let Some(block_root) = unverified_payload {
+            crate::req_resp::fetch_envelope_for_payload_vote(self, block_root).await;
         }
     }
 }

@@ -1601,6 +1601,7 @@ impl P2P {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -1775,6 +1776,9 @@ pub struct P2PServer {
     /// counterpart for envelopes, deduplicating a repeated ask and carrying
     /// the retry ladder.
     pub(crate) pending_envelope_requests: HashMap<H256, PendingRequest>,
+    /// Envelope lookups gossip votes started, at most one a slot per root.
+    /// See [`req_resp::PayloadVoteFetches`].
+    pub(crate) payload_vote_fetches: req_resp::PayloadVoteFetches,
     /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
@@ -4072,6 +4076,7 @@ pub(crate) mod test_support {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,

@@ -210,7 +210,11 @@ but its own progressive `Attestation`, so it decodes to its own
 attestation is electra's `SingleAttestation` unchanged. In both, `data.index` is
 the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
 the block's envelope has been seen and its payload validated
-(`verify_attestation_payload_status`). Gloas is a followed fork, so a block at
+(`verify_attestation_payload_status`). Such a vote also asks a peer for the
+envelope by root, as the specification says a node SHOULD, at most once a slot
+per block (`PayloadVoteFetches`, `req_resp/envelope_client.rs`): every member of
+a committee casts one, and an envelope that arrived may still wait on its
+columns or the execution client. The vote itself is not queued (a MAY). Gloas is a followed fork, so a block at
 a gloas slot that fails to decode is REJECTed like one at any other followed
 fork; `unsupported_fork` is kept for a fork the node does not follow
 (`ForkName::is_followed`), none today. A gloas aggregate's aggregation bits are
