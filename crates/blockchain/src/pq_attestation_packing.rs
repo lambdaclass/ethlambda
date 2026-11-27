@@ -562,10 +562,10 @@ mod tests {
             &[b.clone(), a.clone()]
         ));
         assert!(
-            !same_aggregates(&[a.clone()], &[b.clone()]),
+            !same_aggregates(std::slice::from_ref(&a), std::slice::from_ref(&b)),
             "equal content, another aggregate"
         );
-        assert!(!same_aggregates(&[a.clone()], &[a.clone(), b]));
+        assert!(!same_aggregates(std::slice::from_ref(&a), &[a.clone(), b]));
         assert!(same_aggregates(&[], &[]));
     }
 
