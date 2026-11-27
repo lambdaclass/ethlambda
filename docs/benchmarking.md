@@ -279,30 +279,33 @@ workload reads its own histogram. A replayed block reports under
 `source="replay"`, a label no node ever writes, so it reaches the histogram
 without passing for a gossip or sync arrival. The phases are the
 `BLOCK_IMPORT_PHASES` labels: `decode`, `queue`, `defer`, `admit`, `guards`,
-`preamble`, `parent_wait`, `cascade_wait`, `da_check`, `columns_wait`, `engine`,
-`verify_struct`, `verify_crypto`, `stf`, `writer_wait`, `db_write`, `fc_head`,
-`block_atts`; plus the per-arrival sections that are not spans around the others, `prune`,
+`preamble`, `parent_wait`, `cascade_wait`, `da_check`, `columns_wait`, `cl`,
+`el_wait`, `verify_struct`, `verify_crypto`, `stf`, `store`, `writer_wait`,
+`db_write`, `fc_head`, `block_atts`; plus the per-arrival sections that are not spans around the others, `prune`,
 `get_head` and `fcu`, since each `import_block` call is one arrival. `get_head`
 is where the head recomputation after every import is charged.
 
-On beacon, `writer_wait` is the importer's blocking hand-off of the post-state
-to the storage crate's background writer, which waits while the writer's queue
-is full. It happens inside `fork_choice::on_block`, so `stf` excludes it: `stf`
-is state-transition work and the two phases do not overlap. When blocks import
-faster than the writer persists them, the wait shows up here rather than in
-`stf`.
+A beacon block's state transition is two phases: `cl`, the transition,
+computed ahead of `fork_choice::on_block`, and `store`, that call, which writes
+the block and its post-state and does the fork-choice bookkeeping. (Before
+lambdaclass/ethlambda#917 the two were one `stf` phase; lean's `stf` is its own
+transition.) `writer_wait` is the importer's blocking hand-off of the
+post-state to the storage crate's background writer, which waits while the
+writer's queue is full. It happens inside `fork_choice::on_block`, so `store`
+excludes it and the two phases do not overlap. When blocks import faster than
+the writer persists them, the wait shows up here rather than in `store`.
 
-With an execution client the beacon `stf` row also includes a state
-transition that ran while `engine_newPayload` was in flight, and `engine` then
-reports only what the request cost beyond it: building it, and the wait left
-after the transition, which is nothing when the answer was already in. The
-execution client's own time is `lean_engine_new_payload_seconds`. A replay has
-no client, so none of this applies to its numbers.
+With an execution client `cl` runs while `engine_newPayload` is in flight, and
+`el_wait` then reports only what the request cost beyond it: building it, and
+the wait left after the transition, which is nothing when the answer was
+already in. The execution client's own time is
+`lean_engine_new_payload_seconds`. A replay has no client, so none of this
+applies to its numbers, and its `el_wait` is zero.
 
-### Where `stf` goes: the report's `stf_phases`, `class` and resource fields
+### Where the transition goes: the report's `stf_phases`, `class` and resource fields
 
-`stf` is one number for a block's whole state transition, and on a mainnet
-block it is most of the import. Each sample therefore also carries what it was
+`cl` plus `store` is a block's whole state transition, and on a mainnet block
+it is most of the import. Each sample therefore also carries what it was
 made of, so a baseline says which step to attack and for which kind of block.
 The report's `schema_version` is 2; version 1 had none of what follows, and every
 field below that a sample or the summary can lack is **absent, not zero**.
@@ -333,9 +336,12 @@ For the same reason an `epoch_boundary` block in a replay always pays
 `caches.epoch_precompute` shows the misses). On a live follower a precompute hit
 takes that cost off the import path, so the replay is the upper bound.
 
-**`stf_unattributed_seconds`** is `stf` minus the sum of `stf_phases`: the part
-of the transition no step covers, such as cloning the parent's state and
-building the epoch-boundary balances. Absent when `stf` did not run.
+**`stf_unattributed_seconds`** is `cl` plus `store` minus the sum of
+`stf_phases`: the part of the transition no step covers, such as cloning the
+parent's state, building the checkpoint balances, the target-balance scan and
+`on_block`'s store writes. Absent when neither ran. A debug-assertions build
+runs the transition a second time inside `store`, as a check, and its steps
+are counted too.
 
 **`class`** is what the block's `process_slots` had to do, decided from the
 block's slot and its parent's (`parent_slot`, also in the sample):
@@ -388,7 +394,7 @@ since close to twenty more columns would not fit a terminal.
 
 Replay runs nothing that a corpus already answers for:
 
-- **No execution client**, so `engine` reports a zero section with nothing to
+- **No execution client**, so `el_wait` reports a zero section with nothing to
   call and `fcu` never runs. On a live follower paired with one, the
   `engine_newPayload` round trip was 31ms p50, about 0.5% of an import, before
   the state transition was overlapped with it; a replay's numbers are complete
