@@ -45,19 +45,21 @@ docker pull ghcr.io/lambdaclass/ethlambda:sha-12f8377   # pinned to a specific c
 ## Release binaries
 
 Every release candidate attaches two builds for each platform, plus a
-`SHA256SUMS` file covering all of them. `ethlambda-<platform>` is ethlambda
-alone. `ethlambda-ethrex-<platform>` is built with the `include-ethrex` feature:
-`ethlambda beacon` without `--execution-endpoint` runs
-[ethrex](https://github.com/lambdaclass/ethrex) in its own process as its
+`SHA256SUMS` file covering all of them. `ethlambda-<platform>` is built with
+the `include-ethrex` feature: `ethlambda beacon` without `--execution-endpoint`
+runs [ethrex](https://github.com/lambdaclass/ethrex) in its own process as its
 execution client (see [`docs/ethrex.md`](docs/ethrex.md)).
+`ethlambda-minimal-<platform>` is built without it. Both take
+`--execution-endpoint`, so either runs beside an external execution client.
+Up to v1.0.0, `ethlambda-<platform>` was the build without ethrex.
 
-| Platform | ethlambda | ethlambda with ethrex |
-|----------|-----------|-----------------------|
-| Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) | `ethlambda-linux-x86_64` | `ethlambda-ethrex-linux-x86_64` |
-| Linux aarch64, glibc 2.35+ | `ethlambda-linux-aarch64` | `ethlambda-ethrex-linux-aarch64` |
-| macOS on Apple silicon | `ethlambda-macos-aarch64` | `ethlambda-ethrex-macos-aarch64` |
+| Platform | ethlambda (ethrex embedded) | ethlambda-minimal |
+|----------|-----------------------------|-------------------|
+| Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) | `ethlambda-linux-x86_64` | `ethlambda-minimal-linux-x86_64` |
+| Linux aarch64, glibc 2.35+ | `ethlambda-linux-aarch64` | `ethlambda-minimal-linux-aarch64` |
+| macOS on Apple silicon | `ethlambda-macos-aarch64` | `ethlambda-minimal-macos-aarch64` |
 
-The Docker images are ethlambda alone. `docs/ethrex.md` shows how to build an
+The Docker images are the minimal build. `docs/ethrex.md` shows how to build an
 image with ethrex embedded.
 
 ## Verifying a release
@@ -218,8 +220,11 @@ The `ethlambda` formula in [lambdaclass/homebrew-tap](https://github.com/lambdac
 builds from the final tag's source tarball. Apple silicon gets a bottle instead,
 repackaged from the release's `ethlambda-macos-aarch64` binary, so it installs
 the same binary the release ships; every other platform builds from source.
-The formula builds without `include-ethrex`, so the bottle comes from that
-build too, never from `ethlambda-ethrex-macos-aarch64`. The
+That binary embeds ethrex, so the formula's source build must too: its
+`cargo install` has to pass `--features include-ethrex`, or the bottle and a
+source install are two different builds under one formula. The v1.0.0 formula
+builds without it, so the flag goes in before the first release with this
+naming. The bottle never comes from `ethlambda-minimal-macos-aarch64`. The
 bottle is attached to a tap release tagged `ethlambda-vX.Y.Z`, because the tap's
 bare `vX.Y.Z` tags are ethrex's.
 

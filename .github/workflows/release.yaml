@@ -288,17 +288,18 @@ jobs:
             name: linux-aarch64
           - runner: macos-latest
             name: macos-aarch64
-        # Every platform ships twice: ethlambda alone, and ethlambda with ethrex
-        # embedded as the beacon node's execution client (`include-ethrex`, see
-        # docs/ethrex.md). Both asset names start with `ethlambda-`, which is
-        # what github-release downloads, checksums and verifies by.
+        # Every platform ships twice: `ethlambda`, with ethrex embedded as the
+        # beacon node's execution client (`include-ethrex`, see docs/ethrex.md),
+        # and `ethlambda-minimal`, without it. Both asset names start with
+        # `ethlambda-`, which is what github-release downloads, checksums and
+        # verifies by.
         variant:
-          - name: default
-            asset: ethlambda
-            features: ""
           - name: ethrex
-            asset: ethlambda-ethrex
+            asset: ethlambda
             features: ethlambda/include-ethrex
+          - name: minimal
+            asset: ethlambda-minimal
+            features: ""
     runs-on: ${{ matrix.target.runner }}
     env:
       ASSET: ${{ matrix.variant.asset }}-${{ matrix.target.name }}
@@ -480,7 +481,7 @@ jobs:
 
           **Docker image:** \`$IMAGE\` (amd64 and arm64)
 
-          **Binaries:** attached below, with their \`SHA256SUMS\`, in two builds per platform. \`ethlambda-<platform>\` is ethlambda alone. \`ethlambda-ethrex-<platform>\` embeds [ethrex](https://github.com/lambdaclass/ethrex) as the beacon node's execution client, so \`ethlambda beacon\` needs no separate one; see [docs/ethrex.md](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/ethrex.md). The \`linux-x86_64\` builds target x86-64-v3, so they need a CPU with AVX2 (Haswell or later).
+          **Binaries:** attached below, with their \`SHA256SUMS\`, in two builds per platform. \`ethlambda-<platform>\` embeds [ethrex](https://github.com/lambdaclass/ethrex) as the beacon node's execution client, so \`ethlambda beacon\` needs no separate one; see [docs/ethrex.md](https://github.com/$GITHUB_REPOSITORY/blob/main/docs/ethrex.md). \`ethlambda-minimal-<platform>\` is ethlambda without ethrex, for running beside an external execution client. The \`linux-x86_64\` builds target x86-64-v3, so they need a CPU with AVX2 (Haswell or later).
 
           **Verifying:** the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
 

@@ -1212,9 +1212,12 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 - `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
   it plus the engine and binary with the feature on
 - Releases ship both builds per platform (`release.yaml`'s `build-binaries`
-  matrix): `ethlambda-<platform>` and `ethlambda-ethrex-<platform>`, the second
-  checked for the `--ethrex.*` flags before upload. Docker images and the
-  Homebrew bottle stay ethlambda-only
+  matrix): `ethlambda-<platform>` with ethrex embedded and
+  `ethlambda-minimal-<platform>` without, each checked for the `--ethrex.*`
+  flags (present or absent) before upload. Up to v1.0.0 `ethlambda-<platform>`
+  was the build without ethrex. Docker images are the minimal build; the
+  Homebrew bottle is `ethlambda-macos-aarch64`, so the tap formula must build
+  with `include-ethrex` too (`RELEASE.md`, step 6)
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
