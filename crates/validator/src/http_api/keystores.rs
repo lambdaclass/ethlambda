@@ -2903,15 +2903,21 @@ mod tests {
         holder.join().expect_err("the holder panics");
 
         // What `run` does from here: stop on the record, the keymanager last.
-        let stopped = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            crate::run_until_stopped(std::future::pending(), &protection, shutdown, Some(server)),
-        )
-        .await
-        .expect("the client stops");
+        let tasks = tokio_util::task::TaskTracker::new();
+        let stopping = crate::run_until_stopped(
+            std::future::pending(),
+            &protection,
+            std::future::pending(),
+            shutdown,
+            Some(server),
+            &tasks,
+        );
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), stopping)
+            .await
+            .expect("the client stops");
         assert!(
-            matches!(stopped, Error::SlashingProtectionUnusable { .. }),
-            "got {stopped}"
+            matches!(stopped, Err(Error::SlashingProtectionUnusable { .. })),
+            "got {stopped:?}"
         );
 
         // Checked before the answer is read: by the time the client is
