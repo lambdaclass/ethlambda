@@ -44,13 +44,21 @@ docker pull ghcr.io/lambdaclass/ethlambda:sha-12f8377   # pinned to a specific c
 
 ## Release binaries
 
-Every release candidate attaches these binaries, plus a `SHA256SUMS` file:
+Every release candidate attaches two builds for each platform, plus a
+`SHA256SUMS` file covering all of them. `ethlambda-<platform>` is ethlambda
+alone. `ethlambda-ethrex-<platform>` is built with the `include-ethrex` feature:
+`ethlambda beacon` without `--execution-endpoint` runs
+[ethrex](https://github.com/lambdaclass/ethrex) in its own process as its
+execution client (see [`docs/ethrex.md`](docs/ethrex.md)).
 
-| Asset | Platform |
-|-------|----------|
-| `ethlambda-linux-x86_64` | Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) |
-| `ethlambda-linux-aarch64` | Linux aarch64, glibc 2.35+ |
-| `ethlambda-macos-aarch64` | macOS on Apple silicon |
+| Platform | ethlambda | ethlambda with ethrex |
+|----------|-----------|-----------------------|
+| Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) | `ethlambda-linux-x86_64` | `ethlambda-ethrex-linux-x86_64` |
+| Linux aarch64, glibc 2.35+ | `ethlambda-linux-aarch64` | `ethlambda-ethrex-linux-aarch64` |
+| macOS on Apple silicon | `ethlambda-macos-aarch64` | `ethlambda-ethrex-macos-aarch64` |
+
+The Docker images are ethlambda alone. `docs/ethrex.md` shows how to build an
+image with ethrex embedded.
 
 ## Verifying a release
 
@@ -209,7 +217,9 @@ in this order, and drop the boxes that do not apply:
 The `ethlambda` formula in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap)
 builds from the final tag's source tarball. Apple silicon gets a bottle instead,
 repackaged from the release's `ethlambda-macos-aarch64` binary, so it installs
-the same binary the release ships; every other platform builds from source. The
+the same binary the release ships; every other platform builds from source.
+The formula builds without `include-ethrex`, so the bottle comes from that
+build too, never from `ethlambda-ethrex-macos-aarch64`. The
 bottle is attached to a tap release tagged `ethlambda-vX.Y.Z`, because the tap's
 bare `vX.Y.Z` tags are ethrex's.
 
