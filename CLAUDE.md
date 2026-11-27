@@ -10,7 +10,7 @@ Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (16 workspace crates)
+## Codebase Structure (17 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -45,8 +45,11 @@ crates/
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
+  execution/
+    └─ ethrex/              # [include-ethrex] ethrex in-process: bootstrap, --ethrex.* flags, eth_ server (docs/ethrex.md)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P, plus the shared sync-gate thresholds (`sync.rs`)
+    ├─ engine/              # Engine API client: JSON-RPC over HTTP, or typed in-process ethrex calls (include-ethrex)
     ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange, gloas envelopes)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
@@ -101,9 +104,11 @@ make test                                    # All tests + forkchoice spec tests
 
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
 jobs so they build and run in parallel (the split was first forced by an older
-runner's disk, which no longer binds). `CONSENSUS_CRATES` in the Makefile names
-the first; `test-node` is the workspace minus it. Run one half directly when
-iterating on it. `test-node` also runs the benchmark smoke test
+runner's disk, which no longer binds), plus `test-ethrex`, the embedded execution
+client's tests with the `include-ethrex` feature on (a third job).
+`CONSENSUS_CRATES` in the Makefile names the first half; `test-node` is the
+workspace minus it and `ETHREX_CRATES`. Run one part directly when iterating on
+it. `test-node` also runs the benchmark smoke test
 (`bin/ethlambda/tests/benchmark_smoke.rs`), which drives the built binary.
 
 ### Docs-only changes skip CI
@@ -833,7 +838,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   selects `BEACON_SPEC_PRESET` at startup), or `test-beacon-mainnet` /
   `test-beacon-minimal` for one. CI runs the two as a job each, so they run
   concurrently. `make test` covers the whole
-  workspace, in two halves, and still needs no fixture download: the
+  workspace, in two halves plus `test-ethrex`, and still needs no fixture download: the
   `beacon_spec_tests` target declares `required-features = ["beacon-spec-tests"]`
   so `cargo test` skips it, and the BLS and KZG fixture vectors, which are unit
   tests inside the module, are `#[cfg_attr(not(feature = ...), ignore)]` so they
@@ -1189,6 +1194,17 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 `cargo build --release`.
 
 ## Common Gotchas
+
+### Embedded ethrex (`include-ethrex`)
+- In a feature build, `ethlambda beacon` without `--execution-endpoint` starts ethrex
+  in-process; with the endpoint it uses HTTP as before. A feature build has no
+  "no execution client" mode. See [`docs/ethrex.md`](docs/ethrex.md)
+- One ethrex tag for the whole workspace (`[workspace.dependencies]`), shared with
+  p2p's discovery. Bumping it means re-diffing ethrex's `init_l1`/`init_rpc_api`/
+  `init_network`/`server_shutdown` against `crates/execution/ethrex/src/lib.rs`,
+  which repeats them
+- `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
+  it plus the engine and binary with the feature on
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks

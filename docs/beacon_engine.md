@@ -522,11 +522,17 @@ authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express "both or neither" across two
 optional flags, so the pairing is checked once, in `From<BeaconOptions>`.
 
-Blob fetching has no flag of its own: it is on whenever `--execution-endpoint` is set.
+Blob fetching has no flag of its own: it is on whenever the node has an
+execution client.
 
-With **neither** flag, the follower contacts no execution client and every block
-gets `PayloadValidity::NotRequired`, which is exactly what it did before any of
-this existed.
+With **neither** flag, a build with the `include-ethrex` feature starts the
+ethrex it embeds and uses it as its execution client, configured by the
+`--ethrex.*` flags; every call above then goes to ethrex's own handlers in
+process instead of over HTTP, with the same timeouts and the same retries
+after a timeout (see [Embedded ethrex](./ethrex.md)). In any other build the
+follower contacts no execution client and every block gets
+`PayloadValidity::NotRequired`, which is exactly what it did before any of this
+existed.
 
 Authentication is HMAC-SHA256 over a JOSE header and a claim set whose only
 member is `iat`. Execution clients accept about a minute of skew either way; a
