@@ -859,9 +859,18 @@ impl SigningContext {
 
     /// Remember `proof`, the combined selection proof a distributed
     /// validator middleware returned for `pubkey` at `slot`, in place of
-    /// whatever was held. Ignored with distributed mode off, where the
-    /// memory holds this client's own proofs and nothing else may replace
-    /// them.
+    /// whatever was held, and answer whether it was kept. Ignored with
+    /// distributed mode off, where the memory holds this client's own proofs
+    /// and nothing else may replace them.
+    ///
+    /// `generation` is [`Self::schedule_generation`] as read before the
+    /// partial proofs it was combined from were signed. Once a swap has moved
+    /// it since, the proof is dropped: it may be over the old schedule's
+    /// domain, which [`Self::replace_config`] already forgot the proofs of,
+    /// so it must neither come back nor replace one a later exchange got
+    /// under the new schedule. Checked with the memory's lock held, the lock
+    /// the swap moves the generation under, so no swap can land between the
+    /// check and the insert.
     ///
     /// Not verified: it is a signature under the validator's key, which
     /// this client never learns (it holds a share, and the middleware
@@ -869,19 +878,21 @@ impl SigningContext {
     /// aggregate every node refuses, nothing slashable.
     pub fn remember_combined_selection_proof(
         &self,
+        generation: u64,
         pubkey: BlsPubkey,
         slot: Slot,
         proof: BlsSignature,
-    ) {
-        if self.distributed {
-            self.remember_selection_proof(pubkey, slot, proof);
+    ) -> bool {
+        if !self.distributed {
+            return false;
         }
-    }
-
-    fn remember_selection_proof(&self, pubkey: BlsPubkey, slot: Slot, proof: BlsSignature) {
         let mut proofs = self.selection_proofs();
+        if self.schedule_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
         proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
         proofs.insert((pubkey, slot), proof);
+        true
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of
@@ -1131,7 +1142,9 @@ impl SigningContext {
     /// Remember `proof`, the combined sync committee selection proof a
     /// distributed validator middleware returned. Ignored with distributed
     /// mode off, and not verified, as
-    /// [`Self::remember_combined_selection_proof`] says.
+    /// [`Self::remember_combined_selection_proof`] says. Unlike that one it
+    /// takes no schedule generation: a sync exchange is for the slot being
+    /// served, and a swap moves only forks still ahead, so never its domain.
     pub fn remember_combined_sync_selection_proof(
         &self,
         pubkey: BlsPubkey,
@@ -1322,6 +1335,32 @@ mod tests {
         assert_eq!(context.config().attestation_due_bps_gloas, 2_000);
         assert_eq!(context.selection_proofs().len(), 1);
         assert_eq!(context.schedule_generation(), generation);
+    }
+
+    /// A combined proof answered for partials signed before a swap that
+    /// moved a fork is dropped, so an exchange still in flight at the swap
+    /// can neither put back what it cleared nor replace a proof a later
+    /// exchange got under the new schedule.
+    #[test]
+    fn a_combined_proof_from_before_a_swap_is_not_kept() {
+        let context = context().with_distributed();
+        let (pubkey, slot) = (BlsPubkey([1; 48]), 5);
+        let before = context.schedule_generation();
+
+        context.replace_config(Config::mainnet().with_fork_version(ForkName::Phase0, [9, 9, 9, 9]));
+        let after = context.schedule_generation();
+        assert_ne!(before, after);
+        let newer = BlsSignature([3; 96]);
+        assert!(context.remember_combined_selection_proof(after, pubkey, slot, newer));
+
+        let stale = BlsSignature([2; 96]);
+        assert!(!context.remember_combined_selection_proof(before, pubkey, slot, stale));
+        assert_eq!(
+            context.selection_proofs().get(&(pubkey, slot)),
+            Some(&newer),
+            "the proof under the new schedule stays"
+        );
+        assert!(context.holds_combined_selection_proof(&pubkey, slot));
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {
