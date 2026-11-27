@@ -120,7 +120,7 @@ from a normal build.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | How many custody groups this node custodies, advertised as the ENR's `cgc` |
+| `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | The fewest custody groups this node custodies, advertised as the ENR's `cgc` and `MetaData`'s `custody_group_count`. Validator custody can raise it (see below) |
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
@@ -147,8 +147,34 @@ lookup finds a custodian at all.
 
 Changing it changes which columns this node custodies, since the custody set is
 a function of the node id *and* the count. Sidecars already on disk belong to
-the old set: nothing is corrupted, but the node advertises a set it has not
-finished filling until it backfills the difference.
+the old set: nothing is corrupted, and nothing backfills the difference, so a
+start with more groups than the data directory held records the slot after the
+highest block it holds (the head's or a side branch's) and reports it in
+`Status` as `earliest_available_slot` (peers do not ask it for older columns of
+the new groups). The record is written only once the start is past its last
+fallible step, just before the chain actor spawns, so a start that fails
+earlier leaves it as it was.
+
+**Validator custody.** Fulu `validator.md` has a node with validators attached
+custody one group per 32 ETH of their total effective balance, at least 8 and
+at most 128, and keep the highest count it has reached. The node learns its
+validators from the indices a validator client names to
+`beacon_committee_subscriptions` and `prepare_beacon_proposer`, and forgets a
+validator not named again for two epochs. Once an epoch it computes their
+requirement off the latest finalized state, as the specification says (not the
+head's, since the record never falls and a branch that is later reorged out
+must not raise it), and records the highest one in the data directory. The count a start runs with is the larger of this flag and that
+record, so the flag is the operator's own floor: raising it, or lowering it to
+no less than the record, takes effect at the next start.
+
+A running node changes only what it *advertises*, and only within what it
+already holds: `MetaData`'s `custody_group_count` rises (under a new sequence
+number) as far as the startup count's sampling size, which at the default is
+the 8 groups one attached validator requires. A requirement past that is
+recorded and logged as a warning, and the next start custodies and advertises
+it. The ENR's `cgc` keeps its startup value until a restart, the same
+limitation as the fork digest's `eth2` entry (ethrex's `DiscoveryServer`
+cannot replace the record it serves).
 
 With neither execution flag, the follower contacts no execution client and
 imports blocks without validating their payloads, which is what it did before
@@ -321,10 +347,10 @@ not chain-specific, branches once, and shares the shutdown:
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
 | resolve `--node-key`, else load `<data-dir>/node.key`, generating it on first start (after the open, so RocksDB's lock covers the write) | shared | shared |
-| **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | `beacon::wire_params` (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend |
+| **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | checkpoint sync or resume onto the same backend, then `beacon::startup_custody` (the custody count, from the flag and the directory's recorded validator custody), then `beacon::wire_params` (genesis metadata, epoch, fork digest, custody columns) |
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
-| spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
+| spawn the chain actor and wire it to P2P | yes | yes: record this start's custody set in the data directory (`StartupCustody::record`), then `BlockChain::spawn_beacon` |
 | ctrl-c or SIGTERM, stop and join the actors | shared | shared |
 
 `ChainSetup` is what the `match` produces: the wire configuration, the ENR
