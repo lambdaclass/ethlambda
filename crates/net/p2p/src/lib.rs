@@ -3066,14 +3066,10 @@ async fn handle_behaviour_event(
             )
             .await;
         }
-        // A peer joined a proposer_preferences topic: preferences whose
-        // publish found no peer on theirs go out now. This is how a publish
-        // waits for a peer (see `publish_owed_proposer_preferences`).
-        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Subscribed { topic, .. })
-            if beacon::topics::topic_kind(topic.as_str())
-                == Some(beacon::topics::PROPOSER_PREFERENCES) =>
-        {
-            return beacon::builder_market::publish_owed_proposer_preferences(server).await;
+        // A peer joined a topic: proposer preferences whose publish found no
+        // peer on it go out now. This is how a publish waits for a peer.
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Subscribed { topic, .. }) => {
+            return beacon::builder_market::on_peer_subscribed(server, topic.as_str()).await;
         }
         BehaviourEvent::Gossipsub(_) => return,
         BehaviourEvent::ReqResp(event) => match event {

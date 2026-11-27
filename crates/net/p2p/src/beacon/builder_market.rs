@@ -199,15 +199,43 @@ pub(crate) async fn publish_proposer_preferences(
     gossip_proposer_preferences(server, preferences).await;
 }
 
-/// Gossip every preference the market still owes a publish whose slot has not
-/// started. Runs whenever a peer joins a `proposer_preferences` topic, which
-/// is how a publish waits for a peer, as Prysm's does, and at every fork-digest
-/// switch.
+/// A peer subscribed to `topic`. If it is the `proposer_preferences` topic of
+/// a digest this node holds, gossip on it every preference still owed a
+/// publish whose slot falls under that digest and has not started. Gossipsub
+/// counts the peer on the topic before it reports the subscription, so they
+/// go out. This is how a publish waits for a peer, as Prysm's does.
 ///
 /// In the epoch before a fork this node joins the new digest's topics at the
 /// same moment as every peer that joins an epoch ahead, and the validator
 /// client sends that epoch's preferences right then, so the first publish can
 /// find no peer yet. It is owed, and goes out once the first peer joins.
+///
+/// Only that topic's own preferences are tried, and only under a held digest:
+/// a peer subscribing to another topic, or to a digest nobody here speaks,
+/// costs a string check and never a publish. One subscribing to the real
+/// topic is handed what is owed there, which clears it.
+pub(crate) async fn on_peer_subscribed(server: &mut P2PServer, topic: &str) {
+    if beacon_topics::topic_kind(topic) != Some(beacon_topics::PROPOSER_PREFERENCES) {
+        return;
+    }
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let Some(digest) = beacon_topics::topic_digest(topic).filter(|&d| wire.holds_digest(d)) else {
+        return;
+    };
+    let wall_slot = wire.wall_slot();
+    let owed: Vec<_> = server
+        .builder_market
+        .preferences_owed_a_publish(wall_slot)
+        .into_iter()
+        .filter(|preferences| wire.digest_for_slot(preferences.message.proposal_slot) == digest)
+        .collect();
+    gossip_owed_proposer_preferences(server, wall_slot, owed).await;
+}
+
+/// Gossip every preference the market still owes a publish whose slot has not
+/// started. Runs at every fork-digest switch.
 ///
 /// A publish that found no peer subscribed left no trace in gossipsub's
 /// duplicate cache, so its retry goes out. One that reached a peer is owed
@@ -224,6 +252,14 @@ pub(crate) async fn publish_owed_proposer_preferences(server: &mut P2PServer) {
     };
     let wall_slot = wire.wall_slot();
     let owed = server.builder_market.preferences_owed_a_publish(wall_slot);
+    gossip_owed_proposer_preferences(server, wall_slot, owed).await;
+}
+
+async fn gossip_owed_proposer_preferences(
+    server: &mut P2PServer,
+    wall_slot: Slot,
+    owed: Vec<SignedProposerPreferences>,
+) {
     if owed.is_empty() {
         return;
     }
@@ -683,8 +719,8 @@ mod tests {
     /// At the start of the epoch before gloas this node joins the gloas topics
     /// at the same moment as every peer that joins an epoch ahead, so a gloas
     /// slot's preferences can find no peer yet: they are reported to the chain
-    /// actor and owed. Once a peer joins the topic, they go out on the gloas
-    /// digest's topic and are owed nothing more.
+    /// actor and owed. A peer joining some other topic changes nothing; once
+    /// one joins theirs, they go out on it and are owed nothing more.
     #[tokio::test]
     async fn preferences_no_peer_took_go_out_on_their_digest_once_a_peer_joins() {
         let boundary = GLOAS * slots_per_epoch();
@@ -694,10 +730,13 @@ mod tests {
         server.blockchain = Some(chain.clone());
         let wire = server.wire.beacon().expect("a beacon wire");
         assert_eq!(wire.wall_slot(), window_opens);
-        let gloas_topic = beacon_topics::topic_name(
-            wire.schedule.digest_at(GLOAS),
-            beacon_topics::PROPOSER_PREFERENCES,
-        );
+        let gloas_digest = wire.schedule.digest_at(GLOAS);
+        let kind = beacon_topics::PROPOSER_PREFERENCES;
+        let gloas_topic = beacon_topics::topic_name(gloas_digest, kind);
+        let bid_topic =
+            beacon_topics::topic_name(gloas_digest, beacon_topics::EXECUTION_PAYLOAD_BID);
+        let fulu_topic = beacon_topics::topic_name(wire.schedule.digest_at(GLOAS - 1), kind);
+        let made_up_topic = beacon_topics::topic_name([0xde, 0xad, 0xbe, 0xef], kind);
         let mut commands = capture_commands(&mut server);
         let preferences = preferences_at(boundary + 3);
         assert!(
@@ -717,11 +756,25 @@ mod tests {
         assert!(server.builder_market.preferences_publish_owed(&preferences));
         assert_eq!(*chain.preference_slots.lock().unwrap(), vec![boundary + 3]);
 
-        // What the P2P actor runs when a peer joins a proposer_preferences topic.
+        // A subscription to another topic publishes nothing: another kind on
+        // the gloas digest, the fulu digest's preferences topic (held, but not
+        // this preference's), or a digest this node does not hold.
+        for topic in [&bid_topic, &fulu_topic, &made_up_topic] {
+            let published = answering_with_topics(
+                &mut commands,
+                PublishOutcome::Published,
+                on_peer_subscribed(&mut server, topic),
+            )
+            .await;
+            assert!(published.is_empty(), "nothing goes out for {topic}");
+        }
+        assert!(server.builder_market.preferences_publish_owed(&preferences));
+
+        // A peer joins the gloas preferences topic: what is owed there goes out.
         let published = answering_with_topics(
             &mut commands,
             PublishOutcome::Published,
-            publish_owed_proposer_preferences(&mut server),
+            on_peer_subscribed(&mut server, &gloas_topic),
         )
         .await;
         assert_eq!(published, vec![(gloas_topic, preferences.to_ssz())]);

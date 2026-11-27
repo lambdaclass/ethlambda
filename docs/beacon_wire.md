@@ -123,8 +123,9 @@ whether it is still owed a publish (`BuilderMarket::record_preferences_publish`)
 after a publish no peer was handed. One still owed is published again while
 its slot is ahead (`publish_owed_proposer_preferences`):
 
-- when a peer joins a `proposer_preferences` topic (gossipsub's `Subscribed`
-  event, which comes once the peer is counted on the topic);
+- when a peer joins its topic (gossipsub's `Subscribed` event, which comes
+  once the peer is counted on the topic; `on_peer_subscribed`). A subscription
+  to any other topic, or to a digest this node does not hold, sends nothing;
 - at every fork-digest switch. The new digest's first slot has started by
   then, so its preference is past helping and is left out.
 
