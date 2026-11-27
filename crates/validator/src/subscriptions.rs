@@ -79,10 +79,11 @@ pub async fn subscribe<B: BeaconNodeApi>(
     // are remembered for the aggregation tick (see
     // `SigningContext::sign_selection_proof`). With distributed mode on,
     // nothing is signed here: the role comes from the middleware's combined
-    // proofs, which `crate::distributed` fetched before sending these, and a
-    // duty with none subscribes without it. The duty loop runs this from a
-    // task of its own, after the slot's block, so that budget is never spent
-    // ahead of a proposal, or of any other duty.
+    // proofs held so far, and a duty with none subscribes without it, to be
+    // sent again with the role once `crate::distributed` has a proof that
+    // selects it. The duty loop runs this from a task of its own, after the
+    // slot's block, so that budget is never spent ahead of a proposal, or of
+    // any other duty.
     let mut is_aggregator = vec![false; duties.len()];
     let mut keyed = Vec::with_capacity(duties.len());
     for (position, duty) in duties.iter().enumerate() {

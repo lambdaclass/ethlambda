@@ -1909,11 +1909,11 @@ fn send_owed<B: BeaconNodeApi + 'static>(
 /// schedule was swapped. See [`send_owed`] for why nothing waits on it.
 ///
 /// In distributed mode, the epoch's selection round for the duties from
-/// `slot` on instead: the middleware's combined proofs are asked for first,
-/// and the subscriptions follow them (see
-/// [`distributed::Distributed::spawn_round`]). `slot` is the first slot
-/// whose duties are still to be served, so a caller that runs after the
-/// slot's duties passes the next one.
+/// `slot` on instead: the subscriptions go out, the middleware's combined
+/// proofs are asked for, and those they select are subscribed again with
+/// the role (see [`distributed::Distributed::spawn_round`]). `slot` is the
+/// first slot whose duties are still to be served, so a caller that runs
+/// after the slot's duties passes the next one.
 fn spawn_subscriptions<B: BeaconNodeApi + 'static>(
     slot: u64,
     epoch: u64,

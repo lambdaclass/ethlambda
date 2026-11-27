@@ -881,8 +881,12 @@ the combined proofs and decides on those:
   the partial proof of every attester duty whose slot has not passed to
   `POST /eth/v1/validator/beacon_committee_selections`, the current epoch's
   and then the next epoch's in separate requests, as the Beacon API asks.
-  Each epoch's subscriptions follow its answer. The aggregation tick acts on
-  the same combined proofs and publishes them in the `AggregateAndProof`.
+  Each epoch's subscriptions go out ahead of its request, since they are what
+  puts the beacon node on the subnets and Charon may hold a request for as
+  long as its timeout: with the aggregator role where a combined proof is
+  already held, and sent again with it for the duties the answer then
+  selects. The aggregation tick acts on the same combined proofs and
+  publishes them in the `AggregateAndProof`.
 - At the start of each slot it sends the partial proof of every sync
   committee subnet its validators sit in to
   `POST /eth/v1/validator/sync_committee_selections`, one request per

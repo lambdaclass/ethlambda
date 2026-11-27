@@ -643,8 +643,9 @@ impl MockBeaconNode {
         self
     }
 
-    /// Make the first call to `what` (`attestation_data`, `head_block_root`
-    /// or `payload_attestation_data`) take `delay` before it answers, and
+    /// Make the first call to `what` (`attestation_data`, `head_block_root`,
+    /// `payload_attestation_data` or `subscribe_committees`) take `delay`
+    /// before it answers, and
     /// every later one answer at once: an early request still out at a
     /// duty's deadline, then the deadline's own request.
     pub fn with_first_call_delay(self, what: &'static str, delay: std::time::Duration) -> Self {
@@ -1664,6 +1665,7 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()> {
+        self.delay_first_call("subscribe_committees").await;
         self.guard("subscribe_committees")?;
         self.subscriptions
             .lock()
