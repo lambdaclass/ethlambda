@@ -1942,9 +1942,7 @@ impl ColumnReport {
         };
         verdicts
             .iter()
-            .filter(|(column, verdict)| {
-                *verdict == ColumnVerdict::Delivered && self.request.columns.contains(column)
-            })
+            .filter(|(column, verdict)| verdict.is_here() && self.request.columns.contains(column))
             .map(|(column, _)| *column)
             .collect()
     }
@@ -1968,9 +1966,7 @@ impl ColumnReport {
         let ColumnReply::Answered(verdicts) = &self.reply else {
             return false;
         };
-        verdicts
-            .iter()
-            .any(|(_, verdict)| *verdict == ColumnVerdict::Rejected)
+        verdicts.iter().any(|(_, verdict)| verdict.is_rejected())
     }
 }
 
@@ -3601,6 +3597,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::ConnectionDirection;
     use ethlambda_network_api::sync::SyncThresholds;
+    use ethlambda_state_transition::beacon::gossip::{
+        IgnoreReason as GossipIgnoreReason, Outcome as GossipOutcome,
+        RejectReason as GossipRejectReason,
+    };
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
@@ -3685,6 +3685,7 @@ pub(crate) mod tests {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -3710,6 +3711,7 @@ pub(crate) mod tests {
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            deferred_columns: Default::default(),
             seen_envelopes: ethlambda_state_transition::beacon::gossip::SeenEnvelopes::new(
                 crate::SEEN_ENVELOPES_CAPACITY,
             ),
@@ -4210,7 +4212,10 @@ pub(crate) mod tests {
         );
 
         // An invalid sidecar still writes its sender off for this root.
-        late.reply = ColumnReply::Answered(vec![(1, ColumnVerdict::Rejected)]);
+        late.reply = ColumnReply::Answered(vec![(
+            1,
+            ColumnVerdict::Dropped(GossipOutcome::Reject(GossipRejectReason::Kzg)),
+        )]);
         settle_column_report(&mut pending, &late);
         assert_eq!(pending.failed_peers, HashSet::from([old_peer]));
         assert_eq!(pending.asked.len(), 2);
@@ -4230,7 +4235,13 @@ pub(crate) mod tests {
         let custodian = PeerId::random();
         let mut pending = column_lookup(vec![1, 2], &[(1, custodian), (2, custodian)]);
 
-        let verdicts = vec![(1, ColumnVerdict::Delivered), (2, ColumnVerdict::Rejected)];
+        let verdicts = vec![
+            (1, ColumnVerdict::Delivered),
+            (
+                2,
+                ColumnVerdict::Dropped(GossipOutcome::Reject(GossipRejectReason::Kzg)),
+            ),
+        ];
         let answer = column_report(custodian, &[1, 2], ColumnReply::Answered(verdicts));
         assert_eq!(
             settle_column_report(&mut pending, &answer),
@@ -4248,7 +4259,7 @@ pub(crate) mod tests {
         let peer = PeerId::random();
         let mut pending = column_lookup(vec![1], &[(1, peer)]);
 
-        let verdicts = vec![(1, ColumnVerdict::Undecided)];
+        let verdicts = vec![(1, ColumnVerdict::Unjudged)];
         let answer = column_report(peer, &[1], ColumnReply::Answered(verdicts));
         assert!(matches!(
             settle_column_report(&mut pending, &answer),
@@ -4608,10 +4619,10 @@ pub(crate) mod tests {
         );
 
         let report = checked.recv().await.expect("the checks report back");
-        assert_eq!(
-            report.reply,
-            ColumnReply::Answered(vec![(1, ColumnVerdict::Delivered)])
-        );
+        // Already stored, which the lookup counts as here.
+        let stored =
+            ColumnVerdict::Dropped(GossipOutcome::Ignore(GossipIgnoreReason::AlreadyStored));
+        assert_eq!(report.reply, ColumnReply::Answered(vec![(1, stored)]));
         assert_eq!(
             report_column_request(&mut server, &report),
             Some(ColumnAttemptOutcome::Complete)

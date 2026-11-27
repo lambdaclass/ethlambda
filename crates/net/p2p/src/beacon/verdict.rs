@@ -11,7 +11,10 @@
 //! [`P2PServer::sync_validation_permits`]. Either way
 //! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
-//! until then.
+//! until then. A gloas data column sidecar judged `Queue` is reported later
+//! than the rest, once its deferred validation decides, or when gossipsub's
+//! message cache would have dropped it anyway; see
+//! [`crate::beacon::deferred_columns`].
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -43,12 +46,13 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler, send_after};
 use tracing::{debug, error, warn};
 
-use crate::beacon::column_checks;
 use crate::beacon::parked_votes::{PARKED_VOTE_SWEEP_INTERVAL, ParkedVote, Parking};
+use crate::beacon::{column_checks, deferred_columns};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics, p2p_protocol};
 
 /// Which gossip message a verdict is for.
+#[derive(Debug)]
 pub(crate) struct GossipId {
     pub(crate) message_id: MessageId,
     pub(crate) propagation_source: PeerId,
@@ -191,6 +195,16 @@ impl Validated {
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
             }
+        }
+    }
+
+    /// The block an attestation or aggregate votes for. `None` for every
+    /// other object.
+    fn voted_block_root(&self) -> Option<Root> {
+        match self {
+            Self::Aggregate { aggregate, .. } => Some(aggregate.data().beacon_block_root),
+            Self::Attestation { attestation, .. } => Some(attestation.data.beacon_block_root),
+            _ => None,
         }
     }
 
@@ -687,10 +701,42 @@ pub(crate) fn settle_message(
 
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, ctx: &Context<Self>) {
+        // A queued gloas column's verdict waits for its deferred validation,
+        // so gossipsub can still relay it. Taken ahead of `receive_verdict`:
+        // a column is never parked, and settling leaves a `Queue` as it is.
+        let msg = match msg {
+            GossipVerdict {
+                id,
+                outcome: outcome @ Outcome::Queue(_),
+                object: Validated::Column(sidecar),
+                check,
+            } if matches!(*sidecar, DataColumnSidecar::Gloas(_)) => {
+                match deferred_columns::defer(self, ctx, id, outcome, sidecar) {
+                    None => return,
+                    Some((id, sidecar)) => GossipVerdict {
+                        id,
+                        outcome,
+                        object: Validated::Column(sidecar),
+                        check,
+                    },
+                }
+            }
+            msg => msg,
+        };
+        // Taken before `receive_verdict` consumes the object. Settling leaves
+        // an `Ignore` as it is, and a vote ignored for its payload is never
+        // parked, so its verdict is reported before the fetch below.
+        let unverified_payload = (msg.outcome
+            == Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen))
+        .then(|| msg.object.voted_block_root())
+        .flatten();
         match receive_verdict(self, msg) {
             AfterVerdict::Done => {}
             AfterVerdict::ScheduleSweep => schedule_parked_vote_sweep(ctx),
             AfterVerdict::Recheck(vote) => spawn_rechecks(self, ctx, vec![*vote]),
+        }
+        if let Some(block_root) = unverified_payload {
+            crate::req_resp::fetch_envelope_for_payload_vote(self, block_root).await;
         }
     }
 }

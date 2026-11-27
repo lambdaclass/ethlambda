@@ -108,7 +108,7 @@ a bid burst cannot starve blocks, columns or attestations. Whatever is accepted
 goes into the node's one shared `BuilderMarket`, which the Beacon API and block
 production read. Neither is ever queued: a message whose parent or dependent
 block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
-(`Reject(Malformed)` above that). The node publishes both: a bid on the digest of
+(see the EIP-7688 bounds below). The node publishes both: a bid on the digest of
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
@@ -267,13 +267,29 @@ but its own progressive `Attestation`, so it decodes to its own
 attestation is electra's `SingleAttestation` unchanged. In both, `data.index` is
 the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
 the block's envelope has been seen and its payload validated
-(`verify_attestation_payload_status`). Gloas is a followed fork, so a block at
+(`verify_attestation_payload_status`). Such a vote also asks a peer for the
+envelope by root, as the specification says a node SHOULD, at most once a slot
+per block (`PayloadVoteFetches`, `req_resp/envelope_client.rs`): every member of
+a committee casts one, and an envelope that arrived may still wait on its
+columns or the execution client. The vote itself is not queued (a MAY). Gloas is a followed fork, so a block at
 a gloas slot that fails to decode is REJECTed like one at any other followed
 fork; `unsupported_fork` is kept for a fork the node does not follow
 (`ForkName::is_followed`), none today. A gloas aggregate's aggregation bits are
 an unbounded progressive bitlist, so one longer than electra's type bound is
 REJECTed first, reading its length without expanding it, since expanding is
 what the seen-set check does before any other.
+
+EIP-7688 makes the lists of four gloas messages progressive, which have no SSZ
+limit, so `gloas/p2p-interface.md` gives their byte bounds as numbers instead:
+`MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE`, `MAX_ATTESTER_SLASHING_SIZE` and
+`MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE` (preset values, each the largest
+encoding of the bounded type it replaces) and
+`compute_max_data_column_sidecar_size` (the largest blob count in the schedule).
+On a gloas digest's topic, a payload whose snappy header declares more bytes
+than its bound is REJECTed (`oversized`) before it is decompressed
+(`p2p/src/beacon/size_bounds.rs`). A gloas sidecar in a by-root or by-range
+answer is held to the same column bound, after its chunk is read and before it
+is decoded; a chunk over it ends the stream.
 
 Three deliberate departures from the gloas gossip rules, each for want of state
 this node does not keep. Where the specification rejects a message whose block
@@ -286,6 +302,29 @@ verifies every envelope itself, without being propagated. And a
 `payload_attestation_message` is applied to fork choice after p2p verified its
 signature, with the actor re-checking only the store-state conditions (known
 block, current slot, committee seat).
+
+A gloas `data_column_sidecar` whose block has not been seen, or has no
+post-state yet, is queued like any other, but its gossip verdict is held rather
+than reported as `Ignore` at once (`p2p/src/beacon/deferred_columns.rs`). The
+specification says a sidecar that passes this deferred validation MUST be
+re-broadcast, and one that fails MUST cost its forwarding peers. Gossipsub
+relays a message on a late `Accept`; publishing again would not work, since the
+duplicate cache refuses a publish of bytes already received, and an `Ignore`
+reported at once drops the message from gossipsub's cache. So the sidecar goes
+through the chain checks as before (parked by the chain actor and rechecked
+once its block imports), and the held verdict is reported when they decide:
+`Accept` when the sidecar was handed to the chain actor, subject to the seen
+cache like any accept; `Reject` or `Ignore` as the checks dropped it (an already
+stored column is `Ignore`d, since storing says nothing of this copy, unless this
+node published the same bytes from its execution client's blobs). One verdict
+is held per block and column, at most 512 at once. A late `Reject` charges no
+one yet: gossipsub's invalid-message penalty counts only on topics with score
+parameters, and column topics have none (see [Peer scoring](#peer-scoring)).
+Gossipsub is sure to hold a message for five 700 ms heartbeats (3.5 s), so a
+verdict still held then is reported with its `Queue`: a block that arrives
+later than that still gets the column stored, but the node does not relay it
+(see [spec_deviations.md](./spec_deviations.md)). Fulu sidecars are unchanged:
+the fulu specification asks for neither.
 
 `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 `bls_to_execution_change` are validated in p2p like aggregates, by

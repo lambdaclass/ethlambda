@@ -16,6 +16,7 @@
 pub mod builder_market;
 pub mod column_checks;
 pub mod decode;
+pub mod deferred_columns;
 pub mod encoding;
 pub mod engine_columns;
 pub mod envelope_checks;
@@ -25,6 +26,7 @@ pub mod messages;
 pub mod parked_votes;
 pub mod protocols;
 pub mod scoring;
+pub mod size_bounds;
 pub mod subnets;
 pub mod swarm;
 pub mod sync_committee;

@@ -59,12 +59,13 @@ use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
+use ethlambda_types::beacon::primitives::KzgCommitment;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::beacon_engine;
 use crate::import_timing::ImportTimings;
 use crate::{BlockChainServer, custody_columns_present, metrics};
+use crate::{beacon_blobs, beacon_engine};
 
 /// How many envelopes for blocks this node has not imported may be held for one
 /// slot.
@@ -429,7 +430,12 @@ impl BlockChainServer {
         if let Some(missing) =
             missing_columns_for_envelope(commitment_count, &self.custody_columns, &present)
         {
+            let first_hold = !self.envelopes.awaiting_columns.contains_key(&root);
+            let commitments = bid.blob_kzg_commitments.to_vec();
             self.hold_envelope_awaiting_columns(root, slot, held, missing);
+            if first_hold && self.envelopes.awaiting_columns.contains_key(&root) {
+                self.ask_execution_client_for_columns(root, slot, commitments);
+            }
             return false;
         }
 
@@ -772,6 +778,42 @@ impl BlockChainServer {
             self.request_missing_columns(root, missing);
         }
         self.publish_envelope_queues();
+    }
+
+    /// Ask the execution client for the blobs of `root`'s bid
+    /// (`commitments`), once, when its envelope is first held for columns:
+    /// fulu's "query `engine_getBlobsV2` as soon as [a node receives] a valid
+    /// `beacon_block`", which gloas keeps. Only for a block at most
+    /// [`beacon_blobs::MAX_ASK_AGE_SLOTS`] behind the clock and within the ask
+    /// budget, as a held fulu block is asked about (see [`beacon_blobs`]). A
+    /// hit hands the sampled columns to p2p, which records, publishes and
+    /// forwards them like gossip's, and their storing settles the envelope.
+    fn ask_execution_client_for_columns(
+        &mut self,
+        root: H256,
+        slot: u64,
+        commitments: Vec<KzgCommitment>,
+    ) {
+        let (Some(engine), Some(p2p)) = (&self.engine, &self.p2p) else {
+            return;
+        };
+        let current_slot = fork_choice::get_current_slot(&self.store, &self.store.config());
+        if !beacon_blobs::recent_enough_to_ask(slot, current_slot) {
+            return;
+        }
+        let Some(permit) = self.blob_asks.admit(slot, current_slot) else {
+            return;
+        };
+        beacon_blobs::spawn_gloas_fetch(
+            engine.clone(),
+            p2p.clone(),
+            self.store.clone(),
+            commitments,
+            slot,
+            root,
+            self.custody_columns.clone(),
+            permit,
+        );
     }
 
     /// Queue `root`'s envelope for a look in [`Self::settle_envelopes`], if one

@@ -52,6 +52,7 @@ use super::messages::{
     StatusV1, StatusV2,
 };
 use super::protocols::{self, MAX_REQUEST_BLOCKS_DENEB};
+use super::size_bounds;
 use crate::req_resp::codec::write_success_chunk;
 use crate::req_resp::encoding::{ChunkLimits, MAX_PAYLOAD_SIZE, invalid, read_chunked_response};
 use crate::req_resp::messages::BlocksByRangeRequest;
@@ -305,6 +306,7 @@ where
         max_chunks: protocols::max_request_data_column_sidecars() as usize,
     };
     let schedule = ForkSchedule::new(config, genesis_validators_root);
+    let gloas_bound = size_bounds::max_data_column_sidecar_size(config);
     read_chunked_response(io, protocol_label, limits, |context, payload| {
         let Some(fork) = <[u8; 4]>::try_from(context)
             .ok()
@@ -315,6 +317,16 @@ where
                 hex::encode(context),
             )));
         };
+        // A gloas sidecar's lists are progressive, so its decoder enforces no
+        // bound: EIP-7688's is checked here instead. After the chunk is read
+        // rather than from its length prefix, which `MAX_PAYLOAD_SIZE` already
+        // bounds, so what this saves is the decode.
+        if fork >= ForkName::Gloas && fork != ForkName::Lean && payload.len() > gloas_bound {
+            return Err(invalid(format!(
+                "data column sidecar chunk of {} bytes exceeds gloas's bound of {gloas_bound}",
+                payload.len(),
+            )));
+        }
         let sidecar = decode::decode_data_column_sidecar(fork, payload)
             .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
         let slot = sidecar.slot();

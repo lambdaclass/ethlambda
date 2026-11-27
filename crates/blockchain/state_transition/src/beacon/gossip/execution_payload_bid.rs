@@ -48,8 +48,9 @@ use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot};
 use crate::beacon::stf;
 use crate::beacon::stf::gloas::verify_execution_payload_bid_signature;
 
-/// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`.
-pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
+/// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`,
+/// re-exported here beside the rules that read it.
+pub use crate::beacon::preset::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE;
 
 /// The specification's `ETH_TO_GWEI`.
 const ETH_TO_GWEI: u64 = 1_000_000_000;

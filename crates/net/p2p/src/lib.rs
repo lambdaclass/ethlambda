@@ -1251,6 +1251,16 @@ const MAX_PUBLISH_MESSAGES_PER_RPC: usize = 1000;
 /// what was asked for.
 const MAX_IWANT_IDS_PER_HEARTBEAT: usize = 500;
 
+/// How long gossipsub is sure to hold a received message waiting for its
+/// verdict. A message enters the message cache's newest window and leaves
+/// when that window shifts out, `history_length` heartbeats after the first
+/// heartbeat that follows its arrival: between five and six heartbeats later,
+/// so five is what every message gets. A verdict reported after gossipsub
+/// dropped the message forwards nothing and penalizes nobody, and is counted
+/// as expired.
+pub(crate) const MESSAGE_CACHE_WINDOW: Duration =
+    GOSSIPSUB_HEARTBEAT.saturating_mul(GOSSIPSUB_HISTORY_LENGTH as u32 - 1);
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -1681,6 +1691,7 @@ impl P2P {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -1697,6 +1708,7 @@ impl P2P {
                 SEEN_COLUMNS_CAPACITY,
             ),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
+            deferred_columns: Default::default(),
             seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
             seen_payload_attestations: SeenPayloadAttestations::new(
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
@@ -1866,6 +1878,9 @@ pub struct P2PServer {
     /// counterpart for envelopes, deduplicating a repeated ask and carrying
     /// the retry ladder.
     pub(crate) pending_envelope_requests: HashMap<H256, PendingRequest>,
+    /// Envelope lookups gossip votes started, at most one a slot per root.
+    /// See [`req_resp::PayloadVoteFetches`].
+    pub(crate) payload_vote_fetches: req_resp::PayloadVoteFetches,
     /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
@@ -1910,6 +1925,9 @@ pub struct P2PServer {
     /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
     /// per `(block root, index)`, since a gloas sidecar names no proposer.
     pub(crate) seen_block_columns: SeenBlockColumns,
+    /// Gossip verdicts of gloas sidecars waiting on their deferred validation.
+    /// See [`beacon::deferred_columns`].
+    pub(crate) deferred_columns: beacon::deferred_columns::DeferredColumns,
     /// The first valid `execution_payload` per `(block root, builder index)`
     /// accepted from gossip.
     pub(crate) seen_envelopes: SeenEnvelopes,
@@ -2107,6 +2125,16 @@ pub(crate) trait P2PProtocol: Send + Sync {
     /// its lookup on what passed.
     #[allow(dead_code)] // sent by the column checks' completion callback
     fn column_answer_checked(&self, report: ColumnReport) -> Result<(), ActorError>;
+    /// A gloas gossip sidecar whose verdict is held has been through the
+    /// chain checks: report what they decided for the held verdicts they were
+    /// run for (`decides`, by gossip message). See [`beacon::deferred_columns`].
+    #[allow(dead_code)] // sent by the column checks' completion callback
+    fn deferred_columns_checked(
+        &self,
+        block_root: H256,
+        verdicts: Vec<(u64, beacon::column_checks::ColumnVerdict)>,
+        decides: beacon::deferred_columns::Decides,
+    ) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -2223,6 +2251,15 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_deferred_columns_checked(
+        &mut self,
+        msg: p2p_protocol::DeferredColumnsChecked,
+        _ctx: &Context<Self>,
+    ) {
+        beacon::deferred_columns::settle(self, msg.block_root, msg.verdicts, msg.decides);
+    }
+
+    #[send_handler]
     async fn handle_retry_peer_redial(
         &mut self,
         msg: p2p_protocol::RetryPeerRedial,
@@ -2333,6 +2370,9 @@ impl P2PServer {
             send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
         }
         beacon::scoring::refresh(self);
+        // Riding the same once-a-slot tick: held column verdicts are
+        // otherwise swept only when another is held or settled.
+        beacon::deferred_columns::report_expired(self, Instant::now());
     }
 
     /// Check once a slot whether a new epoch's validator custody run is due.
@@ -2504,15 +2544,11 @@ impl Handler<FetchBlock> for P2PServer {
 }
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
-    async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: CheckDataColumnSidecars, ctx: &Context<Self>) {
         match msg.origin {
             // Parked sidecars handed back once their block imported: their
             // arrival was recorded when they were parked.
-            SidecarOrigin::Parked => beacon::column_checks::check_and_forward(
-                self,
-                msg.sidecars,
-                beacon::column_checks::ColumnArrival::Recheck,
-            ),
+            SidecarOrigin::Parked => beacon::deferred_columns::recheck(self, ctx, msg.sidecars),
             SidecarOrigin::ExecutionLayer => {
                 beacon::engine_columns::publish_and_forward(self, msg.sidecars)
             }
@@ -4251,6 +4287,7 @@ pub(crate) mod test_support {
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
             pending_envelope_requests: HashMap::new(),
+            payload_vote_fetches: Default::default(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -4276,6 +4313,7 @@ pub(crate) mod test_support {
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            deferred_columns: Default::default(),
             seen_envelopes: ethlambda_state_transition::beacon::gossip::envelope::SeenEnvelopes::new(
                 crate::SEEN_ENVELOPES_CAPACITY,
             ),

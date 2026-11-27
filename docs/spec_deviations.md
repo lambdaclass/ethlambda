@@ -773,6 +773,30 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
+## A deferred gloas column is relayed only within gossipsub's cache window, and its senders are not charged
+
+- **The specification:** a gloas `data_column_sidecar` queued for its block
+  that then fails validation MUST get its forwarding peers downscored, and one
+  that passes MUST be re-broadcast (`gloas/p2p-interface.md`).
+- **ethlambda:** the gossip verdict of a queued gloas sidecar is held until the
+  chain checks decide, then reported to gossipsub
+  (`p2p/src/beacon/deferred_columns.rs`). A late `Accept` relays the message.
+  A late `Reject` marks it invalid, but gossipsub's invalid-message penalty
+  counts only on topics with score parameters, and `data_column_sidecar_*` has
+  none, so no peer is charged. Gossipsub is sure to keep a message for five
+  700 ms heartbeats, so a verdict still held at 3.5 s is reported with its
+  `Queue` instead: a block that arrives later still gets the column stored, but
+  the column is not relayed.
+- **Why:** gossipsub refuses to publish bytes already in its duplicate cache, so
+  a sidecar received by gossip cannot be re-broadcast any other way, and it has
+  nothing to forward once the message has left its cache. Column topics are
+  unscored as in every client but Prysm (see `beacon_wire.md`, "Peer scoring"),
+  and this node has no application-level peer score to charge instead.
+- **Consequence:** the re-broadcast holds for the usual case, a column that
+  arrives a moment before its block, and lapses for a block that arrives
+  seconds late. The downscore waits on column topic score parameters, or an
+  application-level peer score.
+
 ## Columns built from the execution client's blobs are verified
 
 - **The specification:** fulu `p2p-interface.md`, "Distributed blob publishing
@@ -781,8 +805,9 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   verifying them, and MUST then treat them as received on gossip.
 - **ethlambda:** the built sidecars go through every chain check a fetched
   column gets, KZG proofs included, before they are published, recorded seen
-  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`). Columns
-  that fail are dropped and counted in `lean_engine_blob_columns_refused_total`.
+  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`), fulu
+  and gloas alike. Columns that fail are dropped and counted in
+  `lean_engine_blob_columns_refused_total`.
 - **Why:** a stored column keeps every later copy of it out (`AlreadyStored`),
   and block import trusts the stored columns, so a wrong blob or proof taken
   on trust from a faulty execution client would either stop its block for

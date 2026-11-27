@@ -579,6 +579,22 @@ pub mod mainnet {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // --- Type-specific SSZ bounds (EIP-7688, `gloas/p2p-interface.md`) ---
+    //
+    // A progressive list has no limit, so from gloas these three wire
+    // messages bound their uncompressed size here instead of through their
+    // type. Each equals the largest encoding of the bounded electra (or, for
+    // the bid, fulu-sized) type it replaces.
+
+    /// The most bytes a gloas `SignedAggregateAndProof` may encode to.
+    pub const MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE: usize = 16_829;
+
+    /// The most bytes a gloas `AttesterSlashing` may encode to.
+    pub const MAX_ATTESTER_SLASHING_SIZE: usize = 2_097_616;
+
+    /// The most bytes a `SignedExecutionPayloadBid` may encode to.
+    pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -1087,6 +1103,19 @@ pub mod minimal {
     /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
     /// builder payments owed for the previous and current epoch.
     pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
+
+    // --- Type-specific SSZ bounds (EIP-7688, `gloas/p2p-interface.md`) ---
+
+    /// The most bytes a gloas `SignedAggregateAndProof` may encode to.
+    /// Smaller than mainnet's because `MAX_COMMITTEES_PER_SLOT` is.
+    pub const MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE: usize = 1_462;
+
+    /// The most bytes a gloas `AttesterSlashing` may encode to. Smaller than
+    /// mainnet's because `MAX_VALIDATORS_PER_SLOT` is.
+    pub const MAX_ATTESTER_SLASHING_SIZE: usize = 131_536;
+
+    /// The most bytes a `SignedExecutionPayloadBid` may encode to.
+    pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
 }
 
 // ================================================================
@@ -1375,6 +1404,7 @@ shared! {
     MAX_PAYLOAD_ATTESTATIONS: u64,
     MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64,
     MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64,
+    MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize,
 }
 
 // ================================================================
@@ -1438,6 +1468,8 @@ per_preset! {
     max_builders_per_withdrawals_sweep => MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64,
     ptc_window_length => PTC_WINDOW_LENGTH: usize,
     builder_pending_payments_length => BUILDER_PENDING_PAYMENTS_LENGTH: usize,
+    max_signed_aggregate_and_proof_size => MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE: usize,
+    max_attester_slashing_size => MAX_ATTESTER_SLASHING_SIZE: usize,
 }
 
 // ================================================================
@@ -2025,7 +2057,11 @@ mod tests {
             PROPOSER_LOOKAHEAD_LENGTH,
         );
 
-        in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
+        in_both!(usize:
+            PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH,
+            MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE, MAX_ATTESTER_SLASHING_SIZE,
+            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE,
+        );
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
